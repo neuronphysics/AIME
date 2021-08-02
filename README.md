@@ -1,2 +1,8 @@
 # AIME
 ## Implementation of the new model
+
+# Reference
+1. https://github.com/zhenwendai/RGP
+2. https://github.com/EmbodiedVision/dlgpd
+3. https://pyro.ai/examples/index.html
+4. https://gpytorch.ai/
