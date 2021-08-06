@@ -1,0 +1,7 @@
+torch==1.4.0
+torchfile==0.1.0
+torchvision==0.5.0
+gym==0.18.3
+pybullet==3.0.6
+pyro-ppl==1.7.0
+gpytorch==1.0.1
