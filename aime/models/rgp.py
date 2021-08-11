@@ -49,6 +49,10 @@ class PolicyGP(DGPHiddenLayer):
     def __init__(self, input_dims, output_dims):
         raise NotImplementedError
 
+class RewardGP(DGPHiddenLayer):
+    def __init__(self, input_dims, output_dims):
+        raise NotImplementedError
+
 class RecurrentGP(DeepGP):
     def __init__(self, horizon_size, train_x_shape=(None, None, None), num_hidden_dgp_dims=1):
         super().__init__()
@@ -64,6 +68,7 @@ class RecurrentGP(DeepGP):
                 input_dims=self.transition_gp[i].output_dims,
                 output_dims=None
             )
+        self.reward_gp = RewardGP(input_dims=None, output_dims=None)
     
     def forward(self, inputs):
         # first stack input x and latent vector z together
@@ -74,3 +79,5 @@ class RecurrentGP(DeepGP):
             a = self.policy_modules[i](w)
             z_hat = torch.stack([z, a])
         # output the final reward
+        r = self.reward_gp(z_hat)
+        return r
