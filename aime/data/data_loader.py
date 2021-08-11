@@ -29,6 +29,7 @@ def generate_data(env_name, mode=None, num_random_episodes=1000, num_lagging_obs
             image_list.append(image)
             num_steps += 1
         if (num_steps >= num_lagging_action) and (num_steps+1 >= num_lagging_observation):
+            print(num_steps)
             episode_data = {
                 "observation_list": obs_list,
                 "reward_list": reward_list,
@@ -43,10 +44,10 @@ def generate_data(env_name, mode=None, num_random_episodes=1000, num_lagging_obs
     return episode_list
 
 def preprocess_data(data):
-    observation_tensor = torch.stack([torch.Tensor(d["observation_list"]) for d in data])
-    image_tensor = torch.stack([torch.Tensor(d["image_list"]) for d in data])
-    action_tensor = torch.stack([torch.Tensor(d["action_list"]) for d in data])
-    reward_tensor = torch.stack([torch.Tensor(d["reward_list"]) for d in data])
+    observation_tensor = torch.Tensor([d["observation_list"] for d in data])
+    image_tensor = torch.Tensor([d["image_list"] for d in data])
+    action_tensor = torch.Tensor([d["action_list"] for d in data])
+    reward_tensor = torch.Tensor([d["reward_list"] for d in data])
     preprocessed_data = {
         "observation_tensor": observation_tensor,
         "image_tensor": image_tensor,
@@ -60,6 +61,6 @@ def load_data(env_name, mode=None, num_random_episodes=1000, num_lagging_observa
     return preprocess_data(data)
 
 if __name__ == '__main__':
-    episode_list = load_data('MountainCarContinuous-v0', num_random_episodes=1)
+    episode_list = load_data('MountainCarContinuous-v0', num_random_episodes=4)
     print(episode_list)
 
