@@ -14,30 +14,19 @@ from models.vae import VAE
 from models.rgp import RecurrentGP
 from models.aime import AIMEModel, AIMEOptmizier
 
-from data_loader.data_loader import load_data
+from .data.loader import (
+    data_ingredient,
+    load_data,
+    encode_batch_of_pairs,
+    get_random_collection_env,
+    get_env_info,
+)
+
+import sacred
 
 assert pyro.__version__.startswith('1.7.0')
 #pyro.distributions.enable_validation(False)
 #pyro.set_rng_seed(0)
-
-# all the hyperparameters
-horizon_size = 20
-lagging_latent_size = 10 # M lagging size
-lagging_observation_number = 10 # M_x (coule be different from M)
-lagging_action_number = 10 # L_a
-num_epochs=1000
-
-vae = VAE()
-rgp = RecurrentGP(horizon_size)
-vae_optimizer = optim.Adam(vae.parameters(), lr=0.001, betas=(0.9, 0.999))
-rgp_optimizer = optim.Adam(rgp.parameters(), lr=0.001, betas=(0.9, 0.999))
-aime_model = AIMEModel(vae, rgp)
-aime_optimizer = AIMEOptmizier(vae_optimizer, rgp_optimizer)
-env_name = "ModifiedPendulumEnv-v0"
-train_data = load_data(env_name, mode='train')
-val_data = load_data(env_name, mode='validation')
-
-os.makedirs("saved_models", exist_ok=True)
 
 def train_epoch(train_data, val_data, aime_model, aime_optimizer):
     raise NotImplementedError
@@ -61,5 +50,61 @@ def train_loop(train_data, val_data, aime_model, aime_optimizer, num_epochs, pri
                 torch.save(aime_model.state_dict(), f"saved_models/epoch_{epoch}_model.pt")
     return best_validation_loss
 
-best_validation_loss = train_loop(train_data, val_data, aime_model, aime_optimizer, num_epochs)
-print(best_validation_loss)
+experiment_name = "aime"
+ex = sacred.Experiment(
+    experiment_name,
+    ingredients=[data_ingredient],
+)
+
+@ex.main
+def run_training():
+    # model hyperparameters
+    horizon_size = 20
+    lagging_latent_size = 10 # M lagging size
+    lagging_observation_number = 10 # M_x (coule be different from M)
+    lagging_action_number = 10 # L_a
+    num_epochs=1000
+    
+    # dataset hyperparameters
+    n_train_rollouts_total = 500
+    n_train_rollouts_subset = 500
+    n_val_rollouts_total = 50
+    n_val_rollouts_subset = 50
+
+    vae = VAE()
+    rgp = RecurrentGP(horizon_size)
+    vae_optimizer = optim.Adam(vae.parameters(), lr=0.001, betas=(0.9, 0.999))
+    rgp_optimizer = optim.Adam(rgp.parameters(), lr=0.001, betas=(0.9, 0.999))
+    aime_model = AIMEModel(vae, rgp)
+    aime_optimizer = AIMEOptmizier(vae_optimizer, rgp_optimizer)
+    
+    env_name, env_kwargs = get_random_collection_env()
+    train_data = load_data(
+                    env_name=env_name,
+                    env_kwargs=env_kwargs,
+                    split_name="train",
+                    n_rollouts_total=n_train_rollouts_total,
+                    n_rollouts_subset=n_train_rollouts_subset,
+                )
+    val_data = load_data(
+                    env_name=env_name,
+                    env_kwargs=env_kwargs,
+                    split_name="val",
+                    n_rollouts_total=n_val_rollouts_total,
+                    n_rollouts_subset=n_val_rollouts_subset,
+                )
+    
+    print(train_data)
+    print(val_data)
+    
+    '''
+    os.makedirs("saved_models", exist_ok=True)
+    
+    best_validation_loss = train_loop(train_data, val_data, aime_model, aime_optimizer, num_epochs)
+    print(best_validation_loss)
+    '''
+
+if __name__ == "__main__":
+    import sys
+
+    ex.run_commandline(argv=sys.argv)
