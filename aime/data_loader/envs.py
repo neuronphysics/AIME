@@ -5,74 +5,18 @@ from gym.envs.classic_control import PendulumEnv
 from gym.utils import seeding
 from collections import namedtuple
 
-
-EnvironmentInfo = namedtuple(
-    "EnvironmentInfo",
-    [
-        "env_name",
-        "obs_to_state_fcn",
-        "state_names",
-        "state_types",
-        "data_collection_kwargs",
-        "ctrl_env_kwargs",
-        "variation_kwargs",
-        "action_size",
-    ],
-)
-
-
-def cos_sin_to_angle(cos, sin):
-    cos, sin = cos.clip(-1, 1), sin.clip(-1, 1)
-    return np.where(sin > 0, np.arccos(cos), 2 * np.pi - np.arccos(cos))
-
-
-def pendulum_obs2state_fcn(observations):
-    angle = cos_sin_to_angle(observations[..., 0], observations[..., 1])
-    angle_vel = observations[..., 2]
-    return np.stack((angle, angle_vel), axis=-1)
-
-
-PENDULUM_STATE_NAMES = ["Angle", "Angular velocity"]
-PENDULUM_STATE_TYPES = ["angle", "velocity"]
-PENDULUM_DATA_COLLECTION_ENV_KWARGS = {"init_type": "random"}
-PENDULUM_CTRL_ENV_KWARGS = {"init_type": "bottom"}
-PENDULUM_VARIATION_KWARGS = {
-    "lighterpole": {"m": 0.2},
-    "heavierpole": {"m": 1.5},
-    "invactions": {"action_factor": -1},
-    "standard": {},
-}
-ENV_INFO_PENDULUM = EnvironmentInfo(
-    env_name="ModifiedPendulumEnv-v0",
-    obs_to_state_fcn=pendulum_obs2state_fcn,
-    state_names=PENDULUM_STATE_NAMES,
-    state_types=PENDULUM_STATE_TYPES,
-    data_collection_kwargs=PENDULUM_DATA_COLLECTION_ENV_KWARGS,
-    ctrl_env_kwargs=PENDULUM_CTRL_ENV_KWARGS,
-    variation_kwargs=PENDULUM_VARIATION_KWARGS,
-    action_size=1,
-)
-
+def angle_normalize(x):
+    return ((x + np.pi) % (2 * np.pi)) - np.pi
 
 def register_envs():
     if "ModifiedPendulumEnv-v0" not in gym.envs.registration.registry.env_specs:
         gym.envs.registration.register(
             id="ModifiedPendulumEnv-v0",
-            entry_point="dlgpd.data.envs:ModifiedPendulumEnv",
+            entry_point="aime.data.envs:ModifiedPendulumEnv",
             kwargs={"render_action": False},
         )
 
-
-"""
-=======================================================================
-The code below this block comment is derived from code
-of the OpenAI Gym, v0.17.0.
-For license information on OpenAI Gym, see 3RD_PARTY_LICENSES.md in the
-root directory of this repository.
-=======================================================================
-"""
-
-
+# environment from the dlgpd paper
 class ModifiedPendulumEnv(PendulumEnv):
     """
     Modified PendulumEnv
@@ -182,6 +126,4 @@ class ModifiedPendulumEnv(PendulumEnv):
         else:
             raise ValueError
 
-
-def angle_normalize(x):
-    return ((x + np.pi) % (2 * np.pi)) - np.pi
+# to do: add more environments (e.g. CartPole)

@@ -14,7 +14,7 @@ from models.vae import VAE
 from models.rgp import RecurrentGP
 from models.aime import AIMEModel, AIMEOptmizier
 
-from data.data_loader import load_data
+from data_loader.data_loader import load_data
 
 assert pyro.__version__.startswith('1.7.0')
 #pyro.distributions.enable_validation(False)
