@@ -58,7 +58,7 @@ def register_envs():
     if "ModifiedPendulumEnv-v0" not in gym.envs.registration.registry.env_specs:
         gym.envs.registration.register(
             id="ModifiedPendulumEnv-v0",
-            entry_point="dlgpd.data.envs:ModifiedPendulumEnv",
+            entry_point="aime.data.envs:ModifiedPendulumEnv",
             kwargs={"render_action": False},
         )
 

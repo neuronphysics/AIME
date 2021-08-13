@@ -10,9 +10,9 @@ import pyro.distributions as dist
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import Adam
 
-from models.vae import VAE
-from models.rgp import RecurrentGP
-from models.aime import AIMEModel, AIMEOptmizier
+from .models.vae import VAE
+from .models.rgp import RecurrentGP
+from .models.aime import AIMEModel, AIMEOptmizier
 
 from .data.loader import (
     data_ingredient,
@@ -76,6 +76,7 @@ def run_training():
     vae_optimizer = optim.Adam(vae.parameters(), lr=0.001, betas=(0.9, 0.999))
     rgp_optimizer = optim.Adam(rgp.parameters(), lr=0.001, betas=(0.9, 0.999))
     aime_model = AIMEModel(vae, rgp)
+    aime_model.cuda()
     aime_optimizer = AIMEOptmizier(vae_optimizer, rgp_optimizer)
     
     env_name, env_kwargs = get_random_collection_env()
