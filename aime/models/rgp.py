@@ -42,16 +42,13 @@ class DGPHiddenLayer(DeepGPLayer):
         return MultivariateNormal(mean_x, covar_x)
 
 class TransitionGP(DGPHiddenLayer):
-    def __init__(self, input_dims, output_dims):
-        raise NotImplementedError
+    pass
 
 class PolicyGP(DGPHiddenLayer):
-    def __init__(self, input_dims, output_dims):
-        raise NotImplementedError
+    pass
 
 class RewardGP(DGPHiddenLayer):
-    def __init__(self, input_dims, output_dims):
-        raise NotImplementedError
+    pass
 
 class RecurrentGP(DeepGP):
     def __init__(self, horizon_size, train_x_shape=(None, None, None), num_hidden_dgp_dims=1):

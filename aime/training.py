@@ -28,18 +28,23 @@ assert pyro.__version__.startswith('1.7.0')
 #pyro.distributions.enable_validation(False)
 #pyro.set_rng_seed(0)
 
-def train_epoch(train_data, val_data, aime_model, aime_optimizer):
-    raise NotImplementedError
+def train_epoch(train_data, val_data, aime_model, aime_optimizer, epoch, num_epochs):
+    train_loader = train_data.chunk_loader
+    train_bar = tqdm(train_loader, leave=epoch != num_epochs)
+    for data in train_bar:
+        aime_optimizer.zero_grad()
+        print(data)
+    return -1
 
 def validate_loss(val_data, aime_model):
-    raise NotImplementedError
+    return -1
 
-def train_loop(train_data, val_data, aime_model, aime_optimizer, num_epochs, print_every=20, validate_every=10):
+def train_loop(train_data, val_data, aime_model, aime_optimizer, num_epochs, print_every=20, validate_every=50):
     bar = tqdm(range(1, num_epochs + 1), leave=False)
     best_validation_loss = None
     for epoch in bar:
         aime_model.train()
-        loss = train_epoch(train_data, val_data, aime_model, aime_optimizer)
+        loss = train_epoch(train_data, val_data, aime_model, aime_optimizer, epoch, num_epochs)
         if epoch % print_every == 0:
             print(loss)
         aime_model.eval()
@@ -63,7 +68,7 @@ def run_training():
     lagging_latent_size = 10 # M lagging size
     lagging_observation_number = 10 # M_x (coule be different from M)
     lagging_action_number = 10 # L_a
-    num_epochs=1000
+    num_epochs=100
     
     # dataset hyperparameters
     n_train_rollouts_total = 500
@@ -94,16 +99,10 @@ def run_training():
                     n_rollouts_total=n_val_rollouts_total,
                     n_rollouts_subset=n_val_rollouts_subset,
                 )
-    
-    print(train_data)
-    print(val_data)
-    
-    '''
     os.makedirs("saved_models", exist_ok=True)
     
     best_validation_loss = train_loop(train_data, val_data, aime_model, aime_optimizer, num_epochs)
     print(best_validation_loss)
-    '''
 
 if __name__ == "__main__":
     import sys
