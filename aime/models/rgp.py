@@ -62,7 +62,7 @@ class RecurrentGP(DeepGP):
                 output_dims=num_hidden_dgp_dims
             )
             self.policy_modules[i] = PolicyGP(
-                input_dims=self.transition_gp[i].output_dims,
+                input_dims=self.transition_modules[i].output_dims,
                 output_dims=None
             )
         self.reward_gp = RewardGP(input_dims=None, output_dims=None)
