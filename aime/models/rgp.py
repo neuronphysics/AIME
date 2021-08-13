@@ -65,7 +65,7 @@ class RecurrentGP(DeepGP):
                 input_dims=self.transition_modules[i].output_dims,
                 output_dims=None
             )
-        self.reward_gp = RewardGP(input_dims=None, output_dims=None)
+        self.reward_gp = RewardGP(input_dims=1, output_dims=None)
     
     def forward(self, inputs):
         # first stack input x and latent vector z together
