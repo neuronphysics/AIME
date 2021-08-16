@@ -51,19 +51,19 @@ class RewardGP(DGPHiddenLayer):
     pass
 
 class RecurrentGP(DeepGP):
-    def __init__(self, horizon_size, train_x_shape=(64, 64, 3), num_hidden_dgp_dims=1):
+    def __init__(self, horizon_size, latent_size, action_size, train_x_shape=(64, 64, 3)):
         super().__init__()
         self.horizon_size = horizon_size
         self.transition_modules = [None for _ in range(horizon_size)]
         self.policy_modules = [None for _ in range(horizon_size)]
         for i in range(horizon_size):
             self.transition_modules[i] = TransitionGP(
-                input_dims=train_x_shape[-1],
-                output_dims=num_hidden_dgp_dims
+                input_dims=latent_size,
+                output_dims=latent_size
             )
             self.policy_modules[i] = PolicyGP(
-                input_dims=self.transition_modules[i].output_dims,
-                output_dims=1
+                input_dims=latent_size,
+                output_dims=action_size
             )
         self.reward_gp = RewardGP(input_dims=1, output_dims=1)
     

@@ -65,11 +65,13 @@ ex = sacred.Experiment(
 def run_training():
     # model hyperparameters
     horizon_length = 10
-    lagging_latent_size = 2 # M lagging size
-    lagging_observation_number = 2 # M_x (coule be different from M)
-    lagging_action_number = 2 # L_a
-    lagging_length = 2
-    num_epochs=100
+    lagging_latent_length = 2 # M lagging size
+    lagging_observation_length = 2 # M_x (coule be different from M)
+    lagging_action_length = 2 # L_a
+    action_size = 1
+    latent_size = 1
+    lagging_length = 2 # for now let the lagging length be the same for action, latent space and observations
+    num_epochs=10
     
     # dataset hyperparameters
     n_train_rollouts_total = 500
@@ -78,7 +80,7 @@ def run_training():
     n_val_rollouts_subset = 50
 
     vae = VAE()
-    rgp = RecurrentGP(horizon_length)
+    rgp = RecurrentGP(horizon_length, latent_size, action_size)
     vae_optimizer = optim.Adam(vae.parameters(), lr=0.001, betas=(0.9, 0.999))
     rgp_optimizer = optim.Adam(rgp.parameters(), lr=0.001, betas=(0.9, 0.999))
     aime_model = AIMEModel(vae, rgp)
