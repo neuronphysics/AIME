@@ -64,10 +64,11 @@ ex = sacred.Experiment(
 @ex.main
 def run_training():
     # model hyperparameters
-    horizon_size = 10
+    horizon_length = 10
     lagging_latent_size = 2 # M lagging size
     lagging_observation_number = 2 # M_x (coule be different from M)
     lagging_action_number = 2 # L_a
+    lagging_length = 2
     num_epochs=100
     
     # dataset hyperparameters
@@ -77,7 +78,7 @@ def run_training():
     n_val_rollouts_subset = 50
 
     vae = VAE()
-    rgp = RecurrentGP(horizon_size)
+    rgp = RecurrentGP(horizon_length)
     vae_optimizer = optim.Adam(vae.parameters(), lr=0.001, betas=(0.9, 0.999))
     rgp_optimizer = optim.Adam(rgp.parameters(), lr=0.001, betas=(0.9, 0.999))
     aime_model = AIMEModel(vae, rgp)
@@ -91,6 +92,8 @@ def run_training():
                     split_name="train",
                     n_rollouts_total=n_train_rollouts_total,
                     n_rollouts_subset=n_train_rollouts_subset,
+                    horizon_length=horizon_length,
+                    lagging_length=lagging_length,
                 )
     val_data = load_data(
                     env_name=env_name,
@@ -98,6 +101,8 @@ def run_training():
                     split_name="val",
                     n_rollouts_total=n_val_rollouts_total,
                     n_rollouts_subset=n_val_rollouts_subset,
+                    horizon_length=horizon_length,
+                    lagging_length=lagging_length,
                 )
     os.makedirs("saved_models", exist_ok=True)
     

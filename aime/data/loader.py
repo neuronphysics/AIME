@@ -91,9 +91,13 @@ class DataHandler(object):
         batch_size_pairs,
         shuffle_batches_chunks,
         shuffle_batches_pairs,
+        horizon_length,
+        lagging_length,
     ):
         self._chunk_dataset = chunk_dataset
         self._pair_dataset = pair_dataset
+        self._horizon_length = horizon_length
+        self._lagging_length = lagging_length
         self._chunk_loader_sequential, self._chunk_loader_shuffled = [
             DataLoader(
                 chunk_dataset,
@@ -207,17 +211,15 @@ class DataHandler(object):
         )
     
     def _process_chunk_batch(self, chunk_batch):
-        horizon_length = None
-        lagging_length = None
         t_b_dim_batch = {
             k: t.transpose(0, 1).float().cuda()
             for k, t in chunk_batch.items()
             if k in ["action", "reward", "observation", "rendering"]
         }
-        reward = t_b_dim_batch["reward"][horizon_length+lagging_length:, ...]
-        observation = t_b_dim_batch["observation"][lagging_length:-horizon_length, ...]
-        action = t_b_dim_batch["action"][lagging_length:-horizon_length, ...]
-        rendering = t_b_dim_batch["rendering"][lagging_length:-horizon_length, ...]
+        reward = t_b_dim_batch["reward"][self._horizon_length+self._lagging_length:, ...]
+        observation = t_b_dim_batch["observation"][self._lagging_length:-self._horizon_length, ...]
+        action = t_b_dim_batch["action"][self._lagging_length:-self._horizon_length, ...]
+        rendering = t_b_dim_batch["rendering"][self._lagging_length:-self._horizon_length, ...]
         
         return dict(
             action=action,
@@ -272,6 +274,8 @@ def load_data(
     shuffle_batches_pairs,
     data_base_dir,
     subset_shuffle_seed,
+    horizon_length,
+    lagging_length,
 ):
     """
 
@@ -327,4 +331,6 @@ def load_data(
         batch_size_pairs=batch_size_pairs,
         shuffle_batches_chunks=shuffle_batches_chunks,
         shuffle_batches_pairs=shuffle_batches_pairs,
+        horizon_length=horizon_length,
+        lagging_length=lagging_length,
     )
