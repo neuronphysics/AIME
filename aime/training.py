@@ -64,10 +64,10 @@ ex = sacred.Experiment(
 @ex.main
 def run_training():
     # model hyperparameters
-    horizon_size = 20
-    lagging_latent_size = 10 # M lagging size
-    lagging_observation_number = 10 # M_x (coule be different from M)
-    lagging_action_number = 10 # L_a
+    horizon_size = 10
+    lagging_latent_size = 2 # M lagging size
+    lagging_observation_number = 2 # M_x (coule be different from M)
+    lagging_action_number = 2 # L_a
     num_epochs=100
     
     # dataset hyperparameters

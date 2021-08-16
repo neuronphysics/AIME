@@ -119,7 +119,7 @@ class DataHandler(object):
 
     @property
     def chunk_loader(self):
-        return self._chunk_loader_shuffled
+        return map(self._process_chunk_batch, self._chunk_loader_shuffled)
 
     @property
     def pair_loader(self):
@@ -204,6 +204,26 @@ class DataHandler(object):
             observation=observation,
             rendering=rendering,
             rendering_history=rendering_history,
+        )
+    
+    def _process_chunk_batch(self, chunk_batch):
+        horizon_length = None
+        lagging_length = None
+        t_b_dim_batch = {
+            k: t.transpose(0, 1).float().cuda()
+            for k, t in chunk_batch.items()
+            if k in ["action", "reward", "observation", "rendering"]
+        }
+        reward = t_b_dim_batch["reward"][horizon_length+lagging_length:, ...]
+        observation = t_b_dim_batch["observation"][lagging_length:-horizon_length, ...]
+        action = t_b_dim_batch["action"][lagging_length:-horizon_length, ...]
+        rendering = t_b_dim_batch["rendering"][lagging_length:-horizon_length, ...]
+        
+        return dict(
+            action=action,
+            reward=reward,
+            observation=observation,
+            rendering=rendering,
         )
 
 
