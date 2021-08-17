@@ -70,7 +70,7 @@ def run_training():
     lagging_action_length = 2 # L_a
     action_size = 1
     latent_size = 1
-    lagging_length = 2 # for now let the lagging length be the same for action, latent space and observations
+    lagging_length = 5 # for now let the lagging length be the same for action, latent space and observations
     num_epochs=10
     
     # dataset hyperparameters

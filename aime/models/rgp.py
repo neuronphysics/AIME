@@ -54,26 +54,17 @@ class RecurrentGP(DeepGP):
     def __init__(self, horizon_size, latent_size, action_size, train_x_shape=(64, 64, 3)):
         super().__init__()
         self.horizon_size = horizon_size
-        self.transition_modules = [None for _ in range(horizon_size)]
-        self.policy_modules = [None for _ in range(horizon_size)]
-        for i in range(horizon_size):
-            self.transition_modules[i] = TransitionGP(
-                input_dims=latent_size,
-                output_dims=latent_size
-            )
-            self.policy_modules[i] = PolicyGP(
-                input_dims=latent_size,
-                output_dims=action_size
-            )
-        self.reward_gp = RewardGP(input_dims=1, output_dims=1)
+        self.transition_gp = TransitionGP(input_dims=latent_size+action_size, output_dims=latent_size)
+        self.policy_gp = PolicyGP(input_dims=latent_size, output_dims=action_size)
+        self.reward_gp = RewardGP(input_dims=latent_size+action_size, output_dims=1)
     
     def forward(self, inputs):
         # first stack input x and latent vector z together
         z_hat = inputs
         for i in range(self.horizon_size):
-            z = self.transition_modules[i](z_hat)
+            z = self.transition_gp(torch.stack(z, a))
             w = z[:-1]
-            a = self.policy_modules[i](w)
+            a = self.policy_gp(w)
             z_hat = torch.stack([z, a])
         # output the final reward
         r = self.reward_gp(z_hat)
