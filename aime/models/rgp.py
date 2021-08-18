@@ -55,17 +55,25 @@ class RecurrentGP(DeepGP):
         super().__init__()
         self.horizon_size = horizon_size
         self.lagging_length = lagging_length
-        self.transition_modules = [TransitionGP(input_dims=latent_size+action_size, output_dims=latent_size) for _ in range(horizon_size)]
-        self.policy_modules = [PolicyGP(input_dims=latent_size, output_dims=action_size) for _ in range(horizon_size)]
-        self.reward_gp = RewardGP(input_dims=latent_size+action_size, output_dims=1)
+        self.action_size = action_size
+        self.latent_size = latent_size
+        self.transition_modules = [TransitionGP(input_dims=(latent_size+action_size)*lagging_length, output_dims=latent_size) for _ in range(horizon_size)]
+        self.policy_modules = [PolicyGP(input_dims=latent_size*lagging_length, output_dims=action_size) for _ in range(horizon_size)]
+        self.reward_gp = RewardGP(input_dims=(latent_size+action_size)*lagging_length, output_dims=1)
     
     def forward(self, data):
-        # need to stack actions and latent vectors together
-        z = data["latent"][:self.lagging_length]
-        a = data["action"][:self.lagging_length]
+        # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)
+        z = torch.reshape(data["latent"][:self.lagging_length].transpose(0,1), (-1, self.lagging_length * self.latent_size))
+        a = torch.reshape(data["action"][:self.lagging_length].transpose(0,1), (-1, self.lagging_length * self.action_size))
+        horizon_actions = []
+        horizon_latents= []
         for i in range(self.horizon_size):
-            z = self.transition_modules[i](torch.cat((z, a), dim=-1))
-            a = self.policy_modules[i](z)
+            latent = self.transition_modules[i](torch.cat((z, a), dim=-1))
+            horizon_latents.append(latent)
+            z = torch.cat((z[:, 1:, :], latent.unsqueeze(0)), dim=-2)
+            action = self.policy_modules[i](z)
+            horizon_actions.append(a)
+            a = torch.cat((a[:, 1:, :], action.unsqueeze(0)), dim=-2)
         # output the final reward
         r = self.reward_gp(torch.cat((z, a), dim=-1))
         return r
