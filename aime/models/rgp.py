@@ -14,7 +14,7 @@ from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistrib
 from gpytorch.distributions import MultivariateNormal
 
 class DGPHiddenLayer(DeepGPLayer):
-    def __init__(self, input_dims, output_dims, num_inducing=10):
+    def __init__(self, input_dims, output_dims, num_inducing=5):
         inducing_points = torch.randn(output_dims, num_inducing, input_dims).cuda()
         batch_shape = torch.Size([output_dims])
 
@@ -68,12 +68,13 @@ class RecurrentGP(DeepGP):
         horizon_actions = []
         horizon_latents= []
         for i in range(self.horizon_size):
-            latent = self.transition_modules[i](torch.cat((z, a), dim=-1).cuda())
+            latent = self.transition_modules[i](torch.cat((z, a), dim=-1).cuda()).sample()
+            # print(latent.size()) # need to fix why the first dimension is always 10 here for latent tensor
             horizon_latents.append(latent)
-            z = torch.cat((z[:, 1:, :], latent.unsqueeze(0)), dim=-2)
-            action = self.policy_modules[i](z)
+            z = torch.cat((z[:, 1:], latent[0]), dim=-1)
+            action = self.policy_modules[i](z).sample()
             horizon_actions.append(a)
-            a = torch.cat((a[:, 1:, :], action.unsqueeze(0)), dim=-2)
+            a = torch.cat((a[:, 1:], action[0]), dim=-1)
         # output the final reward
         r = self.reward_gp(torch.cat((z, a), dim=-1))
         return r

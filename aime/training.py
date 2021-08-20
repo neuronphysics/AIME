@@ -36,7 +36,8 @@ def train_epoch(train_data, val_data, aime_model, aime_optimizer, epoch, num_epo
         aime_optimizer.zero_grad()
         encoding = aime_model.vae.encode_batch_sequences(data['rendering'])
         data['latent'] = encoding["latent_sample"]
-        aime_model.rgp(data)
+        horizon_reward = aime_model.rgp(data).sample()
+        #print(horizon_reward.size())
     return -1
 
 def validate_loss(val_data, aime_model):
@@ -73,7 +74,7 @@ def run_training():
     lagging_action_length = 2 # L_a
     action_size = 1
     latent_size = 1
-    lagging_length = 5 # for now let the lagging length be the same for action, latent space and observations
+    lagging_length = 3 # for now let the lagging length be the same for action, latent space and observations
     num_epochs=10
     
     # dataset hyperparameters
@@ -119,3 +120,4 @@ if __name__ == "__main__":
     import sys
 
     ex.run_commandline(argv=sys.argv)
+
