@@ -76,10 +76,10 @@ def run_training():
     num_epochs=10
     
     # dataset hyperparameters
-    n_train_rollouts_total = 500
-    n_train_rollouts_subset = 500
-    n_val_rollouts_total = 50
-    n_val_rollouts_subset = 50
+    n_train_rollouts_total = 100
+    n_train_rollouts_subset = 100
+    n_val_rollouts_total = 10
+    n_val_rollouts_subset = 10
 
     vae = VAE()
     rgp = RecurrentGP(horizon_length, latent_size, action_size, lagging_length)
