@@ -29,7 +29,7 @@ class Encoder(nn.Module):
 
     def forward(self, x):
         *bs, c, h, w = x.shape
-        x = x.view(np.prod(bs), c, h, w)
+        x = torch.reshape(x, (np.prod(bs), c, h, w))
         
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
