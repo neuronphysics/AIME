@@ -14,14 +14,14 @@ from torch.distributions import constraints
 
 
 class Encoder(nn.Module):
-    def __init__(self, latent_dim):
+    def __init__(self, latent_size):
         super(Encoder, self).__init__()
         self.conv1 = nn.Conv2d(3, 32, 4, stride=2)
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
         self.conv3 = nn.Conv2d(64, 128, 4, stride=2)
         self.conv4 = nn.Conv2d(128, 256, 4, stride=2)
-        self.fc_loc = nn.Linear(2 * 2 * 256, latent_dim)
-        self.fc_scale = nn.Linear(2 * 2 * 256, latent_dim)
+        self.fc_loc = nn.Linear(2 * 2 * 256, latent_size)
+        self.fc_scale = nn.Linear(2 * 2 * 256, latent_size)
 
     def forward(self, x):
         *bs, c, h, w = x.shape
@@ -38,12 +38,12 @@ class Encoder(nn.Module):
         return z_loc, z_scale
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim, image_dim):
+    def __init__(self, latent_size, image_dim):
         super(Decoder, self).__init__()
-        self.latent_dim = latent_dim
+        self.latent_size = latent_size
         self.image_dim = image_dim
 
-        self.fc1 = nn.Linear(latent_dim, 1024)
+        self.fc1 = nn.Linear(latent_size, 1024)
         self.deconv1 = nn.ConvTranspose2d(1024, 128, 5, stride=2)
         self.deconv2 = nn.ConvTranspose2d(128, 64, 5, stride=2)
         self.deconv3 = nn.ConvTranspose2d(64, 32, 6, stride=2)
@@ -74,15 +74,15 @@ def truncate(alpha, centers, weights):
 # need to use Dirichlet Process Mixture Models later
 # https://pyro.ai/examples/dirichlet_process_mixture.html
 class VAE(nn.Module):
-    def __init__(self, z_dim=5, image_dim=64, num_sticks=20, alpha=0.1, use_cuda=True):
+    def __init__(self, latent_size, image_dim=64, num_sticks=20, alpha=0.1, use_cuda=True):
         super().__init__()
-        self.z_dim = z_dim
+        self.latent_size = latent_size
         self.image_dim = image_dim
         self.num_sticks = num_sticks
         self.alpha = alpha
         # create the encoder and decoder networks
-        self.encoder = Encoder(self.z_dim)
-        self.decoder = Decoder(self.z_dim, self.image_dim)
+        self.encoder = Encoder(self.latent_size)
+        self.decoder = Decoder(self.latent_size, self.image_dim)
 
         if use_cuda:
             # calling cuda() here will put all the parameters of
@@ -116,8 +116,8 @@ class VAE(nn.Module):
         
         with pyro.plate("data", x.shape[0]):
             # setup hyperparameters for prior p(z)
-            z_loc = x.new_zeros(torch.Size((x.shape[0], self.z_dim)))
-            z_scale = x.new_ones(torch.Size((x.shape[0], self.z_dim)))
+            z_loc = x.new_zeros(torch.Size((x.shape[0], self.latent_size)))
+            z_scale = x.new_ones(torch.Size((x.shape[0], self.latent_size)))
             # sample from prior (value will be sampled by guide when computing the ELBO)
             z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
             #z = pyro.sample("z", Categorical(mix_weights(beta)))

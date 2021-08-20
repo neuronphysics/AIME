@@ -81,7 +81,7 @@ def run_training():
     n_val_rollouts_total = 10
     n_val_rollouts_subset = 10
 
-    vae = VAE()
+    vae = VAE(latent_size)
     rgp = RecurrentGP(horizon_length, latent_size, action_size, lagging_length)
     vae_optimizer = optim.Adam(vae.parameters(), lr=0.001, betas=(0.9, 0.999))
     rgp_optimizer = optim.Adam(rgp.parameters(), lr=0.001, betas=(0.9, 0.999))
