@@ -15,13 +15,13 @@ from gpytorch.distributions import MultivariateNormal
 
 class DGPHiddenLayer(DeepGPLayer):
     def __init__(self, input_dims, output_dims, num_inducing=10):
-        inducing_points = torch.randn(output_dims, num_inducing, input_dims)
+        inducing_points = torch.randn(output_dims, num_inducing, input_dims).cuda()
         batch_shape = torch.Size([output_dims])
 
         variational_distribution = CholeskyVariationalDistribution(
             num_inducing_points=num_inducing,
             batch_shape=batch_shape
-        )
+        ).cuda()
         variational_strategy = VariationalStrategy(
             self,
             inducing_points,
@@ -34,7 +34,7 @@ class DGPHiddenLayer(DeepGPLayer):
         self.covar_module = ScaleKernel(
             MaternKernel(nu=2.5, batch_shape=batch_shape, ard_num_dims=input_dims),
             batch_shape=batch_shape, ard_num_dims=None
-        )
+        ).cuda()
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -68,7 +68,7 @@ class RecurrentGP(DeepGP):
         horizon_actions = []
         horizon_latents= []
         for i in range(self.horizon_size):
-            latent = self.transition_modules[i](torch.cat((z, a), dim=-1))
+            latent = self.transition_modules[i](torch.cat((z, a), dim=-1).cuda())
             horizon_latents.append(latent)
             z = torch.cat((z[:, 1:, :], latent.unsqueeze(0)), dim=-2)
             action = self.policy_modules[i](z)
