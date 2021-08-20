@@ -84,10 +84,11 @@ def run_training():
 
     vae = VAE(latent_size)
     rgp = RecurrentGP(horizon_length, latent_size, action_size, lagging_length)
-    vae_optimizer = optim.Adam(vae.parameters(), lr=0.001, betas=(0.9, 0.999))
-    rgp_optimizer = optim.Adam(rgp.parameters(), lr=0.001, betas=(0.9, 0.999))
     aime_model = AIMEModel(vae, rgp)
     aime_model.cuda()
+    
+    vae_optimizer = optim.Adam(vae.parameters(), lr=0.001, betas=(0.9, 0.999))
+    rgp_optimizer = optim.Adam(rgp.parameters(), lr=0.001, betas=(0.9, 0.999))
     aime_optimizer = AIMEOptmizier(vae_optimizer, rgp_optimizer)
     
     env_name, env_kwargs = get_random_collection_env()

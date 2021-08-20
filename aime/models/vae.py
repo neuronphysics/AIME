@@ -78,7 +78,7 @@ def truncate(alpha, centers, weights):
 # need to use Dirichlet Process Mixture Models later
 # https://pyro.ai/examples/dirichlet_process_mixture.html
 class VAE(nn.Module):
-    def __init__(self, latent_size, image_dim=64, num_sticks=20, alpha=0.1, use_cuda=True):
+    def __init__(self, latent_size, image_dim=64, num_sticks=20, alpha=0.1):
         super().__init__()
         self.latent_size = latent_size
         self.image_dim = image_dim
@@ -88,11 +88,13 @@ class VAE(nn.Module):
         self.encoder = Encoder(self.latent_size)
         self.decoder = Decoder(self.latent_size, self.image_dim)
 
+        '''
         if use_cuda:
             # calling cuda() here will put all the parameters of
             # the encoder and decoder networks into gpu memory
             self.cuda()
         self.use_cuda = use_cuda
+        '''
     
     def model(self, data):
         pyro.module("decoder", self.decoder)
@@ -170,7 +172,7 @@ class VAE(nn.Module):
     def encode_batch_sequences(self, x):
         latent_mean, latent_std = self.encoder(x)
         latent_std = torch.log(torch.exp(latent_std) + 1)
-        latent_sample = sample(latent_mean, sigma=latent_std)
+        latent_sample = sample(latent_mean, sigma=latent_std).cuda()
         return {
             "latent_mean": latent_mean,
             "latent_std": latent_std,
