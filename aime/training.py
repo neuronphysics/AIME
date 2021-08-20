@@ -34,8 +34,9 @@ def train_epoch(train_data, val_data, aime_model, aime_optimizer, epoch, num_epo
     train_bar = tqdm(train_loader, leave=epoch != num_epochs)
     for data in train_bar:
         aime_optimizer.zero_grad()
-        encoding = aime_model.vae.encoder(data['rendering'])
-        print(encoding)
+        encoding = aime_model.vae.encode_batch_sequences(data['rendering'])
+        data['latent'] = encoding["latent_sample"]
+        aime_model.rgp(data)
     return -1
 
 def validate_loss(val_data, aime_model):

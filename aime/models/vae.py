@@ -12,6 +12,10 @@ import pyro
 import pyro.distributions as dist
 from torch.distributions import constraints
 
+def sample(mu, sigma):
+    eps = torch.randn_like(sigma)
+    z = mu + eps * sigma
+    return z
 
 class Encoder(nn.Module):
     def __init__(self, latent_size):
@@ -162,3 +166,13 @@ class VAE(nn.Module):
         # decode the image (note we don't sample in image space)
         loc_img = self.decoder(z)
         return loc_img
+    
+    def encode_batch_sequences(self, x):
+        latent_mean, latent_std = self.encoder(x)
+        latent_std = torch.log(torch.exp(latent_std) + 1)
+        latent_sample = sample(latent_mean, sigma=latent_std)
+        return {
+            "latent_mean": latent_mean,
+            "latent_std": latent_std,
+            "latent_sample": latent_sample
+        }
