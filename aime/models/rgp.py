@@ -51,7 +51,7 @@ class RewardGP(DGPHiddenLayer):
     pass
 
 class RecurrentGP(DeepGP):
-    def __init__(self, horizon_size, latent_size, action_size, lagging_length):
+    def __init__(self, horizon_size, latent_size, action_size, lagging_length, use_cuda=True):
         super().__init__()
         self.horizon_size = horizon_size
         self.lagging_length = lagging_length
@@ -60,6 +60,8 @@ class RecurrentGP(DeepGP):
         self.transition_modules = [TransitionGP(input_dims=(latent_size+action_size)*lagging_length, output_dims=latent_size) for _ in range(horizon_size)]
         self.policy_modules = [PolicyGP(input_dims=latent_size*lagging_length, output_dims=action_size) for _ in range(horizon_size)]
         self.reward_gp = RewardGP(input_dims=(latent_size+action_size)*lagging_length, output_dims=1)
+        if use_cuda:
+            self.cuda()
     
     def forward(self, data):
         # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)
