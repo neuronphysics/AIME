@@ -168,7 +168,6 @@ class VAE(nn.Module):
         return loc_img
     
     def encode_batch_sequences(self, x):
-        x = x.cuda()
         latent_mean, latent_std = self.encoder(x)
         latent_std = torch.log(torch.exp(latent_std) + 1)
         latent_sample = sample(latent_mean, sigma=latent_std)
