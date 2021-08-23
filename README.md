@@ -6,3 +6,4 @@
 2. https://github.com/EmbodiedVision/dlgpd
 3. https://pyro.ai/examples/index.html
 4. https://gpytorch.ai/
+5. https://github.com/Kaixhin/PlaNet
