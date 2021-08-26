@@ -7,7 +7,7 @@ from torch.distributions import constraints
 
 from gpytorch.models.deep_gps import DeepGPLayer, DeepGP
 from gpytorch.means import ConstantMean, ZeroMean
-from gpytorch.kernels import MaternKernel, ScaleKernel
+from gpytorch.kernels import RBFKernel, ScaleKernel
 from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution
 from gpytorch.distributions import MultivariateNormal
 
@@ -204,7 +204,7 @@ class DGPHiddenLayer(DeepGPLayer):
         super().__init__(variational_strategy, input_dims, output_dims)
         self.mean_module = ZeroMean()
         self.covar_module = ScaleKernel(
-            MaternKernel(nu=2.5, batch_shape=batch_shape, ard_num_dims=input_dims),
+            RBFKernel(batch_shape=batch_shape, ard_num_dims=input_dims),
             batch_shape=batch_shape, ard_num_dims=None
         ).to(device=device)
 
@@ -252,18 +252,18 @@ class RecurrentGP(DeepGP):
         posterior_actions = []
         posterior_states = []
         for i in range(self.horizon_size):
-            z = self.transition_modules[i](z_hat).sample()
+            z = self.transition_modules[i](z_hat).rsample()
             # print(latent.size()) # need to fix why the first dimension is always 10 here for latent tensor
             # to do: add noise later
             if i == 0:
               posterior_states.append(z)
             lagging_states = torch.cat([lagging_actions[..., self.latent_size:], z], dim=-1)
             w_hat = lagging_states # may have to change this to lagging_states[:-1] later
-            a = self.policy_modules[i](w_hat).sample()
+            a = self.policy_modules[i](w_hat).rsample()
             if i == 0:
               posterior_actions.append(a)
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
         r = self.reward_gp(z_hat)
-        return r, posterior_actions, posterior_states
+        return r #, posterior_actions, posterior_states
