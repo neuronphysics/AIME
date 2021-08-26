@@ -175,7 +175,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
     # Create initial belief and state for time t = 0
     #init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(args.batch_size, args.state_size, device=args.device)
-    init_states = torch.zeros(args.chunk_size-args.horizon_size-1-args.lagging_size, args.batch_size, args.state_size * args.lagging_size, device=args.device)
+    init_states = torch.zeros(args.chunk_size-args.horizon_size-args.lagging_size, args.batch_size, args.state_size * args.lagging_size, device=args.device)
     # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
     #beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])
     predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1), bottle(encoder, (observations[:-args.horizon_size-1], )).unfold(0, args.lagging_size, 1))
