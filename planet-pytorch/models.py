@@ -258,7 +258,7 @@ class RecurrentGP(DeepGP):
             if i == 0:
               posterior_states.append(z)
             lagging_states = torch.cat([lagging_actions[..., self.latent_size:], z], dim=-1)
-            w_hat = z # may have to change this to z[:-1] later
+            w_hat = lagging_states # may have to change this to lagging_states[:-1] later
             a = self.policy_modules[i](w_hat).sample()
             if i == 0:
               posterior_actions.append(a)
