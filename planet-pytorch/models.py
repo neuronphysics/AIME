@@ -193,7 +193,7 @@ class DGPHiddenLayer(DeepGPLayer):
         variational_distribution = CholeskyVariationalDistribution(
             num_inducing_points=num_inducing,
             batch_shape=batch_shape
-        )
+        ).to(device=device)
         variational_strategy = VariationalStrategy(
             self,
             inducing_points,
@@ -206,7 +206,7 @@ class DGPHiddenLayer(DeepGPLayer):
         self.covar_module = ScaleKernel(
             MaternKernel(nu=2.5, batch_shape=batch_shape, ard_num_dims=input_dims),
             batch_shape=batch_shape, ard_num_dims=None
-        )
+        ).to(device=device)
 
     def forward(self, x):
         mean_x = self.mean_module(x)
