@@ -219,11 +219,11 @@ class TransitionGP(DGPHiddenLayer):
         input_size = (latent_size+action_size+embedding_size)*lagging_size
       else:
         input_size = (latent_size+action_size)*lagging_size
-      super(RewardGP, self).__init__(input_size, latent_size)
+      super(TransitionGP, self).__init__(input_size, latent_size)
 
 class PolicyGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size):
-      super(RewardGP, self).__init__(latent_size*lagging_size, action_size)
+      super(PolicyGP, self).__init__(latent_size*lagging_size, action_size)
 
 class RewardGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size):
