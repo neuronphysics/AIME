@@ -243,8 +243,8 @@ class RecurrentGP(DeepGP):
     
     def forward(self, init_states, actions, observations):
         # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)
-        actions = actions.reshape((-1, actions.size(-1)*actions.size(-2)))
-        observations = observations.reshape((-1, observations.size(-1)*observations.size(-2)))
+        actions = actions.reshape((actions.size(0), actions.size(1), -1))
+        observations = observations.reshape((observations.size(0), observations.size(1), -1))
         z_hat = torch.cat([init_states, observations, actions], dim=-1)
         w_hat = None
         lagging_actions = actions
