@@ -116,9 +116,9 @@ class VisualObservationModel(jit.ScriptModule):
     return observation
 
 
-def ObservationModel(symbolic, observation_size, belief_size, state_size, embedding_size, activation_function='relu'):
+def ObservationModel(symbolic, observation_size, state_size, embedding_size, activation_function='relu'):
   if symbolic:
-    return SymbolicObservationModel(observation_size, belief_size, state_size, embedding_size, activation_function)
+    return SymbolicObservationModel(observation_size, -1, state_size, embedding_size, activation_function)
   else:
     return VisualObservationModel(state_size, embedding_size, activation_function)
 
