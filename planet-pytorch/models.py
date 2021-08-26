@@ -186,8 +186,8 @@ def Encoder(symbolic, observation_size, embedding_size, activation_function='rel
     return VisualEncoder(embedding_size, activation_function)
 
 class DGPHiddenLayer(DeepGPLayer):
-    def __init__(self, input_dims, output_dims, num_inducing=5):
-        inducing_points = torch.randn(output_dims, num_inducing, input_dims)
+    def __init__(self, input_dims, output_dims, device, num_inducing=5):
+        inducing_points = torch.randn(output_dims, num_inducing, input_dims).to(device=device)
         batch_shape = torch.Size([output_dims])
 
         variational_distribution = CholeskyVariationalDistribution(
@@ -214,32 +214,32 @@ class DGPHiddenLayer(DeepGPLayer):
         return MultivariateNormal(mean_x, covar_x)
 
 class TransitionGP(DGPHiddenLayer):
-    def __init__(self, latent_size, action_size, lagging_size, embedding_size, layer_number):
+    def __init__(self, latent_size, action_size, lagging_size, embedding_size, layer_number, device):
       if layer_number == 0:
         input_size = (latent_size+action_size+embedding_size)*lagging_size
       else:
         input_size = (latent_size+action_size)*lagging_size
-      super(TransitionGP, self).__init__(input_size, latent_size)
+      super(TransitionGP, self).__init__(input_size, latent_size, device)
 
 class PolicyGP(DGPHiddenLayer):
-    def __init__(self, latent_size, action_size, lagging_size):
-      super(PolicyGP, self).__init__(latent_size*lagging_size, action_size)
+    def __init__(self, latent_size, action_size, lagging_size, device):
+      super(PolicyGP, self).__init__(latent_size*lagging_size, action_size, device)
 
 class RewardGP(DGPHiddenLayer):
-    def __init__(self, latent_size, action_size, lagging_size):
-      super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, 1)
+    def __init__(self, latent_size, action_size, lagging_size, device):
+      super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, 1, device)
 
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
-    def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size):
+    def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size, device):
         super().__init__()
         self.horizon_size = horizon_size
         self.lagging_length = lagging_size
         self.action_size = action_size
         self.latent_size = latent_size
-        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, embedding_size, i) for i in range(horizon_size)]
-        self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size) for _ in range(horizon_size)]
-        self.reward_gp = RewardGP(latent_size, action_size, lagging_size)
+        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, embedding_size, i, device) for i in range(horizon_size)]
+        self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
+        self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device)
     
     def forward(self, init_states, actions, observations):
         # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)
