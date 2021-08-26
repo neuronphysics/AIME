@@ -120,7 +120,7 @@ def ObservationModel(symbolic, observation_size, belief_size, state_size, embedd
   if symbolic:
     return SymbolicObservationModel(observation_size, belief_size, state_size, embedding_size, activation_function)
   else:
-    return VisualObservationModel(belief_size, state_size, embedding_size, activation_function)
+    return VisualObservationModel(state_size, embedding_size, activation_function)
 
 
 class RewardModel(jit.ScriptModule):
@@ -229,6 +229,7 @@ class RewardGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size):
       super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, 1)
 
+# may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
     def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size):
         super().__init__()
