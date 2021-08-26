@@ -253,18 +253,16 @@ class RecurrentGP(DeepGP):
         posterior_states = []
         for i in range(self.horizon_size):
             z = self.transition_modules[i](z_hat).rsample()
-            # first dimension of z (z.size(0)) is the number of Gaussian mixtures
+            # print(latent.size()) # need to fix why the first dimension is always 10 here for latent tensor
             # to do: add noise later
             if i == 0:
               posterior_states.append(z)
-            lagging_states = lagging_states[..., self.latent_size:]
-            lagging_states = torch.cat([lagging_states.unsqueeze(0).expand(z.size(0), *lagging_states.size()), z], dim=-1)
+            lagging_states = torch.cat([lagging_actions[..., self.latent_size:], z], dim=-1)
             w_hat = lagging_states # may have to change this to lagging_states[:-1] later
             a = self.policy_modules[i](w_hat).rsample()
             if i == 0:
               posterior_actions.append(a)
-            lagging_actions = lagging_actions[..., self.action_size:]
-            lagging_actions = torch.cat([lagging_actions.unsqueeze(0).expand(a.size(0), *lagging_actions.size()), a], dim=-1)
+            lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
         r = self.reward_gp(z_hat)
