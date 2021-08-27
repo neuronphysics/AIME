@@ -242,8 +242,6 @@ class RecurrentGP(DeepGP):
         self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device)
         self.num_mixture_samples = num_mixture_samples
-        self._posterior_states = []
-        self._posterior_actions = []
     
     def forward(self, init_states, actions, observations):
         with gpytorch.settings.num_likelihood_samples(self.num_mixture_samples):
@@ -254,22 +252,22 @@ class RecurrentGP(DeepGP):
           w_hat = None
           lagging_actions = actions
           lagging_states = init_states
+          posterior_states = []
+          posterior_actions = []
           for i in range(self.horizon_size):
               z = self.transition_modules[i](z_hat).rsample().squeeze(0)
               # first dimension of z is the number of Gaussian mixtures (z.size(0))
               # to do: add noise later
-              if i == 0:
-                self._posterior_states.append(z)
+              posterior_states.append(z)
               lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
               w_hat = lagging_states # may have to change this to lagging_states[:-1] later
               a = self.policy_modules[i](w_hat).rsample().squeeze(0)
-              if i == 0:
-                self._posterior_actions.append(a)
+              posterior_actions.append(a)
               lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
               z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
           # output the final reward
           r = self.reward_gp(z_hat).rsample().squeeze(0)
-          return r #, posterior_actions, posterior_states
+          return r, posterior_actions, posterior_states
     
     def get_posterior_states(self):
         return self._posterior_states
