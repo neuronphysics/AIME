@@ -107,8 +107,8 @@ class VisualObservationModel(jit.ScriptModule):
     self.conv4 = nn.ConvTranspose2d(32, 3, 6, stride=2)
 
   @jit.script_method
-  def forward(self, belief, state):
-    hidden = self.fc1(torch.cat([belief, state], dim=1))  # No nonlinearity here
+  def forward(self, state):
+    hidden = self.fc1(state)  # No nonlinearity here
     hidden = hidden.view(-1, self.embedding_size, 1, 1)
     hidden = self.act_fn(self.conv1(hidden))
     hidden = self.act_fn(self.conv2(hidden))
