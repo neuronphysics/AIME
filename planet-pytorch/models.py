@@ -268,5 +268,5 @@ class RecurrentGP(DeepGP):
               lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a.squeeze(0)], dim=-1)
               z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
           # output the final reward
-          r = self.reward_gp(z_hat)
+          r = self.reward_gp(z_hat).rsample().squeeze(0)
           return r #, posterior_actions, posterior_states
