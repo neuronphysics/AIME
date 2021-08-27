@@ -181,10 +181,11 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1), bottle(encoder, (observations[:-args.horizon_size-1], )).unfold(0, args.lagging_size, 1))
     reward_loss = F.mse_loss(predicted_rewards.squeeze(-1), rewards[args.lagging_size+args.horizon_size:], reduction='none').mean(dim=(0, 1))
     # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting); sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
+    posterior_states = posterior_states.to(device=args.device)
     observation_loss = F.mse_loss(bottle(observation_model, (posterior_states[0],)), observations[args.lagging_size+args.horizon_size:], reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
     #reward_loss = F.mse_loss(bottle(reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0, 1))
     action_loss = None
-    kl_loss = torch.max(kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(prior_means, prior_std_devs)).sum(dim=2), free_nats).mean(dim=(0, 1))  # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
+    #kl_loss = torch.max(kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(prior_means, prior_std_devs)).sum(dim=2), free_nats).mean(dim=(0, 1))  # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
     #if args.global_kl_beta != 0:
     #  kl_loss += args.global_kl_beta * kl_divergence(Normal(posterior_means, posterior_std_devs), global_prior).sum(dim=2).mean(dim=(0, 1))
     # Calculate latent overshooting objective for t > 0
@@ -213,20 +214,22 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
     # Update model parameters
     optimiser.zero_grad()
-    (observation_loss + reward_loss + kl_loss).backward()
+    #(observation_loss + reward_loss + kl_loss).backward()
+    (observation_loss + reward_loss).backward()
     nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
     optimiser.step()
     # Store (0) observation loss (1) reward loss (2) KL loss
-    losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item()])
+    #losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item()])
+    losses.append([observation_loss.item(), reward_loss.item()])
 
   # Update and plot loss metrics
   losses = tuple(zip(*losses))
   metrics['observation_loss'].append(losses[0])
   metrics['reward_loss'].append(losses[1])
-  metrics['kl_loss'].append(losses[2])
+  #metrics['kl_loss'].append(losses[2])
   lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['kl_loss']):], metrics['kl_loss'], 'kl_loss', results_dir)
+  #lineplot(metrics['episodes'][-len(metrics['kl_loss']):], metrics['kl_loss'], 'kl_loss', results_dir)
 
 
   # Data collection
@@ -259,6 +262,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     observation_model.eval()
     #reward_model.eval()
     encoder.eval()
+    recurrent_gp.eval()
     # Initialise parallelised test environments
     test_envs = EnvBatcher(Env, (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth), {}, args.test_episodes)
     
@@ -288,10 +292,11 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     torch.save(metrics, os.path.join(results_dir, 'metrics.pth'))
 
     # Set models to train mode
-    transition_model.train()
+    #transition_model.train()
     observation_model.train()
-    reward_model.train()
+    #reward_model.train()
     encoder.train()
+    recurrent_gp.train()
     # Close test environments
     test_envs.close()
 
