@@ -232,7 +232,7 @@ class RewardGP(DGPHiddenLayer):
 
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
-    def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size, device):
+    def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size, device, num_mixture_samples=1):
         super().__init__()
         self.horizon_size = horizon_size
         self.lagging_length = lagging_size
@@ -241,10 +241,10 @@ class RecurrentGP(DeepGP):
         self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, embedding_size, i, device) for i in range(horizon_size)]
         self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device)
-        self.num_samples = 1
+        self.num_mixture_samples = num_mixture_samples
     
     def forward(self, init_states, actions, observations):
-        with gpytorch.settings.num_likelihood_samples(self.num_samples):
+        with gpytorch.settings.num_likelihood_samples(self.num_mixture_samples):
           # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)
           actions = actions.reshape((actions.size(0), actions.size(1), -1))
           observations = observations.reshape((observations.size(0), observations.size(1), -1))
@@ -256,16 +256,16 @@ class RecurrentGP(DeepGP):
           posterior_states = []
           for i in range(self.horizon_size):
               z = self.transition_modules[i](z_hat).rsample()
-              # print(latent.size()) # need to fix why the first dimension is always 10 here for latent tensor
+              # first dimension of z is the number of Gaussian mixtures (z.size(0))
               # to do: add noise later
               if i == 0:
                 posterior_states.append(z)
-              lagging_states = torch.cat([lagging_actions[..., self.latent_size:], z], dim=-1)
+              lagging_states = torch.cat([lagging_states[..., self.latent_size:], z.squeeze(0)], dim=-1)
               w_hat = lagging_states # may have to change this to lagging_states[:-1] later
               a = self.policy_modules[i](w_hat).rsample()
               if i == 0:
                 posterior_actions.append(a)
-              lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
+              lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a.squeeze(0)], dim=-1)
               z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
           # output the final reward
           r = self.reward_gp(z_hat)
