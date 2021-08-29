@@ -245,7 +245,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     for t in pbar:
       if time_step < args.lagging_size:
         action = lagging_actions[time_step]
-        next_observation, reward, done = env.step(action)
+        next_observation, reward, done = env.step(action.cpu())
       else:
         posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, observation.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
         lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0)], dim=0)
@@ -285,7 +285,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       for t in pbar:
         if time_step < args.lagging_size:
           action = lagging_actions[time_step]
-          next_observation, reward, done = env.step(action)
+          next_observation, reward, done = env.step(action.cpu())
         else:
           posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, observation.to(device=args.device), env.action_range[0], env.action_range[1])
           lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0)], dim=0)

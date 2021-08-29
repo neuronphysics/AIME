@@ -1,6 +1,7 @@
 from math import inf
 import torch
 from torch import jit
+import torch.nn as nn
 
 
 # Model-predictive control planner with cross-entropy method and learned transition model
@@ -38,7 +39,7 @@ class MPCPlanner(jit.ScriptModule):
     # Return first action mean µ_t
     return action_mean[0].squeeze(dim=1)
 
-class AIMEPlanner(jit.ScriptModule):
+class AIMEPlanner(nn.Module):
   
   def __init__(self, action_size, planning_horizon, optimisation_iters, recurrent_gp, min_action=-inf, max_action=inf):
     super().__init__()
