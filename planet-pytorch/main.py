@@ -329,7 +329,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
   # Checkpoint models
   if episode % args.checkpoint_interval == 0:
-    torch.save({'observation_model': observation_model.state_dict(), 'encoder': encoder.state_dict(), 'recurrent_gp': recurrent_gp, 'optimiser': optimiser.state_dict()}, os.path.join(results_dir, 'models_%d.pth' % episode))
+    torch.save({'observation_model': observation_model.state_dict(), 'encoder': encoder.state_dict(), 'recurrent_gp': recurrent_gp.state_dict(), 'optimiser': optimiser.state_dict()}, os.path.join(results_dir, 'models_%d.pth' % episode))
     if args.checkpoint_experience:
       torch.save(D, os.path.join(results_dir, 'experience.pth'))  # Warning: will fail with MemoryError with large memory sizes
 
