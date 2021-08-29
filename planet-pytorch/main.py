@@ -131,10 +131,10 @@ free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.d
 
 def update_belief_and_act(args, env, planner, recurrent_gp, encoder, prior_states, prior_actions, prior_observations, min_action=-inf, max_action=inf, explore=False):
   # Infer belief over current state q(s_t|o≤t,a<t) from the history
-  rewards, posterior_actions, posterior_states = recurrent_gp(prior_states, prior_actions.unsqueeze(dim=0), encoder(prior_observations))  # Action and observation need extra time dimension
+  rewards, posterior_actions, posterior_states = recurrent_gp(torch.flatten(prior_states).unsqueeze(dim=0).unsqueeze(dim=0), prior_actions.unsqueeze(dim=0).unsqueeze(dim=0), encoder(prior_observations).unsqueeze(0).unsqueeze(dim=0))  # Action and observation need extra time dimension
   posterior_state = posterior_states[0].squeeze(dim=0).squeeze(dim=0)  # Remove time dimension from belief/state
   #action = planner(belief, posterior_state)  # Get action from planner(q(s_t|o≤t,a<t), p)
-  action = posterior_actions[0].squeeze(dim=0).squeeze(dim=0)
+  action = posterior_actions[0].squeeze(dim=0)
   if explore:
     action = action + args.action_noise * torch.randn_like(action)  # Add exploration noise ε ~ p(ε) to the action
   action.clamp_(min=min_action, max=max_action)  # Clip action range
@@ -251,8 +251,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       else:
         posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, lagging_observations.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
         lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
-        lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0)], dim=0)
-        lagging_actions = torch.cat([lagging_actions[1:], action.unsqueeze(0)], dim=0)
+        lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0).to(device=args.device)], dim=0)
+        lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
       D.append(observation, action.cpu(), reward, done)
       total_reward += reward
       observation = next_observation
