@@ -283,16 +283,19 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     
     with torch.no_grad():
       observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
+      lagging_observations = observation[:]
       lagging_states, lagging_actions = torch.zeros(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
         if time_step < args.lagging_size:
           action = lagging_actions[time_step]
           next_observation, reward, done = env.step(action.cpu())
+          lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
         else:
-          posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, observation.to(device=args.device), env.action_range[0], env.action_range[1])
-          lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0)], dim=0)
-          lagging_actions = torch.cat([lagging_actions[1:], action.unsqueeze(0)], dim=0)
+          posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, lagging_observations.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
+          lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
+          lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0).to(device=args.device)], dim=0)
+          lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
         total_rewards += reward.numpy()
         time_step += 1
         if not args.symbolic_env:  # Collect real vs. predicted frames for video
