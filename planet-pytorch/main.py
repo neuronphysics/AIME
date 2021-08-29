@@ -54,7 +54,7 @@ parser.add_argument('--candidates', type=int, default=1000, metavar='J', help='C
 parser.add_argument('--top-candidates', type=int, default=100, metavar='K', help='Number of top candidates to fit')
 parser.add_argument('--test', action='store_true', help='Test only')
 parser.add_argument('--test-interval', type=int, default=25, metavar='I', help='Test interval (episodes)')
-parser.add_argument('--test-episodes', type=int, default=10, metavar='E', help='Number of test episodes')
+parser.add_argument('--test-episodes', type=int, default=1, metavar='E', help='Number of test episodes')
 parser.add_argument('--checkpoint-interval', type=int, default=50, metavar='I', help='Checkpoint interval (episodes)')
 parser.add_argument('--checkpoint-experience', action='store_true', help='Checkpoint experience replay')
 parser.add_argument('--models', type=str, default='', metavar='M', help='Load model checkpoint')
@@ -291,15 +291,16 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           action = lagging_actions[time_step]
           next_observation, reward, done = env.step(action.cpu())
           lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
+          done = torch.Tensor([done])
         else:
           posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, lagging_observations.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
           lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
           lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0).to(device=args.device)], dim=0)
           lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
-        total_rewards += reward.numpy()
+        total_rewards += reward
         time_step += 1
         if not args.symbolic_env:  # Collect real vs. predicted frames for video
-          video_frames.append(make_grid(torch.cat([observation, observation_model(belief, posterior_state).cpu()], dim=3) + 0.5, nrow=5).numpy())  # Decentre
+          video_frames.append(make_grid(torch.cat([observation, observation_model(posterior_state.to(device=args.device)).cpu()], dim=3) + 0.5, nrow=5).numpy())  # Decentre
         observation = next_observation
         if done.sum().item() == args.test_episodes:
           pbar.close()
