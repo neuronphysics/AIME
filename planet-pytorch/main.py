@@ -12,7 +12,7 @@ from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
 from models import bottle, Encoder, ObservationModel, RewardModel, TransitionModel, RecurrentGP
-from planner import MPCPlanner
+from planner import MPCPlanner, AIMEPlanner
 from utils import lineplot, write_video
 
 
@@ -30,7 +30,7 @@ parser.add_argument('--embedding-size', type=int, default=5, metavar='E', help='
 parser.add_argument('--hidden-size', type=int, default=200, metavar='H', help='Hidden size')
 parser.add_argument('--belief-size', type=int, default=200, metavar='H', help='Belief/hidden size')
 parser.add_argument('--state-size', type=int, default=1, metavar='Z', help='State/latent size')
-parser.add_argument('--action-repeat', type=int, default=2, metavar='R', help='Action repeat')
+parser.add_argument('--action-repeat', type=int, default=1, metavar='R', help='Action repeat')
 parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', help='Action noise')
 parser.add_argument('--episodes', type=int, default=1000, metavar='E', help='Total number of episodes')
 parser.add_argument('--seed-episodes', type=int, default=5, metavar='S', help='Seed episodes')
@@ -124,21 +124,22 @@ if args.models is not '' and os.path.exists(args.models):
   encoder.load_state_dict(model_dicts['encoder'])
   optimiser.load_state_dict(model_dicts['optimiser'])
 #planner = MPCPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, args.candidates, args.top_candidates, transition_model, reward_model, env.action_range[0], env.action_range[1])
-planner = None
+planner = AIMEPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, recurrent_gp, env.action_range[0], env.action_range[1])
 global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.device), torch.ones(args.batch_size, args.state_size, device=args.device))  # Global prior N(0, I)
 free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.device)  # Allowed deviation in KL divergence
 
 
-def update_belief_and_act(args, env, planner, transition_model, encoder, belief, posterior_state, action, observation, min_action=-inf, max_action=inf, explore=False):
+def update_belief_and_act(args, env, planner, recurrent_gp, encoder, prior_states, prior_actions, observation, min_action=-inf, max_action=inf, explore=False):
   # Infer belief over current state q(s_t|o≤t,a<t) from the history
-  belief, _, _, _, posterior_state, _, _ = transition_model(posterior_state, action.unsqueeze(dim=0), belief, encoder(observation).unsqueeze(dim=0))  # Action and observation need extra time dimension
-  belief, posterior_state = belief.squeeze(dim=0), posterior_state.squeeze(dim=0)  # Remove time dimension from belief/state
-  action = planner(belief, posterior_state)  # Get action from planner(q(s_t|o≤t,a<t), p)
+  rewards, posterior_actions, posterior_states = recurrent_gp(prior_states, prior_actions.unsqueeze(dim=0), encoder(observation).unsqueeze(dim=0))  # Action and observation need extra time dimension
+  posterior_state = posterior_states[0].squeeze(dim=0).squeeze(dim=0)  # Remove time dimension from belief/state
+  #action = planner(belief, posterior_state)  # Get action from planner(q(s_t|o≤t,a<t), p)
+  action = posterior_actions[0].squeeze(dim=0).squeeze(dim=0)
   if explore:
     action = action + args.action_noise * torch.randn_like(action)  # Add exploration noise ε ~ p(ε) to the action
   action.clamp_(min=min_action, max=max_action)  # Clip action range
   next_observation, reward, done = env.step(action.cpu() if isinstance(env, EnvBatcher) else action[0].cpu())  # Perform environment step (action repeats handled internally)
-  return belief, posterior_state, action, next_observation, reward, done
+  return posterior_state, action, next_observation, reward, done
 
 
 # Testing only
@@ -237,14 +238,22 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
   # Data collection
   with torch.no_grad():
-    observation, total_reward = env.reset(), 0
-    belief, posterior_state, action = torch.zeros(1, args.belief_size, device=args.device), torch.zeros(1, args.state_size, device=args.device), torch.zeros(1, env.action_size, device=args.device)
+    observation, total_reward, time_step = env.reset(), 0, 0
+    lagging_states, lagging_actions = torch.zeros(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
     pbar = tqdm(range(args.max_episode_length // args.action_repeat))
+    time_steps = 0
     for t in pbar:
-      belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, transition_model, encoder, belief, posterior_state, action, observation.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
+      if time_step < args.lagging_size:
+        action = lagging_actions[time_step]
+        next_observation, reward, done = env.step(action)
+      else:
+        posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, observation.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
+        lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0)], dim=0)
+        lagging_actions = torch.cat([lagging_actions[1:], action.unsqueeze(0)], dim=0)
       D.append(observation, action.cpu(), reward, done)
       total_reward += reward
       observation = next_observation
+      time_step += 1
       if args.render:
         env.render()
       if done:
@@ -270,12 +279,19 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     test_envs = EnvBatcher(Env, (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth), {}, args.test_episodes)
     
     with torch.no_grad():
-      observation, total_rewards, video_frames = test_envs.reset(), np.zeros((args.test_episodes, )), []
-      belief, posterior_state, action = torch.zeros(args.test_episodes, args.belief_size, device=args.device), torch.zeros(args.test_episodes, args.state_size, device=args.device), torch.zeros(args.test_episodes, env.action_size, device=args.device)
+      observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
+      lagging_states, lagging_actions = torch.zeros(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
-        belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(args, test_envs, planner, transition_model, encoder, belief, posterior_state, action, observation.to(device=args.device), env.action_range[0], env.action_range[1])
+        if time_step < args.lagging_size:
+          action = lagging_actions[time_step]
+          next_observation, reward, done = env.step(action)
+        else:
+          posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, observation.to(device=args.device), env.action_range[0], env.action_range[1])
+          lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0)], dim=0)
+          lagging_actions = torch.cat([lagging_actions[1:], action.unsqueeze(0)], dim=0)
         total_rewards += reward.numpy()
+        time_step += 1
         if not args.symbolic_env:  # Collect real vs. predicted frames for video
           video_frames.append(make_grid(torch.cat([observation, observation_model(belief, posterior_state).cpu()], dim=3) + 0.5, nrow=5).numpy())  # Decentre
         observation = next_observation

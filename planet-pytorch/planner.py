@@ -37,3 +37,15 @@ class MPCPlanner(jit.ScriptModule):
       action_mean, action_std_dev = best_actions.mean(dim=2, keepdim=True), best_actions.std(dim=2, unbiased=False, keepdim=True)
     # Return first action mean µ_t
     return action_mean[0].squeeze(dim=1)
+
+class AIMEPlanner(jit.ScriptModule):
+  
+  def __init__(self, action_size, planning_horizon, optimisation_iters, recurrent_gp, min_action=-inf, max_action=inf):
+    super().__init__()
+    self.action_size, self.min_action, self.max_action = action_size, min_action, max_action
+    self.planning_horizon = planning_horizon
+    self.recurrent_gp = recurrent_gp
+  
+  @jit.script_method
+  def forward(self, state):
+    raise NotImplementedError
