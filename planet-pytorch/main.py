@@ -131,10 +131,15 @@ free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.d
 
 def update_belief_and_act(args, env, planner, recurrent_gp, encoder, prior_states, prior_actions, prior_observations, min_action=-inf, max_action=inf, explore=False):
   # Infer belief over current state q(s_t|o≤t,a<t) from the history
-  rewards, posterior_actions, posterior_states = recurrent_gp(torch.flatten(prior_states).unsqueeze(dim=0).unsqueeze(dim=0), prior_actions.unsqueeze(dim=0).unsqueeze(dim=0), encoder(prior_observations).unsqueeze(0).unsqueeze(dim=0))  # Action and observation need extra time dimension
-  posterior_state = posterior_states[0].squeeze(dim=0).squeeze(dim=0)  # Remove time dimension from belief/state
+  rewards, posterior_actions, posterior_states = recurrent_gp(
+    torch.flatten(prior_states).unsqueeze(dim=0).expand(10, args.lagging_size * env.state_size).unsqueeze(dim=0),
+    prior_actions.unsqueeze(dim=0).expand(10, args.lagging_size, env.action_size).unsqueeze(dim=0),
+    encoder(prior_observations).unsqueeze(0).expand(10, args.lagging_size, args.embedding_size).unsqueeze(dim=0)
+  )  # Action and observation need extra time dimension
+  #posterior_state = posterior_states[0].squeeze(dim=0).squeeze(dim=0)  # Remove time dimension from belief/state
   #action = planner(belief, posterior_state)  # Get action from planner(q(s_t|o≤t,a<t), p)
-  action = posterior_actions[0].squeeze(dim=0)
+  action, posterior_state = planner(rewards, posterior_actions, posterior_states)
+  #action = posterior_actions[0].squeeze(dim=0)
   if explore:
     action = action + args.action_noise * torch.randn_like(action)  # Add exploration noise ε ~ p(ε) to the action
   action.clamp_(min=min_action, max=max_action)  # Clip action range

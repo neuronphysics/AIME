@@ -48,5 +48,8 @@ class AIMEPlanner(nn.Module):
     self.recurrent_gp = recurrent_gp
   
   @jit.script_method
-  def forward(self, state):
-    raise NotImplementedError
+  def forward(self, rewards, posterior_actions, posterior_states):
+    rewards = rewards.squeeze(0)
+    posterior_actions = posterior_actions.squeeze(0)
+    posterior_states = posterior_states.squeeze(0)
+    return posterior_actions[0], posterior_states[0]
