@@ -131,9 +131,10 @@ free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.d
 
 def update_belief_and_act(args, env, planner, recurrent_gp, encoder, prior_states, prior_actions, prior_observations, min_action=-inf, max_action=inf, explore=False):
   # Infer belief over current state q(s_t|o≤t,a<t) from the history
+  action_size = prior_actions.size(-1)
   rewards, posterior_actions, posterior_states = recurrent_gp(
     torch.flatten(prior_states).unsqueeze(dim=0).expand(50, args.lagging_size * args.state_size).unsqueeze(dim=0),
-    prior_actions.unsqueeze(dim=0).expand(50, args.lagging_size, env.action_size).unsqueeze(dim=0),
+    prior_actions.unsqueeze(dim=0).expand(50, args.lagging_size, action_size).unsqueeze(dim=0),
     encoder(prior_observations).unsqueeze(0).expand(50, args.lagging_size, args.embedding_size).unsqueeze(dim=0)
   )  # Action and observation need extra time dimension
   #posterior_state = posterior_states[0].squeeze(dim=0).squeeze(dim=0)  # Remove time dimension from belief/state
@@ -246,6 +247,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     observation, total_reward, time_step = env.reset(), 0, 0
     lagging_observations = observation[:]
     lagging_states, lagging_actions = torch.zeros(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
+    lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
     pbar = tqdm(range(args.max_episode_length // args.action_repeat))
     time_steps = 0
     for t in pbar:
@@ -290,19 +292,20 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
       lagging_observations = observation[:]
       lagging_states, lagging_actions = torch.zeros(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
+      lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
         if time_step < args.lagging_size:
           action = lagging_actions[time_step]
-          next_observation, reward, done = env.step(action.cpu())
+          next_observation, reward, done = test_envs.step(action.unsqueeze(0).cpu())
           lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
           done = torch.Tensor([done])
         else:
-          posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, lagging_observations.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
+          posterior_state, action, next_observation, reward, done = update_belief_and_act(args, test_envs, planner, recurrent_gp, encoder, lagging_states, lagging_actions, lagging_observations.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
           lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
           lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0).to(device=args.device)], dim=0)
           lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
-        total_rewards += reward
+        total_rewards += reward.numpy()
         time_step += 1
         if not args.symbolic_env:  # Collect real vs. predicted frames for video
           video_frames.append(make_grid(torch.cat([observation, observation_model(posterior_state.to(device=args.device)).cpu()], dim=3) + 0.5, nrow=5).numpy())  # Decentre
