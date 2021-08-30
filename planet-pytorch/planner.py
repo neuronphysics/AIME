@@ -47,9 +47,9 @@ class AIMEPlanner(nn.Module):
     self.planning_horizon = planning_horizon
     self.recurrent_gp = recurrent_gp
   
-  @jit.script_method
   def forward(self, rewards, posterior_actions, posterior_states):
-    rewards = rewards.squeeze(0)
-    posterior_actions = posterior_actions.squeeze(0)
-    posterior_states = posterior_states.squeeze(0)
-    return posterior_actions[0], posterior_states[0]
+    rewards = rewards.squeeze(dim=0).squeeze(-1)
+    posterior_actions = posterior_actions.squeeze(dim=1)
+    posterior_states = posterior_states.squeeze(dim=1)
+    max_index = torch.argmax(rewards)
+    return posterior_actions[0][max_index:max_index+1], posterior_states[0][max_index]
