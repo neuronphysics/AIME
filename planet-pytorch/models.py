@@ -192,7 +192,7 @@ class SampleLayer(jit.ScriptModule):
   @jit.script_method
   def forward(self, embedding):
     latent_mean = self.fc_mean(embedding)
-    latent_std = self.softplus(self.fc_mean(embedding))
+    latent_std = self.softplus(self.fc_std(embedding))
     latent_state = latent_mean + torch.rand_like(latent_mean) * latent_std
     return latent_mean, latent_std, latent_state
 
