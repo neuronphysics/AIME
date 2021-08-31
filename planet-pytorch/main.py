@@ -263,7 +263,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         lagging_states[time_step] = current_latent_state
       else:
         posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
-        lagging_states = torch.cat([lagging_states[1:], current_latent_state.unsqueeze(dim=0)], dim=0)
+        lagging_states = torch.cat([lagging_states[1:], current_latent_state], dim=0)
         lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
       D.append(observation, action.cpu(), reward, done)
       total_reward += reward
@@ -307,7 +307,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           done = torch.Tensor([done])
         else:
           posterior_state, action, next_observation, reward, done = update_belief_and_act(args, test_envs, planner, recurrent_gp, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
-          lagging_states = torch.cat([lagging_states[1:], current_latent_state.unsqueeze(dim=0)], dim=0)
+          lagging_states = torch.cat([lagging_states[1:], current_latent_state], dim=0)
           lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
         total_rewards += reward.numpy()
         time_step += 1
