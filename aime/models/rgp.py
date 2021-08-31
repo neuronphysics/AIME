@@ -14,14 +14,14 @@ from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistrib
 from gpytorch.distributions import MultivariateNormal
 
 class DGPHiddenLayer(DeepGPLayer):
-    def __init__(self, input_dims, output_dims, num_inducing=10):
-        inducing_points = torch.randn(output_dims, num_inducing, input_dims)
+    def __init__(self, input_dims, output_dims, num_inducing=5):
+        inducing_points = torch.randn(output_dims, num_inducing, input_dims).cuda()
         batch_shape = torch.Size([output_dims])
 
         variational_distribution = CholeskyVariationalDistribution(
             num_inducing_points=num_inducing,
             batch_shape=batch_shape
-        )
+        ).cuda()
         variational_strategy = VariationalStrategy(
             self,
             inducing_points,
@@ -34,7 +34,7 @@ class DGPHiddenLayer(DeepGPLayer):
         self.covar_module = ScaleKernel(
             MaternKernel(nu=2.5, batch_shape=batch_shape, ard_num_dims=input_dims),
             batch_shape=batch_shape, ard_num_dims=None
-        )
+        ).cuda()
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -42,35 +42,39 @@ class DGPHiddenLayer(DeepGPLayer):
         return MultivariateNormal(mean_x, covar_x)
 
 class TransitionGP(DGPHiddenLayer):
-    def __init__(self, input_dims, output_dims):
-        raise NotImplementedError
+    pass
 
 class PolicyGP(DGPHiddenLayer):
-    def __init__(self, input_dims, output_dims):
-        raise NotImplementedError
+    pass
+
+class RewardGP(DGPHiddenLayer):
+    pass
 
 class RecurrentGP(DeepGP):
-    def __init__(self, horizon_size, train_x_shape=(None, None, None), num_hidden_dgp_dims=1):
+    def __init__(self, horizon_size, latent_size, action_size, lagging_length):
         super().__init__()
         self.horizon_size = horizon_size
-        self.transition_modules = [None for _ in range(horizon_size)]
-        self.policy_modules = [None for _ in range(horizon_size)]
-        for i in range(horizon_size):
-            self.transition_modules[i] = TransitionGP(
-                input_dims=train_x_shape[-1],
-                output_dims=num_hidden_dgp_dims
-            )
-            self.policy_modules[i] = PolicyGP(
-                input_dims=self.transition_gp[i].output_dims,
-                output_dims=None
-            )
+        self.lagging_length = lagging_length
+        self.action_size = action_size
+        self.latent_size = latent_size
+        self.transition_modules = [TransitionGP(input_dims=(latent_size+action_size)*lagging_length, output_dims=latent_size) for _ in range(horizon_size)]
+        self.policy_modules = [PolicyGP(input_dims=latent_size*lagging_length, output_dims=action_size) for _ in range(horizon_size)]
+        self.reward_gp = RewardGP(input_dims=(latent_size+action_size)*lagging_length, output_dims=1)
     
-    def forward(self, inputs):
-        # first stack input x and latent vector z together
-        z_hat = inputs
+    def forward(self, data):
+        # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)
+        z = torch.reshape(data["latent"][:self.lagging_length].transpose(0,1), (-1, self.lagging_length * self.latent_size))
+        a = torch.reshape(data["action"][:self.lagging_length].transpose(0,1), (-1, self.lagging_length * self.action_size))
+        horizon_actions = []
+        horizon_latents= []
         for i in range(self.horizon_size):
-            z = self.transition_modules[i](z_hat)
-            w = z[:-1]
-            a = self.policy_modules[i](w)
-            z_hat = torch.stack([z, a])
+            latent = self.transition_modules[i](torch.cat((z, a), dim=-1).cuda()).sample()
+            # print(latent.size()) # need to fix why the first dimension is always 10 here for latent tensor
+            horizon_latents.append(latent)
+            z = torch.cat((z[:, 1:], latent[0]), dim=-1)
+            action = self.policy_modules[i](z).sample()
+            horizon_actions.append(a)
+            a = torch.cat((a[:, 1:], action[0]), dim=-1)
         # output the final reward
+        r = self.reward_gp(torch.cat((z, a), dim=-1))
+        return r
