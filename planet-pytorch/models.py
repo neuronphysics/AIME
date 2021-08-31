@@ -179,6 +179,21 @@ class VisualEncoder(jit.ScriptModule):
     hidden = self.fc(hidden)  # Identity if embedding size is 1024 else linear projection
     return hidden
 
+class SampleLayer(jit.ScriptModule):
+  
+  def __init__(self, embedding_size, state_size):
+    self.embedding_size = embedding_size
+    self.state_size = state_size
+    self.fc_mean = nn.Linear(embedding_size, state_size)
+    self.fc_std = nn.Linear(embedding_size, state_size)
+    self.softplus = nn.Softplus()
+  
+  @jit.script_method
+  def forward(self, embedding):
+    latent_mean = self.fc_mean(embedding)
+    latent_std = self.softplus(self.fc_mean(embedding))
+    latent_state = latent_mean + torch.rand_like(latent_mean) * latent_std
+    return latent_mean, latent_std, latent_state
 
 def Encoder(symbolic, observation_size, embedding_size, activation_function='relu'):
   if symbolic:
@@ -215,12 +230,8 @@ class DGPHiddenLayer(DeepGPLayer):
         return MultivariateNormal(mean_x, covar_x)
 
 class TransitionGP(DGPHiddenLayer):
-    def __init__(self, latent_size, action_size, lagging_size, embedding_size, layer_number, device):
-      if layer_number == 0:
-        input_size = (latent_size+action_size+embedding_size)*lagging_size
-      else:
-        input_size = (latent_size+action_size)*lagging_size
-      super(TransitionGP, self).__init__(input_size, latent_size, device)
+    def __init__(self, latent_size, action_size, lagging_size, device):
+      super(TransitionGP, self).__init__((latent_size+action_size)*lagging_size, latent_size, device)
 
 class PolicyGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
@@ -238,17 +249,17 @@ class RecurrentGP(DeepGP):
         self.lagging_length = lagging_size
         self.action_size = action_size
         self.latent_size = latent_size
-        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, embedding_size, i, device) for i in range(horizon_size)]
+        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
         self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device)
         self.num_mixture_samples = num_mixture_samples
     
-    def forward(self, init_states, actions, observations):
+    def forward(self, init_states, actions):
         with gpytorch.settings.num_likelihood_samples(self.num_mixture_samples):
           # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)
+          init_states = init_states.reshape((init_states.size(0), init_states.size(1), -1))
           actions = actions.reshape((actions.size(0), actions.size(1), -1))
-          observations = observations.reshape((observations.size(0), observations.size(1), -1))
-          z_hat = torch.cat([init_states, observations, actions], dim=-1)
+          z_hat = torch.cat([init_states, actions], dim=-1)
           w_hat = None
           lagging_actions = actions
           lagging_states = init_states

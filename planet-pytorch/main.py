@@ -11,7 +11,7 @@ from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
-from models import bottle, Encoder, ObservationModel, RewardModel, TransitionModel, RecurrentGP
+from models import bottle, Encoder, ObservationModel, RewardModel, TransitionModel, RecurrentGP, SampleLayer
 from planner import MPCPlanner, AIMEPlanner
 from utils import lineplot, write_video
 
@@ -26,7 +26,7 @@ parser.add_argument('--symbolic-env', action='store_true', help='Symbolic featur
 parser.add_argument('--max-episode-length', type=int, default=1000, metavar='T', help='Max episode length')
 parser.add_argument('--experience-size', type=int, default=1000000, metavar='D', help='Experience replay size')  # Original implementation has an unlimited buffer size, but 1 million is the max experience collected anyway
 parser.add_argument('--activation-function', type=str, default='relu', choices=dir(F), help='Model activation function')
-parser.add_argument('--embedding-size', type=int, default=5, metavar='E', help='Observation embedding size')  # Note that the default encoder for visual observations outputs a 1024D vector; for other embedding sizes an additional fully-connected layer is used
+parser.add_argument('--embedding-size', type=int, default=1024, metavar='E', help='Observation embedding size')  # Note that the default encoder for visual observations outputs a 1024D vector; for other embedding sizes an additional fully-connected layer is used
 parser.add_argument('--hidden-size', type=int, default=200, metavar='H', help='Hidden size')
 parser.add_argument('--belief-size', type=int, default=200, metavar='H', help='Belief/hidden size')
 parser.add_argument('--state-size', type=int, default=1, metavar='Z', help='State/latent size')
@@ -111,9 +111,10 @@ observation_model = ObservationModel(args.symbolic_env, env.observation_size, ar
 #reward_model = RewardModel(args.belief_size, args.state_size, args.hidden_size, args.activation_function).to(device=args.device)
 encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.activation_function).to(device=args.device)
 recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, args.lagging_size, args.embedding_size, args.device).to(device=args.device)
+sample_layer = SampleLayer(args.embedding_size, args.state_size).to(device=args.device)
 
 #param_list = list(transition_model.parameters()) + list(observation_model.parameters()) + list(reward_model.parameters()) + list(encoder.parameters())
-param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters())
+param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters()) + list(sample_layer.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 if args.models is not '' and os.path.exists(args.models):
   model_dicts = torch.load(args.models)
@@ -122,6 +123,7 @@ if args.models is not '' and os.path.exists(args.models):
   recurrent_gp.load_state_dict(model_dicts['recurrent_gp'])
   #reward_model.load_state_dict(model_dicts['reward_model'])
   encoder.load_state_dict(model_dicts['encoder'])
+  sample_layer.load_state_dict(model_dicts['sample_layer'])
   optimiser.load_state_dict(model_dicts['optimiser'])
 #planner = MPCPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, args.candidates, args.top_candidates, transition_model, reward_model, env.action_range[0], env.action_range[1])
 planner = AIMEPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, recurrent_gp, env.action_range[0], env.action_range[1])
@@ -182,15 +184,17 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
     # Create initial belief and state for time t = 0
     #init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(args.batch_size, args.state_size, device=args.device)
-    init_states = torch.zeros(args.chunk_size-args.horizon_size-args.lagging_size, args.batch_size, args.state_size * args.lagging_size, device=args.device)
+    observation_embedding = bottle(encoder, (observations, ))
+    latent_mean, latent_std, latent_state = sample_layer(observation_embedding)
+    init_states = latent_state[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)
     # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
     #beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])
-    predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1), bottle(encoder, (observations[:-args.horizon_size-1], )).unfold(0, args.lagging_size, 1))
+    predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
     reward_loss = F.mse_loss(predicted_rewards.squeeze(-1), rewards[args.lagging_size+args.horizon_size:], reduction='none').mean(dim=(0, 1))
     # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting); sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
     posterior_states = posterior_states.to(device=args.device)
     posterior_actions = posterior_actions.to(device=args.device)
-    observation_loss = F.mse_loss(bottle(observation_model, (posterior_states[0],)), observations[args.lagging_size:-args.horizon_size], reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
+    observation_loss = F.mse_loss(bottle(observation_model, (latent_state,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
     #reward_loss = F.mse_loss(bottle(reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0, 1))
     action_loss = F.mse_loss(posterior_actions, actions[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').mean(dim=(0, 1, 2))
     #kl_loss = torch.max(kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(prior_means, prior_std_devs)).sum(dim=2), free_nats).mean(dim=(0, 1))  # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
@@ -337,7 +341,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
   # Checkpoint models
   if episode % args.checkpoint_interval == 0:
-    torch.save({'observation_model': observation_model.state_dict(), 'encoder': encoder.state_dict(), 'recurrent_gp': recurrent_gp.state_dict(), 'optimiser': optimiser.state_dict()}, os.path.join(results_dir, 'models_%d.pth' % episode))
+    torch.save({
+      'observation_model': observation_model.state_dict(),
+      'encoder': encoder.state_dict(),
+      'recurrent_gp': recurrent_gp.state_dict(),
+      'optimiser': optimiser.state_dict(),
+      'sample_layer': sample_layer.state_dict(),
+      }, os.path.join(results_dir, 'models_%d.pth' % episode))
     if args.checkpoint_experience:
       torch.save(D, os.path.join(results_dir, 'experience.pth'))  # Warning: will fail with MemoryError with large memory sizes
 
