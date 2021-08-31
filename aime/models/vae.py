@@ -1,42 +1,53 @@
 # https://pyro.ai/examples/vae.html
 # https://pyro.ai/examples/dirichlet_process_mixture.html
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pyro.distributions import Beta, MultivariateNormal, Categorical
+from pyro.distributions import Beta, MultivariateNormal, Categorical, Uniform, Dirichlet
 
 import pyro
 import pyro.distributions as dist
+from torch.distributions import constraints
 
-
+def sample(mu, sigma):
+    eps = torch.randn_like(sigma)
+    z = mu + eps * sigma
+    return z
 
 class Encoder(nn.Module):
-    def __init__(self, latent_dim):
+    def __init__(self, latent_size):
         super(Encoder, self).__init__()
         self.conv1 = nn.Conv2d(3, 32, 4, stride=2)
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
         self.conv3 = nn.Conv2d(64, 128, 4, stride=2)
         self.conv4 = nn.Conv2d(128, 256, 4, stride=2)
-        self.fc_loc = nn.Linear(2 * 2 * 256, latent_dim)
-        self.fc_scale = nn.Linear(2 * 2 * 256, latent_dim)
+        self.fc_loc = nn.Linear(2 * 2 * 256, latent_size)
+        self.fc_scale = nn.Linear(2 * 2 * 256, latent_size)
 
     def forward(self, x):
+        *bs, c, h, w = x.shape
+        x = torch.reshape(x, (np.prod(bs), c, h, w))
+        
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = F.relu(self.conv4(x))
-        z_loc = self.fc_loc(x)
-        z_scale = torch.exp(self.fc_scale(x)) # should be positive
+        x = x.view(x.size(0), -1)
+
+        z_loc = self.fc_loc(x).view(*bs, -1)
+        z_scale = self.fc_scale(x).view(*bs, -1) # should be positive
         return z_loc, z_scale
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim, image_dim):
+    def __init__(self, latent_size, image_dim):
         super(Decoder, self).__init__()
-        self.latent_dim = latent_dim
+        self.latent_size = latent_size
         self.image_dim = image_dim
 
-        self.fc1 = nn.Linear(latent_dim, 1024)
+        self.fc1 = nn.Linear(latent_size, 1024)
         self.deconv1 = nn.ConvTranspose2d(1024, 128, 5, stride=2)
         self.deconv2 = nn.ConvTranspose2d(128, 64, 5, stride=2)
         self.deconv3 = nn.ConvTranspose2d(64, 32, 6, stride=2)
@@ -58,27 +69,46 @@ def mix_weights(beta):
     beta1m_cumprod = (1 - beta).cumprod(-1)
     return F.pad(beta, (0, 1), value=1) * F.pad(beta1m_cumprod, (1, 0), value=1)
 
-
+def truncate(alpha, centers, weights):
+    threshold = alpha**-1 / 100.
+    true_centers = centers[weights > threshold]
+    true_weights = weights[weights > threshold] / torch.sum(weights[weights > threshold])
+    return true_centers, true_weights
 
 # need to use Dirichlet Process Mixture Models later
 # https://pyro.ai/examples/dirichlet_process_mixture.html
 class VAE(nn.Module):
-    def __init__(self, z_dim=5, image_dim=64, num_sticks=20, alpha=0.1, use_cuda=False):
+    def __init__(self, latent_size, image_dim=64, num_sticks=20, alpha=0.1):
         super().__init__()
-        self.z_dim = z_dim
+        self.latent_size = latent_size
         self.image_dim = image_dim
         self.num_sticks = num_sticks
         self.alpha = alpha
         # create the encoder and decoder networks
-        self.encoder = Encoder(self.z_dim)
-        self.decoder = Decoder(self.z_dim, self.image_dim)
+        self.encoder = Encoder(self.latent_size)
+        self.decoder = Decoder(self.latent_size, self.image_dim)
 
+        '''
         if use_cuda:
             # calling cuda() here will put all the parameters of
             # the encoder and decoder networks into gpu memory
             self.cuda()
         self.use_cuda = use_cuda
+        '''
+    
+    def model(self, data):
+        pyro.module("decoder", self.decoder)
+        with pyro.plate("beta_plate", self.num_sticks-1):
+            beta = pyro.sample("beta", Beta(1, self.alpha))
 
+        with pyro.plate("mu_plate", self.num_sticks):
+            mu = pyro.sample("mu", MultivariateNormal(torch.zeros(2), 5 * torch.eye(2)))
+
+        with pyro.plate("data", data.shape[0]):
+            z = pyro.sample("z", Categorical(mix_weights(beta)))
+            pyro.sample("obs", MultivariateNormal(mu[z], torch.eye(2)), obs=data)
+
+    '''
     # define the model p(x|z)p(z)
     def model(self, x):
         # register PyTorch module `decoder` with Pyro
@@ -92,8 +122,8 @@ class VAE(nn.Module):
         
         with pyro.plate("data", x.shape[0]):
             # setup hyperparameters for prior p(z)
-            z_loc = x.new_zeros(torch.Size((x.shape[0], self.z_dim)))
-            z_scale = x.new_ones(torch.Size((x.shape[0], self.z_dim)))
+            z_loc = x.new_zeros(torch.Size((x.shape[0], self.latent_size)))
+            z_scale = x.new_ones(torch.Size((x.shape[0], self.latent_size)))
             # sample from prior (value will be sampled by guide when computing the ELBO)
             z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
             #z = pyro.sample("z", Categorical(mix_weights(beta)))
@@ -101,7 +131,23 @@ class VAE(nn.Module):
             loc_img = self.decoder(z)
             # score against actual images
             pyro.sample("obs", dist.Bernoulli(loc_img).to_event(1), obs=x.reshape(-1, self.image_dim**2))
+    '''
+    
+    def guide(self, data):
+        kappa = pyro.param('kappa', lambda: Uniform(0, 2).sample([self.num_sticks-1]), constraint=constraints.positive)
+        tau = pyro.param('tau', lambda: MultivariateNormal(torch.zeros(2), 3 * torch.eye(2)).sample([self.num_sticks]))
+        phi = pyro.param('phi', lambda: Dirichlet(1/self.num_sticks * torch.ones(self.num_sticks)).sample([data.shape[0]]), constraint=constraints.simplex)
 
+        with pyro.plate("beta_plate", self.num_sticks-1):
+            q_beta = pyro.sample("beta", Beta(torch.ones(self.num_sticks-1), kappa))
+
+        with pyro.plate("mu_plate", self.num_sticks):
+            q_mu = pyro.sample("mu", MultivariateNormal(tau, torch.eye(2)))
+
+        with pyro.plate("data", data.shape[0]):
+            z = pyro.sample("z", Categorical(phi))
+
+    '''
     # define the guide (i.e. variational distribution) q(z|x)
     def guide(self, x):
         # register PyTorch module `encoder` with Pyro
@@ -111,6 +157,7 @@ class VAE(nn.Module):
             z_loc, z_scale = self.encoder(x)
             # sample the latent code z
             pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
+    '''
 
     # define a helper function for reconstructing images
     def reconstruct_img(self, x):
@@ -121,3 +168,13 @@ class VAE(nn.Module):
         # decode the image (note we don't sample in image space)
         loc_img = self.decoder(z)
         return loc_img
+    
+    def encode_batch_sequences(self, x):
+        latent_mean, latent_std = self.encoder(x)
+        latent_std = torch.log(torch.exp(latent_std) + 1)
+        latent_sample = sample(latent_mean, sigma=latent_std).cuda()
+        return {
+            "latent_mean": latent_mean,
+            "latent_std": latent_std,
+            "latent_sample": latent_sample
+        }
