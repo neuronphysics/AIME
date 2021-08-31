@@ -179,7 +179,7 @@ class VisualEncoder(jit.ScriptModule):
     hidden = self.fc(hidden)  # Identity if embedding size is 1024 else linear projection
     return hidden
 
-class SampleLayer(jit.ScriptModule):
+class SampleLayer(nn.Module):
   
   def __init__(self, embedding_size, state_size):
     super().__init__()
@@ -189,7 +189,6 @@ class SampleLayer(jit.ScriptModule):
     self.fc_std = nn.Linear(embedding_size, state_size)
     self.softplus = nn.Softplus()
   
-  @jit.script_method
   def forward(self, embedding):
     latent_mean = self.fc_mean(embedding)
     latent_std = self.softplus(self.fc_std(embedding))

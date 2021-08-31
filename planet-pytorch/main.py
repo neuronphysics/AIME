@@ -83,7 +83,7 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
   args.device = torch.device('cpu')
 #metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'reward_loss': [], 'kl_loss': []}
-metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'reward_loss': [], 'action_loss': []}
+metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'reward_loss': [], 'action_loss': [], 'transition_loss': []}
 
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
@@ -185,8 +185,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # Create initial belief and state for time t = 0
     #init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(args.batch_size, args.state_size, device=args.device)
     observation_embedding = bottle(encoder, (observations, ))
-    latent_mean, latent_std, latent_state = sample_layer(observation_embedding)
-    init_states = latent_state[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)
+    latent_mean, latent_std, latent_states = sample_layer(observation_embedding)
+    init_states = latent_states[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)
     # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
     #beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])
     predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
@@ -194,9 +194,10 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting); sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
     posterior_states = posterior_states.to(device=args.device)
     posterior_actions = posterior_actions.to(device=args.device)
-    observation_loss = F.mse_loss(bottle(observation_model, (latent_state,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
+    observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
     #reward_loss = F.mse_loss(bottle(reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0, 1))
     action_loss = F.mse_loss(posterior_actions, actions[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').mean(dim=(0, 1, 2))
+    transition_loss = F.mse_loss(posterior_states, latent_states[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').mean(dim=(0, 1, 2))
     #kl_loss = torch.max(kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(prior_means, prior_std_devs)).sum(dim=2), free_nats).mean(dim=(0, 1))  # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
     #if args.global_kl_beta != 0:
     #  kl_loss += args.global_kl_beta * kl_divergence(Normal(posterior_means, posterior_std_devs), global_prior).sum(dim=2).mean(dim=(0, 1))
@@ -227,31 +228,34 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # Update model parameters
     optimiser.zero_grad()
     #(observation_loss + reward_loss + kl_loss).backward()
-    (observation_loss + reward_loss + action_loss).backward()
+    (observation_loss + reward_loss + action_loss + transition_loss).backward()
     nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
     optimiser.step()
     # Store (0) observation loss (1) reward loss (2) KL loss
     #losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item()])
-    losses.append([observation_loss.item(), reward_loss.item(), action_loss.item()])
+    losses.append([observation_loss.item(), reward_loss.item(), action_loss.item(), transition_loss.item()])
 
   # Update and plot loss metrics
   losses = tuple(zip(*losses))
   metrics['observation_loss'].append(losses[0])
   metrics['reward_loss'].append(losses[1])
   metrics['action_loss'].append(losses[2])
+  metrics['transition_loss'].append(losses[3])
   #metrics['kl_loss'].append(losses[2])
   lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
   #lineplot(metrics['episodes'][-len(metrics['kl_loss']):], metrics['kl_loss'], 'kl_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['action_loss']):], metrics['action_loss'], 'action_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['transition_loss']):], metrics['transition_loss'], 'transition_loss', results_dir)
 
 
   # Data collection
   with torch.no_grad():
     observation, total_reward, time_step = env.reset(), 0, 0
-    lagging_observations = observation[:]
     lagging_states, lagging_actions = torch.zeros(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
     lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
+    _, _, first_latent_state = sample_layer(encoder(observation))
+    lagging_states[0] = first_latent_state
     pbar = tqdm(range(args.max_episode_length // args.action_repeat))
     time_steps = 0
     for t in pbar:
