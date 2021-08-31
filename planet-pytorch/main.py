@@ -254,22 +254,19 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     observation, total_reward, time_step = env.reset(), 0, 0
     lagging_states, lagging_actions = torch.zeros(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
     lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
-    _, _, first_latent_state = sample_layer(encoder(observation))
-    lagging_states[0] = first_latent_state
     pbar = tqdm(range(args.max_episode_length // args.action_repeat))
     time_steps = 0
     for t in pbar:
       if time_step < args.lagging_size:
         action = lagging_actions[time_step]
         next_observation, reward, done = env.step(action.cpu())
-        lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
       else:
-        posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, lagging_observations.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
-        lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
+        posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
         lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0).to(device=args.device)], dim=0)
         lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
       D.append(observation, action.cpu(), reward, done)
       total_reward += reward
+      lagging_states[time_step] = sample_layer(encoder(observation.to(device=args.device)))[2]
       observation = next_observation
       time_step += 1
       if args.render:
