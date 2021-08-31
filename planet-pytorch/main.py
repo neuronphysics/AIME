@@ -29,7 +29,7 @@ parser.add_argument('--activation-function', type=str, default='relu', choices=d
 parser.add_argument('--embedding-size', type=int, default=1024, metavar='E', help='Observation embedding size')  # Note that the default encoder for visual observations outputs a 1024D vector; for other embedding sizes an additional fully-connected layer is used
 parser.add_argument('--hidden-size', type=int, default=200, metavar='H', help='Hidden size')
 parser.add_argument('--belief-size', type=int, default=200, metavar='H', help='Belief/hidden size')
-parser.add_argument('--state-size', type=int, default=1, metavar='Z', help='State/latent size')
+parser.add_argument('--state-size', type=int, default=5, metavar='Z', help='State/latent size')
 parser.add_argument('--action-repeat', type=int, default=1, metavar='R', help='Action repeat')
 parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', help='Action noise')
 parser.add_argument('--episodes', type=int, default=1000, metavar='E', help='Total number of episodes')
@@ -131,13 +131,12 @@ global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.
 free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.device)  # Allowed deviation in KL divergence
 
 
-def update_belief_and_act(args, env, planner, recurrent_gp, encoder, prior_states, prior_actions, prior_observations, min_action=-inf, max_action=inf, explore=False):
+def update_belief_and_act(args, env, planner, recurrent_gp, prior_states, prior_actions, min_action=-inf, max_action=inf, explore=False):
   # Infer belief over current state q(s_t|o≤t,a<t) from the history
   action_size = prior_actions.size(-1)
   rewards, posterior_actions, posterior_states = recurrent_gp(
     torch.flatten(prior_states).unsqueeze(dim=0).expand(50, args.lagging_size * args.state_size).unsqueeze(dim=0),
-    prior_actions.unsqueeze(dim=0).expand(50, args.lagging_size, action_size).unsqueeze(dim=0),
-    encoder(prior_observations).unsqueeze(0).expand(50, args.lagging_size, args.embedding_size).unsqueeze(dim=0)
+    prior_actions.unsqueeze(dim=0).expand(50, args.lagging_size, action_size).unsqueeze(dim=0)
   )  # Action and observation need extra time dimension
   #posterior_state = posterior_states[0].squeeze(dim=0).squeeze(dim=0)  # Remove time dimension from belief/state
   #action = planner(belief, posterior_state)  # Get action from planner(q(s_t|o≤t,a<t), p)
@@ -252,21 +251,22 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   # Data collection
   with torch.no_grad():
     observation, total_reward, time_step = env.reset(), 0, 0
-    lagging_states, lagging_actions = torch.zeros(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
+    lagging_states, lagging_actions = torch.empty(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
     lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
     pbar = tqdm(range(args.max_episode_length // args.action_repeat))
     time_steps = 0
     for t in pbar:
+      _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
       if time_step < args.lagging_size:
         action = lagging_actions[time_step]
         next_observation, reward, done = env.step(action.cpu())
+        lagging_states[time_step] = current_latent_state
       else:
-        posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, encoder, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
-        lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0).to(device=args.device)], dim=0)
+        posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
+        lagging_states = torch.cat([lagging_states[1:], current_latent_state.unsqueeze(dim=0)], dim=0)
         lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
       D.append(observation, action.cpu(), reward, done)
       total_reward += reward
-      lagging_states[time_step] = sample_layer(encoder(observation.to(device=args.device)))[2]
       observation = next_observation
       time_step += 1
       if args.render:
@@ -295,25 +295,24 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     
     with torch.no_grad():
       observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
-      lagging_observations = observation[:]
-      lagging_states, lagging_actions = torch.zeros(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
+      lagging_states, lagging_actions = torch.empty(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
       lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
+        _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
         if time_step < args.lagging_size:
           action = lagging_actions[time_step]
           next_observation, reward, done = test_envs.step(action.unsqueeze(0).cpu())
-          lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
+          lagging_states[time_step] = current_latent_state
           done = torch.Tensor([done])
         else:
-          posterior_state, action, next_observation, reward, done = update_belief_and_act(args, test_envs, planner, recurrent_gp, encoder, lagging_states, lagging_actions, lagging_observations.to(device=args.device), env.action_range[0], env.action_range[1], explore=True)
-          lagging_observations = torch.cat([lagging_observations, next_observation], dim=0)[-args.lagging_size:]
-          lagging_states = torch.cat([lagging_states[1:], posterior_state.unsqueeze(0).to(device=args.device)], dim=0)
+          posterior_state, action, next_observation, reward, done = update_belief_and_act(args, test_envs, planner, recurrent_gp, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
+          lagging_states = torch.cat([lagging_states[1:], current_latent_state.unsqueeze(dim=0)], dim=0)
           lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
         total_rewards += reward.numpy()
         time_step += 1
         if not args.symbolic_env:  # Collect real vs. predicted frames for video
-          video_frames.append(make_grid(torch.cat([observation, observation_model(posterior_state.to(device=args.device)).cpu()], dim=3) + 0.5, nrow=5).numpy())  # Decentre
+          video_frames.append(make_grid(torch.cat([observation, observation_model(current_latent_state).cpu()], dim=3) + 0.5, nrow=5).numpy())  # Decentre
         observation = next_observation
         if done.sum().item() == args.test_episodes:
           pbar.close()
