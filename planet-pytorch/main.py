@@ -15,9 +15,6 @@ from models import bottle, Encoder, ObservationModel, RewardModel, TransitionMod
 from planner import MPCPlanner, AIMEPlanner
 from utils import lineplot, write_video
 
-import gpytorch
-from gpytorch.mlls import DeepApproximateMLL, VariationalELBO
-
 
 # Hyperparameters
 parser = argparse.ArgumentParser(description='PlaNet')
@@ -175,65 +172,63 @@ if args.test:
   env.close()
   quit()
 
-mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, (args.chunk_size-args.horizon_size-args.lagging_size)*args.batch_size))
 
 # Training (and testing)
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
   # Model fitting
-  with gpytorch.settings.num_likelihood_samples(1):
-    losses = []
-    for s in tqdm(range(args.collect_interval)):
-      # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
-      observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
-      # Create initial belief and state for time t = 0
-      #init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(args.batch_size, args.state_size, device=args.device)
-      init_states = torch.zeros(args.chunk_size-args.horizon_size-args.lagging_size, args.batch_size, args.state_size * args.lagging_size, device=args.device)
-      # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
-      #beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])
-      predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1), bottle(encoder, (observations[:-args.horizon_size-1], )).unfold(0, args.lagging_size, 1))
-      reward_loss = -mll(predicted_rewards, rewards[args.lagging_size+args.horizon_size:]).mean()
-      # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting); sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
-      posterior_states = posterior_states.to(device=args.device)
-      posterior_actions = posterior_actions.to(device=args.device)
-      observation_loss = F.mse_loss(bottle(observation_model, (posterior_states[0],)), observations[args.lagging_size:-args.horizon_size], reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
-      #reward_loss = F.mse_loss(bottle(reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0, 1))
-      action_loss = F.mse_loss(posterior_actions, actions[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').mean(dim=(0, 1, 2))
-      #kl_loss = torch.max(kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(prior_means, prior_std_devs)).sum(dim=2), free_nats).mean(dim=(0, 1))  # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
-      #if args.global_kl_beta != 0:
-      #  kl_loss += args.global_kl_beta * kl_divergence(Normal(posterior_means, posterior_std_devs), global_prior).sum(dim=2).mean(dim=(0, 1))
-      # Calculate latent overshooting objective for t > 0
-      '''
-      if args.overshooting_kl_beta != 0:
-        overshooting_vars = []  # Collect variables for overshooting to process in batch
-        for t in range(1, args.chunk_size - 1):
-          d = min(t + args.overshooting_distance, args.chunk_size - 1)  # Overshooting distance
-          t_, d_ = t - 1, d - 1  # Use t_ and d_ to deal with different time indexing for latent states
-          seq_pad = (0, 0, 0, 0, 0, t - d + args.overshooting_distance)  # Calculate sequence padding so overshooting terms can be calculated in one batch
-          # Store (0) actions, (1) nonterminals, (2) rewards, (3) beliefs, (4) posterior states, (5) posterior means, (6) posterior standard deviations and (7) sequence masks
-          overshooting_vars.append((F.pad(actions[t:d], seq_pad), F.pad(nonterminals[t:d], seq_pad), F.pad(rewards[t:d], seq_pad[2:]), beliefs[t_], posterior_states[t_].detach(), F.pad(posterior_means[t_ + 1:d_ + 1].detach(), seq_pad), F.pad(posterior_std_devs[t_ + 1:d_ + 1].detach(), seq_pad, value=1), F.pad(torch.ones(d - t, args.batch_size, args.state_size, device=args.device), seq_pad)))  # Posterior standard deviations must be padded with > 0 to prevent infinite KL divergences
-        overshooting_vars = tuple(zip(*overshooting_vars))
-        # Update belief/state using prior from previous belief/state and previous action (over entire sequence at once)
-        beliefs, prior_states, prior_means, prior_std_devs = transition_model(torch.cat(overshooting_vars[4], dim=0), torch.cat(overshooting_vars[0], dim=1), torch.cat(overshooting_vars[3], dim=0), None, torch.cat(overshooting_vars[1], dim=1))
-        seq_mask = torch.cat(overshooting_vars[7], dim=1)
-        # Calculate overshooting KL loss with sequence mask
-        kl_loss += (1 / args.overshooting_distance) * args.overshooting_kl_beta * torch.max((kl_divergence(Normal(torch.cat(overshooting_vars[5], dim=1), torch.cat(overshooting_vars[6], dim=1)), Normal(prior_means, prior_std_devs)) * seq_mask).sum(dim=2), free_nats).mean(dim=(0, 1)) * (args.chunk_size - 1)  # Update KL loss (compensating for extra average over each overshooting/open loop sequence) 
-        # Calculate overshooting reward prediction loss with sequence mask
-        if args.overshooting_reward_scale != 0:
-          reward_loss += (1 / args.overshooting_distance) * args.overshooting_reward_scale * F.mse_loss(bottle(reward_model, (beliefs, prior_states)) * seq_mask[:, :, 0], torch.cat(overshooting_vars[2], dim=1), reduction='none').mean(dim=(0, 1)) * (args.chunk_size - 1)  # Update reward loss (compensating for extra average over each overshooting/open loop sequence) 
-      '''
-      # Apply linearly ramping learning rate schedule
-      if args.learning_rate_schedule != 0:
-        for group in optimiser.param_groups:
-          group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
-      # Update model parameters
-      optimiser.zero_grad()
-      #(observation_loss + reward_loss + kl_loss).backward()
-      (observation_loss + reward_loss + action_loss).backward()
-      nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-      optimiser.step()
-      # Store (0) observation loss (1) reward loss (2) KL loss
-      #losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item()])
-      losses.append([observation_loss.item(), reward_loss.item(), action_loss.item()])
+  losses = []
+  for s in tqdm(range(args.collect_interval)):
+    # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
+    observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
+    # Create initial belief and state for time t = 0
+    #init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(args.batch_size, args.state_size, device=args.device)
+    init_states = torch.zeros(args.chunk_size-args.horizon_size-args.lagging_size, args.batch_size, args.state_size * args.lagging_size, device=args.device)
+    # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
+    #beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])
+    predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1), bottle(encoder, (observations[:-args.horizon_size-1], )).unfold(0, args.lagging_size, 1))
+    reward_loss = F.mse_loss(predicted_rewards.squeeze(-1), rewards[args.lagging_size+args.horizon_size:], reduction='none').mean(dim=(0, 1))
+    # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting); sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
+    posterior_states = posterior_states.to(device=args.device)
+    posterior_actions = posterior_actions.to(device=args.device)
+    observation_loss = F.mse_loss(bottle(observation_model, (posterior_states[0],)), observations[args.lagging_size:-args.horizon_size], reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
+    #reward_loss = F.mse_loss(bottle(reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0, 1))
+    action_loss = F.mse_loss(posterior_actions, actions[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').mean(dim=(0, 1, 2))
+    #kl_loss = torch.max(kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(prior_means, prior_std_devs)).sum(dim=2), free_nats).mean(dim=(0, 1))  # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
+    #if args.global_kl_beta != 0:
+    #  kl_loss += args.global_kl_beta * kl_divergence(Normal(posterior_means, posterior_std_devs), global_prior).sum(dim=2).mean(dim=(0, 1))
+    # Calculate latent overshooting objective for t > 0
+    '''
+    if args.overshooting_kl_beta != 0:
+      overshooting_vars = []  # Collect variables for overshooting to process in batch
+      for t in range(1, args.chunk_size - 1):
+        d = min(t + args.overshooting_distance, args.chunk_size - 1)  # Overshooting distance
+        t_, d_ = t - 1, d - 1  # Use t_ and d_ to deal with different time indexing for latent states
+        seq_pad = (0, 0, 0, 0, 0, t - d + args.overshooting_distance)  # Calculate sequence padding so overshooting terms can be calculated in one batch
+        # Store (0) actions, (1) nonterminals, (2) rewards, (3) beliefs, (4) posterior states, (5) posterior means, (6) posterior standard deviations and (7) sequence masks
+        overshooting_vars.append((F.pad(actions[t:d], seq_pad), F.pad(nonterminals[t:d], seq_pad), F.pad(rewards[t:d], seq_pad[2:]), beliefs[t_], posterior_states[t_].detach(), F.pad(posterior_means[t_ + 1:d_ + 1].detach(), seq_pad), F.pad(posterior_std_devs[t_ + 1:d_ + 1].detach(), seq_pad, value=1), F.pad(torch.ones(d - t, args.batch_size, args.state_size, device=args.device), seq_pad)))  # Posterior standard deviations must be padded with > 0 to prevent infinite KL divergences
+      overshooting_vars = tuple(zip(*overshooting_vars))
+      # Update belief/state using prior from previous belief/state and previous action (over entire sequence at once)
+      beliefs, prior_states, prior_means, prior_std_devs = transition_model(torch.cat(overshooting_vars[4], dim=0), torch.cat(overshooting_vars[0], dim=1), torch.cat(overshooting_vars[3], dim=0), None, torch.cat(overshooting_vars[1], dim=1))
+      seq_mask = torch.cat(overshooting_vars[7], dim=1)
+      # Calculate overshooting KL loss with sequence mask
+      kl_loss += (1 / args.overshooting_distance) * args.overshooting_kl_beta * torch.max((kl_divergence(Normal(torch.cat(overshooting_vars[5], dim=1), torch.cat(overshooting_vars[6], dim=1)), Normal(prior_means, prior_std_devs)) * seq_mask).sum(dim=2), free_nats).mean(dim=(0, 1)) * (args.chunk_size - 1)  # Update KL loss (compensating for extra average over each overshooting/open loop sequence) 
+      # Calculate overshooting reward prediction loss with sequence mask
+      if args.overshooting_reward_scale != 0:
+        reward_loss += (1 / args.overshooting_distance) * args.overshooting_reward_scale * F.mse_loss(bottle(reward_model, (beliefs, prior_states)) * seq_mask[:, :, 0], torch.cat(overshooting_vars[2], dim=1), reduction='none').mean(dim=(0, 1)) * (args.chunk_size - 1)  # Update reward loss (compensating for extra average over each overshooting/open loop sequence) 
+    '''
+    # Apply linearly ramping learning rate schedule
+    if args.learning_rate_schedule != 0:
+      for group in optimiser.param_groups:
+        group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
+    # Update model parameters
+    optimiser.zero_grad()
+    #(observation_loss + reward_loss + kl_loss).backward()
+    (observation_loss + reward_loss + action_loss).backward()
+    nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
+    optimiser.step()
+    # Store (0) observation loss (1) reward loss (2) KL loss
+    #losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item()])
+    losses.append([observation_loss.item(), reward_loss.item(), action_loss.item()])
 
   # Update and plot loss metrics
   losses = tuple(zip(*losses))
