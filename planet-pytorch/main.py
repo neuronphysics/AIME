@@ -140,10 +140,12 @@ def update_belief_and_act(args, env, planner, recurrent_gp, prior_states, prior_
   )  # Action and observation need extra time dimension
   #posterior_state = posterior_states[0].squeeze(dim=0).squeeze(dim=0)  # Remove time dimension from belief/state
   #action = planner(belief, posterior_state)  # Get action from planner(q(s_t|o≤t,a<t), p)
+  if explore:
+    posterior_actions = posterior_actions + args.action_noise * torch.randn_like(posterior_actions)
   action, posterior_state = planner(rewards, posterior_actions, posterior_states)
   #action = posterior_actions[0].squeeze(dim=0)
-  if explore:
-    action = action + args.action_noise * torch.randn_like(action)  # Add exploration noise ε ~ p(ε) to the action
+  #if explore:
+  #  action = action + args.action_noise * torch.randn_like(action)  # Add exploration noise ε ~ p(ε) to the action
   action.clamp_(min=min_action, max=max_action)  # Clip action range
   next_observation, reward, done = env.step(action.cpu() if isinstance(env, EnvBatcher) else action[0].cpu())  # Perform environment step (action repeats handled internally)
   return posterior_state, action, next_observation, reward, done
