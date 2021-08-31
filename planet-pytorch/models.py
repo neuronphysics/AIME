@@ -182,6 +182,7 @@ class VisualEncoder(jit.ScriptModule):
 class SampleLayer(jit.ScriptModule):
   
   def __init__(self, embedding_size, state_size):
+    super().__init__()
     self.embedding_size = embedding_size
     self.state_size = state_size
     self.fc_mean = nn.Linear(embedding_size, state_size)
