@@ -243,7 +243,7 @@ class RewardGP(DGPHiddenLayer):
 
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
-    def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size, device, num_mixture_samples=1):
+    def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size, device, num_mixture_samples=1, noise=0.5):
         super().__init__()
         self.horizon_size = horizon_size
         self.lagging_length = lagging_size
@@ -253,6 +253,7 @@ class RecurrentGP(DeepGP):
         self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device)
         self.num_mixture_samples = num_mixture_samples
+        self.noise = noise
     
     def forward(self, init_states, actions):
         with gpytorch.settings.num_likelihood_samples(self.num_mixture_samples):
@@ -267,15 +268,18 @@ class RecurrentGP(DeepGP):
           posterior_actions = torch.empty((self.horizon_size, init_states.size(0), init_states.size(1), self.action_size))
           for i in range(self.horizon_size):
               z = self.transition_modules[i](z_hat).rsample().squeeze(0)
+              z = z + self.noise * torch.rand_like(z)
               # first dimension of z is the number of Gaussian mixtures (z.size(0))
               # to do: add noise later
               posterior_states[i] = z
               lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
               w_hat = lagging_states # may have to change this to lagging_states[:-1] later
               a = self.policy_modules[i](w_hat).rsample().squeeze(0)
+              a = a + self.noise * torch.rand_like(a)
               posterior_actions[i] = a
               lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
               z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
           # output the final reward
-          r = self.reward_gp(z_hat).rsample().squeeze(0)
-          return r, posterior_actions, posterior_states
+          rewards = self.reward_gp(z_hat).rsample().squeeze(0)
+          rewards = rewards + self.noise * torch.rand_like(rewards)
+          return rewards, posterior_actions, posterior_states
