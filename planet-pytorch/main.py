@@ -233,7 +233,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     optimiser.step()
     # Store (0) observation loss (1) reward loss (2) KL loss
     #losses.append([observation_loss.item(), reward_loss.item(), kl_loss.item()])
-    losses.append([observation_loss.item(), reward_loss.item(), action_loss.item(), transition_loss.item()])
+    losses.append([observation_loss.item(), reward_loss.item(), action_loss.item(), transition_loss.item(), posterior_entropy.item()])
 
   # Update and plot loss metrics
   losses = tuple(zip(*losses))
