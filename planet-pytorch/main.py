@@ -83,7 +83,7 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
   args.device = torch.device('cpu')
 #metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'reward_loss': [], 'kl_loss': []}
-metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'reward_loss': [], 'action_loss': [], 'transition_loss': []}
+metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': []}
 
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
@@ -197,6 +197,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     #reward_loss = F.mse_loss(bottle(reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0, 1))
     action_loss = F.mse_loss(posterior_actions, actions[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').sum(dim=(0, 3)).mean(dim=(0, 1))
     transition_loss = F.mse_loss(posterior_states, latent_states[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').sum(dim=(0, 3)).mean(dim=(0, 1))
+    posterior_entropy = -torch.log(latent_std).sum(dim=2).mean(dim=(0, 1))
     #kl_loss = torch.max(kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(prior_means, prior_std_devs)).sum(dim=2), free_nats).mean(dim=(0, 1))  # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
     #if args.global_kl_beta != 0:
     #  kl_loss += args.global_kl_beta * kl_divergence(Normal(posterior_means, posterior_std_devs), global_prior).sum(dim=2).mean(dim=(0, 1))
@@ -227,7 +228,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # Update model parameters
     optimiser.zero_grad()
     #(observation_loss + reward_loss + kl_loss).backward()
-    (observation_loss + reward_loss + action_loss + transition_loss).backward()
+    (observation_loss + reward_loss + action_loss + transition_loss + posterior_entropy).backward()
     nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
     optimiser.step()
     # Store (0) observation loss (1) reward loss (2) KL loss
@@ -240,12 +241,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   metrics['reward_loss'].append(losses[1])
   metrics['action_loss'].append(losses[2])
   metrics['transition_loss'].append(losses[3])
+  metrics['posterior_entropy'].append(losses[4])
   #metrics['kl_loss'].append(losses[2])
   lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
   #lineplot(metrics['episodes'][-len(metrics['kl_loss']):], metrics['kl_loss'], 'kl_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['action_loss']):], metrics['action_loss'], 'action_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['transition_loss']):], metrics['transition_loss'], 'transition_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['posterior_entropy']):], metrics['posterior_entropy'], 'posterior_entropy', results_dir)
 
 
   # Data collection
