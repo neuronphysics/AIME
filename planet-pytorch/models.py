@@ -179,6 +179,21 @@ class VisualEncoder(jit.ScriptModule):
     hidden = self.fc(hidden)  # Identity if embedding size is 1024 else linear projection
     return hidden
 
+class SampleLayer(nn.Module):
+  
+  def __init__(self, embedding_size, state_size):
+    super().__init__()
+    self.embedding_size = embedding_size
+    self.state_size = state_size
+    self.fc_mean = nn.Linear(embedding_size, state_size)
+    self.fc_std = nn.Linear(embedding_size, state_size)
+    self.softplus = nn.Softplus()
+  
+  def forward(self, embedding):
+    latent_mean = self.fc_mean(embedding)
+    latent_std = self.softplus(self.fc_std(embedding))
+    latent_state = latent_mean + torch.rand_like(latent_mean) * latent_std
+    return latent_mean, latent_std, latent_state
 
 def Encoder(symbolic, observation_size, embedding_size, activation_function='relu'):
   if symbolic:
@@ -215,12 +230,8 @@ class DGPHiddenLayer(DeepGPLayer):
         return MultivariateNormal(mean_x, covar_x)
 
 class TransitionGP(DGPHiddenLayer):
-    def __init__(self, latent_size, action_size, lagging_size, embedding_size, layer_number, device):
-      if layer_number == 0:
-        input_size = (latent_size+action_size+embedding_size)*lagging_size
-      else:
-        input_size = (latent_size+action_size)*lagging_size
-      super(TransitionGP, self).__init__(input_size, latent_size, device)
+    def __init__(self, latent_size, action_size, lagging_size, device):
+      super(TransitionGP, self).__init__((latent_size+action_size)*lagging_size, latent_size, device)
 
 class PolicyGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
@@ -232,23 +243,24 @@ class RewardGP(DGPHiddenLayer):
 
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
-    def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size, device, num_mixture_samples=1):
+    def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size, device, num_mixture_samples=1, noise=0.5):
         super().__init__()
         self.horizon_size = horizon_size
         self.lagging_length = lagging_size
         self.action_size = action_size
         self.latent_size = latent_size
-        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, embedding_size, i, device) for i in range(horizon_size)]
+        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
         self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device)
         self.num_mixture_samples = num_mixture_samples
+        self.noise = noise
     
-    def forward(self, init_states, actions, observations):
+    def forward(self, init_states, actions):
         with gpytorch.settings.num_likelihood_samples(self.num_mixture_samples):
           # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)
+          init_states = init_states.reshape((init_states.size(0), init_states.size(1), -1))
           actions = actions.reshape((actions.size(0), actions.size(1), -1))
-          observations = observations.reshape((observations.size(0), observations.size(1), -1))
-          z_hat = torch.cat([init_states, observations, actions], dim=-1)
+          z_hat = torch.cat([init_states, actions], dim=-1)
           w_hat = None
           lagging_actions = actions
           lagging_states = init_states
@@ -256,15 +268,18 @@ class RecurrentGP(DeepGP):
           posterior_actions = torch.empty((self.horizon_size, init_states.size(0), init_states.size(1), self.action_size))
           for i in range(self.horizon_size):
               z = self.transition_modules[i](z_hat).rsample().squeeze(0)
+              z = z + self.noise * torch.rand_like(z)
               # first dimension of z is the number of Gaussian mixtures (z.size(0))
               # to do: add noise later
               posterior_states[i] = z
               lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
               w_hat = lagging_states # may have to change this to lagging_states[:-1] later
               a = self.policy_modules[i](w_hat).rsample().squeeze(0)
+              a = a + self.noise * torch.rand_like(a)
               posterior_actions[i] = a
               lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
               z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
           # output the final reward
-          r = self.reward_gp(z_hat).rsample().squeeze(0)
-          return r, posterior_actions, posterior_states
+          rewards = self.reward_gp(z_hat).rsample().squeeze(0)
+          rewards = rewards + self.noise * torch.rand_like(rewards)
+          return rewards, posterior_actions, posterior_states
