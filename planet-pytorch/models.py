@@ -7,7 +7,7 @@ from torch.distributions import constraints
 
 import gpytorch
 from gpytorch.models.deep_gps import DeepGPLayer, DeepGP
-from gpytorch.means import ConstantMean, ZeroMean
+from gpytorch.means import ConstantMean, ZeroMean, LinearMean
 from gpytorch.kernels import RBFKernel, ScaleKernel
 from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution
 from gpytorch.distributions import MultivariateNormal
@@ -218,7 +218,7 @@ class DGPHiddenLayer(DeepGPLayer):
         )
 
         super().__init__(variational_strategy, input_dims, output_dims)
-        self.mean_module = ZeroMean()
+        self.mean_module = None
         self.covar_module = ScaleKernel(
             RBFKernel(batch_shape=batch_shape, ard_num_dims=input_dims),
             batch_shape=batch_shape, ard_num_dims=None
@@ -231,15 +231,19 @@ class DGPHiddenLayer(DeepGPLayer):
 
 class TransitionGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
-      super(TransitionGP, self).__init__((latent_size+action_size)*lagging_size, latent_size, device)
+      input_size = (latent_size+action_size)*lagging_size
+      super(TransitionGP, self).__init__(input_size, latent_size, device)
+      self.mean_module = LinearMean(input_size)
 
 class PolicyGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
       super(PolicyGP, self).__init__(latent_size*lagging_size, action_size, device)
+      self.mean_module = ConstantMean()
 
 class RewardGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
       super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, 1, device)
+      self.mean_module = ZeroMean()
 
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
