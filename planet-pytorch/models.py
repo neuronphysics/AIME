@@ -209,7 +209,7 @@ class DGPHiddenLayer(DeepGPLayer):
         variational_distribution = CholeskyVariationalDistribution(
             num_inducing_points=num_inducing,
             batch_shape=batch_shape
-        ).to(device=device)
+        )
         variational_strategy = VariationalStrategy(
             self,
             inducing_points,
@@ -222,7 +222,7 @@ class DGPHiddenLayer(DeepGPLayer):
         self.covar_module = ScaleKernel(
             RBFKernel(batch_shape=batch_shape, ard_num_dims=input_dims),
             batch_shape=batch_shape, ard_num_dims=None
-        ).to(device=device)
+        )
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -233,12 +233,12 @@ class TransitionGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
       input_size = (latent_size+action_size)*lagging_size
       super(TransitionGP, self).__init__(input_size, latent_size, device)
-      self.mean_module = LinearMean(input_size).to(device=device)
+      self.mean_module = LinearMean(input_size)
 
 class PolicyGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
       super(PolicyGP, self).__init__(latent_size*lagging_size, action_size, device)
-      self.mean_module = ConstantMean().to(device=device)
+      self.mean_module = ConstantMean()
 
 class RewardGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
@@ -253,9 +253,9 @@ class RecurrentGP(DeepGP):
         self.lagging_length = lagging_size
         self.action_size = action_size
         self.latent_size = latent_size
-        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
-        self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
-        self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device)
+        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size)]
+        self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size)]
+        self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device).to(device=device)
         self.num_mixture_samples = num_mixture_samples
         self.noise = noise
     
