@@ -233,12 +233,12 @@ class TransitionGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
       input_size = (latent_size+action_size)*lagging_size
       super(TransitionGP, self).__init__(input_size, latent_size, device)
-      self.mean_module = LinearMean(input_size)
+      self.mean_module = LinearMean(input_size).to(device=device)
 
 class PolicyGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
       super(PolicyGP, self).__init__(latent_size*lagging_size, action_size, device)
-      self.mean_module = ConstantMean()
+      self.mean_module = ConstantMean().to(device=device)
 
 class RewardGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
