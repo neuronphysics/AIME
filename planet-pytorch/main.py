@@ -64,6 +64,7 @@ parser.add_argument('--render', action='store_true', help='Render environment')
 ## extra hyperparameters for new model
 parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='Horizon size')
 parser.add_argument('--lagging-size', type=int, default=2, metavar='La', help='Lagging size')
+parser.add_argument('--cumulative-reward', action='store_true', help='Model cumulative rewards')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -110,7 +111,7 @@ elif not args.test:
 observation_model = ObservationModel(args.symbolic_env, env.observation_size, args.state_size, args.embedding_size, args.activation_function).to(device=args.device)
 #reward_model = RewardModel(args.belief_size, args.state_size, args.hidden_size, args.activation_function).to(device=args.device)
 encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.activation_function).to(device=args.device)
-recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, args.lagging_size, args.embedding_size, args.device).to(device=args.device)
+recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, args.lagging_size, args.device).to(device=args.device)
 sample_layer = SampleLayer(args.embedding_size, args.state_size).to(device=args.device)
 
 #param_list = list(transition_model.parameters()) + list(observation_model.parameters()) + list(reward_model.parameters()) + list(encoder.parameters())
@@ -189,7 +190,11 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
     #beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])
     predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
-    reward_loss = F.mse_loss(predicted_rewards.squeeze(-1), rewards[args.lagging_size+args.horizon_size:], reduction='none').mean(dim=(0, 1))
+    if args.cumulative_reward:
+      true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size, 1).sum(dim=-1)
+    else:
+      true_rewards = rewards[args.lagging_size+args.horizon_size:]
+    reward_loss = F.mse_loss(predicted_rewards.squeeze(-1), true_rewards, reduction='none').mean(dim=(0, 1))
     # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting); sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
     posterior_states = posterior_states.to(device=args.device)
     posterior_actions = posterior_actions.to(device=args.device)

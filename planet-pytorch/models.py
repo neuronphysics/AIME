@@ -247,7 +247,7 @@ class RewardGP(DGPHiddenLayer):
 
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
-    def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size, device, num_mixture_samples=1, noise=0.5):
+    def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1, noise=0.5):
         super().__init__()
         self.horizon_size = horizon_size
         self.lagging_length = lagging_size
