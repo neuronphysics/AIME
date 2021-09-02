@@ -127,21 +127,17 @@ if args.models is not '' and os.path.exists(args.models):
   sample_layer.load_state_dict(model_dicts['sample_layer'])
   optimiser.load_state_dict(model_dicts['optimiser'])
 #planner = MPCPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, args.candidates, args.top_candidates, transition_model, reward_model, env.action_range[0], env.action_range[1])
-planner = AIMEPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, recurrent_gp, env.action_range[0], env.action_range[1])
+planner = AIMEPlanner(env.action_size, args.planning_horizon, args.lagging_size, args.state_size, args.optimisation_iters, recurrent_gp, env.action_range[0], env.action_range[1])
 global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.device), torch.ones(args.batch_size, args.state_size, device=args.device))  # Global prior N(0, I)
 free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.device)  # Allowed deviation in KL divergence
 
 
-def update_belief_and_act(args, env, planner, recurrent_gp, prior_states, prior_actions, min_action=-inf, max_action=inf, explore=False):
+def update_belief_and_act(args, env, planner, prior_states, prior_actions, min_action=-inf, max_action=inf, explore=False):
   # Infer belief over current state q(s_t|o≤t,a<t) from the history
-  action_size = prior_actions.size(-1)
-  rewards, posterior_actions, posterior_states = recurrent_gp(
-    torch.flatten(prior_states).unsqueeze(dim=0).expand(50, args.lagging_size * args.state_size).unsqueeze(dim=0),
-    prior_actions.unsqueeze(dim=0).expand(50, args.lagging_size, action_size).unsqueeze(dim=0)
-  )  # Action and observation need extra time dimension
+  # Action and observation need extra time dimension
   #posterior_state = posterior_states[0].squeeze(dim=0).squeeze(dim=0)  # Remove time dimension from belief/state
   #action = planner(belief, posterior_state)  # Get action from planner(q(s_t|o≤t,a<t), p)
-  action, posterior_state = planner(rewards, posterior_actions, posterior_states)
+  action, posterior_state = planner(prior_states, prior_actions)
   #action = posterior_actions[0].squeeze(dim=0)
   if explore:
     action = action + args.action_noise * torch.randn_like(action)  # Add exploration noise ε ~ p(ε) to the action
@@ -270,7 +266,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         next_observation, reward, done = env.step(action.cpu())
         lagging_states[time_step] = current_latent_state
       else:
-        posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, recurrent_gp, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
+        posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
         lagging_states = torch.cat([lagging_states[1:], current_latent_state], dim=0)
         lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
       D.append(observation, action.cpu(), reward, done)
