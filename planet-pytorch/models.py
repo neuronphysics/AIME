@@ -233,20 +233,7 @@ class TransitionGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
       input_size = (latent_size+action_size)*lagging_size
       super(TransitionGP, self).__init__(input_size, latent_size, device)
-      self.mean_module = ConstantMean().to(device=device)
-      self.fc1_mean = nn.Linear(input_size, input_size)
-      self.fc1_covar = nn.Linear(input_size, input_size)
-      self.fc2_mean = nn.Linear(input_size, input_size)
-      self.fc2_covar = nn.Linear(input_size, input_size)
-    
-    def forward(self, x):
-      mean_x = nn.ReLU()(self.fc1_mean(x))
-      mean_x = nn.Tanh()(self.fc2_mean(mean_x))
-      mean_x = self.mean_module(mean_x)
-      covar_x = nn.ReLU()(self.fc1_covar(x))
-      covar_x = nn.Softplus()(self.fc2_covar(covar_x))
-      covar_x = self.covar_module(covar_x)
-      return MultivariateNormal(mean_x, covar_x)
+      self.mean_module = LinearMean(input_size).to(device=device)
 
 class PolicyGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
@@ -266,7 +253,7 @@ class RecurrentGP(DeepGP):
         self.lagging_length = lagging_size
         self.action_size = action_size
         self.latent_size = latent_size
-        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size)]
+        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
         self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device)
         self.num_mixture_samples = num_mixture_samples
