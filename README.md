@@ -8,3 +8,4 @@
 4. https://gpytorch.ai/
 5. https://github.com/Kaixhin/PlaNet
 6. https://github.com/ku2482/slac.pytorch
+7. https://github.com/Olloxan/Pytorch-A2C

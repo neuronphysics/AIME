@@ -245,16 +245,28 @@ class RewardGP(DGPHiddenLayer):
       super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, 1, device)
       self.mean_module = ZeroMean()
 
+class ValueNetwork(nn.Module):
+  def __init__(self, latent_size):
+    self.latent_size = latent_size
+    self.relu = nn.ReLU()
+    self.fc1 = nn.Linear(latent_size + 1, latent_size + 1)
+    self.fc2 = nn.Linear(latent_size + 1, 1)
+  
+  def forward(self, state):
+    value = self.relu(self.fc1(state))
+    value = self.fc2(value)
+    return value
+
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
     def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1, noise=0.5):
         super().__init__()
         self.horizon_size = horizon_size
-        self.lagging_length = lagging_size
+        self.lagging_size = lagging_size
         self.action_size = action_size
         self.latent_size = latent_size
         self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size)]
-        self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size)]
+        self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size+1)]
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device).to(device=device)
         self.num_mixture_samples = num_mixture_samples
         self.noise = noise
@@ -265,24 +277,33 @@ class RecurrentGP(DeepGP):
           init_states = init_states.reshape((init_states.size(0), init_states.size(1), -1))
           actions = actions.reshape((actions.size(0), actions.size(1), -1))
           z_hat = torch.cat([init_states, actions], dim=-1)
-          w_hat = None
+          #w_hat = None
           lagging_actions = actions
           lagging_states = init_states
           posterior_states = torch.empty((self.horizon_size, init_states.size(0), init_states.size(1), self.latent_size))
-          posterior_actions = torch.empty((self.horizon_size, init_states.size(0), init_states.size(1), self.action_size))
+          posterior_actions = torch.empty((self.horizon_size+1, init_states.size(0), init_states.size(1), self.action_size))
           for i in range(self.horizon_size):
+              # policy distribution
+              #w_hat = lagging_states # may have to change this to lagging_states[:-1] later
+              a = self.policy_modules[i](lagging_states).rsample().squeeze(0)
+              a = a + self.noise * torch.rand_like(a)
+              posterior_actions[i] = a
+              lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
+              z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
+              # transition distribution
               z = self.transition_modules[i](z_hat).rsample().squeeze(0)
               z = z + self.noise * torch.rand_like(z)
               # first dimension of z is the number of Gaussian mixtures (z.size(0))
               # to do: add noise later
               posterior_states[i] = z
               lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
-              w_hat = lagging_states # may have to change this to lagging_states[:-1] later
-              a = self.policy_modules[i](w_hat).rsample().squeeze(0)
-              a = a + self.noise * torch.rand_like(a)
-              posterior_actions[i] = a
-              lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
-              z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
+          
+          # last policy in the horizon
+          a = self.policy_modules[self.horizon_size](lagging_states).rsample().squeeze(0)
+          a = a + self.noise * torch.rand_like(a)
+          posterior_actions[self.horizon_size] = a
+          lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
+          z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
           # output the final reward
           rewards = self.reward_gp(z_hat).rsample().squeeze(0)
           rewards = rewards + self.noise * torch.rand_like(rewards)
