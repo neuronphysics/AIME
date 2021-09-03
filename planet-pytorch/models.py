@@ -247,6 +247,7 @@ class RewardGP(DGPHiddenLayer):
 
 class ValueNetwork(nn.Module):
   def __init__(self, latent_size):
+    super().__init__()
     self.latent_size = latent_size
     self.relu = nn.ReLU()
     self.fc1 = nn.Linear(latent_size + 1, latent_size + 1)

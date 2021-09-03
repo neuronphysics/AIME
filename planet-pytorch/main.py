@@ -199,7 +199,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     #returns = None # compare values with returns here and compute value loss
     observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
     #reward_loss = F.mse_loss(bottle(reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0, 1))
-    action_loss = F.mse_loss(posterior_actions, actions[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').sum(dim=(0, 3)).mean(dim=(0, 1))
+    action_loss = F.mse_loss(posterior_actions, actions[args.lagging_size:].unfold(0, args.horizon_size+1, 1).permute(3, 0, 1, 2), reduction='none').sum(dim=(0, 3)).mean(dim=(0, 1))
     transition_loss = F.mse_loss(posterior_states, latent_states[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').sum(dim=(0, 3)).mean(dim=(0, 1))
     posterior_entropy = -torch.log(latent_std).sum(dim=2).mean(dim=(0, 1))
     #discounted_returns = rewards
