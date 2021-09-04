@@ -264,13 +264,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     pbar = tqdm(range(args.max_episode_length // args.action_repeat))
     time_steps = 0
     for t in pbar:
-      _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
       if time_step < args.lagging_size:
         action = lagging_actions[time_step]
         next_observation, reward, done = env.step(action.cpu())
+        _, _, current_latent_state = sample_layer(encoder(next_observation.to(device=args.device)))
         lagging_states[time_step] = current_latent_state
       else:
         posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
+        _, _, current_latent_state = sample_layer(encoder(next_observation.to(device=args.device)))
         lagging_states = torch.cat([lagging_states[1:], current_latent_state], dim=0)
         lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
       D.append(observation, action.cpu(), reward, done)
@@ -307,14 +308,15 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
-        _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
         if time_step < args.lagging_size:
           action = lagging_actions[time_step]
           next_observation, reward, done = test_envs.step(action.unsqueeze(0).cpu())
+          _, _, current_latent_state = sample_layer(encoder(next_observation.to(device=args.device)))
           lagging_states[time_step] = current_latent_state
           done = torch.Tensor([done])
         else:
           posterior_state, action, next_observation, reward, done = update_belief_and_act(args, test_envs, planner, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
+          _, _, current_latent_state = sample_layer(encoder(next_observation.to(device=args.device)))
           lagging_states = torch.cat([lagging_states[1:], current_latent_state], dim=0)
           lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
         total_rewards += reward.numpy()
