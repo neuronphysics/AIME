@@ -188,7 +188,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     #beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])
     predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
     if args.cumulative_reward:
-      true_rewards = rewards[args.lagging_size+1:].unfold(0, args.horizon_size, 1).sum(dim=-1)
+      true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
     else:
       true_rewards = rewards[args.lagging_size+args.horizon_size:]
     reward_loss = F.mse_loss(predicted_rewards.squeeze(-1), true_rewards, reduction='none').mean(dim=(0, 1))
