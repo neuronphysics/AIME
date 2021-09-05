@@ -244,39 +244,6 @@ class RewardGP(DGPHiddenLayer):
       super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, 1, device)
       self.mean_module = ZeroMean()
 
-class ValueNetwork(nn.Module):
-  def __init__(self, latent_size, activation_function='relu'):
-    super().__init__()
-    self.act_fn = getattr(F, activation_function)
-    self.latent_size = latent_size
-    self.fc1 = nn.Linear(latent_size + 1, latent_size + 1)
-    self.fc2 = nn.Linear(latent_size + 1, 1)
-  
-  def forward(self, state):
-    value = self.act_fn(self.fc1(state))
-    value = self.fc2(value)
-    return value
-
-class PolicyNetwork(nn.Module):
-  def __init__(self, latent_size, action_size, activation_function='relu'):
-    super().__init__()
-    self.act_fn = getattr(F, activation_function)
-    self.latent_size = latent_size
-    self.fc1 = nn.Linear(latent_size + 1, latent_size + 1)
-    self.fc_mean = nn.Linear(latent_size + 1, action_size)
-    self.fc_std = nn.Linear(latent_size + 1, action_size)
-  
-  def forward(self, state):
-    policy = self.act_fn(self.fc1(state))
-    policy_mean = self.fc_mean(policy)
-    policy_std = F.softplus(self.fc_std(policy))
-    return policy_mean, policy_std
-
-class ActorCritic(nn.Module):
-  def __init__(self, latent_size, action_size):
-    self.actor = PolicyNetwork(latent_size, action_size)
-    self.critic = ValueNetwork(latent_size)
-
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
     def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1, noise=0.5):

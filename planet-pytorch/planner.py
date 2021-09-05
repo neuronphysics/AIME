@@ -2,6 +2,7 @@ from math import inf
 import torch
 from torch import jit
 import torch.nn as nn
+from torch.nn import functional as F
 
 
 # Model-predictive control planner with cross-entropy method and learned transition model
@@ -39,6 +40,7 @@ class MPCPlanner(jit.ScriptModule):
     # Return first action mean µ_t
     return action_mean[0].squeeze(dim=1)
 
+'''
 class AIMEPlanner(nn.Module):
   
   def __init__(self, action_size, planning_horizon, lagging_size, state_size, optimisation_iters, recurrent_gp, min_action=-inf, max_action=inf):
@@ -59,3 +61,76 @@ class AIMEPlanner(nn.Module):
     posterior_states = posterior_states.squeeze(dim=1)
     max_index = torch.argmax(rewards)
     return posterior_actions[0][max_index:max_index+1], posterior_states[0][max_index]
+'''
+
+class ValueNetwork(nn.Module):
+  def __init__(self, latent_size, activation_function='relu'):
+    super().__init__()
+    self.act_fn = getattr(F, activation_function)
+    self.latent_size = latent_size
+    self.fc2 = nn.Linear(latent_size + 1, 1)
+  
+  def forward(self, x):
+    value = self.fc2(x)
+    return value
+
+class PolicyNetwork(nn.Module):
+  def __init__(self, latent_size, action_size, activation_function='relu'):
+    super().__init__()
+    self.act_fn = getattr(F, activation_function)
+    self.latent_size = latent_size
+    self.action_size = action_size
+    self.fc_mean = nn.Linear(latent_size + 1, action_size)
+    self.fc_std = nn.Linear(latent_size + 1, action_size)
+  
+  def forward(self, x):
+    policy_mean = self.fc_mean(x)
+    policy_std = F.softplus(self.fc_std(x))
+    return policy_mean, policy_std
+
+class RolloutEncoder(nn.Module):
+  def __init__(self, latent_size, action_size, hidden_size=8):
+    super().__init__()
+    self.encoder = nn.LSTM(input_size=action_size+latent_size, hidden_size=hidden_size)
+  
+  def forward(self, imagined_actions, imagined_states):
+    x = torch.cat([imagined_actions, imagined_states], dim=-1)
+    x = self.encoder(x)
+    return x
+
+class ActorCriticPlanner(nn.Module):
+  def __init__(self, latent_size, action_size, recurrent_gp, min_action=-inf, max_action=inf, action_noise=0):
+    self.action_size, self.action_noise, self.min_action, self.max_action = action_size, min_action, max_action, action_noise
+    self.latent_size = latent_size
+    self.fc1 = nn.Linear(latent_size + 1, latent_size + 1)
+    self.actor = PolicyNetwork(latent_size, action_size)
+    self.critic = ValueNetwork(latent_size)
+    self.recurrent_gp = recurrent_gp
+    self.rollout_encoder = nn.LSTM(input_size=action_size+latent_size, hidden_size=8)
+  
+  def forward(self, prior_states, prior_actions):
+    current_state = prior_states[-1]
+    imagined_reward, imagined_actions, imagined_states = self.imaginary_rollout(prior_states, prior_actions)
+    rollout_embedding = self.rollout_encoder(imagined_actions, imagined_states)
+    hidden = torch.cat([current_state, imagined_reward, rollout_embedding], dim=-1)
+    hidden = self.fc1(hidden)
+    policy_mean, policy_std = self.actor(hidden)
+    policy_action = policy_mean + torch.rand_like(policy_mean) * policy_std
+    value = self.critic(hidden)
+    return policy_action, value
+  
+  def imaginary_rollout(self, prior_states, prior_actions, num_sample_trajectories=50):
+    with torch.no_grad():
+      rewards, posterior_actions, posterior_states = self.recurrent_gp(
+        torch.flatten(prior_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.state_size).unsqueeze(dim=0),
+        prior_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
+      )
+    return rewards, posterior_actions, posterior_states
+  
+  def act(self, prior_states, prior_actions, explore=False):
+    # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
+    action = [0.5, 0.5, 0]
+    if explore:
+      action = action + self.action_noise * torch.randn_like(action)
+    action.clamp_(min=self.min_action, max=self.max_action)
+    return action

@@ -11,8 +11,8 @@ from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
-from models import bottle, Encoder, ObservationModel, RewardModel, TransitionModel, RecurrentGP, SampleLayer, ValueNetwork
-from planner import MPCPlanner, AIMEPlanner
+from models import bottle, Encoder, ObservationModel, RecurrentGP, SampleLayer
+from planner import ActorCriticPlanner
 from utils import lineplot, write_video
 
 
@@ -113,7 +113,6 @@ observation_model = ObservationModel(args.symbolic_env, env.observation_size, ar
 encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.activation_function).to(device=args.device)
 recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, args.lagging_size, args.device).to(device=args.device)
 sample_layer = SampleLayer(args.embedding_size, args.state_size).to(device=args.device)
-#value_network = ValueNetwork(args.state_size)
 
 #param_list = list(transition_model.parameters()) + list(observation_model.parameters()) + list(reward_model.parameters()) + list(encoder.parameters())
 param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters()) + list(sample_layer.parameters())
@@ -128,7 +127,7 @@ if args.models is not '' and os.path.exists(args.models):
   sample_layer.load_state_dict(model_dicts['sample_layer'])
   optimiser.load_state_dict(model_dicts['optimiser'])
 #planner = MPCPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, args.candidates, args.top_candidates, transition_model, reward_model, env.action_range[0], env.action_range[1])
-planner = AIMEPlanner(env.action_size, args.planning_horizon, args.lagging_size, args.state_size, args.optimisation_iters, recurrent_gp, env.action_range[0], env.action_range[1])
+planner = ActorCriticPlanner(args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1])
 global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.device), torch.ones(args.batch_size, args.state_size, device=args.device))  # Global prior N(0, I)
 free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.device)  # Allowed deviation in KL divergence
 
@@ -257,32 +256,34 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
 
   # Data collection
-  with torch.no_grad():
-    observation, total_reward, time_step = env.reset(), 0, 0
-    lagging_states, lagging_actions = torch.empty(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
-    lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
-    pbar = tqdm(range(args.max_episode_length // args.action_repeat))
-    time_steps = 0
-    for t in pbar:
-      if time_step < args.lagging_size:
-        action = lagging_actions[time_step]
-        next_observation, reward, done = env.step(action.cpu())
+  ##with torch.no_grad():
+  observation, total_reward, time_step = env.reset(), 0, 0
+  lagging_states, lagging_actions = torch.empty(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
+  lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
+  pbar = tqdm(range(args.max_episode_length // args.action_repeat))
+  time_steps = 0
+  for t in pbar:
+    if time_step < args.lagging_size:
+      action = lagging_actions[time_step]
+      next_observation, reward, done = env.step(action.cpu())
+      with torch.no_grad():
         _, _, current_latent_state = sample_layer(encoder(next_observation.to(device=args.device)))
-        lagging_states[time_step] = current_latent_state
-      else:
-        posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
+      lagging_states[time_step] = current_latent_state
+    else:
+      posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
+      with torch.no_grad():
         _, _, current_latent_state = sample_layer(encoder(next_observation.to(device=args.device)))
-        lagging_states = torch.cat([lagging_states[1:], current_latent_state], dim=0)
-        lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
-      D.append(observation, action.cpu(), reward, done)
-      total_reward += reward
-      observation = next_observation
-      time_step += 1
-      if args.render:
-        env.render()
-      if done:
-        pbar.close()
-        break
+      lagging_states = torch.cat([lagging_states[1:], current_latent_state], dim=0)
+      lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
+    D.append(observation, action.cpu(), reward, done)
+    total_reward += reward
+    observation = next_observation
+    time_step += 1
+    if args.render:
+      env.render()
+    if done:
+      pbar.close()
+      break
     
     # Update and plot train reward metrics
     metrics['steps'].append(t + metrics['steps'][-1])
