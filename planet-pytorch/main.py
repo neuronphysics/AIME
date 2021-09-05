@@ -65,6 +65,7 @@ parser.add_argument('--render', action='store_true', help='Render environment')
 parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='Horizon size')
 parser.add_argument('--lagging-size', type=int, default=2, metavar='La', help='Lagging size')
 parser.add_argument('--cumulative-reward', action='store_true', help='Model cumulative rewards')
+parser.add_argument('--num-planning-steps', type=int, default=5, metavar='I2A', help='number of steps in the I2A part')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -127,11 +128,13 @@ if args.models is not '' and os.path.exists(args.models):
   sample_layer.load_state_dict(model_dicts['sample_layer'])
   optimiser.load_state_dict(model_dicts['optimiser'])
 #planner = MPCPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, args.candidates, args.top_candidates, transition_model, reward_model, env.action_range[0], env.action_range[1])
-planner = ActorCriticPlanner(args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1])
+actor_critic_planner = ActorCriticPlanner(args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1])
+planning_optimiser = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
+
 global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.device), torch.ones(args.batch_size, args.state_size, device=args.device))  # Global prior N(0, I)
 free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.device)  # Allowed deviation in KL divergence
 
-
+'''
 def update_belief_and_act(args, env, planner, prior_states, prior_actions, min_action=-inf, max_action=inf, explore=False):
   # Infer belief over current state q(s_t|o≤t,a<t) from the history
   # Action and observation need extra time dimension
@@ -144,8 +147,9 @@ def update_belief_and_act(args, env, planner, prior_states, prior_actions, min_a
   action.clamp_(min=min_action, max=max_action)  # Clip action range
   next_observation, reward, done = env.step(action.cpu() if isinstance(env, EnvBatcher) else action[0].cpu())  # Perform environment step (action repeats handled internally)
   return posterior_state, action, next_observation, reward, done
+'''
 
-
+'''
 # Testing only
 if args.test:
   # Set models to eval mode
@@ -169,7 +173,7 @@ if args.test:
   print('Average Reward:', total_reward / args.test_episodes)
   env.close()
   quit()
-
+'''
 
 # Training (and testing)
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
@@ -258,23 +262,26 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   # Data collection
   ##with torch.no_grad():
   observation, total_reward, time_step = env.reset(), 0, 0
-  lagging_states, lagging_actions = torch.empty(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
-  lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
+  episode_states, episode_actions = torch.empty(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
+  episode_actions += torch.randn_like(episode_actions) * (env.action_range[1] - env.action_range[0]) / 2
+  episode_values = torch.zeros(args.lagging_size, 1, device=args.device)
+  episode_rewards = torch.zeros(args.lagging_size, 1, device=args.device)
   pbar = tqdm(range(args.max_episode_length // args.action_repeat))
   time_steps = 0
   for t in pbar:
+    with torch.no_grad():
+        _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
     if time_step < args.lagging_size:
-      action = lagging_actions[time_step]
+      action = episode_actions[time_step]
       next_observation, reward, done = env.step(action.cpu())
-      with torch.no_grad():
-        _, _, current_latent_state = sample_layer(encoder(next_observation.to(device=args.device)))
-      lagging_states[time_step] = current_latent_state
+      episode_states[time_step] = current_latent_state
     else:
-      posterior_state, action, next_observation, reward, done = update_belief_and_act(args, env, planner, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
-      with torch.no_grad():
-        _, _, current_latent_state = sample_layer(encoder(next_observation.to(device=args.device)))
-      lagging_states = torch.cat([lagging_states[1:], current_latent_state], dim=0)
-      lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
+      action, value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=True)
+      next_observation, reward, done = env.step(action.cpu())
+      episode_states = torch.cat([episode_states, current_latent_state], dim=0)
+      episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
+      episode_values = torch.cat([episode_values, value], dim=0)
+      episode_rewards = torch.cat([episode_values, reward.to(device=args.device)], dim=0)
     D.append(observation, action.cpu(), reward, done)
     total_reward += reward
     observation = next_observation
@@ -290,7 +297,15 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     metrics['episodes'].append(episode)
     metrics['train_rewards'].append(total_reward)
     lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
-
+  
+  # compute returns in reverse order in the episode reward list
+  final_value = episode_values[-1]
+  returns = actor_critic_planner.compute_returns(final_value, episode_rewards)
+  episode_returns = returns.to(device=args.device)
+  value_loss = F.mse_loss(episode_returns, episode_states, reduction='none').mean()
+  planning_optimiser.zero_grad()
+  value_loss.backward()
+  planning_optimiser.step()
 
   # Test model
   if episode % args.test_interval == 0:
@@ -306,21 +321,22 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     
     with torch.no_grad():
       observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
-      lagging_states, lagging_actions = torch.empty(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
-      lagging_actions += torch.randn_like(lagging_actions) * (env.action_range[1] - env.action_range[0]) / 2
+      episode_states, episode_actions = torch.empty(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[0] + env.action_range[1]) / 2
+      episode_actions += torch.randn_like(episode_actions) * (env.action_range[1] - env.action_range[0]) / 2
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
+        with torch.no_grad():
+          _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
         if time_step < args.lagging_size:
-          action = lagging_actions[time_step]
+          action = episode_actions[time_step]
           next_observation, reward, done = test_envs.step(action.unsqueeze(0).cpu())
-          _, _, current_latent_state = sample_layer(encoder(next_observation.to(device=args.device)))
-          lagging_states[time_step] = current_latent_state
+          episode_states[time_step] = current_latent_state
           done = torch.Tensor([done])
         else:
-          posterior_state, action, next_observation, reward, done = update_belief_and_act(args, test_envs, planner, lagging_states, lagging_actions, env.action_range[0], env.action_range[1], explore=True)
-          _, _, current_latent_state = sample_layer(encoder(next_observation.to(device=args.device)))
-          lagging_states = torch.cat([lagging_states[1:], current_latent_state], dim=0)
-          lagging_actions = torch.cat([lagging_actions[1:], action.to(device=args.device)], dim=0)
+          action, value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=False)
+          next_observation, reward, done = test_envs.step(action.unsqueeze(0).cpu())
+          episode_states = torch.cat([episode_states, current_latent_state], dim=0)
+          episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
         total_rewards += reward.numpy()
         time_step += 1
         if not args.symbolic_env:  # Collect real vs. predicted frames for video

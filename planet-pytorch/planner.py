@@ -64,24 +64,22 @@ class AIMEPlanner(nn.Module):
 '''
 
 class ValueNetwork(nn.Module):
-  def __init__(self, latent_size, activation_function='relu'):
+  def __init__(self, latent_size, hidden_size):
     super().__init__()
-    self.act_fn = getattr(F, activation_function)
     self.latent_size = latent_size
-    self.fc2 = nn.Linear(latent_size + 1, 1)
+    self.fc2 = nn.Linear(latent_size + hidden_size, 1)
   
   def forward(self, x):
     value = self.fc2(x)
     return value
 
 class PolicyNetwork(nn.Module):
-  def __init__(self, latent_size, action_size, activation_function='relu'):
+  def __init__(self, latent_size, action_size, hidden_size):
     super().__init__()
-    self.act_fn = getattr(F, activation_function)
     self.latent_size = latent_size
     self.action_size = action_size
-    self.fc_mean = nn.Linear(latent_size + 1, action_size)
-    self.fc_std = nn.Linear(latent_size + 1, action_size)
+    self.fc_mean = nn.Linear(latent_size + hidden_size, action_size)
+    self.fc_std = nn.Linear(latent_size + hidden_size, action_size)
   
   def forward(self, x):
     policy_mean = self.fc_mean(x)
@@ -89,37 +87,47 @@ class PolicyNetwork(nn.Module):
     return policy_mean, policy_std
 
 class RolloutEncoder(nn.Module):
-  def __init__(self, latent_size, action_size, hidden_size=8):
+  def __init__(self, latent_size, action_size, hidden_size, num_sample_trajectories, activation_function='relu'):
     super().__init__()
+    self.act_fn = getattr(F, activation_function)
+    self.latent_size = latent_size
+    self.action_size = action_size
+    self.hidden_size = hidden_size
     self.encoder = nn.LSTM(input_size=action_size+latent_size, hidden_size=hidden_size)
+    self.fc = nn.Linear(num_sample_trajectories*(hidden_size+action_size+1), hidden_size)
   
-  def forward(self, imagined_actions, imagined_states):
-    x = torch.cat([imagined_actions, imagined_states], dim=-1)
-    x = self.encoder(x)
-    return x
+  def forward(self, imagined_reward, imagined_actions, imagined_states):
+    last_action = imagined_actions[-1]
+    rewards = imagined_reward.view(-1, 1)
+    state_action_sequence = torch.cat([imagined_actions[:-1], imagined_states], dim=-1)
+    state_action_embedding = self.encoder(state_action_sequence)
+    embedding = torch.cat([state_action_embedding, last_action, rewards], dim=-1)
+    embedding = embedding.view(1, -1)
+    embedding = self.act_fn(self.fc(embedding))
+    return embedding
 
 class ActorCriticPlanner(nn.Module):
-  def __init__(self, latent_size, action_size, recurrent_gp, min_action=-inf, max_action=inf, action_noise=0):
+  def __init__(self, latent_size, action_size, recurrent_gp, min_action=-inf, max_action=inf, action_noise=0, num_sample_trajectories=10, hidden_size=8):
     self.action_size, self.action_noise, self.min_action, self.max_action = action_size, min_action, max_action, action_noise
     self.latent_size = latent_size
-    self.fc1 = nn.Linear(latent_size + 1, latent_size + 1)
-    self.actor = PolicyNetwork(latent_size, action_size)
-    self.critic = ValueNetwork(latent_size)
+    self.fc1 = nn.Linear(latent_size + (1+action_size+hidden_size)*num_sample_trajectories, latent_size + 1)
+    self.actor = PolicyNetwork(latent_size, action_size, hidden_size)
+    self.critic = ValueNetwork(latent_size, hidden_size)
     self.recurrent_gp = recurrent_gp
-    self.rollout_encoder = nn.LSTM(input_size=action_size+latent_size, hidden_size=8)
+    self.rollout_encoder = RolloutEncoder(latent_size, action_size, hidden_size, num_sample_trajectories)
+    self.num_sample_trajectories = num_sample_trajectories
+    self.hidden_size = hidden_size
   
   def forward(self, prior_states, prior_actions):
-    current_state = prior_states[-1]
-    imagined_reward, imagined_actions, imagined_states = self.imaginary_rollout(prior_states, prior_actions)
-    rollout_embedding = self.rollout_encoder(imagined_actions, imagined_states)
-    hidden = torch.cat([current_state, imagined_reward, rollout_embedding], dim=-1)
-    hidden = self.fc1(hidden)
-    policy_mean, policy_std = self.actor(hidden)
-    policy_action = policy_mean + torch.rand_like(policy_mean) * policy_std
-    value = self.critic(hidden)
-    return policy_action, value
+    current_state = prior_states[-1].view(1, self.latent_size)
+    imagined_reward, imagined_actions, imagined_states = self.imaginary_rollout(prior_states, prior_actions, self.num_sample_trajectories)
+    rollout_embedding = self.rollout_encoder(imagined_reward, imagined_actions, imagined_states)
+    embedding = torch.cat([current_state,rollout_embedding], dim=-1)
+    policy_mean, policy_std = self.actor(embedding)
+    value = self.critic(embedding)
+    return policy_mean, policy_std, value
   
-  def imaginary_rollout(self, prior_states, prior_actions, num_sample_trajectories=50):
+  def imaginary_rollout(self, prior_states, prior_actions, num_sample_trajectories):
     with torch.no_grad():
       rewards, posterior_actions, posterior_states = self.recurrent_gp(
         torch.flatten(prior_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.state_size).unsqueeze(dim=0),
@@ -129,8 +137,17 @@ class ActorCriticPlanner(nn.Module):
   
   def act(self, prior_states, prior_actions, explore=False):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
-    action = [0.5, 0.5, 0]
+    policy_mean, policy_std, value = self.forward(prior_states, prior_actions)
+    policy_action = policy_mean + torch.rand_like(policy_mean) * policy_std
     if explore:
-      action = action + self.action_noise * torch.randn_like(action)
-    action.clamp_(min=self.min_action, max=self.max_action)
-    return action
+      policy_action = policy_action + self.action_noise * torch.randn_like(policy_action)
+    policy_action.clamp_(min=self.min_action, max=self.max_action)
+    return policy_action, value
+  
+  def compute_returns(self, final_value, rewards, gamma=0.99):
+    num_steps = rewards.size(0)
+    returns   = torch.zeros(num_steps + 1, 1)
+    returns[-1] = final_value
+    for step in reversed(range(self.num_steps)):
+        returns[step] = returns[step + 1] * gamma + rewards[step]
+    return returns[:-1]
