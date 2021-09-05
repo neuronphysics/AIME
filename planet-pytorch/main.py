@@ -299,6 +299,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     #reward_model.eval()
     encoder.eval()
     recurrent_gp.eval()
+    sample_layer.eval()
     # Initialise parallelised test environments
     test_envs = EnvBatcher(Env, (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth), {}, args.test_episodes)
     
@@ -345,6 +346,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     #reward_model.train()
     encoder.train()
     recurrent_gp.train()
+    sample_layer.train()
     # Close test environments
     test_envs.close()
 

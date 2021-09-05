@@ -187,11 +187,10 @@ class SampleLayer(nn.Module):
     self.state_size = state_size
     self.fc_mean = nn.Linear(embedding_size, state_size)
     self.fc_std = nn.Linear(embedding_size, state_size)
-    self.softplus = nn.Softplus()
   
   def forward(self, embedding):
     latent_mean = self.fc_mean(embedding)
-    latent_std = self.softplus(self.fc_std(embedding))
+    latent_std = F.softplus(self.fc_std(embedding))
     latent_state = latent_mean + torch.rand_like(latent_mean) * latent_std
     return latent_mean, latent_std, latent_state
 
@@ -246,17 +245,37 @@ class RewardGP(DGPHiddenLayer):
       self.mean_module = ZeroMean()
 
 class ValueNetwork(nn.Module):
-  def __init__(self, latent_size):
+  def __init__(self, latent_size, activation_function='relu'):
     super().__init__()
+    self.act_fn = getattr(F, activation_function)
     self.latent_size = latent_size
-    self.relu = nn.ReLU()
     self.fc1 = nn.Linear(latent_size + 1, latent_size + 1)
     self.fc2 = nn.Linear(latent_size + 1, 1)
   
   def forward(self, state):
-    value = self.relu(self.fc1(state))
+    value = self.act_fn(self.fc1(state))
     value = self.fc2(value)
     return value
+
+class PolicyNetwork(nn.Module):
+  def __init__(self, latent_size, action_size, activation_function='relu'):
+    super().__init__()
+    self.act_fn = getattr(F, activation_function)
+    self.latent_size = latent_size
+    self.fc1 = nn.Linear(latent_size + 1, latent_size + 1)
+    self.fc_mean = nn.Linear(latent_size + 1, action_size)
+    self.fc_std = nn.Linear(latent_size + 1, action_size)
+  
+  def forward(self, state):
+    policy = self.act_fn(self.fc1(state))
+    policy_mean = self.fc_mean(policy)
+    policy_std = F.softplus(self.fc_std(policy))
+    return policy_mean, policy_std
+
+class ActorCritic(nn.Module):
+  def __init__(self, latent_size, action_size):
+    self.actor = PolicyNetwork(latent_size, action_size)
+    self.critic = ValueNetwork(latent_size)
 
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
