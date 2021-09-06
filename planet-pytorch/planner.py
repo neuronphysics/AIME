@@ -100,15 +100,16 @@ class RolloutEncoder(nn.Module):
     last_action = imagined_actions[-1]
     rewards = imagined_reward.view(-1, 1)
     state_action_sequence = torch.cat([imagined_actions[:-1], imagined_states], dim=-1)
-    state_action_embedding = self.encoder(state_action_sequence)
-    embedding = torch.cat([state_action_embedding, last_action, rewards], dim=-1)
+    _, (state_action_embedding, _) = self.encoder(state_action_sequence)
+    embedding = torch.cat([state_action_embedding.squeeze(0), last_action, rewards], dim=-1)
     embedding = embedding.view(1, -1)
     embedding = self.act_fn(self.fc(embedding))
     return embedding
 
 class ActorCriticPlanner(nn.Module):
-  def __init__(self, latent_size, action_size, recurrent_gp, min_action=-inf, max_action=inf, action_noise=0, num_sample_trajectories=10, hidden_size=8):
-    self.action_size, self.action_noise, self.min_action, self.max_action = action_size, min_action, max_action, action_noise
+  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, action_noise=0, num_sample_trajectories=10, hidden_size=8):
+    super().__init__()
+    self.action_size, self.action_noise, self.min_action, self.max_action = action_size, action_noise, min_action, max_action
     self.latent_size = latent_size
     self.fc1 = nn.Linear(latent_size + (1+action_size+hidden_size)*num_sample_trajectories, latent_size + 1)
     self.actor = PolicyNetwork(latent_size, action_size, hidden_size)
@@ -117,11 +118,12 @@ class ActorCriticPlanner(nn.Module):
     self.rollout_encoder = RolloutEncoder(latent_size, action_size, hidden_size, num_sample_trajectories)
     self.num_sample_trajectories = num_sample_trajectories
     self.hidden_size = hidden_size
-  
+    self.lagging_size = lagging_size
+
   def forward(self, prior_states, prior_actions):
     current_state = prior_states[-1].view(1, self.latent_size)
     imagined_reward, imagined_actions, imagined_states = self.imaginary_rollout(prior_states, prior_actions, self.num_sample_trajectories)
-    rollout_embedding = self.rollout_encoder(imagined_reward, imagined_actions, imagined_states)
+    rollout_embedding = self.rollout_encoder(imagined_reward.squeeze(0), imagined_actions.squeeze(1), imagined_states.squeeze(1))
     embedding = torch.cat([current_state,rollout_embedding], dim=-1)
     policy_mean, policy_std = self.actor(embedding)
     value = self.critic(embedding)
@@ -130,10 +132,11 @@ class ActorCriticPlanner(nn.Module):
   def imaginary_rollout(self, prior_states, prior_actions, num_sample_trajectories):
     with torch.no_grad():
       rewards, posterior_actions, posterior_states = self.recurrent_gp(
-        torch.flatten(prior_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.state_size).unsqueeze(dim=0),
+        torch.flatten(prior_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
         prior_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
       )
-    return rewards, posterior_actions, posterior_states
+    
+    return rewards.cuda(), posterior_actions.cuda(), posterior_states.cuda()
   
   def act(self, prior_states, prior_actions, explore=False):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
@@ -146,8 +149,8 @@ class ActorCriticPlanner(nn.Module):
   
   def compute_returns(self, final_value, rewards, gamma=0.99):
     num_steps = rewards.size(0)
-    returns   = torch.zeros(num_steps + 1, 1)
+    returns   = torch.zeros(num_steps + 1, 1).cuda()
     returns[-1] = final_value
-    for step in reversed(range(self.num_steps)):
+    for step in reversed(range(num_steps)):
         returns[step] = returns[step + 1] * gamma + rewards[step]
     return returns[:-1]
