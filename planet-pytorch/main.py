@@ -301,11 +301,11 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       pbar.close()
       break
     
-    # Update and plot train reward metrics
-    metrics['steps'].append(t + metrics['steps'][-1])
-    metrics['episodes'].append(episode)
-    metrics['train_rewards'].append(total_reward)
-    lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
+  # Update and plot train reward metrics
+  metrics['steps'].append(t + metrics['steps'][-1])
+  metrics['episodes'].append(episode)
+  metrics['train_rewards'].append(total_reward)
+  lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
   
   # compute returns in reverse order in the episode reward list
   final_value = episode_values[-1]
