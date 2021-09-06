@@ -86,7 +86,7 @@ else:
   args.device = torch.device('cpu')
 #metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'reward_loss': [], 'kl_loss': []}
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [],
-           'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': []}
+           'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': [], 'value_loss': [], 'action_entropy': [], 'advantages': []}
 
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
@@ -318,13 +318,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   (value_loss-action_entropy - advantages).backward()
   planning_optimiser.step()
   
-  #metrics['value_loss'].append(value_loss.item())
-  #metrics['action_entropy'].append(action_entropy.item())
-  #metrics['advantages'].append(advantages.item())
+  metrics['value_loss'].append(value_loss.item())
+  metrics['action_entropy'].append(action_entropy.item())
+  metrics['advantages'].append(advantages.item())
   
-  #lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
-  #lineplot(metrics['episodes'][-len(metrics['action_entropy']):], metrics['action_entropy'], 'action_entropy', results_dir)
-  #lineplot(metrics['episodes'][-len(metrics['advantages']):], metrics['advantages'], 'advantages', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['action_entropy']):], metrics['action_entropy'], 'action_entropy', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['advantages']):], metrics['advantages'], 'advantages', results_dir)
 
   # Test model
   if episode % args.test_interval == 0:
