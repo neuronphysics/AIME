@@ -130,12 +130,13 @@ class ActorCriticPlanner(nn.Module):
     return policy_mean, policy_std, value
   
   def imaginary_rollout(self, prior_states, prior_actions, num_sample_trajectories):
+    self.recurrent_gp.eval()
     with torch.no_grad():
       rewards, posterior_actions, posterior_states = self.recurrent_gp(
         torch.flatten(prior_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
         prior_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
       )
-    
+    self.recurrent_gp.train()
     return rewards.cuda(), posterior_actions.cuda(), posterior_states.cuda()
   
   def act(self, prior_states, prior_actions, explore=False):
@@ -145,7 +146,7 @@ class ActorCriticPlanner(nn.Module):
     if explore:
       policy_action = policy_action + self.action_noise * torch.randn_like(policy_action)
     policy_action.clamp_(min=self.min_action, max=self.max_action)
-    return policy_action, value
+    return policy_action, value, policy_mean, policy_std
   
   def compute_returns(self, final_value, rewards, gamma=0.99):
     num_steps = rewards.size(0)
