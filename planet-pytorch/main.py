@@ -86,7 +86,7 @@ else:
   args.device = torch.device('cpu')
 #metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'reward_loss': [], 'kl_loss': []}
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [],
-           'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': [], 'value_loss': [], 'action_entropy': [], 'advantages': []}
+           'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': []}
 
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
