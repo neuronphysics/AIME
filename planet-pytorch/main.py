@@ -305,7 +305,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       action_entropy = torch.log(episode_action_std[-args.num_planning_steps:]).sum(dim=1).mean(dim=0)
       advantages = torch.Tensor([0])
       planning_optimiser.zero_grad()
-      (value_loss-action_entropy - advantages).backward()
+      (value_loss-action_entropy).backward()
       planning_optimiser.step()
       
       metrics['value_loss'].append(value_loss.item())
