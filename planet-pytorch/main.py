@@ -309,7 +309,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       policy_loss = -soft_v_values.mean()
       planning_optimiser.zero_grad()
       # may add an action entropy
-      (value_loss + q_loss + policy_loss).backward()
+      (value_loss + q_loss + policy_loss).backward(retain_graph=True)
       planning_optimiser.step()
       
       metrics['value_loss'].append(value_loss.item())
