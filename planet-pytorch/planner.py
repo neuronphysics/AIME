@@ -74,7 +74,7 @@ class ValueNetwork(nn.Module):
     return value
 
 class QNetwork(nn.Module):
-  def __init__(self, latent_size, action_size, hidden_size):
+  def __init__(self, latent_size, action_size):
     super().__init__()
     self.latent_size = latent_size
     self.action_size = action_size
@@ -125,6 +125,7 @@ class ActorCriticPlanner(nn.Module):
     self.fc1 = nn.Linear(latent_size + (1+action_size+hidden_size)*num_sample_trajectories, latent_size + 1)
     self.actor = PolicyNetwork(latent_size, action_size, hidden_size)
     self.critic = ValueNetwork(latent_size, hidden_size)
+    self.q_network = QNetwork(latent_size, action_size)
     self.recurrent_gp = recurrent_gp
     self.rollout_encoder = RolloutEncoder(latent_size, action_size, hidden_size, num_sample_trajectories)
     self.num_sample_trajectories = num_sample_trajectories
@@ -138,7 +139,7 @@ class ActorCriticPlanner(nn.Module):
     embedding = torch.cat([current_state,rollout_embedding], dim=-1)
     policy_mean, policy_std = self.actor(embedding)
     value = self.critic(embedding)
-    return policy_mean, policy_std, value
+    return policy_mean, policy_std, value, current_state
   
   def imaginary_rollout(self, prior_states, prior_actions, num_sample_trajectories):
     self.recurrent_gp.eval()
@@ -152,12 +153,13 @@ class ActorCriticPlanner(nn.Module):
   
   def act(self, prior_states, prior_actions, explore=False):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
-    policy_mean, policy_std, value = self.forward(prior_states, prior_actions)
+    policy_mean, policy_std, value, current_state = self.forward(prior_states, prior_actions)
     policy_action = policy_mean + torch.rand_like(policy_mean) * policy_std
     if explore:
       policy_action = policy_action + self.action_noise * torch.randn_like(policy_action)
     policy_action.clamp_(min=self.min_action, max=self.max_action)
-    return policy_action, value, policy_mean, policy_std
+    q_value = self.q_network(current_state, policy_action)
+    return policy_action, value, policy_mean, policy_std, q_value
   
   def compute_returns(self, final_value, rewards, gamma=0.99):
     num_steps = rewards.size(0)

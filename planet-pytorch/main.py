@@ -86,7 +86,7 @@ else:
   args.device = torch.device('cpu')
 #metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'reward_loss': [], 'kl_loss': []}
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [],
-           'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': [], 'value_loss': [], 'action_entropy': [], 'advantages': []}
+           'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': [], 'value_loss': [], 'policy_loss': [], 'q_loss': []}
 
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
@@ -269,6 +269,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_actions.clamp_(env.action_range[0], env.action_range[1])
   episode_action_std = torch.zeros(args.lagging_size, env.action_size, device=args.device) + (env.action_range[1] - env.action_range[0]) / 2
   episode_values = torch.zeros(args.lagging_size, 1, device=args.device)
+  episode_q_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_rewards = torch.zeros(args.lagging_size, 1, device=args.device)
   pbar = tqdm(range(args.max_episode_length // args.action_repeat))
   time_steps = 0
@@ -284,11 +285,12 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       next_observation, reward, done = env.step(action.cpu())
       episode_states[time_step] = current_latent_state
     else:
-      action, value, policy_mean, policy_std = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=True)
+      action, value, policy_mean, policy_std, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=True)
       next_observation, reward, done = env.step(action[0].cpu())
       episode_states = torch.cat([episode_states, current_latent_state], dim=0)
       episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
       episode_values = torch.cat([episode_values, value], dim=0)
+      episode_q_values = torch.cat([episode_q_values, q_value], dim=0)
       episode_rewards = torch.cat([episode_rewards, torch.Tensor([[reward]]).to(device=args.device)], dim=0)
       episode_action_std = torch.cat([episode_action_std, policy_std.to(device=args.device)], dim=0)
     D.append(observation, action.detach().cpu(), reward, done)
@@ -301,16 +303,19 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       final_value = episode_values[-1]
       returns = actor_critic_planner.compute_returns(final_value, episode_rewards[-args.num_planning_steps:])
       returns = returns.to(device=args.device)
-      value_loss = F.mse_loss(returns, episode_values[-args.num_planning_steps:], reduction='none').mean()
-      action_entropy = torch.log(episode_action_std[-args.num_planning_steps:]).sum(dim=1).mean(dim=0)
-      advantages = torch.Tensor([0])
+      soft_v_values = episode_q_values[-args.num_planning_steps:] - torch.log(episode_action_std[-args.num_planning_steps:]).sum(dim=1)
+      value_loss = F.mse_loss(episode_values[-args.num_planning_steps:], soft_v_values, reduction='none').mean()
+      q_loss = F.mse_loss(episode_q_values[-args.num_planning_steps:], returns, reduction='none').mean()
+      policy_loss = -soft_v_values.mean()
       planning_optimiser.zero_grad()
-      (value_loss-action_entropy).backward()
+      # may add an action entropy
+      (value_loss + q_loss + policy_loss).backward()
       planning_optimiser.step()
       
       metrics['value_loss'].append(value_loss.item())
-      metrics['action_entropy'].append(action_entropy.item())
-      metrics['advantages'].append(advantages.item())
+      metrics['policy_loss'].append(policy_loss.item())
+      #metrics['action_entropy'].append(action_entropy.item())
+      metrics['q_loss'].append(q_loss.item())
     if args.render:
       env.render()
     if done:
@@ -324,8 +329,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
   
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['action_entropy']):], metrics['action_entropy'], 'action_entropy', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['advantages']):], metrics['advantages'], 'advantages', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['policy_loss']):], metrics['policy_loss'], 'policy_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
 
   # Test model
   if episode % args.test_interval == 0:
