@@ -67,11 +67,22 @@ class ValueNetwork(nn.Module):
   def __init__(self, latent_size, hidden_size):
     super().__init__()
     self.latent_size = latent_size
-    self.fc2 = nn.Linear(latent_size + hidden_size, 1)
+    self.fc = nn.Linear(latent_size + hidden_size, 1)
   
   def forward(self, x):
-    value = self.fc2(x)
+    value = self.fc(x)
     return value
+
+class QNetwork(nn.Module):
+  def __init__(self, latent_size, action_size, hidden_size):
+    super().__init__()
+    self.latent_size = latent_size
+    self.action_size = action_size
+    self.fc = nn.Linear(latent_size + action_size, 1)
+  
+  def forward(self, state, action):
+    q_value = self.fc(torch.cat([state, action], dim=-1))
+    return q_value
 
 class PolicyNetwork(nn.Module):
   def __init__(self, latent_size, action_size, hidden_size):

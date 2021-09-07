@@ -295,6 +295,22 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     total_reward += reward
     observation = next_observation
     time_step += 1
+    
+    if time_step % args.num_planning_steps == 0:
+      # compute returns in reverse order in the episode reward list
+      final_value = episode_values[-1]
+      returns = actor_critic_planner.compute_returns(final_value, episode_rewards[-args.num_planning_steps:])
+      returns = returns.to(device=args.device)
+      value_loss = F.mse_loss(returns, episode_values[-args.num_planning_steps:], reduction='none').mean()
+      action_entropy = torch.log(episode_action_std[-args.num_planning_steps:]).sum(dim=1).mean(dim=0)
+      advantages = torch.Tensor([0])
+      planning_optimiser.zero_grad()
+      (value_loss-action_entropy - advantages).backward()
+      planning_optimiser.step()
+      
+      metrics['value_loss'].append(value_loss.item())
+      metrics['action_entropy'].append(action_entropy.item())
+      metrics['advantages'].append(advantages.item())
     if args.render:
       env.render()
     if done:
@@ -306,21 +322,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   metrics['episodes'].append(episode)
   metrics['train_rewards'].append(total_reward)
   lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
-  
-  # compute returns in reverse order in the episode reward list
-  final_value = episode_values[-1]
-  returns = actor_critic_planner.compute_returns(final_value, episode_rewards)
-  episode_returns = returns.to(device=args.device)
-  value_loss = F.mse_loss(episode_returns, episode_values, reduction='none').mean()
-  action_entropy = torch.log(episode_action_std).sum(dim=1).mean(dim=0)
-  advantages = torch.Tensor([0])
-  planning_optimiser.zero_grad()
-  (value_loss-action_entropy - advantages).backward()
-  planning_optimiser.step()
-  
-  metrics['value_loss'].append(value_loss.item())
-  metrics['action_entropy'].append(action_entropy.item())
-  metrics['advantages'].append(advantages.item())
   
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['action_entropy']):], metrics['action_entropy'], 'action_entropy', results_dir)
