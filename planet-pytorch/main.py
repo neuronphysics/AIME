@@ -313,7 +313,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_returns = returns.to(device=args.device)
   value_loss = F.mse_loss(episode_returns, episode_values, reduction='none').mean()
   action_entropy = torch.log(episode_action_std).sum(dim=1).mean(dim=0)
-  advantages = 0
+  advantages = torch.Tensor([0])
   planning_optimiser.zero_grad()
   (value_loss-action_entropy - advantages).backward()
   planning_optimiser.step()
