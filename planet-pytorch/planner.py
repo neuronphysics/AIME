@@ -97,6 +97,20 @@ class PolicyNetwork(nn.Module):
     policy_std = F.softplus(self.fc_std(x))
     return policy_mean, policy_std
 
+class TransitionNetwork(nn.Module):
+  def __init__(self, latent_size, action_size):
+    super().__init__()
+    self.latent_size = latent_size
+    self.action_size = action_size
+    self.fc_mean = nn.Linear(latent_size + action_size, latent_size)
+    self.fc_std = nn.Linear(latent_size + action_size, latent_size)
+  
+  def forward(self, state, action):
+    x = torch.cat([state, action], dim=-1)
+    next_state_mean = self.fc_mean(x)
+    next_state_std = F.softplus(self.fc_std(x))
+    return next_state_mean, next_state_std
+
 class RolloutEncoder(nn.Module):
   def __init__(self, latent_size, action_size, hidden_size, num_sample_trajectories, activation_function='relu'):
     super().__init__()
@@ -118,7 +132,7 @@ class RolloutEncoder(nn.Module):
     return embedding
 
 class ActorCriticPlanner(nn.Module):
-  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, action_noise=0, num_sample_trajectories=10, hidden_size=8):
+  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, action_noise=0, num_sample_trajectories=10, hidden_size=8, temperature=1):
     super().__init__()
     self.action_size, self.action_noise, self.min_action, self.max_action = action_size, action_noise, min_action, max_action
     self.latent_size = latent_size
@@ -126,11 +140,13 @@ class ActorCriticPlanner(nn.Module):
     self.actor = PolicyNetwork(latent_size, action_size, hidden_size)
     self.critic = ValueNetwork(latent_size, hidden_size)
     self.q_network = QNetwork(latent_size, action_size)
+    self.transition_network = TransitionNetwork(latent_size, action_size)
     self.recurrent_gp = recurrent_gp
     self.rollout_encoder = RolloutEncoder(latent_size, action_size, hidden_size, num_sample_trajectories)
     self.num_sample_trajectories = num_sample_trajectories
     self.hidden_size = hidden_size
     self.lagging_size = lagging_size
+    self.temperature = temperature
 
   def forward(self, prior_states, prior_actions):
     current_state = prior_states[-1].view(1, self.latent_size)
@@ -159,7 +175,8 @@ class ActorCriticPlanner(nn.Module):
       policy_action = policy_action + self.action_noise * torch.randn_like(policy_action)
     policy_action.clamp_(min=self.min_action, max=self.max_action)
     q_value = self.q_network(current_state, policy_action)
-    return policy_action, value, policy_mean, policy_std, q_value
+    next_state_mean, next_state_std = self.transition_network(current_state, policy_action)
+    return policy_action, value, policy_mean, policy_std, q_value, next_state_mean, next_state_std
   
   def compute_returns(self, final_value, rewards, gamma=0.99):
     num_steps = rewards.size(0)
