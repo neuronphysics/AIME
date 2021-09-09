@@ -300,12 +300,12 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
     if time_step >= args.lagging_size:
       state_log_prob = Normal(next_state_mean, next_state_std).log_prob(current_latent_state)
-      episode_state_log_probs = torch.cat([episode_state_log_probs, state_log_prob], dim=0)
+      episode_state_log_probs = torch.cat([episode_state_log_probs, state_log_prob.sum(dim=-1, keepdim=True)], dim=0)
       policy_log_prob = Normal(policy_mean, policy_std).log_prob(action)
-      episode_policy_log_probs = torch.cat([episode_policy_log_probs, policy_log_prob], dim=0)
+      episode_policy_log_probs = torch.cat([episode_policy_log_probs, policy_log_prob.sum(dim=-1, keepdim=True)], dim=0)
     time_step += 1
     
-    if time_step % args.num_planning_steps == 0:
+    if (time_step % args.num_planning_steps == 0) or done:
       # compute returns in reverse order in the episode reward list
       final_value = episode_values[-1]
       returns = actor_critic_planner.compute_returns(final_value, episode_rewards[-args.num_planning_steps:])
@@ -313,8 +313,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       soft_v_values = episode_q_values[-args.num_planning_steps:] - episode_policy_log_probs[-args.num_planning_steps:]
       value_loss = F.mse_loss(episode_values[-args.num_planning_steps:], soft_v_values - episode_state_log_probs[-args.num_planning_steps:], reduction='none').mean()
       q_loss = F.mse_loss(episode_q_values[-args.num_planning_steps:], returns, reduction='none').mean()
-      policy_loss = episode_values[-args.num_planning_steps:] - soft_v_values
-      transition_loss = -(torch.exp(episode_rewards[-args.num_planning_steps:] + episode_values[-args.num_planning_steps:] - episode_q_values[-args.num_planning_steps:]) * episode_state_log_probs[-args.num_planning_steps:]).sum()
+      policy_loss = (episode_values[-args.num_planning_steps:] - soft_v_values).mean()
+      transition_loss = -(torch.exp(episode_rewards[-args.num_planning_steps:] + episode_values[-args.num_planning_steps:] - episode_q_values[-args.num_planning_steps:]) * episode_state_log_probs[-args.num_planning_steps:]).mean()
       planning_optimiser.zero_grad()
       # may add an action entropy
       (value_loss + q_loss + policy_loss + transition_loss).backward(retain_graph=True)
