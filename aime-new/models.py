@@ -281,7 +281,6 @@ class RecurrentGP(DeepGP):
               z = self.transition_modules[i](z_hat).rsample().squeeze(0)
               z = z + self.noise * torch.rand_like(z)
               # first dimension of z is the number of Gaussian mixtures (z.size(0))
-              # to do: add noise later
               posterior_states[i] = z
               lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
           

@@ -40,28 +40,6 @@ class MPCPlanner(jit.ScriptModule):
     # Return first action mean µ_t
     return action_mean[0].squeeze(dim=1)
 
-'''
-class AIMEPlanner(nn.Module):
-  
-  def __init__(self, action_size, planning_horizon, lagging_size, state_size, optimisation_iters, recurrent_gp, min_action=-inf, max_action=inf):
-    super().__init__()
-    self.action_size, self.min_action, self.max_action = action_size, min_action, max_action
-    self.planning_horizon = planning_horizon
-    self.recurrent_gp = recurrent_gp
-    self.lagging_size = lagging_size
-    self.state_size = state_size
-  
-  def forward(self, prior_states, prior_actions):
-    rewards, posterior_actions, posterior_states = self.recurrent_gp(
-      torch.flatten(prior_states).unsqueeze(dim=0).expand(50, self.lagging_size * self.state_size).unsqueeze(dim=0),
-      prior_actions.unsqueeze(dim=0).expand(50, self.lagging_size, self.action_size).unsqueeze(dim=0)
-    ) 
-    rewards = rewards.squeeze(dim=0).squeeze(-1)
-    posterior_actions = posterior_actions.squeeze(dim=1)
-    posterior_states = posterior_states.squeeze(dim=1)
-    max_index = torch.argmax(rewards)
-    return posterior_actions[0][max_index:max_index+1], posterior_states[0][max_index]
-'''
 
 class ValueNetwork(nn.Module):
   def __init__(self, latent_size, hidden_size):
