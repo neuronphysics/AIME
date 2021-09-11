@@ -1,5 +1,6 @@
 # AIME
 ## Implementation of the new model
+Note that the current work is being done in branch `implement-planner`
 
 # Reference
 1. https://github.com/zhenwendai/RGP
