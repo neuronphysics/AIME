@@ -66,6 +66,9 @@ parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='H
 parser.add_argument('--lagging-size', type=int, default=2, metavar='La', help='Lagging size')
 parser.add_argument('--cumulative-reward', action='store_true', help='Model cumulative rewards')
 parser.add_argument('--num-planning-steps', type=int, default=5, metavar='I2A', help='number of steps in the I2A part')
+parser.add_argument('--temperature-factor', type=int, default=1, metavar='Temp', help='Temperature factor')
+parser.add_argument('--discount-factor', type=float, default=0.99, metavar='Temp', help='Discount factor')
+
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -190,8 +193,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_q_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_rewards = torch.zeros(args.lagging_size, 1, device=args.device)
-  episode_state_log_probs = torch.zeros(args.lagging_size, 1, device=args.device)
-  episode_policy_log_probs = torch.zeros(args.lagging_size, 1, device=args.device)
+  episode_state_kl = torch.zeros(args.lagging_size, 1, device=args.device)
+  episode_policy_kl = torch.zeros(args.lagging_size, 1, device=args.device)
   pbar = tqdm(range(args.max_episode_length // args.action_repeat))
   time_steps = 0
   for t in pbar:
@@ -204,7 +207,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       next_observation, reward, done = env.step(action.cpu())
       episode_states[time_step] = current_latent_state
     else:
-      action, value, policy_mean, policy_std, q_value, next_state_mean, next_state_std = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=True)
+      action, value, policy_mean, policy_std, q_value, next_state_mean, next_state_std, prior_next_state, prior_next_action = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=True)
       next_observation, reward, done = env.step(action[0].cpu())
       episode_states = torch.cat([episode_states, current_latent_state], dim=0)
       episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
@@ -217,36 +220,45 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     with torch.no_grad():
       _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
     if time_step >= args.lagging_size:
-      state_log_prob = Normal(next_state_mean, next_state_std).log_prob(current_latent_state)
-      episode_state_log_probs = torch.cat([episode_state_log_probs, state_log_prob.sum(dim=-1, keepdim=True)], dim=0)
-      policy_log_prob = Normal(policy_mean, policy_std).log_prob(action)
-      episode_policy_log_probs = torch.cat([episode_policy_log_probs, policy_log_prob.sum(dim=-1, keepdim=True)], dim=0)
+      next_state_dist = Normal(next_state_mean, next_state_std)
+      state_kl = next_state_dist.log_prob(current_latent_state) - next_state_dist.log_prob(next_state_dist)
+      episode_state_kl = torch.cat([episode_state_kl, state_kl.sum(dim=-1, keepdim=True)], dim=0)
+      policy_dist = Normal(policy_mean, policy_std)
+      policy_kl = policy_dist.log_prob(action) - policy_dist.log_prob(prior_next_action)
+      episode_policy_kl = torch.cat([episode_policy_kl, policy_kl.sum(dim=-1, keepdim=True)], dim=0)
     time_step += 1
     
-    if (time_step % args.num_planning_steps == 0) or done:
+    #if (time_step % args.num_planning_steps == 0) or done:
       # compute returns in reverse order in the episode reward list
-      final_value = episode_values[-1]
-      returns = actor_critic_planner.compute_returns(final_value, episode_rewards[-args.num_planning_steps:])
-      returns = returns.to(device=args.device)
-      soft_v_values = episode_q_values[-args.num_planning_steps:] - episode_policy_log_probs[-args.num_planning_steps:]
-      value_loss = F.mse_loss(episode_values[-args.num_planning_steps:], soft_v_values - episode_state_log_probs[-args.num_planning_steps:], reduction='none').mean()
-      q_loss = F.mse_loss(episode_q_values[-args.num_planning_steps:], returns, reduction='none').mean()
-      policy_loss = (episode_values[-args.num_planning_steps:] - soft_v_values).mean()
-      transition_loss = -(torch.exp(episode_rewards[-args.num_planning_steps:] + episode_values[-args.num_planning_steps:] - episode_q_values[-args.num_planning_steps:]) * episode_state_log_probs[-args.num_planning_steps:]).mean()
-      planning_optimiser.zero_grad()
-      # may add an action entropy
-      (value_loss + q_loss + policy_loss + transition_loss).backward(retain_graph=True)
-      planning_optimiser.step()
-      
-      metrics['value_loss'].append(value_loss.item())
-      metrics['policy_loss'].append(policy_loss.item())
-      metrics['q_loss'].append(q_loss.item())
     if args.render:
       env.render()
     if done:
+      # get the predicted next state even when the episode ends
+      #_, value, _, _, _, next_state_mean, next_state_std, prior_next_state, prior_next_action = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=True)
       pbar.close()
       break
-    
+  
+  # perform parameter optimization over batches of num_planning_steps length vector
+  #final_value = episode_values[-1]
+  #returns = actor_critic_planner.compute_returns(final_value, episode_rewards[-args.num_planning_steps:])
+  #returns = returns.to(device=args.device)
+  #next_predicted_value = None
+  #target_q_values = args.temperature_factor * reward + args.discount_factor * next_predicted_value # V(z_{t+1}) should be the value for the predicted next states q(z_t, a_t)
+  soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
+  target_q_values = args.temperature_factor * reward + args.discount_factor * soft_v_values
+  value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
+  q_loss = F.mse_loss(episode_q_values, target_q_values, reduction='none').mean()
+  policy_loss = (episode_policy_kl - episode_q_values + episode_values).mean()
+  transition_loss = -(torch.exp(episode_rewards + episode_values - episode_q_values) * episode_state_kl).mean()
+  planning_optimiser.zero_grad()
+  # may add an action entropy
+  (value_loss + q_loss + policy_loss + transition_loss).backward(retain_graph=True)
+  planning_optimiser.step()
+  
+  metrics['value_loss'].append(value_loss.item())
+  metrics['policy_loss'].append(policy_loss.item())
+  metrics['q_loss'].append(q_loss.item())
+  metrics['transition_loss'].append(transition_loss.item())
   # Update and plot train reward metrics
   metrics['steps'].append(t + metrics['steps'][-1])
   metrics['episodes'].append(episode)
@@ -256,6 +268,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['policy_loss']):], metrics['policy_loss'], 'policy_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['transition_loss']):], metrics['transition_loss'], 'transition_loss', results_dir)
 
   # Test model
   if episode % args.test_interval == 0:

@@ -126,35 +126,37 @@ class ActorCriticPlanner(nn.Module):
     self.lagging_size = lagging_size
     self.temperature = temperature
 
-  def forward(self, prior_states, prior_actions):
-    current_state = prior_states[-1].view(1, self.latent_size)
-    imagined_reward, imagined_actions, imagined_states = self.imaginary_rollout(prior_states, prior_actions, self.num_sample_trajectories)
+  def forward(self, lagging_states, lagging_actions):
+    current_state = lagging_states[-1].view(1, self.latent_size)
+    imagined_reward, imagined_actions, imagined_states = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories)
     rollout_embedding = self.rollout_encoder(imagined_reward.squeeze(0), imagined_actions.squeeze(1), imagined_states.squeeze(1))
     embedding = torch.cat([current_state,rollout_embedding], dim=-1)
     policy_mean, policy_std = self.actor(embedding)
     value = self.critic(embedding)
-    return policy_mean, policy_std, value, current_state
+    prior_next_state = imagined_states[0]
+    prior_next_action = imagined_actions[0]
+    return policy_mean, policy_std, value, current_state, prior_next_state, prior_next_action
   
-  def imaginary_rollout(self, prior_states, prior_actions, num_sample_trajectories):
+  def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories):
     self.recurrent_gp.eval()
     with torch.no_grad():
       rewards, posterior_actions, posterior_states = self.recurrent_gp(
-        torch.flatten(prior_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
-        prior_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
+        torch.flatten(lagging_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
+        lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
       )
     self.recurrent_gp.train()
     return rewards.cuda(), posterior_actions.cuda(), posterior_states.cuda()
   
   def act(self, prior_states, prior_actions, explore=False):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
-    policy_mean, policy_std, value, current_state = self.forward(prior_states, prior_actions)
+    policy_mean, policy_std, value, current_state, prior_next_state, prior_next_action = self.forward(prior_states, prior_actions)
     policy_action = policy_mean + torch.rand_like(policy_mean) * policy_std
     if explore:
       policy_action = policy_action + self.action_noise * torch.randn_like(policy_action)
     policy_action.clamp_(min=self.min_action, max=self.max_action)
     q_value = self.q_network(current_state, policy_action)
     next_state_mean, next_state_std = self.transition_network(current_state, policy_action)
-    return policy_action, value, policy_mean, policy_std, q_value, next_state_mean, next_state_std
+    return policy_action, value, policy_mean, policy_std, q_value, next_state_mean, next_state_std, prior_next_state, prior_next_action
   
   def compute_returns(self, final_value, rewards, gamma=0.99):
     num_steps = rewards.size(0)
