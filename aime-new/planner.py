@@ -157,7 +157,7 @@ class ActorCriticPlanner(nn.Module):
     q_value = self.q_network(current_state, policy_action)
     next_state_mean, next_state_std = self.transition_network(current_state, policy_action)
     prior_next_state = prior_next_state.mean(dim=-2)
-    prior_actions = prior_actions.mean(dim=-2)
+    prior_next_action = prior_next_action.mean(dim=-2)
     return policy_action, value, policy_mean, policy_std, q_value, next_state_mean, next_state_std, prior_next_state, prior_next_action
   
   def compute_returns(self, final_value, rewards, gamma=0.99):
