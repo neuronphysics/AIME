@@ -88,7 +88,7 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [],
-           'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': [], 'value_loss': [], 'policy_loss': [], 'q_loss': []}
+           'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 'transition_loss': []}
 
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
