@@ -221,7 +221,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
     if time_step >= args.lagging_size:
       next_state_dist = Normal(next_state_mean, next_state_std)
-      state_kl = next_state_dist.log_prob(current_latent_state) - next_state_dist.log_prob(next_state_dist)
+      state_kl = next_state_dist.log_prob(current_latent_state) - next_state_dist.log_prob(prior_next_state)
       episode_state_kl = torch.cat([episode_state_kl, state_kl.sum(dim=-1, keepdim=True)], dim=0)
       policy_dist = Normal(policy_mean, policy_std)
       policy_kl = policy_dist.log_prob(action) - policy_dist.log_prob(prior_next_action)
