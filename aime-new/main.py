@@ -88,7 +88,7 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [],
-           'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 'transition_loss': []}
+           'reward_loss': [], 'action_loss': [], 'transition_loss': [], 'posterior_entropy': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 'kl_transition_loss': []}
 
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
@@ -258,7 +258,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
   metrics['q_loss'].append(q_loss.item())
-  metrics['transition_loss'].append(transition_loss.item())
+  metrics['kl_transition_loss'].append(transition_loss.item())
   # Update and plot train reward metrics
   metrics['steps'].append(t + metrics['steps'][-1])
   metrics['episodes'].append(episode)
@@ -268,7 +268,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['policy_loss']):], metrics['policy_loss'], 'policy_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['transition_loss']):], metrics['transition_loss'], 'transition_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['kl_transition_loss']):], metrics['kl_transition_loss'], 'kl_transition_loss', results_dir)
 
   # Test model
   if episode % args.test_interval == 0:
