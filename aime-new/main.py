@@ -119,7 +119,7 @@ sample_layer = SampleLayer(args.embedding_size, args.state_size).to(device=args.
 param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters()) + list(sample_layer.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
-actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1]).to(device=args.device)
+actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.action_noise).to(device=args.device)
 planning_optimiser = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 if args.models is not '' and os.path.exists(args.models):
   model_dicts = torch.load(args.models)
@@ -163,7 +163,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
     # Update model parameters
     optimiser.zero_grad()
-    (observation_loss + reward_loss + action_loss + transition_loss - posterior_entropy).backward()
+    (observation_loss + reward_loss + action_loss + transition_loss - posterior_entropy + latent_kl_loss).backward()
     nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
     optimiser.step()
     # Store loss

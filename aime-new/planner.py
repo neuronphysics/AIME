@@ -110,7 +110,7 @@ class RolloutEncoder(nn.Module):
     return embedding
 
 class ActorCriticPlanner(nn.Module):
-  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, action_noise=0, num_sample_trajectories=10, hidden_size=8, temperature=1):
+  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, action_noise, num_sample_trajectories=10, hidden_size=8, temperature=1):
     super().__init__()
     self.action_size, self.action_noise, self.min_action, self.max_action = action_size, action_noise, min_action, max_action
     self.latent_size = latent_size
