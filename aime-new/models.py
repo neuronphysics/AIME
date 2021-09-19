@@ -191,7 +191,7 @@ class SampleLayer(nn.Module):
   def forward(self, embedding):
     latent_mean = self.fc_mean(embedding)
     latent_std = F.softplus(self.fc_std(embedding))
-    latent_state = latent_mean + torch.rand_like(latent_mean) * latent_std
+    latent_state = torch.normal(mean=latent_mean, std=latent_std)
     return latent_mean, latent_std, latent_state
 
 def Encoder(symbolic, observation_size, embedding_size, activation_function='relu'):
@@ -273,24 +273,24 @@ class RecurrentGP(DeepGP):
               # policy distribution
               #w_hat = lagging_states # may have to change this to lagging_states[:-1] later
               a = self.policy_modules[i](lagging_states).rsample().squeeze(0)
-              a = a + self.noise * torch.rand_like(a)
+              a = torch.normal(mean=a, std=self.noise)
               posterior_actions[i] = a
               lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
               z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
               # transition distribution
               z = self.transition_modules[i](z_hat).rsample().squeeze(0)
-              z = z + self.noise * torch.rand_like(z)
+              z = torch.normal(mean=z, std=self.noise)
               # first dimension of z is the number of Gaussian mixtures (z.size(0))
               posterior_states[i] = z
               lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
           
           # last policy in the horizon
           a = self.policy_modules[self.horizon_size](lagging_states).rsample().squeeze(0)
-          a = a + self.noise * torch.rand_like(a)
+          a = torch.normal(mean=a, std=self.noise)
           posterior_actions[self.horizon_size] = a
           lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
           z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
           # output the final reward
           rewards = self.reward_gp(z_hat).rsample().squeeze(0)
-          rewards = rewards + self.noise * torch.rand_like(rewards)
+          rewards = torch.normal(mean=rewards, std=self.noise)
           return rewards, posterior_actions, posterior_states
