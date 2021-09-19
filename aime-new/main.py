@@ -253,6 +253,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   planning_optimiser.zero_grad()
   # may add an action entropy
   (value_loss + q_loss + policy_loss + transition_loss).backward(retain_graph=True)
+  nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
   
   metrics['value_loss'].append(value_loss.item())
