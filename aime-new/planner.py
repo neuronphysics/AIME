@@ -150,9 +150,9 @@ class ActorCriticPlanner(nn.Module):
   def act(self, prior_states, prior_actions, explore=False):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
     policy_mean, policy_std, value, current_state, prior_next_state, prior_next_action = self.forward(prior_states, prior_actions)
-    policy_action = torch.normal(mean=policy_mean, std=policy_std)
+    policy_action = policy_mean + torch.rand_like(policy_mean) * policy_std
     if explore:
-      policy_action = torch.normal(mean=policy_action, std=self.action_noise)
+      policy_action = policy_action + self.action_noise * torch.randn_like(policy_action)
     policy_action.clamp_(min=self.min_action, max=self.max_action)
     q_value = self.q_network(current_state, policy_action)
     next_state_mean, next_state_std = self.transition_network(current_state, policy_action)
