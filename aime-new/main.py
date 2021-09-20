@@ -252,17 +252,17 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
   q_loss = F.mse_loss(episode_q_values, target_q_values, reduction='none').mean()
   policy_loss = (episode_policy_kl - episode_q_values + episode_values).mean()
-  transition_loss = -(torch.exp(episode_rewards + episode_values - episode_q_values) * episode_state_kl).mean()
+  kl_transition_loss = (torch.exp(episode_rewards + episode_values - episode_q_values) * episode_state_kl).mean()
   planning_optimiser.zero_grad()
   # may add an action entropy
-  (value_loss + q_loss + policy_loss + transition_loss).backward(retain_graph=True)
+  (value_loss + q_loss + policy_loss + kl_transition_loss).backward(retain_graph=True)
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
   metrics['q_loss'].append(q_loss.item())
-  metrics['kl_transition_loss'].append(transition_loss.item())
+  metrics['kl_transition_loss'].append(kl_transition_loss.item())
   # Update and plot train reward metrics
   metrics['steps'].append(t + metrics['steps'][-1])
   metrics['episodes'].append(episode)
