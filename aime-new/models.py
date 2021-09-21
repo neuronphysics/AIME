@@ -7,7 +7,7 @@ from torch.distributions import constraints
 
 import gpytorch
 from gpytorch.models.deep_gps import DeepGPLayer, DeepGP
-from gpytorch.means import ConstantMean, ZeroMean
+from gpytorch.means import ConstantMean, ZeroMean, LinearMean
 from gpytorch.kernels import RBFKernel, ScaleKernel
 from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution
 from gpytorch.distributions import MultivariateNormal
@@ -187,12 +187,11 @@ class SampleLayer(nn.Module):
     self.state_size = state_size
     self.fc_mean = nn.Linear(embedding_size, state_size)
     self.fc_std = nn.Linear(embedding_size, state_size)
-    self.softplus = nn.Softplus()
   
   def forward(self, embedding):
     latent_mean = self.fc_mean(embedding)
-    latent_std = self.softplus(self.fc_std(embedding))
-    latent_state = latent_mean + torch.rand_like(latent_mean) * latent_std
+    latent_std = F.softplus(self.fc_std(embedding))
+    latent_state = latent_mean + torch.randn_like(latent_mean) * latent_std
     return latent_mean, latent_std, latent_state
 
 def Encoder(symbolic, observation_size, embedding_size, activation_function='relu'):
@@ -209,7 +208,7 @@ class DGPHiddenLayer(DeepGPLayer):
         variational_distribution = CholeskyVariationalDistribution(
             num_inducing_points=num_inducing,
             batch_shape=batch_shape
-        ).to(device=device)
+        )
         variational_strategy = VariationalStrategy(
             self,
             inducing_points,
@@ -218,11 +217,11 @@ class DGPHiddenLayer(DeepGPLayer):
         )
 
         super().__init__(variational_strategy, input_dims, output_dims)
-        self.mean_module = ZeroMean()
+        self.mean_module = None
         self.covar_module = ScaleKernel(
             RBFKernel(batch_shape=batch_shape, ard_num_dims=input_dims),
             batch_shape=batch_shape, ard_num_dims=None
-        ).to(device=device)
+        )
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -231,27 +230,31 @@ class DGPHiddenLayer(DeepGPLayer):
 
 class TransitionGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
-      super(TransitionGP, self).__init__((latent_size+action_size)*lagging_size, latent_size, device)
+      input_size = (latent_size+action_size)*lagging_size
+      super(TransitionGP, self).__init__(input_size, latent_size, device)
+      self.mean_module = LinearMean(input_size)
 
 class PolicyGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
       super(PolicyGP, self).__init__(latent_size*lagging_size, action_size, device)
+      self.mean_module = ConstantMean()
 
 class RewardGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
       super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, 1, device)
+      self.mean_module = ZeroMean()
 
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
-    def __init__(self, horizon_size, latent_size, action_size, lagging_size, embedding_size, device, num_mixture_samples=1, noise=0.5):
+    def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1, noise=0.5):
         super().__init__()
         self.horizon_size = horizon_size
-        self.lagging_length = lagging_size
+        self.lagging_size = lagging_size
         self.action_size = action_size
         self.latent_size = latent_size
-        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
-        self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device) for _ in range(horizon_size)]
-        self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device)
+        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size)]
+        self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size+1)]
+        self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device).to(device=device)
         self.num_mixture_samples = num_mixture_samples
         self.noise = noise
     
@@ -261,25 +264,33 @@ class RecurrentGP(DeepGP):
           init_states = init_states.reshape((init_states.size(0), init_states.size(1), -1))
           actions = actions.reshape((actions.size(0), actions.size(1), -1))
           z_hat = torch.cat([init_states, actions], dim=-1)
-          w_hat = None
+          #w_hat = None
           lagging_actions = actions
           lagging_states = init_states
           posterior_states = torch.empty((self.horizon_size, init_states.size(0), init_states.size(1), self.latent_size))
-          posterior_actions = torch.empty((self.horizon_size, init_states.size(0), init_states.size(1), self.action_size))
+          posterior_actions = torch.empty((self.horizon_size+1, init_states.size(0), init_states.size(1), self.action_size))
           for i in range(self.horizon_size):
-              z = self.transition_modules[i](z_hat).rsample().squeeze(0)
-              z = z + self.noise * torch.rand_like(z)
-              # first dimension of z is the number of Gaussian mixtures (z.size(0))
-              # to do: add noise later
-              posterior_states[i] = z
-              lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
-              w_hat = lagging_states # may have to change this to lagging_states[:-1] later
-              a = self.policy_modules[i](w_hat).rsample().squeeze(0)
-              a = a + self.noise * torch.rand_like(a)
+              # policy distribution
+              #w_hat = lagging_states # may have to change this to lagging_states[:-1] later
+              a = self.policy_modules[i](lagging_states).rsample().squeeze(0)
+              a = a + self.noise * torch.randn_like(a)
               posterior_actions[i] = a
               lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
               z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
+              # transition distribution
+              z = self.transition_modules[i](z_hat).rsample().squeeze(0)
+              z = z + self.noise * torch.randn_like(z)
+              # first dimension of z is the number of Gaussian mixtures (z.size(0))
+              posterior_states[i] = z
+              lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
+          
+          # last policy in the horizon
+          a = self.policy_modules[self.horizon_size](lagging_states).rsample().squeeze(0)
+          a = a + self.noise * torch.randn_like(a)
+          posterior_actions[self.horizon_size] = a
+          lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
+          z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
           # output the final reward
           rewards = self.reward_gp(z_hat).rsample().squeeze(0)
-          rewards = rewards + self.noise * torch.rand_like(rewards)
+          rewards = rewards + self.noise * torch.randn_like(rewards)
           return rewards, posterior_actions, posterior_states
