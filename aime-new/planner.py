@@ -4,6 +4,7 @@ from torch import jit
 import torch.nn as nn
 from torch.nn import functional as F
 
+from dlgpd.gp import build_gp
 
 # Model-predictive control planner with cross-entropy method and learned transition model
 class MPCPlanner(jit.ScriptModule):
@@ -118,7 +119,7 @@ class ActorCriticPlanner(nn.Module):
     self.actor = PolicyNetwork(latent_size, action_size, hidden_size)
     self.critic = ValueNetwork(latent_size, hidden_size)
     self.q_network = QNetwork(latent_size, action_size)
-    self.transition_network = TransitionNetwork(latent_size, action_size)
+    self.transition_gp = build_gp(latent_size+action_size, latent_size)
     self.recurrent_gp = recurrent_gp
     self.rollout_encoder = RolloutEncoder(latent_size, action_size, hidden_size, num_sample_trajectories)
     self.num_sample_trajectories = num_sample_trajectories
@@ -155,15 +156,6 @@ class ActorCriticPlanner(nn.Module):
       policy_action = policy_action + self.action_noise * torch.randn_like(policy_action)
     policy_action.clamp_(min=self.min_action, max=self.max_action)
     q_value = self.q_network(current_state, policy_action)
-    next_state_mean, next_state_std = self.transition_network(current_state, policy_action)
     prior_next_state = prior_next_state.mean(dim=-2)
     prior_next_action = prior_next_action.mean(dim=-2)
-    return policy_action, value, policy_mean, policy_std, q_value, next_state_mean, next_state_std, prior_next_state, prior_next_action
-  
-  def compute_returns(self, final_value, rewards, gamma=0.99):
-    num_steps = rewards.size(0)
-    returns   = torch.zeros(num_steps + 1, 1).cuda()
-    returns[-1] = final_value
-    for step in reversed(range(num_steps)):
-        returns[step] = returns[step + 1] * gamma + rewards[step]
-    return returns[:-1]
+    return policy_action, value, policy_mean, policy_std, q_value, prior_next_state, prior_next_action

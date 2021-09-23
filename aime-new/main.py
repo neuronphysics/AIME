@@ -14,6 +14,7 @@ from memory import ExperienceReplay
 from models import bottle, Encoder, ObservationModel, RecurrentGP, SampleLayer
 from planner import ActorCriticPlanner
 from utils import lineplot, write_video
+import gpytorch
 
 
 # Hyperparameters
@@ -196,7 +197,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_q_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_rewards = torch.zeros(args.lagging_size, 1, device=args.device)
-  episode_state_kl = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_policy_kl = torch.zeros(args.lagging_size, 1, device=args.device)
   pbar = tqdm(range(args.max_episode_length // args.action_repeat))
   time_steps = 0
@@ -210,7 +210,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       next_observation, reward, done = env.step(action.cpu())
       episode_states[time_step] = current_latent_state
     else:
-      action, value, policy_mean, policy_std, q_value, next_state_mean, next_state_std, prior_next_state, prior_next_action = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=True)
+      action, value, policy_mean, policy_std, q_value, prior_next_state, prior_next_action = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=True)
       next_observation, reward, done = env.step(action[0].cpu())
       episode_states = torch.cat([episode_states, current_latent_state], dim=0)
       episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
@@ -223,9 +223,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     with torch.no_grad():
       _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
     if time_step >= args.lagging_size:
-      next_state_dist = Normal(next_state_mean, next_state_std)
-      state_kl = next_state_dist.log_prob(current_latent_state) - next_state_dist.log_prob(prior_next_state)
-      episode_state_kl = torch.cat([episode_state_kl, state_kl.sum(dim=-1, keepdim=True)], dim=0)
       policy_dist = Normal(policy_mean, policy_std)
       policy_kl = policy_dist.log_prob(action) - policy_dist.log_prob(prior_next_action)
       episode_policy_kl = torch.cat([episode_policy_kl, policy_kl.sum(dim=-1, keepdim=True)], dim=0)
@@ -236,26 +233,30 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     if args.render:
       env.render()
     if done:
-      # get the predicted next state even when the episode ends
-      #_, value, _, _, _, next_state_mean, next_state_std, prior_next_state, prior_next_action = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=True)
+      episode_states = torch.cat([episode_states, current_latent_state], dim=0) # add the last state
       pbar.close()
       break
   
-  # perform parameter optimization over batches of num_planning_steps length vector
-  #final_value = episode_values[-1]
-  #returns = actor_critic_planner.compute_returns(final_value, episode_rewards[-args.num_planning_steps:])
-  #returns = returns.to(device=args.device)
-  #next_predicted_value = None
-  #target_q_values = args.temperature_factor * reward + args.discount_factor * next_predicted_value # V(z_{t+1}) should be the value for the predicted next states q(z_t, a_t)
+  episode_state_kl = torch.Tensor([0])
   soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
   target_q_values = args.temperature_factor * reward + args.discount_factor * soft_v_values
   value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
   q_loss = F.mse_loss(episode_q_values, target_q_values, reduction='none').mean()
   policy_loss = (episode_policy_kl - episode_q_values + episode_values).mean()
   kl_transition_loss = (torch.exp(episode_rewards + episode_values - episode_q_values) * episode_state_kl).mean()
+  
+  # transition loss for gp, adapted from dlgpd repo
+  scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[:-1], next_states=episode_states[1:], actions=episode_actions)
+  with gpytorch.settings.prior_mode(True):
+      outputs = actor_critic_planner.transition_gp.predict(
+          scaled_X, suppress_eval_mode_warning=False
+      )
+      neg_mll = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])))
+  ##
+  
   planning_optimiser.zero_grad()
   # may add an action entropy
-  (value_loss + q_loss + policy_loss + kl_transition_loss).backward(retain_graph=True)
+  (value_loss + q_loss + policy_loss + kl_transition_loss + neg_mll).backward(retain_graph=True)
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
   
@@ -299,7 +300,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           episode_states[time_step] = current_latent_state
           done = torch.Tensor([done])
         else:
-          action, _, _, _, _, _, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=False)
+          action, _, _, _, _, _, _, = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=False)
           next_observation, reward, done = test_envs.step(action.cpu())
           episode_states = torch.cat([episode_states, current_latent_state], dim=0)
           episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
