@@ -4,10 +4,8 @@ import math
 import gpytorch
 import torch
 from gpytorch.distributions import MultivariateNormal
-from sacred import Ingredient
 from torch import nn
 
-gp_ingredient = Ingredient("gp")
 
 
 logger = logging.getLogger(__name__)
@@ -20,20 +18,19 @@ HYPERPARAMETER_PENALTY_DEFAULTS = dict(
 )
 
 
-@gp_ingredient.capture
 def build_gp(
     input_dim,
     output_dim,
-    rescale,
-    gp_kernel,
-    outputscale_gamma_prior,
-    lengthscale_gamma_prior,
-    snr_type,
-    snr_penalty_tolerance,
-    snr_penalty_p,
-    init_noise_factor,
-    noise_bound,
-    noise_bound_factor,
+    rescale = "standard",
+    gp_kernel = "rbf",
+    outputscale_gamma_prior = (1, 5),
+    lengthscale_gamma_prior = None,
+    snr_type = "pilco",
+    snr_penalty_tolerance = 10,
+    snr_penalty_p = 8,
+    init_noise_factor = 0.2,
+    noise_bound = None,
+    noise_bound_factor = 0.001,
 ):
     gp_model = MultiIndepGP(
         input_dim=input_dim,
