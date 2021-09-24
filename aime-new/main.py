@@ -237,7 +237,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       pbar.close()
       break
   
-  episode_state_kl = torch.Tensor([0])
+  episode_state_kl = torch.tensor(0).to(device=args.device)
   soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
   target_q_values = args.temperature_factor * reward + args.discount_factor * soft_v_values
   value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
