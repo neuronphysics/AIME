@@ -243,7 +243,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       outputs = actor_critic_planner.transition_gp.predict(
           scaled_X, suppress_eval_mode_warning=False
       )
-      episode_state_kl = -torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:]))
+      episode_state_kl = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])), dim=-1, keepdim=True)
   ##
   soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
   target_q_values = args.temperature_factor * reward + args.discount_factor * soft_v_values
