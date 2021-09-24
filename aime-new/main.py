@@ -237,7 +237,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       pbar.close()
       break
   
-  episode_state_kl = torch.tensor(0).to(device=args.device)
+  # transition loss for gp, adapted from dlgpd repo
+  scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[:-1], next_states=episode_states[1:], actions=episode_actions)
+  with gpytorch.settings.prior_mode(True):
+      outputs = actor_critic_planner.transition_gp.predict(
+          scaled_X, suppress_eval_mode_warning=False
+      )
+      episode_state_kl = -torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:]))
+  ##
   soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
   target_q_values = args.temperature_factor * reward + args.discount_factor * soft_v_values
   value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
@@ -245,18 +252,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   policy_loss = (episode_policy_kl - episode_q_values + episode_values).mean()
   kl_transition_loss = (torch.exp(episode_rewards + episode_values - episode_q_values) * episode_state_kl).mean()
   
-  # transition loss for gp, adapted from dlgpd repo
-  scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[:-1], next_states=episode_states[1:], actions=episode_actions)
-  with gpytorch.settings.prior_mode(True):
-      outputs = actor_critic_planner.transition_gp.predict(
-          scaled_X, suppress_eval_mode_warning=False
-      )
-      neg_mll = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])))
-  ##
-  
   planning_optimiser.zero_grad()
   # may add an action entropy
-  (value_loss + q_loss + policy_loss + kl_transition_loss + neg_mll).backward(retain_graph=True)
+  (value_loss + q_loss + policy_loss + kl_transition_loss + torch.sum(episode_state_kl)).backward(retain_graph=True)
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
   
