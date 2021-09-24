@@ -246,7 +246,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       episode_state_kl = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])), dim=-1, keepdim=True)
   ##
   soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
-  target_q_values = args.temperature_factor * reward + args.discount_factor * soft_v_values
+  target_q_values = args.temperature_factor * episode_rewards + args.discount_factor * episode_values
   value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
   q_loss = F.mse_loss(episode_q_values, target_q_values, reduction='none').mean()
   policy_loss = (episode_policy_kl - episode_q_values + episode_values).mean()
