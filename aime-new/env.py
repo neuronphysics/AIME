@@ -90,7 +90,6 @@ def get_closest_point_index(pts_arr, pts):
 
 
 def get_path_to_goal(goal, paths, start):
-    goal_pos = goal.position
     start_pos = start.position
     path_start_pts = [each[0].pos for each in paths]
 
@@ -102,7 +101,6 @@ def get_path_to_goal(goal, paths, start):
     goal_lane_index = middle_point.lane_index
 
     path_pts = [each.pos for each in path]
-    end_path_ind = get_closest_point_index(path_pts, goal_pos)
 
     return path
 
@@ -132,7 +130,6 @@ def adapt(observation: Observation, reward: float) -> float:
 
     # Distance to goal
     ego_2d_position = ego_observation.position[0:2]
-    goal_dist = euclidean(ego_2d_position, goal.position)
 
     closest_wp, _ = get_closest_waypoint(
         num_lookahead=_WAYPOINTS,
