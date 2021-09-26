@@ -348,7 +348,7 @@ class Hiway:
     import gym
     env = gym.make(
         "smarts.env:hiway-v0",
-        scenarios=['/SMARTS/scenarios/intersections/4lane'],
+        scenarios=['/SMARTS/scenarios/intersections/4lane', '/SMARTS/scenarios/loop'],
         agent_specs={agent_id: agent_spec},
         sim_name=None,
         headless=True,
