@@ -142,35 +142,36 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   # Model fitting
   losses = []
   for s in tqdm(range(args.collect_interval)):
-    # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
-    observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
-    observation_embedding = bottle(encoder, (observations, ))
-    latent_mean, latent_std, latent_states = sample_layer(observation_embedding)
-    latent_kl_loss = kl_divergence(Normal(latent_mean, latent_std), global_prior).sum(dim=2).mean(dim=(0, 1))
-    init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
-    predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
-    if args.cumulative_reward:
-      true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
-    else:
-      true_rewards = rewards[args.lagging_size+args.horizon_size:]
-    reward_loss = -reward_mll(predicted_rewards, true_rewards)
-    posterior_states = posterior_states.to(device=args.device)
-    posterior_actions = posterior_actions.to(device=args.device)
-    observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
-    action_loss = F.mse_loss(posterior_actions, actions[args.lagging_size:].unfold(0, args.horizon_size+1, 1).permute(3, 0, 1, 2), reduction='none').sum(dim=(0, 3)).mean(dim=(0, 1))
-    transition_loss = F.mse_loss(posterior_states, latent_states[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').sum(dim=(0, 3)).mean(dim=(0, 1))
-    posterior_entropy = torch.log(latent_std).sum(dim=2).mean(dim=(0, 1))
-    # Apply linearly ramping learning rate schedule
-    if args.learning_rate_schedule != 0:
-      for group in optimiser.param_groups:
-        group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
-    # Update model parameters
-    optimiser.zero_grad()
-    (observation_loss + reward_loss + action_loss + transition_loss - posterior_entropy + latent_kl_loss).backward()
-    nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-    optimiser.step()
-    # Store loss
-    losses.append([observation_loss.item(), reward_loss.item(), action_loss.item(), transition_loss.item(), posterior_entropy.item(), latent_kl_loss.item()])
+    with gpytorch.settings.num_likelihood_samples(1):
+      # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
+      observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
+      observation_embedding = bottle(encoder, (observations, ))
+      latent_mean, latent_std, latent_states = sample_layer(observation_embedding)
+      latent_kl_loss = kl_divergence(Normal(latent_mean, latent_std), global_prior).sum(dim=2).mean(dim=(0, 1))
+      init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
+      predicted_rewards, posterior_actions, posterior_states = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
+      if args.cumulative_reward:
+        true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
+      else:
+        true_rewards = rewards[args.lagging_size+args.horizon_size:]
+      reward_loss = -reward_mll(predicted_rewards, true_rewards)
+      posterior_states = posterior_states.to(device=args.device)
+      posterior_actions = posterior_actions.to(device=args.device)
+      observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
+      action_loss = F.mse_loss(posterior_actions, actions[args.lagging_size:].unfold(0, args.horizon_size+1, 1).permute(3, 0, 1, 2), reduction='none').sum(dim=(0, 3)).mean(dim=(0, 1))
+      transition_loss = F.mse_loss(posterior_states, latent_states[args.lagging_size:-1].unfold(0, args.horizon_size, 1).permute(3, 0, 1, 2), reduction='none').sum(dim=(0, 3)).mean(dim=(0, 1))
+      posterior_entropy = torch.log(latent_std).sum(dim=2).mean(dim=(0, 1))
+      # Apply linearly ramping learning rate schedule
+      if args.learning_rate_schedule != 0:
+        for group in optimiser.param_groups:
+          group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
+      # Update model parameters
+      optimiser.zero_grad()
+      (observation_loss + reward_loss + action_loss + transition_loss - posterior_entropy + latent_kl_loss).backward()
+      nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
+      optimiser.step()
+      # Store loss
+      losses.append([observation_loss.item(), reward_loss.item(), action_loss.item(), transition_loss.item(), posterior_entropy.item(), latent_kl_loss.item()])
 
   # Update and plot loss metrics
   losses = tuple(zip(*losses))
