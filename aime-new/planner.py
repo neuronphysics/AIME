@@ -4,6 +4,8 @@ from torch import jit
 import torch.nn as nn
 from torch.nn import functional as F
 
+import gpytorch
+
 from dlgpd.gp import build_gp
 
 # Model-predictive control planner with cross-entropy method and learned transition model
@@ -138,10 +140,11 @@ class ActorCriticPlanner(nn.Module):
   def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories):
     self.recurrent_gp.eval()
     with torch.no_grad():
-      rewards = self.recurrent_gp(
-        torch.flatten(lagging_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
-        lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
-      )
+      with gpytorch.settings.num_likelihood_samples(1):
+        rewards = self.recurrent_gp(
+          torch.flatten(lagging_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
+          lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
+        )
     self.recurrent_gp.train()
     return rewards.rsample().cuda()
   
