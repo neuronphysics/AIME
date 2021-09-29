@@ -11,6 +11,7 @@ from gpytorch.means import ConstantMean, ZeroMean, LinearMean
 from gpytorch.kernels import RBFKernel, ScaleKernel
 from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution
 from gpytorch.distributions import MultivariateNormal
+from gpytorch.likelihoods import GaussianLikelihood
 
 
 # Wraps the input tuple for a function to process a time x batch x features sequence in batch x features (assumes one output)
@@ -257,6 +258,7 @@ class RecurrentGP(DeepGP):
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device).to(device=device)
         self.num_mixture_samples = num_mixture_samples
         self.noise = noise
+        self.likelihood = GaussianLikelihood()
     
     def forward(self, init_states, actions):
         with gpytorch.settings.num_likelihood_samples(self.num_mixture_samples):

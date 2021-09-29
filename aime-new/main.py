@@ -15,7 +15,7 @@ from models import bottle, Encoder, ObservationModel, RecurrentGP, SampleLayer
 from planner import ActorCriticPlanner
 from utils import lineplot, write_video
 import gpytorch
-
+from gpytorch.mlls import DeepApproximateMLL, VariationalELBO
 
 # Hyperparameters
 parser = argparse.ArgumentParser(description='PlaNet')
@@ -135,6 +135,8 @@ if args.models is not '' and os.path.exists(args.models):
 global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.device), torch.ones(args.batch_size, args.state_size, device=args.device))  # Global prior N(0, I)
 free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.device)  # Allowed deviation in KL divergence
 
+reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, args.batch_size*(args.chunk_size-args.lagging_size-1)))
+
 # Training (and testing)
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
   # Model fitting
@@ -151,7 +153,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
     else:
       true_rewards = rewards[args.lagging_size+args.horizon_size:]
-    reward_loss = F.mse_loss(predicted_rewards.squeeze(-1), true_rewards, reduction='none').mean(dim=(0, 1))
+    reward_loss = -reward_mll(predicted_rewards, true_rewards)
     posterior_states = posterior_states.to(device=args.device)
     posterior_actions = posterior_actions.to(device=args.device)
     observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
