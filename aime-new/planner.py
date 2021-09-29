@@ -118,8 +118,8 @@ class ActorCriticPlanner(nn.Module):
     self.action_size, self.action_noise, self.min_action, self.max_action = action_size, action_noise, min_action, max_action
     self.latent_size = latent_size
     self.fc1 = nn.Linear(latent_size + (1+action_size+hidden_size)*num_sample_trajectories, latent_size + 1)
-    self.actor = PolicyNetwork(latent_size, action_size, hidden_size)
-    self.critic = ValueNetwork(latent_size, hidden_size)
+    self.actor = PolicyNetwork(latent_size, action_size, num_sample_trajectories)
+    self.critic = ValueNetwork(latent_size, num_sample_trajectories)
     self.q_network = QNetwork(latent_size, action_size)
     self.transition_gp = build_gp(latent_size+action_size, latent_size)
     self.recurrent_gp = recurrent_gp
@@ -132,7 +132,7 @@ class ActorCriticPlanner(nn.Module):
   def forward(self, lagging_states, lagging_actions):
     current_state = lagging_states[-1].view(1, self.latent_size)
     imagined_reward = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories)
-    embedding = torch.cat([current_state,imagined_reward], dim=-1)
+    embedding = torch.cat([current_state,imagined_reward.squeeze(dim=-2)], dim=-1)
     policy_mean, policy_std = self.actor(embedding)
     value = self.critic(embedding)
     return policy_mean, policy_std, value, current_state
