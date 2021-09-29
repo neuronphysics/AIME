@@ -203,8 +203,12 @@ def Encoder(symbolic, observation_size, embedding_size, activation_function='rel
 
 class DGPHiddenLayer(DeepGPLayer):
     def __init__(self, input_dims, output_dims, device, num_inducing=5):
-        inducing_points = torch.randn(output_dims, num_inducing, input_dims).to(device=device)
-        batch_shape = torch.Size([output_dims])
+        if output_dims is None:
+            inducing_points = torch.randn(num_inducing, input_dims).to(device=device)
+            batch_shape = torch.Size([])
+        else:
+            inducing_points = torch.randn(output_dims, num_inducing, input_dims).to(device=device)
+            batch_shape = torch.Size([output_dims])
 
         variational_distribution = CholeskyVariationalDistribution(
             num_inducing_points=num_inducing,
@@ -242,7 +246,7 @@ class PolicyGP(DGPHiddenLayer):
 
 class RewardGP(DGPHiddenLayer):
     def __init__(self, latent_size, action_size, lagging_size, device):
-      super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, 1, device)
+      super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, None, device)
       self.mean_module = ZeroMean()
 
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??

@@ -154,7 +154,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
       else:
         true_rewards = rewards[args.lagging_size+args.horizon_size:]
-      reward_loss = -reward_mll(predicted_rewards, true_rewards)
+      reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
       posterior_states = posterior_states.to(device=args.device)
       posterior_actions = posterior_actions.to(device=args.device)
       observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
