@@ -272,29 +272,24 @@ class RecurrentGP(DeepGP):
         #w_hat = None
         lagging_actions = actions
         lagging_states = init_states
-        posterior_states = torch.empty((self.horizon_size, init_states.size(0), init_states.size(1), self.latent_size))
-        posterior_actions = torch.empty((self.horizon_size+1, init_states.size(0), init_states.size(1), self.action_size))
         for i in range(self.horizon_size):
             # policy distribution
             #w_hat = lagging_states # may have to change this to lagging_states[:-1] later
             a = self.policy_modules[i](lagging_states).rsample().squeeze(0)
             a = a + self.noise * torch.randn_like(a)
-            posterior_actions[i] = a
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
             # transition distribution
             z = self.transition_modules[i](z_hat).rsample().squeeze(0)
             z = z + self.noise * torch.randn_like(z)
             # first dimension of z is the number of Gaussian mixtures (z.size(0))
-            posterior_states[i] = z
             lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
         
         # last policy in the horizon
         a = self.policy_modules[self.horizon_size](lagging_states).rsample().squeeze(0)
         a = a + self.noise * torch.randn_like(a)
-        posterior_actions[self.horizon_size] = a
         lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
         z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
         rewards = self.reward_gp(z_hat)
-        return rewards, posterior_actions, posterior_states
+        return rewards
