@@ -67,7 +67,7 @@ parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='H
 parser.add_argument('--lagging-size', type=int, default=2, metavar='La', help='Lagging size')
 parser.add_argument('--cumulative-reward', action='store_true', help='Model cumulative rewards')
 parser.add_argument('--num-planning-steps', type=int, default=5, metavar='I2A', help='number of steps in the I2A part')
-parser.add_argument('--temperature-factor', type=int, default=1, metavar='Temp', help='Temperature factor')
+parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
 parser.add_argument('--discount-factor', type=float, default=0.99, metavar='Temp', help='Discount factor')
 
 
