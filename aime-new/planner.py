@@ -3,6 +3,7 @@ import torch
 from torch import jit
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.distributions import Normal
 
 import gpytorch
 
@@ -116,6 +117,8 @@ class ActorCriticPlanner(nn.Module):
   def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, action_noise, num_sample_trajectories=10, hidden_size=1, temperature=1):
     super().__init__()
     self.action_size, self.action_noise, self.min_action, self.max_action = action_size, action_noise, min_action, max_action
+    self.action_scale = (self.max_action - self.min_action) / 2
+    self.action_bias = (self.max_action + self.min_action) / 2
     self.latent_size = latent_size
     self.fc1 = nn.Linear(latent_size + (1+action_size+hidden_size)*num_sample_trajectories, latent_size + 1)
     self.actor = PolicyNetwork(latent_size, action_size, num_sample_trajectories)
@@ -151,9 +154,10 @@ class ActorCriticPlanner(nn.Module):
   def act(self, prior_states, prior_actions, explore=False):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
     policy_mean, policy_std, value, current_state= self.forward(prior_states, prior_actions)
-    policy_action = policy_mean + torch.randn_like(policy_mean) * policy_std
-    if explore:
-      policy_action = policy_action + self.action_noise * torch.randn_like(policy_action)
+    policy_dist = Normal(policy_mean, policy_std)
+    policy_action = policy_dist.rsample()
+    policy_log_prob = policy_dist.log_prob(policy_action)
+    normalized_policy_action = torch.tanh(policy_action) * self.action_scale + self.action_bias
     policy_action.clamp_(min=self.min_action, max=self.max_action)
     q_value = self.q_network(current_state, policy_action)
-    return policy_action, value, policy_mean, policy_std, q_value
+    return normalized_policy_action, policy_log_prob, value, q_value

@@ -205,7 +205,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       next_observation, reward, done = env.step(action.cpu())
       episode_states[time_step] = current_latent_state
     else:
-      action, value, policy_mean, policy_std, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=False)
+      action, action_log_prob, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=False)
+      episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).sum(dim=-1, keepdim=True)], dim=0)
       next_observation, reward, done = env.step(action[0].cpu())
       episode_states = torch.cat([episode_states, current_latent_state], dim=0)
       episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
@@ -217,10 +218,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     observation = next_observation
     with torch.no_grad():
       _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
-    if time_step >= args.lagging_size:
-      policy_dist = Normal(policy_mean, policy_std)
-      policy_kl = -policy_dist.log_prob(action)
-      episode_policy_kl = torch.cat([episode_policy_kl, policy_kl.sum(dim=-1, keepdim=True)], dim=0)
     time_step += 1
     
     #if (time_step % args.num_planning_steps == 0) or done:
@@ -294,7 +291,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           episode_states[time_step] = current_latent_state
           done = torch.Tensor([done])
         else:
-          action, _, _, _, _, = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=False)
+          action, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=False)
           next_observation, reward, done = test_envs.step(action.cpu())
           episode_states = torch.cat([episode_states, current_latent_state], dim=0)
           episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
