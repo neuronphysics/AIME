@@ -405,7 +405,7 @@ class Hiway:
 
   @property
   def action_range(self):
-    return float(self.action_space.low[0]), float(self.action_space.high[0])
+    return (self.action_space.low, self.action_space.high)
   
   # Sample an action randomly from a uniform distribution over all valid actions
   def sample_random_action(self):
