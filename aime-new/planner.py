@@ -158,6 +158,6 @@ class ActorCriticPlanner(nn.Module):
     policy_action = policy_dist.rsample()
     policy_log_prob = policy_dist.log_prob(policy_action)
     normalized_policy_action = torch.tanh(policy_action) * self.action_scale + self.action_bias
-    policy_action.clamp_(min=self.min_action, max=self.max_action)
+    normalized_policy_action.clamp_(min=self.min_action, max=self.max_action)
     q_value = self.q_network(current_state, policy_action)
     return normalized_policy_action, policy_log_prob, value, q_value
