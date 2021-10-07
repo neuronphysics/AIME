@@ -188,7 +188,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
   episode_states, episode_actions = torch.empty(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.Tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device) 
   episode_actions += torch.randn_like(episode_actions) * torch.Tensor((env.action_range[1] - env.action_range[0]) / 2).to(device=args.device)
-  episode_actions = torch.min(torch.max(episode_actions, env.action_range[0]), env.action_range[1])
+  episode_actions = torch.min(torch.max(episode_actions, torch.Tensor(env.action_range[0])), torch.Tensor(env.action_range[1]))
   episode_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_q_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_rewards = torch.zeros(args.lagging_size, 1, device=args.device)
@@ -281,7 +281,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
       episode_states, episode_actions = torch.empty(args.lagging_size, args.state_size, device=args.device), torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.Tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
       episode_actions += torch.randn_like(episode_actions) * torch.Tensor((env.action_range[1] - env.action_range[0]) / 2).to(device=args.device)
-      episode_actions = torch.min(torch.max(episode_actions, env.action_range[0]), env.action_range[1])
+      episode_actions = torch.min(torch.max(episode_actions, torch.Tensor(env.action_range[0])), torch.Tensor(env.action_range[1]))
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
         _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
