@@ -3,7 +3,11 @@ import torch
 from torch import jit
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.distributions import Normal
 
+import gpytorch
+
+from dlgpd.gp import build_gp
 
 # Model-predictive control planner with cross-entropy method and learned transition model
 class MPCPlanner(jit.ScriptModule):
@@ -110,15 +114,17 @@ class RolloutEncoder(nn.Module):
     return embedding
 
 class ActorCriticPlanner(nn.Module):
-  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, action_noise, num_sample_trajectories=10, hidden_size=8, temperature=1):
+  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, action_noise, num_sample_trajectories=10, hidden_size=1, temperature=1):
     super().__init__()
     self.action_size, self.action_noise, self.min_action, self.max_action = action_size, action_noise, min_action, max_action
+    self.action_scale = (self.max_action - self.min_action) / 2
+    self.action_bias = (self.max_action + self.min_action) / 2
     self.latent_size = latent_size
     self.fc1 = nn.Linear(latent_size + (1+action_size+hidden_size)*num_sample_trajectories, latent_size + 1)
-    self.actor = PolicyNetwork(latent_size, action_size, hidden_size)
-    self.critic = ValueNetwork(latent_size, hidden_size)
+    self.actor = PolicyNetwork(latent_size, action_size, num_sample_trajectories)
+    self.critic = ValueNetwork(latent_size, num_sample_trajectories)
     self.q_network = QNetwork(latent_size, action_size)
-    self.transition_network = TransitionNetwork(latent_size, action_size)
+    self.transition_gp = build_gp(latent_size+action_size, latent_size)
     self.recurrent_gp = recurrent_gp
     self.rollout_encoder = RolloutEncoder(latent_size, action_size, hidden_size, num_sample_trajectories)
     self.num_sample_trajectories = num_sample_trajectories
@@ -128,42 +134,30 @@ class ActorCriticPlanner(nn.Module):
 
   def forward(self, lagging_states, lagging_actions):
     current_state = lagging_states[-1].view(1, self.latent_size)
-    imagined_reward, imagined_actions, imagined_states = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories)
-    rollout_embedding = self.rollout_encoder(imagined_reward.squeeze(0), imagined_actions.squeeze(1), imagined_states.squeeze(1))
-    embedding = torch.cat([current_state,rollout_embedding], dim=-1)
+    imagined_reward = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories)
+    embedding = torch.cat([current_state,imagined_reward.squeeze(dim=-2)], dim=-1)
     policy_mean, policy_std = self.actor(embedding)
     value = self.critic(embedding)
-    prior_next_state = imagined_states[0]
-    prior_next_action = imagined_actions[0]
-    return policy_mean, policy_std, value, current_state, prior_next_state, prior_next_action
+    return policy_mean, policy_std, value, current_state
   
   def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories):
     self.recurrent_gp.eval()
     with torch.no_grad():
-      rewards, posterior_actions, posterior_states = self.recurrent_gp(
-        torch.flatten(lagging_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
-        lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
-      )
+      with gpytorch.settings.num_likelihood_samples(1):
+        rewards = self.recurrent_gp(
+          torch.flatten(lagging_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
+          lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
+        )
     self.recurrent_gp.train()
-    return rewards.cuda(), posterior_actions.cuda(), posterior_states.cuda()
+    return rewards.rsample().cuda()
   
   def act(self, prior_states, prior_actions, explore=False):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
-    policy_mean, policy_std, value, current_state, prior_next_state, prior_next_action = self.forward(prior_states, prior_actions)
-    policy_action = policy_mean + torch.randn_like(policy_mean) * policy_std
-    if explore:
-      policy_action = policy_action + self.action_noise * torch.randn_like(policy_action)
-    policy_action.clamp_(min=self.min_action, max=self.max_action)
+    policy_mean, policy_std, value, current_state= self.forward(prior_states, prior_actions)
+    policy_dist = Normal(policy_mean, policy_std)
+    policy_action = policy_dist.rsample()
+    policy_log_prob = policy_dist.log_prob(policy_action)
+    normalized_policy_action = torch.tanh(policy_action) * torch.Tensor(self.action_scale).cuda() + torch.Tensor(self.action_bias).cuda()
+    normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.Tensor(self.min_action).cuda()), torch.Tensor(self.max_action).cuda())
     q_value = self.q_network(current_state, policy_action)
-    next_state_mean, next_state_std = self.transition_network(current_state, policy_action)
-    prior_next_state = prior_next_state.mean(dim=-2)
-    prior_next_action = prior_next_action.mean(dim=-2)
-    return policy_action, value, policy_mean, policy_std, q_value, next_state_mean, next_state_std, prior_next_state, prior_next_action
-  
-  def compute_returns(self, final_value, rewards, gamma=0.99):
-    num_steps = rewards.size(0)
-    returns   = torch.zeros(num_steps + 1, 1).cuda()
-    returns[-1] = final_value
-    for step in reversed(range(num_steps)):
-        returns[step] = returns[step + 1] * gamma + rewards[step]
-    return returns[:-1]
+    return normalized_policy_action, policy_log_prob, value, q_value
