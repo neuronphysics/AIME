@@ -5,7 +5,7 @@ from gym.spaces import Box
 import pybullet_envs
 
 
-GYM_ENVS = ['Pendulum-v0', 'MountainCarContinuous-v0', 'CarRacing-v0', 'CartPoleContinuousBulletEnv-v0', 'AntBulletEnv-v0', 'HalfCheetahBulletEnv-v0', 'HopperBulletEnv-v0', 'HopperBulletEnv-v0', 'HumanoidStandup-v2', 'InvertedDoublePendulum-v2', 'InvertedPendulum-v2', 'Reacher-v2', 'Swimmer-v2', 'Walker2DBulletEnv-v0']
+GYM_ENVS = ['HumanoidBulletEnv-v0', 'Pendulum-v0', 'MountainCarContinuous-v0', 'CarRacing-v0', 'CartPoleContinuousBulletEnv-v0', 'AntBulletEnv-v0', 'HalfCheetahBulletEnv-v0', 'HopperBulletEnv-v0', 'HopperBulletEnv-v0', 'HumanoidStandup-v2', 'InvertedDoublePendulum-v2', 'InvertedPendulum-v2', 'Reacher-v2', 'Swimmer-v2', 'Walker2DBulletEnv-v0']
 CONTROL_SUITE_ENVS = ['cartpole-balance', 'cartpole-swingup', 'reacher-easy', 'finger-spin', 'cheetah-run', 'ball_in_cup-catch', 'walker-walk']
 CONTROL_SUITE_ACTION_REPEATS = {'cartpole': 8, 'reacher': 4, 'finger': 2, 'cheetah': 4, 'ball_in_cup': 6, 'walker': 2}
 
@@ -90,7 +90,6 @@ def get_closest_point_index(pts_arr, pts):
 
 
 def get_path_to_goal(goal, paths, start):
-    goal_pos = goal.position
     start_pos = start.position
     path_start_pts = [each[0].pos for each in paths]
 
@@ -102,7 +101,6 @@ def get_path_to_goal(goal, paths, start):
     goal_lane_index = middle_point.lane_index
 
     path_pts = [each.pos for each in path]
-    end_path_ind = get_closest_point_index(path_pts, goal_pos)
 
     return path
 
@@ -132,7 +130,6 @@ def adapt(observation: Observation, reward: float) -> float:
 
     # Distance to goal
     ego_2d_position = ego_observation.position[0:2]
-    goal_dist = euclidean(ego_2d_position, goal.position)
 
     closest_wp, _ = get_closest_waypoint(
         num_lookahead=_WAYPOINTS,
@@ -408,7 +405,7 @@ class Hiway:
 
   @property
   def action_range(self):
-    return float(self.action_space.low[0]), float(self.action_space.high[0])
+    return (self.action_space.low, self.action_space.high)
   
   # Sample an action randomly from a uniform distribution over all valid actions
   def sample_random_action(self):
