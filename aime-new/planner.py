@@ -114,23 +114,20 @@ class RolloutEncoder(nn.Module):
     return embedding
 
 class ActorCriticPlanner(nn.Module):
-  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, action_noise, num_sample_trajectories=10, hidden_size=1, temperature=1):
+  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, num_sample_trajectories):
     super().__init__()
-    self.action_size, self.action_noise, self.min_action, self.max_action = action_size, action_noise, min_action, max_action
+    self.action_size, self.action_noise, self.min_action, self.max_action = action_size, min_action, max_action
     self.action_scale = (self.max_action - self.min_action) / 2
     self.action_bias = (self.max_action + self.min_action) / 2
     self.latent_size = latent_size
-    self.fc1 = nn.Linear(latent_size + (1+action_size+hidden_size)*num_sample_trajectories, latent_size + 1)
     self.actor = PolicyNetwork(latent_size, action_size, num_sample_trajectories)
     self.critic = ValueNetwork(latent_size, num_sample_trajectories)
     self.q_network = QNetwork(latent_size, action_size)
     self.transition_gp = build_gp(latent_size+action_size, latent_size)
     self.recurrent_gp = recurrent_gp
-    self.rollout_encoder = RolloutEncoder(latent_size, action_size, hidden_size, num_sample_trajectories)
+    #self.rollout_encoder = RolloutEncoder(latent_size, action_size, hidden_size, num_sample_trajectories)
     self.num_sample_trajectories = num_sample_trajectories
-    self.hidden_size = hidden_size
     self.lagging_size = lagging_size
-    self.temperature = temperature
 
   def forward(self, lagging_states, lagging_actions):
     current_state = lagging_states[-1].view(1, self.latent_size)
@@ -151,7 +148,7 @@ class ActorCriticPlanner(nn.Module):
     self.recurrent_gp.train()
     return rewards.rsample().cuda()
   
-  def act(self, prior_states, prior_actions, explore=False):
+  def act(self, prior_states, prior_actions):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
     policy_mean, policy_std, value, current_state = self.forward(prior_states, prior_actions)
     policy_dist = Normal(policy_mean, policy_std)

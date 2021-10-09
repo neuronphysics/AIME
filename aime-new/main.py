@@ -66,10 +66,9 @@ parser.add_argument('--render', action='store_true', help='Render environment')
 parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='Horizon size')
 parser.add_argument('--lagging-size', type=int, default=2, metavar='La', help='Lagging size')
 parser.add_argument('--cumulative-reward', action='store_true', help='Model cumulative rewards')
-parser.add_argument('--num-planning-steps', type=int, default=5, metavar='I2A', help='number of steps in the I2A part')
+parser.add_argument('--num-sample-trajectories', type=int, default=10, metavar='nst', help='number of trajectories sample in the imagination part')
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
 parser.add_argument('--discount-factor', type=float, default=0.99, metavar='Temp', help='Discount factor')
-
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -120,7 +119,7 @@ sample_layer = SampleLayer(args.embedding_size, args.state_size).to(device=args.
 param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters()) + list(sample_layer.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
-actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.action_noise).to(device=args.device)
+actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories).to(device=args.device)
 planning_optimiser = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 if args.models is not '' and os.path.exists(args.models):
   model_dicts = torch.load(args.models)
@@ -234,8 +233,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       outputs = actor_critic_planner.transition_gp.predict(
           scaled_X, suppress_eval_mode_warning=False
       )
-      sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([10])) for o in outputs]), 0, 1)
-      print(sample_outputs.size())
+      sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([args.num_sample_trajectories])) for o in outputs]), 0, 2).mean(dim=-2)
       episode_state_kl = torch.pow(sample_outputs - episode_states[1:], 2).mean(dim=-1, keepdim=True)
       kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])))
   ##
