@@ -233,11 +233,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       outputs = actor_critic_planner.transition_gp.predict(
           scaled_X, suppress_eval_mode_warning=False
       )
-      sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([args.num_sample_trajectories])) for o in outputs]), 0, 2).mean(dim=-2)
-      episode_state_kl = torch.pow(sample_outputs - episode_states[1:], 2).mean(dim=-1, keepdim=True)
+      sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([args.num_sample_trajectories])) for o in outputs]), 0, 2)
+      episode_state_kl = torch.pow(sample_outputs.mean(dim=-2) - episode_states[1:], 2).mean(dim=-1, keepdim=True)
       kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])))
   ##
   soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
+  expected_next_values = [torch.stack([actor_critic_planner.act(state.unsqueeze(dim=0), curr_action.unsqueeze(dim=0))[2] for state in next_states]).sum() for next_states, curr_action in zip(sample_outputs, episode_actions)]
+  print(expected_next_values)
   target_q_values = args.temperature_factor * episode_rewards[:-1] + args.discount_factor * episode_values[1:]
   value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
   q_loss = F.mse_loss(episode_q_values[:-1], target_q_values, reduction='none').mean()
