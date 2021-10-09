@@ -116,7 +116,7 @@ class RolloutEncoder(nn.Module):
 class ActorCriticPlanner(nn.Module):
   def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, num_sample_trajectories):
     super().__init__()
-    self.action_size, self.action_noise, self.min_action, self.max_action = action_size, min_action, max_action
+    self.action_size, self.min_action, self.max_action = action_size, min_action, max_action
     self.action_scale = (self.max_action - self.min_action) / 2
     self.action_bias = (self.max_action + self.min_action) / 2
     self.latent_size = latent_size
