@@ -187,7 +187,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   with torch.no_grad():
     _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
   episode_states = torch.empty(args.lagging_size, args.state_size, device=args.device)
-  episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.Tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
+  episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
   episode_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_q_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_rewards = torch.zeros(args.lagging_size, 1, device=args.device)
@@ -279,7 +279,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     with torch.no_grad():
       observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
       episode_states = torch.empty(args.lagging_size, args.state_size, device=args.device)
-      episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.Tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
+      episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
         _, _, current_latent_state = sample_layer(encoder(observation.to(device=args.device)))
