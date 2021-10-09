@@ -234,7 +234,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       outputs = actor_critic_planner.transition_gp.predict(
           scaled_X, suppress_eval_mode_warning=False
       )
-      sample_outputs = torch.transpose(torch.stack([o.rsample() for o in outputs]), 0, 1)
+      sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([10])) for o in outputs]), 0, 1)
+      print(sample_outputs.size())
       episode_state_kl = torch.pow(sample_outputs - episode_states[1:], 2).mean(dim=-1, keepdim=True)
       kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])))
   ##
