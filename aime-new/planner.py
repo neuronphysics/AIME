@@ -157,7 +157,7 @@ class ActorCriticPlanner(nn.Module):
     policy_dist = Normal(policy_mean, policy_std)
     policy_action = policy_dist.rsample()
     policy_log_prob = policy_dist.log_prob(policy_action)
-    normalized_policy_action = torch.tanh(policy_action) * torch.Tensor(self.action_scale).cuda() + torch.Tensor(self.action_bias).cuda()
-    normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.Tensor(self.min_action).cuda()), torch.Tensor(self.max_action).cuda())
+    normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).cuda() + torch.tensor(self.action_bias).cuda()
+    normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.tensor(self.min_action).cuda()), torch.tensor(self.max_action).cuda())
     q_value = self.q_network(current_state, policy_action)
     return normalized_policy_action, policy_log_prob, value, q_value
