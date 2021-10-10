@@ -114,9 +114,8 @@ elif not args.test:
 observation_model = ObservationModel(args.symbolic_env, env.observation_size, args.state_size, args.embedding_size, args.activation_function).to(device=args.device)
 encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.activation_function).to(device=args.device)
 recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, args.lagging_size, args.device).to(device=args.device)
-sample_layer = SampleLayer(args.embedding_size, args.state_size).to(device=args.device)
 
-param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters()) + list(sample_layer.parameters())
+param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
 actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories).to(device=args.device)
@@ -126,7 +125,6 @@ if args.models is not '' and os.path.exists(args.models):
   observation_model.load_state_dict(model_dicts['observation_model'])
   recurrent_gp.load_state_dict(model_dicts['recurrent_gp'])
   encoder.load_state_dict(model_dicts['encoder'])
-  sample_layer.load_state_dict(model_dicts['sample_layer'])
   optimiser.load_state_dict(model_dicts['optimiser'])
   actor_critic_planner.load_state_dict(model_dicts['actor_critic_planner'])
   planning_optimiser.load_state_dict(model_dicts['planning_optimiser'])
@@ -180,6 +178,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
   # Data collection
   ##with torch.no_grad():
+  encoder.eval()
   observation, total_reward, time_step = env.reset(), 0, 0
   with torch.no_grad():
     current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
@@ -193,10 +192,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   pbar = tqdm(range(args.max_episode_length // args.action_repeat))
   time_steps = 0
   for t in pbar:
-    sample_layer.eval()
-    encoder.eval()
-    sample_layer.train()
-    encoder.train()
     if time_step < args.lagging_size:
       action = episode_actions[time_step]
       next_observation, reward, done = env.step(action.cpu())
@@ -264,13 +259,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['kl_transition_loss']):], metrics['kl_transition_loss'], 'kl_transition_loss', results_dir)
 
+  encoder.train()
+
   # Test model
   if episode % args.test_interval == 0:
     # Set models to eval mode
     observation_model.eval()
     encoder.eval()
     recurrent_gp.eval()
-    sample_layer.eval()
     actor_critic_planner.eval()
     # Initialise parallelised test environments
     test_envs = EnvBatcher(Env, (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth), {}, args.test_episodes)
@@ -317,7 +313,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     observation_model.train()
     encoder.train()
     recurrent_gp.train()
-    sample_layer.train()
     actor_critic_planner.train()
     # Close test environments
     test_envs.close()
@@ -330,7 +325,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       'encoder': encoder.state_dict(),
       'recurrent_gp': recurrent_gp.state_dict(),
       'optimiser': optimiser.state_dict(),
-      'sample_layer': sample_layer.state_dict(),
       'actor_critic_planner': actor_critic_planner.state_dict(),
       'planning_optimiser': planning_optimiser.state_dict(),
       }, os.path.join(results_dir, 'models_%d.pth' % episode))
