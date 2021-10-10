@@ -30,14 +30,14 @@ parser.add_argument('--activation-function', type=str, default='relu', choices=d
 parser.add_argument('--embedding-size', type=int, default=1024, metavar='E', help='Observation embedding size')  # Note that the default encoder for visual observations outputs a 1024D vector; for other embedding sizes an additional fully-connected layer is used
 parser.add_argument('--hidden-size', type=int, default=200, metavar='H', help='Hidden size')
 parser.add_argument('--belief-size', type=int, default=200, metavar='H', help='Belief/hidden size')
-parser.add_argument('--state-size', type=int, default=5, metavar='Z', help='State/latent size')
+parser.add_argument('--state-size', type=int, default=10, metavar='Z', help='State/latent size')
 parser.add_argument('--action-repeat', type=int, default=1, metavar='R', help='Action repeat')
 parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', help='Action noise')
-parser.add_argument('--episodes', type=int, default=1000, metavar='E', help='Total number of episodes')
+parser.add_argument('--episodes', type=int, default=10000, metavar='E', help='Total number of episodes')
 parser.add_argument('--seed-episodes', type=int, default=5, metavar='S', help='Seed episodes')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C', help='Collect interval')
 parser.add_argument('--batch-size', type=int, default=50, metavar='B', help='Batch size')
-parser.add_argument('--chunk-size', type=int, default=50, metavar='L', help='Chunk size')
+parser.add_argument('--chunk-size', type=int, default=10, metavar='L', help='Chunk size')
 parser.add_argument('--overshooting-distance', type=int, default=50, metavar='D', help='Latent overshooting distance/latent overshooting weight for t = 1')
 parser.add_argument('--overshooting-kl-beta', type=float, default=0, metavar='β>1', help='Latent overshooting KL weight for t > 1 (0 to disable)')
 parser.add_argument('--overshooting-reward-scale', type=float, default=0, metavar='R>1', help='Latent overshooting reward prediction weight for t > 1 (0 to disable)')
@@ -54,7 +54,7 @@ parser.add_argument('--optimisation-iters', type=int, default=10, metavar='I', h
 parser.add_argument('--candidates', type=int, default=1000, metavar='J', help='Candidate samples per iteration')
 parser.add_argument('--top-candidates', type=int, default=100, metavar='K', help='Number of top candidates to fit')
 parser.add_argument('--test', action='store_true', help='Test only')
-parser.add_argument('--test-interval', type=int, default=25, metavar='I', help='Test interval (episodes)')
+parser.add_argument('--test-interval', type=int, default=10, metavar='I', help='Test interval (episodes)')
 parser.add_argument('--test-episodes', type=int, default=1, metavar='E', help='Number of test episodes')
 parser.add_argument('--checkpoint-interval', type=int, default=50, metavar='I', help='Checkpoint interval (episodes)')
 parser.add_argument('--checkpoint-experience', action='store_true', help='Checkpoint experience replay')
@@ -66,10 +66,9 @@ parser.add_argument('--render', action='store_true', help='Render environment')
 parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='Horizon size')
 parser.add_argument('--lagging-size', type=int, default=2, metavar='La', help='Lagging size')
 parser.add_argument('--cumulative-reward', action='store_true', help='Model cumulative rewards')
-parser.add_argument('--num-planning-steps', type=int, default=5, metavar='I2A', help='number of steps in the I2A part')
+parser.add_argument('--num-sample-trajectories', type=int, default=10, metavar='nst', help='number of trajectories sample in the imagination part')
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
-parser.add_argument('--discount-factor', type=float, default=0.99, metavar='Temp', help='Discount factor')
-
+parser.add_argument('--discount-factor', type=float, default=0.999, metavar='Temp', help='Discount factor')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -120,7 +119,7 @@ sample_layer = SampleLayer(args.embedding_size, args.state_size).to(device=args.
 param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters()) + list(sample_layer.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
-actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.action_noise).to(device=args.device)
+actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories).to(device=args.device)
 planning_optimiser = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 if args.models is not '' and os.path.exists(args.models):
   model_dicts = torch.load(args.models)
@@ -204,7 +203,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       next_observation, reward, done = env.step(action.cpu())
       episode_states[time_step] = current_latent_state
     else:
-      action, action_log_prob, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=False)
+      action, action_log_prob, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:])
       episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).sum(dim=-1, keepdim=True)], dim=0)
       next_observation, reward, done = env.step(action[0].cpu())
       episode_states = torch.cat([episode_states, current_latent_state], dim=0)
@@ -234,7 +233,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       outputs = actor_critic_planner.transition_gp.predict(
           scaled_X, suppress_eval_mode_warning=False
       )
-      sample_outputs = torch.transpose(torch.stack([o.rsample() for o in outputs]), 0, 1)
+      sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([args.num_sample_trajectories])) for o in outputs]), 0, 2).mean(dim=-2)
       episode_state_kl = torch.pow(sample_outputs - episode_states[1:], 2).mean(dim=-1, keepdim=True)
       kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])))
   ##
@@ -289,7 +288,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           episode_states[time_step] = current_latent_state
           done = torch.Tensor([done])
         else:
-          action, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], explore=False)
+          action, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:])
           next_observation, reward, done = test_envs.step(action.cpu())
           episode_states = torch.cat([episode_states, current_latent_state], dim=0)
           episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
