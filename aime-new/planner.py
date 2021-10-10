@@ -51,19 +51,19 @@ class ValueNetwork(nn.Module):
     self.latent_size = latent_size
     self.fc = nn.Linear(latent_size + hidden_size, 1)
   
-  def forward(self, x):
-    value = self.fc(x)
+  def forward(self, embedding):
+    value = self.fc(embedding)
     return value
 
 class QNetwork(nn.Module):
-  def __init__(self, latent_size, action_size):
+  def __init__(self, latent_size, num_sample_trajectories, action_size):
     super().__init__()
     self.latent_size = latent_size
     self.action_size = action_size
-    self.fc = nn.Linear(latent_size + action_size, 1)
+    self.fc = nn.Linear(latent_size + num_sample_trajectories + action_size, 1)
   
-  def forward(self, state, action):
-    q_value = self.fc(torch.cat([state, action], dim=-1))
+  def forward(self, embedding, action):
+    q_value = self.fc(torch.cat([embedding, action], dim=-1))
     return q_value
 
 class PolicyNetwork(nn.Module):
@@ -74,9 +74,9 @@ class PolicyNetwork(nn.Module):
     self.fc_mean = nn.Linear(latent_size + hidden_size, action_size)
     self.fc_std = nn.Linear(latent_size + hidden_size, action_size)
   
-  def forward(self, x):
-    policy_mean = self.fc_mean(x)
-    policy_std = F.softplus(self.fc_std(x))
+  def forward(self, embedding):
+    policy_mean = self.fc_mean(embedding)
+    policy_std = F.softplus(self.fc_std(embedding))
     return policy_mean, policy_std
 
 class TransitionNetwork(nn.Module):
@@ -122,10 +122,9 @@ class ActorCriticPlanner(nn.Module):
     self.latent_size = latent_size
     self.actor = PolicyNetwork(latent_size, action_size, num_sample_trajectories)
     self.critic = ValueNetwork(latent_size, num_sample_trajectories)
-    self.q_network = QNetwork(latent_size, action_size)
+    self.q_network = QNetwork(latent_size, num_sample_trajectories, action_size)
     self.transition_gp = build_gp(latent_size+action_size, latent_size)
     self.recurrent_gp = recurrent_gp
-    #self.rollout_encoder = RolloutEncoder(latent_size, action_size, hidden_size, num_sample_trajectories)
     self.num_sample_trajectories = num_sample_trajectories
     self.lagging_size = lagging_size
 
@@ -135,7 +134,7 @@ class ActorCriticPlanner(nn.Module):
     embedding = torch.cat([current_state,imagined_reward.squeeze(dim=-2)], dim=-1)
     policy_mean, policy_std = self.actor(embedding)
     value = self.critic(embedding)
-    return policy_mean, policy_std, value, current_state
+    return policy_mean, policy_std, value, embedding
   
   def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories):
     self.recurrent_gp.eval()
@@ -150,11 +149,11 @@ class ActorCriticPlanner(nn.Module):
   
   def act(self, prior_states, prior_actions):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
-    policy_mean, policy_std, value, current_state = self.forward(prior_states, prior_actions)
+    policy_mean, policy_std, value, embedding = self.forward(prior_states, prior_actions)
     policy_dist = Normal(policy_mean, policy_std)
     policy_action = policy_dist.rsample()
     policy_log_prob = policy_dist.log_prob(policy_action)
     normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).cuda() + torch.tensor(self.action_bias).cuda()
     normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.tensor(self.min_action).cuda()), torch.tensor(self.max_action).cuda())
-    q_value = self.q_network(current_state, policy_action)
+    q_value = self.q_network(embedding, policy_action)
     return normalized_policy_action, policy_log_prob, value, q_value
