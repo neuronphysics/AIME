@@ -183,7 +183,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   with torch.no_grad():
     current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
     current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
-  episode_states = torch.empty(args.lagging_size, args.state_size, device=args.device)
+  episode_states = torch.zeros(args.lagging_size, args.state_size, device=args.device)
+  episode_states[-1] = current_latent_state
   episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
   episode_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_q_values = torch.zeros(args.lagging_size, 1, device=args.device)
@@ -192,26 +193,19 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   pbar = tqdm(range(args.max_episode_length // args.action_repeat))
   time_steps = 0
   for t in pbar:
-    if time_step < args.lagging_size:
-      action = episode_actions[time_step]
-      next_observation, reward, done = env.step(action.cpu())
-      episode_states[time_step] = current_latent_state
-    else:
-      action, action_log_prob, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
-      episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).sum(dim=-1, keepdim=True)], dim=0)
-      next_observation, reward, done = env.step(action[0].cpu())
-      episode_states = torch.cat([episode_states, current_latent_state], dim=0)
-      episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
-      episode_values = torch.cat([episode_values, value], dim=0)
-      episode_q_values = torch.cat([episode_q_values, q_value], dim=0)
-      episode_rewards = torch.cat([episode_rewards, torch.Tensor([[reward]]).to(device=args.device)], dim=0)
-    D.append(observation, action.detach().cpu(), reward, done)
-    total_reward += reward
-    observation = next_observation
+    action, action_log_prob, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+    episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).sum(dim=-1, keepdim=True)], dim=0)
+    observation, reward, done = env.step(action[0].cpu())
     with torch.no_grad():
       current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
       current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
-    time_step += 1
+    episode_states = torch.cat([episode_states, current_latent_state], dim=0)
+    episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
+    episode_values = torch.cat([episode_values, value], dim=0)
+    episode_q_values = torch.cat([episode_q_values, q_value], dim=0)
+    episode_rewards = torch.cat([episode_rewards, torch.Tensor([[reward]]).to(device=args.device)], dim=0)
+    D.append(observation, action.detach().cpu(), reward, done)
+    total_reward += reward
     
     #if (time_step % args.num_planning_steps == 0) or done:
       # compute returns in reverse order in the episode reward list
@@ -222,6 +216,12 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       pbar.close()
       break
   
+  episode_actions = episode_actions[args.lagging_size:]
+  episode_values = episode_values[args.lagging_size:]
+  episode_q_values = episode_q_values[args.lagging_size:]
+  episode_rewards = episode_rewards[args.lagging_size:]
+  episode_policy_kl = episode_policy_kl[args.lagging_size:]
+  episode_states = episode_states[args.lagging_size-1:]
   # transition loss for gp, adapted from dlgpd repo
   scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[:-1], next_states=episode_states[1:], actions=episode_actions)
   with gpytorch.settings.prior_mode(True):
@@ -273,27 +273,22 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     
     with torch.no_grad():
       observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
-      episode_states = torch.empty(args.lagging_size, args.state_size, device=args.device)
+      episode_states = torch.zeros(args.lagging_size, args.state_size, device=args.device)
+      current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
+      current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
+      episode_states[-1] = current_latent_state
       episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
+        action, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+        observation, reward, done = test_envs.step(action.cpu())
         current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
         current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
-        if time_step < args.lagging_size:
-          action = episode_actions[time_step]
-          next_observation, reward, done = test_envs.step(action.unsqueeze(0).cpu())
-          episode_states[time_step] = current_latent_state
-          done = torch.Tensor([done])
-        else:
-          action, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
-          next_observation, reward, done = test_envs.step(action.cpu())
-          episode_states = torch.cat([episode_states, current_latent_state], dim=0)
-          episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
+        episode_states = torch.cat([episode_states, current_latent_state], dim=0)
+        episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
         total_rewards += reward.numpy()
-        time_step += 1
         if not args.symbolic_env:  # Collect real vs. predicted frames for video
           video_frames.append(make_grid(torch.cat([observation, observation_model(current_latent_state).cpu()], dim=3) + 0.5, nrow=5).numpy())  # Decentre
-        observation = next_observation
         if done.sum().item() == args.test_episodes:
           pbar.close()
           break
