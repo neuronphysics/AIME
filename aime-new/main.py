@@ -212,7 +212,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     if args.render:
       env.render()
     if done:
-      episode_states = torch.cat([episode_states, current_latent_state], dim=0) # add the last state
       pbar.close()
       break
   
