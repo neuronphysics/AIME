@@ -238,9 +238,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])))
   ##
   soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
-  expected_next_values = [torch.stack([actor_critic_planner.act(state.unsqueeze(dim=0), curr_action.unsqueeze(dim=0))[2] for state in next_states]).sum() for next_states, curr_action in zip(sample_outputs, episode_actions)]
-  print(expected_next_values)
-  target_q_values = args.temperature_factor * episode_rewards[:-1] + args.discount_factor * episode_values[1:]
+  expected_next_values = torch.stack([torch.log(torch.exp(torch.stack([actor_critic_planner.act(state.unsqueeze(dim=0), curr_action.unsqueeze(dim=0))[2] for state in next_states])).mean()) for next_states, curr_action in zip(sample_outputs, episode_actions)])
+  target_q_values = args.temperature_factor * episode_rewards[:-1] + args.discount_factor * expected_next_values[:-1].unsqueeze(dim=-1)
   value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
   q_loss = F.mse_loss(episode_q_values[:-1], target_q_values, reduction='none').mean()
   policy_loss = (episode_policy_kl - episode_q_values + episode_values).mean()
