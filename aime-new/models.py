@@ -207,11 +207,11 @@ class SampleLayer(nn.Module):
     latent_state = latent_mean + torch.randn_like(latent_mean) * latent_std
     return latent_mean, latent_std, latent_state
 
-def Encoder(symbolic, observation_size, embedding_size, activation_function='relu'):
+def Encoder(symbolic, observation_size, embedding_size, state_size, activation_function='relu'):
   if symbolic:
     return SymbolicEncoder(observation_size, embedding_size, activation_function)
   else:
-    return VisualEncoder(embedding_size, activation_function)
+    return VisualEncoder(embedding_size, state_size, activation_function)
 
 class DGPHiddenLayer(DeepGPLayer):
     def __init__(self, input_dims, output_dims, device, num_inducing=5):
