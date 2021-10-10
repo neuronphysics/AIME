@@ -128,9 +128,9 @@ class ActorCriticPlanner(nn.Module):
     self.num_sample_trajectories = num_sample_trajectories
     self.lagging_size = lagging_size
 
-  def forward(self, lagging_states, lagging_actions):
+  def forward(self, lagging_states, lagging_actions, device):
     current_state = lagging_states[-1].view(1, self.latent_size)
-    imagined_reward = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories)
+    imagined_reward = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories).to(device=device)
     embedding = torch.cat([current_state,imagined_reward.squeeze(dim=-2)], dim=-1)
     policy_mean, policy_std = self.actor(embedding)
     value = self.critic(embedding)
@@ -145,15 +145,15 @@ class ActorCriticPlanner(nn.Module):
           lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
         )
     self.recurrent_gp.train()
-    return rewards.rsample().cuda()
+    return rewards.rsample()
   
-  def act(self, prior_states, prior_actions):
+  def act(self, prior_states, prior_actions, device=None):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
-    policy_mean, policy_std, value, embedding = self.forward(prior_states, prior_actions)
+    policy_mean, policy_std, value, embedding = self.forward(prior_states, prior_actions, device)
     policy_dist = Normal(policy_mean, policy_std)
     policy_action = policy_dist.rsample()
     policy_log_prob = policy_dist.log_prob(policy_action)
-    normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).cuda() + torch.tensor(self.action_bias).cuda()
-    normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.tensor(self.min_action).cuda()), torch.tensor(self.max_action).cuda())
+    normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).to(device=device) + torch.tensor(self.action_bias).to(device=device)
+    normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.tensor(self.min_action).to(device=device)), torch.tensor(self.max_action).to(device=device))
     q_value = self.q_network(embedding, policy_action)
     return normalized_policy_action, policy_log_prob, value, q_value
