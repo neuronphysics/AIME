@@ -406,7 +406,7 @@ class InfGaussMMVAE(GMMVAE):
         self.kumar_a = torch.exp(mlp(h,self.encoder_kumar_a))
         self.kumar_b = torch.exp(mlp(h,self.encoder_kumar_b))
         self.c       = self.pc_wz
-        return x_recon_linear, self.z
+        return x_recon_linear[:,0], self.z[:,0]
 
 
     def compose_stick_segments(self, v):

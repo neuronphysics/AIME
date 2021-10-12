@@ -123,7 +123,7 @@ hyperParams = {"batch_size": args.batch_size,
                "hidden_d": 16,
                "latent_d": 10,
                "latent_w": 12}
-infinite_vae = InfGaussMMVAE(hyperParams, 15, 3, 4, args.state_size, 16, 16, args.device, 64, hyperParams["batch_size"])
+infinite_vae = InfGaussMMVAE(hyperParams, 15, 3, 4, args.state_size, 16, 16, args.device, 64, hyperParams["batch_size"]).to(device=args.device)
 
 param_list = list(infinite_vae.parameters()) + list(recurrent_gp.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
@@ -147,6 +147,7 @@ reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurre
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
   # Model fitting
   losses = []
+  infinite_vae.batch_size = args.batch_size * args.chunk_size
   for s in tqdm(range(args.collect_interval)):
     with gpytorch.settings.num_likelihood_samples(1):
       # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
@@ -180,7 +181,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   losses = tuple(zip(*losses))
   metrics['observation_loss'].append(losses[0])
   metrics['reward_loss'].append(losses[1])
-  metrics['latent_kl_loss'].append(losses[2])
   lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
 
@@ -188,6 +188,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   # Data collection
   ##with torch.no_grad():
   infinite_vae.eval()
+  infinite_vae.batch_size = 1
   observation, total_reward, time_step = env.reset(), 0, 0
   with torch.no_grad():
     _, current_latent_state = infinite_vae(observation.to(device=args.device))
@@ -286,12 +287,12 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       for t in pbar:
         action, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
         observation, reward, done = test_envs.step(action.cpu())
-        _, current_latent_state = current_latent_state(observation.to(device=args.device))
+        _, current_latent_state = infinite_vae(observation.to(device=args.device))
         episode_states = torch.cat([episode_states, current_latent_state], dim=0)
         episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
         total_rewards += reward.numpy()
         if not args.symbolic_env:  # Collect real vs. predicted frames for video
-          video_frames.append(make_grid(torch.cat([observation, reconstructed_observation[:, 0].cpu()], dim=3) + 0.5, nrow=5).numpy())  # Decentre
+          video_frames.append(make_grid(torch.cat([observation, reconstructed_observation.permute(0, 3, 1, 2).cpu()], dim=3) + 0.5, nrow=5).numpy())  # Decentre
         if done.sum().item() == args.test_episodes:
           pbar.close()
           break
