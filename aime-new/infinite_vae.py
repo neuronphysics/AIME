@@ -405,10 +405,10 @@ class InfGaussMMVAE(GMMVAE):
         # z_temp       = list()
         # self.z_sigma = z_temp.extend(np.transpose(self.z_wc_var_list_sample, [1, 0, 2]))
         # self.z_sigma = torch.tensor(self.z_sigma)
-        self.z       = self.z_mu + torch.mul(self.z_sigma, Normal(0., 1.).sample(self.z_sigma.shape).to(device))
+        self.z       = self.z_mu + torch.mul(self.z_sigma, Normal(0., 1.).sample(self.z_sigma.shape).to(self.device))
         self.w_mu    = self.w_x_mean # TODO Fix this
         self.w_sigma = self.w_x_var # TODO: Fix this
-        self.w       = self.w_mu + torch.mul(self.w_sigma, Normal(0., 1.).sample(self.w_sigma.shape).to(device))
+        self.w       = self.w_mu + torch.mul(self.w_sigma, Normal(0., 1.).sample(self.w_sigma.shape).to(self.device))
 
         h = F.relu(self.bn1d_inf(self.fc_inf0(self.flatten_x(X))))  # TODO: What goes here???
 
