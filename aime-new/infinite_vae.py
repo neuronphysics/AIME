@@ -157,7 +157,7 @@ class GMMVAE(nn.Module):
         # h = F.relu(self.px_z_bn2d_1(self.px_z_conv_transpose2d_1(h)))
         # h = F.relu(self.px_z_bn2d_2(self.px_z_conv_transpose2d_2(h)))
         # h = F.relu(self.px_z_bn2d_3(self.px_z_conv_transpose2d_3(h)))
-        x_recons_mean_flat = F.sigmoid(self.px_z_conv_transpose2d[self.n_conv2d_transpose - 1](h))
+        x_recons_mean_flat = torch.sigmoid(self.px_z_conv_transpose2d[self.n_conv2d_transpose - 1](h))
         return x_recons_mean_flat
 
 
@@ -202,7 +202,7 @@ class GMMVAE(nn.Module):
         hc               = zw
         hc               = F.relu(self.bn1d_6(self.fc6(hc)))
         Pc_wz            = F.relu(self.bn1d_7(self.fc7(hc)))
-        self.pc_wz       = F.softmax(Pc_wz)
+        self.pc_wz       = F.softmax(Pc_wz, dim=-1)
         self.log_pc_wz   = torch.log(1e-20+self.pc_wz)
 
         #Build P(x|z)
