@@ -113,7 +113,8 @@ class GMMVAE(nn.Module):
         # Px_given_z LAYERS Decoder P(X|Z)
         conv2d_transpose_kernels, conv2d_transpose_input_width = self.determine_decoder_params(self.z_dim, self.img_width)
         self.px_z_fc = nn.Linear(self.z_dim, conv2d_transpose_input_width ** 2)
-        self.unflatten = nn.Unflatten(1, (1, conv2d_transpose_input_width, conv2d_transpose_input_width))
+        #self.unflatten = nn.Unflatten(1, (1, conv2d_transpose_input_width, conv2d_transpose_input_width))
+        self.conv2d_transpose_input_width = conv2d_transpose_input_width
         self.px_z_conv_transpose2d = nn.ModuleList()
         self.px_z_bn2d = nn.ModuleList()
         self.n_conv2d_transpose = len(conv2d_transpose_kernels)
@@ -148,7 +149,8 @@ class GMMVAE(nn.Module):
 
     def Px_given_z(self, z_input):
         #prior P(x|z)
-        h = self.unflatten(self.px_z_fc(z_input))
+        flattened_h = self.px_z_fc(z_input)
+        h = flattened_h.view(flattened_h.size()[0], 1, self.conv2d_transpose_input_width, self.conv2d_transpose_input_width)
         for i in range(self.n_conv2d_transpose - 1):
             h = F.relu(self.px_z_bn2d[i](self.px_z_conv_transpose2d[i](h)))
         # h = F.relu(self.px_z_bn2d_0(self.px_z_conv_transpose2d_0(h)))
@@ -207,7 +209,7 @@ class GMMVAE(nn.Module):
         self.x_recons_mean_flat = self.Px_given_z(self.z_x)
         eps = Normal(loc=torch.zeros(self.x_recons_mean_flat.shape,), scale=torch.ones(self.x_recons_mean_flat.shape,)).sample().to(self.device)
 
-        self.x_recons_flat = torch.clamp(torch.add(self.x_recons_mean_flat, np.sqrt(self.sigma) * eps), 0, 1)
+        self.x_recons_flat = torch.min(torch.max(torch.add(self.x_recons_mean_flat, np.sqrt(self.sigma) * eps), torch.tensor(0, dtype=torch.float).to(self.device)), torch.tensor(1, dtype=torch.float).to(self.device))
         self.x_recons = torch.reshape(self.x_recons_flat , [-1,self.img_width, self.img_width, self.nchannel])
 
 
@@ -271,7 +273,7 @@ def gauss_cross_entropy(mu_post, sigma_post, mu_prior, sigma_prior):
 
 
 def beta_fn(a,b):
-    return torch.exp(torch.lgamma(torch.tensor(a)) + torch.lgamma(torch.tensor(b)) - torch.lgamma(torch.tensor(a+b)))
+    return torch.exp(torch.lgamma(torch.tensor(a, dtype=torch.float).cuda()) + torch.lgamma(torch.tensor(b, dtype=torch.float).cuda()) - torch.lgamma(torch.tensor(a+b, dtype=torch.float).cuda()))
 
 
 def compute_kumar2beta_kld(a, b, alpha, beta):
@@ -470,8 +472,8 @@ class InfGaussMMVAE(GMMVAE):
         #kl_loss = 0.5*torch.sum(1 + z_logstd - z_mean**2 - torch.exp(z_logstd), dim=1)
         # likelihood loss
 
-        logq = -0.5 * torch.sum(self.z_x_logvar, 1) - 0.5 * torch.sum(torch.divide(
-                torch.square(self.z_x - self.z_x_mean), self.z_x_var), 1)
+        logq = -0.5 * torch.sum(self.z_x_logvar, 1) - 0.5 * torch.sum(
+                torch.pow(self.z_x - self.z_x_mean, 2) / self.z_x_var, 1)
         z_wy=torch.unsqueeze(self.z_x, 2)
 
 
