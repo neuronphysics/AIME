@@ -11,10 +11,13 @@ from torch.autograd import Variable
 #tf.expand_dims -> tensor.expand
 #tf.transpose -> tensor.permute
 
+'''
 if torch.cuda.is_available():
     device = "cuda:0"
 else:
     device = "cpu"
+'''
+local_device = "cpu"
 
 def gather_nd(params, indices):
     # this function has a limit that MAX_ADVINDEX_CALC_DIMS=5
@@ -273,7 +276,8 @@ def gauss_cross_entropy(mu_post, sigma_post, mu_prior, sigma_prior):
 
 
 def beta_fn(a,b):
-    return torch.exp(torch.lgamma(torch.tensor(a, dtype=torch.float).cuda()) + torch.lgamma(torch.tensor(b, dtype=torch.float).cuda()) - torch.lgamma(torch.tensor(a+b, dtype=torch.float).cuda()))
+    global local_device
+    return torch.exp(torch.lgamma(torch.tensor(a, dtype=torch.float).to(device=local_device)) + torch.lgamma(torch.tensor(b, dtype=torch.float).to(device=local_device)) - torch.lgamma(torch.tensor(a+b, dtype=torch.float).to(device=local_device)))
 
 
 def compute_kumar2beta_kld(a, b, alpha, beta):
@@ -325,8 +329,9 @@ def mcMixtureEntropy(pi_samples, z, mu, sigma, K):
 
 
 def gumbel_softmax_sample(log_pi, temperature, eps=1e-20):
+    global local_device
     # Sample from Gumbel
-    U = torch.rand(log_pi.shape).cuda()
+    U = torch.rand(log_pi.shape).to(device=local_device)
     g = -Variable(torch.log(-torch.log(U + eps) + eps))
     # Gumbel-Softmax sample
     y = log_pi + g
@@ -335,7 +340,9 @@ def gumbel_softmax_sample(log_pi, temperature, eps=1e-20):
 ### Gaussian Mixture Model VAE Class
 class InfGaussMMVAE(GMMVAE):
     # based on this implementation https://github.com/enalisnick/mixture_density_VAEs/blob/ee4e3b766523017a7bfd1c408d682ffd94fd0829/models/gaussMMVAE_collapsed.py
-    def __init__(self, hyperParams, K, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size):
+    def __init__(self, hyperParams, K, nchannel, base_channels, z_dim, w_dim, hidden_dim, device, img_width, batch_size):
+        global local_device
+        local_device = device
         super(InfGaussMMVAE, self).__init__(K, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size)
 
         #self.X = Variable(torch.FloatTensor(hyperParams['batch_size'], hyperParams['input_d']))
