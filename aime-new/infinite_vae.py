@@ -11,8 +11,6 @@ from torch.autograd import Variable
 #tf.expand_dims -> tensor.expand
 #tf.transpose -> tensor.permute
 
-from main import args
-
 if torch.cuda.is_available():
     device = "cuda:0"
 else:
@@ -275,7 +273,7 @@ def gauss_cross_entropy(mu_post, sigma_post, mu_prior, sigma_prior):
 
 
 def beta_fn(a,b):
-    return torch.exp(torch.lgamma(torch.tensor(a, dtype=torch.float).to(device=args.device)) + torch.lgamma(torch.tensor(b, dtype=torch.float).to(device=args.device)) - torch.lgamma(torch.tensor(a+b, dtype=torch.float).to(device=args.device)))
+    return torch.exp(torch.lgamma(torch.tensor(a, dtype=torch.float).cuda()) + torch.lgamma(torch.tensor(b, dtype=torch.float).cuda()) - torch.lgamma(torch.tensor(a+b, dtype=torch.float).cuda()))
 
 
 def compute_kumar2beta_kld(a, b, alpha, beta):
@@ -328,7 +326,7 @@ def mcMixtureEntropy(pi_samples, z, mu, sigma, K):
 
 def gumbel_softmax_sample(log_pi, temperature, eps=1e-20):
     # Sample from Gumbel
-    U = torch.rand(log_pi.shape).to(device=args.device)
+    U = torch.rand(log_pi.shape).cuda()
     g = -Variable(torch.log(-torch.log(U + eps) + eps))
     # Gumbel-Softmax sample
     y = log_pi + g
