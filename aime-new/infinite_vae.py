@@ -457,7 +457,7 @@ class InfGaussMMVAE(GMMVAE):
 
     def get_ELBO(self, X):
         _, _, _, pc  = self._decoding(self.z)
-        log_ratio = torch.log( torch.div( self.pc_wz, pc) + 1e-20)
+        log_ratio = torch.sub(torch.log(self.pc_wz+ 1e-20),torch.log(pc+ 1e-20))
         #1)need this term
         elbo      = torch.sum(self.pc_wz * log_ratio, dim=-1).mean()
 
