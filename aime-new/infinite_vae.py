@@ -471,7 +471,7 @@ class InfGaussMMVAE(GMMVAE):
             elbo -= compute_kumar2beta_kld(self.kumar_a[:, k].expand(self.batch_size), self.kumar_b[:, k].expand(self.batch_size), self.prior, (self.K-1-k)* self.prior).mean()
         #elbo += mcMixtureEntropy(self.pi_samples, self.z, self.z_mu, self.z_sigma, self.K)
         #3)need this term
-        elbo += -0.5 * torch.sum(1 + torch.log(self.w_sigma + 1e-10) - torch.pow(self.w_mu, 2) - self.w_sigma) #KLD_W
+        elbo += -0.5 * torch.sum(1 + torch.log(self.w_sigma + 1e-20) - torch.pow(self.w_mu, 2) - self.w_sigma) #KLD_W
         #compute D_KL(Q(z|x)||p(z|c,w))
         #use this term https://github.com/psanch21/VAE-GMVAE/blob/e176d24d0e743f109ce37834f71f2f9067aae9bc/Alg_GMVAE/GMVAE_graph.py#L278
         # KL loss
@@ -484,9 +484,9 @@ class InfGaussMMVAE(GMMVAE):
         z_wc = torch.unsqueeze(self.z_x, 2)
         z_wc = z_wc.repeat((1, 1, self.K))  # [batch_size, z_dim, K]
         z_wc = z_wc.permute(2, 0, 1)  # [K, batch_size, z_dim]
-        z_wc_var_stack=torch.log(self.z_wc_var_list_sample)
+        z_wc_var_stack=torch.log(self.z_wc_var_list_sample + 1e-20)
         log_det_sigma = torch.transpose(torch.mean(z_wc_var_stack, 2), 0, 1)  # [batch_size, K ]
-        aux = torch.pow(z_wc - self.z_wc_mean_list_sample, 2) / z_wc_var_stack  # [K, batch_size, z_dim]
+        aux = torch.pow(z_wc - self.z_wc_mean_list_sample, 2) / (self.z_wc_var_list_sample+1e-20)  # [K, batch_size, z_dim]
         aux = torch.mean(aux, 2)  # [K, batch_size]
         aux = torch.transpose(aux, 0, 1)  # [batch_size, K]
         aux = torch.mul(self.pc_wz, aux)  # [batch_size, K]
