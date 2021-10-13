@@ -485,10 +485,10 @@ class InfGaussMMVAE(GMMVAE):
         z_wc = z_wc.repeat((1, 1, self.K))  # [batch_size, z_dim, K]
         z_wc = z_wc.permute(2, 0, 1)  # [K, batch_size, z_dim]
         z_wc_var_stack=torch.log(self.z_wc_var_list_sample)
-        log_det_sigma = torch.transpose(torch.mean(z_wc_var_stack, 2))  # [batch_size, K ]
+        log_det_sigma = torch.transpose(torch.mean(z_wc_var_stack, 2), 0, 1)  # [batch_size, K ]
         aux = torch.pow(z_wc - self.z_wc_mean_list_sample, 2) / z_wc_var_stack  # [K, batch_size, z_dim]
         aux = torch.mean(aux, 2)  # [K, batch_size]
-        aux = torch.transpose(aux)  # [batch_size, K]
+        aux = torch.transpose(aux, 0, 1)  # [batch_size, K]
         aux = torch.mul(self.pc_wz, aux)  # [batch_size, K]
         aux = torch.mean(aux, 1)  # [batch_size]
         logp = -0.5 * torch.mean(torch.mul(self.pc_wz, log_det_sigma), 1) - 0.5 * aux
