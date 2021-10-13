@@ -33,7 +33,7 @@ def gather_nd(params, indices):
 def init_mlp(layer_sizes, std=.01, bias_init=0., device=None):
     params = {'w': [], 'b': []}
     for n_in, n_out in zip(layer_sizes[:-1], layer_sizes[1:]):
-        params['w'].append(nn.Parameter(torch.tensor(Normal(torch.zeros(n_in, n_out), std * torch.ones(n_in, n_out)).sample(), requires_grad=True, device=device)))
+        params['w'].append(nn.Parameter(torch.tensor(Normal(torch.zeros(n_in, n_out), std * torch.ones(n_in, n_out)).rsample(), requires_grad=True, device=device)))
         params['b'].append(nn.Parameter(torch.tensor(torch.mul(bias_init, torch.ones([n_out,])), requires_grad=True, device=device)))
     return params
 
@@ -182,7 +182,7 @@ class GMMVAE(nn.Module):
         self.z_x_var     = F.softplus(self.bn1d_2(self.fc2(h)))
         self.z_x_logvar  = torch.log(self.z_x_var)
 
-        eps1             = Normal(loc=torch.zeros(self.z_x_mean.shape,), scale=torch.ones(self.z_x_logvar.shape,)).sample().to(self.device)
+        eps1             = Normal(loc=torch.zeros(self.z_x_mean.shape,), scale=torch.ones(self.z_x_logvar.shape,)).rsample().to(self.device)
         self.z_x         = self.z_x_mean+torch.mul(torch.sqrt(self.z_x_var), eps1)
 
 
@@ -197,7 +197,7 @@ class GMMVAE(nn.Module):
         self.w_x_var     = F.relu(self.bn1d_5(self.fc5(hw)))
         self.w_x_logvar  = torch.log(self.w_x_var)
 
-        eps2             = Normal(loc=torch.zeros(self.w_x_mean.shape,), scale=torch.ones(self.w_x_logvar.shape,)).sample().to(self.device)
+        eps2             = Normal(loc=torch.zeros(self.w_x_mean.shape,), scale=torch.ones(self.w_x_logvar.shape,)).rsample().to(self.device)
         self.w_x         = torch.add(self.w_x_mean,torch.mul(torch.sqrt(self.w_x_var), eps2))
 
         #P(c|w,z)=Q(c|x)
@@ -210,14 +210,14 @@ class GMMVAE(nn.Module):
 
         #Build P(x|z)
         self.x_recons_mean_flat = self.Px_given_z(self.z_x)
-        eps = Normal(loc=torch.zeros(self.x_recons_mean_flat.shape,), scale=torch.ones(self.x_recons_mean_flat.shape,)).sample().to(self.device)
+        eps = Normal(loc=torch.zeros(self.x_recons_mean_flat.shape,), scale=torch.ones(self.x_recons_mean_flat.shape,)).rsample().to(self.device)
 
         self.x_recons_flat = torch.min(torch.max(torch.add(self.x_recons_mean_flat, np.sqrt(self.sigma) * eps), torch.tensor(0, dtype=torch.float).to(self.device)), torch.tensor(1, dtype=torch.float).to(self.device))
         self.x_recons = torch.reshape(self.x_recons_flat , [-1,self.img_width, self.img_width, self.nchannel])
 
 
         #P(w)
-        self.w_sample = Normal(loc=torch.zeros((self.batch_size, self.w_dim)), scale=torch.ones((self.batch_size, self.w_dim))).sample().to(self.device)
+        self.w_sample = Normal(loc=torch.zeros((self.batch_size, self.w_dim)), scale=torch.ones((self.batch_size, self.w_dim))).rsample().to(self.device)
 
         #P(z_i|w,c_i)
         self.z_wc_mean_list_sample, self.z_wc_var_list_sample = self.Pz_given_wc(self.w_sample,self.hidden_dim)
@@ -225,7 +225,7 @@ class GMMVAE(nn.Module):
         #self.z_wc_var_list_sample = self.z_wc_var_list_sample.reshape(self.z_wc_var_list_sample.shape[1], self.z_wc_var_list_sample.shape[0], self.z_wc_var_list_sample.shape[2])
         self.z_sample_list = list()
         for i in range(self.K):
-            eps = Normal(loc=torch.zeros_like(self.z_wc_mean_list_sample[i]), scale=torch.ones_like(self.z_wc_mean_list_sample[i])).sample().to(self.device)
+            eps = Normal(loc=torch.zeros_like(self.z_wc_mean_list_sample[i]), scale=torch.ones_like(self.z_wc_mean_list_sample[i])).rsample().to(self.device)
             z_sample = torch.add(self.z_wc_mean_list_sample[i], torch.mul(torch.sqrt(self.z_wc_var_list_sample[i]), eps))
             self.z_sample_list.append(z_sample)
         #P(x|z)
@@ -236,7 +236,7 @@ class GMMVAE(nn.Module):
             x_sample_mean_flat = self.Px_given_z(self.z_sample_list[i])
             self.x_sample_mean_flat_list.append(x_sample_mean_flat)
 
-            eps = Normal(loc=torch.zeros(x_sample_mean_flat.shape), scale=torch.ones(x_sample_mean_flat.shape)).sample().to(self.device)
+            eps = Normal(loc=torch.zeros(x_sample_mean_flat.shape), scale=torch.ones(x_sample_mean_flat.shape)).rsample().to(self.device)
 
             x_sample_flat = torch.add(x_sample_mean_flat, np.sqrt(self.sigma) * eps)
             x_sample = torch.reshape(x_sample_flat , [-1, self.img_width, self.img_width, self.nchannel])
@@ -405,10 +405,10 @@ class InfGaussMMVAE(GMMVAE):
         # z_temp       = list()
         # self.z_sigma = z_temp.extend(np.transpose(self.z_wc_var_list_sample, [1, 0, 2]))
         # self.z_sigma = torch.tensor(self.z_sigma)
-        self.z       = self.z_mu + torch.mul(self.z_sigma, Normal(0., 1.).sample(self.z_sigma.shape).to(self.device))
+        self.z       = self.z_mu + torch.mul(self.z_sigma, Normal(0., 1.).rsample(self.z_sigma.shape).to(self.device))
         self.w_mu    = self.w_x_mean # TODO Fix this
         self.w_sigma = self.w_x_var # TODO: Fix this
-        self.w       = self.w_mu + torch.mul(self.w_sigma, Normal(0., 1.).sample(self.w_sigma.shape).to(self.device))
+        self.w       = self.w_mu + torch.mul(self.w_sigma, Normal(0., 1.).rsample(self.w_sigma.shape).to(self.device))
 
         h = F.relu(self.bn1d_inf(self.fc_inf0(self.flatten_x(X))))  # TODO: What goes here???
 
