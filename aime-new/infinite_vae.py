@@ -179,7 +179,7 @@ class GMMVAE(nn.Module):
         self.z_x_mean    = F.relu(self.bn1d_1(self.fc1(h)))
 
 
-        self.z_x_var     = F.relu(self.bn1d_2(self.fc2(h)))
+        self.z_x_var     = F.softplus(self.bn1d_2(self.fc2(h)))
         self.z_x_logvar  = torch.log(self.z_x_var)
 
         eps1             = Normal(loc=torch.zeros(self.z_x_mean.shape,), scale=torch.ones(self.z_x_logvar.shape,)).sample().to(self.device)
@@ -471,7 +471,7 @@ class InfGaussMMVAE(GMMVAE):
             elbo -= compute_kumar2beta_kld(self.kumar_a[:, k].expand(self.batch_size), self.kumar_b[:, k].expand(self.batch_size), self.prior, (self.K-1-k)* self.prior).mean()
         #elbo += mcMixtureEntropy(self.pi_samples, self.z, self.z_mu, self.z_sigma, self.K)
         #3)need this term
-        elbo += -0.5 * torch.sum(1 + torch.log(self.w_sigma + 1e-10) - self.w_mu*self.w_mu - self.w_sigma) #KLD_W
+        elbo += -0.5 * torch.sum(1 + torch.log(self.w_sigma + 1e-10) - torch.pow(self.w_mu, 2) - self.w_sigma) #KLD_W
         #compute D_KL(Q(z|x)||p(z|c,w))
         #use this term https://github.com/psanch21/VAE-GMVAE/blob/e176d24d0e743f109ce37834f71f2f9067aae9bc/Alg_GMVAE/GMVAE_graph.py#L278
         # KL loss
