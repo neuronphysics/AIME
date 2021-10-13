@@ -449,7 +449,7 @@ class InfGaussMMVAE(GMMVAE):
         self.pi_samples = torch.stack(self.compose_stick_segments(v_samples), axis=2)
         #KL divergence P(c|z,w)=Q(c|x) while P(c|pi) is the prior
 
-        prior_c        = gumbel_softmax_sample(torch.log(self.pi_samples), 1, eps=1e-20)
+        prior_c        = gumbel_softmax_sample(torch.log(self.pi_samples+1e-20), 1, eps=1e-20)
         return self.x_recons_flat, self.z_mu, torch.log(self.z_sigma), prior_c
 
     def decode(self, z):
