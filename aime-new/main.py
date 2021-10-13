@@ -31,7 +31,7 @@ parser.add_argument('--activation-function', type=str, default='relu', choices=d
 parser.add_argument('--embedding-size', type=int, default=1024, metavar='E', help='Observation embedding size')  # Note that the default encoder for visual observations outputs a 1024D vector; for other embedding sizes an additional fully-connected layer is used
 parser.add_argument('--hidden-size', type=int, default=200, metavar='H', help='Hidden size')
 parser.add_argument('--belief-size', type=int, default=200, metavar='H', help='Belief/hidden size')
-parser.add_argument('--state-size', type=int, default=10, metavar='Z', help='State/latent size')
+parser.add_argument('--state-size', type=int, default=5, metavar='Z', help='State/latent size')
 parser.add_argument('--action-repeat', type=int, default=1, metavar='R', help='Action repeat')
 parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', help='Action noise')
 parser.add_argument('--episodes', type=int, default=10000, metavar='E', help='Total number of episodes')
@@ -71,6 +71,7 @@ parser.add_argument('--num-sample-trajectories', type=int, default=20, metavar='
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
 parser.add_argument('--discount-factor', type=float, default=0.999, metavar='Temp', help='Discount factor')
 parser.add_argument('--num-mixtures', type=int, default=5, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
+parser.add_argument('--w-dim', type=int, default=5, metavar='w', help='dimension of w')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -124,7 +125,7 @@ hyperParams = {"batch_size": args.batch_size,
                "hidden_d": 16,
                "latent_d": 10,
                "latent_w": 12}
-infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, 16, 16, args.device, 64, hyperParams["batch_size"]).to(device=args.device)
+infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, 16, args.device, 64, hyperParams["batch_size"]).to(device=args.device)
 
 param_list = list(infinite_vae.parameters()) + list(recurrent_gp.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
