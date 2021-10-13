@@ -498,7 +498,7 @@ class InfGaussMMVAE(GMMVAE):
 
         #compute E_{q(z|x)}[P(x|x)] reconstruction loss
         #use this term https://github.com/psanch21/VAE-GMVAE/blob/e176d24d0e743f109ce37834f71f2f9067aae9bc/Alg_GMVAE/GMVAE_graph.py#L256
-        elbo += F.binary_cross_entropy(input=self.x_recons_flat.view(-1, self.img_size*self.img_size), target=X.view(-1, self.img_size*self.img_size), reduction='sum')
+        elbo += F.binary_cross_entropy(input=self.x_recons_flat.view(-1, self.nchannel*self.img_size*self.img_size), target=X.view(-1, self.nchannel*self.img_size*self.img_size), reduction='none').sum(dim=1).mean(dim=0)
         #elbo += F.binary_cross_entropy(input=self.x_recons_flat, target=X, reduction='sum')
         return elbo.mean()
 
