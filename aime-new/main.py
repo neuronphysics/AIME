@@ -29,9 +29,7 @@ parser.add_argument('--max-episode-length', type=int, default=1000, metavar='T',
 parser.add_argument('--experience-size', type=int, default=1000000, metavar='D', help='Experience replay size')  # Original implementation has an unlimited buffer size, but 1 million is the max experience collected anyway
 parser.add_argument('--activation-function', type=str, default='relu', choices=dir(F), help='Model activation function')
 parser.add_argument('--embedding-size', type=int, default=1024, metavar='E', help='Observation embedding size')  # Note that the default encoder for visual observations outputs a 1024D vector; for other embedding sizes an additional fully-connected layer is used
-parser.add_argument('--hidden-size', type=int, default=200, metavar='H', help='Hidden size')
 parser.add_argument('--belief-size', type=int, default=200, metavar='H', help='Belief/hidden size')
-parser.add_argument('--state-size', type=int, default=5, metavar='Z', help='State/latent size')
 parser.add_argument('--action-repeat', type=int, default=1, metavar='R', help='Action repeat')
 parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', help='Action noise')
 parser.add_argument('--episodes', type=int, default=10000, metavar='E', help='Total number of episodes')
@@ -72,6 +70,8 @@ parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp
 parser.add_argument('--discount-factor', type=float, default=0.999, metavar='Temp', help='Discount factor')
 parser.add_argument('--num-mixtures', type=int, default=5, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
 parser.add_argument('--w-dim', type=int, default=5, metavar='w', help='dimension of w')
+parser.add_argument('--hidden-size', type=int, default=16, metavar='H', help='Hidden size')
+parser.add_argument('--state-size', type=int, default=5, metavar='Z', help='State/latent size')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -122,10 +122,10 @@ hyperParams = {"batch_size": args.batch_size,
                "input_d": 1,
                "prior": 1, #dirichlet_alpha'
                "K": args.num_mixtures,
-               "hidden_d": 16,
+               "hidden_d": args.hidden_size,
                "latent_d": args.state_size,
                "latent_w": args.w_dim}
-infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, 16, args.device, 64, hyperParams["batch_size"]).to(device=args.device)
+infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, args.hidden_size, args.device, 64, hyperParams["batch_size"]).to(device=args.device)
 
 param_list = list(infinite_vae.parameters()) + list(recurrent_gp.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
