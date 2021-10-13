@@ -70,6 +70,7 @@ parser.add_argument('--non-cumulative-reward', action='store_true', help='Model 
 parser.add_argument('--num-sample-trajectories', type=int, default=20, metavar='nst', help='number of trajectories sample in the imagination part')
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
 parser.add_argument('--discount-factor', type=float, default=0.999, metavar='Temp', help='Discount factor')
+parser.add_argument('--num-mixtures', type=int, default=5, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -123,7 +124,7 @@ hyperParams = {"batch_size": args.batch_size,
                "hidden_d": 16,
                "latent_d": 10,
                "latent_w": 12}
-infinite_vae = InfGaussMMVAE(hyperParams, 15, 3, 4, args.state_size, 16, 16, args.device, 64, hyperParams["batch_size"]).to(device=args.device)
+infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, 16, 16, args.device, 64, hyperParams["batch_size"]).to(device=args.device)
 
 param_list = list(infinite_vae.parameters()) + list(recurrent_gp.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
