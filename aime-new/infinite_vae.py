@@ -477,7 +477,8 @@ class InfGaussMMVAE(GMMVAE):
         # KL loss
         #kl_loss = 0.5*torch.sum(1 + z_logstd - z_mean**2 - torch.exp(z_logstd), dim=1)
         # likelihood loss
-
+        
+        '''
         logq = -0.5 * torch.sum(self.z_x_logvar, 1) - 0.5 * torch.sum(
                 torch.pow(self.z_x - self.z_x_mean, 2) / self.z_x_var, 1)
         
@@ -494,6 +495,7 @@ class InfGaussMMVAE(GMMVAE):
         logp = -0.5 * torch.mean(torch.mul(self.pc_wz, log_det_sigma), 1) - 0.5 * aux
         cond_prior = logq - logp
         elbo -= torch.mean(cond_prior)
+        '''
 
 
         #compute E_{q(z|x)}[P(x|x)] reconstruction loss
