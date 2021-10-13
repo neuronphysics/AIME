@@ -125,7 +125,7 @@ hyperParams = {"batch_size": args.batch_size,
                "hidden_d": 16,
                "latent_d": 10,
                "latent_w": 12}
-infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, 16, args.device, 64, hyperParams["batch_size"]).to(device=args.device)
+infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, args.w_dim, args.device, 64, hyperParams["batch_size"]).to(device=args.device)
 
 param_list = list(infinite_vae.parameters()) + list(recurrent_gp.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
