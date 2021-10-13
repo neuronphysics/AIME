@@ -493,7 +493,7 @@ class InfGaussMMVAE(GMMVAE):
         aux = torch.mean(aux, 1)  # [batch_size]
         logp = -0.5 * torch.mean(torch.mul(self.pc_wz, log_det_sigma), 1) - 0.5 * aux
         cond_prior = logq - logp
-        elbo += torch.mean(cond_prior)
+        elbo -= torch.mean(cond_prior)
 
 
         #compute E_{q(z|x)}[P(x|x)] reconstruction loss
