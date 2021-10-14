@@ -277,7 +277,7 @@ def gauss_cross_entropy(mu_post, sigma_post, mu_prior, sigma_prior):
 
 def beta_fn(a,b):
     global local_device
-    return torch.exp(torch.lgamma(torch.tensor(a, dtype=torch.float).to(device=local_device)) + torch.lgamma(torch.tensor(b, dtype=torch.float).to(device=local_device)) - torch.lgamma(torch.tensor(a+b, dtype=torch.float).to(device=local_device)))
+    return torch.exp(torch.lgamma(torch.tensor(a, dtype=torch.float, requires_grad=True).to(device=local_device)) + torch.lgamma(torch.tensor(b, dtype=torch.float, requires_grad=True).to(device=local_device)) - torch.lgamma(torch.tensor(a+b, dtype=torch.float, requires_grad=True).to(device=local_device)))
 
 
 def compute_kumar2beta_kld(a, b, alpha, beta):
