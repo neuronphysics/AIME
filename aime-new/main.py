@@ -72,6 +72,7 @@ parser.add_argument('--num-mixtures', type=int, default=10, metavar='Mix', help=
 parser.add_argument('--w-dim', type=int, default=5, metavar='w', help='dimension of w')
 parser.add_argument('--hidden-size', type=int, default=16, metavar='H', help='Hidden size')
 parser.add_argument('--state-size', type=int, default=5, metavar='Z', help='State/latent size')
+parser.add_argument('--include-kl-z', action='store_true', help='add kl loss related to z in vae')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -125,7 +126,7 @@ hyperParams = {"batch_size": args.batch_size,
                "hidden_d": args.hidden_size,
                "latent_d": args.state_size,
                "latent_w": args.w_dim}
-infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, args.hidden_size, args.device, 64, hyperParams["batch_size"]).to(device=args.device)
+infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, args.hidden_size, args.device, 64, hyperParams["batch_size"], args.include_kl_z).to(device=args.device)
 
 param_list = list(infinite_vae.parameters()) + list(recurrent_gp.parameters())
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)

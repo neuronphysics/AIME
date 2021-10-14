@@ -340,7 +340,7 @@ def gumbel_softmax_sample(log_pi, temperature, eps=1e-20):
 ### Gaussian Mixture Model VAE Class
 class InfGaussMMVAE(GMMVAE):
     # based on this implementation https://github.com/enalisnick/mixture_density_VAEs/blob/ee4e3b766523017a7bfd1c408d682ffd94fd0829/models/gaussMMVAE_collapsed.py
-    def __init__(self, hyperParams, K, nchannel, base_channels, z_dim, w_dim, hidden_dim, device, img_width, batch_size):
+    def __init__(self, hyperParams, K, nchannel, base_channels, z_dim, w_dim, hidden_dim, device, img_width, batch_size, include_kl_z):
         global local_device
         local_device = device
         super(InfGaussMMVAE, self).__init__(K, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size)
@@ -364,6 +364,7 @@ class InfGaussMMVAE(GMMVAE):
 
         #self.elbo_obj = self.get_ELBO()
         self.img_size = img_width
+        self.include_kl_z = include_kl_z
 
     # def __len__(self):
     #     return len(self.X)
@@ -478,24 +479,23 @@ class InfGaussMMVAE(GMMVAE):
         #kl_loss = 0.5*torch.sum(1 + z_logstd - z_mean**2 - torch.exp(z_logstd), dim=1)
         # likelihood loss
         
-        '''
-        logq = -0.5 * torch.sum(self.z_x_logvar, 1) - 0.5 * torch.sum(
-                torch.pow(self.z_x - self.z_x_mean, 2) / self.z_x_var, 1)
-        
-        z_wc = torch.unsqueeze(self.z_x, 2)
-        z_wc = z_wc.repeat((1, 1, self.K))  # [batch_size, z_dim, K]
-        z_wc = z_wc.permute(2, 0, 1)  # [K, batch_size, z_dim]
-        z_wc_var_stack=torch.log(self.z_wc_var_list_sample)
-        log_det_sigma = torch.transpose(torch.mean(z_wc_var_stack, 2), 0, 1)  # [batch_size, K ]
-        aux = torch.pow(z_wc - self.z_wc_mean_list_sample, 2) / (self.z_wc_var_list_sample)  # [K, batch_size, z_dim]
-        aux = torch.mean(aux, 2)  # [K, batch_size]
-        aux = torch.transpose(aux, 0, 1)  # [batch_size, K]
-        aux = torch.mul(self.pc_wz, aux)  # [batch_size, K]
-        aux = torch.mean(aux, 1)  # [batch_size]
-        logp = -0.5 * torch.mean(torch.mul(self.pc_wz, log_det_sigma), 1) - 0.5 * aux
-        cond_prior = logq - logp
-        elbo -= torch.mean(cond_prior)
-        '''
+        if self.include_kl_z:
+            logq = -0.5 * torch.sum(self.z_x_logvar, 1) - 0.5 * torch.sum(
+                    torch.pow(self.z_x - self.z_x_mean, 2) / self.z_x_var, 1)
+            
+            z_wc = torch.unsqueeze(self.z_x, 2)
+            z_wc = z_wc.repeat((1, 1, self.K))  # [batch_size, z_dim, K]
+            z_wc = z_wc.permute(2, 0, 1)  # [K, batch_size, z_dim]
+            z_wc_var_stack=torch.log(self.z_wc_var_list_sample)
+            log_det_sigma = torch.transpose(torch.mean(z_wc_var_stack, 2), 0, 1)  # [batch_size, K ]
+            aux = torch.pow(z_wc - self.z_wc_mean_list_sample, 2) / (self.z_wc_var_list_sample)  # [K, batch_size, z_dim]
+            aux = torch.mean(aux, 2)  # [K, batch_size]
+            aux = torch.transpose(aux, 0, 1)  # [batch_size, K]
+            aux = torch.mul(self.pc_wz, aux)  # [batch_size, K]
+            aux = torch.mean(aux, 1)  # [batch_size]
+            logp = -0.5 * torch.mean(torch.mul(self.pc_wz, log_det_sigma), 1) - 0.5 * aux
+            cond_prior = logq - logp
+            elbo -= torch.mean(cond_prior)
 
 
         #compute E_{q(z|x)}[P(x|x)] reconstruction loss
