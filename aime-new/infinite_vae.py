@@ -179,7 +179,7 @@ class GMMVAE(nn.Module):
         self.z_x_mean    = F.relu(self.bn1d_1(self.fc1(h)))
 
 
-        self.z_x_var     = F.softplus(self.bn1d_2(self.fc2(h)))
+        self.z_x_var     = F.softplus(self.bn1d_2(self.fc2(h))) + 1e-20
         self.z_x_logvar  = torch.log(self.z_x_var)
 
         eps1             = Normal(loc=torch.zeros(self.z_x_mean.shape,), scale=torch.ones(self.z_x_logvar.shape,)).rsample().to(self.device)
@@ -272,7 +272,7 @@ def compute_nll(x, x_recon_linear):
 def gauss_cross_entropy(mu_post, sigma_post, mu_prior, sigma_prior):
     d = (mu_post - mu_prior)
     d = torch.mul(d,d)
-    return torch.sum(-torch.div(d + torch.mul(sigma_post,sigma_post),(2.*sigma_prior*sigma_prior)) - torch.log(sigma_prior*2.506628), dim=1, keepdim=True)
+    return torch.sum(-torch.div(d + torch.mul(sigma_post,sigma_post),(2.*sigma_prior*sigma_prior)) - torch.log(sigma_prior*2.506628 + 1e-20), dim=1, keepdim=True)
 
 
 def beta_fn(a,b):
@@ -296,7 +296,7 @@ def compute_kumar2beta_kld(a, b, alpha, beta):
 
     kl += torch.mul(torch.div(a-alpha,a), -0.57721 - torch.digamma(b) - b_inv)
     # add normalization constants
-    kl += torch.log(ab) + torch.log(beta_fn(alpha, beta))
+    kl += torch.log(ab + 1e-20) + torch.log(beta_fn(alpha, beta) + 1e-20)
     
     # final term
     kl += torch.div(-(b-1),b)
@@ -308,22 +308,22 @@ def log_normal_pdf(x, mu, sigma):
     d = mu - x
     d2 = torch.mul(-1., torch.mul(d, d))
     s2 = torch.mul(2., torch.mul(sigma,sigma))
-    return torch.sum(torch.div(d2, s2) - torch.log(torch.mul(sigma, 2.506628)), dim=1, keepdim=True)
+    return torch.sum(torch.div(d2, s2) - torch.log(torch.mul(sigma, 2.506628) + 1e-20), dim=1, keepdim=True)
 
 
 def log_beta_pdf(v, alpha, beta):
-    return torch.sum((alpha - 1) * torch.log(v) + (beta-1) * torch.log(1 - v) - torch.log(beta_fn(alpha, beta)), dim=1, keepdim=True)
+    return torch.sum((alpha - 1) * torch.log(v + 1e-20) + (beta-1) * torch.log(1 - v + 1e-20) - torch.log(beta_fn(alpha, beta) + 1e-20), dim=1, keepdim=True)
 
 
 def log_kumar_pdf(v, a, b):
-    return torch.sum(torch.mul(a - 1, torch.log(v)) + torch.mul(b - 1, torch.log(1 - torch.pow(v,a))) + torch.log(a) + torch.log(b), dim=1, keepdim=True)
+    return torch.sum(torch.mul(a - 1, torch.log(v + 1e-20)) + torch.mul(b - 1, torch.log(1 - torch.pow(v,a) + 1e-20)) + torch.log(a + 1e-20) + torch.log(b + 1e-20), dim=1, keepdim=True)
 
 
 def mcMixtureEntropy(pi_samples, z, mu, sigma, K):
     s = torch.mul(pi_samples[0], torch.exp(log_normal_pdf(z[0], mu[0], sigma[0])))
     for k in range(K-1):
         s += torch.mul(pi_samples[k+1], torch.exp(log_normal_pdf(z[k+1], mu[k+1], sigma[k+1])))
-    return -torch.log(s)
+    return -torch.log(s + 1e-20)
 
 
 
@@ -449,8 +449,8 @@ class InfGaussMMVAE(GMMVAE):
         self.pi_samples = torch.stack(self.compose_stick_segments(v_samples), axis=2)
         #KL divergence P(c|z,w)=Q(c|x) while P(c|pi) is the prior
 
-        prior_c        = gumbel_softmax_sample(torch.log(self.pi_samples+1e-20), 1, eps=1e-20)
-        return self.x_recons_flat, self.z_mu, torch.log(self.z_sigma), prior_c
+        prior_c        = gumbel_softmax_sample(torch.log(self.pi_samples + 1e-20), 1, eps=1e-20)
+        return self.x_recons_flat, self.z_mu, torch.log(self.z_sigma + 1e-20), prior_c
 
     def decode(self, z):
         return self._decoding(z)[0]
@@ -518,8 +518,8 @@ class InfGaussMMVAE(GMMVAE):
 
         # sample a component index
         uni_samples = torch.rand((a_inv.shape[0], self.K))
-        gumbel_samples = -torch.log(-torch.log(uni_samples))
-        component_samples = torch.IntTensor(torch.argmax(torch.log(torch.cat( self.pi_samples,1)) + gumbel_samples, 1))
+        gumbel_samples = -torch.log(-torch.log(uni_samples + 1e-20) + 1e-20)
+        component_samples = torch.IntTensor(torch.argmax(torch.log(torch.cat( self.pi_samples,1) + 1e-20) + gumbel_samples, 1))
 
         # calc likelihood term for chosen components
         all_ll = []
