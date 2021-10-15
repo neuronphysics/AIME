@@ -48,8 +48,9 @@ plt.plot(regular_vae_steps_seed1[:num_regular_vae_samples], regular_vae_average_
 plt.plot(infinite_vae_test_rewards_seed1[:num_regular_vae_samples], infinite_vae_average_eval_return, label="infinite vae model")
 
 plt.legend()
-plt.title("Humanoid Comparison")
+plt.title("Humanoid")
 plt.xlabel("Steps")
-plt.ylabel("Test Return/Reward")
+plt.ylabel("Averaged Test Return/Reward")
+plt.ticklabel_format(axis='x', style='sci', scilimits=(4,4))
 
 plt.savefig("final_plot.png")
