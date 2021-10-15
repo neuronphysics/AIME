@@ -1,0 +1,55 @@
+import json
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+import torch
+
+def dreamerv2_results(file_path):
+    with open(file_path, 'r') as json_file:
+        json_list = list(json_file)
+
+    dreamerv2_steps = []
+    dreamerv2_eval_returns = []
+    for json_str in json_list:
+        result = json.loads(json_str)
+        if 'eval_return' in result.keys():
+            dreamerv2_steps.append(result['step'])
+            dreamerv2_eval_returns.append(result['eval_return'])
+            #print(f"result: {result}")
+            #print(isinstance(result, dict))
+    return (np.array(dreamerv2_steps), np.array(dreamerv2_eval_returns))
+
+def new_model_results(file_path):
+    data = torch.load(file_path)
+    steps = np.array(data['steps'])[109::10]
+    test_rewards = np.squeeze(np.array(data['test_rewards']))
+    return (steps, test_rewards)
+
+dreamerv2_steps_seed_1, dreamerv2_eval_returns_seed1 = dreamerv2_results("dreamerv2/humanoid/humanoid_final/metrics_1")
+dreamerv2_steps_seed_2, dreamerv2_eval_returns_seed2 = dreamerv2_results("dreamerv2/humanoid/humanoid_final/metrics_2")
+dreamerv2_steps_seed_3, dreamerv2_eval_returns_seed3 = dreamerv2_results("dreamerv2/humanoid/humanoid_final/metrics_3")
+num_dreamerv2samples = min(len(dreamerv2_steps_seed_1), len(dreamerv2_steps_seed_2), len(dreamerv2_steps_seed_3))
+dreamerv2_average_eval_return = (dreamerv2_eval_returns_seed1[:num_dreamerv2samples] + dreamerv2_eval_returns_seed2[:num_dreamerv2samples] + dreamerv2_eval_returns_seed3[:num_dreamerv2samples])/3
+
+regular_vae_steps_seed1, regular_vae_test_rewards_seed1 = new_model_results("regular_vae/humanoid/1/metrics.pth")
+regular_vae_steps_seed2, regular_vae_test_rewards_seed2 = new_model_results("regular_vae/humanoid/2/metrics.pth")
+regular_vae_steps_seed3, regular_vae_test_rewards_seed3 = new_model_results("regular_vae/humanoid/3/metrics.pth")
+num_regular_vae_samples = min(len(regular_vae_steps_seed1), len(regular_vae_steps_seed2), len(regular_vae_steps_seed3))
+regular_vae_average_eval_return = (regular_vae_test_rewards_seed1[:num_regular_vae_samples] + regular_vae_test_rewards_seed2[:num_regular_vae_samples] + regular_vae_test_rewards_seed3[:num_regular_vae_samples])/3
+
+infinite_vae_steps_seed1, infinite_vae_test_rewards_seed1 = new_model_results("infinite_vae/humanoid/1/metrics.pth")
+infinite_vae_steps_seed2, infinite_vae_test_rewards_seed2 = new_model_results("infinite_vae/humanoid/2/metrics.pth")
+infinite_vae_steps_seed3, infinite_vae_test_rewards_seed3 = new_model_results("infinite_vae/humanoid/3/metrics.pth")
+num_infinite_vae_samples = min(len(infinite_vae_steps_seed1), len(infinite_vae_steps_seed2), len(infinite_vae_steps_seed3))
+infinite_vae_average_eval_return = (infinite_vae_test_rewards_seed1[:num_infinite_vae_samples] + infinite_vae_test_rewards_seed2[:num_infinite_vae_samples] + infinite_vae_test_rewards_seed3[:num_infinite_vae_samples])/3
+
+plt.plot(dreamerv2_steps_seed_1[:num_dreamerv2samples], dreamerv2_average_eval_return, label="dreamerv2")
+plt.plot(regular_vae_steps_seed1[:num_regular_vae_samples], regular_vae_average_eval_return, label="regular vae model")
+plt.plot(infinite_vae_test_rewards_seed1[:num_regular_vae_samples], infinite_vae_average_eval_return, label="infinite vae model")
+
+plt.legend()
+plt.title("Humanoid Comparison")
+plt.xlabel("Steps")
+plt.ylabel("Test Return/Reward")
+
+plt.savefig("final_plot.png")
