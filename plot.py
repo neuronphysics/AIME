@@ -25,7 +25,7 @@ def new_model_results(file_path):
     test_rewards = np.squeeze(np.array(data['test_rewards']))
     return (steps, test_rewards)
 
-env = "half_cheetah"
+env = "humanoid"
 
 dreamerv2_steps_seed_1, dreamerv2_eval_returns_seed1 = dreamerv2_results(f"dreamerv2/{env}/{env}/metrics_1.jsonl")
 dreamerv2_steps_seed_2, dreamerv2_eval_returns_seed2 = dreamerv2_results(f"dreamerv2/{env}/{env}/metrics_2.jsonl")
@@ -55,4 +55,4 @@ plt.xlabel("Steps")
 plt.ylabel("Averaged Test Return/Reward")
 plt.ticklabel_format(axis='x', style='sci', scilimits=(4,4))
 
-plt.savefig(f"final_plot_{env}.png")
+plt.savefig(f"final_plots/final_plot_{env}.png")
