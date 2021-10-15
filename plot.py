@@ -25,7 +25,14 @@ def new_model_results(file_path):
     test_rewards = np.squeeze(np.array(data['test_rewards']))
     return (steps, test_rewards)
 
-env = "humanoid"
+def planet_results(file_path):
+    data = torch.load(file_path)
+    steps = np.array(data['steps'])[24::25]
+    test_rewards = np.squeeze(np.array(data['test_rewards']))
+    return (steps, test_rewards)
+
+env = "smarts"
+
 
 dreamerv2_steps_seed_1, dreamerv2_eval_returns_seed1 = dreamerv2_results(f"dreamerv2/{env}/{env}/metrics_1.jsonl")
 dreamerv2_steps_seed_2, dreamerv2_eval_returns_seed2 = dreamerv2_results(f"dreamerv2/{env}/{env}/metrics_2.jsonl")
@@ -39,15 +46,24 @@ regular_vae_steps_seed3, regular_vae_test_rewards_seed3 = new_model_results(f"re
 num_regular_vae_samples = min(len(regular_vae_steps_seed1), len(regular_vae_steps_seed2), len(regular_vae_steps_seed3))
 regular_vae_average_eval_return = (regular_vae_test_rewards_seed1[:num_regular_vae_samples] + regular_vae_test_rewards_seed2[:num_regular_vae_samples] + regular_vae_test_rewards_seed3[:num_regular_vae_samples])/3
 
+planet_steps_seed1, planet_test_rewards_seed1 = planet_results(f"planet/{env}/1/metrics.pth")
+planet_steps_seed2, planet_test_rewards_seed2 = planet_results(f"planet/{env}/2/metrics.pth")
+planet_steps_seed3, planet_test_rewards_seed3 = planet_results(f"planet/{env}/3/metrics.pth")
+num_planet_samples = min(len(planet_steps_seed1), len(planet_steps_seed2), len(planet_steps_seed3))
+planet_average_eval_return = (planet_test_rewards_seed1[:num_planet_samples] + planet_test_rewards_seed2[:num_planet_samples] + planet_test_rewards_seed3[:num_planet_samples])/3
+
+'''
 infinite_vae_steps_seed1, infinite_vae_test_rewards_seed1 = new_model_results(f"infinite_vae/{env}/1/metrics.pth")
 infinite_vae_steps_seed2, infinite_vae_test_rewards_seed2 = new_model_results(f"infinite_vae/{env}/2/metrics.pth")
 infinite_vae_steps_seed3, infinite_vae_test_rewards_seed3 = new_model_results(f"infinite_vae/{env}/3/metrics.pth")
 num_infinite_vae_samples = min(len(infinite_vae_steps_seed1), len(infinite_vae_steps_seed2), len(infinite_vae_steps_seed3))
 infinite_vae_average_eval_return = (infinite_vae_test_rewards_seed1[:num_infinite_vae_samples] + infinite_vae_test_rewards_seed2[:num_infinite_vae_samples] + infinite_vae_test_rewards_seed3[:num_infinite_vae_samples])/3
+'''
 
 plt.plot(dreamerv2_steps_seed_1[:num_dreamerv2samples], dreamerv2_average_eval_return, label="dreamerv2")
-plt.plot(regular_vae_steps_seed1[:num_regular_vae_samples], regular_vae_average_eval_return, label="regular vae model")
-plt.plot(infinite_vae_test_rewards_seed1[:num_infinite_vae_samples], infinite_vae_average_eval_return, label="infinite vae model")
+plt.plot(regular_vae_steps_seed1[:num_regular_vae_samples], regular_vae_average_eval_return, label="DtoE")
+plt.plot(planet_steps_seed1[:num_planet_samples], planet_average_eval_return, label="planet")
+#plt.plot(infinite_vae_test_rewards_seed1[:num_infinite_vae_samples], infinite_vae_average_eval_return, label="infinite vae model")
 
 plt.legend()
 plt.title(f"{env.replace('_', ' ').capitalize()}")
