@@ -4,6 +4,11 @@ import os
 import numpy as np
 import torch
 
+import seaborn as sns
+
+# Apply the default theme
+sns.set_theme()
+
 def dreamerv2_results(file_path):
     with open(file_path, 'r') as json_file:
         json_list = list(json_file)
@@ -31,8 +36,7 @@ def planet_results(file_path):
     test_rewards = np.squeeze(np.array(data['test_rewards']))
     return (steps, test_rewards)
 
-env = "smarts"
-
+env = "humanoid"
 
 dreamerv2_steps_seed_1, dreamerv2_eval_returns_seed1 = dreamerv2_results(f"dreamerv2/{env}/{env}/metrics_1.jsonl")
 dreamerv2_steps_seed_2, dreamerv2_eval_returns_seed2 = dreamerv2_results(f"dreamerv2/{env}/{env}/metrics_2.jsonl")
@@ -60,15 +64,15 @@ num_infinite_vae_samples = min(len(infinite_vae_steps_seed1), len(infinite_vae_s
 infinite_vae_average_eval_return = (infinite_vae_test_rewards_seed1[:num_infinite_vae_samples] + infinite_vae_test_rewards_seed2[:num_infinite_vae_samples] + infinite_vae_test_rewards_seed3[:num_infinite_vae_samples])/3
 '''
 
-plt.plot(dreamerv2_steps_seed_1[:num_dreamerv2samples], dreamerv2_average_eval_return, label="dreamerv2")
-plt.plot(regular_vae_steps_seed1[:num_regular_vae_samples], regular_vae_average_eval_return, label="DtoE")
-plt.plot(planet_steps_seed1[:num_planet_samples], planet_average_eval_return, label="planet")
+plt.plot(regular_vae_steps_seed1[:num_regular_vae_samples], regular_vae_average_eval_return, label="D2E")
+plt.plot(dreamerv2_steps_seed_1[:num_dreamerv2samples], dreamerv2_average_eval_return, label="Dreamerv2")
+plt.plot(planet_steps_seed1[:num_planet_samples], planet_average_eval_return, label="Planet")
 #plt.plot(infinite_vae_test_rewards_seed1[:num_infinite_vae_samples], infinite_vae_average_eval_return, label="infinite vae model")
 
 plt.legend()
 plt.title(f"{env.replace('_', ' ').capitalize()}")
 plt.xlabel("Steps")
-plt.ylabel("Averaged Test Return/Reward")
+plt.ylabel("Average Test Return/Reward")
 plt.ticklabel_format(axis='x', style='sci', scilimits=(4,4))
 
 plt.savefig(f"final_plots/final_plot_{env}.png")
