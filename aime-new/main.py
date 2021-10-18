@@ -239,7 +239,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           scaled_X, suppress_eval_mode_warning=False
       )
       sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([args.num_sample_trajectories])) for o in outputs]), 0, 2).mean(dim=-2)
-      episode_state_kl = F.binary_cross_entropy(torch.sigmoid(sample_outputs), episode_states[1:], reduction='mean').mean(dim=-1, keepdim=True)
+      episode_state_kl = F.binary_cross_entropy(torch.sigmoid(sample_outputs), torch.sigmoid(episode_states[1:]), reduction='mean').mean(dim=-1, keepdim=True)
       kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])))
   ##
   soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
