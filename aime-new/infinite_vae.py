@@ -212,7 +212,7 @@ class GMMVAE(nn.Module):
         self.x_recons_mean_flat = self.Px_given_z(self.z_x)
         eps = Normal(loc=torch.zeros(self.x_recons_mean_flat.shape,), scale=torch.ones(self.x_recons_mean_flat.shape,)).rsample().to(self.device)
 
-        self.x_recons_flat = torch.min(torch.max(torch.add(self.x_recons_mean_flat, np.sqrt(self.sigma) * eps), torch.tensor(0, dtype=torch.float).to(self.device)), torch.tensor(1, dtype=torch.float).to(self.device))
+        self.x_recons_flat = torch.min(torch.max(torch.add(self.x_recons_mean_flat, np.sqrt(self.sigma) * eps), torch.tensor(1e-20, dtype=torch.float).to(self.device)), torch.tensor(1, dtype=torch.float).to(self.device))
         self.x_recons = torch.reshape(self.x_recons_flat , [-1,self.img_width, self.img_width, self.nchannel])
 
 
