@@ -342,11 +342,11 @@ class GymEnv():
 
 
 class Hiway:
-  def __init__(self, seed, max_episode_length, action_repeat, bit_depth, agent_id, agent_spec):
+  def __init__(self, seed, max_episode_length, action_repeat, bit_depth, agent_id, agent_spec, scenario):
     import gym
     env = gym.make(
         "smarts.env:hiway-v0",
-        scenarios=['/SMARTS/scenarios/intersections/4lane'],
+        scenarios=[scenario],
         agent_specs={agent_id: agent_spec},
         sim_name=None,
         headless=True,
@@ -418,7 +418,7 @@ def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
     return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
   elif env in CONTROL_SUITE_ENVS:
     return ControlSuiteEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
-  elif env == 'Smarts':
+  elif (env == 'loop' or env == '4lane'):
     AGENT_ID = "Agent-001"
     AGENT_SPEC = AgentSpec(
       interface=AgentInterface.from_type(
@@ -427,7 +427,11 @@ def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
       agent_builder=Agent,
       reward_adapter = ultra_default_reward_adapter,
     )
-    return Hiway(seed, max_episode_length, action_repeat, bit_depth, AGENT_ID, AGENT_SPEC)
+    if env == '4lane':
+      scenario = '/SMARTS/scenarios/intersections/4lane'
+    else:
+      scenario = '/SMARTS/scenarios/loop'
+    return Hiway(seed, max_episode_length, action_repeat, bit_depth, AGENT_ID, AGENT_SPEC, scenario)
 
 
 # Wrapper for batching environments together
