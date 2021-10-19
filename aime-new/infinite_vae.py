@@ -281,11 +281,12 @@ def beta_fn(a,b):
 
 
 def compute_kumar2beta_kld(a, b, alpha, beta):
+    SMALL = 1e-16
+    EULER_GAMMA = 0.5772156649015329
     # precompute some terms
-    ab    = torch.mul(a,b)
-    a_inv = torch.pow(a, -1)
-    b_inv = torch.pow(b, -1)
-
+    ab    = torch.mul(a,b)+ SMALL
+    a_inv = torch.pow(a + SMALL, -1)
+    b_inv = torch.pow(b + SMALL, -1)
     # compute taylor expansion for E[log (1-v)] term
     kl = torch.mul(torch.pow(1+ab,-1), beta_fn(a_inv, b))
     
@@ -293,15 +294,14 @@ def compute_kumar2beta_kld(a, b, alpha, beta):
         kl += torch.mul(torch.pow(idx+2+ab,-1), beta_fn(torch.mul(idx+2., a_inv), b))
         
     kl = torch.mul(torch.mul(beta-1,b), kl)
-
-    kl += torch.mul(torch.div(a-alpha,a), -0.57721 - torch.digamma(b) - b_inv)
+    # 
+    kl += torch.mul(torch.div(a-alpha,a+SMALL), -EULER_GAMMA - torch.digamma(b) - torch.reciprocal(b + SMALL))
     # add normalization constants
-    kl += torch.log(ab + 1e-20) + torch.log(beta_fn(alpha, beta) + 1e-20)
+    kl += torch.log(ab) + torch.log(beta_fn(alpha, beta) + SMALL)
     
-    # final term
-    kl += torch.div(-(b-1),b)
-
-    return kl
+    #  final term
+    kl += torch.div(-(b-1),b +SMALL)
+    return kl.sum(dim=1).mean()
 
 
 def log_normal_pdf(x, mu, sigma):
