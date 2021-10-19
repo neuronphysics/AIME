@@ -301,7 +301,7 @@ def compute_kumar2beta_kld(a, b, alpha, beta):
     
     #  final term
     kl += torch.div(-(b-1),b +SMALL)
-    return kl.sum(dim=1).mean()
+    return kl
 
 
 def log_normal_pdf(x, mu, sigma):
