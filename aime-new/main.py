@@ -72,7 +72,7 @@ parser.add_argument('--num-mixtures', type=int, default=15, metavar='Mix', help=
 parser.add_argument('--w-dim', type=int, default=10, metavar='w', help='dimension of w')
 parser.add_argument('--hidden-size', type=int, default=16, metavar='H', help='Hidden size')
 parser.add_argument('--state-size', type=int, default=10, metavar='Z', help='State/latent size')
-parser.add_argument('--exclude-kl-z', action='store_true', help='remove kl loss related to z in vae')
+parser.add_argument('--include-elbo2', action='store_true', help='include elbo 2 loss')
 parser.add_argument('--use-regular-vae', action='store_true', help='use vae that uses single Gaussian mixture')
 
 args = parser.parse_args()
@@ -133,7 +133,7 @@ else:
                 "hidden_d": args.hidden_size,
                 "latent_d": args.state_size,
                 "latent_w": args.w_dim}
-  infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, args.hidden_size, args.device, 64, hyperParams["batch_size"], (not args.exclude_kl_z)).to(device=args.device)
+  infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, args.hidden_size, args.device, 64, hyperParams["batch_size"], args.include_elbo2).to(device=args.device)
   param_list = list(infinite_vae.parameters()) + list(recurrent_gp.parameters())
 
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)

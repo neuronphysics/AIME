@@ -340,7 +340,7 @@ def gumbel_softmax_sample(log_pi, temperature, eps=1e-20):
 ### Gaussian Mixture Model VAE Class
 class InfGaussMMVAE(GMMVAE):
     # based on this implementation https://github.com/enalisnick/mixture_density_VAEs/blob/ee4e3b766523017a7bfd1c408d682ffd94fd0829/models/gaussMMVAE_collapsed.py
-    def __init__(self, hyperParams, K, nchannel, base_channels, z_dim, w_dim, hidden_dim, device, img_width, batch_size, include_kl_z):
+    def __init__(self, hyperParams, K, nchannel, base_channels, z_dim, w_dim, hidden_dim, device, img_width, batch_size, include_elbo2):
         global local_device
         local_device = device
         super(InfGaussMMVAE, self).__init__(K, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size)
@@ -364,7 +364,7 @@ class InfGaussMMVAE(GMMVAE):
 
         #self.elbo_obj = self.get_ELBO()
         self.img_size = img_width
-        self.include_kl_z = include_kl_z
+        self.include_elbo2 = include_elbo2
 
     # def __len__(self):
     #     return len(self.X)
@@ -463,14 +463,15 @@ class InfGaussMMVAE(GMMVAE):
         elbo1      = torch.sum(self.pc_wz * log_ratio, dim=-1).mean()
 
         # compose elbo
-        elbo2 = 0
-        for k in range(self.K-1):
-            #2)need this term
-            #elbo -= compute_kumar2beta_kld(tf.expand_dims(self.kumar_a[:,k],1), tf.expand_dims(self.kumar_b[:,k],1), \
-            #                                   self.prior['dirichlet_alpha'], (self.K-1-k)*self.prior['dirichlet_alpha'])
-            #print(self.kumar_b[:, k].unsqueeze(1))
-            #print(self.kumar_b[:, k].expand(self.batch_size))
-            elbo2 -= compute_kumar2beta_kld(self.kumar_a[:, k].expand(self.batch_size), self.kumar_b[:, k].expand(self.batch_size), self.prior, (self.K-1-k)* self.prior).mean()
+        elbo2 = torch.tensor(0, dtype=torch.float).to(self.device)
+        if self.include_elbo2:
+            for k in range(self.K-1):
+                #2)need this term
+                #elbo -= compute_kumar2beta_kld(tf.expand_dims(self.kumar_a[:,k],1), tf.expand_dims(self.kumar_b[:,k],1), \
+                #                                   self.prior['dirichlet_alpha'], (self.K-1-k)*self.prior['dirichlet_alpha'])
+                #print(self.kumar_b[:, k].unsqueeze(1))
+                #print(self.kumar_b[:, k].expand(self.batch_size))
+                elbo2 -= compute_kumar2beta_kld(self.kumar_a[:, k].expand(self.batch_size), self.kumar_b[:, k].expand(self.batch_size), self.prior, (self.K-1-k)* self.prior).mean()
         #elbo += mcMixtureEntropy(self.pi_samples, self.z, self.z_mu, self.z_sigma, self.K)
         #3)need this term
         elbo3 = -0.5 * torch.sum(1 + torch.log(self.w_sigma) - torch.pow(self.w_mu, 2) - self.w_sigma) #KLD_W
