@@ -460,39 +460,39 @@ class InfGaussMMVAE(GMMVAE):
         _, _, _, pc  = self._decoding(self.z)
         log_ratio = torch.sub(torch.log(self.pc_wz+ 1e-20),torch.log(pc+ 1e-20))
         #1)need this term
-        elbo      = torch.sum(self.pc_wz * log_ratio, dim=-1).mean()
+        elbo1      = torch.sum(self.pc_wz * log_ratio, dim=-1).mean()
 
         # compose elbo
+        elbo2 = 0
         for k in range(self.K-1):
             #2)need this term
             #elbo -= compute_kumar2beta_kld(tf.expand_dims(self.kumar_a[:,k],1), tf.expand_dims(self.kumar_b[:,k],1), \
             #                                   self.prior['dirichlet_alpha'], (self.K-1-k)*self.prior['dirichlet_alpha'])
             #print(self.kumar_b[:, k].unsqueeze(1))
             #print(self.kumar_b[:, k].expand(self.batch_size))
-            elbo -= compute_kumar2beta_kld(self.kumar_a[:, k].expand(self.batch_size), self.kumar_b[:, k].expand(self.batch_size), self.prior, (self.K-1-k)* self.prior).mean()
+            elbo2 -= compute_kumar2beta_kld(self.kumar_a[:, k].expand(self.batch_size), self.kumar_b[:, k].expand(self.batch_size), self.prior, (self.K-1-k)* self.prior).mean()
         #elbo += mcMixtureEntropy(self.pi_samples, self.z, self.z_mu, self.z_sigma, self.K)
         #3)need this term
-        elbo += -0.5 * torch.sum(1 + torch.log(self.w_sigma) - torch.pow(self.w_mu, 2) - self.w_sigma) #KLD_W
+        elbo3 = -0.5 * torch.sum(1 + torch.log(self.w_sigma) - torch.pow(self.w_mu, 2) - self.w_sigma) #KLD_W
         #compute D_KL(Q(z|x)||p(z|c,w))
         #use this term https://github.com/psanch21/VAE-GMVAE/blob/e176d24d0e743f109ce37834f71f2f9067aae9bc/Alg_GMVAE/GMVAE_graph.py#L278
         # KL loss
         #kl_loss = 0.5*torch.sum(1 + z_logstd - z_mean**2 - torch.exp(z_logstd), dim=1)
         # likelihood loss
         
-        if self.include_kl_z:
-            z_wc = torch.unsqueeze(self.z_x_mean, -1)
-            z_wc = z_wc.expand(-1, self.z_dim, self.K)
-            logvar_z = self.z_x_logvar.unsqueeze(-1)
-            logvar_z = logvar_z.expand(-1, self.z_dim, self.K)
-            logvar_pz = torch.log(self.z_wc_var_list_sample.permute(1, 2, 0))
-            elbo += 0.5 * (((logvar_pz - logvar_z) + ((logvar_z.exp() + (z_wc - self.z_wc_mean_list_sample.permute(1, 2, 0)).pow(2))/logvar_pz.exp())) - 1).sum(dim=(1,2)).mean(dim=0)
+        z_wc = torch.unsqueeze(self.z_x_mean, -1)
+        z_wc = z_wc.expand(-1, self.z_dim, self.K)
+        logvar_z = self.z_x_logvar.unsqueeze(-1)
+        logvar_z = logvar_z.expand(-1, self.z_dim, self.K)
+        logvar_pz = torch.log(self.z_wc_var_list_sample.permute(1, 2, 0))
+        elbo4 = 0.5 * (((logvar_pz - logvar_z) + ((logvar_z.exp() + (z_wc - self.z_wc_mean_list_sample.permute(1, 2, 0)).pow(2))/logvar_pz.exp())) - 1).sum(dim=(1,2)).mean(dim=0)
 
 
         #compute E_{q(z|x)}[P(x|x)] reconstruction loss
         #use this term https://github.com/psanch21/VAE-GMVAE/blob/e176d24d0e743f109ce37834f71f2f9067aae9bc/Alg_GMVAE/GMVAE_graph.py#L256
-        elbo += F.binary_cross_entropy(input=self.x_recons_flat.view(-1, self.nchannel*self.img_size*self.img_size), target=X.view(-1, self.nchannel*self.img_size*self.img_size), reduction='none').sum(dim=1).mean(dim=0)
+        elbo5 = F.binary_cross_entropy(input=self.x_recons_flat.view(-1, self.nchannel*self.img_size*self.img_size), target=X.view(-1, self.nchannel*self.img_size*self.img_size), reduction='none').sum(dim=1).mean(dim=0)
         #elbo += F.binary_cross_entropy(input=self.x_recons_flat, target=X, reduction='sum')
-        return elbo.mean()
+        return (elbo1, elbo2, elbo3, elbo4, elbo5)
 
 
     def get_log_margLL(self, batchSize, X_recons_linear):

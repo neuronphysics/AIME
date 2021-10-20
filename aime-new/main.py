@@ -93,7 +93,8 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'latent_kl_loss': [],
-           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 'kl_transition_loss': []}
+           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 'kl_transition_loss': [],
+           'elbo1': [], 'elbo2': [], 'elbo3': [], 'elbo4': [], 'elbo5': []}
 
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
@@ -183,7 +184,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       if args.use_regular_vae:
         observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
       else:
-        observation_loss = infinite_vae.get_ELBO(observations.view(-1, 3, 64, 64))
+        elbo1, elbo2, elbo3, elbo4, elbo5 = infinite_vae.get_ELBO(observations.view(-1, 3, 64, 64))
       # Apply linearly ramping learning rate schedule
       if args.learning_rate_schedule != 0:
         for group in optimiser.param_groups:
@@ -193,25 +194,37 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       if args.use_regular_vae:
         (observation_loss + reward_loss + latent_kl_loss).backward()
       else:
-        (observation_loss + reward_loss).backward()
+        (elbo1 + elbo2 + elbo3 + elbo4 + elbo5 + reward_loss).backward()
       nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
       optimiser.step()
       # Store loss
       if args.use_regular_vae:
         losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item()])
       else:
-        losses.append([observation_loss.item(), reward_loss.item()])
+        losses.append([elbo1.item(), elbo2.item(), elbo3.item(), elbo4.item(), elbo5.item(), reward_loss.item()])
 
   # Update and plot loss metrics
   losses = tuple(zip(*losses))
-  metrics['observation_loss'].append(losses[0])
-  metrics['reward_loss'].append(losses[1])
   if args.use_regular_vae:
+    metrics['observation_loss'].append(losses[0])
+    metrics['reward_loss'].append(losses[1])
     metrics['latent_kl_loss'].append(losses[2])
-  lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
-  if args.use_regular_vae:
+    lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
     lineplot(metrics['episodes'][-len(metrics['latent_kl_loss']):], metrics['latent_kl_loss'], 'latent_kl_loss', results_dir)
+  else:
+    metrics['elbo1'].append(losses[0])
+    metrics['elbo2'].append(losses[1])
+    metrics['elbo3'].append(losses[2])
+    metrics['elbo4'].append(losses[3])
+    metrics['elbo5'].append(losses[4])
+    metrics['reward_loss'].append(losses[5])
+    lineplot(metrics['episodes'][-len(metrics['elbo1']):], metrics['elbo1'], 'elbo1', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['elbo2']):], metrics['elbo2'], 'elbo2', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['elbo3']):], metrics['elbo3'], 'elbo3', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['elbo4']):], metrics['elbo4'], 'elbo4', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['elbo5']):], metrics['elbo5'], 'elbo5', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
 
   # Data collection
   if args.use_regular_vae:
