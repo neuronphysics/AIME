@@ -183,7 +183,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       if args.use_regular_vae:
         observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
       else:
-        observation_loss = infinite_vae.get_ELBO(observations)
+        observation_loss = infinite_vae.get_ELBO(observations.view(-1, 3, 64, 64))
       # Apply linearly ramping learning rate schedule
       if args.learning_rate_schedule != 0:
         for group in optimiser.param_groups:
