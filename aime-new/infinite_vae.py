@@ -485,7 +485,7 @@ class InfGaussMMVAE(GMMVAE):
             logvar_z = self.z_x_logvar.unsqueeze(-1)
             logvar_z = logvar_z.expand(-1, self.z_dim, self.K)
             logvar_pz = torch.log(self.z_wc_var_list_sample.permute(1, 2, 0))
-            elbo += 0.5 * (((logvar_pz - logvar_z) + ((logvar_z.exp() + (z_wc - self.z_wc_mean_list_sample.permute(1, 2, 0)).pow(2))/logvar_pz.exp())) - 1)
+            elbo += 0.5 * (((logvar_pz - logvar_z) + ((logvar_z.exp() + (z_wc - self.z_wc_mean_list_sample.permute(1, 2, 0)).pow(2))/logvar_pz.exp())) - 1).sum(dim=(1,2)).mean(dim=0)
 
 
         #compute E_{q(z|x)}[P(x|x)] reconstruction loss
