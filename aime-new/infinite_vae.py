@@ -480,22 +480,12 @@ class InfGaussMMVAE(GMMVAE):
         # likelihood loss
         
         if self.include_kl_z:
-            logq = -0.5 * torch.sum(self.z_x_logvar, 1) - 0.5 * torch.sum(
-                    torch.pow(self.z_x - self.z_x_mean, 2) / self.z_x_var, 1)
-            
-            z_wc = torch.unsqueeze(self.z_x, 2)
-            z_wc = z_wc.repeat((1, 1, self.K))  # [batch_size, z_dim, K]
-            z_wc = z_wc.permute(2, 0, 1)  # [K, batch_size, z_dim]
-            z_wc_var_stack=torch.log(self.z_wc_var_list_sample)
-            log_det_sigma = torch.transpose(torch.mean(z_wc_var_stack, 2), 0, 1)  # [batch_size, K ]
-            aux = torch.pow(z_wc - self.z_wc_mean_list_sample, 2) / (self.z_wc_var_list_sample)  # [K, batch_size, z_dim]
-            aux = torch.mean(aux, 2)  # [K, batch_size]
-            aux = torch.transpose(aux, 0, 1)  # [batch_size, K]
-            aux = torch.mul(self.pc_wz, aux)  # [batch_size, K]
-            aux = torch.mean(aux, 1)  # [batch_size]
-            logp = -0.5 * torch.mean(torch.mul(self.pc_wz, log_det_sigma), 1) - 0.5 * aux
-            cond_prior = logq - logp
-            elbo -= torch.mean(cond_prior)
+            z_wc = torch.unsqueeze(self.z_x_mean, -1)
+            z_wc = z_wc.expand(-1, self.z_dim, self.K)
+            logvar_z = self.z_x_logvar.unsqueeze(-1)
+            logvar_z = logvar_z.expand(-1, self.z_dim, self.K)
+            logvar_pz = torch.log(self.z_wc_var_list_sample)
+            elbo += 0.5 * (((logvar_pz - logvar_z) + ((logvar_z.exp() + (z_wc - self.z_wc_mean_list_sample).pow(2))/logvar_pz.exp())) - 1)
 
 
         #compute E_{q(z|x)}[P(x|x)] reconstruction loss
