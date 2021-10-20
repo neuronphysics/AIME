@@ -69,9 +69,9 @@ parser.add_argument('--num-sample-trajectories', type=int, default=20, metavar='
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
 parser.add_argument('--discount-factor', type=float, default=0.999, metavar='Temp', help='Discount factor')
 parser.add_argument('--num-mixtures', type=int, default=15, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
-parser.add_argument('--w-dim', type=int, default=5, metavar='w', help='dimension of w')
+parser.add_argument('--w-dim', type=int, default=10, metavar='w', help='dimension of w')
 parser.add_argument('--hidden-size', type=int, default=16, metavar='H', help='Hidden size')
-parser.add_argument('--state-size', type=int, default=5, metavar='Z', help='State/latent size')
+parser.add_argument('--state-size', type=int, default=10, metavar='Z', help='State/latent size')
 parser.add_argument('--exclude-kl-z', action='store_true', help='remove kl loss related to z in vae')
 parser.add_argument('--use-regular-vae', action='store_true', help='use vae that uses single Gaussian mixture')
 
