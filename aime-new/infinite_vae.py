@@ -289,16 +289,15 @@ def compute_kumar2beta_kld(a, b, alpha, beta):
     b_inv = torch.pow(b + SMALL, -1)
     # compute taylor expansion for E[log (1-v)] term
     kl = torch.mul(torch.pow(1+ab,-1), beta_fn(a_inv, b))
-    
     for idx in range(10):
         kl += torch.mul(torch.pow(idx+2+ab,-1), beta_fn(torch.mul(idx+2., a_inv), b))
-        
     kl = torch.mul(torch.mul(beta-1,b), kl)
-    # 
-    kl += torch.mul(torch.div(a-alpha,a+SMALL), -EULER_GAMMA - torch.digamma(b) - torch.reciprocal(b + SMALL))
+    #
+    psi_b = torch.log(b + SMALL) - 1. / (2 * b + SMALL) -\
+        1. / (12 * b**2 + SMALL)
+    kl += torch.mul(torch.div(a-alpha,a+SMALL), -EULER_GAMMA - psi_b - b_inv)
     # add normalization constants
     kl += torch.log(ab) + torch.log(beta_fn(alpha, beta) + SMALL)
-    
     #  final term
     kl += torch.div(-(b-1),b +SMALL)
     return kl
