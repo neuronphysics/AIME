@@ -12,18 +12,19 @@ CONTROL_SUITE_ACTION_REPEATS = {'cartpole': 8, 'reacher': 4, 'finger': 2, 'cheet
 
 # Preprocesses an observation inplace (from float32 Tensor [0, 255] to [-0.5, 0.5])
 def preprocess_observation_(observation, bit_depth):
-  observation.div_(2 ** (8 - bit_depth)).floor_().div_(2 ** bit_depth).sub_(0.5)  # Quantise to given bit depth and centre
+  observation.div_(2 ** (8 - bit_depth)).floor_().div_(2 ** bit_depth)  # Quantise to given bit depth and centre
   observation.add_(torch.rand_like(observation).div_(2 ** bit_depth))  # Dequantise (to approx. match likelihood of PDF of continuous images vs. PMF of discrete images)
 
 
 # Postprocess an observation for storage (from float32 numpy array [-0.5, 0.5] to uint8 numpy array [0, 255])
 def postprocess_observation(observation, bit_depth):
-  return np.clip(np.floor((observation + 0.5) * 2 ** bit_depth) * 2 ** (8 - bit_depth), 0, 2 ** 8 - 1).astype(np.uint8)
+  return np.clip(np.floor((observation) * 2 ** bit_depth) * 2 ** (8 - bit_depth), 0, 2 ** 8 - 1).astype(np.uint8)
 
 
 def _images_to_observation(images, bit_depth):
   images = torch.tensor(cv2.resize(images, (64, 64), interpolation=cv2.INTER_LINEAR).transpose(2, 0, 1), dtype=torch.float32)  # Resize and put channel first
   preprocess_observation_(images, bit_depth)  # Quantise, centre and dequantise inplace
+  images = torch.min(torch.max(images, torch.tensor(1e-20, dtype=torch.float)), torch.tensor(1-1e-20, dtype=torch.float))
   return images.unsqueeze(dim=0)  # Add batch dimension
 
 
@@ -341,11 +342,11 @@ class GymEnv():
 
 
 class Hiway:
-  def __init__(self, seed, max_episode_length, action_repeat, bit_depth, agent_id, agent_spec):
+  def __init__(self, seed, max_episode_length, action_repeat, bit_depth, agent_id, agent_spec, scenario):
     import gym
     env = gym.make(
         "smarts.env:hiway-v0",
-        scenarios=['/SMARTS/scenarios/intersections/4lane'],
+        scenarios=[scenario],
         agent_specs={agent_id: agent_spec},
         sim_name=None,
         headless=True,
@@ -417,7 +418,7 @@ def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
     return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
   elif env in CONTROL_SUITE_ENVS:
     return ControlSuiteEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
-  elif env == 'Smarts':
+  elif (env == 'loop' or env == '4lane'):
     AGENT_ID = "Agent-001"
     AGENT_SPEC = AgentSpec(
       interface=AgentInterface.from_type(
@@ -426,7 +427,11 @@ def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
       agent_builder=Agent,
       reward_adapter = ultra_default_reward_adapter,
     )
-    return Hiway(seed, max_episode_length, action_repeat, bit_depth, AGENT_ID, AGENT_SPEC)
+    if env == '4lane':
+      scenario = '/SMARTS/scenarios/intersections/4lane'
+    else:
+      scenario = '/SMARTS/scenarios/loop'
+    return Hiway(seed, max_episode_length, action_repeat, bit_depth, AGENT_ID, AGENT_SPEC, scenario)
 
 
 # Wrapper for batching environments together
