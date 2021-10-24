@@ -24,9 +24,9 @@ def bottle(f, x_tuple):
 def bottle_two_output(f, x_tuple):
   x_sizes = tuple(map(lambda x: x.size(), x_tuple))
   y1, y2 = f(*map(lambda x: x[0].view(x[1][0] * x[1][1], *x[1][2:]), zip(x_tuple, x_sizes)))
-  y_size = y1.size()
-  assert y_size == y2.size()
-  return y1.view(x_sizes[0][0], x_sizes[0][1], *y_size[1:]), y2.view(x_sizes[0][0], x_sizes[0][1], *y_size[1:])
+  y1_size = y1.size()
+  y2_size = y2.size()
+  return y1.view(x_sizes[0][0], x_sizes[0][1], *y1_size[1:]), y2.view(x_sizes[0][0], x_sizes[0][1], *y2_size[1:])
 
 
 class TransitionModel(jit.ScriptModule):

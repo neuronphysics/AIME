@@ -43,7 +43,7 @@ def build_gp(
         snr_penalty_tolerance=snr_penalty_tolerance,
         snr_penalty_p=snr_penalty_p,
         init_noise_factor=init_noise_factor,
-        outputscale_bound=1e-2,
+        outputscale_bound=1e-6,
         noise_bound=noise_bound,
         noise_bound_factor=noise_bound_factor,
         num_inducing=0,
