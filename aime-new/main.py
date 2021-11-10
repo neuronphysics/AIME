@@ -281,26 +281,28 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_policy_kl = episode_policy_kl[args.lagging_size:]
   episode_states = episode_states[args.lagging_size-1:]
   # transition loss for gp, adapted from dlgpd repo
-  scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[:-1], next_states=episode_states[1:], actions=episode_actions)
-  with gpytorch.settings.prior_mode(True):
-      outputs = actor_critic_planner.transition_gp.predict(
-          scaled_X, suppress_eval_mode_warning=False
-      )
-      sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([args.num_sample_trajectories])) for o in outputs]), 0, 2).mean(dim=-2)
-      episode_state_kl = F.binary_cross_entropy(torch.sigmoid(sample_outputs), torch.sigmoid(episode_states[1:]), reduction='mean').mean(dim=-1, keepdim=True)
-      kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])))
-  ##
-  soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
-  target_q_values = args.temperature_factor * episode_rewards[:-1] + args.discount_factor * episode_values[1:]
-  value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
-  q_loss = F.mse_loss(episode_q_values[:-1], target_q_values, reduction='none').mean()
-  policy_loss = (episode_policy_kl - episode_q_values + episode_values).mean()
-  
-  planning_optimiser.zero_grad()
-  # may add an action entropy
-  (value_loss + q_loss + policy_loss + kl_transition_loss).backward(retain_graph=True)
-  nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
-  planning_optimiser.step()
+  index_numbers = np.arange(0, episode_actions[args.lagging_size:].size(0), args.horizon_size)[:-1]
+  for start in index_numbers:
+    scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[start:start+args.horizon_size], next_states=episode_states[start+1:start+args.horizon_size+1], actions=episode_actions[start:start+args.horizon_size])
+    with gpytorch.settings.prior_mode(True):
+        outputs = actor_critic_planner.transition_gp.predict(
+            scaled_X, suppress_eval_mode_warning=False
+        )
+        sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([args.num_sample_trajectories])) for o in outputs]), 0, 2).mean(dim=-2)
+        episode_state_kl = F.binary_cross_entropy(torch.sigmoid(sample_outputs), torch.sigmoid(episode_states[start+1:start+args.horizon_size+1]), reduction='mean').mean(dim=-1, keepdim=True)
+        kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[start+1:start+args.horizon_size+1])))
+    ##
+    soft_v_values = episode_q_values[start:start+args.horizon_size] - episode_state_kl - episode_policy_kl[start:start+args.horizon_size]
+    target_q_values = args.temperature_factor * episode_rewards[start:start+args.horizon_size-1] + args.discount_factor * episode_values[start+1:start+args.horizon_size]
+    value_loss = F.mse_loss(episode_values[start:start+args.horizon_size], soft_v_values, reduction='none').mean()
+    q_loss = F.mse_loss(episode_q_values[start:start+args.horizon_size-1], target_q_values, reduction='none').mean()
+    policy_loss = (episode_policy_kl[start:start+args.horizon_size] - episode_q_values[start:start+args.horizon_size] + episode_values[start:start+args.horizon_size]).mean()
+    
+    planning_optimiser.zero_grad()
+    # may add an action entropy
+    (value_loss + q_loss + policy_loss + kl_transition_loss).backward(retain_graph=True)
+    nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
+    planning_optimiser.step()
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
