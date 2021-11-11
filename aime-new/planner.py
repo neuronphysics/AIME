@@ -46,37 +46,41 @@ class MPCPlanner(jit.ScriptModule):
 
 
 class ValueNetwork(nn.Module):
-  def __init__(self, latent_size, hidden_size):
+  def __init__(self, latent_size, num_sample_trajectories, hidden_size):
     super().__init__()
     self.latent_size = latent_size
-    self.fc = nn.Linear(latent_size + hidden_size, 1)
+    self.fc1 = nn.Linear(latent_size + num_sample_trajectories, hidden_size)
+    self.fc2 = nn.Linear(hidden_size, 1)
   
   def forward(self, embedding):
-    value = self.fc(embedding)
-    return value
+    hidden = F.relu(self.fc1(embedding))
+    return self.fc2(hidden)
 
 class QNetwork(nn.Module):
-  def __init__(self, latent_size, num_sample_trajectories, action_size):
+  def __init__(self, latent_size, num_sample_trajectories, action_size, hidden_size):
     super().__init__()
     self.latent_size = latent_size
     self.action_size = action_size
-    self.fc = nn.Linear(latent_size + num_sample_trajectories + action_size, 1)
+    self.fc1 = nn.Linear(latent_size + num_sample_trajectories + action_size, hidden_size)
+    self.fc2 = nn.Linear(hidden_size, 1)
   
   def forward(self, embedding, action):
-    q_value = self.fc(torch.cat([embedding, action], dim=-1))
-    return q_value
+    hidden = F.relu(self.fc1(torch.cat([embedding, action], dim=-1)))
+    return self.fc2(hidden)
 
 class PolicyNetwork(nn.Module):
-  def __init__(self, latent_size, action_size, hidden_size):
+  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size):
     super().__init__()
     self.latent_size = latent_size
     self.action_size = action_size
-    self.fc_mean = nn.Linear(latent_size + hidden_size, action_size)
-    self.fc_std = nn.Linear(latent_size + hidden_size, action_size)
+    self.fc1 = nn.Linear(latent_size + num_sample_trajectories, hidden_size)
+    self.fc_mean = nn.Linear(hidden_size, action_size)
+    self.fc_std = nn.Linear(hidden_size, action_size)
   
   def forward(self, embedding):
-    policy_mean = self.fc_mean(embedding)
-    policy_std = F.softplus(self.fc_std(embedding))
+    hidden = F.relu(self.fc1(embedding))
+    policy_mean = self.fc_mean(hidden)
+    policy_std = F.softplus(self.fc_std(hidden))
     return policy_mean, policy_std
 
 class TransitionNetwork(nn.Module):
@@ -114,15 +118,15 @@ class RolloutEncoder(nn.Module):
     return embedding
 
 class ActorCriticPlanner(nn.Module):
-  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, num_sample_trajectories):
+  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, num_sample_trajectories, hidden_size):
     super().__init__()
     self.action_size, self.min_action, self.max_action = action_size, min_action, max_action
     self.action_scale = (self.max_action - self.min_action) / 2
     self.action_bias = (self.max_action + self.min_action) / 2
     self.latent_size = latent_size
-    self.actor = PolicyNetwork(latent_size, action_size, num_sample_trajectories)
-    self.critic = ValueNetwork(latent_size, num_sample_trajectories)
-    self.q_network = QNetwork(latent_size, num_sample_trajectories, action_size)
+    self.actor = PolicyNetwork(latent_size, action_size, num_sample_trajectories, hidden_size)
+    self.critic = ValueNetwork(latent_size, num_sample_trajectories, hidden_size)
+    self.q_network = QNetwork(latent_size, num_sample_trajectories, action_size, hidden_size)
     self.transition_gp = build_gp(latent_size+action_size, latent_size)
     self.recurrent_gp = recurrent_gp
     self.num_sample_trajectories = num_sample_trajectories
