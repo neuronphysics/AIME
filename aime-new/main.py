@@ -282,22 +282,23 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_policy_kl = episode_policy_kl[args.lagging_size:]
   episode_states = episode_states[args.lagging_size-1:]
   # transition loss for gp, adapted from dlgpd repo
-  index_numbers = np.arange(0, episode_actions[args.lagging_size:].size(0), args.horizon_size)[:-1]
+  episode_length = episode_actions[args.lagging_size:].size(0)
+  index_numbers = np.arange(0, episode_length, args.horizon_size)
   for start in index_numbers:
-    scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[start:start+args.horizon_size], next_states=episode_states[start+1:start+args.horizon_size+1], actions=episode_actions[start:start+args.horizon_size])
+    scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[start:min(start+args.horizon_size, episode_length-1)], next_states=episode_states[start+1:min(start+args.horizon_size+1, episode_length)], actions=episode_actions[start:min(start+args.horizon_size, episode_length-1)])
     with gpytorch.settings.prior_mode(True):
         outputs = actor_critic_planner.transition_gp.predict(
             scaled_X, suppress_eval_mode_warning=False
         )
         sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([args.num_sample_trajectories])) for o in outputs]), 0, 2).mean(dim=-2)
-        episode_state_kl = F.binary_cross_entropy(torch.sigmoid(sample_outputs), torch.sigmoid(episode_states[start+1:start+args.horizon_size+1]), reduction='mean').mean(dim=-1, keepdim=True)
-        kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[start+1:start+args.horizon_size+1])))
+        episode_state_kl = F.binary_cross_entropy(torch.sigmoid(sample_outputs), torch.sigmoid(episode_states[start+1:min(start+args.horizon_size+1, episode_length)]), reduction='mean').mean(dim=-1, keepdim=True)
+        kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[start+1:min(start+args.horizon_size+1, episode_length)])))
     ##
-    soft_v_values = episode_q_values[start:start+args.horizon_size] - episode_state_kl - episode_policy_kl[start:start+args.horizon_size]
-    target_q_values = args.temperature_factor * episode_rewards[start:start+args.horizon_size-1] + args.discount_factor * episode_values[start+1:start+args.horizon_size]
-    value_loss = F.mse_loss(episode_values[start:start+args.horizon_size], soft_v_values, reduction='none').mean()
-    q_loss = F.mse_loss(episode_q_values[start:start+args.horizon_size-1], target_q_values, reduction='none').mean()
-    policy_loss = (episode_policy_kl[start:start+args.horizon_size] - episode_q_values[start:start+args.horizon_size] + episode_values[start:start+args.horizon_size]).mean()
+    soft_v_values = episode_q_values[start:min(start+args.horizon_size, episode_length)] - episode_state_kl - episode_policy_kl[start:min(start+args.horizon_size, episode_length)]
+    target_q_values = args.temperature_factor * episode_rewards[start:min(start+args.horizon_size-1, episode_length-1)] + args.discount_factor * episode_values[start+1:min(start+args.horizon_size, episode_length)]
+    value_loss = F.mse_loss(episode_values[start:min(start+args.horizon_size, episode_length)], soft_v_values, reduction='none').mean()
+    q_loss = F.mse_loss(episode_q_values[start:min(start+args.horizon_size-1, episode_length-1)], target_q_values, reduction='none').mean()
+    policy_loss = (episode_policy_kl[start:min(start+args.horizon_size, episode_length)] - episode_q_values[start:min(start+args.horizon_size, episode_length)] + episode_values[start:min(start+args.horizon_size, episode_length)]).mean()
     
     planning_optimiser.zero_grad()
     # may add an action entropy
