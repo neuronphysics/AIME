@@ -157,11 +157,14 @@ free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.d
 
 reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
 
+rgp_training_episode = 50
+
 # Training (and testing)
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
   # Model fitting
   losses = []
-  if episode % 10 == 1:
+  if ((episode-1) == rgp_training_episode):
+    rgp_training_episode = int(rgp_training_episode * 1.25)
     if (not args.use_regular_vae):
       infinite_vae.batch_size = args.batch_size * args.chunk_size
     for s in tqdm(range(args.collect_interval)):
