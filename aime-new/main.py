@@ -287,7 +287,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_states = episode_states[args.lagging_size-1:]
   # transition loss for gp, adapted from dlgpd repo
   episode_length = episode_actions[args.lagging_size:].size(0)
-  index_numbers = np.arange(0, episode_length-1, args.horizon_size)
+  index_numbers = np.arange(0, episode_length-2, args.horizon_size)
   for start in index_numbers:
     scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[start:min(start+args.horizon_size, episode_length-1)], next_states=episode_states[start+1:min(start+args.horizon_size+1, episode_length)], actions=episode_actions[start:min(start+args.horizon_size, episode_length-1)])
     with gpytorch.settings.prior_mode(True):
