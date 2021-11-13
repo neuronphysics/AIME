@@ -289,6 +289,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_length = episode_actions[args.lagging_size:].size(0)
   index_numbers = np.arange(0, episode_length-1, args.horizon_size)
   for start in index_numbers:
+    if start >= episode_length-2:
+      continue
     scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[start:min(start+args.horizon_size, episode_length-1)], next_states=episode_states[start+1:min(start+args.horizon_size+1, episode_length)], actions=episode_actions[start:min(start+args.horizon_size, episode_length-1)])
     with gpytorch.settings.prior_mode(True):
         outputs = actor_critic_planner.transition_gp.predict(
