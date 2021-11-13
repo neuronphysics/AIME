@@ -161,7 +161,7 @@ reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurre
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
   # Model fitting
   losses = []
-  if episode <= args.seed_episodes + 50:
+  if episode % 10 == 1:
     if (not args.use_regular_vae):
       infinite_vae.batch_size = args.batch_size * args.chunk_size
     for s in tqdm(range(args.collect_interval)):
