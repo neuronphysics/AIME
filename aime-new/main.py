@@ -286,7 +286,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_policy_kl = episode_policy_kl[args.lagging_size:]
   episode_states = episode_states[args.lagging_size-1:]
   episode_length = episode_actions[args.lagging_size:].size(0)
-  index_numbers = np.arange(0, episode_length-1, args.horizon_size)
+  index_numbers = np.arange(0, episode_length, args.horizon_size)
   for start in index_numbers:
     soft_v_values = episode_q_values[start:min(start+args.horizon_size, episode_length)] - episode_policy_kl[start:min(start+args.horizon_size, episode_length)]
     target_q_values = args.temperature_factor * episode_rewards[start:min(start+args.horizon_size-1, episode_length-1)] + args.discount_factor * episode_values[start+1:min(start+args.horizon_size, episode_length)]
