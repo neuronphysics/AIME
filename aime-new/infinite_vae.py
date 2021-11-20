@@ -17,7 +17,7 @@ if torch.cuda.is_available():
 else:
     device = "cpu"
 '''
-local_device = "cpu"
+local_device = torch.device('cuda')
 
 def gather_nd(params, indices):
     # this function has a limit that MAX_ADVINDEX_CALC_DIMS=5
@@ -171,7 +171,7 @@ class GMMVAE(nn.Module):
         h = F.relu(self.bn2d_1(self.conv1(h)))
         h = F.relu(self.bn2d_2(self.conv2(h)))
         h = F.relu(self.bn2d_3(self.conv3(h)))
-        
+
         h = F.relu(self.bn1d(self.fc0(self.flatten(h))))
         self.sigma= 0.0001
         #create bottleneck
@@ -431,7 +431,7 @@ class InfGaussMMVAE(GMMVAE):
         return segments
 
     def _encoding(self, X):
-      return self.z_x_mean, self.z_x_logvar, self.kumar_a, self.kumar_b, self.c, self.w_x_mean, self.w_x_logvar 
+      return self.z_x_mean, self.z_x_logvar, self.kumar_a, self.kumar_b, self.c, self.w_x_mean, self.w_x_logvar
 
     def _decoding(self, z):
         a_inv = torch.pow(self.kumar_a, -1)
@@ -479,7 +479,7 @@ class InfGaussMMVAE(GMMVAE):
         # KL loss
         #kl_loss = 0.5*torch.sum(1 + z_logstd - z_mean**2 - torch.exp(z_logstd), dim=1)
         # likelihood loss
-        
+
         z_wc = torch.unsqueeze(self.z_x_mean, -1)
         z_wc = z_wc.expand(-1, self.z_dim, self.K)
         logvar_z = self.z_x_logvar.unsqueeze(-1)
@@ -490,8 +490,11 @@ class InfGaussMMVAE(GMMVAE):
 
         #compute E_{q(z|x)}[P(x|x)] reconstruction loss
         #use this term https://github.com/psanch21/VAE-GMVAE/blob/e176d24d0e743f109ce37834f71f2f9067aae9bc/Alg_GMVAE/GMVAE_graph.py#L256
-        elbo5 = F.binary_cross_entropy(input=self.x_recons_flat.view(-1, self.nchannel*self.img_size*self.img_size), target=X.view(-1, self.nchannel*self.img_size*self.img_size), reduction='none').sum(dim=1).mean(dim=0)
-        #elbo += F.binary_cross_entropy(input=self.x_recons_flat, target=X, reduction='sum')
+        criterion = nn.BCELoss(reduction='sum')
+        elbo5 = criterion(self.x_recons_flat.view(-1, self.nchannel*self.img_size*self.img_size), X.view(-1, self.nchannel*self.img_size*self.img_size))
+
+        #elbo = F.binary_cross_entropy(input=self.x_recons_flat, target=X, reduction='sum')
+
         return (elbo1, elbo2, elbo3, elbo4, elbo5)
 
 
@@ -540,7 +543,7 @@ class InfGaussMMVAE(GMMVAE):
         # ****need this term :calc post term
         log_kumar_post = log_kumar_pdf(v_samples, self.kumar_a, self.kumar_b)
 
-        
+
         log_gauss_post = log_normal_pdf(self.z_x, self.z_x_mean, self.z_x_var)
 
         #****need this term :cal prior and posterior over w
@@ -550,7 +553,7 @@ class InfGaussMMVAE(GMMVAE):
 
 
     def generate_samples(self):
-        
+
         w = list()
         z = list()
         x = list()
