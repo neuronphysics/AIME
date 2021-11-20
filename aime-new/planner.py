@@ -7,8 +7,6 @@ from torch.distributions import Normal
 
 import gpytorch
 
-from dlgpd.gp import build_gp
-
 # Model-predictive control planner with cross-entropy method and learned transition model
 class MPCPlanner(jit.ScriptModule):
   __constants__ = ['action_size', 'planning_horizon', 'optimisation_iters', 'candidates', 'top_candidates', 'min_action', 'max_action']
@@ -127,7 +125,6 @@ class ActorCriticPlanner(nn.Module):
     self.actor = PolicyNetwork(latent_size, action_size, num_sample_trajectories, hidden_size)
     self.critic = ValueNetwork(latent_size, num_sample_trajectories, hidden_size)
     self.q_network = QNetwork(latent_size, num_sample_trajectories, action_size, hidden_size)
-    self.transition_gp = build_gp(latent_size+action_size, latent_size)
     self.recurrent_gp = recurrent_gp
     self.num_sample_trajectories = num_sample_trajectories
     self.lagging_size = lagging_size

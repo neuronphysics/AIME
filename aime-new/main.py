@@ -94,7 +94,7 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'latent_kl_loss': [],
-           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 'kl_transition_loss': [],
+           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [],
            'elbo1': [], 'elbo2': [], 'elbo3': [], 'elbo4': [], 'elbo5': []}
 
 # Initialise training environment and experience replay memory
@@ -285,20 +285,10 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_rewards = episode_rewards[args.lagging_size:]
   episode_policy_kl = episode_policy_kl[args.lagging_size:]
   episode_states = episode_states[args.lagging_size-1:]
-  # transition loss for gp, adapted from dlgpd repo
   episode_length = episode_actions[args.lagging_size:].size(0)
-  index_numbers = np.arange(0, episode_length-2, args.horizon_size)
+  index_numbers = np.arange(0, episode_length-1, args.horizon_size)
   for start in index_numbers:
-    scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[start:min(start+args.horizon_size, episode_length-1)], next_states=episode_states[start+1:min(start+args.horizon_size+1, episode_length)], actions=episode_actions[start:min(start+args.horizon_size, episode_length-1)])
-    with gpytorch.settings.prior_mode(True):
-        outputs = actor_critic_planner.transition_gp.predict(
-            scaled_X, suppress_eval_mode_warning=False
-        )
-        sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([args.num_sample_trajectories])) for o in outputs]), 0, 2).mean(dim=-2)
-        episode_state_kl = F.binary_cross_entropy(torch.sigmoid(sample_outputs), torch.sigmoid(episode_states[start+1:min(start+args.horizon_size+1, episode_length)]), reduction='mean').mean(dim=-1, keepdim=True)
-        kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[start+1:min(start+args.horizon_size+1, episode_length)])))
-    ##
-    soft_v_values = episode_q_values[start:min(start+args.horizon_size, episode_length)] - episode_state_kl - episode_policy_kl[start:min(start+args.horizon_size, episode_length)]
+    soft_v_values = episode_q_values[start:min(start+args.horizon_size, episode_length)] - episode_policy_kl[start:min(start+args.horizon_size, episode_length)]
     target_q_values = args.temperature_factor * episode_rewards[start:min(start+args.horizon_size-1, episode_length-1)] + args.discount_factor * episode_values[start+1:min(start+args.horizon_size, episode_length)]
     value_loss = F.mse_loss(episode_values[start:min(start+args.horizon_size, episode_length)], soft_v_values, reduction='none').mean()
     q_loss = F.mse_loss(episode_q_values[start:min(start+args.horizon_size-1, episode_length-1)], target_q_values, reduction='none').mean()
@@ -306,14 +296,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     
     planning_optimiser.zero_grad()
     # may add an action entropy
-    (value_loss + q_loss + policy_loss + kl_transition_loss).backward(retain_graph=True)
+    (value_loss + q_loss + policy_loss).backward(retain_graph=True)
     nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
     planning_optimiser.step()
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
   metrics['q_loss'].append(q_loss.item())
-  metrics['kl_transition_loss'].append(kl_transition_loss.item())
   # Update and plot train reward metrics
   metrics['steps'].append(t + metrics['steps'][-1])
   metrics['episodes'].append(episode)
@@ -323,7 +312,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['policy_loss']):], metrics['policy_loss'], 'policy_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['kl_transition_loss']):], metrics['kl_transition_loss'], 'kl_transition_loss', results_dir)
 
   if args.use_regular_vae:
     encoder.train()
