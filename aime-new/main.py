@@ -33,7 +33,7 @@ parser.add_argument('--belief-size', type=int, default=200, metavar='H', help='B
 parser.add_argument('--action-repeat', type=int, default=1, metavar='R', help='Action repeat')
 parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', help='Action noise')
 parser.add_argument('--episodes', type=int, default=10000, metavar='E', help='Total number of episodes')
-parser.add_argument('--seed-episodes', type=int, default=100, metavar='S', help='Seed episodes')
+parser.add_argument('--seed-episodes', type=int, default=50, metavar='S', help='Seed episodes')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C', help='Collect interval')
 parser.add_argument('--batch-size', type=int, default=50, metavar='B', help='Batch size')
 parser.add_argument('--chunk-size', type=int, default=10, metavar='L', help='Chunk size')
@@ -74,6 +74,7 @@ parser.add_argument('--hidden-size', type=int, default=16, metavar='H', help='Hi
 parser.add_argument('--state-size', type=int, default=10, metavar='Z', help='State/latent size')
 parser.add_argument('--include-elbo2', action='store_true', help='include elbo 2 loss')
 parser.add_argument('--use-regular-vae', action='store_true', help='use vae that uses single Gaussian mixture')
+parser.add_argument('--rgp-training-interval-ratio', type=float, default=1.1, metavar='In', help='RGP training interval ratio')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -93,7 +94,7 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'latent_kl_loss': [],
-           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 'kl_transition_loss': [],
+           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [],
            'elbo1': [], 'elbo2': [], 'elbo3': [], 'elbo4': [], 'elbo5': []}
 
 # Initialise training environment and experience replay memory
@@ -138,7 +139,7 @@ else:
 
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
-actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories).to(device=args.device)
+actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories, args.hidden_size).to(device=args.device)
 planning_optimiser = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 if args.models is not '' and os.path.exists(args.models):
   model_dicts = torch.load(args.models)
@@ -157,74 +158,78 @@ free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.d
 
 reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
 
+rgp_training_episode = args.seed_episodes
+
 # Training (and testing)
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
   # Model fitting
   losses = []
-  if (not args.use_regular_vae):
-    infinite_vae.batch_size = args.batch_size * args.chunk_size
-  for s in tqdm(range(args.collect_interval)):
-    with gpytorch.settings.num_likelihood_samples(1):
-      # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
-      observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
-      if args.use_regular_vae:
-        latent_mean, latent_std = bottle_two_output(encoder, (observations, ))
-        latent_dist = Normal(latent_mean, latent_std)
-        latent_kl_loss = kl_divergence(latent_dist, global_prior).sum(dim=2).mean(dim=(0, 1))
-        latent_states = latent_dist.rsample()
-      else:
-        reconstructed_observations, latent_states = bottle_two_output(infinite_vae, (observations, ))
-      init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
-      predicted_rewards = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
-      if (not args.non_cumulative_reward):
-        true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
-      else:
-        true_rewards = rewards[args.lagging_size+args.horizon_size:]
-      reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
-      if args.use_regular_vae:
-        observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
-      else:
-        elbo1, elbo2, elbo3, elbo4, elbo5 = infinite_vae.get_ELBO(observations.view(-1, 3, 64, 64))
-      # Apply linearly ramping learning rate schedule
-      if args.learning_rate_schedule != 0:
-        for group in optimiser.param_groups:
-          group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
-      # Update model parameters
-      optimiser.zero_grad()
-      if args.use_regular_vae:
-        (observation_loss + reward_loss + latent_kl_loss).backward()
-      else:
-        (elbo1 + elbo2 + elbo3 + elbo4 + elbo5 + reward_loss).backward()
-      nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-      optimiser.step()
-      # Store loss
-      if args.use_regular_vae:
-        losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item()])
-      else:
-        losses.append([elbo1.item(), elbo2.item(), elbo3.item(), elbo4.item(), elbo5.item(), reward_loss.item()])
+  if ((episode-1) == rgp_training_episode):
+    rgp_training_episode = int(rgp_training_episode * args.rgp_training_interval_ratio)
+    if (not args.use_regular_vae):
+      infinite_vae.batch_size = args.batch_size * args.chunk_size
+    for s in tqdm(range(args.collect_interval)):
+      with gpytorch.settings.num_likelihood_samples(1):
+        # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
+        observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
+        if args.use_regular_vae:
+          latent_mean, latent_std = bottle_two_output(encoder, (observations, ))
+          latent_dist = Normal(latent_mean, latent_std)
+          latent_kl_loss = kl_divergence(latent_dist, global_prior).sum(dim=2).mean(dim=(0, 1))
+          latent_states = latent_dist.rsample()
+        else:
+          reconstructed_observations, latent_states = bottle_two_output(infinite_vae, (observations, ))
+        init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
+        predicted_rewards = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
+        if (not args.non_cumulative_reward):
+          true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
+        else:
+          true_rewards = rewards[args.lagging_size+args.horizon_size:]
+        reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
+        if args.use_regular_vae:
+          observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
+        else:
+          elbo1, elbo2, elbo3, elbo4, elbo5 = infinite_vae.get_ELBO(observations.view(-1, 3, 64, 64))
+        # Apply linearly ramping learning rate schedule
+        if args.learning_rate_schedule != 0:
+          for group in optimiser.param_groups:
+            group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
+        # Update model parameters
+        optimiser.zero_grad()
+        if args.use_regular_vae:
+          (observation_loss + reward_loss + latent_kl_loss).backward()
+        else:
+          (elbo1 + elbo2 + elbo3 + elbo4 + elbo5 + reward_loss).backward()
+        nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
+        optimiser.step()
+        # Store loss
+        if args.use_regular_vae:
+          losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item()])
+        else:
+          losses.append([elbo1.item(), elbo2.item(), elbo3.item(), elbo4.item(), elbo5.item(), reward_loss.item()])
 
-  # Update and plot loss metrics
-  losses = tuple(zip(*losses))
-  if args.use_regular_vae:
-    metrics['observation_loss'].append(losses[0])
-    metrics['reward_loss'].append(losses[1])
-    metrics['latent_kl_loss'].append(losses[2])
-    lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['latent_kl_loss']):], metrics['latent_kl_loss'], 'latent_kl_loss', results_dir)
-  else:
-    metrics['elbo1'].append(losses[0])
-    metrics['elbo2'].append(losses[1])
-    metrics['elbo3'].append(losses[2])
-    metrics['elbo4'].append(losses[3])
-    metrics['elbo5'].append(losses[4])
-    metrics['reward_loss'].append(losses[5])
-    lineplot(metrics['episodes'][-len(metrics['elbo1']):], metrics['elbo1'], 'elbo1', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['elbo2']):], metrics['elbo2'], 'elbo2', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['elbo3']):], metrics['elbo3'], 'elbo3', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['elbo4']):], metrics['elbo4'], 'elbo4', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['elbo5']):], metrics['elbo5'], 'elbo5', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
+    # Update and plot loss metrics
+    losses = tuple(zip(*losses))
+    if args.use_regular_vae:
+      metrics['observation_loss'].append(losses[0])
+      metrics['reward_loss'].append(losses[1])
+      metrics['latent_kl_loss'].append(losses[2])
+      lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['latent_kl_loss']):], metrics['latent_kl_loss'], 'latent_kl_loss', results_dir)
+    else:
+      metrics['elbo1'].append(losses[0])
+      metrics['elbo2'].append(losses[1])
+      metrics['elbo3'].append(losses[2])
+      metrics['elbo4'].append(losses[3])
+      metrics['elbo5'].append(losses[4])
+      metrics['reward_loss'].append(losses[5])
+      lineplot(metrics['episodes'][-len(metrics['elbo1']):], metrics['elbo1'], 'elbo1', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['elbo2']):], metrics['elbo2'], 'elbo2', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['elbo3']):], metrics['elbo3'], 'elbo3', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['elbo4']):], metrics['elbo4'], 'elbo4', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['elbo5']):], metrics['elbo5'], 'elbo5', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
 
   # Data collection
   if args.use_regular_vae:
@@ -280,32 +285,24 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_rewards = episode_rewards[args.lagging_size:]
   episode_policy_kl = episode_policy_kl[args.lagging_size:]
   episode_states = episode_states[args.lagging_size-1:]
-  # transition loss for gp, adapted from dlgpd repo
-  scaled_X = actor_critic_planner.transition_gp.set_data(curr_states=episode_states[:-1], next_states=episode_states[1:], actions=episode_actions)
-  with gpytorch.settings.prior_mode(True):
-      outputs = actor_critic_planner.transition_gp.predict(
-          scaled_X, suppress_eval_mode_warning=False
-      )
-      sample_outputs = torch.transpose(torch.stack([o.rsample(sample_shape=torch.Size([args.num_sample_trajectories])) for o in outputs]), 0, 2).mean(dim=-2)
-      episode_state_kl = F.binary_cross_entropy(torch.sigmoid(sample_outputs), torch.sigmoid(episode_states[1:]), reduction='mean').mean(dim=-1, keepdim=True)
-      kl_transition_loss = -torch.sum(torch.stack(actor_critic_planner.transition_gp.get_mll(outputs, episode_states[1:])))
-  ##
-  soft_v_values = episode_q_values - episode_state_kl - episode_policy_kl
-  target_q_values = args.temperature_factor * episode_rewards[:-1] + args.discount_factor * episode_values[1:]
-  value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
-  q_loss = F.mse_loss(episode_q_values[:-1], target_q_values, reduction='none').mean()
-  policy_loss = (episode_policy_kl - episode_q_values + episode_values).mean()
-  
-  planning_optimiser.zero_grad()
-  # may add an action entropy
-  (value_loss + q_loss + policy_loss + kl_transition_loss).backward(retain_graph=True)
-  nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
-  planning_optimiser.step()
+  episode_length = episode_actions[args.lagging_size:].size(0)
+  index_numbers = np.arange(0, episode_length, args.horizon_size)
+  for start in index_numbers:
+    soft_v_values = episode_q_values[start:min(start+args.horizon_size, episode_length)] - episode_policy_kl[start:min(start+args.horizon_size, episode_length)]
+    target_q_values = args.temperature_factor * episode_rewards[start:min(start+args.horizon_size-1, episode_length-1)] + args.discount_factor * episode_values[start+1:min(start+args.horizon_size, episode_length)]
+    value_loss = F.mse_loss(episode_values[start:min(start+args.horizon_size, episode_length)], soft_v_values, reduction='none').mean()
+    q_loss = F.mse_loss(episode_q_values[start:min(start+args.horizon_size-1, episode_length-1)], target_q_values, reduction='none').mean()
+    policy_loss = (episode_policy_kl[start:min(start+args.horizon_size, episode_length)] - episode_q_values[start:min(start+args.horizon_size, episode_length)] + episode_values[start:min(start+args.horizon_size, episode_length)]).mean()
+    
+    planning_optimiser.zero_grad()
+    # may add an action entropy
+    (value_loss + q_loss + policy_loss).backward(retain_graph=True)
+    nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
+    planning_optimiser.step()
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
   metrics['q_loss'].append(q_loss.item())
-  metrics['kl_transition_loss'].append(kl_transition_loss.item())
   # Update and plot train reward metrics
   metrics['steps'].append(t + metrics['steps'][-1])
   metrics['episodes'].append(episode)
@@ -315,7 +312,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['policy_loss']):], metrics['policy_loss'], 'policy_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['kl_transition_loss']):], metrics['kl_transition_loss'], 'kl_transition_loss', results_dir)
 
   if args.use_regular_vae:
     encoder.train()
