@@ -263,7 +263,7 @@ class RewardGP(DGPHiddenLayer):
 
 # may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
-    def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1, noise=0.5):
+    def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1):
         super().__init__()
         self.horizon_size = horizon_size
         self.lagging_size = lagging_size
@@ -273,7 +273,6 @@ class RecurrentGP(DeepGP):
         self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size+1)]
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device).to(device=device)
         self.num_mixture_samples = num_mixture_samples
-        self.noise = noise
         self.likelihood = GaussianLikelihood()
     
     def forward(self, init_states, actions):
@@ -288,18 +287,15 @@ class RecurrentGP(DeepGP):
             # policy distribution
             #w_hat = lagging_states # may have to change this to lagging_states[:-1] later
             a = self.policy_modules[i](lagging_states).rsample().squeeze(0)
-            a = a + self.noise * torch.randn_like(a)
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
             # transition distribution
             z = self.transition_modules[i](z_hat).rsample().squeeze(0)
-            z = z + self.noise * torch.randn_like(z)
             # first dimension of z is the number of Gaussian mixtures (z.size(0))
             lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
         
         # last policy in the horizon
         a = self.policy_modules[self.horizon_size](lagging_states).rsample().squeeze(0)
-        a = a + self.noise * torch.randn_like(a)
         lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
         z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
