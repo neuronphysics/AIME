@@ -152,7 +152,7 @@ class ActorCriticPlanner(nn.Module):
   def act(self, prior_states, prior_actions, device=None):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
     policy_dist, value, embedding = self.forward(prior_states, prior_actions, device)
-    policy_action = policy_dist.rsample().squeeze(dim=0)
+    policy_action = policy_dist.rsample().mean(dim=0)
     policy_log_prob = policy_dist.log_prob(policy_action)
     policy_mll_loss = -self.policy_mll(policy_dist, policy_action)
     transition_dist = self.transition_model(embedding, policy_action)
