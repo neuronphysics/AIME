@@ -256,7 +256,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   with gpytorch.settings.num_likelihood_samples(1):
     for t in pbar:
       action, action_log_prob, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
-      episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).sum(dim=-1, keepdim=True)], dim=0)
+      episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).unsqueeze(dim=0)], dim=0)
       observation, reward, done = env.step(action[0].cpu())
       with torch.no_grad():
         if args.use_regular_vae:
@@ -344,7 +344,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
-        action, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+        with gpytorch.settings.num_likelihood_samples(1):
+          action, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
         observation, reward, done = test_envs.step(action.cpu())
         if args.use_regular_vae:
           current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))

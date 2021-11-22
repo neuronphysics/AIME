@@ -137,7 +137,7 @@ class ActorCriticPlanner(nn.Module):
   def act(self, prior_states, prior_actions, device=None):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
     policy_dist, value, embedding = self.forward(prior_states, prior_actions, device)
-    policy_action = policy_dist.rsample()
+    policy_action = policy_dist.rsample().squeeze(dim=0)
     policy_log_prob = policy_dist.log_prob(policy_action)
     normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).to(device=device) + torch.tensor(self.action_bias).to(device=device)
     normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.tensor(self.min_action).to(device=device)), torch.tensor(self.max_action).to(device=device))
