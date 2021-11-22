@@ -253,31 +253,32 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_policy_kl = torch.zeros(args.lagging_size, 1, device=args.device)
   pbar = tqdm(range(args.max_episode_length // args.action_repeat))
   time_steps = 0
-  for t in pbar:
-    action, action_log_prob, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
-    episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).sum(dim=-1, keepdim=True)], dim=0)
-    observation, reward, done = env.step(action[0].cpu())
-    with torch.no_grad():
-      if args.use_regular_vae:
-        current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
-        current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
-      else:
-        _, current_latent_state = infinite_vae(observation.to(device=args.device))
-    episode_states = torch.cat([episode_states, current_latent_state], dim=0)
-    episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
-    episode_values = torch.cat([episode_values, value], dim=0)
-    episode_q_values = torch.cat([episode_q_values, q_value], dim=0)
-    episode_rewards = torch.cat([episode_rewards, torch.Tensor([[reward]]).to(device=args.device)], dim=0)
-    D.append(observation, action.detach().cpu(), reward, done)
-    total_reward += reward
-    
-    #if (time_step % args.num_planning_steps == 0) or done:
-      # compute returns in reverse order in the episode reward list
-    if args.render:
-      env.render()
-    if done:
-      pbar.close()
-      break
+  with gpytorch.settings.num_likelihood_samples(1):
+    for t in pbar:
+      action, action_log_prob, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+      episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).sum(dim=-1, keepdim=True)], dim=0)
+      observation, reward, done = env.step(action[0].cpu())
+      with torch.no_grad():
+        if args.use_regular_vae:
+          current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
+          current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
+        else:
+          _, current_latent_state = infinite_vae(observation.to(device=args.device))
+      episode_states = torch.cat([episode_states, current_latent_state], dim=0)
+      episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
+      episode_values = torch.cat([episode_values, value], dim=0)
+      episode_q_values = torch.cat([episode_q_values, q_value], dim=0)
+      episode_rewards = torch.cat([episode_rewards, torch.Tensor([[reward]]).to(device=args.device)], dim=0)
+      D.append(observation, action.detach().cpu(), reward, done)
+      total_reward += reward
+      
+      #if (time_step % args.num_planning_steps == 0) or done:
+        # compute returns in reverse order in the episode reward list
+      if args.render:
+        env.render()
+      if done:
+        pbar.close()
+        break
   
   episode_actions = episode_actions[args.lagging_size:]
   episode_values = episode_values[args.lagging_size:]
