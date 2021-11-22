@@ -11,6 +11,7 @@ from models import DGPHiddenLayer
 from gpytorch.models.deep_gps import DeepGP
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.means import ConstantMean, ZeroMean, LinearMean
+from gpytorch.mlls import DeepApproximateMLL, VariationalELBO
 
 class ValueNetwork(nn.Module):
   def __init__(self, latent_size, num_sample_trajectories, hidden_size):
@@ -60,6 +61,7 @@ class PolicyModel(DeepGP):
     super().__init__()
     self.policy_dist = PolicyLayer(latent_size, action_size, num_sample_trajectories, device)
     self.likelihood = GaussianLikelihood()
+    self.mll = DeepApproximateMLL(VariationalELBO(self.likelihood, self, 1))
   
   def forward(self, embedding):
     return self.policy_dist(embedding)
@@ -139,7 +141,8 @@ class ActorCriticPlanner(nn.Module):
     policy_dist, value, embedding = self.forward(prior_states, prior_actions, device)
     policy_action = policy_dist.rsample().squeeze(dim=0)
     policy_log_prob = policy_dist.log_prob(policy_action)
+    policy_mll = self.actor.mll(policy_dist, policy_action)
     normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).to(device=device) + torch.tensor(self.action_bias).to(device=device)
     normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.tensor(self.min_action).to(device=device)), torch.tensor(self.max_action).to(device=device))
     q_value = self.q_network(embedding, policy_action)
-    return normalized_policy_action, policy_log_prob, value, q_value
+    return normalized_policy_action, policy_log_prob, (-policy_mll), value, q_value

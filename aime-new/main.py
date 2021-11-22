@@ -251,12 +251,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_q_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_rewards = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_policy_kl = torch.zeros(args.lagging_size, 1, device=args.device)
+  episode_policy_mll_loss = torch.zeros(args.lagging_size, 1, device=args.device)
   pbar = tqdm(range(args.max_episode_length // args.action_repeat))
   time_steps = 0
   with gpytorch.settings.num_likelihood_samples(1):
     for t in pbar:
-      action, action_log_prob, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+      action, action_log_prob, policy_mll_loss, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
       episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).unsqueeze(dim=0)], dim=0)
+      episode_policy_mll_loss = torch.cat([episode_policy_mll_loss, policy_mll_loss.unsqueeze(dim=0)], dim=0)
       observation, reward, done = env.step(action[0].cpu())
       with torch.no_grad():
         if args.use_regular_vae:
@@ -285,6 +287,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_q_values = episode_q_values[args.lagging_size:]
   episode_rewards = episode_rewards[args.lagging_size:]
   episode_policy_kl = episode_policy_kl[args.lagging_size:]
+  episode_policy_mll_loss = episode_policy_mll_loss[args.lagging_size:]
   episode_states = episode_states[args.lagging_size-1:]
   episode_length = episode_actions[args.lagging_size:].size(0)
   index_numbers = np.arange(0, episode_length, args.horizon_size)
@@ -297,7 +300,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     
     planning_optimiser.zero_grad()
     # may add an action entropy
-    (value_loss + q_loss + policy_loss).backward(retain_graph=True)
+    (value_loss + q_loss + policy_loss + episode_policy_mll_loss[start:min(start+args.horizon_size, episode_length)].mean()).backward(retain_graph=True)
     nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
     planning_optimiser.step()
   
@@ -345,7 +348,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
         with gpytorch.settings.num_likelihood_samples(1):
-          action, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+          action, _, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
         observation, reward, done = test_envs.step(action.cpu())
         if args.use_regular_vae:
           current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
