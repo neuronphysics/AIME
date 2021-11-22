@@ -64,9 +64,20 @@ class PolicyModel(DeepGP):
   
   def forward(self, embedding):
     return self.policy_dist(embedding)
+
+class TransitionLayer(DGPHiddenLayer):
+  def __init__(self, latent_size, action_size, num_sample_trajectories, device):
+    super(PolicyLayer, self).__init__(latent_size+num_sample_trajectories+action_size, latent_size, device)
+    self.mean_module = LinearMean()
+
+class TransitionModel(DeepGP):
+  def __init__(self, latent_size, action_size, num_sample_trajectories, device, num_mixture_samples=1):
+    super().__init__()
+    self.transition_dist = TransitionLayer(latent_size, action_size, num_sample_trajectories, device)
+    self.likelihood = GaussianLikelihood()
   
-  def predict(self, embedding):
-    raise NotImplementedError
+  def forward(self, embedding, action):
+    return self.transition_dist(torch.cat([embedding, action], dim=-1))
 
 class TransitionNetwork(nn.Module):
   def __init__(self, latent_size, action_size):
@@ -111,6 +122,8 @@ class ActorCriticPlanner(nn.Module):
     self.latent_size = latent_size
     self.actor = PolicyModel(latent_size, action_size, num_sample_trajectories, device)
     self.policy_mll = DeepApproximateMLL(VariationalELBO(self.actor.likelihood, self.actor, 1))
+    self.transition_model = TransitionModel(latent_size, action_size, num_sample_trajectories, device)
+    self.transition_mll = DeepApproximateMLL(VariationalELBO(self.transition_model.likelihood, self.transition_model, 1))
     self.critic = ValueNetwork(latent_size, num_sample_trajectories, hidden_size)
     self.q_network = QNetwork(latent_size, num_sample_trajectories, action_size, hidden_size)
     self.recurrent_gp = recurrent_gp
@@ -142,7 +155,8 @@ class ActorCriticPlanner(nn.Module):
     policy_action = policy_dist.rsample().squeeze(dim=0)
     policy_log_prob = policy_dist.log_prob(policy_action)
     policy_mll_loss = -self.policy_mll(policy_dist, policy_action)
+    transition_dist = self.transition_model(embedding, policy_action)
     normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).to(device=device) + torch.tensor(self.action_bias).to(device=device)
     normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.tensor(self.min_action).to(device=device)), torch.tensor(self.max_action).to(device=device))
     q_value = self.q_network(embedding, policy_action)
-    return normalized_policy_action, policy_log_prob, policy_mll_loss, value, q_value
+    return normalized_policy_action, policy_log_prob, policy_mll_loss, value, q_value, transition_dist
