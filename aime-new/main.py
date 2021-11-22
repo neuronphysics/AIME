@@ -260,7 +260,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     for t in pbar:
       action, action_log_prob, policy_mll_loss, value, q_value, transition_dist = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
       episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
-      episode_policy_mll_loss = torch.cat([episode_policy_mll_loss, policy_mll_loss.unsqueeze(dim=0)], dim=0)
+      episode_policy_mll_loss = torch.cat([episode_policy_mll_loss, policy_mll_loss.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
       observation, reward, done = env.step(action[0].cpu())
       with torch.no_grad():
         if args.use_regular_vae:
@@ -271,7 +271,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       transition_kl = -transition_dist.log_prob(current_latent_state)
       transition_mll_loss = -actor_critic_planner.transition_mll(transition_dist, current_latent_state)
       episode_transition_kl = torch.cat([episode_transition_kl, transition_kl.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
-      episode_transition_mll_loss = torch.cat([episode_transition_mll_loss, transition_mll_loss.unsqueeze(dim=0)], dim=0)
+      episode_transition_mll_loss = torch.cat([episode_transition_mll_loss, transition_mll_loss.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
       episode_states = torch.cat([episode_states, current_latent_state], dim=0)
       episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
       episode_values = torch.cat([episode_values, value], dim=0)
