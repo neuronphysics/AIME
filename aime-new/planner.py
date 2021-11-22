@@ -7,6 +7,11 @@ from torch.distributions import Normal
 
 import gpytorch
 
+from models import DGPHiddenLayer
+from gpytorch.models.deep_gps import DeepGP
+from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.means import ConstantMean, ZeroMean, LinearMean
+
 class ValueNetwork(nn.Module):
   def __init__(self, latent_size, num_sample_trajectories, hidden_size):
     super().__init__()
@@ -45,6 +50,23 @@ class PolicyNetwork(nn.Module):
     policy_std = F.softplus(self.fc_std(hidden))
     return policy_mean, policy_std
 
+class PolicyLayer(DGPHiddenLayer):
+  def __init__(self, latent_size, action_size, num_sample_trajectories, device):
+    super(PolicyLayer, self).__init__(latent_size+num_sample_trajectories, action_size, device)
+    self.mean_module = ConstantMean()
+
+class PolicyModel(DeepGP):
+  def __init__(self, latent_size, action_size, num_sample_trajectories, device, num_mixture_samples=1):
+    super().__init__()
+    self.policy_dist = PolicyLayer(latent_size, action_size, num_sample_trajectories, device)
+    self.likelihood = GaussianLikelihood()
+  
+  def forward(self, embedding):
+    return self.policy_dist(embedding)
+  
+  def predict(self, embedding):
+    raise NotImplementedError
+
 class TransitionNetwork(nn.Module):
   def __init__(self, latent_size, action_size):
     super().__init__()
@@ -80,13 +102,13 @@ class RolloutEncoder(nn.Module):
     return embedding
 
 class ActorCriticPlanner(nn.Module):
-  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, num_sample_trajectories, hidden_size):
+  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, num_sample_trajectories, hidden_size, device):
     super().__init__()
     self.action_size, self.min_action, self.max_action = action_size, min_action, max_action
     self.action_scale = (self.max_action - self.min_action) / 2
     self.action_bias = (self.max_action + self.min_action) / 2
     self.latent_size = latent_size
-    self.actor = PolicyNetwork(latent_size, action_size, num_sample_trajectories, hidden_size)
+    self.actor = PolicyModel(latent_size, action_size, num_sample_trajectories, device)
     self.critic = ValueNetwork(latent_size, num_sample_trajectories, hidden_size)
     self.q_network = QNetwork(latent_size, num_sample_trajectories, action_size, hidden_size)
     self.recurrent_gp = recurrent_gp
@@ -97,9 +119,9 @@ class ActorCriticPlanner(nn.Module):
     current_state = lagging_states[-1].view(1, self.latent_size)
     imagined_reward = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories).to(device=device)
     embedding = torch.cat([current_state,imagined_reward.squeeze(dim=-2)], dim=-1)
-    policy_mean, policy_std = self.actor(embedding)
+    policy_dist = self.actor(embedding)
     value = self.critic(embedding)
-    return policy_mean, policy_std, value, embedding
+    return policy_dist, value, embedding
   
   def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories):
     self.recurrent_gp.eval()
@@ -114,8 +136,7 @@ class ActorCriticPlanner(nn.Module):
   
   def act(self, prior_states, prior_actions, device=None):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
-    policy_mean, policy_std, value, embedding = self.forward(prior_states, prior_actions, device)
-    policy_dist = Normal(policy_mean, policy_std)
+    policy_dist, value, embedding = self.forward(prior_states, prior_actions, device)
     policy_action = policy_dist.rsample()
     policy_log_prob = policy_dist.log_prob(policy_action)
     normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).to(device=device) + torch.tensor(self.action_bias).to(device=device)
