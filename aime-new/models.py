@@ -201,16 +201,16 @@ class RecurrentGP(DeepGP):
         for i in range(self.horizon_size):
             # policy distribution
             #w_hat = lagging_states # may have to change this to lagging_states[:-1] later
-            a = self.policy_modules[i](lagging_states).rsample().squeeze(0)
+            a = self.policy_modules[i](lagging_states).rsample().mean(dim=0)
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
             # transition distribution
-            z = self.transition_modules[i](z_hat).rsample().squeeze(0)
+            z = self.transition_modules[i](z_hat).rsample().mean(dim=0)
             # first dimension of z is the number of Gaussian mixtures (z.size(0))
             lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
         
         # last policy in the horizon
-        a = self.policy_modules[self.horizon_size](lagging_states).rsample().squeeze(0)
+        a = self.policy_modules[self.horizon_size](lagging_states).rsample().mean(dim=0)
         lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
         z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward

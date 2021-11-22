@@ -141,13 +141,13 @@ class ActorCriticPlanner(nn.Module):
   def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories):
     self.recurrent_gp.eval()
     with torch.no_grad():
-      with gpytorch.settings.num_likelihood_samples(1):
+      with gpytorch.settings.num_likelihood_samples(100):
         rewards = self.recurrent_gp(
           torch.flatten(lagging_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
           lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
-        )
+        ).sample().mean(dim=0)
     self.recurrent_gp.train()
-    return rewards.rsample()
+    return rewards
   
   def act(self, prior_states, prior_actions, device=None):
     # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts

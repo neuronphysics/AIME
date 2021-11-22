@@ -169,7 +169,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     if (not args.use_regular_vae):
       infinite_vae.batch_size = args.batch_size * args.chunk_size
     for s in tqdm(range(args.collect_interval)):
-      with gpytorch.settings.num_likelihood_samples(1): # to do: move this line inside the RGP module
+      with gpytorch.settings.num_likelihood_samples(100): # to do: move this line inside the RGP module
         # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
         observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
         if args.use_regular_vae:
