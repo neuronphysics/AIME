@@ -67,7 +67,7 @@ class PolicyModel(DeepGP):
 
 class TransitionLayer(DGPHiddenLayer):
   def __init__(self, latent_size, action_size, num_sample_trajectories, device):
-    super(PolicyLayer, self).__init__(latent_size+num_sample_trajectories+action_size, latent_size, device)
+    super(TransitionLayer, self).__init__(latent_size+num_sample_trajectories+action_size, latent_size, device)
     self.mean_module = LinearMean()
 
 class TransitionModel(DeepGP):
