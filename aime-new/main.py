@@ -94,7 +94,7 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'latent_kl_loss': [],
-           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [],
+           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 'policy_mll_loss': [], 'transition_mll_loss': [],
            'elbo1': [], 'elbo2': [], 'elbo3': [], 'elbo4': [], 'elbo5': []}
 
 # Initialise training environment and experience replay memory
@@ -169,7 +169,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     if (not args.use_regular_vae):
       infinite_vae.batch_size = args.batch_size * args.chunk_size
     for s in tqdm(range(args.collect_interval)):
-      with gpytorch.settings.num_likelihood_samples(100): # to do: move this line inside the RGP module
+      with gpytorch.settings.num_likelihood_samples(100): # to do: make this a hyperparameter as well
         # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
         observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
         if args.use_regular_vae:
@@ -300,21 +300,32 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_length = episode_actions[args.lagging_size:].size(0)
   index_numbers = np.arange(0, episode_length, args.horizon_size)
   for start in index_numbers:
-    soft_v_values = episode_q_values[start:min(start+args.horizon_size, episode_length)] - episode_transition_kl[start:min(start+args.horizon_size, episode_length)] - episode_policy_kl[start:min(start+args.horizon_size, episode_length)]
-    target_q_values = args.temperature_factor * episode_rewards[start:min(start+args.horizon_size-1, episode_length-1)] + args.discount_factor * episode_values[start+1:min(start+args.horizon_size, episode_length)]
-    value_loss = F.mse_loss(episode_values[start:min(start+args.horizon_size, episode_length)], soft_v_values, reduction='none').mean()
-    q_loss = torch.tensor(0).to(device=args.device) if target_q_values.size(0) == 0 else F.mse_loss(episode_q_values[start:min(start+args.horizon_size-1, episode_length-1)], target_q_values, reduction='none').mean()
-    policy_loss = (episode_policy_kl[start:min(start+args.horizon_size, episode_length)] - episode_q_values[start:min(start+args.horizon_size, episode_length)] + episode_values[start:min(start+args.horizon_size, episode_length)]).mean()
+    current_q_values = episode_q_values[start:min(start+args.horizon_size, episode_length)]
+    previous_q_values = episode_q_values[start:min(start+args.horizon_size-1, episode_length-1)]
+    current_rewards = episode_rewards[start:min(start+args.horizon_size-1, episode_length-1)]
+    current_policy_kl = episode_policy_kl[start:min(start+args.horizon_size, episode_length)]
+    current_transition_kl = episode_transition_kl[start:min(start+args.horizon_size, episode_length)]
+    current_values = episode_values[start+1:min(start+args.horizon_size, episode_length)]
+    previous_values = episode_values[start:min(start+args.horizon_size, episode_length)]
+    soft_v_values = current_q_values - current_transition_kl - current_policy_kl
+    target_q_values = args.temperature_factor * current_rewards + args.discount_factor * current_values
+    value_loss = F.mse_loss(previous_values, soft_v_values, reduction='none').mean()
+    q_loss = torch.tensor(0).to(device=args.device) if target_q_values.size(0) == 0 else F.mse_loss(previous_q_values, target_q_values, reduction='none').mean()
+    policy_loss = (current_policy_kl - current_q_values + previous_values).mean()
+    
+    current_policy_mll_loss = episode_policy_mll_loss[start:min(start+args.horizon_size, episode_length)].mean()
+    current_transition_mll_loss = episode_transition_mll_loss[start:min(start+args.horizon_size, episode_length)].mean()
     
     planning_optimiser.zero_grad()
-    # may add an action entropy
-    (value_loss + q_loss + policy_loss + episode_policy_mll_loss[start:min(start+args.horizon_size, episode_length)].mean() + episode_transition_mll_loss[start:min(start+args.horizon_size, episode_length)].mean()).backward(retain_graph=True)
+    (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward(retain_graph=True)
     nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
     planning_optimiser.step()
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
   metrics['q_loss'].append(q_loss.item())
+  metrics['policy_mll_loss'].append(current_policy_mll_loss.item())
+  metrics['transition_mll_loss'].append(current_transition_mll_loss.item())
   # Update and plot train reward metrics
   metrics['steps'].append(t + metrics['steps'][-1])
   metrics['episodes'].append(episode)
