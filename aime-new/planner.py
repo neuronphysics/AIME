@@ -133,7 +133,7 @@ class ActorCriticPlanner(nn.Module):
   def forward(self, lagging_states, lagging_actions, device):
     current_state = lagging_states[-1].view(1, self.latent_size)
     imagined_reward = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories).to(device=device)
-    embedding = torch.cat([current_state,imagined_reward.squeeze(dim=-2)], dim=-1)
+    embedding = torch.cat([current_state,imagined_reward], dim=-1)
     policy_dist = self.actor(embedding)
     value = self.critic(embedding)
     return policy_dist, value, embedding
