@@ -331,10 +331,11 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   metrics['episodes'].append(episode)
   metrics['train_rewards'].append(total_reward)
   lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
-  
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['policy_loss']):], metrics['policy_loss'], 'policy_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['policy_mll_loss']):], metrics['policy_mll_loss'], 'policy_mll_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['transition_mll_loss']):], metrics['transition_mll_loss'], 'transition_mll_loss', results_dir)
 
   if args.use_regular_vae:
     encoder.train()
