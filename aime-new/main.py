@@ -11,7 +11,7 @@ from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
-from models import bottle, bottle_two_output, Encoder, ObservationModel, RecurrentGP, SampleLayer
+from models import bottle, bottle_two_output, Encoder, ObservationModel, RecurrentGP
 from infinite_vae import InfGaussMMVAE
 from planner import ActorCriticPlanner
 from utils import lineplot, write_video
