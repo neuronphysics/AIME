@@ -303,7 +303,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     soft_v_values = episode_q_values[start:min(start+args.horizon_size, episode_length)] - episode_transition_kl[start:min(start+args.horizon_size, episode_length)] - episode_policy_kl[start:min(start+args.horizon_size, episode_length)]
     target_q_values = args.temperature_factor * episode_rewards[start:min(start+args.horizon_size-1, episode_length-1)] + args.discount_factor * episode_values[start+1:min(start+args.horizon_size, episode_length)]
     value_loss = F.mse_loss(episode_values[start:min(start+args.horizon_size, episode_length)], soft_v_values, reduction='none').mean()
-    q_loss = F.mse_loss(episode_q_values[start:min(start+args.horizon_size-1, episode_length-1)], target_q_values, reduction='none').mean()
+    q_loss = torch.tensor(0).to(device=args.device) if target_q_values.size(0) == 0 else F.mse_loss(episode_q_values[start:min(start+args.horizon_size-1, episode_length-1)], target_q_values, reduction='none').mean()
     policy_loss = (episode_policy_kl[start:min(start+args.horizon_size, episode_length)] - episode_q_values[start:min(start+args.horizon_size, episode_length)] + episode_values[start:min(start+args.horizon_size, episode_length)]).mean()
     
     planning_optimiser.zero_grad()
