@@ -1,3 +1,5 @@
+# https://docs.gpytorch.ai/en/stable/examples/05_Deep_Gaussian_Processes/Deep_Gaussian_Processes.html
+
 from typing import Optional, List
 import torch
 from torch import jit, nn
@@ -27,63 +29,6 @@ def bottle_two_output(f, x_tuple):
   y1_size = y1.size()
   y2_size = y2.size()
   return y1.view(x_sizes[0][0], x_sizes[0][1], *y1_size[1:]), y2.view(x_sizes[0][0], x_sizes[0][1], *y2_size[1:])
-
-
-class TransitionModel(jit.ScriptModule):
-  __constants__ = ['min_std_dev']
-
-  def __init__(self, belief_size, state_size, action_size, hidden_size, embedding_size, activation_function='relu', min_std_dev=0.1):
-    super().__init__()
-    self.act_fn = getattr(F, activation_function)
-    self.min_std_dev = min_std_dev
-    self.fc_embed_state_action = nn.Linear(state_size + action_size, belief_size)
-    self.rnn = nn.GRUCell(belief_size, belief_size)
-    self.fc_embed_belief_prior = nn.Linear(belief_size, hidden_size)
-    self.fc_state_prior = nn.Linear(hidden_size, 2 * state_size)
-    self.fc_embed_belief_posterior = nn.Linear(belief_size + embedding_size, hidden_size)
-    self.fc_state_posterior = nn.Linear(hidden_size, 2 * state_size)
-
-  # Operates over (previous) state, (previous) actions, (previous) belief, (previous) nonterminals (mask), and (current) observations
-  # Diagram of expected inputs and outputs for T = 5 (-x- signifying beginning of output belief/state that gets sliced off):
-  # t :  0  1  2  3  4  5
-  # o :    -X--X--X--X--X-
-  # a : -X--X--X--X--X-
-  # n : -X--X--X--X--X-
-  # pb: -X-
-  # ps: -X-
-  # b : -x--X--X--X--X--X-
-  # s : -x--X--X--X--X--X-
-  @jit.script_method
-  def forward(self, prev_state:torch.Tensor, actions:torch.Tensor, prev_belief:torch.Tensor, observations:Optional[torch.Tensor]=None, nonterminals:Optional[torch.Tensor]=None) -> List[torch.Tensor]:
-    # Create lists for hidden states (cannot use single tensor as buffer because autograd won't work with inplace writes)
-    T = actions.size(0) + 1
-    beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = [torch.empty(0)] * T, [torch.empty(0)] * T, [torch.empty(0)] * T, [torch.empty(0)] * T, [torch.empty(0)] * T, [torch.empty(0)] * T, [torch.empty(0)] * T
-    beliefs[0], prior_states[0], posterior_states[0] = prev_belief, prev_state, prev_state
-    # Loop over time sequence
-    for t in range(T - 1):
-      _state = prior_states[t] if observations is None else posterior_states[t]  # Select appropriate previous state
-      _state = _state if nonterminals is None else _state * nonterminals[t]  # Mask if previous transition was terminal
-      # Compute belief (deterministic hidden state)
-      hidden = self.act_fn(self.fc_embed_state_action(torch.cat([_state, actions[t]], dim=1)))
-      beliefs[t + 1] = self.rnn(hidden, beliefs[t])
-      # Compute state prior by applying transition dynamics
-      hidden = self.act_fn(self.fc_embed_belief_prior(beliefs[t + 1]))
-      prior_means[t + 1], _prior_std_dev = torch.chunk(self.fc_state_prior(hidden), 2, dim=1)
-      prior_std_devs[t + 1] = F.softplus(_prior_std_dev) + self.min_std_dev
-      prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])     
-      if observations is not None:
-        # Compute state posterior by applying transition dynamics and using current observation
-        t_ = t - 1  # Use t_ to deal with different time indexing for observations
-        hidden = self.act_fn(self.fc_embed_belief_posterior(torch.cat([beliefs[t + 1], observations[t_ + 1]], dim=1)))
-        posterior_means[t + 1], _posterior_std_dev = torch.chunk(self.fc_state_posterior(hidden), 2, dim=1)
-        posterior_std_devs[t + 1] = F.softplus(_posterior_std_dev) + self.min_std_dev
-        posterior_states[t + 1] = posterior_means[t + 1] + posterior_std_devs[t + 1] * torch.randn_like(posterior_means[t + 1])
-    # Return new hidden states
-    hidden = [torch.stack(beliefs[1:], dim=0), torch.stack(prior_states[1:], dim=0), torch.stack(prior_means[1:], dim=0), torch.stack(prior_std_devs[1:], dim=0)]
-    if observations is not None:
-      hidden += [torch.stack(posterior_states[1:], dim=0), torch.stack(posterior_means[1:], dim=0), torch.stack(posterior_std_devs[1:], dim=0)]
-    return hidden
-
 
 class SymbolicObservationModel(jit.ScriptModule):
   def __init__(self, observation_size, belief_size, state_size, embedding_size, activation_function='relu'):
@@ -132,22 +77,6 @@ def ObservationModel(symbolic, observation_size, state_size, embedding_size, act
     return VisualObservationModel(state_size, embedding_size, activation_function)
 
 
-class RewardModel(jit.ScriptModule):
-  def __init__(self, belief_size, state_size, hidden_size, activation_function='relu'):
-    super().__init__()
-    self.act_fn = getattr(F, activation_function)
-    self.fc1 = nn.Linear(belief_size + state_size, hidden_size)
-    self.fc2 = nn.Linear(hidden_size, hidden_size)
-    self.fc3 = nn.Linear(hidden_size, 1)
-
-  @jit.script_method
-  def forward(self, belief, state):
-    hidden = self.act_fn(self.fc1(torch.cat([belief, state], dim=1)))
-    hidden = self.act_fn(self.fc2(hidden))
-    reward = self.fc3(hidden).squeeze(dim=1)
-    return reward
-
-
 class SymbolicEncoder(jit.ScriptModule):
   def __init__(self, observation_size, embedding_size, activation_function='relu'):
     super().__init__()
@@ -192,20 +121,6 @@ class VisualEncoder(jit.ScriptModule):
     latent_std = F.softplus(self.fc_std(embedding))
     return latent_mean, latent_std
 
-class SampleLayer(nn.Module):
-  
-  def __init__(self, embedding_size, state_size):
-    super().__init__()
-    self.embedding_size = embedding_size
-    self.state_size = state_size
-    self.fc_mean = nn.Linear(embedding_size, state_size)
-    self.fc_std = nn.Linear(embedding_size, state_size)
-  
-  def forward(self, embedding):
-    latent_mean = self.fc_mean(embedding)
-    latent_std = F.softplus(self.fc_std(embedding))
-    latent_state = latent_mean + torch.randn_like(latent_mean) * latent_std
-    return latent_mean, latent_std, latent_state
 
 def Encoder(symbolic, observation_size, embedding_size, state_size, activation_function='relu'):
   if symbolic:
@@ -214,7 +129,7 @@ def Encoder(symbolic, observation_size, embedding_size, state_size, activation_f
     return VisualEncoder(embedding_size, state_size, activation_function)
 
 class DGPHiddenLayer(DeepGPLayer):
-    def __init__(self, input_dims, output_dims, device, num_inducing=5):
+    def __init__(self, input_dims, output_dims, device, num_inducing=100):
         if output_dims is None:
             inducing_points = torch.randn(num_inducing, input_dims).to(device=device)
             batch_shape = torch.Size([])
@@ -286,16 +201,16 @@ class RecurrentGP(DeepGP):
         for i in range(self.horizon_size):
             # policy distribution
             #w_hat = lagging_states # may have to change this to lagging_states[:-1] later
-            a = self.policy_modules[i](lagging_states).rsample().squeeze(0)
+            a = self.policy_modules[i](lagging_states).rsample().mean(dim=0)
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
             # transition distribution
-            z = self.transition_modules[i](z_hat).rsample().squeeze(0)
+            z = self.transition_modules[i](z_hat).rsample().mean(dim=0)
             # first dimension of z is the number of Gaussian mixtures (z.size(0))
             lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
         
         # last policy in the horizon
-        a = self.policy_modules[self.horizon_size](lagging_states).rsample().squeeze(0)
+        a = self.policy_modules[self.horizon_size](lagging_states).rsample().mean(dim=0)
         lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
         z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
