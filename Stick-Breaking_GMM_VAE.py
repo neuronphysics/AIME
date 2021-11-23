@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 #tf.reduce_mean -> tensor.mean
 #tf.expand_dims -> tensor.expand
 #tf.transpose -> tensor.permute
-
+#author: Zahra Sheikhbahaee
 '''
 if torch.cuda.is_available():
     device = "cuda:0"
@@ -706,6 +706,8 @@ import torch.utils.data.dataloader as DataLoader
 from torch.utils.data import Dataset
 from sklearn.manifold import TSNE
 from torchvision import datasets, transforms
+import torchvision.transforms as transforms
+import torchvision.utils
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
@@ -851,7 +853,7 @@ for image_batch, _ in test_loader:
 
         # vae reconstruction
         X_recons_linear, vector_z = net(image_batch)
-        image_batch_recon, latent_mu, latent_logvar = vae(image_batch)
+        
 
         # reconstruction error
         loss = sum(net.get_ELBO(image_batch))
