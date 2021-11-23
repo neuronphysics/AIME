@@ -36,62 +36,47 @@ class QNetwork(nn.Module):
     hidden = F.relu(self.fc1(torch.cat([embedding, action], dim=-1)))
     return self.fc2(hidden)
 
-class PolicyNetwork(nn.Module):
-  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size):
-    super().__init__()
-    self.latent_size = latent_size
-    self.action_size = action_size
-    self.fc1 = nn.Linear(latent_size + num_sample_trajectories, hidden_size)
-    self.fc_mean = nn.Linear(hidden_size, action_size)
-    self.fc_std = nn.Linear(hidden_size, action_size)
-  
-  def forward(self, embedding):
-    hidden = F.relu(self.fc1(embedding))
-    policy_mean = self.fc_mean(hidden)
-    policy_std = F.softplus(self.fc_std(hidden))
-    return policy_mean, policy_std
+class FirstPolicyLayer(DGPHiddenLayer):
+  def __init__(self, latent_size, num_sample_trajectories, hidden_size, device):
+    super(FirstPolicyLayer, self).__init__(latent_size+num_sample_trajectories, hidden_size, device)
+    self.mean_module = LinearMean(latent_size+num_sample_trajectories)
 
-class PolicyLayer(DGPHiddenLayer):
-  def __init__(self, latent_size, action_size, num_sample_trajectories, device):
-    super(PolicyLayer, self).__init__(latent_size+num_sample_trajectories, action_size, device)
+class SecondPolicyLayer(DGPHiddenLayer):
+  def __init__(self, hidden_size, action_size, device):
+    super(SecondPolicyLayer, self).__init__(hidden_size, action_size, device)
     self.mean_module = ConstantMean()
 
 class PolicyModel(DeepGP):
-  def __init__(self, latent_size, action_size, num_sample_trajectories, device, num_mixture_samples=1):
+  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, device):
     super().__init__()
-    self.policy_dist = PolicyLayer(latent_size, action_size, num_sample_trajectories, device)
+    self.first_policy_layer = FirstPolicyLayer(latent_size, num_sample_trajectories, hidden_size, device)
+    self.second_policy_layer = SecondPolicyLayer(hidden_size, action_size, device)
     self.likelihood = GaussianLikelihood()
   
   def forward(self, embedding):
-    return self.policy_dist(embedding)
+    hidden = self.first_policy_layer(embedding)
+    return self.second_policy_layer(hidden)
 
-class TransitionLayer(DGPHiddenLayer):
-  def __init__(self, latent_size, action_size, num_sample_trajectories, device):
-    super(TransitionLayer, self).__init__(latent_size+num_sample_trajectories+action_size, latent_size, device)
+class FirstTransitionLayer(DGPHiddenLayer):
+  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, device):
+    super(FirstTransitionLayer, self).__init__(latent_size+num_sample_trajectories+action_size, hidden_size, device)
     self.mean_module = LinearMean(latent_size+num_sample_trajectories+action_size)
 
+class SecondTransitionLayer(DGPHiddenLayer):
+  def __init__(self, hidden_size, latent_size, device):
+    super(SecondTransitionLayer, self).__init__(hidden_size, latent_size, device)
+    self.mean_module = ConstantMean()
+
 class TransitionModel(DeepGP):
-  def __init__(self, latent_size, action_size, num_sample_trajectories, device, num_mixture_samples=1):
+  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, device):
     super().__init__()
-    self.transition_dist = TransitionLayer(latent_size, action_size, num_sample_trajectories, device)
+    self.first_transition_layer = FirstTransitionLayer(latent_size, action_size, num_sample_trajectories, hidden_size, device)
+    self.second_transition_layer = SecondTransitionLayer(hidden_size, latent_size, device)
     self.likelihood = GaussianLikelihood()
   
   def forward(self, embedding, action):
-    return self.transition_dist(torch.cat([embedding, action], dim=-1))
-
-class TransitionNetwork(nn.Module):
-  def __init__(self, latent_size, action_size):
-    super().__init__()
-    self.latent_size = latent_size
-    self.action_size = action_size
-    self.fc_mean = nn.Linear(latent_size + action_size, latent_size)
-    self.fc_std = nn.Linear(latent_size + action_size, latent_size)
-  
-  def forward(self, state, action):
-    x = torch.cat([state, action], dim=-1)
-    next_state_mean = self.fc_mean(x)
-    next_state_std = F.softplus(self.fc_std(x))
-    return next_state_mean, next_state_std
+    hidden = self.first_transition_layer(torch.cat([embedding, action], dim=-1))
+    return self.second_transition_layer(hidden)
 
 class RolloutEncoder(nn.Module):
   def __init__(self, latent_size, action_size, hidden_size, num_sample_trajectories, activation_function='relu'):
@@ -114,21 +99,23 @@ class RolloutEncoder(nn.Module):
     return embedding
 
 class ActorCriticPlanner(nn.Module):
-  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action, num_sample_trajectories, hidden_size, device):
+  def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action,
+               num_sample_trajectories, hidden_size, num_gp_likelihood_samples, device):
     super().__init__()
     self.action_size, self.min_action, self.max_action = action_size, min_action, max_action
     self.action_scale = (self.max_action - self.min_action) / 2
     self.action_bias = (self.max_action + self.min_action) / 2
     self.latent_size = latent_size
-    self.actor = PolicyModel(latent_size, action_size, num_sample_trajectories, device)
+    self.actor = PolicyModel(latent_size, action_size, num_sample_trajectories, hidden_size, device)
     self.policy_mll = DeepApproximateMLL(VariationalELBO(self.actor.likelihood, self.actor, 1))
-    self.transition_model = TransitionModel(latent_size, action_size, num_sample_trajectories, device)
+    self.transition_model = TransitionModel(latent_size, action_size, num_sample_trajectories, hidden_size, device)
     self.transition_mll = DeepApproximateMLL(VariationalELBO(self.transition_model.likelihood, self.transition_model, 1))
     self.critic = ValueNetwork(latent_size, num_sample_trajectories, hidden_size)
     self.q_network = QNetwork(latent_size, num_sample_trajectories, action_size, hidden_size)
     self.recurrent_gp = recurrent_gp
     self.num_sample_trajectories = num_sample_trajectories
     self.lagging_size = lagging_size
+    self.num_gp_likelihood_samples = num_gp_likelihood_samples
 
   def forward(self, lagging_states, lagging_actions, device):
     current_state = lagging_states[-1].view(1, self.latent_size)
@@ -141,7 +128,7 @@ class ActorCriticPlanner(nn.Module):
   def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories):
     self.recurrent_gp.eval()
     with torch.no_grad():
-      with gpytorch.settings.num_likelihood_samples(100):
+      with gpytorch.settings.num_likelihood_samples(self.num_gp_likelihood_samples):
         rewards = self.recurrent_gp(
           torch.flatten(lagging_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
           lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
