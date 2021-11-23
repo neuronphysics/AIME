@@ -129,7 +129,7 @@ def Encoder(symbolic, observation_size, embedding_size, state_size, activation_f
     return VisualEncoder(embedding_size, state_size, activation_function)
 
 class DGPHiddenLayer(DeepGPLayer):
-    def __init__(self, input_dims, output_dims, device, num_inducing=100):
+    def __init__(self, input_dims, output_dims, device, num_inducing=16):
         if output_dims is None:
             inducing_points = torch.randn(num_inducing, input_dims).to(device=device)
             batch_shape = torch.Size([])
