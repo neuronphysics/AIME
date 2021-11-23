@@ -11,7 +11,7 @@ from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
-from models import bottle, bottle_two_output, Encoder, ObservationModel, RecurrentGP, SampleLayer
+from models import bottle, bottle_two_output, Encoder, ObservationModel, RecurrentGP
 from infinite_vae import InfGaussMMVAE
 from planner import ActorCriticPlanner
 from utils import lineplot, write_video
@@ -65,13 +65,13 @@ parser.add_argument('--render', action='store_true', help='Render environment')
 parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='Horizon size')
 parser.add_argument('--lagging-size', type=int, default=2, metavar='La', help='Lagging size')
 parser.add_argument('--non-cumulative-reward', action='store_true', help='Model non-cumulative rewards')
-parser.add_argument('--num-sample-trajectories', type=int, default=20, metavar='nst', help='number of trajectories sample in the imagination part')
+parser.add_argument('--num-sample-trajectories', type=int, default=30, metavar='nst', help='number of trajectories sample in the imagination part')
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
 parser.add_argument('--discount-factor', type=float, default=0.999, metavar='Temp', help='Discount factor')
 parser.add_argument('--num-mixtures', type=int, default=15, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
 parser.add_argument('--w-dim', type=int, default=10, metavar='w', help='dimension of w')
-parser.add_argument('--hidden-size', type=int, default=16, metavar='H', help='Hidden size')
-parser.add_argument('--state-size', type=int, default=10, metavar='Z', help='State/latent size')
+parser.add_argument('--hidden-size', type=int, default=30, metavar='H', help='Hidden size')
+parser.add_argument('--state-size', type=int, default=30, metavar='Z', help='State/latent size')
 parser.add_argument('--include-elbo2', action='store_true', help='include elbo 2 loss')
 parser.add_argument('--use-regular-vae', action='store_true', help='use vae that uses single Gaussian mixture')
 parser.add_argument('--rgp-training-interval-ratio', type=float, default=1.1, metavar='In', help='RGP training interval ratio')
@@ -94,7 +94,7 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'latent_kl_loss': [],
-           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [],
+           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 'policy_mll_loss': [], 'transition_mll_loss': [],
            'elbo1': [], 'elbo2': [], 'elbo3': [], 'elbo4': [], 'elbo5': []}
 
 # Initialise training environment and experience replay memory
@@ -139,7 +139,7 @@ else:
 
 optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
-actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories, args.hidden_size).to(device=args.device)
+actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories, args.hidden_size, args.device).to(device=args.device)
 planning_optimiser = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 if args.models is not '' and os.path.exists(args.models):
   model_dicts = torch.load(args.models)
@@ -169,7 +169,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     if (not args.use_regular_vae):
       infinite_vae.batch_size = args.batch_size * args.chunk_size
     for s in tqdm(range(args.collect_interval)):
-      with gpytorch.settings.num_likelihood_samples(1):
+      with gpytorch.settings.num_likelihood_samples(100): # to do: make this a hyperparameter as well
         # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
         observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
         if args.use_regular_vae:
@@ -251,67 +251,91 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_q_values = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_rewards = torch.zeros(args.lagging_size, 1, device=args.device)
   episode_policy_kl = torch.zeros(args.lagging_size, 1, device=args.device)
+  episode_policy_mll_loss = torch.zeros(args.lagging_size, 1, device=args.device)
+  episode_transition_kl = torch.zeros(args.lagging_size, 1, device=args.device)
+  episode_transition_mll_loss = torch.zeros(args.lagging_size, 1, device=args.device)
   pbar = tqdm(range(args.max_episode_length // args.action_repeat))
   time_steps = 0
-  for t in pbar:
-    action, action_log_prob, value, q_value = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
-    episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).sum(dim=-1, keepdim=True)], dim=0)
-    observation, reward, done = env.step(action[0].cpu())
-    with torch.no_grad():
-      if args.use_regular_vae:
-        current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
-        current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
-      else:
-        _, current_latent_state = infinite_vae(observation.to(device=args.device))
-    episode_states = torch.cat([episode_states, current_latent_state], dim=0)
-    episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
-    episode_values = torch.cat([episode_values, value], dim=0)
-    episode_q_values = torch.cat([episode_q_values, q_value], dim=0)
-    episode_rewards = torch.cat([episode_rewards, torch.Tensor([[reward]]).to(device=args.device)], dim=0)
-    D.append(observation, action.detach().cpu(), reward, done)
-    total_reward += reward
-    
-    #if (time_step % args.num_planning_steps == 0) or done:
-      # compute returns in reverse order in the episode reward list
-    if args.render:
-      env.render()
-    if done:
-      pbar.close()
-      break
+  with gpytorch.settings.num_likelihood_samples(100):
+    for t in pbar:
+      action, action_log_prob, policy_mll_loss, value, q_value, transition_dist = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+      episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
+      episode_policy_mll_loss = torch.cat([episode_policy_mll_loss, policy_mll_loss.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
+      observation, reward, done = env.step(action[0].cpu())
+      with torch.no_grad():
+        if args.use_regular_vae:
+          current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
+          current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
+        else:
+          _, current_latent_state = infinite_vae(observation.to(device=args.device))
+      transition_kl = -transition_dist.log_prob(current_latent_state)
+      transition_mll_loss = -actor_critic_planner.transition_mll(transition_dist, current_latent_state)
+      episode_transition_kl = torch.cat([episode_transition_kl, transition_kl.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
+      episode_transition_mll_loss = torch.cat([episode_transition_mll_loss, transition_mll_loss.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
+      episode_states = torch.cat([episode_states, current_latent_state], dim=0)
+      episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
+      episode_values = torch.cat([episode_values, value], dim=0)
+      episode_q_values = torch.cat([episode_q_values, q_value], dim=0)
+      episode_rewards = torch.cat([episode_rewards, torch.Tensor([[reward]]).to(device=args.device)], dim=0)
+      D.append(observation, action.detach().cpu(), reward, done)
+      total_reward += reward
+      
+      #if (time_step % args.num_planning_steps == 0) or done:
+        # compute returns in reverse order in the episode reward list
+      if args.render:
+        env.render()
+      if done:
+        pbar.close()
+        break
   
   episode_actions = episode_actions[args.lagging_size:]
   episode_values = episode_values[args.lagging_size:]
   episode_q_values = episode_q_values[args.lagging_size:]
   episode_rewards = episode_rewards[args.lagging_size:]
   episode_policy_kl = episode_policy_kl[args.lagging_size:]
+  episode_policy_mll_loss = episode_policy_mll_loss[args.lagging_size:]
+  episode_transition_kl = episode_transition_kl[args.lagging_size:]
+  episode_transition_mll_loss = episode_transition_mll_loss[args.lagging_size:]
   episode_states = episode_states[args.lagging_size-1:]
   episode_length = episode_actions[args.lagging_size:].size(0)
   index_numbers = np.arange(0, episode_length, args.horizon_size)
   for start in index_numbers:
-    soft_v_values = episode_q_values[start:min(start+args.horizon_size, episode_length)] - episode_policy_kl[start:min(start+args.horizon_size, episode_length)]
-    target_q_values = args.temperature_factor * episode_rewards[start:min(start+args.horizon_size-1, episode_length-1)] + args.discount_factor * episode_values[start+1:min(start+args.horizon_size, episode_length)]
-    value_loss = F.mse_loss(episode_values[start:min(start+args.horizon_size, episode_length)], soft_v_values, reduction='none').mean()
-    q_loss = F.mse_loss(episode_q_values[start:min(start+args.horizon_size-1, episode_length-1)], target_q_values, reduction='none').mean()
-    policy_loss = (episode_policy_kl[start:min(start+args.horizon_size, episode_length)] - episode_q_values[start:min(start+args.horizon_size, episode_length)] + episode_values[start:min(start+args.horizon_size, episode_length)]).mean()
+    current_q_values = episode_q_values[start:min(start+args.horizon_size, episode_length)]
+    previous_q_values = episode_q_values[start:min(start+args.horizon_size-1, episode_length-1)]
+    current_rewards = episode_rewards[start:min(start+args.horizon_size-1, episode_length-1)]
+    current_policy_kl = episode_policy_kl[start:min(start+args.horizon_size, episode_length)]
+    current_transition_kl = episode_transition_kl[start:min(start+args.horizon_size, episode_length)]
+    current_values = episode_values[start+1:min(start+args.horizon_size, episode_length)]
+    previous_values = episode_values[start:min(start+args.horizon_size, episode_length)]
+    soft_v_values = current_q_values - current_transition_kl - current_policy_kl
+    target_q_values = args.temperature_factor * current_rewards + args.discount_factor * current_values
+    value_loss = F.mse_loss(previous_values, soft_v_values, reduction='none').mean()
+    q_loss = torch.tensor(0).to(device=args.device) if target_q_values.size(0) == 0 else F.mse_loss(previous_q_values, target_q_values, reduction='none').mean()
+    policy_loss = (current_policy_kl - current_q_values + previous_values).mean()
+    
+    current_policy_mll_loss = episode_policy_mll_loss[start:min(start+args.horizon_size, episode_length)].mean()
+    current_transition_mll_loss = episode_transition_mll_loss[start:min(start+args.horizon_size, episode_length)].mean()
     
     planning_optimiser.zero_grad()
-    # may add an action entropy
-    (value_loss + q_loss + policy_loss).backward(retain_graph=True)
+    (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward(retain_graph=True)
     nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
     planning_optimiser.step()
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
   metrics['q_loss'].append(q_loss.item())
+  metrics['policy_mll_loss'].append(current_policy_mll_loss.item())
+  metrics['transition_mll_loss'].append(current_transition_mll_loss.item())
   # Update and plot train reward metrics
   metrics['steps'].append(t + metrics['steps'][-1])
   metrics['episodes'].append(episode)
   metrics['train_rewards'].append(total_reward)
   lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
-  
   lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['policy_loss']):], metrics['policy_loss'], 'policy_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['policy_mll_loss']):], metrics['policy_mll_loss'], 'policy_mll_loss', results_dir)
+  lineplot(metrics['episodes'][-len(metrics['transition_mll_loss']):], metrics['transition_mll_loss'], 'transition_mll_loss', results_dir)
 
   if args.use_regular_vae:
     encoder.train()
@@ -343,7 +367,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
-        action, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+        with gpytorch.settings.num_likelihood_samples(100):
+          action, _, _, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
         observation, reward, done = test_envs.step(action.cpu())
         if args.use_regular_vae:
           current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
