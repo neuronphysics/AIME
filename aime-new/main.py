@@ -337,6 +337,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   lineplot(metrics['episodes'][-len(metrics['policy_mll_loss']):], metrics['policy_mll_loss'], 'policy_mll_loss', results_dir)
   lineplot(metrics['episodes'][-len(metrics['transition_mll_loss']):], metrics['transition_mll_loss'], 'transition_mll_loss', results_dir)
 
+  del episode_states, episode_actions, episode_values, episode_q_values, episode_rewards, episode_policy_kl, episode_policy_mll_loss, episode_transition_kl, episode_transition_mll_loss
+
   if args.use_regular_vae:
     encoder.train()
   else:
@@ -397,6 +399,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       write_video(video_frames, 'test_episode_%s' % episode_str, results_dir)  # Lossy compression
       save_image(torch.as_tensor(video_frames[-1]), os.path.join(results_dir, 'test_episode_%s.png' % episode_str))
     torch.save(metrics, os.path.join(results_dir, 'metrics.pth'))
+
+    del episode_states, episode_actions
 
     # Set models to train mode
     if args.use_regular_vae:
