@@ -12,7 +12,7 @@ from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
 from models import bottle, bottle_two_output, Encoder, ObservationModel, RecurrentGP
-from Stick_Breaking_GMM_VAE import InfGaussMMVAE
+from Stick_Breaking_GMM_VAE import InfGaussMMVAE, AdaBound
 from planner import ActorCriticPlanner
 from utils import lineplot, write_video
 import gpytorch
@@ -74,6 +74,7 @@ parser.add_argument('--hidden-size', type=int, default=10, metavar='H', help='Hi
 parser.add_argument('--state-size', type=int, default=10, metavar='Z', help='State/latent size')
 parser.add_argument('--include-elbo2', action='store_true', help='include elbo 2 loss')
 parser.add_argument('--use-regular-vae', action='store_true', help='use vae that uses single Gaussian mixture')
+parser.add_argument('--use-ada-bound', action='store_true', help='use AdaBound as the optimizer')
 parser.add_argument('--rgp-training-interval-ratio', type=float, default=1.1, metavar='In', help='RGP training interval ratio')
 parser.add_argument('--num-gp-likelihood-samples', type=int, default=100, metavar='GP', help='Number of likelihood samples for GP')
 
@@ -138,7 +139,7 @@ else:
   infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, args.hidden_size, args.device, 64, hyperParams["batch_size"], args.include_elbo2).to(device=args.device)
   param_list = list(infinite_vae.parameters()) + list(recurrent_gp.parameters())
 
-optimiser = optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
+optimiser = AdaBound(param_list, lr=0.0001) if args.use_ada_bound else optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
 actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories, args.hidden_size, args.num_gp_likelihood_samples, args.device).to(device=args.device)
 planning_optimiser = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
