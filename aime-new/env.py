@@ -1,8 +1,11 @@
-import cv2
+from torchvision.transforms.functional import resize
 import numpy as np
 import torch
 from gym.spaces import Box
 import pybullet_envs
+
+import dmc2gym
+import gym
 
 
 GYM_ENVS = ['HumanoidBulletEnv-v0', 'Pendulum-v0', 'MountainCarContinuous-v0', 'CarRacing-v0', 'CartPoleContinuousBulletEnv-v0', 'AntBulletEnv-v0', 'HalfCheetahBulletEnv-v0', 'HopperBulletEnv-v0', 'HopperBulletEnv-v0', 'HumanoidStandup-v2', 'InvertedDoublePendulum-v2', 'InvertedPendulum-v2', 'Reacher-v2', 'Swimmer-v2', 'Walker2DBulletEnv-v0']
@@ -22,12 +25,12 @@ def postprocess_observation(observation, bit_depth):
 
 
 def _images_to_observation(images, bit_depth):
-  images = torch.tensor(cv2.resize(images, (64, 64), interpolation=cv2.INTER_LINEAR).transpose(2, 0, 1), dtype=torch.float32)  # Resize and put channel first
+  images = torch.tensor(resize(images, [64, 64]).transpose(2, 0, 1), dtype=torch.float32)  # Resize and put channel first
   preprocess_observation_(images, bit_depth)  # Quantise, centre and dequantise inplace
   images = torch.min(torch.max(images, torch.tensor(1e-20, dtype=torch.float)), torch.tensor(1-1e-20, dtype=torch.float))
   return images.unsqueeze(dim=0)  # Add batch dimension
 
-
+'''
 from smarts.core.agent import Agent, AgentSpec
 from smarts.core.agent_interface import AgentInterface, AgentType, Waypoints
 
@@ -214,71 +217,66 @@ def adapt(observation: Observation, reward: float) -> float:
 
 def ultra_default_reward_adapter(observation: Observation, reward: float) -> float:
     return adapt(observation, reward)
-
+'''
 
 class ControlSuiteEnv():
-  def __init__(self, env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
-    from dm_control import suite
-    from dm_control.suite.wrappers import pixels
-    domain, task = env.split('-')
-    self.symbolic = symbolic
-    self._env = suite.load(domain_name=domain, task_name=task, task_kwargs={'random': seed})
-    if not symbolic:
-      self._env = pixels.Wrapper(self._env)
+  def __init__(self, env, seed, max_episode_length, action_repeat, image_size=64):
+    domain_name, task_name = env.split('-')
+    self._env = dmc2gym.make(
+        domain_name=domain_name,
+        task_name=task_name,
+        visualize_reward=False,
+        from_pixels=True,
+        height=image_size,
+        width=image_size,
+        frame_skip=action_repeat,
+    )
+    self._env.seed(seed)
     self.max_episode_length = max_episode_length
     self.action_repeat = action_repeat
-    if action_repeat != CONTROL_SUITE_ACTION_REPEATS[domain]:
-      print('Using action repeat %d; recommended action repeat for domain is %d' % (action_repeat, CONTROL_SUITE_ACTION_REPEATS[domain]))
-    self.bit_depth = bit_depth
+    if action_repeat != CONTROL_SUITE_ACTION_REPEATS[domain_name]:
+      print('Using action repeat %d; recommended action repeat for domain is %d' % (action_repeat, CONTROL_SUITE_ACTION_REPEATS[domain_name]))
 
   def reset(self):
     self.t = 0  # Reset internal timer
     state = self._env.reset()
-    if self.symbolic:
-      return torch.tensor(np.concatenate([np.asarray([obs]) if isinstance(obs, float) else obs for obs in state.observation.values()], axis=0), dtype=torch.float32).unsqueeze(dim=0)
-    else:
-      return _images_to_observation(self._env.physics.render(camera_id=0), self.bit_depth)
+    return state
 
   def step(self, action):
     action = action.detach().numpy()
     reward = 0
+    observation = None
     for k in range(self.action_repeat):
       state = self._env.step(action)
+      observation = state
       reward += state.reward
       self.t += 1  # Increment internal timer
       done = state.last() or self.t == self.max_episode_length
       if done:
         break
-    if self.symbolic:
-      observation = torch.tensor(np.concatenate([np.asarray([obs]) if isinstance(obs, float) else obs for obs in state.observation.values()], axis=0), dtype=torch.float32).unsqueeze(dim=0)
-    else:
-      observation = _images_to_observation(self._env.physics.render(camera_id=0), self.bit_depth)
     return observation, reward, done
 
   def render(self):
-    cv2.imshow('screen', self._env.physics.render(camera_id=0)[:, :, ::-1])
-    cv2.waitKey(1)
+    pass
 
   def close(self):
-    cv2.destroyAllWindows()
     self._env.close()
 
   @property
   def observation_size(self):
-    return sum([(1 if len(obs.shape) == 0 else obs.shape[0]) for obs in self._env.observation_spec().values()]) if self.symbolic else (3, 64, 64)
+    return self.observation_space.shape
 
   @property
   def action_size(self):
-    return self._env.action_spec().shape[0]
+    return self._env.action_space.shape[0]
 
   @property
   def action_range(self):
-    return float(self._env.action_spec().minimum[0]), float(self._env.action_spec().maximum[0]) 
+    return (self._env.action_space.low, self._env.action_space.high)
 
   # Sample an action randomly from a uniform distribution over all valid actions
   def sample_random_action(self):
-    spec = self._env.action_spec()
-    return torch.from_numpy(np.random.uniform(spec.minimum, spec.maximum, spec.shape))
+    return torch.from_numpy(self._env.action_space.sample())
 
 
 
@@ -340,7 +338,7 @@ class GymEnv():
   def sample_random_action(self):
     return torch.from_numpy(self._env.action_space.sample())
 
-
+'''
 class Hiway:
   def __init__(self, seed, max_episode_length, action_repeat, bit_depth, agent_id, agent_spec, scenario):
     import gym
@@ -411,14 +409,15 @@ class Hiway:
   # Sample an action randomly from a uniform distribution over all valid actions
   def sample_random_action(self):
     return torch.from_numpy(self.action_space.sample())
-
+'''
 
 def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
   if env in GYM_ENVS:
     return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
   elif env in CONTROL_SUITE_ENVS:
-    return ControlSuiteEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
+    return ControlSuiteEnv(env, seed, max_episode_length, action_repeat)
   elif (env == 'loop' or env == '4lane'):
+    '''
     AGENT_ID = "Agent-001"
     AGENT_SPEC = AgentSpec(
       interface=AgentInterface.from_type(
@@ -432,6 +431,8 @@ def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
     else:
       scenario = '/SMARTS/scenarios/loop'
     return Hiway(seed, max_episode_length, action_repeat, bit_depth, AGENT_ID, AGENT_SPEC, scenario)
+    '''
+    raise ValueError(f"{env} is not supported")
 
 
 # Wrapper for batching environments together
