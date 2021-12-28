@@ -256,16 +256,9 @@ class ControlSuiteEnv():
 
   def step(self, action):
     action = action.detach().numpy()
-    reward = 0
-    observation = None
-    for k in range(self.action_repeat):
-      state, reward_k, done, _ = self._env.step(action)
-      observation = state
-      reward += reward_k
-      self.t += 1  # Increment internal timer
-      done = done or self.t == self.max_episode_length
-      if done:
-        break
+    observation, reward, done, _ = self._env.step(action)
+    self.t += self.action_repeat  # Increment internal timer
+    done = done or self.t >= self.max_episode_length
     return _images_to_observation_dm_control(observation, self.bit_depth), reward, done
 
   def render(self):
