@@ -24,12 +24,17 @@ def postprocess_observation(observation, bit_depth):
   return np.clip(np.floor((observation) * 2 ** bit_depth) * 2 ** (8 - bit_depth), 0, 2 ** 8 - 1).astype(np.uint8)
 
 
-def _images_to_observation(images, bit_depth, should_resize=True):
+def _images_to_observation(images, bit_depth):
   images = torch.tensor(images, dtype=torch.float32).permute((2, 0, 1))  # Resize and put channel first
-  if should_resize:
-    images = resize(images, [64, 64])
+  images = resize(images, [64, 64])
   preprocess_observation_(images, bit_depth)  # Quantise, centre and dequantise inplace
   images = torch.min(torch.max(images, torch.tensor(1e-20, dtype=torch.float)), torch.tensor(1-1e-20, dtype=torch.float))
+  return images.unsqueeze(dim=0)  # Add batch dimension
+
+def _images_to_observation_dm_control(images, bit_depth):
+  images = torch.tensor(images, dtype=torch.float32)  # Resize and put channel first
+  preprocess_observation_(images, bit_depth)  # Quantise, centre and dequantise inplace
+  #images = torch.min(torch.max(images, torch.tensor(1e-20, dtype=torch.float)), torch.tensor(1-1e-20, dtype=torch.float))
   return images.unsqueeze(dim=0)  # Add batch dimension
 
 '''
@@ -243,7 +248,7 @@ class ControlSuiteEnv():
   def reset(self):
     self.t = 0  # Reset internal timer
     observation = self._env.reset()
-    return _images_to_observation(observation, self.bit_depth, should_resize=False)
+    return _images_to_observation_dm_control(observation, self.bit_depth, should_resize=False)
 
   def step(self, action):
     action = action.detach().numpy()
@@ -257,7 +262,7 @@ class ControlSuiteEnv():
       done = done or self.t == self.max_episode_length
       if done:
         break
-    return _images_to_observation(observation, self.bit_depth, should_resize=False), reward, done
+    return _images_to_observation_dm_control(observation, self.bit_depth), reward, done
 
   def render(self):
     pass
