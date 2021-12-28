@@ -144,6 +144,6 @@ class ActorCriticPlanner(nn.Module):
     policy_mll_loss = -self.policy_mll(policy_dist, policy_action)
     transition_dist = self.transition_model(embedding, policy_action)
     normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).to(device=device) + torch.tensor(self.action_bias).to(device=device)
-    normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.tensor(self.min_action).to(device=device)), torch.tensor(self.max_action).to(device=device))
+    normalized_policy_action = torch.clamp(normalized_policy_action, min=torch.tensor(self.min_action).to(device=device), max=torch.tensor(self.max_action).to(device=device))
     q_value = self.q_network(embedding, policy_action)
     return normalized_policy_action, policy_log_prob, policy_mll_loss, value, q_value, transition_dist
