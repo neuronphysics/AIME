@@ -220,7 +220,7 @@ def ultra_default_reward_adapter(observation: Observation, reward: float) -> flo
 '''
 
 class ControlSuiteEnv():
-  def __init__(self, env, seed, max_episode_length, action_repeat, image_size=64):
+  def __init__(self, env, seed, max_episode_length, action_repeat, bit_depth, image_size=64):
     domain_name, task_name = env.split('-')
     self._env = dmc2gym.make(
         domain_name=domain_name,
@@ -234,6 +234,7 @@ class ControlSuiteEnv():
     self._env.seed(seed)
     self.max_episode_length = max_episode_length
     self.action_repeat = action_repeat
+    self.bit_depth = bit_depth
     if action_repeat != CONTROL_SUITE_ACTION_REPEATS[domain_name]:
       print('Using action repeat %d; recommended action repeat for domain is %d' % (action_repeat, CONTROL_SUITE_ACTION_REPEATS[domain_name]))
 
@@ -254,7 +255,7 @@ class ControlSuiteEnv():
       done = done or self.t == self.max_episode_length
       if done:
         break
-    return observation, reward, done
+    return preprocess_observation_(observation, self.bit_depth), reward, done
 
   def render(self):
     pass
@@ -415,7 +416,7 @@ def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
   if env in GYM_ENVS:
     return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
   elif env in CONTROL_SUITE_ENVS:
-    return ControlSuiteEnv(env, seed, max_episode_length, action_repeat)
+    return ControlSuiteEnv(env, seed, max_episode_length, action_repeat, bit_depth)
   elif (env == 'loop' or env == '4lane'):
     '''
     AGENT_ID = "Agent-001"
