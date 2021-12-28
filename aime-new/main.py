@@ -307,9 +307,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   #current_values = episode_values[start+1:min(start+args.horizon_size, episode_length+args.lagging_size)].clone()
   #previous_values = episode_values[start:min(start+args.horizon_size, episode_length+args.lagging_size)].clone()
   soft_v_values = episode_q_values - episode_transition_kl - episode_policy_kl
-  target_q_values = args.temperature_factor * episode_rewards + args.discount_factor * episode_values[1:]
+  target_q_values = args.temperature_factor * episode_rewards + args.discount_factor * episode_values
   value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
-  q_loss = torch.tensor(0).to(device=args.device) if target_q_values.size(0) == 0 else F.mse_loss(episode_q_values[:-1], target_q_values, reduction='none').mean()
+  q_loss = torch.tensor(0).to(device=args.device) if target_q_values.size(0) == 0 else F.mse_loss(episode_q_values, target_q_values, reduction='none').mean()
   policy_loss = (episode_policy_kl - episode_q_values + episode_values).mean()
   
   current_policy_mll_loss = episode_policy_mll_loss.mean()
