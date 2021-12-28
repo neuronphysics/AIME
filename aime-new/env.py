@@ -36,8 +36,8 @@ def _images_to_observation(images, bit_depth):
   return images.unsqueeze(dim=0)  # Add batch dimension
 
 def _images_to_observation_dm_control(images, bit_depth):
-  images = torch.tensor(images, dtype=torch.float32)  # Resize and put channel first
-  preprocess_observation_(images, bit_depth)  # Quantise, centre and dequantise inplace
+  images = torch.tensor(np.clip(images / 255.0 - 1.0, -0.5, 0.5), dtype=torch.float32)  # Resize and put channel first
+  #preprocess_observation_(images, bit_depth)  # Quantise, centre and dequantise inplace
   #images = torch.min(torch.max(images, torch.tensor(1e-20, dtype=torch.float)), torch.tensor(1-1e-20, dtype=torch.float))
   return images.unsqueeze(dim=0)  # Add batch dimension
 
