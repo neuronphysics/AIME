@@ -299,7 +299,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   episode_transition_mll_loss = episode_transition_mll_loss[args.lagging_size:]
   episode_states = episode_states[args.lagging_size-1:]
   episode_length = episode_actions[args.lagging_size:].size(0)
-  index_numbers = np.arange(0, episode_length, args.horizon_size)
   #current_q_values = episode_q_values[start:min(start+args.horizon_size, episode_length].clone()
   #previous_q_values = episode_q_values[start:min(start+args.horizon_size-1, episode_length-1+args.lagging_size)].clone()
   #current_rewards = episode_rewards[start:min(start+args.horizon_size-1, episode_length-1+args.lagging_size)].clone()
@@ -307,11 +306,11 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   #current_transition_kl = episode_transition_kl[start:min(start+args.horizon_size, episode_length+args.lagging_size)].clone()
   #current_values = episode_values[start+1:min(start+args.horizon_size, episode_length+args.lagging_size)].clone()
   #previous_values = episode_values[start:min(start+args.horizon_size, episode_length+args.lagging_size)].clone()
-  soft_v_values = episode_q_values[1:] - episode_transition_kl - episode_policy_kl
+  soft_v_values = episode_q_values - episode_transition_kl - episode_policy_kl
   target_q_values = args.temperature_factor * episode_rewards + args.discount_factor * episode_values[1:]
   value_loss = F.mse_loss(episode_values, soft_v_values, reduction='none').mean()
   q_loss = torch.tensor(0).to(device=args.device) if target_q_values.size(0) == 0 else F.mse_loss(episode_q_values[:-1], target_q_values, reduction='none').mean()
-  policy_loss = (episode_policy_kl - episode_q_values[1:] + episode_values).mean()
+  policy_loss = (episode_policy_kl - episode_q_values + episode_values).mean()
   
   current_policy_mll_loss = episode_policy_mll_loss.mean()
   current_transition_mll_loss = episode_transition_mll_loss.mean()
