@@ -303,21 +303,21 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     episode_length = episode_actions[args.lagging_size:].size(0)
     index_numbers = np.arange(0, episode_length, args.horizon_size)
     for start in index_numbers:
-      current_q_values = episode_q_values[start:min(start+args.horizon_size, episode_length+args.lagging_size)]
-      previous_q_values = episode_q_values[start:min(start+args.horizon_size-1, episode_length-1+args.lagging_size)]
-      current_rewards = episode_rewards[start:min(start+args.horizon_size-1, episode_length-1+args.lagging_size)]
-      current_policy_kl = episode_policy_kl[start:min(start+args.horizon_size, episode_length+args.lagging_size)]
-      current_transition_kl = episode_transition_kl[start:min(start+args.horizon_size, episode_length+args.lagging_size)]
-      current_values = episode_values[start+1:min(start+args.horizon_size, episode_length+args.lagging_size)]
-      previous_values = episode_values[start:min(start+args.horizon_size, episode_length+args.lagging_size)]
+      current_q_values = episode_q_values[start:min(start+args.horizon_size, episode_length+args.lagging_size)].clone()
+      previous_q_values = episode_q_values[start:min(start+args.horizon_size-1, episode_length-1+args.lagging_size)].clone()
+      current_rewards = episode_rewards[start:min(start+args.horizon_size-1, episode_length-1+args.lagging_size)].clone()
+      current_policy_kl = episode_policy_kl[start:min(start+args.horizon_size, episode_length+args.lagging_size)].clone()
+      current_transition_kl = episode_transition_kl[start:min(start+args.horizon_size, episode_length+args.lagging_size)].clone()
+      current_values = episode_values[start+1:min(start+args.horizon_size, episode_length+args.lagging_size)].clone()
+      previous_values = episode_values[start:min(start+args.horizon_size, episode_length+args.lagging_size)].clone()
       soft_v_values = current_q_values - current_transition_kl - current_policy_kl
       target_q_values = args.temperature_factor * current_rewards + args.discount_factor * current_values
       value_loss = F.mse_loss(previous_values, soft_v_values, reduction='none').mean()
       q_loss = torch.tensor(0).to(device=args.device) if target_q_values.size(0) == 0 else F.mse_loss(previous_q_values, target_q_values, reduction='none').mean()
       policy_loss = (current_policy_kl - current_q_values + previous_values).mean()
       
-      current_policy_mll_loss = episode_policy_mll_loss[start:min(start+args.horizon_size, episode_length+args.lagging_size)].mean()
-      current_transition_mll_loss = episode_transition_mll_loss[start:min(start+args.horizon_size, episode_length+args.lagging_size)].mean()
+      current_policy_mll_loss = episode_policy_mll_loss[start:min(start+args.horizon_size, episode_length+args.lagging_size)].clone().mean()
+      current_transition_mll_loss = episode_transition_mll_loss[start:min(start+args.horizon_size, episode_length+args.lagging_size)].clone().mean()
       
       planning_optimiser.zero_grad()
       (value_loss + q_loss + current_transition_mll_loss).backward(retain_graph=True)
