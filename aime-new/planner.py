@@ -14,26 +14,28 @@ from gpytorch.means import ConstantMean, ZeroMean, LinearMean
 from gpytorch.mlls import DeepApproximateMLL, VariationalELBO
 
 class ValueNetwork(nn.Module):
-  def __init__(self, latent_size, num_sample_trajectories, hidden_size):
+  def __init__(self, latent_size, num_sample_trajectories, hidden_size, activation_function='relu'):
     super().__init__()
+    self.act_fn = getattr(F, activation_function)
     self.latent_size = latent_size
     self.fc1 = nn.Linear(latent_size + num_sample_trajectories, hidden_size)
     self.fc2 = nn.Linear(hidden_size, 1)
   
   def forward(self, embedding):
-    hidden = F.relu(self.fc1(embedding))
+    hidden = self.act_fn(self.fc1(embedding))
     return self.fc2(hidden)
 
 class QNetwork(nn.Module):
-  def __init__(self, latent_size, num_sample_trajectories, action_size, hidden_size):
+  def __init__(self, latent_size, num_sample_trajectories, action_size, hidden_size, activation_function='relu'):
     super().__init__()
+    self.act_fn = getattr(F, activation_function)
     self.latent_size = latent_size
     self.action_size = action_size
     self.fc1 = nn.Linear(latent_size + num_sample_trajectories + action_size, hidden_size)
     self.fc2 = nn.Linear(hidden_size, 1)
   
   def forward(self, embedding, action):
-    hidden = F.relu(self.fc1(torch.cat([embedding, action], dim=-1)))
+    hidden = self.act_fn(self.fc1(torch.cat([embedding, action], dim=-1)))
     return self.fc2(hidden)
 
 class FirstPolicyLayer(DGPHiddenLayer):
