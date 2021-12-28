@@ -264,7 +264,7 @@ class ControlSuiteEnv():
 
   @property
   def observation_size(self):
-    return self.observation_space.shape
+    return self._env.observation_space.shape
 
   @property
   def action_size(self):
