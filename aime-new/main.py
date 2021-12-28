@@ -247,7 +247,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
       else:
         _, current_latent_state = infinite_vae(observation.to(device=args.device))
-    episode_states = torch.cat([torch.zeros(args.lagging_size-1, args.state_size, device=args.device), current_latent_state.unsqueeze(dim=0)], dim=0)
+    episode_states = torch.cat([torch.zeros(args.lagging_size-1, args.state_size, device=args.device), current_latent_state], dim=0)
     episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
     episode_values = torch.zeros(args.lagging_size, 1, device=args.device)
     episode_q_values = torch.zeros(args.lagging_size, 1, device=args.device)
