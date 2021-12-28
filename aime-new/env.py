@@ -247,11 +247,11 @@ class ControlSuiteEnv():
     reward = 0
     observation = None
     for k in range(self.action_repeat):
-      state = self._env.step(action)
+      state, reward_k, done, _ = self._env.step(action)
       observation = state
-      reward += state.reward
+      reward += reward_k
       self.t += 1  # Increment internal timer
-      done = state.last() or self.t == self.max_episode_length
+      done = done or self.t == self.max_episode_length
       if done:
         break
     return observation, reward, done
