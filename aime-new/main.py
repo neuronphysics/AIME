@@ -318,15 +318,16 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     current_policy_mll_loss = episode_policy_mll_loss[start:min(start+args.horizon_size, episode_length)].mean()
     current_transition_mll_loss = episode_transition_mll_loss[start:min(start+args.horizon_size, episode_length)].mean()
     
-    planning_optimiser.zero_grad()
-    (value_loss + q_loss + current_transition_mll_loss).backward(retain_graph=True)
-    nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
-    planning_optimiser.step()
+    with torch.autograd.detect_anomaly():
+      planning_optimiser.zero_grad()
+      (value_loss + q_loss + current_transition_mll_loss).backward(retain_graph=True)
+      nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
+      planning_optimiser.step()
 
-    planning_optimiser.zero_grad()
-    (policy_loss + current_policy_mll_loss).backward()
-    nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
-    planning_optimiser.step()
+      planning_optimiser.zero_grad()
+      (policy_loss + current_policy_mll_loss).backward()
+      nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
+      planning_optimiser.step()
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
