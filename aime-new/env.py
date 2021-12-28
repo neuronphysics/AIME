@@ -248,7 +248,7 @@ class ControlSuiteEnv():
   def reset(self):
     self.t = 0  # Reset internal timer
     observation = self._env.reset()
-    return _images_to_observation_dm_control(observation, self.bit_depth, should_resize=False)
+    return _images_to_observation_dm_control(observation, self.bit_depth)
 
   def step(self, action):
     action = action.detach().numpy()
