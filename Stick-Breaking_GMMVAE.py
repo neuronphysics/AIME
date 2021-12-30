@@ -798,7 +798,7 @@ def train(epoch):
         X = X.to(device=device, dtype=torch.float)
         optimizer.zero_grad()
         
-        X_recon_expand, X_recons_linear, mu_z, logvar_z, mu_w, logvae_w, qc, kumar_a, kumar_b,mu_pz, logvar_pz= net(X)
+        X_recon_expand, X_recons_linear, mu_z, logvar_z, mu_w, logvae_w, qc, kumar_a, kumar_b, mu_pz, logvar_pz= net(X)
 
     
         loss_dict = net.get_ELBO(X)
@@ -859,6 +859,7 @@ start_epoch = 0
 if os.path.isfile("/scratch/ssd001/home/zsheikhb/iGMMVAE/results/model_StickBreaking_GMM_VAE_*.pth"):
    list_of_files = glob.glob('/scratch/ssd001/home/zsheikhb/iGMMVAE/results/model_StickBreaking_GMM_VAE*.pth') # * means all if need specific format then *.csv
    latest_file = max(list_of_files, key=os.path.getctime)
+   print("latest saved model: ")
    print(latest_file)
    checkpoint = torch.load(latest_file)
    net.load_state_dict(checkpoint['model_state_dict'])
@@ -877,9 +878,13 @@ for epoch in range(start_epoch,num_epochs):
 
        average_epoch_loss, out , elbo2 =train(epoch)
        avg_train_loss.extend(average_epoch_loss)
-       if epoch %10 == 0:
-          pic =out.data.view(out.size(0),3,96, 96)
-          save_image(pic,'./results/'+str(epoch)+'_epochs.png')
+       if epoch % 25 == 0:
+
+          img =torchvision.utils.make_grid(out.detach().cpu())
+          npimg = np.transpose(img.numpy(),(1,2,0))
+          fig = plt.figure(dpi=300)
+          plt.imshow(npimg)
+          plt.imsave('./results/reconst_'+str(epoch)+'_epochs.png', npimg)
        # plot beta-kumaraswamy loss
        plotter.plot('KL of beta-kumaraswamy distributions', 'val', 'Class Loss', epoch, elbo2)
        
@@ -970,7 +975,7 @@ def visualise_output(images, model):
     with torch.no_grad():
 
         images = images.to(device)
-        images, _, _ = model(images)
+        _, images, _, _, _, _, _, _, _,_, _ = model(images)
         images = images.cpu()
         images = to_img(images)
         np_imagegrid = torchvision.utils.make_grid(images[1:50], 10, 5).numpy()
