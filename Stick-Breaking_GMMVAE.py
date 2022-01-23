@@ -14,8 +14,8 @@ from types import SimpleNamespace as SN
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 from collections import OrderedDict
-import pyro
-import pyro.distributions as dist
+#import pyro
+#import pyro.distributions as dist
 from numpy.testing import assert_almost_equal
 import os
 try:
