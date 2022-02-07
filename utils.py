@@ -14,15 +14,15 @@ from types import SimpleNamespace as SN
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 from collections import OrderedDict
-#import pyro
-#import pyro.distributions as dist
+import pyro
+import pyro.distributions as dist
 from numpy.testing import assert_almost_equal
 import os
 try:
     import PIL.Image as Image
 except ImportError:
     import Image
-#from utils import tile_raster_images
+from utils import tile_raster_images
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 #tf.reduce_mean -> tensor.mean
 #tf.expand_dims -> tensor.expand
@@ -669,7 +669,7 @@ class InfGaussMMVAE(GMMVAE):
 
 
 #class of optimizer
-#from utils import AdaBound
+from utils import AdaBound
 #data analysis
 from torch import nn, optim
 from torchvision.utils import save_image
