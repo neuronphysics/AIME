@@ -121,28 +121,9 @@ class GaussMMVAE(nn.Module):
         return len(self.X)
 
     def init_encoder(self, hyperParams):
-        return {'base':nn.Sequential(
-                                     nn.Conv2d([hyperParams['input_d'], 32, kernel_size=4, stride=2),
-                                     nn.BatchNorm2d(num_feature=32),
-                                     nn.ReLU(),
-                                     nn.Conv2d(32, 64, kernel_size=4, stride=2),
-                                     nn.BatchNorm2d(num_feature=64),
-                                     nn.ReLU(),
-                                     nn.Conv2d(64, 128, kernel_size=4, stride=2),
-                                     nn.BatchNorm2d(num_feature=128),
-                                     nn.ReLU(),
-                                     nn.Conv2d(128, 256, kernel_size=4, stride=2),
-                                     nn.BatchNorm2d(num_feature=256),
-                                     nn.ReLU(),
-                                     Flatten(),
-                                     nn.Linear(256*256, hyperParams['hidden_d'],bias=False),
-                                     nn.BatchNorm2d(num_feature=hyperParams['hidden_d']),
-                                     nn.ReLU()
-                                     ),
-                'z_mu':[init_mlp([hyperParams['hidden_d'], hyperParams['latent_d']]) for k in xrange(self.K)],
-                'z_sigma':[init_mlp([hyperParams['hidden_d'], hyperParams['latent_d']]) for k in xrange(self.K)],
-                'w_mu':init_mlp([hyperParams['hidden_d'], hyperParams['latent_w']]),
-                'w_sigma':init_mlp([hyperParams['hidden_d'], hyperParams['latent_w']]),
+        return {'base':init_mlp([hyperParams['input_d'], hyperParams['hidden_d'], hyperParams['hidden_d']]),
+                'mu':[init_mlp([hyperParams['hidden_d'], hyperParams['latent_d']]) for k in xrange(self.K)],
+                'sigma':[init_mlp([hyperParams['hidden_d'], hyperParams['latent_d']]) for k in xrange(self.K)],
                 'kumar_a':init_mlp([hyperParams['hidden_d'], self.K-1], 1e-8),
                 'kumar_b':init_mlp([hyperParams['hidden_d'], self.K-1], 1e-8)}
 
@@ -154,27 +135,23 @@ class GaussMMVAE(nn.Module):
     def f_prop(self):
 
         # init variational params
-        self.z_mu = []
-        self.z_sigma = []
+        self.mu = []
+        self.sigma = []
         self.kumar_a = []
         self.kumar_b = []
         self.z = []
         x_recon_linear = []
 
-        h1 =  self.encoder_params['base'](self.X)
+        h1 = mlp(self.X, self.encoder_params['base'])
 
         for k in xrange(self.K):
-            self.z_mu.append(mlp(h1, self.encoder_params['z_mu'][k]))
-            self.z_sigma.append(torch.exp(mlp(h1, self.encoder_params['z_sigma'][k])))
-            self.z.append(self.z_mu[-1] + torch.mul(self.z_sigma[-1], Normal(self.z_sigma[-1].shape)))##??
+            self.mu.append(mlp(h1, self.encoder_params['mu'][k]))
+            self.sigma.append(torch.exp(mlp(h1, self.encoder_params['sigma'][k])))
+            self.z.append(self.mu[-1] + torch.mul(self.sigma[-1], Normal(self.sigma[-1].shape)))##??
             x_recon_linear.append(mlp(self.z[-1], self.decoder_params))
 
-        self.w_mu    = mlp(h1, self.encoder_params['w_mu'])
-        self.w_sigma = torch.exp(mlp(h1, self.encoder_params['w_sigma']))
-        self.w       = self.w_mu[-1] + torch.mul(self.z_sigma[-1], Normal(self.z_sigma[-1].shape))
-        h2           = torch.cat((self.z, self.w), 1)
-        self.kumar_a = torch.exp(mlp(h2, self.encoder_params['kumar_a']))
-        self.kumar_b = torch.exp(mlp(h2, self.encoder_params['kumar_b']))
+        self.kumar_a = torch.exp(mlp(h1, self.encoder_params['kumar_a']))
+        self.kumar_b = torch.exp(mlp(h1, self.encoder_params['kumar_b']))
 
         return x_recon_linear
 
@@ -208,16 +185,14 @@ class GaussMMVAE(nn.Module):
         self.pi_samples = self.compose_stick_segments(v_samples)
 
         # compose elbo
-        elbo = torch.mul(self.pi_means[0], -compute_nll(self.X, self.x_recons_linear[0]) + gauss_cross_entropy(self.z_mu[0], self.z_sigma[0], self.prior['mu'][0], self.prior['sigma'][0]))
+        elbo = torch.mul(self.pi_means[0], -compute_nll(self.X, self.x_recons_linear[0]) + gauss_cross_entropy(self.mu[0], self.sigma[0], self.prior['mu'][0], self.prior['sigma'][0]))
         for k in xrange(self.K-1):
             elbo += torch.mul(self.pi_means[k+1], -compute_nll(self.X, self.x_recons_linear[k+1]) \
-                               + gauss_cross_entropy(self.z_mu[k+1], self.z_sigma[k+1], self.prior['mu'][k+1], self.prior['sigma'][k+1]))
+                               + gauss_cross_entropy(self.mu[k+1], self.sigma[k+1], self.prior['mu'][k+1], self.prior['sigma'][k+1]))
             elbo -= compute_kumar2beta_kld(tensor.expand(self.kumar_a[:,k],1), tensor.expand(self.kumar_b[:,k],1), \
                                                self.prior['dirichlet_alpha'], (self.K-1-k)*self.prior['dirichlet_alpha'])
 
-        elbo += mcMixtureEntropy(self.pi_samples, self.z, self.z_mu, self.z_sigma, self.K)
-        elbo += -0.5 * torch.sum(1 + torch.log(self.w_sigma) - self.w_mu*self.w_mu - self.w_sigma) #KLD_W
-
+        elbo += mcMixtureEntropy(self.pi_samples, self.z, self.mu, self.sigma, self.K)
 
         return tensor.mean(elbo)
 
@@ -249,7 +224,6 @@ class GaussMMVAE(nn.Module):
 
         # calc prior terms
         all_log_gauss_priors = []
-
         for k in xrange(self.K):
             all_log_gauss_priors.append(log_normal_pdf(self.z[k], self.prior['mu'][k], self.prior['sigma'][k]))
         all_log_gauss_priors = torch.cat(1, all_log_gauss_priors)
@@ -265,14 +239,12 @@ class GaussMMVAE(nn.Module):
 
         all_log_gauss_posts = []
         for k in xrange(self.K):
-            all_log_gauss_posts.append(log_normal_pdf(self.z[k], self.z_mu[k], self.z_sigma[k]))
+            all_log_gauss_posts.append(log_normal_pdf(self.z[k], self.mu[k], self.sigma[k]))
         all_log_gauss_posts = torch.cat(all_log_gauss_posts,1)
         log_gauss_post = gather_nd(all_log_gauss_posts, component_samples)
         log_gauss_post = tensor.expand(log_gauss_post,1)
-        #modified and added by Zahra
-        log_w_prior = log_normal_pdf(self.w, torch.zeros(self.w.size()),torch.eye(self.w.size()))
-        log_w_post  = log_normal_pdf(self.w, self.w_mu,self.w_sigma)
-        return ll + log_beta_prior + log_gauss_prior +log_w_prior - log_kumar_post - log_gauss_post - log_w_post
+
+        return ll + log_beta_prior + log_gauss_prior - log_kumar_post - log_gauss_post
 
 
     def get_samples(self, nImages):
@@ -334,14 +306,14 @@ class DPVAE(GaussMMVAE):
         self.pi_samples = self.compose_stick_segments(v_samples)
 
         # compose elbo
-        elbo = torch.mul(self.pi_means[0], -compute_nll(self.X, self.x_recons_linear[0]) + gauss_cross_entropy(self.z_mu[0], self.z_sigma[0], self.prior['mu'][0], self.prior['sigma'][0]))
+        elbo = torch.mul(self.pi_means[0], -compute_nll(self.X, self.x_recons_linear[0]) + gauss_cross_entropy(self.mu[0], self.sigma[0], self.prior['mu'][0], self.prior['sigma'][0]))
         for k in xrange(self.K-1):
             elbo += torch.mul(self.pi_means[k+1], -compute_nll(self.X, self.x_recons_linear[k+1]) \
-                               + gauss_cross_entropy(self.z_mu[k+1], self.z_sigma[k+1], self.prior['mu'][k+1], self.prior['sigma'][k+1]))
+                               + gauss_cross_entropy(self.mu[k+1], self.sigma[k+1], self.prior['mu'][k+1], self.prior['sigma'][k+1]))
             elbo -= compute_kumar2beta_kld(tensor.expand(self.kumar_a[:,k],1), tensor.expand(self.kumar_b[:,k],1), 1., self.prior['dirichlet_alpha'])
 
-        elbo += mcMixtureEntropy(self.pi_samples, self.z, self.z_mu, self.z_sigma, self.K)
-        elbo += -0.5 * torch.sum(1 + torch.log(self.w_sigma) - self.w_mu*self.w_mu - self.w_sigma)
+        elbo += mcMixtureEntropy(self.pi_samples, self.z, self.mu, self.sigma, self.K)
+
         return tensor.mean(elbo)
 
 
@@ -387,7 +359,7 @@ class DPVAE(GaussMMVAE):
 
         all_log_gauss_posts = []
         for k in xrange(self.K):
-            all_log_gauss_posts.append(log_normal_pdf(self.z[k], self.z_mu[k], self.z_sigma[k]))
+            all_log_gauss_posts.append(log_normal_pdf(self.z[k], self.mu[k], self.sigma[k]))
         all_log_gauss_posts = torch.cat(1, all_log_gauss_posts)
         log_gauss_post = gather_nd(all_log_gauss_posts, component_samples)
         log_gauss_post = tensor.expand(log_gauss_post,1)
@@ -437,10 +409,10 @@ class DLGMM(GaussMMVAE):
 
     def f_prop(self):
         # init variational params
-        self.z_mu1 = []
-        self.z_mu2 =[]
-        self.z_sigma1 = []
-        self.z_sigma2 = []
+        self.mu1 = []
+        self.mu2 =[]
+        self.sigma1 = []
+        self.sigma2 = []
         self.z1 = []
         self.z2 = []
         self.kumar_a1 = []
@@ -451,15 +423,15 @@ class DLGMM(GaussMMVAE):
 
         # compute z1's sigma params
         for k in xrange(self.K):
-            self.z_sigma1.append(torch.exp(mlp(h1, self.encoder_params1['sigma'][k])))
+            self.sigma1.append(torch.exp(mlp(h1, self.encoder_params1['sigma'][k])))
 
         h2 = mlp(h1, self.encoder_params2['base'])
 
         # compute z2's param
         for k in xrange(self.K):
-            self.z_mu2.append(mlp(h2, self.encoder_params2['mu'][k]))
-            self.z_sigma2.append(torch.exp(mlp(h2, self.encoder_params2['sigma'][k])))
-            self.z2.append(self.z_mu2[-1] + torch.mul(self.z_sigma2[-1], Normal(self.z_sigma2[-1].shape)))
+            self.mu2.append(mlp(h2, self.encoder_params2['mu'][k]))
+            self.sigma2.append(torch.exp(mlp(h2, self.encoder_params2['sigma'][k])))
+            self.z2.append(self.mu2[-1] + torch.mul(self.sigma2[-1], Normal(self.sigma2[-1].shape)))
         self.kumar_a2 = torch.nn.Softplus(mlp(h2, self.encoder_params2['kumar_a']))
         self.kumar_b2 = torch.nn.Softplus(mlp(h2, self.encoder_params2['kumar_b']))
 
@@ -470,12 +442,12 @@ class DLGMM(GaussMMVAE):
         # compute z1's, finally.  KxK of them
         for k in xrange(self.K):
             self.z1.append([])
-            self.z_mu1.append([])
+            self.mu1.append([])
             self.kumar_a1.append(torch.nn.Softplus(mlp(h3[k], self.encoder_params1['kumar_a'])))
             self.kumar_b1.append(torch.nn.Softplus(mlp(h3[k], self.encoder_params1['kumar_b'])))
             for j in xrange(self.K):
-                self.z_mu1[-1].append(mlp(h3[k], self.encoder_params1['mu'][j]))
-                self.z1[-1].append(self.z_mu1[-1][-1] + torch.mul(self.z_sigma1[k], Normal(self.z_sigma1[k].shape)))
+                self.mu1[-1].append(mlp(h3[k], self.encoder_params1['mu'][j]))
+                self.z1[-1].append(self.mu1[-1][-1] + torch.mul(self.sigma1[k], Normal(self.sigma1[k].shape)))
 
         # compute KxK reconstructions
         for k in xrange(self.K):
@@ -517,7 +489,7 @@ class DLGMM(GaussMMVAE):
         # compose elbo
         elbo = torch.zeros((a2_inv.shape[0],1))
         for k in xrange(self.K):
-            elbo += torch.mul(self.pi_means2[k], gauss_cross_entropy(self.z_mu2[k], self.z_sigma2[k], self.prior['mu'][k], self.prior['sigma'][k]))
+            elbo += torch.mul(self.pi_means2[k], gauss_cross_entropy(self.mu2[k], self.sigma2[k], self.prior['mu'][k], self.prior['sigma'][k]))
             for j in xrange(self.K):
                 elbo += torch.mul(torch.mul(self.pi_means2[k], self.pi_means1[k][j]), -compute_nll(self.X, self.x_recons_linear[k][j]))
                 elbo += torch.mul(torch.mul(self.pi_means2[k], self.pi_means1[k][j]), log_normal_pdf(self.z1[k][j], self.prior['mu'][k], self.prior['sigma'][k]))
@@ -538,9 +510,9 @@ class DLGMM(GaussMMVAE):
         elbo += kl2
 
 
-        elbo += mcMixtureEntropy(self.pi_samples2, self.z2, self.z_mu2, self.z_sigma2, self.K)
+        elbo += mcMixtureEntropy(self.pi_samples2, self.z2, self.mu2, self.sigma2, self.K)
         for k in xrange(self.K):
-            elbo += torch.mul(self.pi_means2[k], mcMixtureEntropy(self.pi_samples1[k], self.z1[k], self.z_mu1[k], self.z_sigma1, self.K))
+            elbo += torch.mul(self.pi_means2[k], mcMixtureEntropy(self.pi_samples1[k], self.z1[k], self.mu1[k], self.sigma1, self.K))
 
         return tensor.mean(elbo)
 
@@ -605,7 +577,7 @@ class DLGMM(GaussMMVAE):
 
         all_log_gauss_posts = []
         for k in xrange(self.K):
-            all_log_gauss_posts.append(log_normal_pdf(self.z2[k], self.z_mu2[k], self.z_sigma2[k]))
+            all_log_gauss_posts.append(log_normal_pdf(self.z2[k], self.mu2[k], self.sigma2[k]))
         all_log_gauss_posts = torch.cat(1, all_log_gauss_posts)
         log_gauss_post = gather_nd(all_log_gauss_posts, component_samples2)
         log_gauss_post = tensor.expand(log_gauss_post,1)
@@ -640,7 +612,7 @@ class DLGMM(GaussMMVAE):
         all_log_gauss_posts1 = []
         for k in xrange(self.K):
             for j in xrange(self.K):
-                all_log_gauss_posts1.append(log_normal_pdf(self.z1[k][j], self.z_mu1[k][j], self.z_sigma1[k]))
+                all_log_gauss_posts1.append(log_normal_pdf(self.z1[k][j], self.mu1[k][j], self.sigma1[k]))
 
         all_log_gauss_posts1 = torch.cat( all_log_gauss_posts1, 1)
         log_gauss_post1 = gather_nd(all_log_gauss_posts1, component_samples1)
