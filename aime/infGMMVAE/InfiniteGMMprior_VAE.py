@@ -282,9 +282,6 @@ class GaussMMVAE(nn.Module):
             samples_from_each_component.append( torch.nn.Sigmoid(mlp(z, self.decoder_params)) )
         return samples_from_each_component
 
-    def get_samples_prior_w(self,nImages):
-        #sample from W parameter (Zahra)??
-        return
 
     def get_component_samples(self, latent_dim, batchSize):
         a_inv = torch.pow(self.kumar_a,-1)
