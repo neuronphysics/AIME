@@ -387,7 +387,7 @@ def beta_fn(a,b):
 
 
 def compute_kumar2beta_kld(a, b, alpha, beta):
-
+    ####### Error occurs here ##############
     global local_device
     global SMALL 
     EULER_GAMMA = torch.tensor(0.5772156649015329, dtype=torch.float, device=local_device)
@@ -608,6 +608,7 @@ class InfGaussMMVAE(GMMVAE):
 
 
         # compose elbo of Kumaraswamy-beta
+        #######error occurs here afterward ##############
         elbo2 = torch.tensor(0, dtype=torch.float, device=self.device)
         if self.include_elbo2:
             for k in range(self.K-1):
