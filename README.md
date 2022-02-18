@@ -1,7 +1,8 @@
 # AIME
 ## Implementation of the new model
 Note that the current work is being done in branch `implement-planner`
-#For running the infinite GMM variational autoencoder and using visdom use this line 
+
+# For running the infinite GMM variational autoencoder and using visdom use this line 
 ssh -L 8097:127.0.0.1:8097 username@hostname
  
 # Reference
