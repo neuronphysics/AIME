@@ -14,10 +14,12 @@ from types import SimpleNamespace as SN
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 from collections import OrderedDict
+import pdb
 #import pyro
 #import pyro.distributions as dist
 from numpy.testing import assert_almost_equal
 import os
+#mypdb=pdb.Pdb(stdin=open('fifo_stdin','r'), stdout=open('fifo_stdout','w'))
 try:
     import PIL.Image as Image
 except ImportError:
@@ -35,6 +37,23 @@ if torch.cuda.is_available():
    torch.cuda.seed()
 
 local_device = torch.device('cuda')
+SMALL = torch.tensor(1e-10, dtype=torch.float64, device=local_device)
+log_norm_constant  = -0.5 * np.log(2 * np.pi)
+def move_to(obj, device):
+  if torch.is_tensor(obj):
+    return obj.to(device)
+  elif isinstance(obj, dict):
+    res = {}
+    for k, v in obj.items():
+      res[k] = move_to(v, device)
+    return res
+  elif isinstance(obj, list):
+    res = []
+    for v in obj:
+      res.append(move_to(v, device))
+    return res
+  else:
+    raise TypeError("Invalid type for move_to")
 
 def gather_nd(params, indices):
     # this function has a limit that MAX_ADVINDEX_CALC_DIMS=5
@@ -45,11 +64,29 @@ def gather_nd(params, indices):
     slices += [Ellipsis]
     return params[slices].view(*output_shape)
 
-def init_mlp(layer_sizes, std=.01, bias_init=0., device=None):
+def init_mlp(layer_sizes, std=.01, bias_init=0.):
+    global local_device
+    params = []
+    for n_in, n_out in zip(layer_sizes[:-1], layer_sizes[1:]):
+        params.append([
+            nn.init.normal_(torch.empty(n_in, n_out, device=local_device)).requires_grad_(True),
+            torch.empty(n_out, device=local_device).fill_(bias_init).requires_grad_(True)])
+    return params
+
+
+def mlp(x, params):
+    for i, (W, b) in enumerate(params):
+        x = x@W + b
+        if i < len(params) - 1:
+            x = torch.relu(x)
+    return x
+"""
+def init_mlp(layer_sizes, std=.01, bias_init=0.):
+    global local_device
     params = {'w': [], 'b': []}
     for n_in, n_out in zip(layer_sizes[:-1], layer_sizes[1:]):
-        params['w'].append(nn.Parameter(torch.tensor(Normal(torch.zeros(n_in, n_out), std * torch.ones(n_in, n_out)).rsample(), requires_grad=True, device=device)))
-        params['b'].append(nn.Parameter(torch.tensor(torch.mul(bias_init, torch.ones([n_out,])), requires_grad=True, device=device)))
+       params['w'].append(nn.init.normal_(torch.empty(n_in, n_out, device=local_device)).requires_grad_(True))
+       params['b'].append(torch.empty(n_out, device=local_device).fill_(bias_init).requires_grad_(True))
     return params
 
 def mlp(X, params):
@@ -57,11 +94,11 @@ def mlp(X, params):
     for w, b in zip(params['w'][:-1], params['b'][:-1]):
         h.append(F.relu(torch.matmul(h[-1], w) + b))
     return torch.matmul(h[-1], params['w'][-1]) + params['b'][-1]
-
+"""
 
 class GMMVAE(nn.Module):
-    #Used this repository as a base 
-    # https://github.com/bhavikngala/gaussian_mixture_vae 
+    #Used this repository as a base
+    # https://github.com/bhavikngala/gaussian_mixture_vae
     # https://github.com/Nat-D/GMVAE
     # https://github.com/psanch21/VAE-GMVAE
     def __init__(self, number_of_mixtures, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size):
@@ -99,23 +136,23 @@ class GMMVAE(nn.Module):
         out_width        = int(np.floor((out_width - self.enc_kernel) / self.enc_stride + 1))
         ########################
         #ENCODER-USING FULLY CONNECTED LAYERS
-        #THE LATENT SPACE (Z) 
+        #THE LATENT SPACE (Z)
         self.flatten     = nn.Flatten()
         self.fc0         = nn.Linear((out_width**2) * base_channels * 8, base_channels*8*4*4, bias=False)
         self.bn1d        = nn.BatchNorm1d(base_channels*8*4*4)
-        self.fc1         = nn.Linear(base_channels*8*4*4, hidden_dim, bias=False)     
+        self.fc1         = nn.Linear(base_channels*8*4*4, hidden_dim, bias=False)
         self.bn1d_1      = nn.BatchNorm1d(hidden_dim)
         # mean of z
-        
-        self.fc2         = nn.Linear(hidden_dim, z_dim, bias=False)     
+
+        self.fc2         = nn.Linear(hidden_dim, z_dim, bias=False)
         self.bn1d_2      = nn.BatchNorm1d(z_dim)
         # variance of z
 
-        self.fc3         = nn.Linear(hidden_dim, z_dim, bias=False)     
+        self.fc3         = nn.Linear(hidden_dim, z_dim, bias=False)
         self.bn1d_3      = nn.BatchNorm1d(z_dim)
         ########################
-        #ENCODER-JUST USING FULLY CONNECTED LAYERS 
-        #THE LATENT SPACE (W) 
+        #ENCODER-JUST USING FULLY CONNECTED LAYERS
+        #THE LATENT SPACE (W)
         self.flatten_raw_img = nn.Flatten()
         self.fc4         = nn.Linear(img_width * img_width * nchannel, hidden_dim)
         self.bn1d_4      = nn.BatchNorm1d(hidden_dim)
@@ -169,15 +206,16 @@ class GMMVAE(nn.Module):
         self.px_z_conv_transpose2d.append(nn.ConvTranspose2d(self.base_channels, self.nchannel,
                                                              kernel_size=conv2d_transpose_kernels[-1], stride=2))
         #print('Final number of convoltional layers in decooder: ', len(self.px_z_conv_transpose2d))
-        self.encoder_kumar_a = init_mlp([hidden_dim,self.K-1], 1e-5, device=device) #Q(pi|x)
-        self.encoder_kumar_b = init_mlp([hidden_dim,self.K-1], 1e-5, device=device) #Q(pi|x)
+        self.encoder_kumar_a = init_mlp([hidden_dim,self.K-1], 1e-5) #Q(pi|x)
+        self.encoder_kumar_b = init_mlp([hidden_dim,self.K-1], 1e-5) #Q(pi|x)
         ##########Device#########
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        self.to(self.device)
+        self.to(device=self.device)
 
     def Pz_given_wc(self, w_input):
         # Prior
         #prior generator P(Z|w,c)
+
         h = self.pz_wc_fc0(w_input)
         h = torch.tanh(self.pz_wc_bn1d_0(h))
         z_wc_mean_list = list()
@@ -195,7 +233,7 @@ class GMMVAE(nn.Module):
         return z_wc_mean_stack, z_wc_logvar_stack
 
     def Px_given_z(self, z_input):
-        #Decoder: 
+        #Decoder:
         #Generate X: P(X|Z)
         h  = F.relu(self.px_z_bn1d_0(self.px_z_fc_0(z_input)))
         flattened_h = self.px_z_fc_1(h)
@@ -221,25 +259,25 @@ class GMMVAE(nn.Module):
         h = self.LeakyReLU_3(self.bn2d_3(self.conv3(h)))
 
         h = F.relu(self.bn1d(self.fc0(self.flatten(h))))
-        hlayer = F.relu(self.bn1d_1(self.fc1(h)))
+        hlayer      = F.relu(self.bn1d_1(self.fc1(h)))
         #mean_z
         mu_z        = F.relu(self.bn1d_2(self.fc2(hlayer)))
 
         #logvar_z
-        logvar_z    = F.softplus(self.bn1d_3(self.fc3(hlayer))) 
+        logvar_z    = F.softplus(self.bn1d_3(self.fc3(hlayer)))
 
         #2) posterior Q(w|X)
         #Create Recogniser for W
-        hw = self.flatten_raw_img(data)
-        hw = F.relu(self.bn1d_4(self.fc4(hw)))
+        hw       = self.flatten_raw_img(data)
+        hw       = F.relu(self.bn1d_4(self.fc4(hw)))
         hlayer_w = F.relu(self.bn1d_5(self.fc5(hw)))
         #mean of W
         mu_w          = F.relu(self.bn1d_6(self.fc6(hlayer_w)))
         #variance of Q(w|x) distribution
-        
+
         #log(variance of W)
         logvar_w      = F.softplus(self.bn1d_7(self.fc7(hlayer_w)))
-        
+
         #3) posterior P(c|w,z)=Q(c|X)
         #posterior distribution of P(c|w,z^{i})=Q(c|x) where z^{i}~q(z|x)
         #combine hidden layers after convolutional layers for Z latent space and feed forward layers of W latent space
@@ -247,67 +285,71 @@ class GMMVAE(nn.Module):
         hc               = zw
         hc               = F.relu(self.bn1d_8(self.fc8(hc)))
         Pc_wz            = F.relu(self.bn1d_9(self.fc9(hc)))
-        c_posterior      = F.softmax(Pc_wz, dim=-1)
-        #4) posterior of Kumaraswamy 
+        c_posterior      = F.softmax(Pc_wz, dim=-1).to(device=self.device)
+        #4) posterior of Kumaraswamy given input images 
+        #P(kumar_a,kumar_b|X)
         self.kumar_a = torch.exp(mlp(hlayer,self.encoder_kumar_a))
         self.kumar_b = torch.exp(mlp(hlayer,self.encoder_kumar_b))
         return mu_w, logvar_w, mu_z, logvar_z, c_posterior
 
     def reparameterize(self, mu, log_var):
-        """you generate a random distribution w.r.t. the mu and log_var from the embedding space.
-        In order for the back-propagation to work, we need to be able to calculate the gradient. 
+        """
+        you generate a random distribution w.r.t. the mu and log_var from the embedding space.
+        In order for the back-propagation to work, we need to be able to calculate the gradient.
         This reparameterization trick first generates a normal distribution, then shapes the distribution
         with the mu and variance from the encoder.
-        
+
         This way, we can can calculate the gradient parameterized by this particular random instance.
         """
-        eps = torch.randn_like(log_var)
-        return torch.add(mu , torch.mul( log_var.mul(0.5).exp_() , eps))
+        eps = torch.randn_like(log_var, device = self.device)
+        return torch.add(mu, torch.mul( log_var.mul(0.5).exp_(), eps))
 
-    
+
 
     def encoder_decoder_fn(self, X):
-        
+
         #create bottleneck
         """
         compute z = z_mean + z_var * eps1
         """
-        
-        
+
+
         self.w_x_mean, self.w_x_logvar, self.z_x_mean, self.z_x_logvar, self.c_posterior = self.GMM_encoder(X)
         self.z_x_sigma = torch.exp(0.5 * self.z_x_logvar)
         # Sample Z
-        self.z_x     = self.reparameterize(self.z_x_mean, self.z_x_logvar)
-        
+        self.z_x       = self.reparameterize(self.z_x_mean, self.z_x_logvar)
+
         #Build a two layers MLP to compute Q(w|x)
         self.w_x_sigma = torch.exp(0.5* self.w_x_logvar)
 
-        
-        self.w_x    = self.reparameterize(self.w_x_mean, self.w_x_logvar)
+
+        self.w_x       = self.reparameterize(self.w_x_mean, self.w_x_logvar)
 
         #Build the decoder P(x|z)
         #
-        self.x_recons = self.Px_given_z(self.z_x)
+        self.x_recons  = self.Px_given_z(self.z_x)
 
-                
+
         #priorGenerator(w_sample)
         #P(z_i|w,c_i)
         #building p_zc
+
         self.z_wc_mean_list_sample, self.z_wc_logvar_list_sample = self.Pz_given_wc(self.w_x)
         z_sample_list = list()
         for i in range(self.K):
             z_sample = self.reparameterize(self.z_wc_mean_list_sample[i], self.z_wc_logvar_list_sample[i])
             z_sample_list.append(z_sample)
+        #pdb.set_trace()
         return z_sample_list
-        
+
 
     def reconstruct_img(self, img):
         # encode image x
         #building x_recon
-        
+
         _, _, z_loc, z_logvar, _ = self.GMM_encoder(img)
-        
-        
+
+
         # sample in latent space
         z      = self.reparameterize(z_loc, z_logvar)
 
@@ -325,7 +367,7 @@ class GMMVAE(nn.Module):
         kernels = kernels[:-1][::-1]
         return kernels, input_img_dim
 
-    
+
 
 def compute_nll(x, x_recon_linear):
     #return torch.sum(func.binary_cross_entropy_with_logits(x_recon_linear, x), dim=1, keepdim=True)
@@ -338,66 +380,85 @@ def gauss_cross_entropy(mu_post, sigma_post, mu_prior, sigma_prior):
     return temp.sum()
 
 def beta_fn(a,b):
-    return torch.exp(torch.lgamma(torch.tensor(a)) + torch.lgamma(torch.tensor(b)) - torch.lgamma(torch.tensor(a+b)))
+    global local_device
+    global SMALL 
+    return torch.exp(torch.lgamma(torch.tensor(a+SMALL , dtype=torch.float64, device=local_device)) + torch.lgamma(torch.tensor(b+SMALL , dtype=torch.float64, device=local_device)) - torch.lgamma(torch.tensor(a+b+SMALL , dtype=torch.float64, device=local_device)))
+
 
 
 def compute_kumar2beta_kld(a, b, alpha, beta):
 
     global local_device
-    SMALL = torch.tensor(1e-16, dtype=torch.float64, device=local_device)
+    global SMALL 
     EULER_GAMMA = torch.tensor(0.5772156649015329, dtype=torch.float, device=local_device)
+    
+    upper_limit = 10000.0
 
-    ab    = torch.mul(a,b)+ SMALL
-    a_inv = torch.pow(a + SMALL, -1)
-    b_inv = torch.pow(b + SMALL, -1)
+    ab    = torch.mul(a,b)
+    a_inv = torch.reciprocal(a )
+    b_inv = torch.reciprocal(b )
+    """
     # compute taylor expansion for E[log (1-v)] term
-    kl = torch.mul(torch.pow(1+ab,-1), beta_fn(a_inv, b))
+    kl    = torch.mul(torch.pow(1+ab,-1), beta_fn(a_inv, b))
+    #print(f"1st value of KL divergence between kumaraswamy and beta distributions: {kl}")
     for idx in range(10):
         kl += torch.mul(torch.pow(idx+2+ab,-1), beta_fn(torch.mul(idx+2., a_inv), b))
-    kl = torch.mul(torch.mul(beta-1,b), kl)
+    kl    = torch.mul(torch.mul(beta-1,b), kl)
+    """
+    log_taylor = torch.logsumexp(torch.stack([beta_fn(torch.mul(m , a_inv), b) - torch.log(m + torch.mul(a ,b)) for m in range(1, 10 + 1)], dim=-1), dim=-1)
+    kl = torch.mul(torch.mul((beta - 1) , b) , torch.exp(log_taylor))
+    #print(f"2nd value of KL divergence between kumaraswamy and beta distributions: {kl}")
     #
-    #psi_b = torch.log(b + SMALL) - 1. / (2 * b + SMALL) -\
-    #    1. / (12 * b**2 + SMALL)
+    #psi_b = torch.log(b + SMALL) - 1. / (2 * b + SMALL) -    1. / (12 * b**2 + SMALL)
     psi_b = torch.digamma(b+SMALL)
-    kl += torch.mul(torch.div(a-alpha,a+SMALL), -EULER_GAMMA - psi_b - b_inv)
+    kl   += torch.mul(torch.div(a-alpha, torch.clamp(a, SMALL, upper_limit)), -EULER_GAMMA - psi_b - b_inv)
+    #print(f"3rd value of KL divergence between kumaraswamy and beta distributions: {kl}")
     # add normalization constants
-    kl += torch.log(ab) + torch.log(beta_fn(alpha, beta) + SMALL)
+    kl   += torch.log(torch.clamp(ab, SMALL, upper_limit)) + torch.log(torch.clamp(beta_fn(alpha, beta), SMALL, upper_limit))
+    #print(f"4th value of KL divergence between kumaraswamy and beta distributions: {kl}")
     #  final term
-    kl += torch.div(-(b-1),b +SMALL)
-    return kl
+    kl   += torch.div(-(b-1),torch.clamp(b , SMALL, upper_limit))
+    #print(f"final value of KL divergence between kumaraswamy and beta distributions: {kl}")
+    #pdb.set_trace()
+    return  torch.clamp(kl, min=0.)
 
 def log_normal_pdf(sample, mean, sigma):
-    
-    d = torch.sub(sample , mean)
-    d2=torch.mul(-1,torch.mul(d,d))
-    s2=torch.mul(2,torch.mul(sigma,sigma))
-    return torch.sum(torch.div(d2,s2)-torch.log(torch.mul(sigma,np.sqrt(2*np.pi))), dim=1)
+    global local_device
+    global SMALL 
+    d  = torch.sub(sample , mean)
+    d2 = torch.mul(-1,torch.mul(d,d))
+    s2 = torch.mul(2,torch.mul(sigma,sigma))
+    return torch.sum(torch.div(d2, s2+SMALL) - torch.log(torch.mul(sigma,np.sqrt(2*torch.tensor(np.pi, dtype=torch.float, device=local_device)))+SMALL), dim=1)
 
 
 
 def log_beta_pdf(v, alpha, beta):
-    return torch.sum((alpha - 1) * torch.log(v + 1e-20) + (beta-1) * torch.log(1 - v + 1e-20) - torch.log(beta_fn(alpha, beta) + 1e-20), dim=1, keepdim=True)
+    global SMALL 
+    return torch.sum((alpha - 1) * torch.log(v + SMALL ) + (beta-1) * torch.log(1 - v + SMALL ) - torch.log(beta_fn(alpha, beta) + SMALL ), dim=1, keepdim=True)
 
 
 def log_kumar_pdf(v, a, b):
-    return torch.sum(torch.mul(a - 1, torch.log(v + 1e-20)) + torch.mul(b - 1, torch.log(1 - torch.pow(v,a) + 1e-20)) + torch.log(a + 1e-20) + torch.log(b + 1e-20), dim=1, keepdim=True)
+    global SMALL 
+    return torch.sum(torch.mul(a - 1, torch.log(v + SMALL )) + torch.mul(b - 1, torch.log(1 - torch.pow(v,a) + SMALL )) + torch.log(a + SMALL ) + torch.log(b + SMALL ), dim=1, keepdim=True)
 
 
 def mcMixtureEntropy(pi_samples, z, mu, sigma, K):
+    global SMALL 
     s = torch.mul(pi_samples[0], torch.exp(log_normal_pdf(z[0], mu[0], sigma[0])))
     for k in range(K-1):
         s += torch.mul(pi_samples[k+1], torch.exp(log_normal_pdf(z[k+1], mu[k+1], sigma[k+1])))
-    return -torch.log(s + 1e-20)
+    return -torch.log(s + SMALL )
 
 
-log_norm_constant  = -0.5 * np.log(2 * np.pi)
+
 def log_gaussian(x, mu=0, logvar=0.):
     global local_device
-	# log likelihood: 
+    global log_norm_constant 
+	# log likelihood:
     # llh = -0.5 sum_d { (x_i - mu_i)^2/var_i } - 1/2 sum_d (logVar_i) - D/2 ln(2pi) [N]
     return -0.5 * torch.sum(((x - mu).pow(2))/logvar.exp(), dim=1) \
 			  - 0.5 * torch.sum(logvar, dim=1) + torch.tensor(log_norm_constant, dtype=torch.float, device=local_device)
-        
+
 
 def gumbel_softmax_sample(log_pi, temperature, eps=1e-20):
     global local_device
@@ -406,7 +467,7 @@ def gumbel_softmax_sample(log_pi, temperature, eps=1e-20):
     g = -Variable(torch.log(-torch.log(U + eps) + eps))
     # Gumbel-Softmax sample
     y = log_pi + g
-    return F.softmax(y / temperature, dim=-1)
+    return F.softmax(y / temperature, dim=-1).to(device=local_device)
 
 ### Gaussian Mixture Model VAE Class
 class InfGaussMMVAE(GMMVAE):
@@ -421,22 +482,26 @@ class InfGaussMMVAE(GMMVAE):
         self.z_dim      = hyperParams['latent_d']
         self.hidden_dim = hyperParams['hidden_d']
         #self.x_recons_linear = self.f_prop(X)
-        
+
         #self.encoder_kumar_a = nn.Linear(self.K-1, self.hidden_dim, bias=True, device=device)
         #self.encoder_kumar_b = nn.Linear(self.K-1, self.hidden_dim, bias=True, device=device)
         #self.elbo_obj = self.get_ELBO()
         self.img_size    = img_width
         self.include_elbo2 = include_elbo2
-        self.to(self.device)
+        self.to(device=self.device)
+        self.dummy_param = nn.Parameter(torch.empty(0))
+
     # def __len__(self):
     #     return len(self.X)
 
 
     def forward(self, X):
         # init variational params
-        self.z_sample_list = self.encoder_decoder_fn(X)
-         
+        device = self.dummy_param.device
+        print(f"device in the InfGaussMMVAE class is {device}")
         
+        self.z_sample_list = self.encoder_decoder_fn(X)
+
 
         return self.x_recons, self.z_x_mean, self.z_x_logvar,\
                self.w_x_mean, self.w_x_logvar, self.c_posterior , self.kumar_a, self.kumar_b, \
@@ -445,7 +510,7 @@ class InfGaussMMVAE(GMMVAE):
 
     def compose_stick_segments( self,v):
         segments = []
-        self.remaining_stick = [torch.ones((v.shape[1],1)).to(self.device)]
+        self.remaining_stick = [torch.ones((v.shape[1],1)).to(device=self.device)]
         for i in range(self.K-1):
             curr_v = torch.squeeze(v[:, i],0)
             segments.append(torch.mul(curr_v, self.remaining_stick[-1]))
@@ -457,44 +522,49 @@ class InfGaussMMVAE(GMMVAE):
         """
         #KL divergence P(c|z,w)=Q(c|x) while P(c|pi) is the prior
         """
+        global SMALL
         a_inv = torch.pow(self.kumar_a,-1)
         b_inv = torch.pow(self.kumar_b,-1)
-        r1    = 1e-8
-        r2    = 1-1e-8
+        r1    = torch.tensor(SMALL, dtype=torch.float64,device=self.device)
+        r2    = torch.tensor(1-SMALL, dtype=torch.float64, device=self.device)
         # compose into stick segments using pi = v \prod (1-v)
-        v_means = torch.mul(self.kumar_b, beta_fn(1.+a_inv, self.kumar_b)).to(self.device)
+        v_means = torch.mul(self.kumar_b, beta_fn(1.+a_inv, self.kumar_b)).to(device=self.device)
         #u       = (r1 - r2) * torch.rand(a_inv.shape[0],self.K-1) + r2
         u       = torch.distributions.uniform.Uniform(low=r1, high=r2).sample([1]).squeeze()
-        v_samples  = torch.pow(1 - torch.pow(u, b_inv), a_inv).to(self.device)
+        v_samples  = torch.pow(1 - torch.pow(u, b_inv), a_inv).to(device=self.device)
         if v_samples.ndim > 2:
             v_samples = v_samples.squeeze()
         v0 = v_samples[:, -1].pow(0).reshape(v_samples.shape[0], 1)
         v1 = torch.cat([v_samples[:, :self.z_dim - 1], v0], dim=1)
         n_samples = v1.size()[0]
         n_dims = v1.size()[1]
-        self.pi_samples = torch.zeros((n_samples, n_dims)).to(self.device)
+        self.pi_samples = torch.zeros((n_samples, n_dims)).to(device=self.device)
 
         for k in range(n_dims):
             if k == 0:
                 self.pi_samples[:, k] = v1[:, k]
             else:
                 self.pi_samples[:, k] = v1[:, k] * torch.stack([(1 - v1[:, j]) for j in range(n_dims) if j < k]).prod(axis=0)
- 
+        #pdb.set_trace()
         #print(f'size of pi {self.pi_samples.size()}')
+
         return  self.pi_samples
-        
+
 
 
     def DiscreteKL(self, P,Q):
+
         #KL(q(z)||p(z)) =  - sum_k q(k) log p(k)/q(k)
    	    # let's p(k) = 1/K???
-        log_q = torch.log(Q+ 1e-10).to(self.device)
-        q     = Q
-        log_p = torch.log(P+ 1e-10).to(self.device)
-        element_wise = (q * torch.sub(log_q , log_p))
-        return torch.sum(element_wise, dim=-1).mean().to(self.device)
-    
+        logQ = torch.log(Q+ 1e-10).to(device=self.device)
+        
+        logP = torch.log(P+ 1e-10).to(device= self.device)
+        element_wise = (Q * torch.sub(logQ , logP))
+        #pdb.set_trace()
+        return torch.sum(element_wise, dim=-1).mean().to(device=self.device)
+
     def ExpectedKLDivergence(self, q_c, mean_z, logvar_z, mean_mixture, logvar_mixture):
+
         # 4. E_p(c|w,z)[KL(q(z)|| p(z|c,w))]
         z_wc       = mean_z.unsqueeze(-1)
         z_wc       = z_wc.expand(-1, self.z_dim, self.K)
@@ -505,37 +575,39 @@ class InfGaussMMVAE(GMMVAE):
         logvar_zwc = logvar_zwc.permute(2, 0, 1)
         KLD_table  = 0.5 * (((logvar_mixture - logvar_zwc) + ((logvar_zwc.exp() + (z_wc - mean_mixture).pow(2))/logvar_mixture.exp())) - 1)
         KLD_table  = KLD_table.permute(0,2,1)
-        
+
         qc         = q_c.unsqueeze(-1)
         qc         = qc.expand(-1, self.K, 1)
         qc         = qc.permute(1,0,2)
-        return torch.sum(torch.bmm(KLD_table, qc)).to(self.device)
+        return torch.sum(torch.bmm(KLD_table, qc)).to(device=self.device)
 
     def EntropyCriterion(self):
+
         # CV = H(C|Z, W) = E_q(z,w) [ E_p(c|z,w)[ - log P(c|z,w)] ]
         z_sample =  self.z_x.unsqueeze(-1)
         z_sample =  z_sample.expand(-1, self.z_dim, self.K)
         z_sample =  z_sample.permute(2,0,1)
-        
+
         log_likelihoods = log_gaussian(z_sample, self.z_wc_mean_list_sample, self.z_wc_logvar_list_sample)
         llh=log_likelihoods.sum(-1)
-        
-        lh = F.softmax(llh, dim=-1)
+
+        lh = F.softmax(llh, dim=-1).to(device=self.device)
         # entropy
-        CV = torch.sum(torch.mul(torch.log(lh+1e-10), lh)).to(self.device)
+        CV = torch.sum(torch.mul(torch.log(lh+1e-10), lh)).to(device=self.device)
         return CV
 
     def get_ELBO(self, X):
+
         loss_dict = OrderedDict()
         #1) Computes the KL divergence between two categorical distributions
         PriorC  = self.GenerateMixtures()
 
-        
+
         #this term KL divergence of two discrete distributions
         elbo1     = self.DiscreteKL(PriorC ,self.c_posterior)
-        #print(elbo1)
 
-        # compose elbo of Kumaraswamy-beta 
+
+        # compose elbo of Kumaraswamy-beta
         elbo2 = torch.tensor(0, dtype=torch.float, device=self.device)
         if self.include_elbo2:
             for k in range(self.K-1):
@@ -548,19 +620,20 @@ class InfGaussMMVAE(GMMVAE):
                 elbo2 -= compute_kumar2beta_kld(self.kumar_a[:, k], self.kumar_b[:, k], self.prior, (self.K-1-k)* self.prior).mean()
         
         #3)need this term of w (context)
-        elbo3 = -0.5 * torch.sum(1 + self.w_x_logvar - self.w_x_mean.pow(2) - self.w_x_logvar.exp()).to(self.device)#VAE_KLDCriterion
+        elbo3 = -0.5 * torch.sum(1 + self.w_x_logvar - self.w_x_mean.pow(2) - self.w_x_logvar.exp()).to(device=self.device)#VAE_KLDCriterion
         
         # 4)compute E_{p(w|x)p(c|x)}[D_KL(Q(z|x)||p(z|c,w))]
-        
-        elbo4 = self.ExpectedKLDivergence(self.c_posterior, self.z_x_mean, self.z_x_logvar, self.z_wc_mean_list_sample, self.z_wc_logvar_list_sample)
 
-        #5) compute Reconstruction Cost = E_{q(z|x)}[P(x|z)] 
+        elbo4 = self.ExpectedKLDivergence(self.c_posterior, self.z_x_mean, self.z_x_logvar, self.z_wc_mean_list_sample, self.z_wc_logvar_list_sample)
+        
+        #5) compute Reconstruction Cost = E_{q(z|x)}[P(x|z)]
         #
-        criterion = nn.BCELoss(reduction='sum').to(self.device)
+        criterion = nn.BCELoss(reduction='sum')
         elbo5 = criterion(self.x_recons.view(-1, self.nchannel*self.img_size*self.img_size), X.view(-1, self.nchannel*self.img_size*self.img_size))
+        
         assert torch.isfinite(elbo5)
 
-        
+
         loss_dict['recon'] = elbo5
         loss_dict['c_clusster_kld'] = elbo1
         loss_dict['kumar2beta_kld'] = elbo2
@@ -568,7 +641,7 @@ class InfGaussMMVAE(GMMVAE):
         loss_dict['z_latent_space_kld'] = elbo4
         # 6.)  CV = H(C|Z, W) = E_q(z,w) [ E_p(c|z,w)[ - log P(c|z,w)] ]
         loss_dict['CV_entropy'] = self.EntropyCriterion()
-        #print(f" Entropy {loss_dict['CV_entropy']}")
+        #print(f" device of CV Etropy: {loss_dict['CV_entropy'].get_device()}")
         loss_dict['loss'] = elbo1 + elbo2 + elbo3 + elbo4 + elbo5
         return loss_dict
 
@@ -579,7 +652,7 @@ class InfGaussMMVAE(GMMVAE):
 
         # compute Kumaraswamy samples
 
-        uni_samples =torch.FloatTensor(a_inv.shape[0], self.K-1).uniform_(1e-8, 1-1e-8).to(self.device)
+        uni_samples =torch.FloatTensor(a_inv.shape[0], self.K-1).uniform_(1e-8, 1-1e-8).to(device=self.device)
         v_samples   = torch.pow(1-torch.pow(uni_samples, b_inv), a_inv)
 
         # compose into stick segments using pi = v \prod (1-v)
@@ -587,13 +660,13 @@ class InfGaussMMVAE(GMMVAE):
 
         # sample a component index
 
-        uni_samples = torch.FloatTensor(a_inv.shape[0], self.K).uniform_(1e-8, 1-1e-8).to(self.device)
+        uni_samples = torch.FloatTensor(a_inv.shape[0], self.K).uniform_(1e-8, 1-1e-8).to(device=self.device)
         gumbel_samples = -torch.log(-torch.log(uni_samples + 1e-20) + 1e-20)
         component_samples = torch.IntTensor(torch.argmax(torch.log(torch.cat( self.pi_samples,1) + 1e-20) + gumbel_samples, 1))
         component_samples = torch.cat( [torch.range(0, batchSize).unsqueeze(1), component_samples.unsqueeze(1)], 1)
         # calc likelihood term for chosen components
         ll = -compute_nll(self.X, self.x_recons)
-        
+
 
         # calc prior terms
         all_log_gauss_priors = []
@@ -618,7 +691,7 @@ class InfGaussMMVAE(GMMVAE):
         log_gauss_post = log_normal_pdf(self.z_x, self.z_x_mean, self.z_x_sigma)
 
         #****need this term :cal prior and posterior over w
-        log_w_prior = log_normal_pdf(self.w_x, torch.zeros(self.w_x.size()),torch.eye(self.w_x.size()))
+        log_w_prior = log_normal_pdf(self.w_x, torch.zeros(self.w_x.size()).to(device=self.device),torch.eye(self.w_x.size()))
         log_w_post  = log_normal_pdf(self.w_x, self.w_x_mean, self.w_x_sigma)
         return ll + log_beta_prior + log_gauss_prior +log_w_prior - log_kumar_post - log_gauss_post - log_w_post
 
@@ -626,23 +699,24 @@ class InfGaussMMVAE(GMMVAE):
     #TODO??
     @torch.no_grad()
     def get_component_samples(self,batchSize):
-        # get the components of the latent space 
+        # get the components of the latent space
+        global SMALL
         a_inv = torch.pow(self.kumar_a,-1)
         b_inv = torch.pow(self.kumar_b,-1)
-        r1=1e-8
-        r2=1-1e-8
+        r1    = torch.tensor(SMALL, dtype=torch.float64,device=self.device)
+        r2    = torch.tensor(1-SMALL, dtype=torch.float64, device=self.device)
         # compose into stick segments using pi = v \prod (1-v)
-        v_means = torch.mul(self.kumar_b, beta_fn(1.+a_inv, self.kumar_b)).to(self.device)
+        v_means = torch.mul(self.kumar_b, beta_fn(1.+a_inv, self.kumar_b)).to(device=self.device)
         #u       = (r1 - r2) * torch.rand(a_inv.shape[0],self.K-1) + r2
         u       = torch.distributions.uniform.Uniform(low=r1, high=r2).sample([1]).squeeze()
-        v_samples  = torch.pow(1 - torch.pow(u, b_inv), a_inv).to(self.device)
+        v_samples  = torch.pow(1 - torch.pow(u, b_inv), a_inv).to(device=self.device)
         if v_samples.ndim > 2:
             v_samples = v_samples.squeeze()
         v0 = v_samples[:, -1].pow(0).reshape(v_samples.shape[0], 1)
         v1 = torch.cat([v_samples[:, :self.z_dim - 1], v0], dim=1)
         n_samples = v1.size()[0]
         n_dims = v1.size()[1]
-        components = torch.zeros((n_samples, n_dims))
+        components = torch.zeros((n_samples, n_dims)).to(device=self.device)
 
         for k in range(n_dims):
             if k == 0:
@@ -650,11 +724,11 @@ class InfGaussMMVAE(GMMVAE):
             else:
                 components[:, k] = v1[:, k] * torch.stack([(1 - v1[:, j]) for j in range(n_dims) if j < k]).prod(axis=0)
         # ensure stick segments sum to 1
-        assert_almost_equal(torch.ones(n_samples), components.sum(axis=1).detach().numpy(),
+        assert_almost_equal(torch.ones(n_samples,device=self.device), components.sum(axis=1).detach().numpy(),
                             decimal=2, err_msg='stick segments do not sum to 1')
         print(f'size of sticks: {components}')
-        
-        
+
+
         components = torch.IntTensor(torch.argmax(torch.cat( self.compose_stick_segments(v_means),1) ,1), dtype=torch.long, device=self.device)
         components = torch.cat( [torch.range(0, batchSize).unsqueeze(1), components.unsqueeze(1)], 1)
         print(f'size of sticks: {components}')
@@ -707,7 +781,7 @@ args = parser.parse_args()
 class VisdomLinePlotter(object):
     """Plots to Visdom"""
     def __init__(self, env_name='main',server=args.visdom_server, port=args.visdom_port):
-        
+
         print("Initializing visdom env [%s]" % env_name)
         self.port = port
         self.viz  = Visdom(port =port,server=server, log_to_filename='vis_log_file')
@@ -733,7 +807,7 @@ class VisdomLinePlotter(object):
             ))
         else:
             self.viz.line(X=np.array([x]), Y=np.array([y]), env=self.env, win=self.plots[var_name], name=split_name, update = 'append')
-    
+
     def add_image(self, images, win, opts=None):
         """ vis image in visdom
         """
@@ -823,7 +897,7 @@ net = InfGaussMMVAE(hyperParams, 20, 3, 4, 200, 150, 500, device, raw_img_width,
 params = list(net.parameters())
 #if torch.cuda.device_count() > 1:
 #    net = nn.DataParallel(net)
-net = net.to(device)
+net = net.to(device=device)
 for name, param in net.named_parameters():
     if param.device.type != 'cuda':
         print('param {}, not on GPU'.format(name))
@@ -844,16 +918,22 @@ def train(epoch):
     train_loss = 0
     train_loss_avg.append(0)
     num_batches = 0
-    datas, targets = [], []
     for batch_idx, (X, classes) in enumerate(train_loader):
-        
+
         X = X.to(device=device, dtype=torch.float)
         optimizer.zero_grad()
-        
+
         X_recons_linear, mu_z, logvar_z, mu_w, logvae_w, qc, kumar_a, kumar_b, mu_pz, logvar_pz= net(X)
-        
+
         loss_dict = net.get_ELBO(X)
-        
+        #print(f" Entropy {loss_dict['CV_entropy'].is_cuda}")
+        #print(f"device of elbo1 is cuda: {loss_dict['c_clusster_kld'].is_cuda}")
+        #print(f"device of elbo2 is cuda: {loss_dict['kumar2beta_kld'].is_cuda}")
+        #print(f"device of elbo3 is cuda: {loss_dict['w_context_kld'].is_cuda}")
+        #print(f"device of elbo4 is cuda: {loss_dict['z_latent_space_kld'].is_cuda}")
+        #print(f"device of elbo5 is cuda: {loss_dict['recon'].is_cuda}")
+        #print(f"device of total loss is cuda: {loss_dict['loss'].is_cuda}")
+
         loss_dict['loss'].backward()
         train_loss += loss_dict['loss'].item()
         optimizer.step()
@@ -861,12 +941,12 @@ def train(epoch):
         train_loss_avg[-1] += loss_dict['loss'].item()
         num_batches += 1
         if batch_idx % 5 == 0:
-                
+
             print('epoch {} --- iteration {}: '
-                      'kumar2beta KL = {:.6f} '
-                      'Z latent space KL = {:.6f} '
-                      'reconstruction loss = {:.6f} '
-                      'W context latent space KL = {:.6f}'.format(epoch, batch_idx, loss_dict['kumar2beta_kld'].item(), loss_dict['z_latent_space_kld'].item(), loss_dict['recon'].item(),loss_dict['w_context_kld'].item()))
+                      ',  kumar2beta KL = {:.6f} '
+                      ',  Z latent space KL = {:.6f} '
+                      ',  reconstruction loss = {:.6f} '
+                      ',  W context latent space KL = {:.6f}'.format(epoch, batch_idx, loss_dict['kumar2beta_kld'].item(), loss_dict['z_latent_space_kld'].item(), loss_dict['recon'].item(),loss_dict['w_context_kld'].item()))
 
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(X), len(train_loader.dataset),
@@ -891,7 +971,7 @@ def train(epoch):
             fig.savefig(str(Path().absolute())+"/results/StickBreaking_GMM_VAE_embedding_epoch_"+str(epoch)+".png")
 
         if (iters % 500 == 0) or ((epoch == num_epochs-1) and (batch_idx == len(train_loader)-1)):
-             
+
              img_list.append(torchvision.utils.make_grid(X_recons_linear[0].detach().cpu(), padding=2, normalize=True))
         iters += 1
     print('====> Epoch: {} Average loss: {:.4f}'.format(
@@ -906,7 +986,7 @@ avg_train_loss=[]
 best_loss = 10**15  # Random big number (bigger than the initial loss)
 best_epoch = 0
 regex = re.compile(r'\d+')
-start_epoch = 0 
+start_epoch = 0
 if os.path.isfile(str(Path().absolute())+"/results/model_StickBreaking_GMM_VAE_*.pth"):
    list_of_files = glob.glob(str(Path().absolute())+"/results/model_StickBreaking_GMM_VAE*.pth") # * means all if need specific format then *.csv
    latest_file = max(list_of_files, key=os.path.getctime)
@@ -939,13 +1019,13 @@ for epoch in range(start_epoch,num_epochs):
           plt.imsave(str(Path().absolute())+"/results/reconst_"+str(epoch)+"_epochs.png", npimg)
        # plot beta-kumaraswamy loss
        plotter.plot('KL of beta-kumaraswamy distributions', 'val', 'Class Loss', epoch, elbo2)
-       
+
        # plot loss
        #print(average_epoch_loss)
        #print(epoch)
        plotter.plot('Total loss', 'train', 'Class Loss', epoch, average_epoch_loss[0])
-       
-       
+
+
        if epoch % 25 == 0:
           torch.save({
                     'best_epoch': epoch,
@@ -953,7 +1033,7 @@ for epoch in range(start_epoch,num_epochs):
                     'optimizer_state_dict': best_opt,
                     'best_loss': best_loss,
           }, str(Path().absolute())+"/results/model_StickBreaking_GMM_VAE_"+str(epoch)+".pth")
-          
+
        if average_epoch_loss[-1] < best_loss:
           best_loss = average_epoch_loss[-1]
           best_epoch = epoch
@@ -978,7 +1058,7 @@ plt.figure(figsize=(15,15))
 plt.subplot(1,2,1)
 plt.axis("off")
 plt.title("Real Images")
-plt.imshow(np.transpose(torchvision.utils.make_grid(data[0].to(device)[:64], padding=5, normalize=True).cpu(),(1,2,0)))
+plt.imshow(np.transpose(torchvision.utils.make_grid(data[0].to(device=device)[:64], padding=5, normalize=True).cpu(),(1,2,0)))
 
 ###plot original versus fake images
 plt.subplot(1,2,2)
@@ -993,20 +1073,20 @@ for image_batch, _ in test_loader:
 
         with torch.no_grad():
 
-            image_batch = image_batch.to(device,dtype=torch.float)
+            image_batch = image_batch.to(device=device,dtype=torch.float)
 
             # VAE Reconstruction
             reco_img = net.reconstruct_img(image_batch)
-            
+
             image_numpy = image_batch[0].cpu().float().numpy()
             image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0
             ###
             reco_numpy = reco_img[0].cpu().float().numpy()
             reco_numpy = (np.transpose(reco_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0
-            
-            plotter.add_image( 
-                        image_numpy.transpose([2, 0, 1]), 
-                        win='Real', 
+
+            plotter.add_image(
+                        image_numpy.transpose([2, 0, 1]),
+                        win='Real',
                         opts={"caption": "test image"},
             )
             plotter.add_image(
@@ -1038,14 +1118,14 @@ def visualise_output(images, model,filename):
 
     with torch.no_grad():
         model.eval()
-        images = images.to(device)
-        
+        images = images.to(device=device)
+
         out, _, _, _, _, _, _, _, _, _ = model(images)
         img =torchvision.utils.make_grid(out.detach().cpu())
         img = 0.5*(img + 1)
         npimg = np.transpose(img.numpy(),(1,2,0))
         fig = plt.figure(dpi=300)
-        plt.imshow(npimg)   
+        plt.imshow(npimg)
     plt.savefig(filename)
 
 images, labels = iter(test_loader).next()
