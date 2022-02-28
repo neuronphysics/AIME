@@ -63,7 +63,7 @@ def gather_nd(params, indices):
     slices = [flatted_indices[:, i] for i in range(ndim)]
     slices += [Ellipsis]
     return params[slices].view(*output_shape)
-
+"""
 def init_mlp(layer_sizes, std=.01, bias_init=0.):
     global local_device
     params = []
@@ -85,16 +85,18 @@ def init_mlp(layer_sizes, std=.01, bias_init=0.):
     global local_device
     params = {'w': [], 'b': []}
     for n_in, n_out in zip(layer_sizes[:-1], layer_sizes[1:]):
-       params['w'].append(nn.init.normal_(torch.empty(n_in, n_out, device=local_device)).requires_grad_(True))
+       
+       params['w'].append(torch.nn.init.normal_(torch.empty(n_in, n_out, device=local_device),std= torch.div(1,torch.sqrt(torch.from_numpy(np.asarray(n_in+n_out)).float()/2.))).requires_grad_(True))
        params['b'].append(torch.empty(n_out, device=local_device).fill_(bias_init).requires_grad_(True))
     return params
 
 def mlp(X, params):
     h = [X]
+    activation = nn.Softplus(beta=0.5, threshold=20)
     for w, b in zip(params['w'][:-1], params['b'][:-1]):
-        h.append(F.relu(torch.matmul(h[-1], w) + b))
+        h.append(activation(torch.matmul(h[-1], w) + b))
     return torch.matmul(h[-1], params['w'][-1]) + params['b'][-1]
-"""
+
 
 class GMMVAE(nn.Module):
     #Used this repository as a base
@@ -206,8 +208,8 @@ class GMMVAE(nn.Module):
         self.px_z_conv_transpose2d.append(nn.ConvTranspose2d(self.base_channels, self.nchannel,
                                                              kernel_size=conv2d_transpose_kernels[-1], stride=2))
         #print('Final number of convoltional layers in decooder: ', len(self.px_z_conv_transpose2d))
-        self.encoder_kumar_a = init_mlp([hidden_dim,self.K-1], 1e-5) #Q(pi|x)
-        self.encoder_kumar_b = init_mlp([hidden_dim,self.K-1], 1e-5) #Q(pi|x)
+        self.encoder_kumar_a = init_mlp([hidden_dim,self.K-1], 1e-8) #Q(pi|x)
+        self.encoder_kumar_b = init_mlp([hidden_dim,self.K-1], 1e-8) #Q(pi|x)
         ##########Device#########
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.to(device=self.device)
@@ -288,8 +290,11 @@ class GMMVAE(nn.Module):
         c_posterior      = F.softmax(Pc_wz, dim=-1).to(device=self.device)
         #4) posterior of Kumaraswamy given input images 
         #P(kumar_a,kumar_b|X)
+
         self.kumar_a = torch.exp(mlp(hlayer,self.encoder_kumar_a))
         self.kumar_b = torch.exp(mlp(hlayer,self.encoder_kumar_b))
+        #print(f"kumaraswamy a: {self.kumar_a[:,self.K-2 ]}")
+        #print(f"kumaraswamy b: {self.kumar_b[:,self.K-2 ]}")
         return mu_w, logvar_w, mu_z, logvar_z, c_posterior
 
     def reparameterize(self, mu, log_var):
@@ -390,35 +395,36 @@ def compute_kumar2beta_kld(a, b, alpha, beta):
     ####### Error occurs here ##############
     global local_device
     global SMALL 
-    EULER_GAMMA = torch.tensor(0.5772156649015329, dtype=torch.float, device=local_device)
+    EULER_GAMMA = torch.tensor(0.5772156649015328606, dtype=torch.float, device=local_device)
     
     upper_limit = 10000.0
 
     ab    = torch.mul(a,b)
     a_inv = torch.reciprocal(a )
     b_inv = torch.reciprocal(b )
-    """
+    
     # compute taylor expansion for E[log (1-v)] term
-    kl    = torch.mul(torch.pow(1+ab,-1), beta_fn(a_inv, b))
+    kl    = torch.mul(torch.pow(1+ab,-1), torch.clamp(beta_fn(a_inv, b), SMALL, upper_limit))
     #print(f"1st value of KL divergence between kumaraswamy and beta distributions: {kl}")
     for idx in range(10):
-        kl += torch.mul(torch.pow(idx+2+ab,-1), beta_fn(torch.mul(idx+2., a_inv), b))
+        kl += torch.mul(torch.pow(idx+2+ab,-1), torch.clamp(beta_fn(torch.mul(idx+2., a_inv), b), SMALL, upper_limit))
     kl    = torch.mul(torch.mul(beta-1,b), kl)
     """
-    log_taylor = torch.logsumexp(torch.stack([beta_fn(torch.mul(m , a_inv), b) - torch.log(m + torch.mul(a ,b)) for m in range(1, 10 + 1)], dim=-1), dim=-1)
+    log_taylor = torch.logsumexp(torch.stack([beta_fn(torch.mul(m , a_inv), b) - torch.log(m + ab) for m in range(1, 10 + 1)], dim=-1), dim=-1)
     kl = torch.mul(torch.mul((beta - 1) , b) , torch.exp(log_taylor))
-    #print(f"2nd value of KL divergence between kumaraswamy and beta distributions: {kl}")
+    """
+    print(f"2nd value of KL divergence between kumaraswamy and beta distributions: {kl}")
     #
     #psi_b = torch.log(b + SMALL) - 1. / (2 * b + SMALL) -    1. / (12 * b**2 + SMALL)
     psi_b = torch.digamma(b+SMALL)
     kl   += torch.mul(torch.div(a-alpha, torch.clamp(a, SMALL, upper_limit)), -EULER_GAMMA - psi_b - b_inv)
-    #print(f"3rd value of KL divergence between kumaraswamy and beta distributions: {kl}")
+    print(f"3rd value of KL divergence between kumaraswamy and beta distributions: {kl}")
     # add normalization constants
     kl   += torch.log(torch.clamp(ab, SMALL, upper_limit)) + torch.log(torch.clamp(beta_fn(alpha, beta), SMALL, upper_limit))
-    #print(f"4th value of KL divergence between kumaraswamy and beta distributions: {kl}")
+    print(f"4th value of KL divergence between kumaraswamy and beta distributions: {kl}")
     #  final term
     kl   += torch.div(-(b-1),torch.clamp(b , SMALL, upper_limit))
-    #print(f"final value of KL divergence between kumaraswamy and beta distributions: {kl}")
+    print(f"final value of KL divergence between kumaraswamy and beta distributions: {kl}")
     #pdb.set_trace()
     return  torch.clamp(kl, min=0.)
 
@@ -618,6 +624,10 @@ class InfGaussMMVAE(GMMVAE):
                 #print(self.kumar_b[:, k].unsqueeze(1))
                 #print(self.kumar_b[:, k].expand(self.batch_size))
                 #elbo2 -= compute_kumar2beta_kld(self.kumar_a[:, k].expand(self.batch_size), self.kumar_b[:, k].expand(self.batch_size), self.prior, (self.K-1-k)* self.prior).mean()
+                print(f"a kumaraswamy component {k}: {self.kumar_a[:, k]}")
+                print(f"b kumaraswamy component {k}: {self.kumar_b[:, k]}")
+                print(f"alpha component {k}: {self.prior}")
+                print(f"beta component {k}: {self.K-1-k}")
                 elbo2 -= compute_kumar2beta_kld(self.kumar_a[:, k], self.kumar_b[:, k], self.prior, (self.K-1-k)* self.prior).mean()
         
         #3)need this term of w (context)
@@ -905,12 +915,13 @@ for name, param in net.named_parameters():
 ###*********************************************************###
 
 #net.cuda()
-#optimizer = optim.Adam(net.parameters(), lr=1e-4, weight_decay=1e-8)
+optimizer = optim.Adam(net.parameters(), lr=0.0001, weight_decay=1e-8)
 
-optimizer = AdaBound(net.parameters(), lr=0.0001)
+##optimizer = AdaBound(net.parameters(), lr=0.0001)
 
 img_list = []
 num_epochs=100
+grad_clip = 1.0
 iters=0
 def train(epoch):
     global iters
@@ -937,6 +948,7 @@ def train(epoch):
 
         loss_dict['loss'].backward()
         train_loss += loss_dict['loss'].item()
+        torch.nn.utils.clip_grad_norm(net.parameters(), grad_clip)
         optimizer.step()
 
         train_loss_avg[-1] += loss_dict['loss'].item()
