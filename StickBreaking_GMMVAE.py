@@ -6,18 +6,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.distributions import Normal, Categorical, Independent, Uniform
+from torch.distributions import Normal, Categorical, Independent, Uniform, Beta
 from torch.distributions.multivariate_normal import MultivariateNormal
 from copy import deepcopy
 from torch.autograd import Variable
 from types import SimpleNamespace as SN
 from sklearn.manifold import TSNE
+import matplotlib
 import matplotlib.pyplot as plt
 from collections import OrderedDict
 import pdb
 #import pyro
 #import pyro.distributions as dist
 from numpy.testing import assert_almost_equal
+from einops import rearrange
 import os
 #mypdb=pdb.Pdb(stdin=open('fifo_stdin','r'), stdout=open('fifo_stdout','w'))
 try:
@@ -31,14 +33,20 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 #tf.transpose -> tensor.permute
 #author: Zahra Sheikhbahaee
 #set randoom seed
-torch.random.seed()
-np.random.seed()
+#torch.random.seed()
+#np.random.seed()
+#if torch.cuda.is_available():
+#   torch.cuda.seed()
+
+torch.manual_seed(42)
 if torch.cuda.is_available():
-   torch.cuda.seed()
+   torch.cuda.manual_seed(42)
+np.random.seed(42)
 
 local_device = torch.device('cuda')
 SMALL = torch.tensor(1e-10, dtype=torch.float64, device=local_device)
-log_norm_constant  = -0.5 * np.log(2 * np.pi)
+pi_   = torch.tensor(np.pi, dtype=torch.float64, device=local_device)
+log_norm_constant  = -0.5 * torch.log(2 * pi_)
 def move_to(obj, device):
   if torch.is_tensor(obj):
     return obj.to(device)
@@ -54,6 +62,8 @@ def move_to(obj, device):
     return res
   else:
     raise TypeError("Invalid type for move_to")
+
+
 
 def gather_nd(params, indices):
     # this function has a limit that MAX_ADVINDEX_CALC_DIMS=5
@@ -81,12 +91,26 @@ def mlp(x, params):
             x = torch.relu(x)
     return x
 """
-def init_mlp(layer_sizes, std=.01, bias_init=0.):
+def calculate_layer_size( input_size, kernel_size, stride, padding=0):
+        numerator = input_size - kernel_size + (2 * padding)
+        denominator = stride
+        return (numerator // denominator) + 1
+
+def calculate_channel_sizes( image_channels, max_filters, num_layers):
+        channel_sizes = [(image_channels, max_filters // np.power(2, num_layers - 1))]
+        for i in range(1, num_layers):
+            prev = channel_sizes[-1][-1]
+            new = prev * 2
+            channel_sizes.append((prev, new))
+        return channel_sizes
+
+def init_mlp(layer_sizes, stdev=.01, bias_init=0.):
     global local_device
     params = {'w': [], 'b': []}
     for n_in, n_out in zip(layer_sizes[:-1], layer_sizes[1:]):
        
-       params['w'].append(torch.nn.init.normal_(torch.empty(n_in, n_out, device=local_device),std= torch.div(1,torch.sqrt(torch.from_numpy(np.asarray(n_in+n_out)).float()/2.))).requires_grad_(True))
+       #params['w'].append(torch.nn.init.normal_(torch.empty(n_in, n_out, device=local_device),std= torch.div(1,torch.sqrt(torch.from_numpy(np.asarray(n_in+n_out)).float()/2.))).requires_grad_(True))
+       params['w'].append(torch.nn.init.normal_(torch.empty(n_in, n_out, device=local_device), std= stdev).requires_grad_(True))
        params['b'].append(torch.empty(n_out, device=local_device).fill_(bias_init).requires_grad_(True))
     return params
 
@@ -98,12 +122,14 @@ def mlp(X, params):
     return torch.matmul(h[-1], params['w'][-1]) + params['b'][-1]
 
 
+
+
 class GMMVAE(nn.Module):
     #Used this repository as a base
     # https://github.com/bhavikngala/gaussian_mixture_vae
     # https://github.com/Nat-D/GMVAE
     # https://github.com/psanch21/VAE-GMVAE
-    def __init__(self, number_of_mixtures, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size):
+    def __init__(self, number_of_mixtures, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4, small_conv=False):
         super(GMMVAE, self).__init__()
 
         self.K          = number_of_mixtures
@@ -117,41 +143,75 @@ class GMMVAE(nn.Module):
         self.batch_size = batch_size
         self.enc_kernel = 4
         self.enc_stride = 2
+        self.enc_padding = 0 
         self._to_linear = None
+        
         ########################
         # ENCODER-CONVOLUTION LAYERS
-        self.conv0       = nn.Conv2d(nchannel, base_channels, self.enc_kernel, stride=self.enc_stride)
-        self.bn2d_0      = nn.BatchNorm2d(self.base_channels)
-        self.LeakyReLU_0 = nn.LeakyReLU(0.2)
-        out_width        = np.floor((self.img_width - self.enc_kernel) / self.enc_stride + 1)
-        self.conv1       = nn.Conv2d(base_channels, base_channels*2, self.enc_kernel, stride=self.enc_stride)
-        self.bn2d_1      = nn.BatchNorm2d(base_channels*2)
-        self.LeakyReLU_1 = nn.LeakyReLU(0.2)
-        out_width        = np.floor((out_width - self.enc_kernel) / self.enc_stride + 1)
-        self.conv2       = nn.Conv2d(base_channels*2, base_channels*4, self.enc_kernel, stride=self.enc_stride)
-        self.bn2d_2      = nn.BatchNorm2d(base_channels*4)
-        self.LeakyReLU_2 = nn.LeakyReLU(0.2)
-        out_width        = np.floor((out_width - self.enc_kernel) / self.enc_stride + 1)
-        self.conv3       = nn.Conv2d(base_channels*4, base_channels*8, self.enc_kernel, stride=self.enc_stride)
-        self.bn2d_3      = nn.BatchNorm2d(base_channels*8)
-        self.LeakyReLU_3 = nn.LeakyReLU(0.2)
-        out_width        = int(np.floor((out_width - self.enc_kernel) / self.enc_stride + 1))
+        if small_conv:
+            num_layers += 1
+        channel_sizes = calculate_channel_sizes(
+            self.nchannel, max_filters, num_layers
+        )
+        print(f"channel size of encoder:{channel_sizes}")
+        # Encoder
+        encoder_layers = nn.ModuleList()
+        # Encoder Convolutions
+        for i, (in_channels, out_channels) in enumerate(channel_sizes):
+            if small_conv and i == 0:
+                # 1x1 Convolution
+                encoder_layers.append(
+                    nn.Conv2d(
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        kernel_size=self.enc_kernel,
+                        stride=self.enc_stride,
+                        padding=self.enc_padding,
+                    )
+                )
+            else:
+                # Convolutional Layer
+                encoder_layers.append(
+                    nn.Conv2d(
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        kernel_size=self.enc_kernel,
+                        stride=self.enc_stride,
+                        padding=self.enc_padding,
+                        bias=False,
+                    )
+                )
+            # Batch Norm
+            encoder_layers.append(nn.BatchNorm2d(out_channels))
+            # ReLU
+            encoder_layers.append(nn.ReLU())
+        # Flatten Encoder Output
+        encoder_layers.append(nn.Flatten())
+        
+        self.encoder = nn.Sequential(*encoder_layers)
+        # Calculate shape of the flattened image
+        h_dim, image_size = self.get_flattened_size(self.img_width)
+        
+        self.encoder = torch.nn.Sequential(
+        self.encoder, torch.nn.Linear(h_dim, hidden_dim, bias=False),
+        nn.BatchNorm1d(hidden_dim),
+        nn.ReLU(),
+        torch.nn.Linear(hidden_dim, hidden_dim, bias=False),
+        nn.BatchNorm1d(hidden_dim),
+        nn.ReLU()) # ReLU
+        
+        #print(f"encode network:\n{self.encoder}")
         ########################
         #ENCODER-USING FULLY CONNECTED LAYERS
         #THE LATENT SPACE (Z)
-        self.flatten     = nn.Flatten()
-        self.fc0         = nn.Linear((out_width**2) * base_channels * 8, base_channels*8*4*4, bias=False)
-        self.bn1d        = nn.BatchNorm1d(base_channels*8*4*4)
-        self.fc1         = nn.Linear(base_channels*8*4*4, hidden_dim, bias=False)
-        self.bn1d_1      = nn.BatchNorm1d(hidden_dim)
         # mean of z
 
-        self.fc2         = nn.Linear(hidden_dim, z_dim, bias=False)
-        self.bn1d_2      = nn.BatchNorm1d(z_dim)
+        self.fc_mu         = nn.Linear(hidden_dim, z_dim, bias=False)
+        
         # variance of z
 
-        self.fc3         = nn.Linear(hidden_dim, z_dim, bias=False)
-        self.bn1d_3      = nn.BatchNorm1d(z_dim)
+        self.fc_log_var    = nn.Linear(hidden_dim, z_dim, bias=False)
+        
         ########################
         #ENCODER-JUST USING FULLY CONNECTED LAYERS
         #THE LATENT SPACE (W)
@@ -184,35 +244,82 @@ class GMMVAE(nn.Module):
         ########################
         # DECODER: CreateXGenerator
         # Px_given_z LAYERS Decoder P(X|Z)
-        conv2d_transpose_kernels, conv2d_transpose_input_width = self.determine_decoder_params(self.z_dim, self.img_width)
-        self.px_z_fc_0   = nn.Linear(self.z_dim, conv2d_transpose_input_width ** 2)
-        self.px_z_bn1d_0 = nn.BatchNorm1d(conv2d_transpose_input_width ** 2)
-        self.px_z_fc_1   = nn.Linear(conv2d_transpose_input_width ** 2, conv2d_transpose_input_width ** 2)
-        #self.unflatten = nn.Unflatten(1, (1, conv2d_transpose_input_width, conv2d_transpose_input_width))
-        self.conv2d_transpose_input_width = conv2d_transpose_input_width
-        self.px_z_conv_transpose2d = nn.ModuleList()
-        self.px_z_bn2d   = nn.ModuleList()
-        self.n_conv2d_transpose = len(conv2d_transpose_kernels)
-        self.px_z_conv_transpose2d.append(nn.ConvTranspose2d(1, self.base_channels * (self.n_conv2d_transpose - 1),
-                                                             kernel_size=conv2d_transpose_kernels[0], stride=2))
-        self.px_z_bn2d.append(nn.BatchNorm2d(self.base_channels * (self.n_conv2d_transpose - 1)))
-        self.px_z_LeakyReLU = nn.ModuleList()
-        self.px_z_LeakyReLU.append(nn.LeakyReLU(0.2))
-        #print('Number of convoltional layers in decooder: ', self.n_conv2d_transpose)
-        for i in range(1, self.n_conv2d_transpose - 1):
-            self.px_z_conv_transpose2d.append(nn.ConvTranspose2d(self.base_channels * (self.n_conv2d_transpose - i),
-                                                                 self.base_channels*(self.n_conv2d_transpose - i - 1),
-                                                                 kernel_size=conv2d_transpose_kernels[i], stride=2))
-            self.px_z_bn2d.append(nn.BatchNorm2d(self.base_channels * (self.n_conv2d_transpose - i - 1)))
-            self.px_z_LeakyReLU.append(nn.LeakyReLU(0.2))
-        self.px_z_conv_transpose2d.append(nn.ConvTranspose2d(self.base_channels, self.nchannel,
-                                                             kernel_size=conv2d_transpose_kernels[-1], stride=2))
-        #print('Final number of convoltional layers in decooder: ', len(self.px_z_conv_transpose2d))
-        self.encoder_kumar_a = init_mlp([hidden_dim,self.K-1], 1e-8) #Q(pi|x)
-        self.encoder_kumar_b = init_mlp([hidden_dim,self.K-1], 1e-8) #Q(pi|x)
+        
+        if small_conv:
+            num_layers += 1
+        channel_sizes = calculate_channel_sizes(
+            self.nchannel, max_filters, num_layers
+        )
+        
+        # Decoder
+        decoder_layers = nn.ModuleList()
+        # Feedforward/Dense Layer to expand our latent dimensions
+        decoder_layers.append(nn.Linear(z_dim, hidden_dim))
+        decoder_layers.append(nn.BatchNorm1d(hidden_dim))
+        decoder_layers.append(nn.ReLU())
+        decoder_layers.append(nn.Linear(hidden_dim, hidden_dim))
+        decoder_layers.append(nn.BatchNorm1d(hidden_dim))
+        decoder_layers.append(nn.ReLU())
+        decoder_layers.append(torch.nn.Linear( hidden_dim, h_dim, bias=False))
+        decoder_layers.append(nn.BatchNorm1d(h_dim))
+        #decoder_layers.append(nn.ReLU())
+        
+        # Unflatten to a shape of (Channels, Height, Width)
+        decoder_layers.append(nn.Unflatten(1, (int(max_filters), self.enc_kernel, self.enc_kernel)))
+        # Decoder Convolutions
+        
+        for i, (out_channels, in_channels) in enumerate(channel_sizes[::-1]):
+            if small_conv and i == num_layers - 1:
+                # 1x1 Transposed Convolution
+                decoder_layers.append(
+                    nn.ConvTranspose2d(
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        kernel_size=self.enc_kernel,
+                        stride=self.enc_stride,
+                        padding=self.enc_padding,
+                    )
+                )
+            else:
+                # Add Transposed Convolutional Layer
+                decoder_layers.append(
+                    nn.ConvTranspose2d(
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        kernel_size=self.enc_kernel,
+                        stride=self.enc_stride,
+                        padding=self.enc_padding,
+                        bias=False,
+                    )
+                )
+            # Batch Norm
+            decoder_layers.append(nn.BatchNorm2d(out_channels))
+            # ReLU if not final layer
+            if i != num_layers - 1:
+                decoder_layers.append(nn.ReLU())
+            # Sigmoid if final layer
+            else:
+                decoder_layers.append(nn.Sigmoid())
+        self.decoder = nn.Sequential(*decoder_layers)
+        #print(f"decode network:\n{self.decoder}")
+        
+        self.encoder_kumar_a = init_mlp([hidden_dim,self.K-1], 1e-6) #Q(pi|x)
+        self.encoder_kumar_b = init_mlp([hidden_dim,self.K-1], 1e-6) #Q(pi|x)
         ##########Device#########
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.to(device=self.device)
+
+    def get_flattened_size(self, image_size, ):
+        for layer in self.encoder:
+            if "Conv2d" in str(layer):
+                kernel_size = layer.kernel_size[0]
+                stride = layer.stride[0]
+                padding = layer.padding[0]
+                filters = layer.out_channels
+                image_size = calculate_layer_size(
+                    image_size, kernel_size, stride, padding
+                )
+        return filters * image_size * image_size, image_size
 
     def Pz_given_wc(self, w_input):
         # Prior
@@ -237,17 +344,10 @@ class GMMVAE(nn.Module):
     def Px_given_z(self, z_input):
         #Decoder:
         #Generate X: P(X|Z)
-        h  = F.relu(self.px_z_bn1d_0(self.px_z_fc_0(z_input)))
-        flattened_h = self.px_z_fc_1(h)
-        h = flattened_h.view(flattened_h.size()[0], 1, self.conv2d_transpose_input_width, self.conv2d_transpose_input_width)
-        for i in range(self.n_conv2d_transpose - 1):
-            h = self.px_z_LeakyReLU[i](self.px_z_bn2d[i](self.px_z_conv_transpose2d[i](h)))
-        # h = F.relu(self.px_z_bn2d_0(self.px_z_conv_transpose2d_0(h)))
-        # h = F.relu(self.px_z_bn2d_1(self.px_z_conv_transpose2d_1(h)))
-        # h = F.relu(self.px_z_bn2d_2(self.px_z_conv_transpose2d_2(h)))
-        # h = F.relu(self.px_z_bn2d_3(self.px_z_conv_transpose2d_3(h)))
-        x_recons_mean_flat = torch.sigmoid(self.px_z_conv_transpose2d[self.n_conv2d_transpose - 1](h))
-        return x_recons_mean_flat
+        Generated_X = self.decoder(z_input)
+        Generated_X = F.pad(input=Generated_X, pad=(1, 1, 1, 1), mode='constant', value=0)
+        #print(f'size of recounstructed image: {Generated_X.size()}')
+        return Generated_X
 
     def GMM_encoder(self, data):
         #1) posterior Q(z|X)
@@ -255,18 +355,15 @@ class GMMVAE(nn.Module):
         compute z = z_mean + z_var * eps1
         """
         h = data
-        h = self.LeakyReLU_0(self.bn2d_0(self.conv0(h)))
-        h = self.LeakyReLU_1(self.bn2d_1(self.conv1(h)))
-        h = self.LeakyReLU_2(self.bn2d_2(self.conv2(h)))
-        h = self.LeakyReLU_3(self.bn2d_3(self.conv3(h)))
-
-        h = F.relu(self.bn1d(self.fc0(self.flatten(h))))
-        hlayer      = F.relu(self.bn1d_1(self.fc1(h)))
+        # Encode
+        hlayer = self.encoder(h)
+        # Get latent variables
+        
         #mean_z
-        mu_z        = F.relu(self.bn1d_2(self.fc2(hlayer)))
+        mu_z        = self.fc_mu(hlayer)
 
         #logvar_z
-        logvar_z    = F.softplus(self.bn1d_3(self.fc3(hlayer)))
+        logvar_z    = self.fc_log_var(hlayer)
 
         #2) posterior Q(w|X)
         #Create Recogniser for W
@@ -361,16 +458,6 @@ class GMMVAE(nn.Module):
         reconst_X = self.Px_given_z(z)
         return reconst_X
 
-    def determine_decoder_params(self, z_dim, img_width):
-        kernels = []
-        input_img_dim = downsampled_img_width = img_width
-        while downsampled_img_width ** 2 > z_dim:
-            kernel = 6 if (downsampled_img_width - 4) % 2 == 0 else 5
-            kernels.append(kernel)
-            input_img_dim = downsampled_img_width
-            downsampled_img_width = (downsampled_img_width - kernel) // 2 + 1
-        kernels = kernels[:-1][::-1]
-        return kernels, input_img_dim
 
 
 
@@ -413,28 +500,28 @@ def compute_kumar2beta_kld(a, b, alpha, beta):
     log_taylor = torch.logsumexp(torch.stack([beta_fn(torch.mul(m , a_inv), b) - torch.log(m + ab) for m in range(1, 10 + 1)], dim=-1), dim=-1)
     kl = torch.mul(torch.mul((beta - 1) , b) , torch.exp(log_taylor))
     """
-    print(f"2nd value of KL divergence between kumaraswamy and beta distributions: {kl}")
+    #print(f"2nd value of KL divergence between kumaraswamy and beta distributions: {kl}")
     #
     #psi_b = torch.log(b + SMALL) - 1. / (2 * b + SMALL) -    1. / (12 * b**2 + SMALL)
     psi_b = torch.digamma(b+SMALL)
     kl   += torch.mul(torch.div(a-alpha, torch.clamp(a, SMALL, upper_limit)), -EULER_GAMMA - psi_b - b_inv)
-    print(f"3rd value of KL divergence between kumaraswamy and beta distributions: {kl}")
+    #print(f"3rd value of KL divergence between kumaraswamy and beta distributions: {kl}")
     # add normalization constants
     kl   += torch.log(torch.clamp(ab, SMALL, upper_limit)) + torch.log(torch.clamp(beta_fn(alpha, beta), SMALL, upper_limit))
-    print(f"4th value of KL divergence between kumaraswamy and beta distributions: {kl}")
+    #print(f"4th value of KL divergence between kumaraswamy and beta distributions: {kl}")
     #  final term
     kl   += torch.div(-(b-1),torch.clamp(b , SMALL, upper_limit))
-    print(f"final value of KL divergence between kumaraswamy and beta distributions: {kl}")
+    #print(f"final value of KL divergence between kumaraswamy and beta distributions: {kl}")
     #pdb.set_trace()
     return  torch.clamp(kl, min=0.)
 
 def log_normal_pdf(sample, mean, sigma):
     global local_device
     global SMALL 
-    d  = torch.sub(sample , mean)
-    d2 = torch.mul(-1,torch.mul(d,d))
-    s2 = torch.mul(2,torch.mul(sigma,sigma))
-    return torch.sum(torch.div(d2, s2+SMALL) - torch.log(torch.mul(sigma,np.sqrt(2*torch.tensor(np.pi, dtype=torch.float, device=local_device)))+SMALL), dim=1)
+    d  = torch.sub(sample , mean).to(device=local_device)
+    d2 = torch.mul(-1,torch.mul(d,d)).to(device=local_device)
+    s2 = torch.mul(2,torch.mul(sigma,sigma)).to(device=local_device)
+    return torch.sum(torch.div(d2, s2+SMALL) - torch.log(torch.mul(sigma, torch.sqrt(2*torch.tensor(pi_, dtype=torch.float, device=local_device)))+SMALL), dim=1)
 
 
 
@@ -481,7 +568,7 @@ class InfGaussMMVAE(GMMVAE):
     def __init__(self, hyperParams, K, nchannel, base_channels, z_dim, w_dim, hidden_dim, device, img_width, batch_size, include_elbo2):
         global local_device
         local_device = device
-        super(InfGaussMMVAE, self).__init__(K, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size)
+        super(InfGaussMMVAE, self).__init__(K, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4, small_conv=False)
 
         self.prior      = hyperParams['prior']
         self.K          = hyperParams['K']
@@ -504,7 +591,7 @@ class InfGaussMMVAE(GMMVAE):
     def forward(self, X):
         # init variational params
         device = self.dummy_param.device
-        print(f"device in the InfGaussMMVAE class is {device}")
+        #print(f"device in the InfGaussMMVAE class is {device}")
         
         self.z_sample_list = self.encoder_decoder_fn(X)
 
@@ -516,9 +603,9 @@ class InfGaussMMVAE(GMMVAE):
 
     def compose_stick_segments( self,v):
         segments = []
-        self.remaining_stick = [torch.ones((v.shape[1],1)).to(device=self.device)]
+        self.remaining_stick = [torch.ones((v.shape[0],1)).to(device=self.device)]
         for i in range(self.K-1):
-            curr_v = torch.squeeze(v[:, i],0)
+            curr_v = torch.unsqueeze(v[:, i],1)
             segments.append(torch.mul(curr_v, self.remaining_stick[-1]))
             self.remaining_stick.append(torch.mul(1-curr_v, self.remaining_stick[-1]))
         segments.append(self.remaining_stick[-1])
@@ -531,12 +618,10 @@ class InfGaussMMVAE(GMMVAE):
         global SMALL
         a_inv = torch.pow(self.kumar_a,-1)
         b_inv = torch.pow(self.kumar_b,-1)
-        r1    = torch.tensor(SMALL, dtype=torch.float64,device=self.device)
-        r2    = torch.tensor(1-SMALL, dtype=torch.float64, device=self.device)
         # compose into stick segments using pi = v \prod (1-v)
         v_means = torch.mul(self.kumar_b, beta_fn(1.+a_inv, self.kumar_b)).to(device=self.device)
         #u       = (r1 - r2) * torch.rand(a_inv.shape[0],self.K-1) + r2
-        u       = torch.distributions.uniform.Uniform(low=r1, high=r2).sample([1]).squeeze()
+        u       = torch.distributions.uniform.Uniform(low=SMALL, high=1-SMALL).sample([1]).squeeze()
         v_samples  = torch.pow(1 - torch.pow(u, b_inv), a_inv).to(device=self.device)
         if v_samples.ndim > 2:
             v_samples = v_samples.squeeze()
@@ -558,13 +643,13 @@ class InfGaussMMVAE(GMMVAE):
 
 
 
-    def DiscreteKL(self, P,Q):
+    def DiscreteKL(self, P,Q, epsilon=1e-8):
 
         #KL(q(z)||p(z)) =  - sum_k q(k) log p(k)/q(k)
    	    # let's p(k) = 1/K???
-        logQ = torch.log(Q+ 1e-10).to(device=self.device)
+        logQ = torch.log(Q+ epsilon).to(device=self.device)
         
-        logP = torch.log(P+ 1e-10).to(device= self.device)
+        logP = torch.log(P+ epsilon).to(device= self.device)
         element_wise = (Q * torch.sub(logQ , logP))
         #pdb.set_trace()
         return torch.sum(element_wise, dim=-1).mean().to(device=self.device)
@@ -588,21 +673,29 @@ class InfGaussMMVAE(GMMVAE):
         return torch.sum(torch.bmm(KLD_table, qc)).to(device=self.device)
 
     def EntropyCriterion(self):
-
-        # CV = H(C|Z, W) = E_q(z,w) [ E_p(c|z,w)[ - log P(c|z,w)] ]
+        #CV = H(C|Z, W) = E_q(c,w) [ E_p(c|z,w)[ - log P(c|z,w)] ]
+        
         z_sample =  self.z_x.unsqueeze(-1)
         z_sample =  z_sample.expand(-1, self.z_dim, self.K)
         z_sample =  z_sample.permute(2,0,1)
-
+        
+        """
+         z [NxD]
+         mean [NxD]
+         logVar [NxD]
+         llh = -0.5 sum_d { (x_i - mu_i)^2/var_i } - 1/2 sum_d (logVar_i) - D/2 ln(2pi) [N]
+        """
         log_likelihoods = log_gaussian(z_sample, self.z_wc_mean_list_sample, self.z_wc_logvar_list_sample)
         llh=log_likelihoods.sum(-1)
 
         lh = F.softmax(llh, dim=-1).to(device=self.device)
         # entropy
+        # H(C|Z) = E_q(z) [ E_p(c|z)[ - log Q(c|z)] ]
         CV = torch.sum(torch.mul(torch.log(lh+1e-10), lh)).to(device=self.device)
         return CV
 
     def get_ELBO(self, X):
+        self.X = X
 
         loss_dict = OrderedDict()
         #1) Computes the KL divergence between two categorical distributions
@@ -621,16 +714,13 @@ class InfGaussMMVAE(GMMVAE):
                 #2)need this term
                 #elbo -= compute_kumar2beta_kld(tf.expand_dims(self.kumar_a[:,k],1), tf.expand_dims(self.kumar_b[:,k],1), \
                 #                                   self.prior['dirichlet_alpha'], (self.K-1-k)*self.prior['dirichlet_alpha'])
-                #print(self.kumar_b[:, k].unsqueeze(1))
-                #print(self.kumar_b[:, k].expand(self.batch_size))
                 #elbo2 -= compute_kumar2beta_kld(self.kumar_a[:, k].expand(self.batch_size), self.kumar_b[:, k].expand(self.batch_size), self.prior, (self.K-1-k)* self.prior).mean()
-                print(f"a kumaraswamy component {k}: {self.kumar_a[:, k]}")
-                print(f"b kumaraswamy component {k}: {self.kumar_b[:, k]}")
-                print(f"alpha component {k}: {self.prior}")
-                print(f"beta component {k}: {self.K-1-k}")
+                #print(f"a kumaraswamy component {k}: {self.kumar_a[:, k]}")
+                #print(f"b kumaraswamy component {k}: {self.kumar_b[:, k]}")
                 elbo2 -= compute_kumar2beta_kld(self.kumar_a[:, k], self.kumar_b[:, k], self.prior, (self.K-1-k)* self.prior).mean()
         
         #3)need this term of w (context)
+        #0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
         elbo3 = -0.5 * torch.sum(1 + self.w_x_logvar - self.w_x_mean.pow(2) - self.w_x_logvar.exp()).to(device=self.device)#VAE_KLDCriterion
         
         # 4)compute E_{p(w|x)p(c|x)}[D_KL(Q(z|x)||p(z|c,w))]
@@ -640,13 +730,13 @@ class InfGaussMMVAE(GMMVAE):
         #5) compute Reconstruction Cost = E_{q(z|x)}[P(x|z)]
         #
         criterion = nn.BCELoss(reduction='sum')
-        elbo5 = criterion(self.x_recons.view(-1, self.nchannel*self.img_size*self.img_size), X.view(-1, self.nchannel*self.img_size*self.img_size))
+        elbo5 = criterion(self.x_recons.view(-1, self.nchannel*self.img_size*self.img_size), self.X.view(-1, self.nchannel*self.img_size*self.img_size))
         
         assert torch.isfinite(elbo5)
 
 
         loss_dict['recon'] = elbo5
-        loss_dict['c_clusster_kld'] = elbo1
+        loss_dict['c_cluster_kld'] = elbo1
         loss_dict['kumar2beta_kld'] = elbo2
         loss_dict['w_context_kld'] = elbo3
         loss_dict['z_latent_space_kld'] = elbo4
@@ -664,7 +754,9 @@ class InfGaussMMVAE(GMMVAE):
         # compute Kumaraswamy samples
 
         uni_samples =torch.FloatTensor(a_inv.shape[0], self.K-1).uniform_(1e-8, 1-1e-8).to(device=self.device)
-        v_samples   = torch.pow(1-torch.pow(uni_samples, b_inv), a_inv)
+        #T(u)=(1-(1-u)^1/b)^1/a , u~Uniform(0,1) based on https://arxiv.org/pdf/1905.12052.pdf
+        #https://github.com/astirn/MV-Kumaraswamy/blob/master/mv_kumaraswamy_sampler.py
+        v_samples   = torch.pow(1-torch.pow(1-uni_samples, b_inv), a_inv)
 
         # compose into stick segments using pi = v \prod (1-v)
         self.pi_samples = self.compose_stick_segments(v_samples)
@@ -673,91 +765,143 @@ class InfGaussMMVAE(GMMVAE):
 
         uni_samples = torch.FloatTensor(a_inv.shape[0], self.K).uniform_(1e-8, 1-1e-8).to(device=self.device)
         gumbel_samples = -torch.log(-torch.log(uni_samples + 1e-20) + 1e-20)
-        component_samples = torch.IntTensor(torch.argmax(torch.log(torch.cat( self.pi_samples,1) + 1e-20) + gumbel_samples, 1))
-        component_samples = torch.cat( [torch.range(0, batchSize).unsqueeze(1), component_samples.unsqueeze(1)], 1)
+        
+        component_samples = torch.argmax(torch.log(torch.cat( self.pi_samples,1) + 1e-20) + gumbel_samples, 1).to(device=self.device, dtype=torch.int64)
+        #print(f'index of stick should be used for the mixture model:\n{component_samples}')
+        component_samples = torch.cat( [torch.arange(0, batchSize, device=self.device).unsqueeze(1), component_samples.unsqueeze(1)], 1)
+        
         # calc likelihood term for chosen components
         ll = -compute_nll(self.X, self.x_recons)
-
-
         # calc prior terms
         all_log_gauss_priors = []
 
         for k in range(self.K):
             all_log_gauss_priors.append(log_normal_pdf(self.z_x, self.z_wc_mean_list_sample[k], self.z_wc_logvar_list_sample[k]))
-        all_log_gauss_priors = torch.cat(all_log_gauss_priors, dim=1)
-        log_gauss_prior = gather_nd(all_log_gauss_priors, component_samples)
-        log_gauss_prior = log_gauss_prior.expand(1)
 
+        
+        all_log_gauss_priors = torch.stack(all_log_gauss_priors).to(device=self.device)
+        #print(f"size of all components of Gaussian prior: {all_log_gauss_priors.size()}")
+        #print(f"size of components of Z: {component_samples.size()}")
+        log_gauss_prior = gather_nd(torch.t(all_log_gauss_priors), component_samples)
+        log_gauss_prior = log_gauss_prior.unsqueeze(1)
+        
         #****need this term :
         #log_beta_prior = log_beta_pdf(tf.expand_dims(v_samples[:,0],1), self.prior['dirichlet_alpha'], (self.K-1)*self.prior['dirichlet_alpha'])
-        log_beta_prior = log_beta_pdf(v_samples[:,0].expand(1), self.prior, (self.K - 1) * self.prior)
+        log_beta_prior = log_beta_pdf(v_samples[:,0].unsqueeze(1), self.prior, (self.K - 1) * self.prior)
         for k in range(self.K-2):
             #log_beta_prior += log_beta_pdf(tf.expand_dims(v_samples[:,k+1],1), self.prior['dirichlet_alpha'], (self.K-2-k)*self.prior['dirichlet_alpha'])
-            log_beta_prior += log_beta_pdf(v_samples[:, k + 1].expand(1), self.prior, (self.K - 2 - k) * self.prior)
+            log_beta_prior += log_beta_pdf(v_samples[:, k + 1].unsqueeze(1), self.prior, (self.K - 2 - k) * self.prior)
 
         # ****need this term :calc post term
         log_kumar_post = log_kumar_pdf(v_samples, self.kumar_a, self.kumar_b)
 
-
         log_gauss_post = log_normal_pdf(self.z_x, self.z_x_mean, self.z_x_sigma)
-
         #****need this term :cal prior and posterior over w
-        log_w_prior = log_normal_pdf(self.w_x, torch.zeros(self.w_x.size()).to(device=self.device),torch.eye(self.w_x.size()))
+        log_w_prior = log_normal_pdf(self.w_x, torch.zeros(self.w_x.size()).to(device=self.device),torch.eye(self.w_x.size()[0],self.w_x.size()[1], device=self.device))
         log_w_post  = log_normal_pdf(self.w_x, self.w_x_mean, self.w_x_sigma)
         return ll + log_beta_prior + log_gauss_prior +log_w_prior - log_kumar_post - log_gauss_post - log_w_post
 
 
+
     #TODO??
     @torch.no_grad()
-    def get_component_samples(self,batchSize):
+    def get_component_samples(self, batchSize):
         # get the components of the latent space
-        global SMALL
-        a_inv = torch.pow(self.kumar_a,-1)
-        b_inv = torch.pow(self.kumar_b,-1)
-        r1    = torch.tensor(SMALL, dtype=torch.float64,device=self.device)
-        r2    = torch.tensor(1-SMALL, dtype=torch.float64, device=self.device)
-        # compose into stick segments using pi = v \prod (1-v)
-        v_means = torch.mul(self.kumar_b, beta_fn(1.+a_inv, self.kumar_b)).to(device=self.device)
-        #u       = (r1 - r2) * torch.rand(a_inv.shape[0],self.K-1) + r2
-        u       = torch.distributions.uniform.Uniform(low=r1, high=r2).sample([1]).squeeze()
-        v_samples  = torch.pow(1 - torch.pow(u, b_inv), a_inv).to(device=self.device)
-        if v_samples.ndim > 2:
-            v_samples = v_samples.squeeze()
-        v0 = v_samples[:, -1].pow(0).reshape(v_samples.shape[0], 1)
-        v1 = torch.cat([v_samples[:, :self.z_dim - 1], v0], dim=1)
-        n_samples = v1.size()[0]
-        n_dims = v1.size()[1]
-        components = torch.zeros((n_samples, n_dims)).to(device=self.device)
-
-        for k in range(n_dims):
-            if k == 0:
-                components[:, k] = v1[:, k]
-            else:
-                components[:, k] = v1[:, k] * torch.stack([(1 - v1[:, j]) for j in range(n_dims) if j < k]).prod(axis=0)
+        #a_inv = torch.pow(self.kumar_a,-1)
+        #b_inv = torch.pow(self.kumar_b,-1)
+        
         # ensure stick segments sum to 1
-        assert_almost_equal(torch.ones(n_samples,device=self.device), components.sum(axis=1).detach().numpy(),
-                            decimal=2, err_msg='stick segments do not sum to 1')
-        print(f'size of sticks: {components}')
+        #v_means = torch.mul(self.kumar_b, beta_fn(1.+a_inv, self.kumar_b)).to(device=self.device)
+        m = Beta(self.kumar_a, self.kumar_b)
+        v_means =m.sample().to(device=self.device)
+        print(f"size of v samples: {v_means.size()}")
+        # compose into stick segments using pi = v \prod (1-v)
+        remaining_stick=torch.ones(v_means.shape[0], device=self.device, requires_grad=False)
+        weights=[]
+        for b in range(v_means.shape[1]):
+            piece = remaining_stick * v_means[:,b]
+            weights.append(piece)
+            remaining_stick -= piece
+        
+        #p(z^{(i)}|c^{(i)}=j;theta)=N(z^{(i)}|mu_j,sigma_j)
+        #p(c^{(i)}=j)=w_j
+        #p(z^{(i)}|theta)=sum_{j=1}^{k} p(c^{(i)}=j) p(z^{(i)}|c^{(i)}=j;theta)
+        # sample a component index       
+        
+        self.pi_samples=torch.stack(weights,1)
+        component = torch.argmax( self.pi_samples  , 1).to(device=self.device, dtype=torch.int64)
+        print(f'size of each latent component: {self.z_sample_list[0].size()}')
 
+        component = torch.cat( [torch.arange(0, batchSize, device=self.device).unsqueeze(1), component.unsqueeze(1)], 1)
+        #assert_almost_equal(torch.ones(n_samples,device=self.device).cpu().numpy(), component.sum(axis=1).detach().cpu().numpy(),decimal=4, err_msg='stick segments do not sum to 1')
 
-        components = torch.IntTensor(torch.argmax(torch.cat( self.compose_stick_segments(v_means),1) ,1), dtype=torch.long, device=self.device)
-        components = torch.cat( [torch.range(0, batchSize).unsqueeze(1), components.unsqueeze(1)], 1)
-        print(f'size of sticks: {components}')
         all_z = []
         for d in range(self.z_dim):
-            temp_z = torch.cat(1, [self.z_sample_list[k][:, d].unsqueeze(1) for k in range(self.K)])
-            all_z.append(gather_nd(temp_z, components).unsqueeze(1))
-        out       = torch.cat( all_z,1)
-        x_samples = self.Px_given_z(out)
+            temp_z = torch.cat( [self.z_sample_list[k][:, d].unsqueeze(1) for k in range(self.K)], dim=1)
+            all_z.append(gather_nd(temp_z, component).unsqueeze(1))
+        print(f"size of pi samples before: {self.pi_samples.size()}")
+        self.pi_samples         = self.pi_samples.unsqueeze(-1)
+        self.pi_samples         = F.pad(input=self.pi_samples, pad=(0, 0, 1, 0), mode='constant', value=0)
+        print(f"size of pi samples after adding pad: {self.pi_samples.size()}")
+        self.pi_samples         = self.pi_samples.expand(-1, self.K, 1)
+        self.pi_samples         = self.pi_samples.permute(0,2,1)
+        out      = torch.stack( all_z).to(device=self.device)
+        out      = out.permute(1,0,2)
+        print(f"size of all z components after stacking: {out.size()}")
+        print(f"size of pi samples after: {self.pi_samples.size()}")
+        
+        """
+        self.concatenated_latent_space = torch.mul(self.pi_samples[0], out[0])
+        for k in range(self.K-1):
+            self.concatenated_latent_space += torch.mul(self.pi_samples[k+1], out[k+1])
+        print(f'size of all z component dimension: {self.concatenated_latent_space.size()}')
+        """
+        self.concatenated_latent_space = torch.bmm(out, self.pi_samples)
+        print(f"size of latent space before reconstruction: {self.concatenated_latent_space.size()}")
+        """
+        all_z = []
+        for d in range(self.z_dim):
+            temp_z = torch.cat( [self.z_sample_list[k][:, d].unsqueeze(1) for k in range(self.K)], dim=1)
+            all_z.append(torch.mm(temp_z.transpose(1, 0), components).unsqueeze(1))
+        out      = torch.cat( all_z,1)
+        print(f'size of all z component dimension: {out.size()}')
+        out = F.pad(out, pad=(1, 0, 0,0, 0, 1), mode='constant', value=0)
+
+        """
+        
+        #self.concatenated_latent_space = rearrange(self.concatenated_latent_space, 'd0 d1 d2 -> d1 (d0 d2)')
+        #out = self.concatenated_latent_space.permute(1,0)
+        out = torch.squeeze(torch.mean(self.concatenated_latent_space, 2, True))
+        
+        print(f'new size of all z component dimension after padding: {out.size()}')
+        x_samples       = self.Px_given_z(out.float())
         return x_samples
 
+### Marginal Likelihood Calculation            
+def calc_margLikelihood(data, model, nSamples=50):
+    
 
+    sample_collector = []
+    for s_idx in range(nSamples):
+        samples = model.get_log_margLL(model.batch_size)
+        #print(f'batch size:{data.shape[0]}')
+        if not np.isnan(samples.mean().detach().cpu().numpy()) and not np.isinf(samples.mean().detach().cpu().numpy()):
+            sample_collector.append(samples.detach().cpu().numpy())
+        
+    if len(sample_collector) < 1:
+        print("\tMARG LIKELIHOOD CALC: No valid samples were collected!")
+        return np.nan
+
+    all_samples = np.hstack(sample_collector)
+    m = np.amax(all_samples, axis=1)
+    mLL = m + np.log(np.mean(np.exp( all_samples - m[np.newaxis].T ), axis=1))
+    return mLL.mean()
 
 #class of optimizer
 from utils import AdaBound
 #data analysis
 from torch import nn, optim
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data.dataloader as DataLoader
@@ -777,6 +921,7 @@ from visdom import Visdom
 from visdom import server
 from subprocess import Popen, PIPE
 from pathlib import Path
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 ###***********************Tensorboard************************###
 from torch.utils.tensorboard import SummaryWriter
 
@@ -837,7 +982,7 @@ device = torch.device('cuda')
 
 hyperParams = {"batch_size": 50,
                "input_d": 1,
-               "prior": 1, #dirichlet_alpha'
+               "prior": 5, #dirichlet_alpha'
                "K": 20,
                "hidden_d": 500,
                "latent_d": 200,
@@ -915,12 +1060,12 @@ for name, param in net.named_parameters():
 ###*********************************************************###
 
 #net.cuda()
-optimizer = optim.Adam(net.parameters(), lr=0.0001, weight_decay=1e-8)
+optimizer = optim.Adam(net.parameters(), lr=0.001)
 
 ##optimizer = AdaBound(net.parameters(), lr=0.0001)
 
 img_list = []
-num_epochs=100
+num_epochs= 600
 grad_clip = 1.0
 iters=0
 def train(epoch):
@@ -933,13 +1078,14 @@ def train(epoch):
     for batch_idx, (X, classes) in enumerate(train_loader):
 
         X = X.to(device=device, dtype=torch.float)
+        #print(f'size of input image {X.size()}')
         optimizer.zero_grad()
 
         X_recons_linear, mu_z, logvar_z, mu_w, logvae_w, qc, kumar_a, kumar_b, mu_pz, logvar_pz= net(X)
 
         loss_dict = net.get_ELBO(X)
         #print(f" Entropy {loss_dict['CV_entropy'].is_cuda}")
-        #print(f"device of elbo1 is cuda: {loss_dict['c_clusster_kld'].is_cuda}")
+        #print(f"device of elbo1 is cuda: {loss_dict['c_cluster_kld'].is_cuda}")
         #print(f"device of elbo2 is cuda: {loss_dict['kumar2beta_kld'].is_cuda}")
         #print(f"device of elbo3 is cuda: {loss_dict['w_context_kld'].is_cuda}")
         #print(f"device of elbo4 is cuda: {loss_dict['z_latent_space_kld'].is_cuda}")
@@ -948,7 +1094,8 @@ def train(epoch):
 
         loss_dict['loss'].backward()
         train_loss += loss_dict['loss'].item()
-        torch.nn.utils.clip_grad_norm(net.parameters(), grad_clip)
+        
+        torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
         optimizer.step()
 
         train_loss_avg[-1] += loss_dict['loss'].item()
@@ -965,39 +1112,65 @@ def train(epoch):
                 epoch, batch_idx * len(X), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader),
                 loss_dict['loss'].item() / len(X)))
-        if (epoch > 1) and (epoch % 50 == 0):
+        if (epoch > 1) and (epoch % 25 == 0):
             #plot low dimensional embedding
-            z_loc = net.get_component_samples()
+            reconst_images_concatenate = net.get_component_samples(hyperParams["batch_size"])
             model_tsne = TSNE(n_components=2, random_state=0)
-            z_states = z_loc.detach().cpu().numpy()
+            z_states = net.z_x.detach().cpu().numpy()
+            print(f'size of the latent dimension {z_states.shape}')
             z_embed = model_tsne.fit_transform(z_states)
+            print(f'size of the embedding dimension {z_embed.shape}')
             classes = classes.detach().cpu().numpy()
             order_classes=set()
             ls =[x for x in classes if x not in order_classes and  order_classes.add(x) is None]
+            matplotlib.use("Agg")
             fig = plt.figure()
             for ic in range(len(ls)):
+                #ind_vec = np.zeros_like(classes)
+                #ind_vec[:, ic] = 1
+                #ind_class = classes[:, ic] == 1
                 ind_class = classes == ic
+                print(f"index of classes {ind_class}")
                 color = plt.cm.Set1(ic)
-                plt.scatter(z_embed[ind_class, 0], z_embed[ind_class, 1], s=1, color=color)
+                plt.scatter(z_embed[ind_class, 0], z_embed[ind_class, 1], s=10, edgecolors=color, facecolors='none')
                 plt.title("Latent Variable T-SNE per Class")
                 fig.savefig(str(Path().absolute())+"/results/StickBreaking_GMM_VAE_embedding_" + str(ic) + "_epoch_"+str(epoch)+".png")
             fig.savefig(str(Path().absolute())+"/results/StickBreaking_GMM_VAE_embedding_epoch_"+str(epoch)+".png")
+            # create original and reconstructed image-grids for
+            d = X.shape[1]
+            w = X.shape[2]
+            h = X.shape[3]
+            orig_img = X.view(len(X), d, w, h)
+            #50 x 3 x 96 x 96
+            recons_img = reconst_images_concatenate.view(len(X), d, w, h)
 
-        if (iters % 500 == 0) or ((epoch == num_epochs-1) and (batch_idx == len(train_loader)-1)):
+            canvas = torch.cat([orig_img, recons_img], 0)
+            canvas = canvas.cpu().data
+            # save_image(orig_img, f'{directory}orig_grid_sample_{b}.png')
+            canvas_grid = make_grid(
+                canvas, nrow=hyperParams["batch_size"], range=(-1, 1), normalize=True
+            )
+            save_image(canvas, str(Path().absolute())+"/results/StickBreaking_GMM_VAE_recons_grid_sample_prior.png")
 
-             img_list.append(torchvision.utils.make_grid(X_recons_linear[0].detach().cpu(), padding=2, normalize=True))
+        if (iters % 200 == 0) or ((epoch == num_epochs-1) and (batch_idx == len(train_loader)-1)):
+            margll_valid = calc_margLikelihood(X, net) 
+
+            print("\n\nValidation Marginal Likelihood: {:.4f}".format(margll_valid))
+            img_list.append(torchvision.utils.make_grid(X_recons_linear[0].detach().cpu(), padding=2, normalize=True))
         iters += 1
     print('====> Epoch: {} Average loss: {:.4f}'.format(
           epoch, train_loss / len(train_loader.dataset)))
     train_loss_avg[-1] /= num_batches
     print(f' average training loss : {train_loss_avg}')
+    print ("Calculating the marginal likelihood...")
+    
     return train_loss_avg, X_recons_linear, loss_dict['kumar2beta_kld'].item()
 
 
 
 avg_train_loss=[]
-best_loss = 10**15  # Random big number (bigger than the initial loss)
-best_epoch = 0
+best_loss = np.finfo(np.float64).max # Random big number (bigger than the initial loss)
+best_epoch = -1
 regex = re.compile(r'\d+')
 start_epoch = 0
 if os.path.isfile(str(Path().absolute())+"/results/model_StickBreaking_GMM_VAE_*.pth"):
@@ -1016,43 +1189,39 @@ if os.path.isfile(str(Path().absolute())+"/results/model_StickBreaking_GMM_VAE_*
 
 global plotter
 plotter = VisdomLinePlotter(env_name='InfGMMVAE_PLOTS')
-best_model_wts = copy.deepcopy(net.state_dict())
-best_opt       = copy.deepcopy(optimizer.state_dict())
+
+scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.9, patience=2)
 for epoch in range(start_epoch,num_epochs):
 
-       average_epoch_loss, out , elbo2 =train(epoch)
-       avg_train_loss.extend(average_epoch_loss)
-       if epoch % 25 == 0:
+        average_epoch_loss, out , elbo2 =train(epoch)
+        avg_train_loss.extend(average_epoch_loss)
+        if (epoch % 50 == 0) and (epoch > 0):
 
-          img =torchvision.utils.make_grid(out.detach().cpu())
-          img = 0.5*(img + 1)
-          npimg = np.transpose(img.numpy(),(1,2,0))
-          fig = plt.figure(dpi=300)
-          plt.imshow(npimg)
-          plt.imsave(str(Path().absolute())+"/results/reconst_"+str(epoch)+"_epochs.png", npimg)
-       # plot beta-kumaraswamy loss
-       plotter.plot('KL of beta-kumaraswamy distributions', 'val', 'Class Loss', epoch, elbo2)
+            img = make_grid(out.detach().cpu())
+            img = 0.5*(img + 1)
+            npimg = np.transpose(img.numpy(),(1,2,0))
+            fig = plt.figure(dpi=500)
+            plt.imshow(npimg)
+            plt.imsave(str(Path().absolute())+"/results/reconst_"+str(epoch)+"_epochs.png", npimg)
+        # plot beta-kumaraswamy loss
+        plotter.plot('KL of beta-kumaraswamy distributions', 'val', 'Class Loss', epoch, elbo2)
 
-       # plot loss
-       #print(average_epoch_loss)
-       #print(epoch)
-       plotter.plot('Total loss', 'train', 'Class Loss', epoch, average_epoch_loss[0])
+        # plot loss
+        #print(average_epoch_loss)
+        #print(epoch)
+        plotter.plot('Total loss', 'train', 'Class Loss', epoch, average_epoch_loss[0])
 
-
-       if epoch % 25 == 0:
-          torch.save({
+          
+        if (epoch % 200 == 0) and (epoch//200> 0):
+            torch.save({
                     'best_epoch': epoch,
-                    'model_state_dict': best_model_wts,
-                    'optimizer_state_dict': best_opt,
-                    'best_loss': best_loss,
-          }, str(Path().absolute())+"/results/model_StickBreaking_GMM_VAE_"+str(epoch)+".pth")
-
-       if average_epoch_loss[-1] < best_loss:
-          best_loss = average_epoch_loss[-1]
-          best_epoch = epoch
-          best_model_wts = copy.deepcopy(net.state_dict())
-          best_opt       = copy.deepcopy(optimizer.state_dict())
-
+                    'model_state_dict': copy.deepcopy(net.state_dict()),
+                    'optimizer_state_dict': copy.deepcopy(optimizer.state_dict()),
+                    'best_loss': average_epoch_loss[-1],
+            }, str(Path().absolute())+"/results/model_StickBreaking_GMM_VAE_"+str(epoch)+".pth")
+            print("Saved Best Model avg. Loss : {:.4f}".format(average_epoch_loss[-1]))
+        scheduler.step(average_epoch_loss[-1])
+          
 
 
 
@@ -1071,7 +1240,7 @@ plt.figure(figsize=(15,15))
 plt.subplot(1,2,1)
 plt.axis("off")
 plt.title("Real Images")
-plt.imshow(np.transpose(torchvision.utils.make_grid(data[0].to(device=device)[:64], padding=5, normalize=True).cpu(),(1,2,0)))
+plt.imshow(np.transpose(make_grid(data[0].to(device=device)[:64], padding=5, normalize=True).cpu(),(1,2,0)))
 
 ###plot original versus fake images
 plt.subplot(1,2,2)
