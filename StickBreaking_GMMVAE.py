@@ -28,10 +28,10 @@ except ImportError:
     import Image
 from utils import tile_raster_images
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-#tf.reduce_mean -> tensor.mean
-#tf.expand_dims -> tensor.expand
-#tf.transpose -> tensor.permute
-#author: Zahra Sheikhbahaee
+##########################################
+#####  author: Zahra Sheikhbahaee   ######
+## affiliation: University of Waterloo ###
+##########################################
 #set randoom seed
 #torch.random.seed()
 #np.random.seed()
@@ -73,24 +73,7 @@ def gather_nd(params, indices):
     slices = [flatted_indices[:, i] for i in range(ndim)]
     slices += [Ellipsis]
     return params[slices].view(*output_shape)
-"""
-def init_mlp(layer_sizes, std=.01, bias_init=0.):
-    global local_device
-    params = []
-    for n_in, n_out in zip(layer_sizes[:-1], layer_sizes[1:]):
-        params.append([
-            nn.init.normal_(torch.empty(n_in, n_out, device=local_device)).requires_grad_(True),
-            torch.empty(n_out, device=local_device).fill_(bias_init).requires_grad_(True)])
-    return params
 
-
-def mlp(x, params):
-    for i, (W, b) in enumerate(params):
-        x = x@W + b
-        if i < len(params) - 1:
-            x = torch.relu(x)
-    return x
-"""
 def calculate_layer_size( input_size, kernel_size, stride, padding=0):
         numerator = input_size - kernel_size + (2 * padding)
         denominator = stride
@@ -104,6 +87,17 @@ def calculate_channel_sizes( image_channels, max_filters, num_layers):
             channel_sizes.append((prev, new))
         return channel_sizes
 
+def get_flattened_size( image_size, NeuralNetwork ):
+        for layer in NeuralNetwork:
+            if "Conv2d" in str(layer):
+                kernel_size = layer.kernel_size[0]
+                stride = layer.stride[0]
+                padding = layer.padding[0]
+                filters = layer.out_channels
+                image_size = calculate_layer_size(
+                    image_size, kernel_size, stride, padding
+                )
+        return filters * image_size * image_size, image_size
 def init_mlp(layer_sizes, stdev=.01, bias_init=0.):
     global local_device
     params = {'w': [], 'b': []}
@@ -121,31 +115,16 @@ def mlp(X, params):
         h.append(activation(torch.matmul(h[-1], w) + b))
     return torch.matmul(h[-1], params['w'][-1]) + params['b'][-1]
 
-
-
-
-class GMMVAE(nn.Module):
-    #Used this repository as a base
-    # https://github.com/bhavikngala/gaussian_mixture_vae
-    # https://github.com/Nat-D/GMVAE
-    # https://github.com/psanch21/VAE-GMVAE
-    def __init__(self, number_of_mixtures, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4, small_conv=False):
-        super(GMMVAE, self).__init__()
-
-        self.K          = number_of_mixtures
+class InfGMMVAEEncoder(nn.Module):
+    def __init__(self,nchannel, z_dim, hidden_dim, img_width, max_filters=512, num_layers=4, small_conv=False):
+        super(InfGMMVAEEncoder,self).__init__()
         self.nchannel   = nchannel
-        self.base_channels = base_channels
         self.z_dim      = z_dim
-        self.w_dim      = w_dim
         self.hidden_dim = hidden_dim
-        self.device     = device
         self.img_width  = img_width
-        self.batch_size = batch_size
         self.enc_kernel = 4
         self.enc_stride = 2
         self.enc_padding = 0 
-        self._to_linear = None
-        
         ########################
         # ENCODER-CONVOLUTION LAYERS
         if small_conv:
@@ -190,10 +169,10 @@ class GMMVAE(nn.Module):
         
         self.encoder = nn.Sequential(*encoder_layers)
         # Calculate shape of the flattened image
-        h_dim, image_size = self.get_flattened_size(self.img_width)
+        self.h_dim, _ = get_flattened_size(self.img_width, self.encoder)
         
         self.encoder = torch.nn.Sequential(
-        self.encoder, torch.nn.Linear(h_dim, hidden_dim, bias=False),
+        self.encoder, torch.nn.Linear(self.h_dim, hidden_dim, bias=False),
         nn.BatchNorm1d(hidden_dim),
         nn.ReLU(),
         torch.nn.Linear(hidden_dim, hidden_dim, bias=False),
@@ -211,36 +190,39 @@ class GMMVAE(nn.Module):
         # variance of z
 
         self.fc_log_var    = nn.Linear(hidden_dim, z_dim, bias=False)
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.to(device=self.device)
+    
+    def forward(self,X):
+            
+            # Encode
+            self.hlayer = self.encoder(X)
+            # Get latent variables
         
-        ########################
-        #ENCODER-JUST USING FULLY CONNECTED LAYERS
-        #THE LATENT SPACE (W)
-        self.flatten_raw_img = nn.Flatten()
-        self.fc4         = nn.Linear(img_width * img_width * nchannel, hidden_dim)
-        self.bn1d_4      = nn.BatchNorm1d(hidden_dim)
-        self.fc5         = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.bn1d_5      = nn.BatchNorm1d(hidden_dim)
-        # mean of w
-        self.fc6         = nn.Linear(hidden_dim, w_dim, bias=False)
-        self.bn1d_6      = nn.BatchNorm1d(w_dim)
-        # logvar_w
-        self.fc7         = nn.Linear(hidden_dim, w_dim, bias=False)
-        self.bn1d_7      = nn.BatchNorm1d(w_dim)
-        ########################
-        #number of mixtures (c parameter) gets the input from feedforward layers of w and convolutional layers of z
-        self.fc8         = nn.Linear(2*hidden_dim, hidden_dim)
-        self.bn1d_8      = nn.BatchNorm1d(hidden_dim)
-        self.fc9         = nn.Linear(hidden_dim, number_of_mixtures)
-        self.bn1d_9      = nn.BatchNorm1d(number_of_mixtures)
-        ########################
-        #(GENERATOR)
-        # CreatePriorGenerator_Given Z LAYERS P(z|w,c)
-        self.pz_wc_fc0     = nn.Linear(self.w_dim, self.hidden_dim, bias=False)
-        self.pz_wc_bn1d_0  = nn.BatchNorm1d(hidden_dim)
-        self.pz_wc_fc_mean = nn.ModuleList([nn.Linear(self.hidden_dim, self.z_dim, bias=False) for i in range(self.K)])
-        self.pz_wc_bn_mean = nn.ModuleList([nn.BatchNorm1d(self.z_dim) for i in range(self.K)])
-        self.pz_wc_fc_var  = nn.ModuleList([nn.Linear(self.hidden_dim, self.z_dim, bias=False) for i in range(self.K)])
-        self.pz_wc_bn_var  = nn.ModuleList([nn.BatchNorm1d(self.z_dim) for i in range(self.K)])
+            #mean_z
+            mu_z        = self.fc_mu(self.hlayer)
+
+            #logvar_z
+            logvar_z    = self.fc_log_var(self.hlayer)
+            z = self.reparameterize(mu_z, logvar_z)
+            return z, mu_z, logvar_z
+        
+    def reparameterize(self, mu, log_var):
+        
+        eps = torch.randn_like(log_var, device = self.device)
+        return torch.add(mu, torch.mul( log_var.mul(0.5).exp_(), eps))
+
+class InfGMMVAEDecoder(nn.Module):
+    #https://github.com/akashsara/fusion-dance
+    def __init__(self,nchannel, z_dim, hidden_dim, extend_dim, img_width, max_filters=512, num_layers=4, small_conv=False):
+        super(InfGMMVAEDecoder,self).__init__()
+        self.nchannel   = nchannel
+        self.z_dim      = z_dim
+        self.hidden_dim = hidden_dim
+        self.img_width  = img_width
+        self.enc_kernel = 4
+        self.enc_stride = 2
+        self.enc_padding = 0 
         ########################
         # DECODER: CreateXGenerator
         # Px_given_z LAYERS Decoder P(X|Z)
@@ -260,8 +242,8 @@ class GMMVAE(nn.Module):
         decoder_layers.append(nn.Linear(hidden_dim, hidden_dim))
         decoder_layers.append(nn.BatchNorm1d(hidden_dim))
         decoder_layers.append(nn.ReLU())
-        decoder_layers.append(torch.nn.Linear( hidden_dim, h_dim, bias=False))
-        decoder_layers.append(nn.BatchNorm1d(h_dim))
+        decoder_layers.append(torch.nn.Linear( hidden_dim, extend_dim, bias=False))
+        decoder_layers.append(nn.BatchNorm1d(extend_dim))
         #decoder_layers.append(nn.ReLU())
         
         # Unflatten to a shape of (Channels, Height, Width)
@@ -302,6 +284,89 @@ class GMMVAE(nn.Module):
                 decoder_layers.append(nn.Sigmoid())
         self.decoder = nn.Sequential(*decoder_layers)
         #print(f"decode network:\n{self.decoder}")
+    def forward(self, x):
+        return self.decoder(x)
+   
+class InfGaussMMVAECritic(nn.Module):
+    
+    def __init__(self, input_dims, num_layers=4):
+        super(InfGaussMMVAECritic,self).__init__()
+        
+
+        layers = nn.ModuleList()
+        layers.append(nn.Linear(input_dims, input_dims // 2))
+        layers.append(nn.BatchNorm2d(input_dims // 2))
+        # Activation Function
+        layers.append(nn.LeakyReLU())
+        size = input_dims // 2
+        # Fully Connected Block
+        for i in range(num_layers-2):
+            # Convolutional Layer
+            layers.append(
+                nn.Linear(size, size // 2), 
+                nn.BatchNorm1d(size // 2), # Batch Norm
+                nn.LeakyReLU()# Activation Function
+            )
+            size = size // 2
+        layers.append(nn.Linear(size, 1))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class GMMVAE(nn.Module):
+    #Used this repository as a base
+    # https://github.com/bhavikngala/gaussian_mixture_vae
+    # https://github.com/Nat-D/GMVAE
+    # https://github.com/psanch21/VAE-GMVAE
+    def __init__(self, number_of_mixtures, nchannel, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4, small_conv=False):
+        super(GMMVAE, self).__init__()
+
+        self.K          = number_of_mixtures
+        self.nchannel   = nchannel
+        self.z_dim      = z_dim
+        self.w_dim      = w_dim
+        self.hidden_dim = hidden_dim
+        self.device     = device
+        self.img_width  = img_width
+        self.batch_size = batch_size
+        self.enc_kernel = 4
+        self.enc_stride = 2
+        self.enc_padding = 0 
+        self._to_linear = None
+        ####################### Encoder & Decoder of Z #####################
+        self.encoder  = InfGMMVAEEncoder(nchannel, z_dim, hidden_dim, img_width)
+        self.decoder  = InfGMMVAEDecoder(nchannel, z_dim, hidden_dim, self.encoder.h_dim, img_width)
+        ########################
+        #ENCODER-JUST USING FULLY CONNECTED LAYERS
+        #THE LATENT SPACE (W)
+        self.flatten_raw_img = nn.Flatten()
+        self.fc4         = nn.Linear(img_width * img_width * nchannel, hidden_dim)
+        self.bn1d_4      = nn.BatchNorm1d(hidden_dim)
+        self.fc5         = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.bn1d_5      = nn.BatchNorm1d(hidden_dim)
+        # mean of w
+        self.fc6         = nn.Linear(hidden_dim, w_dim, bias=False)
+        self.bn1d_6      = nn.BatchNorm1d(w_dim)
+        # logvar_w
+        self.fc7         = nn.Linear(hidden_dim, w_dim, bias=False)
+        self.bn1d_7      = nn.BatchNorm1d(w_dim)
+        ########################
+        #number of mixtures (c parameter) gets the input from feedforward layers of w and convolutional layers of z
+        self.fc8         = nn.Linear(2*hidden_dim, hidden_dim)
+        self.bn1d_8      = nn.BatchNorm1d(hidden_dim)
+        self.fc9         = nn.Linear(hidden_dim, number_of_mixtures)
+        self.bn1d_9      = nn.BatchNorm1d(number_of_mixtures)
+        ########################
+        #(GENERATOR)
+        # CreatePriorGenerator_Given Z LAYERS P(z|w,c)
+        self.pz_wc_fc0     = nn.Linear(self.w_dim, self.hidden_dim, bias=False)
+        self.pz_wc_bn1d_0  = nn.BatchNorm1d(hidden_dim)
+        self.pz_wc_fc_mean = nn.ModuleList([nn.Linear(self.hidden_dim, self.z_dim, bias=False) for i in range(self.K)])
+        self.pz_wc_bn_mean = nn.ModuleList([nn.BatchNorm1d(self.z_dim) for i in range(self.K)])
+        self.pz_wc_fc_var  = nn.ModuleList([nn.Linear(self.hidden_dim, self.z_dim, bias=False) for i in range(self.K)])
+        self.pz_wc_bn_var  = nn.ModuleList([nn.BatchNorm1d(self.z_dim) for i in range(self.K)])
         
         self.encoder_kumar_a = init_mlp([hidden_dim,self.K-1], 1e-6) #Q(pi|x)
         self.encoder_kumar_b = init_mlp([hidden_dim,self.K-1], 1e-6) #Q(pi|x)
@@ -309,17 +374,7 @@ class GMMVAE(nn.Module):
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.to(device=self.device)
 
-    def get_flattened_size(self, image_size, ):
-        for layer in self.encoder:
-            if "Conv2d" in str(layer):
-                kernel_size = layer.kernel_size[0]
-                stride = layer.stride[0]
-                padding = layer.padding[0]
-                filters = layer.out_channels
-                image_size = calculate_layer_size(
-                    image_size, kernel_size, stride, padding
-                )
-        return filters * image_size * image_size, image_size
+    
 
     def Pz_given_wc(self, w_input):
         # Prior
@@ -355,16 +410,9 @@ class GMMVAE(nn.Module):
         compute z = z_mean + z_var * eps1
         """
         h = data
-        # Encode
-        hlayer = self.encoder(h)
-        # Get latent variables
+        # 1) Cmpute posterior of latent variables Q(Z|x) --->Encoder  (mean_z, logvar_z)
+        z_x, mu_z, logvar_z = self.encoder(h)
         
-        #mean_z
-        mu_z        = self.fc_mu(hlayer)
-
-        #logvar_z
-        logvar_z    = self.fc_log_var(hlayer)
-
         #2) posterior Q(w|X)
         #Create Recogniser for W
         hw       = self.flatten_raw_img(data)
@@ -380,33 +428,20 @@ class GMMVAE(nn.Module):
         #3) posterior P(c|w,z)=Q(c|X)
         #posterior distribution of P(c|w,z^{i})=Q(c|x) where z^{i}~q(z|x)
         #combine hidden layers after convolutional layers for Z latent space and feed forward layers of W latent space
-        zw               = torch.cat([hlayer,hlayer_w],1)
+        zw               = torch.cat([self.encoder.hlayer,hlayer_w],1)
         hc               = zw
         hc               = F.relu(self.bn1d_8(self.fc8(hc)))
         Pc_wz            = F.relu(self.bn1d_9(self.fc9(hc)))
         c_posterior      = F.softmax(Pc_wz, dim=-1).to(device=self.device)
+
         #4) posterior of Kumaraswamy given input images 
         #P(kumar_a,kumar_b|X)
 
-        self.kumar_a = torch.exp(mlp(hlayer,self.encoder_kumar_a))
-        self.kumar_b = torch.exp(mlp(hlayer,self.encoder_kumar_b))
+        self.kumar_a = torch.exp(mlp(self.encoder.hlayer,self.encoder_kumar_a))
+        self.kumar_b = torch.exp(mlp(self.encoder.hlayer,self.encoder_kumar_b))
         #print(f"kumaraswamy a: {self.kumar_a[:,self.K-2 ]}")
         #print(f"kumaraswamy b: {self.kumar_b[:,self.K-2 ]}")
-        return mu_w, logvar_w, mu_z, logvar_z, c_posterior
-
-    def reparameterize(self, mu, log_var):
-        """
-        you generate a random distribution w.r.t. the mu and log_var from the embedding space.
-        In order for the back-propagation to work, we need to be able to calculate the gradient.
-        This reparameterization trick first generates a normal distribution, then shapes the distribution
-        with the mu and variance from the encoder.
-
-        This way, we can can calculate the gradient parameterized by this particular random instance.
-        """
-        eps = torch.randn_like(log_var, device = self.device)
-        return torch.add(mu, torch.mul( log_var.mul(0.5).exp_(), eps))
-
-
+        return mu_w, logvar_w, z_x, mu_z, logvar_z, c_posterior
 
     def encoder_decoder_fn(self, X):
 
@@ -415,22 +450,19 @@ class GMMVAE(nn.Module):
         compute z = z_mean + z_var * eps1
         """
 
-
-        self.w_x_mean, self.w_x_logvar, self.z_x_mean, self.z_x_logvar, self.c_posterior = self.GMM_encoder(X)
-        self.z_x_sigma = torch.exp(0.5 * self.z_x_logvar)
         # Sample Z
-        self.z_x       = self.reparameterize(self.z_x_mean, self.z_x_logvar)
+        self.w_x_mean, self.w_x_logvar, self.z_x, self.z_x_mean, self.z_x_logvar, self.c_posterior = self.GMM_encoder(X)
+        self.z_x_sigma = torch.exp(0.5 * self.z_x_logvar)
+        
 
         #Build a two layers MLP to compute Q(w|x)
         self.w_x_sigma = torch.exp(0.5* self.w_x_logvar)
 
-
-        self.w_x       = self.reparameterize(self.w_x_mean, self.w_x_logvar)
+        self.w_x       = self.encoder.reparameterize(self.w_x_mean, self.w_x_logvar)
 
         #Build the decoder P(x|z)
         #
         self.x_recons  = self.Px_given_z(self.z_x)
-
 
         #priorGenerator(w_sample)
         #P(z_i|w,c_i)
@@ -439,7 +471,7 @@ class GMMVAE(nn.Module):
         self.z_wc_mean_list_sample, self.z_wc_logvar_list_sample = self.Pz_given_wc(self.w_x)
         z_sample_list = list()
         for i in range(self.K):
-            z_sample = self.reparameterize(self.z_wc_mean_list_sample[i], self.z_wc_logvar_list_sample[i])
+            z_sample = self.encoder.reparameterize(self.z_wc_mean_list_sample[i], self.z_wc_logvar_list_sample[i])
             z_sample_list.append(z_sample)
         #pdb.set_trace()
         return z_sample_list
@@ -447,18 +479,11 @@ class GMMVAE(nn.Module):
 
     def reconstruct_img(self, img):
         # encode image x
-        #building x_recon
+        #building recunstruction of data
 
-        _, _, z_loc, z_logvar, _ = self.GMM_encoder(img)
-
-
-        # sample in latent space
-        z      = self.reparameterize(z_loc, z_logvar)
-
-        reconst_X = self.Px_given_z(z)
-        return reconst_X
-
-
+        _, _, z_x, _, _, _ = self.GMM_encoder(img)
+        
+        return self.Px_given_z(z_x)
 
 
 def compute_nll(x, x_recon_linear):
@@ -476,7 +501,26 @@ def beta_fn(a,b):
     global SMALL 
     return torch.exp(torch.lgamma(torch.tensor(a+SMALL , dtype=torch.float64, device=local_device)) + torch.lgamma(torch.tensor(b+SMALL , dtype=torch.float64, device=local_device)) - torch.lgamma(torch.tensor(a+b+SMALL , dtype=torch.float64, device=local_device)))
 
-
+def gradient_penalty(critic, real, fake, device):
+    #wasserstein distance with gradient penalty model
+    BATCH_SIZE, C, H, W= real.shape
+    #one epsilon value for each
+    epsilon = torch.rand((BATCH_SIZE,1,1,1)).repeat(1,C,H,W).to(device)
+    interpolated_images = real*epsilon+fake*(1-epsilon)
+    #calculate critic score
+    mixed_scores        = critic(interpolated_images)
+    #calculate gradient of mixed score w.r.t. interpolated iimages
+    gradient = torch.autograd.grad(
+        inputs      = interpolated_images,
+        outputs     = mixed_scores,
+        grad_outputs= torch.one_like(mixed_scores),
+        create_grad = True,
+        retain_grad = True,
+    )[0]
+    gradient      =  gradient.view(gradient.shape[0],-1)
+    gradient_norm =  gradient.norm(2, dim=1)
+    gradient_penalty =  torch.mean(torch.pow(gradient_norm-1 ,2))
+    return gradient_penalty
 
 def compute_kumar2beta_kld(a, b, alpha, beta):
     ####### Error occurs here ##############
@@ -565,10 +609,10 @@ def gumbel_softmax_sample(log_pi, temperature, eps=1e-20):
 ### Gaussian Mixture Model VAE Class
 class InfGaussMMVAE(GMMVAE):
     # based on this implementation :https://github.com/enalisnick/mixture_density_VAEs
-    def __init__(self, hyperParams, K, nchannel, base_channels, z_dim, w_dim, hidden_dim, device, img_width, batch_size, include_elbo2):
+    def __init__(self, hyperParams, K, nchannel, z_dim, w_dim, hidden_dim, device, img_width, batch_size, include_elbo2):
         global local_device
         local_device = device
-        super(InfGaussMMVAE, self).__init__(K, nchannel, base_channels, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4, small_conv=False)
+        super(InfGaussMMVAE, self).__init__(K, nchannel, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4, small_conv=False)
 
         self.prior      = hyperParams['prior']
         self.K          = hyperParams['K']
@@ -1048,7 +1092,7 @@ raw_img_width = data.shape[3]
 print('images size in the training data: ', raw_img_width)
 
 
-net = InfGaussMMVAE(hyperParams, 20, 3, 4, 200, 150, 500, device, raw_img_width, hyperParams["batch_size"],include_elbo2=True)
+net = InfGaussMMVAE(hyperParams, 20, 3, 200, 150, 500, device, raw_img_width, hyperParams["batch_size"],include_elbo2=True)
 
 params = list(net.parameters())
 #if torch.cuda.device_count() > 1:
