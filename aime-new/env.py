@@ -252,7 +252,7 @@ class ControlSuiteEnv():
       done = done or self.t == self.max_episode_length
       if done:
         break
-    return observation, reward, done
+    return torch.tensor(observation, dtype=torch.float32), reward, done
 
   def render(self):
     pass
