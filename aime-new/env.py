@@ -237,8 +237,8 @@ class ControlSuiteEnv():
 
   def reset(self):
     self.t = 0  # Reset internal timer
-    state = self._env.reset()
-    return state
+    observation = self._env.reset()
+    return torch.tensor(observation, dtype=torch.float32)
 
   def step(self, action):
     action = action.detach().numpy()
