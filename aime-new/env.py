@@ -1,8 +1,6 @@
 from torchvision.transforms.functional import resize
 import numpy as np
 import torch
-from gym.spaces import Box
-import pybullet_envs
 
 import dmc2gym
 import gym
