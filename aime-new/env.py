@@ -247,8 +247,8 @@ class ControlSuiteEnv():
     done = None
     for k in range(self.action_repeat):
       observation, reward_k, done, _ = self._env.step(action)
-      self.t += 1  # Increment internal timer
-      reward += reward_k
+      self.t =  self.t + 1  # Increment internal timer
+      reward = reward + reward_k
       done = done or self.t == self.max_episode_length
       if done:
         break
@@ -303,8 +303,8 @@ class GymEnv():
     reward = 0
     for k in range(self.action_repeat):
       state, reward_k, done, _ = self._env.step(action)
-      reward += reward_k
-      self.t += 1  # Increment internal timer
+      reward = reward + reward_k
+      self.t =  self.t + 1  # Increment internal timer
       done = done or self.t == self.max_episode_length
       if done:
         break

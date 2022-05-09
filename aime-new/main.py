@@ -114,7 +114,7 @@ elif not args.test:
       next_observation, reward, done = env.step(action)
       D.append(observation, action, reward, done)
       observation = next_observation
-      t += 1
+      t = t + 1
     metrics['steps'].append(t * args.action_repeat + (0 if len(metrics['steps']) == 0 else metrics['steps'][-1]))
     metrics['episodes'].append(s)
 
@@ -280,7 +280,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       episode_q_values = torch.cat([episode_q_values, q_value], dim=0)
       episode_rewards = torch.cat([episode_rewards, torch.Tensor([[reward]]).to(device=args.device)], dim=0)
       D.append(observation, action.detach().cpu(), reward, done)
-      total_reward += reward
+      total_reward = total_reward + reward
       
       #if (time_step % args.num_planning_steps == 0) or done:
         # compute returns in reverse order in the episode reward list
@@ -381,7 +381,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           _, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
         episode_states = torch.cat([episode_states, current_latent_state], dim=0)
         episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
-        total_rewards += reward.numpy()
+        total_rewards = total_reward + reward.numpy()
         if not args.symbolic_env:  # Collect real vs. predicted frames for video
           if args.use_regular_vae:
             video_frames.append(make_grid(torch.cat([observation, observation_model(current_latent_state).cpu()], dim=3), nrow=5).numpy())  # Decentre
