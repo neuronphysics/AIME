@@ -242,10 +242,10 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   observation, total_reward, time_step = env.reset(), 0, 0
   with torch.no_grad():
     if args.use_regular_vae:
-      current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
+      current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
       current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
     else:
-      _, current_latent_state = infinite_vae(observation.to(device=args.device))
+      _, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
   episode_states = torch.zeros(args.lagging_size, args.state_size, device=args.device)
   episode_states[-1] = current_latent_state
   episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
@@ -266,10 +266,10 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       observation, reward, done = env.step(action[0].cpu())
       with torch.no_grad():
         if args.use_regular_vae:
-          current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
+          current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
           current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
         else:
-          _, current_latent_state = infinite_vae(observation.to(device=args.device))
+          _, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
       transition_kl = -transition_dist.log_prob(current_latent_state)
       transition_mll_loss = -actor_critic_planner.transition_mll(transition_dist, current_latent_state)
       episode_transition_kl = torch.cat([episode_transition_kl, transition_kl.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
@@ -363,10 +363,10 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
       episode_states = torch.zeros(args.lagging_size, args.state_size, device=args.device)
       if args.use_regular_vae:
-        current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
+        current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
         current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
       else:
-        reconstructed_observation, current_latent_state = infinite_vae(observation.to(device=args.device))
+        reconstructed_observation, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
       episode_states[-1] = current_latent_state
       episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
@@ -375,10 +375,10 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           action, _, _, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
         observation, reward, done = test_envs.step(action.cpu())
         if args.use_regular_vae:
-          current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
+          current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
           current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
         else:
-          _, current_latent_state = infinite_vae(observation.to(device=args.device))
+          _, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
         episode_states = torch.cat([episode_states, current_latent_state], dim=0)
         episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
         total_rewards += reward.numpy()
