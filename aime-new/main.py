@@ -242,7 +242,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   observation, total_reward, time_step = env.reset(), 0, 0
   with torch.no_grad():
     if args.use_regular_vae:
-      current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
+      current_latent_mean, current_latent_std = bottle_two_output(encoder, (observations.to(device=args.device), ))
       current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
     else:
       _, current_latent_state = infinite_vae(observation.to(device=args.device))
@@ -266,7 +266,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       observation, reward, done = env.step(action[0].cpu())
       with torch.no_grad():
         if args.use_regular_vae:
-          current_latent_mean, current_latent_std = encoder(observation.to(device=args.device))
+          current_latent_mean, current_latent_std = bottle_two_output(encoder, (observations.to(device=args.device), ))
           current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
         else:
           _, current_latent_state = infinite_vae(observation.to(device=args.device))
