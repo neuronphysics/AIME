@@ -232,7 +232,7 @@ class ControlSuiteEnv():
     self._env.seed(seed)
     self.max_episode_length = max_episode_length
     self.action_repeat = action_repeat
-    if action_repeat != CONTROL_SUITE_ACTION_REPEATS[domain_name]:
+    if domain_name in CONTROL_SUITE_ACTION_REPEATS and action_repeat != CONTROL_SUITE_ACTION_REPEATS[domain_name]:
       print('Using action repeat %d; recommended action repeat for domain is %d' % (action_repeat, CONTROL_SUITE_ACTION_REPEATS[domain_name]))
 
   def reset(self):
