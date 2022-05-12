@@ -291,23 +291,23 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         break
 
   current_q_values = episode_q_values
-  previous_q_values = episode_q_values[:-1]
+  previous_q_values = episode_q_values
   current_rewards = episode_rewards
   current_policy_kl = episode_policy_kl
   current_transition_kl = episode_transition_kl
-  current_values = episode_values[1:]
+  current_values = episode_values
   previous_values = episode_values
   soft_v_values = current_q_values - current_transition_kl - current_policy_kl
   target_q_values = args.temperature_factor * current_rewards + args.discount_factor * current_values
   value_loss = F.mse_loss(previous_values, soft_v_values, reduction='none').mean()
-  q_loss = torch.tensor(0).to(device=args.device) if target_q_values.size(0) == 0 else F.mse_loss(previous_q_values, target_q_values, reduction='none').mean()
+  q_loss = F.mse_loss(previous_q_values, target_q_values, reduction='none').mean()
   policy_loss = (current_policy_kl - current_q_values + previous_values).mean()
   
   current_policy_mll_loss = episode_policy_mll_loss.mean()
   current_transition_mll_loss = episode_transition_mll_loss.mean()
   
   planning_optimiser.zero_grad()
-  (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward(retain_graph=True)
+  (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
   
@@ -372,9 +372,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         total_rewards = total_reward + reward.numpy()
         if not args.symbolic_env:  # Collect real vs. predicted frames for video
           if args.use_regular_vae:
-            video_frames.append(make_grid(torch.cat([observation, observation_model(current_latent_state).cpu()], dim=3), nrow=5).numpy())  # Decentre
+            video_frames.append(make_grid(observation, nrow=5).numpy())  # Decentre
           else:
-            video_frames.append(make_grid(torch.cat([observation, reconstructed_observation.permute(0, 3, 1, 2).cpu()], dim=3), nrow=5).numpy())  # Decentre
+            video_frames.append(make_grid(observation, nrow=5).numpy())  # Decentre
         if done.sum().item() == args.test_episodes:
           pbar.close()
           break
