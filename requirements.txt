@@ -1,7 +1,9 @@
-torch==1.9.0
+torch==1.10.0
 torchfile==0.1.0
-torchvision==0.5.0
+torchvision==0.11.1
 gym==0.18.3
-pybullet==3.0.6
-pyro-ppl==1.7.0
-gpytorch==1.0.1
+gpytorch==1.6.0
+matplotlib
+plotly
+dm-control
+git+https://github.com/denisyarats/dmc2gym.git
