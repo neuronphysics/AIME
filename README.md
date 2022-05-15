@@ -1,6 +1,7 @@
 # AIME
 ## Implementation of the new model
-Note that the current work is being done in branch `implement-planner`
+
+To train the model and the agent, run `python aime-new/main.py`
 
 # For running the infinite GMM variational autoencoder and using visdom use this line 
 ssh -L 8097:127.0.0.1:8097 username@hostname
@@ -21,3 +22,6 @@ http://localhost:16010
 4. https://gpytorch.ai/
 5. https://github.com/Kaixhin/PlaNet
 6. https://github.com/ku2482/slac.pytorch
+7. https://github.com/Olloxan/Pytorch-A2C
+8. https://github.com/higgsfield/Imagination-Augmented-Agents
+9. https://github.com/pranz24/pytorch-soft-actor-critic
