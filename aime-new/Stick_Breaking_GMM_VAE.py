@@ -695,199 +695,199 @@ class AdaBound(Optimizer):
         return loss
 
 
+if __name__ == '__main__':
+    #data analysis
+    from torchvision import datasets, transforms
+    from torch import nn, optim
+    from torchvision.utils import save_image
+    import torch.backends.cudnn as cudnn
+    import torch.optim as optim
+    import torch.utils.data.dataloader as DataLoader
+    from torch.utils.data import Dataset
+    from sklearn.manifold import TSNE
+    from torchvision import datasets, transforms
+    import os
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-#data analysis
-from torchvision import datasets, transforms
-from torch import nn, optim
-from torchvision.utils import save_image
-import torch.backends.cudnn as cudnn
-import torch.optim as optim
-import torch.utils.data.dataloader as DataLoader
-from torch.utils.data import Dataset
-from sklearn.manifold import TSNE
-from torchvision import datasets, transforms
-import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    '''
+    if torch.cuda.is_available():
+        device = "cuda:0"
+    else:
+        device = "cpu"
+    '''
 
-'''
-if torch.cuda.is_available():
-    device = "cuda:0"
-else:
-    device = "cpu"
-'''
-
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-])
-device = torch.device('cuda')
-hyperParams = {"batch_size": 50,
-               "input_d": 1,
-               "prior": 1, #dirichlet_alpha'
-               "K": 25,
-               "hidden_d": 80,
-               "latent_d": 20,
-               "latent_w": 10}
-
-
-# # Preparing Data : STL10
-print("Loading trainset...")
-train_dataset = datasets.STL10('../data', split='train', transform=transform,
-                              target_transform=None, download=True)
-train_loader = DataLoader.DataLoader(train_dataset, batch_size=hyperParams["batch_size"], shuffle=True, num_workers=4)
-print("Loading testset...")
-test_dataset = datasets.STL10('../data', split='test', transform=transform,
-                             target_transform=None, download=True)
-test_loader  = DataLoader.DataLoader(test_dataset, batch_size=hyperParams["batch_size"], shuffle=True, num_workers=4)
-print("Done!")
-##########
-
-train_dataset_data = train_dataset.data
-train_dataset_label = train_dataset.labels
-
-print(train_dataset_label.shape)
-label_class = np.array(list(set(train_dataset.labels)))
-print(label_class.shape)
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    device = torch.device('cuda')
+    hyperParams = {"batch_size": 50,
+                "input_d": 1,
+                "prior": 1, #dirichlet_alpha'
+                "K": 25,
+                "hidden_d": 80,
+                "latent_d": 20,
+                "latent_w": 10}
 
 
+    # # Preparing Data : STL10
+    print("Loading trainset...")
+    train_dataset = datasets.STL10('../data', split='train', transform=transform,
+                                target_transform=None, download=True)
+    train_loader = DataLoader.DataLoader(train_dataset, batch_size=hyperParams["batch_size"], shuffle=True, num_workers=4)
+    print("Loading testset...")
+    test_dataset = datasets.STL10('../data', split='test', transform=transform,
+                                target_transform=None, download=True)
+    test_loader  = DataLoader.DataLoader(test_dataset, batch_size=hyperParams["batch_size"], shuffle=True, num_workers=4)
+    print("Done!")
+    ##########
 
-data, label  = iter(train_loader).next()
+    train_dataset_data = train_dataset.data
+    train_dataset_label = train_dataset.labels
 
-
-print('data shape', data.shape)
-print('label shape', label.shape)
-raw_img_width = data.shape[3]
-print('image size', raw_img_width)
-
-
-net = InfGaussMMVAE(hyperParams, 25, 3, 4, 20, 10, 80, device, raw_img_width, hyperParams["batch_size"],include_elbo2=True)
-params = list(net.parameters())
-#if torch.cuda.device_count() > 1:
-#    net = nn.DataParallel(net)
-net = net.to(device)
-
-#net.cuda()
-#optimizer = optim.Adam(net.parameters(), lr=1e-4, weight_decay=1e-8)
-
-optimizer = AdaBound(net.parameters(), lr=0.0001)
+    print(train_dataset_label.shape)
+    label_class = np.array(list(set(train_dataset.labels)))
+    print(label_class.shape)
 
 
-def train(epoch):
-    train_loss_avg = []
-    net.train()
-    train_loss = 0
-    train_loss_avg.append(0)
-    num_batches = 0
-    for batch_idx, (X, _) in enumerate(train_loader):
-        X = X.to(device=device, dtype=torch.float)
-        optimizer.zero_grad()
-        X_recons_linear, vector_z = net(X)
-        loss = sum(net.get_ELBO(X))
-        loss.backward()
-        train_loss += loss.item()
-        optimizer.step()
 
-        train_loss_avg[-1] += loss.item()
-        num_batches += 1
-        if batch_idx % 5 == 0:
-            '''
-            if epoch % 2 == 0:
-                plt.figure(0)
-                plt.imshow(X[0].permute(1,2,0).cpu())
-                plt.show()
-                plt.figure(1)
-                plt.imshow(X_recons_linear[0].detach().cpu().numpy())
-                plt.show()
-            '''
+    data, label  = iter(train_loader).next()
 
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(X), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader),
-                loss.item() / len(X)))
 
-    print('====> Epoch: {} Average loss: {:.4f}'.format(
-          epoch, train_loss / len(train_loader.dataset)))
-    train_loss_avg[-1] /= num_batches
-    print(train_loss_avg)
-    return train_loss_avg
+    print('data shape', data.shape)
+    print('label shape', label.shape)
+    raw_img_width = data.shape[3]
+    print('image size', raw_img_width)
 
-avg_train_loss=[]
-best_loss = 10**15  # Random big number (bigger than the initial loss)
-best_epoch = 0
-for epoch in range(1, 200):
+
+    net = InfGaussMMVAE(hyperParams, 25, 3, 4, 20, 10, 80, device, raw_img_width, hyperParams["batch_size"],include_elbo2=True)
+    params = list(net.parameters())
+    #if torch.cuda.device_count() > 1:
+    #    net = nn.DataParallel(net)
+    net = net.to(device)
+
+    #net.cuda()
+    #optimizer = optim.Adam(net.parameters(), lr=1e-4, weight_decay=1e-8)
+
+    optimizer = AdaBound(net.parameters(), lr=0.0001)
+
+
+    def train(epoch):
+        train_loss_avg = []
+        net.train()
+        train_loss = 0
+        train_loss_avg.append(0)
+        num_batches = 0
+        for batch_idx, (X, _) in enumerate(train_loader):
+            X = X.to(device=device, dtype=torch.float)
+            optimizer.zero_grad()
+            X_recons_linear, vector_z = net(X)
+            loss = sum(net.get_ELBO(X))
+            loss.backward()
+            train_loss += loss.item()
+            optimizer.step()
+
+            train_loss_avg[-1] += loss.item()
+            num_batches += 1
+            if batch_idx % 5 == 0:
+                '''
+                if epoch % 2 == 0:
+                    plt.figure(0)
+                    plt.imshow(X[0].permute(1,2,0).cpu())
+                    plt.show()
+                    plt.figure(1)
+                    plt.imshow(X_recons_linear[0].detach().cpu().numpy())
+                    plt.show()
+                '''
+
+                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                    epoch, batch_idx * len(X), len(train_loader.dataset),
+                    100. * batch_idx / len(train_loader),
+                    loss.item() / len(X)))
+
+        print('====> Epoch: {} Average loss: {:.4f}'.format(
+            epoch, train_loss / len(train_loader.dataset)))
+        train_loss_avg[-1] /= num_batches
+        print(train_loss_avg)
+        return train_loss_avg
+
+    avg_train_loss=[]
+    best_loss = 10**15  # Random big number (bigger than the initial loss)
+    best_epoch = 0
+    for epoch in range(1, 200):
+            
+        average_epoch_loss =train(epoch)
+        avg_train_loss.extend(average_epoch_loss)
+        """
+        if epoch % 50 == 0:
+            torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': net.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss': best_loss,
+            }, "results/model_InfGMM_VAE.pt")
         
-       average_epoch_loss =train(epoch)
-       avg_train_loss.extend(average_epoch_loss)
-       """
-       if epoch % 50 == 0:
-          torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': net.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': best_loss,
-          }, "results/model_InfGMM_VAE.pt")
-       
-       if average_epoch_loss[-1] < best_loss:
-          best_loss = average_epoch_loss[-1]
-          best_epoch = epoch
+        if average_epoch_loss[-1] < best_loss:
+            best_loss = average_epoch_loss[-1]
+            best_epoch = epoch
 
-       if os.path.isfile("results/model_InfGMM_VAE.pt"):
-          net.load_state_dict(torch.load('results/model_InfGMM_VAE.pt'))
-       """
-#plot the loss vvalues
-fig = plt.figure()
-plt.plot(avg_train_loss)
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.savefig('results/Loss_InfGMM_VAE.png')
-net.eval()
+        if os.path.isfile("results/model_InfGMM_VAE.pt"):
+            net.load_state_dict(torch.load('results/model_InfGMM_VAE.pt'))
+        """
+    #plot the loss vvalues
+    fig = plt.figure()
+    plt.plot(avg_train_loss)
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.savefig('results/Loss_InfGMM_VAE.png')
+    net.eval()
 
-test_loss_avg, num_batches = 0, 0
-for image_batch, _ in test_loader:
+    test_loss_avg, num_batches = 0, 0
+    for image_batch, _ in test_loader:
 
-    with torch.no_grad():
+        with torch.no_grad():
 
-        image_batch = image_batch.to(device)
+            image_batch = image_batch.to(device)
 
-        # vae reconstruction
-        X_recons_linear, vector_z = net(image_batch)
-        image_batch_recon, latent_mu, latent_logvar = vae(image_batch)
+            # vae reconstruction
+            X_recons_linear, vector_z = net(image_batch)
+            image_batch_recon, latent_mu, latent_logvar = vae(image_batch)
 
-        # reconstruction error
-        loss = sum(net.get_ELBO(image_batch))
+            # reconstruction error
+            loss = sum(net.get_ELBO(image_batch))
 
-        test_loss_avg += loss.item()
-        num_batches += 1
+            test_loss_avg += loss.item()
+            num_batches += 1
 
-test_loss_avg /= num_batches
-print('average reconstruction error: %f' % (test_loss_avg))
+    test_loss_avg /= num_batches
+    print('average reconstruction error: %f' % (test_loss_avg))
 
 
 
-def to_img(x):
-    x = x.clamp(0, 1)
-    return x
+    def to_img(x):
+        x = x.clamp(0, 1)
+        return x
 
-def show_image(img):
-    img = to_img(img)
-    npimg = img.numpy()
-    plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    def show_image(img):
+        img = to_img(img)
+        npimg = img.numpy()
+        plt.imshow(np.transpose(npimg, (1, 2, 0)))
 
-def visualise_output(images, model):
+    def visualise_output(images, model):
 
-    with torch.no_grad():
+        with torch.no_grad():
 
-        images = images.to(device)
-        images, _, _ = model(images)
-        images = images.cpu()
-        images = to_img(images)
-        np_imagegrid = torchvision.utils.make_grid(images[1:50], 10, 5).numpy()
-        plt.imshow(np.transpose(np_imagegrid, (1, 2, 0)))
-        plt.show()
+            images = images.to(device)
+            images, _, _ = model(images)
+            images = images.cpu()
+            images = to_img(images)
+            np_imagegrid = torchvision.utils.make_grid(images[1:50], 10, 5).numpy()
+            plt.imshow(np.transpose(np_imagegrid, (1, 2, 0)))
+            plt.show()
 
-images, labels = iter(test_loader).next()
-show_image(torchvision.utils.make_grid(images[1:50],10,5))
-plt.savefig('results/Original_Images_InfGMM_VAE.png')
-visualise_output(images, net)
-plt.savefig('results/Reconstructed_Images_InfGMM_VAE.png')
+    images, labels = iter(test_loader).next()
+    show_image(torchvision.utils.make_grid(images[1:50],10,5))
+    plt.savefig('results/Original_Images_InfGMM_VAE.png')
+    visualise_output(images, net)
+    plt.savefig('results/Reconstructed_Images_InfGMM_VAE.png')
 
