@@ -1184,8 +1184,8 @@ import time
 import argparse
 #import wandb
 #plotting using visdom
-from visdom import Visdom
-from visdom import server
+#from visdom import Visdom
+#from visdom import server
 from subprocess import Popen, PIPE
 from pathlib import Path
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -1201,6 +1201,7 @@ parser.add_argument('--visdom_server', default="http://localhost",help='visdom s
 parser.add_argument('--visdom_port', default=8097, help='visdom port of the web display')
 args = parser.parse_args()
 #server.start_server()
+'''
 class VisdomLinePlotter(object):
     """Plots to Visdom"""
     def __init__(self, env_name='main',server=args.visdom_server, port=args.visdom_port):
@@ -1238,7 +1239,7 @@ class VisdomLinePlotter(object):
         if opts is not None:
             default_opts.update(opts)
         self.viz.image(images, win=win, opts=default_opts, env=self.env)
-
+'''
 
 
 transform = transforms.Compose([
