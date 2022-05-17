@@ -12,9 +12,9 @@ from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
 from models import bottle, bottle_two_output, Encoder, ObservationModel, RecurrentGP
-from Stick_Breaking_GMM_VAE import InfGaussMMVAE, AdaBound
+from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
 from planner import ActorCriticPlanner
-from utils import lineplot, write_video
+from utils import lineplot, write_video, AdaBound
 import gpytorch
 from gpytorch.mlls import DeepApproximateMLL, VariationalELBO
 
@@ -129,15 +129,31 @@ if args.use_regular_vae:
   encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.state_size, args.activation_function).to(device=args.device)
   param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters())
 else:
-  hyperParams = {"batch_size": args.batch_size,
-                "input_d": 1,
-                "prior": 1, #dirichlet_alpha'
-                "K": args.num_mixtures,
-                "hidden_d": args.hidden_size,
-                "latent_d": args.state_size,
-                "latent_w": args.w_dim}
-  infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, args.hidden_size, args.device, 64, hyperParams["batch_size"], args.include_elbo2).to(device=args.device)
-  param_list = list(infinite_vae.parameters()) + list(recurrent_gp.parameters())
+  hyperParams = {"batch_size": 100,
+               "input_d": 1,
+               "prior_alpha": 7., #gamma_alpha
+               "prior_beta": 1., #gamma_beta
+               "K": 25,
+               "hidden_d": 500,
+               "latent_d": 200,
+               "latent_w": 150,
+               "LAMBDA_GP": 10, #hyperparameter for WAE with gradient penalty
+               "LEARNING_RATE": 1e-4,
+               "CRITIC_ITERATIONS" : 5
+               }
+  infinite_vae = InfGaussMMVAE(hyperParams, hyperParams["K"], 3, hyperParams["latent_d"], hyperParams["latent_w"], hyperParams["hidden_d"], args.device, 64, hyperParams["batch_size"],include_elbo2=True).to(device=args.device)
+  
+  vae_encoder, vae_decoder, discriminator = infinite_vae.encoder, infinite_vae.decoder, VAECritic(infinite_vae.z_dim)
+
+  enc_optim = torch.optim.Adam(vae_encoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+  dec_optim = torch.optim.Adam(vae_decoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+  dis_optim = torch.optim.Adam(discriminator.parameters(), lr = 0.5 * hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+
+  enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
+  dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
+  dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
+  
+  param_list = list(recurrent_gp.parameters())
 
 optimiser = AdaBound(param_list, lr=0.0001) if args.use_ada_bound else optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
@@ -180,7 +196,39 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           latent_kl_loss = kl_divergence(latent_dist, global_prior).sum(dim=2).mean(dim=(0, 1))
           latent_states = latent_dist.rsample()
         else:
-          reconstructed_observations, latent_states = bottle_two_output(infinite_vae, (observations, ))
+          grad_clip = 1.0
+          for _ in range(hyperParams["CRITIC_ITERATIONS"]):
+            X_recons_linear, mu_z, logvar_z, _, _, _, _, _, _, _, _, _ = infinite_vae(observations)
+            z_fake = observations.encoder.reparameterize(mu_z, logvar_z)
+            reconstruct_latent_components = infinite_vae.get_component_samples(hyperParams["batch_size"])
+            
+            critic_real = discriminator(reconstruct_latent_components).reshape(-1)
+            critic_fake = discriminator(z_fake).reshape(-1)
+            gp = gradient_penalty(discriminator, reconstruct_latent_components, z_fake, device=args.device)
+            loss_critic = (
+                -(torch.mean(critic_real) - torch.mean(critic_fake)) + hyperParams["LAMBDA_GP"] * gp
+            )
+            discriminator.zero_grad()
+            loss_critic.backward(retain_graph=True)
+            dis_optim.step()
+          gen_fake = discriminator(z_fake).reshape(-1)
+        
+          loss_dict = infinite_vae.get_ELBO(observations)
+          loss_dict["wasserstein_loss"] =  -torch.mean(gen_fake)
+          vae_encoder.zero_grad()
+          vae_decoder.zero_grad()
+          
+          loss_dict["WAE-GP"]=loss_dict["loss"]+loss_dict["wasserstein_loss"]
+
+          loss_dict["WAE-GP"].backward()
+          
+          torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), grad_clip)
+
+          enc_optim.step()
+          dec_optim.step()
+          
+          latent_states = infinite_vae.get_latent_states(observations)
+
         init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
         predicted_rewards = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
         if (not args.non_cumulative_reward):
