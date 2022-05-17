@@ -197,6 +197,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           latent_states = latent_dist.rsample()
         else:
           grad_clip = 1.0
+          original_shape = observations.shape
+          observations = observations.view(-1, original_shape[-1], original_shape[-2], original_shape[-3])
           for _ in range(hyperParams["CRITIC_ITERATIONS"]):
             X_recons_linear, mu_z, logvar_z, _, _, _, _, _, _, _, _, _ = infinite_vae(observations)
             z_fake = observations.encoder.reparameterize(mu_z, logvar_z)
@@ -227,7 +229,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           enc_optim.step()
           dec_optim.step()
           
-          latent_states = infinite_vae.get_latent_states(observations)
+          latent_states = torch.reshape(infinite_vae.get_latent_states(observations), original_shape)
 
         init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
         predicted_rewards = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
@@ -238,8 +240,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
         if args.use_regular_vae:
           observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
-        else:
-          elbo1, elbo2, elbo3, elbo4, elbo5 = infinite_vae.get_ELBO(observations.view(-1, 3, 64, 64))
+
         # Apply linearly ramping learning rate schedule
         if args.learning_rate_schedule != 0:
           for group in optimiser.param_groups:
@@ -249,14 +250,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         if args.use_regular_vae:
           (observation_loss + reward_loss + latent_kl_loss).backward()
         else:
-          (elbo1 + elbo2 + elbo3 + elbo4 + elbo5 + reward_loss).backward()
+          reward_loss.backward()
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
         optimiser.step()
         # Store loss
         if args.use_regular_vae:
           losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item()])
         else:
-          losses.append([elbo1.item(), elbo2.item(), elbo3.item(), elbo4.item(), elbo5.item(), reward_loss.item()])
+          losses.append([0, 0, 0, 0, 0, reward_loss.item()])
 
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
