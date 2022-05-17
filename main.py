@@ -229,7 +229,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           enc_optim.step()
           dec_optim.step()
           
-          latent_states = torch.reshape(infinite_vae.get_latent_states(observations), original_shape)
+          latent_states = torch.reshape(infinite_vae.get_latent_states(observations), (original_shape[0], original_shape[1], args.state_size))
 
         init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
         predicted_rewards = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
