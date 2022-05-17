@@ -1456,10 +1456,6 @@ def visualise_output(images, model,filename):
         plt.imshow(npimg)
     plt.savefig(filename)
 
-images, labels = iter(test_loader).next()
-show_image(torchvision.utils.make_grid(images[1:50],10,5), str(Path().absolute())+"/results/Original_Images_Hierarchical_StickBreaking_GMM_VAE.png")
-visualise_output(images, net,str(Path().absolute())+"/results/Reconstructed_Images_Hierarchical_StickBreaking_VAE.png")
-
 if __name__ == "__main__":
 
     # default `log_dir` is "runs" - we'll be more specific here
@@ -1673,3 +1669,7 @@ if __name__ == "__main__":
     plt.savefig(str(Path().absolute())+"/results/real_vs_fake_images.jpg")
 
     #plotter.viz.save([plotter.env])###???
+    
+    images, labels = iter(test_loader).next()
+    show_image(torchvision.utils.make_grid(images[1:50],10,5), str(Path().absolute())+"/results/Original_Images_Hierarchical_StickBreaking_GMM_VAE.png")
+    visualise_output(images, net,str(Path().absolute())+"/results/Reconstructed_Images_Hierarchical_StickBreaking_VAE.png")
