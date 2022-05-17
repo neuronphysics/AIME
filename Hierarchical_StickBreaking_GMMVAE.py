@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from collections import OrderedDict
 import pdb
 from typing import TypeVar, List
-from abcmeta import ABCMeta, abstractmethod
+from abc import ABCMeta, abstractmethod
 Tensor = TypeVar('torch.tensor')
 from numpy.testing import assert_almost_equal
 from einops import rearrange
@@ -1266,11 +1266,11 @@ hyperParams = {"batch_size": 100,
 
 # # Preparing Data : STL10
 print("Loading trainset...")
-train_dataset = datasets.STL10('../data', split='train', transform=transform,
+train_dataset = datasets.STL10('./data', split='train', transform=transform,
                               target_transform=None, download=True)
 train_loader = DataLoader.DataLoader(train_dataset, batch_size=hyperParams["batch_size"], shuffle=True, num_workers=0)
 print("Loading testset...")
-test_dataset = datasets.STL10('../data', split='test', transform=transform,
+test_dataset = datasets.STL10('./data', split='test', transform=transform,
                              target_transform=None, download=True)
 test_loader  = DataLoader.DataLoader(test_dataset, batch_size=hyperParams["batch_size"], shuffle=True, num_workers=0)
 
@@ -1547,7 +1547,7 @@ best_loss = np.finfo(np.float64).max # Random big number (bigger than the initia
 best_epoch = -1
 regex = re.compile(r'\d+')
 start_epoch = 0
-for file in os.listdir(str(Path().absolute())+"/results/"):
+for file in os.listdir("./results/"):
     if file.startswith("model_Hierarchical_StickBreaking_GMMVAE_") and file.endswith(".pth"):
         print(file)
         list_of_files = glob.glob(str(Path().absolute())+"/results/model_Hierarchical_StickBreaking_GMMVAE*.pth") # * means all if need specific format then *.csv
