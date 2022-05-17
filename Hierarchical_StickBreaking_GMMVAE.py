@@ -39,6 +39,34 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 #if torch.cuda.is_available():
 #   torch.cuda.seed()
 
+#class of optimizer
+from utils import AdaBound
+#data analysis
+from torch import nn, optim
+from torchvision.utils import save_image, make_grid
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+import torch.utils.data.dataloader as DataLoader
+from torch.utils.data import Dataset
+from torchvision import datasets, transforms
+import torchvision.transforms as transforms
+import torchvision.utils
+import glob
+import re
+import sys
+import copy
+import time
+import argparse
+#import wandb
+#plotting using visdom
+#from visdom import Visdom
+#from visdom import server
+from subprocess import Popen, PIPE
+from pathlib import Path
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+###***********************Tensorboard************************###
+from torch.utils.tensorboard import SummaryWriter
+
 torch.manual_seed(42)
 if torch.cuda.is_available():
    torch.cuda.manual_seed(42)
@@ -1166,43 +1194,6 @@ def calc_margLikelihood(data, model, nSamples=50):
     mLL = m + np.log(np.mean(np.exp( all_samples - m[np.newaxis].T ), axis=1))
     return mLL.mean()
 
-#class of optimizer
-from utils import AdaBound
-#data analysis
-from torch import nn, optim
-from torchvision.utils import save_image, make_grid
-import torch.backends.cudnn as cudnn
-import torch.optim as optim
-import torch.utils.data.dataloader as DataLoader
-from torch.utils.data import Dataset
-from torchvision import datasets, transforms
-import torchvision.transforms as transforms
-import torchvision.utils
-import glob
-import re
-import sys
-import copy
-import time
-import argparse
-#import wandb
-#plotting using visdom
-#from visdom import Visdom
-#from visdom import server
-from subprocess import Popen, PIPE
-from pathlib import Path
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-###***********************Tensorboard************************###
-from torch.utils.tensorboard import SummaryWriter
-
-# default `log_dir` is "runs" - we'll be more specific here
-writer = SummaryWriter(log_dir='scalar', comment='runs/STL10_experiment_1')
-###**********************************************************###
-# Training settings
-#parser = argparse.ArgumentParser(description='PyTorch Stick Breaking Gaussian Mixture VAE....')
-#parser.add_argument('--visdom_server', default="http://localhost",help='visdom server of the web display')
-#parser.add_argument('--visdom_port', default=8097, help='visdom port of the web display')
-#args = parser.parse_args()
-#server.start_server()
 '''
 class VisdomLinePlotter(object):
     """Plots to Visdom"""
@@ -1243,52 +1234,6 @@ class VisdomLinePlotter(object):
         self.viz.image(images, win=win, opts=default_opts, env=self.env)
 '''
 
-
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4467, 0.4398, 0.4066), (0.2603, 0.2566, 0.2713)),
-])
-device = torch.device('cuda')
-
-hyperParams = {"batch_size": 100,
-               "input_d": 1,
-               "prior_alpha": 7., #gamma_alpha
-               "prior_beta": 1., #gamma_beta
-               "K": 25,
-               "hidden_d": 500,
-               "latent_d": 200,
-               "latent_w": 150,
-               "LAMBDA_GP": 10, #hyperparameter for WAE with gradient penalty
-               "LEARNING_RATE": 1e-4,
-               "CRITIC_ITERATIONS" : 5
-               }
-
-
-# # Preparing Data : STL10
-print("Loading trainset...")
-train_dataset = datasets.STL10('./data', split='train', transform=transform,
-                              target_transform=None, download=True)
-train_loader = DataLoader.DataLoader(train_dataset, batch_size=hyperParams["batch_size"], shuffle=True, num_workers=0)
-print("Loading testset...")
-test_dataset = datasets.STL10('./data', split='test', transform=transform,
-                             target_transform=None, download=True)
-test_loader  = DataLoader.DataLoader(test_dataset, batch_size=hyperParams["batch_size"], shuffle=True, num_workers=0)
-
-class_names = ['airplane', 'bird', 'car', 'cat', 'deer', 'dog', 'horse', 'monkey', 'ship', 'truck']
-
-
-print("Done!")
-##########
-
-train_dataset_data = train_dataset.data
-train_dataset_label = train_dataset.labels
-print("training data labels ", train_dataset_label.shape)
-label_class = np.array(list(set(train_dataset.labels)))
-print(f"size of label's class {label_class.shape}")
-
-
-# get some random training images
-data, label  = iter(train_loader).next()
 ###***********************Tensorboard************************###
 # helper function to show an image
 def matplotlib_imshow(img, one_channel=False):
@@ -1301,57 +1246,6 @@ def matplotlib_imshow(img, one_channel=False):
     else:
         plt.imshow(np.transpose(npimg, (1, 2, 0)))
 
-# create grid of images
-
-img_grid = torchvision.utils.make_grid(data)
-
-# show images
-matplotlib_imshow(img_grid, one_channel=True)
-
-# write to tensorboard
-writer.add_image('STL10_images', img_grid)
-writer.close()
-###*********************************************************###
-
-test_data, test_label  = iter(test_loader).next()
-img_width = test_data.shape[3]
-print('image size in test data ', img_width)
-
-print('data shape', data.shape)
-print('label shape', label.shape)
-raw_img_width = data.shape[3]
-print('images size in the training data: ', raw_img_width)
-
-
-net = InfGaussMMVAE(hyperParams, 25, 3, 200, 150, 500, device, raw_img_width, hyperParams["batch_size"],include_elbo2=True)
-
-params = list(net.parameters())
-#if torch.cuda.device_count() > 1:
-#    net = nn.DataParallel(net)
-net = net.to(device=device)
-for name, param in net.named_parameters():
-    if param.device.type != 'cuda':
-        print('param {}, not on GPU'.format(name))
-###*********************************************************###
-
-#net.cuda()
-vae_encoder, vae_decoder, discriminator = net.encoder, net.decoder, VAECritic(net.z_dim)
-
-enc_optim = torch.optim.Adam(vae_encoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
-dec_optim = torch.optim.Adam(vae_decoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
-dis_optim = torch.optim.Adam(discriminator.parameters(), lr = 0.5 * hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
-
-enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
-dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
-dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
-#optimizer = optim.Adam(net.parameters(), lr=hyperParams["LEARNING_RATE"])
-
-##optimizer = AdaBound(net.parameters(), lr=0.0001)
-
-img_list = []
-num_epochs= 2001
-grad_clip = 1.0
-iters=0
 def train(epoch):
     global iters
     batch_time = AverageMeter()
@@ -1542,112 +1436,6 @@ def test(epoch):
         writer.add_scalar('Test reconstruction loss', loss_dict['recon'].item(), epoch)
         writer.add_scalar( 'Test KL loss of Z', loss_dict['z_latent_space_kld'].item(), epoch)
 
-avg_train_loss=[]
-best_loss = np.finfo(np.float64).max # Random big number (bigger than the initial loss)
-best_epoch = -1
-regex = re.compile(r'\d+')
-start_epoch = 0
-for file in os.listdir("./results/"):
-    if file.startswith("model_Hierarchical_StickBreaking_GMMVAE_") and file.endswith(".pth"):
-        print(file)
-        list_of_files = glob.glob(str(Path().absolute())+"/results/model_Hierarchical_StickBreaking_GMMVAE*.pth") # * means all if need specific format then *.csv
-        latest_file = max(list_of_files, key=os.path.getctime)
-        print("latest saved model: ")
-        print(latest_file)
-        checkpoint = torch.load(latest_file)
-        net.load_state_dict(checkpoint['model_state_dict'])
-        #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        enc_optim.load_state_dict(checkpoint['encoder_optimizer_state_dict'])
-        dec_optim.load_state_dict(checkpoint['decoder_optimizer_state_dict'])
-        vae_encoder.load_state_dict(checkpoint['encoder_state_dict'])
-        vae_decoder.load_state_dict(checkpoint['decoder_state_dict'])
-        discriminator.load_state_dict(checkpoint['citic_state_dict'])
-        best_loss   = checkpoint['best_loss']
-        start_epoch = int(regex.findall(latest_file)[-1])
-        print(f"start of epoch: {start_epoch}")
-
-
-####Training
-
-#global plotter
-#plotter = VisdomLinePlotter(env_name='HIERARCHICAL_STICKBREAKING_GMMVAE_PLOTS')
-
-#scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.9, patience=2)
-for epoch in range(start_epoch, num_epochs):
-
-        average_epoch_loss, out , elbo2, wasserstein_loss, latent_dimension_kld = train(epoch)
-        if (epoch % 10 == 0):
-            test(epoch)
-        avg_train_loss.extend(average_epoch_loss)
-        if (epoch % 50 == 0) and (epoch > 0):
-
-            img = make_grid(out.detach().cpu())
-            img = 0.5*(img + 1)
-            npimg = np.transpose(img.numpy(),(1,2,0))
-            fig = plt.figure(dpi=600)
-            plt.imshow(npimg)
-            plt.imsave(str(Path().absolute())+"/results/reconst_images_Hierarchical_StickBreaking_GMMVAE_"+str(epoch)+"_epochs.png", npimg)
-        # plot beta-kumaraswamy loss
-        #plotter.plot('KL of beta-kumaraswamy distributions', 'val', 'Class Loss', epoch, elbo2)
-
-        # plot loss
-        #print(average_epoch_loss)
-        #print(epoch)
-        #plotter.plot('Total loss', 'train', 'Class Loss', epoch, average_epoch_loss[0])
-        vae_encoder.eval()
-        vae_decoder.eval()
-        discriminator.eval()
-        if (epoch % 500 == 0) and (epoch//500> 0):
-            torch.save({
-                    'best_epoch': epoch,
-                    'model_state_dict': copy.deepcopy(net.state_dict()),
-                    'encoder_optimizer_state_dict':copy.deepcopy(enc_optim.state_dict()),
-                    'decoder_optimizer_state_dict':copy.deepcopy(dec_optim.state_dict()),
-                    'encoder_state_dict':copy.deepcopy(vae_encoder.state_dict()),
-                    'decoder_state_dict':copy.deepcopy(vae_decoder.state_dict()),
-                    'citic_state_dict':copy.deepcopy(discriminator.state_dict()),
-                    #'optimizer_state_dict': copy.deepcopy(optimizer.state_dict()),
-                    'best_loss': average_epoch_loss[-1],
-            }, str(Path().absolute())+"/results/model_Hierarchical_StickBreaking_GMMVAE_"+str(epoch)+".pth")
-            print("Saved Best Model avg. Loss : {:.4f}".format(average_epoch_loss[-1]))
-        #scheduler.step(average_epoch_loss[-1])
-        writer.add_scalar('training average loss', average_epoch_loss[-1], epoch )
-        writer.add_scalar('training loss_kld_Kumar_beta', elbo2, epoch )
-        writer.add_scalar('training loss_wasserstein', wasserstein_loss, epoch )
-        writer.add_scalar('training loss_kld_z',latent_dimension_kld, epoch )
-
-writer.flush()
-
-
-
-print('Finished Trainning')
-
-
-#plot the loss values of trained model
-fig = plt.figure()
-plt.plot(avg_train_loss)
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.savefig(str(Path().absolute())+"/results/Loss_Hierarchical_StickBreakingGMM_VAE.png")
-
-# Plot the real images
-plt.figure(figsize=(15,15))
-plt.subplot(1,2,1)
-plt.axis("off")
-plt.title("Real Images")
-plt.imshow(np.transpose(make_grid(data[0].to(device=device)[:64], padding=5, normalize=True).cpu(),(1,2,0)))
-
-###plot original versus fake images
-plt.subplot(1,2,2)
-plt.axis("off")
-plt.title("Fake Images")
-plt.imshow(np.transpose(img_list[-1],(1,2,0)))
-plt.savefig(str(Path().absolute())+"/results/real_vs_fake_images.jpg")
-
-#plotter.viz.save([plotter.env])###???
-
-
-
 def show_image(img, filename):
     img = img.clamp(0, 1)
     npimg = img.numpy()
@@ -1671,3 +1459,217 @@ def visualise_output(images, model,filename):
 images, labels = iter(test_loader).next()
 show_image(torchvision.utils.make_grid(images[1:50],10,5), str(Path().absolute())+"/results/Original_Images_Hierarchical_StickBreaking_GMM_VAE.png")
 visualise_output(images, net,str(Path().absolute())+"/results/Reconstructed_Images_Hierarchical_StickBreaking_VAE.png")
+
+if __name__ == "__main__":
+
+    # default `log_dir` is "runs" - we'll be more specific here
+    writer = SummaryWriter(log_dir='scalar', comment='runs/STL10_experiment_1')
+    ###**********************************************************###
+    # Training settings
+    #parser = argparse.ArgumentParser(description='PyTorch Stick Breaking Gaussian Mixture VAE....')
+    #parser.add_argument('--visdom_server', default="http://localhost",help='visdom server of the web display')
+    #parser.add_argument('--visdom_port', default=8097, help='visdom port of the web display')
+    #args = parser.parse_args()
+    #server.start_server()
+    
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4467, 0.4398, 0.4066), (0.2603, 0.2566, 0.2713)),
+    ])
+    device = torch.device('cuda')
+
+    hyperParams = {"batch_size": 100,
+                "input_d": 1,
+                "prior_alpha": 7., #gamma_alpha
+                "prior_beta": 1., #gamma_beta
+                "K": 25,
+                "hidden_d": 500,
+                "latent_d": 200,
+                "latent_w": 150,
+                "LAMBDA_GP": 10, #hyperparameter for WAE with gradient penalty
+                "LEARNING_RATE": 1e-4,
+                "CRITIC_ITERATIONS" : 5
+                }
+
+
+    # # Preparing Data : STL10
+    print("Loading trainset...")
+    train_dataset = datasets.STL10('./data', split='train', transform=transform,
+                                target_transform=None, download=True)
+    train_loader = DataLoader.DataLoader(train_dataset, batch_size=hyperParams["batch_size"], shuffle=True, num_workers=0)
+    print("Loading testset...")
+    test_dataset = datasets.STL10('./data', split='test', transform=transform,
+                                target_transform=None, download=True)
+    test_loader  = DataLoader.DataLoader(test_dataset, batch_size=hyperParams["batch_size"], shuffle=True, num_workers=0)
+
+    class_names = ['airplane', 'bird', 'car', 'cat', 'deer', 'dog', 'horse', 'monkey', 'ship', 'truck']
+
+
+    print("Done!")
+    ##########
+
+    train_dataset_data = train_dataset.data
+    train_dataset_label = train_dataset.labels
+    print("training data labels ", train_dataset_label.shape)
+    label_class = np.array(list(set(train_dataset.labels)))
+    print(f"size of label's class {label_class.shape}")
+
+
+    # get some random training images
+    data, label  = iter(train_loader).next()
+    
+    # create grid of images
+
+    img_grid = torchvision.utils.make_grid(data)
+
+    # show images
+    matplotlib_imshow(img_grid, one_channel=True)
+
+    # write to tensorboard
+    writer.add_image('STL10_images', img_grid)
+    writer.close()
+    ###*********************************************************###
+
+    test_data, test_label  = iter(test_loader).next()
+    img_width = test_data.shape[3]
+    print('image size in test data ', img_width)
+
+    print('data shape', data.shape)
+    print('label shape', label.shape)
+    raw_img_width = data.shape[3]
+    print('images size in the training data: ', raw_img_width)
+
+
+    net = InfGaussMMVAE(hyperParams, 25, 3, 200, 150, 500, device, raw_img_width, hyperParams["batch_size"],include_elbo2=True)
+
+    params = list(net.parameters())
+    #if torch.cuda.device_count() > 1:
+    #    net = nn.DataParallel(net)
+    net = net.to(device=device)
+    for name, param in net.named_parameters():
+        if param.device.type != 'cuda':
+            print('param {}, not on GPU'.format(name))
+    ###*********************************************************###
+
+    #net.cuda()
+    vae_encoder, vae_decoder, discriminator = net.encoder, net.decoder, VAECritic(net.z_dim)
+
+    enc_optim = torch.optim.Adam(vae_encoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+    dec_optim = torch.optim.Adam(vae_decoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+    dis_optim = torch.optim.Adam(discriminator.parameters(), lr = 0.5 * hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+
+    enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
+    dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
+    dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
+    #optimizer = optim.Adam(net.parameters(), lr=hyperParams["LEARNING_RATE"])
+
+    ##optimizer = AdaBound(net.parameters(), lr=0.0001)
+
+    img_list = []
+    num_epochs= 2001
+    grad_clip = 1.0
+    iters=0
+    
+    avg_train_loss=[]
+    best_loss = np.finfo(np.float64).max # Random big number (bigger than the initial loss)
+    best_epoch = -1
+    regex = re.compile(r'\d+')
+    start_epoch = 0
+    for file in os.listdir("./results/"):
+        if file.startswith("model_Hierarchical_StickBreaking_GMMVAE_") and file.endswith(".pth"):
+            print(file)
+            list_of_files = glob.glob(str(Path().absolute())+"/results/model_Hierarchical_StickBreaking_GMMVAE*.pth") # * means all if need specific format then *.csv
+            latest_file = max(list_of_files, key=os.path.getctime)
+            print("latest saved model: ")
+            print(latest_file)
+            checkpoint = torch.load(latest_file)
+            net.load_state_dict(checkpoint['model_state_dict'])
+            #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            enc_optim.load_state_dict(checkpoint['encoder_optimizer_state_dict'])
+            dec_optim.load_state_dict(checkpoint['decoder_optimizer_state_dict'])
+            vae_encoder.load_state_dict(checkpoint['encoder_state_dict'])
+            vae_decoder.load_state_dict(checkpoint['decoder_state_dict'])
+            discriminator.load_state_dict(checkpoint['citic_state_dict'])
+            best_loss   = checkpoint['best_loss']
+            start_epoch = int(regex.findall(latest_file)[-1])
+            print(f"start of epoch: {start_epoch}")
+
+
+    ####Training
+
+    #global plotter
+    #plotter = VisdomLinePlotter(env_name='HIERARCHICAL_STICKBREAKING_GMMVAE_PLOTS')
+
+    #scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.9, patience=2)
+    for epoch in range(start_epoch, num_epochs):
+
+            average_epoch_loss, out , elbo2, wasserstein_loss, latent_dimension_kld = train(epoch)
+            if (epoch % 10 == 0):
+                test(epoch)
+            avg_train_loss.extend(average_epoch_loss)
+            if (epoch % 50 == 0) and (epoch > 0):
+
+                img = make_grid(out.detach().cpu())
+                img = 0.5*(img + 1)
+                npimg = np.transpose(img.numpy(),(1,2,0))
+                fig = plt.figure(dpi=600)
+                plt.imshow(npimg)
+                plt.imsave(str(Path().absolute())+"/results/reconst_images_Hierarchical_StickBreaking_GMMVAE_"+str(epoch)+"_epochs.png", npimg)
+            # plot beta-kumaraswamy loss
+            #plotter.plot('KL of beta-kumaraswamy distributions', 'val', 'Class Loss', epoch, elbo2)
+
+            # plot loss
+            #print(average_epoch_loss)
+            #print(epoch)
+            #plotter.plot('Total loss', 'train', 'Class Loss', epoch, average_epoch_loss[0])
+            vae_encoder.eval()
+            vae_decoder.eval()
+            discriminator.eval()
+            if (epoch % 500 == 0) and (epoch//500> 0):
+                torch.save({
+                        'best_epoch': epoch,
+                        'model_state_dict': copy.deepcopy(net.state_dict()),
+                        'encoder_optimizer_state_dict':copy.deepcopy(enc_optim.state_dict()),
+                        'decoder_optimizer_state_dict':copy.deepcopy(dec_optim.state_dict()),
+                        'encoder_state_dict':copy.deepcopy(vae_encoder.state_dict()),
+                        'decoder_state_dict':copy.deepcopy(vae_decoder.state_dict()),
+                        'citic_state_dict':copy.deepcopy(discriminator.state_dict()),
+                        #'optimizer_state_dict': copy.deepcopy(optimizer.state_dict()),
+                        'best_loss': average_epoch_loss[-1],
+                }, str(Path().absolute())+"/results/model_Hierarchical_StickBreaking_GMMVAE_"+str(epoch)+".pth")
+                print("Saved Best Model avg. Loss : {:.4f}".format(average_epoch_loss[-1]))
+            #scheduler.step(average_epoch_loss[-1])
+            writer.add_scalar('training average loss', average_epoch_loss[-1], epoch )
+            writer.add_scalar('training loss_kld_Kumar_beta', elbo2, epoch )
+            writer.add_scalar('training loss_wasserstein', wasserstein_loss, epoch )
+            writer.add_scalar('training loss_kld_z',latent_dimension_kld, epoch )
+
+    writer.flush()
+
+
+
+    print('Finished Trainning')
+
+
+    #plot the loss values of trained model
+    fig = plt.figure()
+    plt.plot(avg_train_loss)
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.savefig(str(Path().absolute())+"/results/Loss_Hierarchical_StickBreakingGMM_VAE.png")
+
+    # Plot the real images
+    plt.figure(figsize=(15,15))
+    plt.subplot(1,2,1)
+    plt.axis("off")
+    plt.title("Real Images")
+    plt.imshow(np.transpose(make_grid(data[0].to(device=device)[:64], padding=5, normalize=True).cpu(),(1,2,0)))
+
+    ###plot original versus fake images
+    plt.subplot(1,2,2)
+    plt.axis("off")
+    plt.title("Fake Images")
+    plt.imshow(np.transpose(img_list[-1],(1,2,0)))
+    plt.savefig(str(Path().absolute())+"/results/real_vs_fake_images.jpg")
+
+    #plotter.viz.save([plotter.env])###???
