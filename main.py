@@ -198,7 +198,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         else:
           grad_clip = 1.0
           original_shape = observations.shape
-          observations = observations.view(-1, original_shape[-1], original_shape[-2], original_shape[-3])
+          observations = observations.view(-1, original_shape[-3], original_shape[-2], original_shape[-1])
           for _ in range(hyperParams["CRITIC_ITERATIONS"]):
             X_recons_linear, mu_z, logvar_z, _, _, _, _, _, _, _, _, _ = infinite_vae(observations)
             z_fake = observations.encoder.reparameterize(mu_z, logvar_z)
