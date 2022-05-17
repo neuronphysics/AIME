@@ -201,7 +201,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           observations = observations.view(-1, original_shape[-3], original_shape[-2], original_shape[-1])
           for _ in range(hyperParams["CRITIC_ITERATIONS"]):
             X_recons_linear, mu_z, logvar_z, _, _, _, _, _, _, _, _, _ = infinite_vae(observations)
-            z_fake = observations.encoder.reparameterize(mu_z, logvar_z)
+            z_fake = infinite_vae.encoder.reparameterize(mu_z, logvar_z)
             reconstruct_latent_components = infinite_vae.get_component_samples(hyperParams["batch_size"])
             
             critic_real = discriminator(reconstruct_latent_components).reshape(-1)
