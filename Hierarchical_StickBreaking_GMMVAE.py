@@ -1198,10 +1198,10 @@ from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter(log_dir='scalar', comment='runs/STL10_experiment_1')
 ###**********************************************************###
 # Training settings
-parser = argparse.ArgumentParser(description='PyTorch Stick Breaking Gaussian Mixture VAE....')
-parser.add_argument('--visdom_server', default="http://localhost",help='visdom server of the web display')
-parser.add_argument('--visdom_port', default=8097, help='visdom port of the web display')
-args = parser.parse_args()
+#parser = argparse.ArgumentParser(description='PyTorch Stick Breaking Gaussian Mixture VAE....')
+#parser.add_argument('--visdom_server', default="http://localhost",help='visdom server of the web display')
+#parser.add_argument('--visdom_port', default=8097, help='visdom port of the web display')
+#args = parser.parse_args()
 #server.start_server()
 '''
 class VisdomLinePlotter(object):
