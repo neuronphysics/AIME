@@ -13,13 +13,13 @@ CONTROL_SUITE_ACTION_REPEATS = {'cartpole': 8, 'reacher': 4, 'finger': 2, 'cheet
 
 # Preprocesses an observation inplace (from float32 Tensor [0, 255] to [-0.5, 0.5])
 def preprocess_observation_(observation, bit_depth):
-  observation.div_(2 ** (8 - bit_depth)).floor_().div_(2 ** bit_depth)  # Quantise to given bit depth and centre
+  observation.div_(2 ** (8 - bit_depth)).floor_().div_(2 ** bit_depth).sub_(0.5)  # Quantise to given bit depth and centre
   observation.add_(torch.rand_like(observation).div_(2 ** bit_depth))  # Dequantise (to approx. match likelihood of PDF of continuous images vs. PMF of discrete images)
 
 
 # Postprocess an observation for storage (from float32 numpy array [-0.5, 0.5] to uint8 numpy array [0, 255])
 def postprocess_observation(observation, bit_depth):
-  return np.clip(np.floor((observation) * 2 ** bit_depth) * 2 ** (8 - bit_depth), 0, 2 ** 8 - 1).astype(np.uint8)
+  return np.clip(np.floor((observation + 0.5) * 2 ** bit_depth) * 2 ** (8 - bit_depth), 0, 2 ** 8 - 1).astype(np.uint8)
 
 
 def _images_to_observation(images, bit_depth):
@@ -218,7 +218,7 @@ def ultra_default_reward_adapter(observation: Observation, reward: float) -> flo
 '''
 
 class ControlSuiteEnv():
-  def __init__(self, env, seed, max_episode_length, action_repeat, image_size=64):
+  def __init__(self, env, seed, max_episode_length, action_repeat, bit_depth, image_size=64):
     domain_name, task_name = env.split('-')
     self._env = dmc2gym.make(
         domain_name=domain_name,
@@ -232,13 +232,15 @@ class ControlSuiteEnv():
     self._env.seed(seed)
     self.max_episode_length = max_episode_length
     self.action_repeat = action_repeat
+    self.bit_depth = bit_depth
     if domain_name in CONTROL_SUITE_ACTION_REPEATS and action_repeat != CONTROL_SUITE_ACTION_REPEATS[domain_name]:
       print('Using action repeat %d; recommended action repeat for domain is %d' % (action_repeat, CONTROL_SUITE_ACTION_REPEATS[domain_name]))
 
   def reset(self):
     self.t = 0  # Reset internal timer
-    observation = self._env.reset()
-    return torch.tensor(observation, dtype=torch.float32)
+    observation = torch.tensor(self._env.reset(), dtype=torch.float32)
+    preprocess_observation_(observation, self.bit_depth)
+    return observation
 
   def step(self, action):
     action = action.detach().numpy()
@@ -252,7 +254,9 @@ class ControlSuiteEnv():
       done = done or self.t == self.max_episode_length
       if done:
         break
-    return torch.tensor(observation, dtype=torch.float32), reward, done
+    observation = torch.tensor(observation, dtype=torch.float32)
+    preprocess_observation_(observation, self.bit_depth)
+    return observation, reward, done
 
   def render(self):
     pass
@@ -413,7 +417,7 @@ def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
   if env in GYM_ENVS:
     return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
   elif env in CONTROL_SUITE_ENVS:
-    return ControlSuiteEnv(env, seed, max_episode_length, action_repeat)
+    return ControlSuiteEnv(env, seed, max_episode_length, action_repeat, bit_depth)
   elif (env == 'loop' or env == '4lane'):
     '''
     AGENT_ID = "Agent-001"
