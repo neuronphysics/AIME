@@ -445,6 +445,7 @@ class VAEDecoder(nn.Module):
         decoder_layers.append(nn.Linear(hidden_dim, hidden_dim))
         decoder_layers.append(nn.BatchNorm1d(hidden_dim))
         decoder_layers.append(nn.ReLU())
+        extend_dim = int(max_filters) * self.dec_kernel * self.dec_kernel
         decoder_layers.append(torch.nn.Linear(hidden_dim, extend_dim, bias=False))
         decoder_layers.append(nn.BatchNorm1d(extend_dim))
         decoder_layers.append(nn.ReLU())
