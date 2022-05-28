@@ -420,7 +420,7 @@ class VAEDecoder(nn.Module):
         self.z_dim      = z_dim
         self.hidden_dim = hidden_dim
         self.img_width  = img_width
-        self.dec_kernel = 4
+        self.dec_kernel = 5
         self.dec_stride = 2
         self.dec_padding = 0 
         self.res_kernel  = 3
@@ -470,7 +470,7 @@ class VAEDecoder(nn.Module):
                     nn.ConvTranspose2d(
                         in_channels=in_channels,
                         out_channels=out_channels,
-                        kernel_size=5,
+                        kernel_size=self.dec_kernel,
                         stride=self.dec_stride,
                         padding=self.dec_padding,
                         bias=False,
