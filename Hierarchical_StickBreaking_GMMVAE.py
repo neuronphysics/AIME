@@ -1015,7 +1015,7 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
                 #elbo2 -= compute_kumar2beta_kld(self.kumar_a[:, k].expand(self.batch_size), self.kumar_b[:, k].expand(self.batch_size), self.prior, (self.K-1-k)* self.prior).mean()
                 #print(f"a kumaraswamy component {k}: {self.kumar_a[:, k]}")
                 #print(f"b kumaraswamy component {k}: {self.kumar_b[:, k]}")
-                elbo2 -= compute_kumar2beta_kld(self.kumar_a[:, k], self.kumar_b[:, k], self.prior_nu[:,k], (self.K-1-k)* self.prior_nu[:,k]).mean()
+                elbo2 = elbo2 - compute_kumar2beta_kld(self.kumar_a[:, k], self.kumar_b[:, k], self.prior_nu[:,k], (self.K-1-k)* self.prior_nu[:,k]).mean()
         
         #3)need this term of w (context)
         #0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
