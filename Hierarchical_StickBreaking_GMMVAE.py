@@ -194,8 +194,8 @@ class GammaSample(DistributionSample):
 
     def log_gamma_pdf(self, samples, alpha, beta):
         output = alpha * torch.log(beta + epsilon()) - torch.lgamma(alpha+ epsilon())
-        output += (alpha - 1) * torch.log(samples + epsilon())
-        output += -beta * samples
+        output = output + (alpha - 1) * torch.log(samples + epsilon())
+        output = output - beta * samples
         return mean_sum_samples(output)
 
     def _h(self, alpha, eps):
@@ -251,8 +251,8 @@ class BetaSample(GammaSample):
 
     def log_beta_pdf(self, samples, alpha, beta):
         output = (alpha - 1) * torch.log(samples + epsilon())
-        output += (beta - 1) * torch.log(1 - samples + epsilon())
-        output -= self._log_beta_func(alpha, beta)
+        output = output + (beta - 1) * torch.log(1 - samples + epsilon())
+        output = output - self._log_beta_func(alpha, beta)
         return mean_sum_samples(output)
 
     def _log_beta_func(self, alpha, beta):
@@ -784,7 +784,7 @@ def compute_kumar2beta_kld(a, b, alpha, beta):
     kl    = torch.mul(torch.pow(1+ab,-1), torch.clamp(beta_fn(a_inv, b), epsilon(), upper_limit))
     #print(f"1st value of KL divergence between kumaraswamy and beta distributions: {kl}")
     for idx in range(10):
-        kl += torch.mul(torch.pow(idx+2+ab,-1), torch.clamp(beta_fn(torch.mul(idx+2., a_inv), b), epsilon(), upper_limit))
+        kl = kl + torch.mul(torch.pow(idx+2+ab,-1), torch.clamp(beta_fn(torch.mul(idx+2., a_inv), b), epsilon(), upper_limit))
     kl    = torch.mul(torch.mul(beta-1,b), kl)
     """
     log_taylor = torch.logsumexp(torch.stack([beta_fn(torch.mul(m , a_inv), b) - torch.log(m + ab) for m in range(1, 10 + 1)], dim=-1), dim=-1)
@@ -794,13 +794,13 @@ def compute_kumar2beta_kld(a, b, alpha, beta):
     #
     #psi_b = torch.log(b + SMALL) - 1. / (2 * b + SMALL) -    1. / (12 * b**2 + SMALL)
     psi_b = torch.digamma(b + epsilon())
-    kl   += torch.mul(torch.div(a-alpha, torch.clamp(a, epsilon(), upper_limit)), -EULER_GAMMA - psi_b - b_inv)
+    kl   = kl + torch.mul(torch.div(a-alpha, torch.clamp(a, epsilon(), upper_limit)), -EULER_GAMMA - psi_b - b_inv)
     #print(f"3rd value of KL divergence between kumaraswamy and beta distributions: {kl}")
     # add normalization constants
-    kl   += torch.log(torch.clamp(ab, epsilon(), upper_limit)) + torch.log(torch.clamp(beta_fn(alpha, beta), epsilon(), upper_limit))
+    kl   = kl + torch.log(torch.clamp(ab, epsilon(), upper_limit)) + torch.log(torch.clamp(beta_fn(alpha, beta), epsilon(), upper_limit))
     #print(f"4th value of KL divergence between kumaraswamy and beta distributions: {kl}")
     #  final term
-    kl   += torch.div(-(b-1),torch.clamp(b , epsilon(), upper_limit))
+    kl   = kl + torch.div(-(b-1),torch.clamp(b , epsilon(), upper_limit))
     #print(f"final value of KL divergence between kumaraswamy and beta distributions: {kl}")
     #pdb.set_trace()
     return  torch.clamp(kl, min=0.)
@@ -829,7 +829,7 @@ def mcMixtureEntropy(pi_samples, z, mu, sigma, K):
     global SMALL 
     s = torch.mul(pi_samples[0], torch.exp(log_normal_pdf(z[0], mu[0], sigma[0])))
     for k in range(K-1):
-        s += torch.mul(pi_samples[k+1], torch.exp(log_normal_pdf(z[k+1], mu[k+1], sigma[k+1])))
+        s = s + torch.mul(pi_samples[k+1], torch.exp(log_normal_pdf(z[k+1], mu[k+1], sigma[k+1])))
     return -torch.log(s + SMALL )
 
 
@@ -1099,7 +1099,7 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
         log_beta_prior = log_beta_pdf(v_samples[:,0].unsqueeze(1), self.prior_nu[:,0].unsqueeze(1), (self.K - 1) * self.prior_nu[:,0].unsqueeze(1))
         for k in range(self.K-2):
             #log_beta_prior += log_beta_pdf(tf.expand_dims(v_samples[:,k+1],1), self.prior['dirichlet_alpha'], (self.K-2-k)*self.prior['dirichlet_alpha'])
-            log_beta_prior += log_beta_pdf(v_samples[:, k + 1].unsqueeze(1), self.prior_nu[:, k + 1].unsqueeze(1), (self.K - 2 - k) * self.prior_nu[:, k + 1].unsqueeze(1))
+            log_beta_prior = log_beta_prior + log_beta_pdf(v_samples[:, k + 1].unsqueeze(1), self.prior_nu[:, k + 1].unsqueeze(1), (self.K - 2 - k) * self.prior_nu[:, k + 1].unsqueeze(1))
 
         # ****need this term :calc post term
         log_kumar_post = log_kumar_pdf(v_samples, self.kumar_a, self.kumar_b)
