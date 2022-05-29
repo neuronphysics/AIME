@@ -353,7 +353,7 @@ class VAEEncoder(nn.Module):
         self.encoder = nn.Sequential(*encoder_layers)
         
         # Calculate shape of the flattened image
-        self.h_dim, _ = self.get_flattened_size(self.img_width)
+        self.h_dim, self.h_image_dim = self.get_flattened_size(self.img_width)
         
         self.encoder = nn.Sequential(
         self.encoder, nn.Linear(self.h_dim, hidden_dim, bias=False),
@@ -414,7 +414,7 @@ class VAEEncoder(nn.Module):
 
 class VAEDecoder(nn.Module):
     #https://github.com/akashsara/fusion-dance
-    def __init__(self,nchannel, z_dim, hidden_dim, extend_dim, img_width, max_filters=512, num_layers=4, small_conv=False):
+    def __init__(self,nchannel, z_dim, hidden_dim, extend_dim, h_image_dim, img_width, max_filters=512, num_layers=4, small_conv=False):
         super(VAEDecoder,self).__init__()
         self.nchannel   = nchannel
         self.z_dim      = z_dim
@@ -445,12 +445,11 @@ class VAEDecoder(nn.Module):
         decoder_layers.append(nn.Linear(hidden_dim, hidden_dim))
         decoder_layers.append(nn.BatchNorm1d(hidden_dim))
         decoder_layers.append(nn.ReLU())
-        extend_dim = int(max_filters) * self.dec_kernel * self.dec_kernel
         decoder_layers.append(torch.nn.Linear(hidden_dim, extend_dim, bias=False))
         decoder_layers.append(nn.BatchNorm1d(extend_dim))
         decoder_layers.append(nn.ReLU())
         # Unflatten to a shape of (Channels, Height, Width)
-        decoder_layers.append(nn.Unflatten(1, (int(max_filters), self.dec_kernel, self.dec_kernel)))
+        decoder_layers.append(nn.Unflatten(1, (int(extend_dim / (h_image_dim * h_image_dim)), h_image_dim, h_image_dim)))
         # Decoder Convolutions
         
         for i, (out_channels, in_channels) in enumerate(channel_sizes[::-1]):
@@ -567,7 +566,7 @@ class GMMVAE(nn.Module):
         self._to_linear = None
         ####################### Encoder & Decoder of Z #####################
         self.encoder  = VAEEncoder(nchannel, z_dim, hidden_dim, img_width, max_filters, num_layers, small_conv)
-        self.decoder  = VAEDecoder(nchannel, z_dim, hidden_dim, self.encoder.h_dim, img_width, max_filters, num_layers, small_conv)
+        self.decoder  = VAEDecoder(nchannel, z_dim, hidden_dim, self.encoder.h_dim, self.encoder.h_image_dim, img_width, max_filters, num_layers, small_conv)
         ########################
         #ENCODER-JUST USING FULLY CONNECTED LAYERS
         #THE LATENT SPACE (W)
