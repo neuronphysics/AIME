@@ -1,7 +1,8 @@
 # AIME
 ## Implementation of the new model
 
-To train the model and the agent, run for example `python main.py --env cheetah-run --use-regular-vae`
+To train the model and the agent, run `python main.py --env cheetah-run --use-regular-vae` for using regular VAE.
+Run `python main.py --env cheetah-run` for using infinite GMM VAE. Override the default hyperparameters on the command line using for example `--state-size 100`.
 
 # For running the infinite GMM variational autoencoder and using visdom use this line 
 ssh -L 8097:127.0.0.1:8097 username@hostname
