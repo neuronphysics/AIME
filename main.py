@@ -129,14 +129,14 @@ if args.use_regular_vae:
   encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.state_size, args.activation_function).to(device=args.device)
   param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters())
 else:
-  hyperParams = {"batch_size": 100,
+  hyperParams = {"batch_size": args.batch_size * args.chunk_size,
                "input_d": 1,
                "prior_alpha": 7., #gamma_alpha
                "prior_beta": 1., #gamma_beta
                "K": 25,
-               "hidden_d": 500,
-               "latent_d": 200,
-               "latent_w": 150,
+               "hidden_d": args.hidden_size,
+               "latent_d": args.state_size,
+               "latent_w": args.w_dim,
                "LAMBDA_GP": 10, #hyperparameter for WAE with gradient penalty
                "LEARNING_RATE": 1e-4,
                "CRITIC_ITERATIONS" : 5
