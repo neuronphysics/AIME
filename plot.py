@@ -45,14 +45,14 @@ def slac_results(file_path):
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='PlaNet')
+    parser = argparse.ArgumentParser(description='Plot Results')
     parser.add_argument('--env', type=str, choices=['cheetah-run', 'hopper-hop', 'humanoid-walk', 'swimmer-swimmer6', 'walker-walk'], help='Environment Name')
     args = parser.parse_args()
     env = args.env
 
-    dreamerv2_steps_seed_1, dreamerv2_eval_returns_seed1 = dreamerv2_results(f"dreamerv2/dreamerv2_dmc/{env}/run0.jsonl")
-    dreamerv2_steps_seed_2, dreamerv2_eval_returns_seed2 = dreamerv2_results(f"dreamerv2/dreamerv2_dmc/{env}/run1.jsonl")
-    dreamerv2_steps_seed_3, dreamerv2_eval_returns_seed3 = dreamerv2_results(f"dreamerv2/dreamerv2_dmc/{env}/run2.jsonl")
+    dreamerv2_steps_seed_1, dreamerv2_eval_returns_seed1 = dreamerv2_results(f"dreamerv2/{env}/run0.jsonl")
+    dreamerv2_steps_seed_2, dreamerv2_eval_returns_seed2 = dreamerv2_results(f"dreamerv2/{env}/run1.jsonl")
+    dreamerv2_steps_seed_3, dreamerv2_eval_returns_seed3 = dreamerv2_results(f"dreamerv2/{env}/run2.jsonl")
     num_dreamerv2samples = min(len(dreamerv2_steps_seed_1), len(dreamerv2_steps_seed_2), len(dreamerv2_steps_seed_3))
     dreamerv2_steps_seed_1 = dreamerv2_steps_seed_1[:num_dreamerv2samples]
     dreamerv2_steps_seed_2 = dreamerv2_steps_seed_2[:num_dreamerv2samples]
