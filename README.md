@@ -1,4 +1,7 @@
 # AIME
+
+## Note that the up-to-date work is being done in branch `test-new-vae`
+
 ## Implementation of the new model
 
 To train the model and the agent, run `python aime-new/main.py`
