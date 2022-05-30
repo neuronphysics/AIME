@@ -19,7 +19,7 @@ import gpytorch
 from gpytorch.mlls import DeepApproximateMLL, VariationalELBO
 
 # Hyperparameters
-parser = argparse.ArgumentParser(description='PlaNet')
+parser = argparse.ArgumentParser(description='AIME')
 parser.add_argument('--id', type=str, default='default', help='Experiment ID')
 parser.add_argument('--seed', type=int, default=1, metavar='S', help='Random seed')
 parser.add_argument('--disable-cuda', action='store_true', help='Disable CUDA')
@@ -46,7 +46,7 @@ parser.add_argument('--bit-depth', type=int, default=5, metavar='B', help='Image
 parser.add_argument('--learning-rate', type=float, default=1e-3, metavar='α', help='Learning rate') 
 parser.add_argument('--learning-rate-schedule', type=int, default=0, metavar='αS', help='Linear learning rate schedule (optimisation steps from 0 to final learning rate; 0 to disable)') 
 parser.add_argument('--adam-epsilon', type=float, default=1e-4, metavar='ε', help='Adam optimiser epsilon value') 
-# Note that original has a linear learning rate decay, but it seems unlikely that this makes a significant difference
+
 parser.add_argument('--grad-clip-norm', type=float, default=1000, metavar='C', help='Gradient clipping norm')
 parser.add_argument('--planning-horizon', type=int, default=12, metavar='H', help='Planning horizon distance')
 parser.add_argument('--optimisation-iters', type=int, default=10, metavar='I', help='Planning optimisation iterations')
@@ -119,9 +119,6 @@ elif not args.test:
     metrics['episodes'].append(s)
 
 
-# Initialise model parameters randomly
-#observation_model = ObservationModel(args.symbolic_env, env.observation_size, args.state_size, args.embedding_size, args.activation_function).to(device=args.device)
-#encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.state_size, args.activation_function).to(device=args.device)
 recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, args.lagging_size, args.device).to(device=args.device)
 
 if args.use_regular_vae:
@@ -331,8 +328,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       D.append(observation, action.detach().cpu(), reward, done)
       total_reward = total_reward + reward
       
-      #if (time_step % args.num_planning_steps == 0) or done:
-        # compute returns in reverse order in the episode reward list
       if args.render:
         env.render()
       if done:
