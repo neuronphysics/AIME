@@ -14,6 +14,23 @@ from gpytorch.kernels import RBFKernel, ScaleKernel
 from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.likelihoods import GaussianLikelihood
+def hidden_size_extract(kwargs, name, delete_from_dict=False):
+    if name not in kwargs:
+        hidden_size = []
+        for i in range(0, 6):
+            key = name + '_%d' % i
+            if key in kwargs and kwargs[key] != 0:
+                hidden_size.append(kwargs[key])
+
+                if delete_from_dict:
+                    kwargs.pop(key)
+    else:
+        hidden_size = kwargs[name].copy()
+
+        if delete_from_dict:
+            kwargs.pop(name)
+
+    return hidden_size
 
 
 # Wraps the input tuple for a function to process a time x batch x features sequence in batch x features (assumes one output)
@@ -129,7 +146,7 @@ def Encoder(symbolic, observation_size, embedding_size, state_size, activation_f
     return VisualEncoder(embedding_size, state_size, activation_function)
 
 class DGPHiddenLayer(DeepGPLayer):
-    def __init__(self, input_dims, output_dims, device, num_inducing=16):
+    def __init__(self, input_dims, output_dims, device, num_inducing=128, mean_type='constant'):
         if output_dims is None:
             inducing_points = torch.randn(num_inducing, input_dims).to(device=device)
             batch_shape = torch.Size([])
@@ -148,8 +165,14 @@ class DGPHiddenLayer(DeepGPLayer):
             learn_inducing_locations=True
         )
 
-        super().__init__(variational_strategy, input_dims, output_dims)
-        self.mean_module = None
+        super(GPHiddenLayer, self).__init__(variational_strategy, input_dims, output_dims)
+        if mean_type == 'constant':
+            self.mean_module = ConstantMean()
+        elif mean_type == 'zero':
+            self.mean_module = ZeroMean()
+        else:
+            self.mean_module = LinearMean(input_dims)
+        
         self.covar_module = ScaleKernel(
             RBFKernel(batch_shape=batch_shape, ard_num_dims=input_dims),
             batch_shape=batch_shape, ard_num_dims=None
@@ -160,23 +183,150 @@ class DGPHiddenLayer(DeepGPLayer):
         covar_x = self.covar_module(x)
         return MultivariateNormal(mean_x, covar_x)
 
-class TransitionGP(DGPHiddenLayer):
-    def __init__(self, latent_size, action_size, lagging_size, device):
-      input_size = (latent_size+action_size)*lagging_size
-      super(TransitionGP, self).__init__(input_size, latent_size, device)
-      self.mean_module = LinearMean(input_size)
+    def __call__(self, x, *other_inputs, **kwargs):
+        """
+        Overriding __call__ isn't strictly necessary, but it lets us add concatenation based skip connections
+        easily. For example, hidden_layer2(hidden_layer1_outputs, inputs) will pass the concatenation of the first
+        hidden layer's outputs and the input data to hidden_layer2.
+        """
+        if len(other_inputs):
+            if isinstance(x, gpytorch.distributions.MultitaskMultivariateNormal):
+                x = x.rsample()
 
-class PolicyGP(DGPHiddenLayer):
-    def __init__(self, latent_size, action_size, lagging_size, device):
-      super(PolicyGP, self).__init__(latent_size*lagging_size, action_size, device)
-      self.mean_module = ConstantMean()
+            processed_inputs = [
+                inp.unsqueeze(0).expand(self.num_samples, *inp.shape)
+                for inp in other_inputs
+            ]
 
-class RewardGP(DGPHiddenLayer):
-    def __init__(self, latent_size, action_size, lagging_size, device):
-      super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, None, device)
-      self.mean_module = ZeroMean()
+            x = torch.cat([x] + processed_inputs, dim=-1)
 
-class RecurrentGP(DeepGP):
+        return super().__call__(x, are_samples=bool(len(other_inputs)))
+
+
+
+
+class DeepGaussianProcesses(DeepGP):
+    def __init__(self, input_size, output_size, device, num_inducing=30, **kwargs):
+        # pass hidden layer sizes as separate arguments as well as array
+        for k, v in kwargs.items():
+            if k=='mean_type':
+                setattr(self, k, v)
+        hidden_size = hidden_size_extract(kwargs, 'hidden_size')
+        
+        self.hidden_size = hidden_size
+        self.hidden_size.append(output_size)
+        
+        self.device = device
+        first_layer = DGPHiddenLayer(
+                      input_dims=input_size,
+                      output_dims=self.hidden_size[0],
+                      device = self.device,
+                      num_inducing=num_inducing,
+                      mean_type=self.mean_type
+                      )
+
+        # variable count of hidden layers and neurons
+
+        if self.mean_type=='linear' or self.mean_type=='constant':
+            hidden_layers = nn.ModuleList(
+              [ 
+              
+                  DGPHiddenLayer(
+                     input_dims=self.hidden_size[i],
+                     output_dims=self.hidden_size[i + 1],
+                     device = self.device,
+                     num_inducing=num_inducing,
+                     mean_type='constant'
+                  )
+                  for i in range(len(self.hidden_size) - 1)
+              ])
+        else:
+            hidden_layers = nn.ModuleList(
+              [
+                
+                  DGPHiddenLayer(
+                     input_dims=self.hidden_size[i],
+                     output_dims=self.hidden_size[i + 1],
+                     device = self.device,
+                     num_inducing=num_inducing,
+                     mean_type='zero'
+                  )
+                  for i in range(len(self.hidden_size) - 1)
+              ])
+
+        super().__init__()
+
+        self.first_layer = first_layer
+        self.hidden_layers = hidden_layers
+        self.likelihood = GaussianLikelihood()
+        self.to(device=self.device)
+    def forward(self, inputs):
+        out = self.first_layer(inputs)
+        for hidden in self.hidden_layers:
+            out = hidden(out)
+        return out
+        
+    def predict(self, test_loader):
+        with torch.no_grad():
+            mus = []
+            variances = []
+            lls = []
+            gts = []
+            for x_batch, y_batch in test_loader:
+                preds = self.likelihood(self(x_batch))
+                mus.append(preds.mean)
+                variances.append(preds.variance)
+                gts.append(y_batch)
+                lls.append(model.likelihood.log_marginal(y_batch, model(x_batch)))
+
+        return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1), torch.cat(lls, dim=-1), torch.cat(gts, dim=-1)
+
+    def retrieve_all_hyperparameter(self):
+        all_sigma2 = []
+        all_sigma2.append(self.first_layer.get_sigma2())
+        for h in self.hidden_layers:
+            all_sigma2.append(h.get_sigma2())
+       
+
+        all_lengthscale = []
+        all_lengthscale.append(self.first_layer.get_lengthscale())
+        for h in self.hidden_layers:
+            all_lengthscale.append(h.get_lengthscale())
+
+        return all_sigma2, all_lengthscale
+
+    def get_K_1(self, x):
+        return self.first_layer.covar_module(x).evaluate().data
+
+def compute_EZ_trajectory(K, m, sigma2s, lengthscales):
+    def recur(x, sigma2, lengthscale):
+        return 2 * (1. - 1. / np.power(1 + x / lengthscale, m / 2.))
+
+    x = K
+    EZ = []
+    for sigma2, lengthscale in zip(sigma2s, lengthscales):
+        temp = recur(x, sigma2, lengthscale)
+        EZ.append(temp)
+        x = temp
+    return EZ
+
+
+class TransitionGP(DeepGaussianProcesses):
+    def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[100], mean_type= 'linear'):
+        input_size = (latent_size+action_size)*lagging_size
+        super(TransitionGP, self).__init__(input_size=input_size, output_size=latent_size, device=device, hidden_size=hidden_size, mean_type=mean_type) 
+      
+class PolicyGP(DeepGaussianProcesses):
+    def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[50], mean_type= 'constant'):
+        input_size =latent_size*lagging_size
+        super(PolicyGP, self).__init__(input_size=input_size, output_size= action_size, device=device, hidden_size=hidden_size, mean_type=mean_type)
+     
+class RewardGP(DeepGaussianProcesses):
+    def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[100], mean_type= 'zero'):
+       input_size =(latent_size+action_size)*lagging_size
+       super(RewardGP, self).__init__(input_size=input_size, output_size= None, device=device, hidden_size=hidden_size, mean_type=mean_type)
+
+class RecurrentGP(DeepGaussianProcesses):
     def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1):
         super().__init__()
         self.horizon_size = horizon_size
