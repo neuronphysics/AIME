@@ -63,7 +63,7 @@ parser.add_argument('--render', action='store_true', help='Render environment')
 
 ## extra hyperparameters for new model
 parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='Horizon size')
-parser.add_argument('--lagging-size', type=int, default=2, metavar='La', help='Lagging size')
+parser.add_argument('--lagging-size', type=int, default=4, metavar='La', help='Lagging size')
 parser.add_argument('--non-cumulative-reward', action='store_true', help='Model non-cumulative rewards')
 parser.add_argument('--num-sample-trajectories', type=int, default=10, metavar='nst', help='number of trajectories sample in the imagination part')
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
@@ -96,8 +96,8 @@ if torch.cuda.is_available() and not args.disable_cuda:
 else:
   args.device = torch.device('cpu')
 metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': [], 'test_rewards': [], 'observation_loss': [], 'latent_kl_loss': [],
-           'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 'policy_mll_loss': [], 'transition_mll_loss': [],
-           'elbo1': [], 'elbo2': [], 'elbo3': [], 'elbo4': [], 'elbo5': []}
+           'transition_imagine_loss':[], 'controller_imagine_loss':[], 'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 
+           'policy_mll_loss': [], 'transition_mll_loss': [], 'elbo1': [], 'elbo2': [], 'elbo3': [], 'elbo4': [], 'elbo5': []}
 
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
@@ -149,8 +149,12 @@ else:
   enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
   dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
   dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
-  
-  param_list = list(recurrent_gp.parameters())
+  #optimize transition function, controller and reward functions
+
+  param_list    = list(recurrent_gp.parameters())
+  ##should we optimize these two like the following?
+  tran_optim    = torch.optim.Adam([{"params": recurrent_gp.transition_modules.parameters()},],lr=hyperParams["LEARNING_RATE"])#train transition function
+  control_optim = torch.optim.Adam([{"params": recurrent_gp.policy_modules.parameters()},],lr=hyperParams["LEARNING_RATE"]) #controller
 
 optimiser = AdaBound(param_list, lr=0.0001) if args.use_ada_bound else optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
@@ -164,6 +168,9 @@ if args.models is not '' and os.path.exists(args.models):
   else:
     infinite_vae.load_state_dict(model_dicts['infinite_vae'])
   recurrent_gp.load_state_dict(model_dicts['recurrent_gp'])
+  #save the controller & transition
+  recurrent_gp.transition_modules.load_state_dict(model_dicts['transition_gp'])
+  recurrent_gp.policy_modules.load_state_dict(model_dicts['controller_gp'])
   optimiser.load_state_dict(model_dicts['optimiser'])
   actor_critic_planner.load_state_dict(model_dicts['actor_critic_planner'])
   planning_optimiser.load_state_dict(model_dicts['planning_optimiser'])
@@ -172,7 +179,9 @@ global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.
 free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.device)  # Allowed deviation in KL divergence
 
 reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
-
+#### ELBO objective for the transition and controller GP ### ???? need to be fixed
+transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, X.shape[-2], beta=0.1))#what X=action+latent_space
+controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_modules.likelihood, recurrent_gp.policy_modules, X.shape[-2], beta=0.1))#latent_space
 rgp_training_episode = args.seed_episodes
 
 # Training (and testing)
@@ -235,6 +244,18 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         else:
           true_rewards = rewards[args.lagging_size+args.horizon_size:]
         reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
+        ###### add controller & polcy losses #####
+        tran_optim.zero_grad()
+        control_optim.zero_grad()
+        output_latent = recurrent_gp.transition_modules(x_batch)#input:action+latent_space ??
+        output_action = recurrent_gp.policy_modules(x_batch)#input:latent_space
+        transition_imagine_loss = -transition_mll(output_latent, y_batch)##??fix
+        transition_imagine_loss.backward()
+        controller_imagine_loss = -controller_mll(output_action, y_batch)##??fix
+        controller_imagine_loss.backward()
+        tran_optim.step()
+        control_optim.step()
+        ##################
         if args.use_regular_vae:
           observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
 
