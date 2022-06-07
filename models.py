@@ -260,26 +260,38 @@ class DeepGaussianProcesses(DeepGP):
         self.hidden_layers = hidden_layers
         self.likelihood = GaussianLikelihood()
         self.to(device=self.device)
+
     def forward(self, inputs):
         out = self.first_layer(inputs)
         for hidden in self.hidden_layers:
             out = hidden(out)
         return out
         
-    def predict(self, test_loader):
+    #def predict(self, test_loader):
+    #    """original predict function"""
+    #    with torch.no_grad():
+    #        mus = []
+    #        variances = []
+    #        lls = []
+    #        gts = []
+    #        for x_batch, y_batch in test_loader:
+    #            preds = self.likelihood(self(x_batch))
+    #            mus.append(preds.mean)
+    #            variances.append(preds.variance)
+    #            gts.append(y_batch)
+    #            lls.append(model.likelihood.log_marginal(y_batch, model(x_batch)))
+    #    return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1), torch.cat(lls, dim=-1), torch.cat(gts, dim=-1)
+    
+    def predict(self, x):
         with torch.no_grad():
             mus = []
             variances = []
             lls = []
             gts = []
-            for x_batch, y_batch in test_loader:
-                preds = self.likelihood(self(x_batch))
-                mus.append(preds.mean)
-                variances.append(preds.variance)
-                gts.append(y_batch)
-                lls.append(model.likelihood.log_marginal(y_batch, model(x_batch)))
-
-        return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1), torch.cat(lls, dim=-1), torch.cat(gts, dim=-1)
+            preds = self.likelihood(self(x))
+            mus.append(preds.mean)
+            variances.append(preds.variance)           
+        return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1)
 
     def retrieve_all_hyperparameter(self):
         all_sigma2 = []
@@ -322,9 +334,9 @@ class PolicyGP(DeepGaussianProcesses):
         super(PolicyGP, self).__init__(input_size=input_size, output_size= action_size, device=device, hidden_size=hidden_size, mean_type=mean_type)
      
 class RewardGP(DeepGaussianProcesses):
-    def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[100], mean_type= 'zero'):
+    def __init__(self, latent_size, action_size, lagging_size, reward_size, device, hidden_size=[100], mean_type= 'zero'):
        input_size =(latent_size+action_size)*lagging_size
-       super(RewardGP, self).__init__(input_size=input_size, output_size= None, device=device, hidden_size=hidden_size, mean_type=mean_type)
+       super(RewardGP, self).__init__(input_size=input_size, output_size= reward_size, device=device, hidden_size=hidden_size, mean_type=mean_type)
 
 class RecurrentGP(DeepGaussianProcesses):
     def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1):
