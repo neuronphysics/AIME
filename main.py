@@ -16,7 +16,7 @@ from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient
 from planner import ActorCriticPlanner
 from utils import lineplot, write_video, AdaBound
 import gpytorch
-from gpytorch.mlls import DeepApproximateMLL, VariationalELBO
+from gpytorch.mlls import DeepApproximateMLL, VariationalELBO, PredictiveLogLikelihood
 
 # Hyperparameters
 parser = argparse.ArgumentParser(description='AIME')
@@ -180,8 +180,9 @@ free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.d
 
 reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
 #### ELBO objective for the transition and controller GP ### ???? need to be fixed
-transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, X.shape[-2], beta=0.1))#what X=action+latent_space
-controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_modules.likelihood, recurrent_gp.policy_modules, X.shape[-2], beta=0.1))#latent_space
+transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, X.shape[-2], beta=1.0))#what X=action+latent_space
+#transition_mll = DeepApproximateMLL(PredictiveLogLikelihood(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, X.shape[-2], beta=1.0))
+controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_modules.likelihood, recurrent_gp.policy_modules, X.shape[-2], beta=1.0))#latent_space
 rgp_training_episode = args.seed_episodes
 
 # Training (and testing)
