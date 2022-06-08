@@ -245,7 +245,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         else:
           true_rewards = rewards[args.lagging_size+args.horizon_size:]
         reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
-        ###### add controller & polcy losses #####
+        ###### add controller & polcy losses ##############
+        ########Need to be fixed in terms of input and outputs#######
         tran_optim.zero_grad()
         control_optim.zero_grad()
         output_latent = recurrent_gp.transition_modules(x_batch)#input:action+latent_space ??

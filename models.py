@@ -281,7 +281,7 @@ class DeepGaussianProcesses(DeepGP):
     #            gts.append(y_batch)
     #            lls.append(model.likelihood.log_marginal(y_batch, model(x_batch)))
     #    return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1), torch.cat(lls, dim=-1), torch.cat(gts, dim=-1)
-    
+
     def predict(self, x):
         with torch.no_grad():
             mus = []
@@ -337,7 +337,8 @@ class RewardGP(DeepGaussianProcesses):
     def __init__(self, latent_size, action_size, lagging_size, reward_size, device, hidden_size=[100], mean_type= 'zero'):
        input_size =(latent_size+action_size)*lagging_size
        super(RewardGP, self).__init__(input_size=input_size, output_size= reward_size, device=device, hidden_size=hidden_size, mean_type=mean_type)
-
+#P(z_{t}|x_{t-k},...x_{t-1})---->T(x_{t-k},...x_{t-1})=z_{t}; x_{.}=[z_{.},a_{.}]--->transition
+#P(z_{t},...z_{t-k})=a(t)--->policy z:latent_space, a: action
 class RecurrentGP(DeepGaussianProcesses):
     def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1):
         super().__init__()
