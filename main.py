@@ -45,7 +45,7 @@ parser.add_argument('--free-nats', type=float, default=3, metavar='F', help='Fre
 parser.add_argument('--bit-depth', type=int, default=5, metavar='B', help='Image bit depth (quantisation)')
 parser.add_argument('--learning-rate', type=float, default=1e-3, metavar='α', help='Learning rate') 
 parser.add_argument('--learning-rate-schedule', type=int, default=0, metavar='αS', help='Linear learning rate schedule (optimisation steps from 0 to final learning rate; 0 to disable)') 
-parser.add_argument('--adam-epsilon', type=float, default=1e-4, metavar='ε', help='Adam optimiser epsilon value') 
+parser.add_argument('--adam-epsilon', type=float, default=1e-4, metavar='ε', help='Adam optimizer epsilon value') 
 
 parser.add_argument('--grad-clip-norm', type=float, default=1000, metavar='C', help='Gradient clipping norm')
 parser.add_argument('--planning-horizon', type=int, default=12, metavar='H', help='Planning horizon distance')
@@ -78,6 +78,7 @@ parser.add_argument('--use-ada-bound', action='store_true', help='use AdaBound a
 parser.add_argument('--rgp-training-interval-ratio', type=float, default=1.1, metavar='In', help='RGP training interval ratio')
 parser.add_argument('--num-gp-likelihood-samples', type=int, default=50, metavar='GP', help='Number of likelihood samples for GP')
 
+torch.autograd.set_detect_anomaly(True)
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
 print(' ' * 26 + 'Options')
@@ -152,14 +153,11 @@ else:
   #optimize transition function, controller and reward functions
 
   param_list    = list(recurrent_gp.parameters())
-  ##should we optimize these two like the following?
-  tran_optim    = torch.optim.Adam([{"params": recurrent_gp.transition_modules.parameters()},],lr=hyperParams["LEARNING_RATE"])#train transition function
-  control_optim = torch.optim.Adam([{"params": recurrent_gp.policy_modules.parameters()},],lr=hyperParams["LEARNING_RATE"]) #controller
 
-optimiser = AdaBound(param_list, lr=0.0001) if args.use_ada_bound else optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
+optimizer = AdaBound(param_list, lr=0.0001) if args.use_ada_bound else optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
 actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories, args.hidden_size, args.num_gp_likelihood_samples, args.device).to(device=args.device)
-planning_optimiser = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
+planning_optimizer = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 if args.models is not '' and os.path.exists(args.models):
   model_dicts = torch.load(args.models)
   if args.use_regular_vae:
@@ -169,20 +167,19 @@ if args.models is not '' and os.path.exists(args.models):
     infinite_vae.load_state_dict(model_dicts['infinite_vae'])
   recurrent_gp.load_state_dict(model_dicts['recurrent_gp'])
   #save the controller & transition
-  recurrent_gp.transition_modules.load_state_dict(model_dicts['transition_gp'])
-  recurrent_gp.policy_modules.load_state_dict(model_dicts['controller_gp'])
-  optimiser.load_state_dict(model_dicts['optimiser'])
+  recurrent_gp.transition_module.load_state_dict(model_dicts['transition_gp'])
+  recurrent_gp.policy_module.load_state_dict(model_dicts['controller_gp'])
+  optimizer.load_state_dict(model_dicts['optimizer'])
   actor_critic_planner.load_state_dict(model_dicts['actor_critic_planner'])
-  planning_optimiser.load_state_dict(model_dicts['planning_optimiser'])
+  planning_optimizer.load_state_dict(model_dicts['planning_optimizer'])
 
 global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.device), torch.ones(args.batch_size, args.state_size, device=args.device))  # Global prior N(0, I)
 free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.device)  # Allowed deviation in KL divergence
 
 reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
-#### ELBO objective for the transition and controller GP ### ???? need to be fixed
-transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, X.shape[-2], beta=1.0))#what X=action+latent_space
-#transition_mll = DeepApproximateMLL(PredictiveLogLikelihood(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, X.shape[-2], beta=1.0))
-controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_modules.likelihood, recurrent_gp.policy_modules, X.shape[-2], beta=1.0))#latent_space
+transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_module.likelihood, recurrent_gp.transition_module, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
+controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_module.likelihood, recurrent_gp.policy_module, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
+
 rgp_training_episode = args.seed_episodes
 
 # Training (and testing)
@@ -196,8 +193,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     for s in tqdm(range(args.collect_interval)):
       with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples): # to do: make this a hyperparameter as well
         # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
-        observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
+        observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0   
         if args.use_regular_vae:
+          # with torch.no_grad():
           latent_mean, latent_std = bottle_two_output(encoder, (observations, ))
           latent_dist = Normal(latent_mean, latent_std)
           latent_kl_loss = kl_divergence(latent_dist, global_prior).sum(dim=2).mean(dim=(0, 1))
@@ -239,45 +237,61 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           latent_states = torch.reshape(infinite_vae.get_latent_states(observations), (original_shape[0], original_shape[1], args.state_size))
 
         init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
-        predicted_rewards = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
+        init_actions = actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)
+
         if (not args.non_cumulative_reward):
-          true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
+          true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(-1)
         else:
           true_rewards = rewards[args.lagging_size+args.horizon_size:]
+
+        policy_labels = actions[args.lagging_size:].unfold(0, 1, 1)
+        policy_labels = policy_labels.reshape(policy_labels.size(0), policy_labels.size(1), -1)
+        policy_input = latent_states[:-1].unfold(0, args.lagging_size, 1)
+        policy_input = policy_input.reshape(policy_input.size(0), policy_input.size(1), -1)
+
+        transition_labels = latent_states[args.lagging_size:].unfold(0, 1, 1)
+        transition_labels = transition_labels.reshape(transition_labels.size(0), transition_labels.size(1), -1)
+        actions_input = actions[:-1].unfold(0, args.lagging_size, 1)
+        actions_input = actions_input.reshape(actions_input.size(0), actions_input.size(1), -1)
+        transition_input = torch.cat([policy_input, actions_input], dim=-1)
+
+        # Update model parameters
+        optimizer.zero_grad()
+        predicted_rewards = recurrent_gp(init_states, init_actions)
         reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
-        ###### add controller & polcy losses ##############
-        ########Need to be fixed in terms of input and outputs#######
-        tran_optim.zero_grad()
-        control_optim.zero_grad()
-        output_latent = recurrent_gp.transition_modules(x_batch)#input:action+latent_space ??
-        output_action = recurrent_gp.policy_modules(x_batch)#input:latent_space
-        transition_imagine_loss = -transition_mll(output_latent, y_batch)##??fix
-        transition_imagine_loss.backward()
-        controller_imagine_loss = -controller_mll(output_action, y_batch)##??fix
-        controller_imagine_loss.backward()
-        tran_optim.step()
-        control_optim.step()
-        ##################
         if args.use_regular_vae:
           observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
-
-        # Apply linearly ramping learning rate schedule
-        if args.learning_rate_schedule != 0:
-          for group in optimiser.param_groups:
-            group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
-        # Update model parameters
-        optimiser.zero_grad()
-        if args.use_regular_vae:
           (observation_loss + reward_loss + latent_kl_loss).backward()
         else:
           reward_loss.backward()
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-        optimiser.step()
+        optimizer.step()
+
+        # Note the detach here is very important
+        optimizer.zero_grad()
+        policy_module_output = recurrent_gp.policy_module(policy_input.detach())
+        policy_module_loss = -controller_mll(policy_module_output, policy_labels.detach()).mean()
+        policy_module_loss.backward()
+        nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
+        optimizer.step()
+
+        optimizer.zero_grad()
+        transition_module_output = recurrent_gp.transition_module(transition_input.detach())
+        transition_module_loss = -transition_mll(transition_module_output, transition_labels.detach()).mean()
+        transition_module_loss.backward()
+        nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
+        optimizer.step()
+
         # Store loss
         if args.use_regular_vae:
-          losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item()])
+          losses.append([0, 0, latent_kl_loss.item(), transition_module_loss.item(), policy_module_loss.item()])
         else:
-          losses.append([0, 0, 0, 0, 0, reward_loss.item()])
+          losses.append([0, 0, 0, 0, 0, reward_loss.item(), transition_module_loss.item(), policy_module_loss.item()])
+
+        # Apply linearly ramping learning rate schedule
+        if args.learning_rate_schedule != 0:
+          for group in optimizer.param_groups:
+            group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
 
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
@@ -285,9 +299,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       metrics['observation_loss'].append(losses[0])
       metrics['reward_loss'].append(losses[1])
       metrics['latent_kl_loss'].append(losses[2])
+      metrics['transition_imagine_loss'].append(losses[3])
+      metrics['controller_imagine_loss'].append(losses[4])
       lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
       lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
       lineplot(metrics['episodes'][-len(metrics['latent_kl_loss']):], metrics['latent_kl_loss'], 'latent_kl_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'latent_kl_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'latent_kl_loss', results_dir)
     else:
       metrics['elbo1'].append(losses[0])
       metrics['elbo2'].append(losses[1])
@@ -295,13 +313,16 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       metrics['elbo4'].append(losses[3])
       metrics['elbo5'].append(losses[4])
       metrics['reward_loss'].append(losses[5])
+      metrics['transition_imagine_loss'].append(losses[6])
+      metrics['controller_imagine_loss'].append(losses[7])
       lineplot(metrics['episodes'][-len(metrics['elbo1']):], metrics['elbo1'], 'elbo1', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo2']):], metrics['elbo2'], 'elbo2', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo3']):], metrics['elbo3'], 'elbo3', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo4']):], metrics['elbo4'], 'elbo4', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo5']):], metrics['elbo5'], 'elbo5', results_dir)
       lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
-
+      lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'latent_kl_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'latent_kl_loss', results_dir)
   # Data collection
   if args.use_regular_vae:
     encoder.eval()
@@ -373,10 +394,10 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   current_policy_mll_loss = episode_policy_mll_loss.mean()
   current_transition_mll_loss = episode_transition_mll_loss.mean()
   
-  planning_optimiser.zero_grad()
+  planning_optimizer.zero_grad()
   (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
-  planning_optimiser.step()
+  planning_optimizer.step()
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
@@ -478,17 +499,17 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         'observation_model': observation_model.state_dict(),
         'encoder': encoder.state_dict(),
         'recurrent_gp': recurrent_gp.state_dict(),
-        'optimiser': optimiser.state_dict(),
+        'optimizer': optimizer.state_dict(),
         'actor_critic_planner': actor_critic_planner.state_dict(),
-        'planning_optimiser': planning_optimiser.state_dict(),
+        'planning_optimizer': planning_optimizer.state_dict(),
         }, os.path.join(results_dir, 'models_%d.pth' % episode))
     else:
       torch.save({
         'infinite_vae': infinite_vae.state_dict(),
         'recurrent_gp': recurrent_gp.state_dict(),
-        'optimiser': optimiser.state_dict(),
+        'optimizer': optimizer.state_dict(),
         'actor_critic_planner': actor_critic_planner.state_dict(),
-        'planning_optimiser': planning_optimiser.state_dict(),
+        'planning_optimizer': planning_optimizer.state_dict(),
         }, os.path.join(results_dir, 'models_%d.pth' % episode))
     if args.checkpoint_experience:
       torch.save(D, os.path.join(results_dir, 'experience.pth'))  # Warning: will fail with MemoryError with large memory sizes
