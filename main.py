@@ -124,7 +124,7 @@ recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, 
 if args.use_regular_vae:
   observation_model = ObservationModel(args.symbolic_env, env.observation_size, args.state_size, args.embedding_size, args.activation_function).to(device=args.device)
   encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.state_size, args.activation_function).to(device=args.device)
-  param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters())
+  param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters()) 
 else:
   hyperParams = {"batch_size": args.batch_size * args.chunk_size,
                "input_d": 1,
@@ -150,11 +150,9 @@ else:
   dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
   dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
   #optimize transition function, controller and reward functions
-
+  ##should we optimize these transition function and controller like the following?
   param_list    = list(recurrent_gp.parameters())
-  ##should we optimize these two like the following?
-  tran_optim    = torch.optim.Adam([{"params": recurrent_gp.transition_modules.parameters()},],lr=hyperParams["LEARNING_RATE"])#train transition function
-  control_optim = torch.optim.Adam([{"params": recurrent_gp.policy_modules.parameters()},],lr=hyperParams["LEARNING_RATE"]) #controller
+  
 
 optimiser = AdaBound(param_list, lr=0.0001) if args.use_ada_bound else optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
@@ -168,9 +166,7 @@ if args.models is not '' and os.path.exists(args.models):
   else:
     infinite_vae.load_state_dict(model_dicts['infinite_vae'])
   recurrent_gp.load_state_dict(model_dicts['recurrent_gp'])
-  #save the controller & transition
-  recurrent_gp.transition_modules.load_state_dict(model_dicts['transition_gp'])
-  recurrent_gp.policy_modules.load_state_dict(model_dicts['controller_gp'])
+  #save the controller & transition in the above? 
   optimiser.load_state_dict(model_dicts['optimiser'])
   actor_critic_planner.load_state_dict(model_dicts['actor_critic_planner'])
   planning_optimiser.load_state_dict(model_dicts['planning_optimiser'])
@@ -180,9 +176,9 @@ free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.d
 
 reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
 #### ELBO objective for the transition and controller GP ### ???? need to be fixed
-transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, X.shape[-2], beta=1.0))#what X=action+latent_space
-#transition_mll = DeepApproximateMLL(PredictiveLogLikelihood(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, X.shape[-2], beta=1.0))
-controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_modules.likelihood, recurrent_gp.policy_modules, X.shape[-2], beta=1.0))#latent_space
+transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_module.likelihood, recurrent_gp.transition_module, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size), beta=1.0))#what X=action+latent_space
+#transition_mll = DeepApproximateMLL(PredictiveLogLikelihood(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size), beta=1.0))
+controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_modules.likelihood, recurrent_gp.policy_modules,args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size), beta=1.0))#latent_space
 rgp_training_episode = args.seed_episodes
 
 # Training (and testing)
@@ -247,16 +243,16 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
         ###### add controller & polcy losses ##############
         ########Need to be fixed in terms of input and outputs#######
-        tran_optim.zero_grad()
-        control_optim.zero_grad()
-        output_latent = recurrent_gp.transition_modules(x_batch)#input:action+latent_space ??
-        output_action = recurrent_gp.policy_modules(x_batch)#input:latent_space
-        transition_imagine_loss = -transition_mll(output_latent, y_batch)##??fix
-        transition_imagine_loss.backward()
-        controller_imagine_loss = -controller_mll(output_action, y_batch)##??fix
-        controller_imagine_loss.backward()
-        tran_optim.step()
-        control_optim.step()
+        init_transition  = torch.cat([init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)], dim=-1)
+        
+        predicted_latent = recurrent_gp.transition_modules(init_transition)#input:action+latent_space ??
+        predicted_action = recurrent_gp.policy_modules(init_states)#input:latent_space
+        true_latent      = latent_states[args.lagging_size:]
+        true_action      = actions[args.lagging_size:]
+        transition_imagine_loss = -transition_mll(predicted_latent, true_latent)##??fix
+        
+        controller_imagine_loss = -controller_mll(predicted_action, true_action)##??fix
+        
         ##################
         if args.use_regular_vae:
           observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
@@ -265,19 +261,20 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         if args.learning_rate_schedule != 0:
           for group in optimiser.param_groups:
             group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
-        # Update model parameters
+        # Update model parameters 
         optimiser.zero_grad()
+        #compute losses
         if args.use_regular_vae:
-          (observation_loss + reward_loss + latent_kl_loss).backward()
+          (observation_loss + reward_loss + latent_kl_loss + transition_imagine_loss + controller_imagine_loss).backward()
         else:
-          reward_loss.backward()
+          (reward_loss + transition_imagine_loss +  controller_imagine_loss).backward()
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
         optimiser.step()
         # Store loss
         if args.use_regular_vae:
-          losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item()])
+          losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item(), transition_imagine_loss.item(), controller_imagine_loss.item() ])
         else:
-          losses.append([0, 0, 0, 0, 0, reward_loss.item()])
+          losses.append([0, 0, 0, 0, 0, reward_loss.item(), transition_imagine_loss.item(), controller_imagine_loss.item()])
 
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
@@ -285,9 +282,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       metrics['observation_loss'].append(losses[0])
       metrics['reward_loss'].append(losses[1])
       metrics['latent_kl_loss'].append(losses[2])
+      metrics['imaginative_transition_loss'].append(losses[3])
+      metrics['imaginative_controller_loss'].append(losses[4])
       lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
       lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
       lineplot(metrics['episodes'][-len(metrics['latent_kl_loss']):], metrics['latent_kl_loss'], 'latent_kl_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['imaginative_transition_loss']):], metrics['imaginative_transition_loss'], 'imaginative_transition_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['imaginative_controller_loss']):], metrics['imaginative_controller_loss'], 'imaginative_controller_loss', results_dir)
     else:
       metrics['elbo1'].append(losses[0])
       metrics['elbo2'].append(losses[1])
@@ -295,12 +296,16 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       metrics['elbo4'].append(losses[3])
       metrics['elbo5'].append(losses[4])
       metrics['reward_loss'].append(losses[5])
+      metrics['imaginative_transition_loss'].append(losses[6])
+      metrics['imaginative_controller_loss'].append(losses[7])
       lineplot(metrics['episodes'][-len(metrics['elbo1']):], metrics['elbo1'], 'elbo1', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo2']):], metrics['elbo2'], 'elbo2', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo3']):], metrics['elbo3'], 'elbo3', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo4']):], metrics['elbo4'], 'elbo4', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo5']):], metrics['elbo5'], 'elbo5', results_dir)
       lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['imaginative_transition_loss']):], metrics['imaginative_transition_loss'], 'imaginative_transition_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['imaginative_controller_loss']):], metrics['imaginative_controller_loss'], 'imaginative_controller_loss', results_dir)
 
   # Data collection
   if args.use_regular_vae:
