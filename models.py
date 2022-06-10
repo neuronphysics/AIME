@@ -262,7 +262,7 @@ class DeepGaussianProcesses(DeepGP):
         self.to(device=self.device)
 
     def forward(self, inputs):
-        out = self.first_layer(inputs)
+        out = self.first_layer(inputs, are_samples=True)
         for hidden in self.hidden_layers:
             out = hidden(out)
         return out
@@ -286,12 +286,16 @@ class DeepGaussianProcesses(DeepGP):
         with torch.no_grad():
             mus = []
             variances = []
-            lls = []
-            gts = []
+            samples = []
             preds = self.likelihood(self(x))
             mus.append(preds.mean)
-            variances.append(preds.variance)           
-        return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1)
+            variances.append(preds.variance)
+            #Alternative: not sure about the size of input for sample???
+            #mvn = MultivariateNormal(preds.mean,preds.variance)
+            #x = mvn.sample(sample_shape=torch.Size([self.dim]))
+            #x = x.t()
+            samples.append(preds.sample())           
+        return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1), torch.cat(samples, dim=-1)
 
     def retrieve_all_hyperparameter(self):
         all_sigma2 = []
@@ -346,8 +350,8 @@ class RecurrentGP(DeepGaussianProcesses):
         self.lagging_size = lagging_size
         self.action_size = action_size
         self.latent_size = latent_size
-        self.transition_modules = [TransitionGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size)]
-        self.policy_modules = [PolicyGP(latent_size, action_size, lagging_size, device).to(device=device) for _ in range(horizon_size+1)]
+        self.transition_module = TransitionGP(latent_size, action_size, lagging_size, device).to(device=device) 
+        self.policy_module = PolicyGP(latent_size, action_size, lagging_size, device).to(device=device) 
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device).to(device=device)
         self.num_mixture_samples = num_mixture_samples
         self.likelihood = GaussianLikelihood()
