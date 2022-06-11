@@ -328,21 +328,23 @@ def compute_EZ_trajectory(K, m, sigma2s, lengthscales):
 
 
 class TransitionGP(DeepGaussianProcesses):
+    #transition probability  P(z_{t}|x_{t-k},...x_{t-1})=N(z_{t}|mu_x,sigma_x)---->T(x_{t-k},...x_{t-1})=z_{t}; x_{.}=[z_{.},a_{.}]
     def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[100], mean_type= 'linear'):
         input_size = (latent_size+action_size)*lagging_size
         super(TransitionGP, self).__init__(input_size=input_size, output_size=latent_size, device=device, hidden_size=hidden_size, mean_type=mean_type) 
       
 class PolicyGP(DeepGaussianProcesses):
+    #policy P(z_{t},...z_{t-k})=a(t)--- input z:latent_space---> output a: action
     def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[50], mean_type= 'constant'):
         input_size =latent_size*lagging_size
         super(PolicyGP, self).__init__(input_size=input_size, output_size= action_size, device=device, hidden_size=hidden_size, mean_type=mean_type)
      
 class RewardGP(DeepGaussianProcesses):
-    def __init__(self, latent_size, action_size, lagging_size, reward_size, device, hidden_size=[100], mean_type= 'zero'):
+    def __init__(self, latent_size, action_size, lagging_size,  device, hidden_size=[100], mean_type= 'zero'):
        input_size =(latent_size+action_size)*lagging_size
-       super(RewardGP, self).__init__(input_size=input_size, output_size= reward_size, device=device, hidden_size=hidden_size, mean_type=mean_type)
-#P(z_{t}|x_{t-k},...x_{t-1})---->T(x_{t-k},...x_{t-1})=z_{t}; x_{.}=[z_{.},a_{.}]--->transition
-#P(z_{t},...z_{t-k})=a(t)--->policy z:latent_space, a: action
+       super(RewardGP, self).__init__(input_size=input_size, output_size= 1, device=device, hidden_size=hidden_size, mean_type=mean_type)
+
+
 class RecurrentGP(DeepGaussianProcesses):
     def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1):
         super().__init__()
@@ -366,17 +368,19 @@ class RecurrentGP(DeepGaussianProcesses):
         lagging_states = init_states
         for i in range(self.horizon_size):
             # policy distribution
-            a = self.policy_modules[i](lagging_states).rsample().mean(dim=0)
+            a, a_v, a_s = self.policy_module.predict(lagging_states)
+            print(f"action mean {a}, variance {a_v}, sample {a_s}")
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
             # transition distribution
-            z = self.transition_modules[i](z_hat).rsample().mean(dim=0)
+            z, z_v, z_s = self.transition_module.predict(z_hat)
+            print(f"latent state mean {z}, variance {z_v}, sample {z_s}")
             lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
         
         # last policy in the horizon
-        a = self.policy_modules[self.horizon_size](lagging_states).rsample().mean(dim=0)
+        a, _, _ = self.policy_module.predict(lagging_states)
         lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
         z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
-        rewards = self.reward_gp(z_hat)
+        rewards, _, _ = self.reward_gp(z_hat)
         return rewards
