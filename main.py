@@ -178,7 +178,7 @@ reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurre
 #### ELBO objective for the transition and controller GP ### ???? need to be fixed
 transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_module.likelihood, recurrent_gp.transition_module, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size), beta=1.0))#what X=action+latent_space
 #transition_mll = DeepApproximateMLL(PredictiveLogLikelihood(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size), beta=1.0))
-controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_modules.likelihood, recurrent_gp.policy_modules,args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size), beta=1.0))#latent_space
+controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_module.likelihood, recurrent_gp.policy_module,args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size), beta=1.0))#latent_space
 rgp_training_episode = args.seed_episodes
 
 # Training (and testing)
@@ -245,8 +245,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         ########Need to be fixed in terms of input and outputs#######
         init_transition  = torch.cat([init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)], dim=-1)
         
-        predicted_latent = recurrent_gp.transition_modules(init_transition)#input:action+latent_space ??
-        predicted_action = recurrent_gp.policy_modules(init_states)#input:latent_space
+        predicted_latent = recurrent_gp.transition_module(init_transition)#input:action+latent_space ??
+        predicted_action = recurrent_gp.policy_module(init_states)#input:latent_space
         true_latent      = latent_states[args.lagging_size:]
         true_action      = actions[args.lagging_size:]
         transition_imagine_loss = -transition_mll(predicted_latent, true_latent)##??fix
