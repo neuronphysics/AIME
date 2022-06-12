@@ -345,7 +345,7 @@ class RewardGP(DeepGaussianProcesses):
        super(RewardGP, self).__init__(input_size=input_size, output_size= 1, device=device, hidden_size=hidden_size, mean_type=mean_type)
 
 
-class RecurrentGP(DeepGaussianProcesses):
+class RecurrentGP(DeepGP):
     def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1):
         super().__init__()
         self.horizon_size = horizon_size
