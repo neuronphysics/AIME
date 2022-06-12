@@ -165,7 +165,7 @@ class DGPHiddenLayer(DeepGPLayer):
             learn_inducing_locations=True
         )
 
-        super(GPHiddenLayer, self).__init__(variational_strategy, input_dims, output_dims)
+        super(DGPHiddenLayer, self).__init__(variational_strategy, input_dims, output_dims)
         if mean_type == 'constant':
             self.mean_module = ConstantMean()
         elif mean_type == 'zero':
