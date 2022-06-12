@@ -241,8 +241,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         else:
           true_rewards = rewards[args.lagging_size+args.horizon_size:]
         reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
-        ###### add controller & polcy losses ##############
-        ########Need to be fixed in terms of input and outputs#######
+        ############### add controller & policy losses #################
+        ######## Need to be fixed in terms of inputs and outputs #######
         init_transition  = torch.cat([init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)], dim=-1)
         
         predicted_latent = recurrent_gp.transition_module(init_transition)#input:action+latent_space ??

@@ -167,9 +167,9 @@ class DGPHiddenLayer(DeepGPLayer):
 
         super(DGPHiddenLayer, self).__init__(variational_strategy, input_dims, output_dims)
         if mean_type == 'constant':
-            self.mean_module = ConstantMean()
+            self.mean_module = ConstantMean(batch_shape=batch_shape)
         elif mean_type == 'zero':
-            self.mean_module = ZeroMean()
+            self.mean_module = ZeroMean(batch_shape=batch_shape)
         else:
             self.mean_module = LinearMean(input_dims)
         
@@ -342,7 +342,7 @@ class PolicyGP(DeepGaussianProcesses):
 class RewardGP(DeepGaussianProcesses):
     def __init__(self, latent_size, action_size, lagging_size,  device, hidden_size=[100], mean_type= 'zero'):
        input_size =(latent_size+action_size)*lagging_size
-       super(RewardGP, self).__init__(input_size=input_size, output_size= 1, device=device, hidden_size=hidden_size, mean_type=mean_type)
+       super(RewardGP, self).__init__(input_size=input_size, output_size= None, device=device, hidden_size=hidden_size, mean_type=mean_type)
 
 
 class RecurrentGP(DeepGP):
