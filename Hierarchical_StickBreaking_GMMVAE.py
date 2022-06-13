@@ -896,7 +896,8 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
                self.z_wc_mean_list_sample, self.z_wc_logvar_list_sample, self.gamma_alpha, self.gamma_beta
 
     def get_latent_states(self, X):
-        return self.z_x_mean
+        self.forward(X)
+        return self.z_x
 
     def compose_stick_segments( self,v):
         segments = []

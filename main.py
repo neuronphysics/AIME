@@ -68,7 +68,7 @@ parser.add_argument('--non-cumulative-reward', action='store_true', help='Model 
 parser.add_argument('--num-sample-trajectories', type=int, default=10, metavar='nst', help='number of trajectories sample in the imagination part')
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
 parser.add_argument('--discount-factor', type=float, default=0.999, metavar='Temp', help='Discount factor')
-parser.add_argument('--num-mixtures', type=int, default=25, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
+parser.add_argument('--num-mixtures', type=int, default=10, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
 parser.add_argument('--w-dim', type=int, default=10, metavar='w', help='dimension of w')
 parser.add_argument('--hidden-size', type=int, default=10, metavar='H', help='Hidden size')
 parser.add_argument('--state-size', type=int, default=10, metavar='Z', help='State/latent size')
@@ -130,10 +130,10 @@ else:
                "input_d": 1,
                "prior_alpha": 7., #gamma_alpha
                "prior_beta": 1., #gamma_beta
-               "K": 25,
-               "hidden_d": args.hidden_size,
-               "latent_d": args.state_size,
-               "latent_w": args.w_dim,
+               "K": args.num_mixtures,
+               "hidden_d": args.hidden_size, # 10
+               "latent_d": args.state_size, # 10
+               "latent_w": args.w_dim, # 10
                "LAMBDA_GP": 10, #hyperparameter for WAE with gradient penalty
                "LEARNING_RATE": 1e-4,
                "CRITIC_ITERATIONS" : 5
@@ -210,21 +210,22 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
             discriminator.zero_grad()
             loss_critic.backward(retain_graph=True)
             dis_optim.step()
+
           gen_fake = discriminator(z_fake).reshape(-1)
         
           loss_dict = infinite_vae.get_ELBO(observations)
           loss_dict["wasserstein_loss"] =  -torch.mean(gen_fake)
-          vae_encoder.zero_grad()
-          vae_decoder.zero_grad()
+          # vae_encoder.zero_grad()
+          # vae_decoder.zero_grad()
           
           loss_dict["WAE-GP"]=loss_dict["loss"]+loss_dict["wasserstein_loss"]
 
-          loss_dict["WAE-GP"].backward()
+          # loss_dict["WAE-GP"].backward()
           
-          torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), grad_clip)
+          # torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), grad_clip)
 
-          enc_optim.step()
-          dec_optim.step()
+          # enc_optim.step()
+          # dec_optim.step()
           
           latent_states = torch.reshape(infinite_vae.get_latent_states(observations), (original_shape[0], original_shape[1], args.state_size))
 
@@ -247,14 +248,28 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         if args.use_regular_vae:
           (observation_loss + reward_loss + latent_kl_loss).backward()
         else:
-          reward_loss.backward()
+          vae_encoder.zero_grad()
+          vae_decoder.zero_grad()
+
+          loss_dict["reward_loss"] = reward_loss
+          total_loss = loss_dict["reward_loss"] + loss_dict["WAE-GP"]
+          total_loss.backward()
+          #reward_loss.backward()
+          torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), grad_clip)
+          enc_optim.step()
+          dec_optim.step()
+          #print("total_loss", total_loss)
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
         optimiser.step()
         # Store loss
         if args.use_regular_vae:
           losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item()])
+          #print("observation_loss", observation_loss, "reward_loss", reward_loss, "latent_kl_loss", latent_kl_loss)
+          #print("observation_loss + reward_loss + latent_kl_loss", observation_loss + reward_loss + latent_kl_loss)
         else:
           losses.append([0, 0, 0, 0, 0, reward_loss.item()])
+          #print("losses", losses)
+          #print("loss_dict", loss_dict)
 
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
@@ -289,9 +304,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   with torch.no_grad():
     if args.use_regular_vae:
       current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
-      current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
+      current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std # (1, 10)
     else:
-      _, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
+      #print("infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))", infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device)).shape)
+      current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
+      #current_latent_state = torch.reshape(infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device)), (original_shape[0], original_shape[1], args.state_size))
+      #_, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
+
   episode_states = torch.zeros(args.lagging_size, args.state_size, device=args.device)
   episode_states[-1] = current_latent_state
   episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
@@ -315,7 +334,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
           current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
         else:
-          _, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
+          current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
+          #_, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
       transition_kl = -transition_dist.log_prob(current_latent_state)
       transition_mll_loss = -actor_critic_planner.transition_mll(transition_dist, current_latent_state)
       episode_transition_kl = torch.cat([episode_transition_kl, transition_kl.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
@@ -333,6 +353,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       if done:
         pbar.close()
         break
+      del current_latent_state
 
   current_q_values = episode_q_values
   previous_q_values = episode_q_values
@@ -351,9 +372,11 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   current_transition_mll_loss = episode_transition_mll_loss.mean()
   
   planning_optimiser.zero_grad()
-  (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
+  (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward(retain_graph=True)
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
+  #print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
+  #print("value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
@@ -398,7 +421,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
         current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
       else:
-        reconstructed_observation, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
+        current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
       episode_states[-1] = current_latent_state
       episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
@@ -410,7 +433,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
           current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
         else:
-          _, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
+          current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
         episode_states = torch.cat([episode_states, current_latent_state], dim=0)
         episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
         total_rewards = total_reward + reward.numpy()
