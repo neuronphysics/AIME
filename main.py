@@ -35,8 +35,8 @@ parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', hel
 parser.add_argument('--episodes', type=int, default=10000, metavar='E', help='Total number of episodes')
 parser.add_argument('--seed-episodes', type=int, default=100, metavar='S', help='Seed episodes')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C', help='Collect interval')
-parser.add_argument('--batch-size', type=int, default=10, metavar='B', help='Batch size')
-parser.add_argument('--chunk-size', type=int, default=10, metavar='L', help='Chunk size')
+parser.add_argument('--batch-size', type=int, default=8, metavar='B', help='Batch size')
+parser.add_argument('--chunk-size', type=int, default=8, metavar='L', help='Chunk size')
 parser.add_argument('--overshooting-distance', type=int, default=50, metavar='D', help='Latent overshooting distance/latent overshooting weight for t = 1')
 parser.add_argument('--overshooting-kl-beta', type=float, default=0, metavar='β>1', help='Latent overshooting KL weight for t > 1 (0 to disable)')
 parser.add_argument('--overshooting-reward-scale', type=float, default=0, metavar='R>1', help='Latent overshooting reward prediction weight for t > 1 (0 to disable)')
@@ -63,15 +63,15 @@ parser.add_argument('--render', action='store_true', help='Render environment')
 
 ## extra hyperparameters for new model
 parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='Horizon size')
-parser.add_argument('--lagging-size', type=int, default=4, metavar='La', help='Lagging size')
+parser.add_argument('--lagging-size', type=int, default=2, metavar='La', help='Lagging size')
 parser.add_argument('--non-cumulative-reward', action='store_true', help='Model non-cumulative rewards')
 parser.add_argument('--num-sample-trajectories', type=int, default=10, metavar='nst', help='number of trajectories sample in the imagination part')
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
 parser.add_argument('--discount-factor', type=float, default=0.999, metavar='Temp', help='Discount factor')
 parser.add_argument('--num-mixtures', type=int, default=25, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
 parser.add_argument('--w-dim', type=int, default=50, metavar='w', help='dimension of w')
-parser.add_argument('--hidden-size', type=int, default=50, metavar='H', help='Hidden size')
-parser.add_argument('--state-size', type=int, default=50, metavar='Z', help='State/latent size')
+parser.add_argument('--hidden-size', type=int, default=20, metavar='H', help='Hidden size')
+parser.add_argument('--state-size', type=int, default=20, metavar='Z', help='State/latent size')
 parser.add_argument('--include-elbo2', action='store_true', help='include elbo 2 loss')
 parser.add_argument('--use-regular-vae', action='store_true', help='use vae that uses single Gaussian mixture')
 parser.add_argument('--use-ada-bound', action='store_true', help='use AdaBound as the optimizer')
@@ -244,10 +244,11 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         ############### add controller & policy losses #################
         ######## Need to be fixed in terms of inputs and outputs #######
         init_transition  = torch.cat([init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)], dim=-1)
-        
+        print(f"size of the input for the transition function {init_transition.size()}")
         predicted_latent = recurrent_gp.transition_module(init_transition)#input:action+latent_space ??
         predicted_action = recurrent_gp.policy_module(init_states)#input:latent_space
         true_latent      = latent_states[args.lagging_size:]
+        print(f"size of the output for the transition function {true_latent.size()}")
         true_action      = actions[args.lagging_size:]
         transition_imagine_loss = -transition_mll(predicted_latent, true_latent)##??fix
         

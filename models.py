@@ -9,8 +9,9 @@ from torch.distributions import constraints
 
 import gpytorch
 from gpytorch.models.deep_gps import DeepGPLayer, DeepGP
+from gpytorch.models.deep_gps.dspp import DSPPLayer, DSPP
 from gpytorch.means import ConstantMean, ZeroMean, LinearMean
-from gpytorch.kernels import RBFKernel, ScaleKernel
+from gpytorch.kernels import RBFKernel, ScaleKernel, SpectralMixtureKernel
 from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.likelihoods import GaussianLikelihood
@@ -145,8 +146,12 @@ def Encoder(symbolic, observation_size, embedding_size, state_size, activation_f
   else:
     return VisualEncoder(embedding_size, state_size, activation_function)
 
-class DGPHiddenLayer(DeepGPLayer):
-    def __init__(self, input_dims, output_dims, device, num_inducing=128, mean_type='constant'):
+class DGPHiddenLayer(DSPPLayer):
+    """
+    :param int Q: Number of quadrature sites to use. Also the number of Gaussians in the mixture output
+        by this layer.
+    """
+    def __init__(self, input_dims, output_dims, device, num_inducing=128, inducing_points=None, mean_type='constant', num_mixtures=5, num_quad_sites= 8):
         if output_dims is None:
             inducing_points = torch.randn(num_inducing, input_dims).to(device=device)
             batch_shape = torch.Size([])
@@ -165,7 +170,7 @@ class DGPHiddenLayer(DeepGPLayer):
             learn_inducing_locations=True
         )
 
-        super(DGPHiddenLayer, self).__init__(variational_strategy, input_dims, output_dims)
+        super().__init__(variational_strategy, input_dims, output_dims, num_quad_sites)
         if mean_type == 'constant':
             self.mean_module = ConstantMean(batch_shape=batch_shape)
         elif mean_type == 'zero':
@@ -174,7 +179,7 @@ class DGPHiddenLayer(DeepGPLayer):
             self.mean_module = LinearMean(input_dims)
         
         self.covar_module = ScaleKernel(
-            RBFKernel(batch_shape=batch_shape, ard_num_dims=input_dims),
+            SpectralMixtureKernel(num_mixtures=num_mixtures, batch_shape=batch_shape, ard_num_dims=input_dims),
             batch_shape=batch_shape, ard_num_dims=None
         )
 
@@ -183,30 +188,43 @@ class DGPHiddenLayer(DeepGPLayer):
         covar_x = self.covar_module(x)
         return MultivariateNormal(mean_x, covar_x)
 
-    def __call__(self, x, *other_inputs, **kwargs):
-        """
-        Overriding __call__ isn't strictly necessary, but it lets us add concatenation based skip connections
-        easily. For example, hidden_layer2(hidden_layer1_outputs, inputs) will pass the concatenation of the first
-        hidden layer's outputs and the input data to hidden_layer2.
-        """
-        if len(other_inputs):
-            if isinstance(x, gpytorch.distributions.MultitaskMultivariateNormal):
-                x = x.rsample()
+    def integrate(self, inputs, quad_sites):
+        # Following the Source Code
+        expect_type = gpytorch.distributions.MultitaskMultivariateNormal
+        assert isinstance(inputs, expect_type)
 
-            processed_inputs = [
-                inp.unsqueeze(0).expand(self.num_samples, *inp.shape)
-                for inp in other_inputs
+        mus, sigmas = inputs.mean, inputs.variance.sqrt()
+        qg = quad_sites.view([self.num_quad_sites] + [1] * (mus.dim() - 2) + [mus.size(-1)])
+        sigmas = sigmas * qg
+        return mus + sigmas 
+"""    
+    def __call__(self, x, *other_inputs, **kwargs):
+            
+        expect_type = gpytorch.distributions.MultitaskMultivariateNormal
+
+        if len(other_inputs):
+
+            each_sizes = [
+                inp.mean.size(-1) if isinstance(inp, expect_type) else inp.size(-1)
+                for inp in [x] + list(other_inputs)
             ]
 
+            each_quad_sites = torch.split(self.quad_sites, each_sizes, dim=-1)
+
+            if isinstance(x, expect_type):
+                x = self.integrate(x, each_quad_sites[0])
+            
+            processed_inputs = [
+                self.integrate(inp, each_quad_sites[i+1]) if isinstance(inp, expect_type) else inp.unsqueeze(0).expand(self.num_quad_sites, *inp.shape) 
+                for i, inp in enumerate(other_inputs)
+            ]
+            
             x = torch.cat([x] + processed_inputs, dim=-1)
 
-        return super().__call__(x, are_samples=bool(len(other_inputs)))
-
-
-
-
-class DeepGaussianProcesses(DeepGP):
-    def __init__(self, input_size, output_size, device, num_inducing=30, **kwargs):
+        return super().__call__(x, are_samples=bool(len(other_inputs)), **kwargs)
+"""
+class DeepGaussianProcesses(DSPP):
+    def __init__(self, input_size, output_size, device, num_inducing= 50, Q=8, max_cholesky_size=10000, **kwargs):
         # pass hidden layer sizes as separate arguments as well as array
         for k, v in kwargs.items():
             if k=='mean_type':
@@ -215,14 +233,15 @@ class DeepGaussianProcesses(DeepGP):
         
         self.hidden_size = hidden_size
         self.hidden_size.append(output_size)
-        
+        self.max_cholesky_size = max_cholesky_size
         self.device = device
         first_layer = DGPHiddenLayer(
                       input_dims=input_size,
                       output_dims=self.hidden_size[0],
                       device = self.device,
                       num_inducing=num_inducing,
-                      mean_type=self.mean_type
+                      mean_type=self.mean_type,
+                      num_quad_sites=Q,
                       )
 
         # variable count of hidden layers and neurons
@@ -236,7 +255,8 @@ class DeepGaussianProcesses(DeepGP):
                      output_dims=self.hidden_size[i + 1],
                      device = self.device,
                      num_inducing=num_inducing,
-                     mean_type='constant'
+                     mean_type='constant',
+                     num_quad_sites=Q,
                   )
                   for i in range(len(self.hidden_size) - 1)
               ])
@@ -249,12 +269,13 @@ class DeepGaussianProcesses(DeepGP):
                      output_dims=self.hidden_size[i + 1],
                      device = self.device,
                      num_inducing=num_inducing,
-                     mean_type='zero'
+                     mean_type='zero',
+                     num_quad_sites=Q,
                   )
                   for i in range(len(self.hidden_size) - 1)
               ])
 
-        super().__init__()
+        super().__init__(Q)
 
         self.first_layer = first_layer
         self.hidden_layers = hidden_layers
@@ -262,7 +283,7 @@ class DeepGaussianProcesses(DeepGP):
         self.to(device=self.device)
 
     def forward(self, inputs):
-        out = self.first_layer(inputs, are_samples=True)
+        out = self.first_layer(inputs)
         for hidden in self.hidden_layers:
             out = hidden(out)
         return out
@@ -283,19 +304,20 @@ class DeepGaussianProcesses(DeepGP):
     #    return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1), torch.cat(lls, dim=-1), torch.cat(gts, dim=-1)
 
     def predict(self, x):
-        with torch.no_grad():
+        with torch.no_grad(), gpytorch.settings.max_cholesky_size(self.max_cholesky_size):
             mus = []
             variances = []
             samples = []
+            lowers=[]
+            uppers=[]
             preds = self.likelihood(self(x))
             mus.append(preds.mean)
             variances.append(preds.variance)
-            #Alternative: not sure about the size of input for sample???
-            #mvn = MultivariateNormal(preds.mean,preds.variance)
-            #x = mvn.sample(sample_shape=torch.Size([self.dim]))
-            #x = x.t()
-            samples.append(preds.sample())           
-        return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1), torch.cat(samples, dim=-1)
+            lower, upper = preds.confidence_region()
+            lowers.append(lower)
+            uppers.append(upper)
+            samples.append(preds.rsample())           
+        return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1), torch.cat(lowers, dim=-1), torch.cat(uppers, dim=-1), torch.cat(samples, dim=-1)
 
     def retrieve_all_hyperparameter(self):
         all_sigma2 = []
@@ -329,7 +351,7 @@ def compute_EZ_trajectory(K, m, sigma2s, lengthscales):
 
 class TransitionGP(DeepGaussianProcesses):
     #transition probability  P(z_{t}|x_{t-k},...x_{t-1})=N(z_{t}|mu_x,sigma_x)---->T(x_{t-k},...x_{t-1})=z_{t}; x_{.}=[z_{.},a_{.}]
-    def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[100], mean_type= 'linear'):
+    def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[50], mean_type= 'linear'):
         input_size = (latent_size+action_size)*lagging_size
         super(TransitionGP, self).__init__(input_size=input_size, output_size=latent_size, device=device, hidden_size=hidden_size, mean_type=mean_type) 
       
@@ -340,7 +362,7 @@ class PolicyGP(DeepGaussianProcesses):
         super(PolicyGP, self).__init__(input_size=input_size, output_size= action_size, device=device, hidden_size=hidden_size, mean_type=mean_type)
      
 class RewardGP(DeepGaussianProcesses):
-    def __init__(self, latent_size, action_size, lagging_size,  device, hidden_size=[100], mean_type= 'zero'):
+    def __init__(self, latent_size, action_size, lagging_size,  device, hidden_size=[50], mean_type= 'zero'):
        input_size =(latent_size+action_size)*lagging_size
        super(RewardGP, self).__init__(input_size=input_size, output_size= None, device=device, hidden_size=hidden_size, mean_type=mean_type)
 
@@ -368,19 +390,22 @@ class RecurrentGP(DeepGP):
         lagging_states = init_states
         for i in range(self.horizon_size):
             # policy distribution
-            a, a_v, a_s = self.policy_module.predict(lagging_states)
-            print(f"action mean {a}, variance {a_v}, sample {a_s}")
+            #s = lagging_states.unsqueeze(-1)     
+            #s = s.repeat(1, 1, 1, lagging_states.size(2))      
+            print(f"new size of state : {lagging_states.size()}, latent size: {self.latent_size}, action size: {self.action_size}, lagging size: {self.lagging_size}")
+            a, a_v, a_l, a_u, a_s = self.policy_module.predict(lagging_states)
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
+            print(f"size of lagging actions {lagging_actions.size()}")
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
             # transition distribution
-            z, z_v, z_s = self.transition_module.predict(z_hat)
-            print(f"latent state mean {z}, variance {z_v}, sample {z_s}")
+            z, z_v, z_l, z_u, z_s = self.transition_module.predict(z_hat)
+            print(f"latent state mean {z}, variance {z_v}, lower bound error {z_l}, upper bound error {z_u}, sample {z_s}")
             lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
         
         # last policy in the horizon
-        a, _, _ = self.policy_module.predict(lagging_states)
+        a, _, _, _, _ = self.policy_module.predict(lagging_states)
         lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
         z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
-        rewards, _, _ = self.reward_gp(z_hat)
+        rewards, _, _, _, _ = self.reward_gp(z_hat)
         return rewards
