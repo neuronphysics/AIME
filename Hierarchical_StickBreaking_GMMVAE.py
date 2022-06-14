@@ -863,10 +863,10 @@ def frozen_params(module: nn.Module):
 ### Gaussian Mixture Model VAE Class
 class InfGaussMMVAE(GMMVAE,BetaSample):
     # based on this implementation :https://github.com/enalisnick/mixture_density_VAEs
-    def __init__(self, hyperParams, K, nchannel, z_dim, w_dim, hidden_dim, device, img_width, batch_size, include_elbo2=True):
+    def __init__(self, hyperParams, K, nchannel, z_dim, w_dim, hidden_dim, device, img_width, batch_size, num_layers = 4, include_elbo2=True):
         global local_device
         local_device = device
-        super(InfGaussMMVAE, self).__init__(K, nchannel, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4, small_conv=False)
+        super(InfGaussMMVAE, self).__init__(K, nchannel, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=num_layers, small_conv=False)
         BetaSample.__init__(self)
        
         self.priors          = {"alpha": hyperParams['prior_alpha'], "beta": hyperParams['prior_beta']}

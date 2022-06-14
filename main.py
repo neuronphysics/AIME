@@ -77,6 +77,8 @@ parser.add_argument('--use-regular-vae', action='store_true', help='use vae that
 parser.add_argument('--use-ada-bound', action='store_true', help='use AdaBound as the optimizer')
 parser.add_argument('--rgp-training-interval-ratio', type=float, default=1.1, metavar='In', help='RGP training interval ratio')
 parser.add_argument('--num-gp-likelihood-samples', type=int, default=50, metavar='GP', help='Number of likelihood samples for GP')
+parser.add_argument('--input-size', type=int, default=64, metavar='InpS', help='observation input size')
+parser.add_argument('--infgmmvae-num-layer', type=int, default=4, metavar='Infnl', help='observation input size')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -100,12 +102,12 @@ metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': []
            'elbo1': [], 'elbo2': [], 'elbo3': [], 'elbo4': [], 'elbo5': []}
 
 # Initialise training environment and experience replay memory
-env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
+env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth, args.input_size)
 if args.experience_replay is not '' and os.path.exists(args.experience_replay):
   D = torch.load(args.experience_replay)
   metrics['steps'], metrics['episodes'] = [D.steps] * D.episodes, list(range(1, D.episodes + 1))
 elif not args.test:
-  D = ExperienceReplay(args.experience_size, args.symbolic_env, env.observation_size, env.action_size, args.bit_depth, args.device)
+  D = ExperienceReplay(args.experience_size, args.symbolic_env, env.observation_size, env.action_size, args.bit_depth, args.device, args.input_size)
   # Initialise dataset D with S random seed episodes
   for s in range(1, args.seed_episodes + 1):
     observation, done, t = env.reset(), False, 0
@@ -122,8 +124,8 @@ elif not args.test:
 recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, args.lagging_size, args.device).to(device=args.device)
 
 if args.use_regular_vae:
-  observation_model = ObservationModel(args.symbolic_env, env.observation_size, args.state_size, args.embedding_size, args.activation_function).to(device=args.device)
-  encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.state_size, args.activation_function).to(device=args.device)
+  observation_model = ObservationModel(args.symbolic_env, env.observation_size, args.state_size, args.embedding_size, args.activation_function, args.input_size).to(device=args.device)
+  encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.state_size, args.activation_function, args.input_size).to(device=args.device)
   param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters())
 else:
   hyperParams = {"batch_size": args.batch_size * args.chunk_size,
@@ -138,7 +140,7 @@ else:
                "LEARNING_RATE": 1e-4,
                "CRITIC_ITERATIONS" : 5
                }
-  infinite_vae = InfGaussMMVAE(hyperParams, hyperParams["K"], 3, hyperParams["latent_d"], hyperParams["latent_w"], hyperParams["hidden_d"], args.device, 64, hyperParams["batch_size"],include_elbo2=True).to(device=args.device)
+  infinite_vae = InfGaussMMVAE(hyperParams, hyperParams["K"], 3, hyperParams["latent_d"], hyperParams["latent_w"], hyperParams["hidden_d"], args.device, args.input_size, hyperParams["batch_size"], args.infgmmvae_num_layer, include_elbo2=True).to(device=args.device)
   
   vae_encoder, vae_decoder, discriminator = infinite_vae.encoder, infinite_vae.decoder, VAECritic(infinite_vae.z_dim)
 
@@ -375,8 +377,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward(retain_graph=True)
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
-  #print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
-  #print("value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
+  # print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
+  print("value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())

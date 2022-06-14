@@ -6,7 +6,7 @@ from torch import jit, nn
 from torch.nn import functional as F
 
 from torch.distributions import constraints
-
+from torchvision.transforms import Resize
 import gpytorch
 from gpytorch.models.deep_gps import DeepGPLayer, DeepGP
 from gpytorch.means import ConstantMean, ZeroMean, LinearMean
@@ -49,32 +49,42 @@ class SymbolicObservationModel(jit.ScriptModule):
 class VisualObservationModel(jit.ScriptModule):
   __constants__ = ['embedding_size']
   
-  def __init__(self, state_size, embedding_size, activation_function='relu'):
+  def __init__(self, state_size, embedding_size, activation_function='relu', input_size=64):
     super().__init__()
     self.act_fn = getattr(F, activation_function)
     self.embedding_size = embedding_size
     self.fc1 = nn.Linear(state_size, embedding_size)
-    self.conv1 = nn.ConvTranspose2d(embedding_size, 128, 5, stride=2)
-    self.conv2 = nn.ConvTranspose2d(128, 64, 5, stride=2)
-    self.conv3 = nn.ConvTranspose2d(64, 32, 6, stride=2)
-    self.conv4 = nn.ConvTranspose2d(32, 3, 6, stride=2)
+    self.input_size = input_size
+    if input_size == 32:
+      self.conv1 = nn.ConvTranspose2d(embedding_size, 64, 6, stride=2)
+      self.conv2 = nn.ConvTranspose2d(64, 32, 5, stride=2)
+      self.conv3 = nn.ConvTranspose2d(32, 3, 4, stride=2)
+      self.conv4 = nn.Identity()
+    else:
+      self.conv1 = nn.ConvTranspose2d(embedding_size, 128, 5, stride=2)
+      self.conv2 = nn.ConvTranspose2d(128, 64, 5, stride=2)
+      self.conv3 = nn.ConvTranspose2d(64, 32, 6, stride=2)
+      self.conv4 = nn.ConvTranspose2d(32, 3, 6, stride=2)
 
   @jit.script_method
   def forward(self, state):
     hidden = self.fc1(state)  # No nonlinearity here
     hidden = hidden.view(-1, self.embedding_size, 1, 1)
     hidden = self.act_fn(self.conv1(hidden))
+    #print("hidden 1 decoder", hidden.shape)
     hidden = self.act_fn(self.conv2(hidden))
-    hidden = self.act_fn(self.conv3(hidden))
-    observation = self.conv4(hidden)
+    #print("hidden 2 decoder", hidden.shape)
+    observation = self.act_fn(self.conv3(hidden))
+    #print("hidden 3 decoder", observation.shape)
+    observation = self.conv4(observation)
     return observation
 
 
-def ObservationModel(symbolic, observation_size, state_size, embedding_size, activation_function='relu'):
+def ObservationModel(symbolic, observation_size, state_size, embedding_size, activation_function='relu', input_size=64):
   if symbolic:
     return SymbolicObservationModel(observation_size, -1, state_size, embedding_size, activation_function)
   else:
-    return VisualObservationModel(state_size, embedding_size, activation_function)
+    return VisualObservationModel(state_size, embedding_size, activation_function, input_size)
 
 
 class SymbolicEncoder(jit.ScriptModule):
@@ -96,37 +106,53 @@ class SymbolicEncoder(jit.ScriptModule):
 class VisualEncoder(jit.ScriptModule):
   __constants__ = ['embedding_size']
   
-  def __init__(self, embedding_size, state_size, activation_function='relu'):
+  def __init__(self, embedding_size, state_size, activation_function='relu', input_size=64):
     super().__init__()
     self.act_fn = getattr(F, activation_function)
     self.embedding_size = embedding_size
     self.state_size = state_size
-    self.conv1 = nn.Conv2d(3, 32, 4, stride=2)
-    self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
-    self.conv3 = nn.Conv2d(64, 128, 4, stride=2)
-    self.conv4 = nn.Conv2d(128, 256, 4, stride=2)
-    self.fc = nn.Identity() if embedding_size == 1024 else nn.Linear(1024, embedding_size)
+    self.input_size = input_size
+    #self.transform = Resize((input_size, input_size))
+    if input_size == 32:
+      self.conv1 = nn.Conv2d(3, 32, 4, stride=2)
+      self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
+      self.conv3 = nn.Conv2d(64, 128, 4, stride=2)
+      self.conv4 = nn.Identity()
+      self.feature_size = 512
+    else:
+      self.conv1 = nn.Conv2d(3, 32, 4, stride=2)
+      self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
+      self.conv3 = nn.Conv2d(64, 128, 4, stride=2)
+      self.conv4 = nn.Conv2d(128, 256, 4, stride=2)
+      self.feature_size = 1024
+    self.fc = nn.Identity() if embedding_size == self.feature_size else nn.Linear(self.feature_size, embedding_size)
     self.fc_mean = nn.Linear(embedding_size, state_size)
     self.fc_std = nn.Linear(embedding_size, state_size)
 
   @jit.script_method
   def forward(self, observation):
+    #if self.input_size != 64:
+      #observation = self.transform(observation)
+      #print("observation", observation.shape)
     hidden = self.act_fn(self.conv1(observation))
     hidden = self.act_fn(self.conv2(hidden))
     hidden = self.act_fn(self.conv3(hidden))
-    hidden = self.act_fn(self.conv4(hidden))
-    hidden = hidden.view(-1, 1024)
+    hidden = self.conv4(hidden)
+    if self.input_size == 64:
+      hidden = self.act_fn(hidden)
+    #print("hidden", hidden.shape)
+    hidden = hidden.view(-1, self.feature_size)
     embedding = self.fc(hidden)  # Identity if embedding size is 1024 else linear projection
     latent_mean = self.fc_mean(embedding)
     latent_std = F.softplus(self.fc_std(embedding))
     return latent_mean, latent_std
 
 
-def Encoder(symbolic, observation_size, embedding_size, state_size, activation_function='relu'):
+def Encoder(symbolic, observation_size, embedding_size, state_size, activation_function='relu', input_size=64):
   if symbolic:
     return SymbolicEncoder(observation_size, embedding_size, activation_function)
   else:
-    return VisualEncoder(embedding_size, state_size, activation_function)
+    return VisualEncoder(embedding_size, state_size, activation_function, input_size)
 
 class DGPHiddenLayer(DeepGPLayer):
     def __init__(self, input_dims, output_dims, device, num_inducing=16):
