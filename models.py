@@ -348,7 +348,7 @@ class TransitionGP(DeepGaussianProcesses):
         super(TransitionGP, self).__init__(input_size=input_size, output_size=latent_size, device=device, hidden_size=hidden_size, mean_type=mean_type) 
       
 class PolicyGP(DeepGaussianProcesses):
-    #policy P(z_{t},...z_{t-k})=a(t)--- input z:latent_space---> output a: action
+    #policy P(z_{t})=a(t)--- input z:latent_space---> output a: action
     def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[50], mean_type= 'constant'):
         input_size =latent_size*lagging_size
         super(PolicyGP, self).__init__(input_size=input_size, output_size= action_size, device=device, hidden_size=hidden_size, mean_type=mean_type)
