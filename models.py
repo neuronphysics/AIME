@@ -6,15 +6,22 @@ from torch import jit, nn
 from torch.nn import functional as F
 
 from torch.distributions import constraints
-
 import gpytorch
 from gpytorch.models.deep_gps import DeepGPLayer, DeepGP
-from gpytorch.models.deep_gps.dspp import DSPPLayer, DSPP
 from gpytorch.means import ConstantMean, ZeroMean, LinearMean
 from gpytorch.kernels import RBFKernel, ScaleKernel, SpectralMixtureKernel
 from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution
 from gpytorch.distributions import MultivariateNormal
-from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.likelihoods import GaussianLikelihood, MultitaskGaussianLikelihood
+
+
+#import debugpy
+#debugpy.listen(5678)
+#print("Waiting for debugger....")
+#debugpy.wait_for_client()
+#print("Attached!")
+
+
 def hidden_size_extract(kwargs, name, delete_from_dict=False):
     if name not in kwargs:
         hidden_size = []
@@ -146,19 +153,16 @@ def Encoder(symbolic, observation_size, embedding_size, state_size, activation_f
   else:
     return VisualEncoder(embedding_size, state_size, activation_function)
 
-class DGPHiddenLayer(DSPPLayer):
-    """
-    :param int Q: Number of quadrature sites to use. Also the number of Gaussians in the mixture output
-        by this layer.
-    """
-    def __init__(self, input_dims, output_dims, device, num_inducing=128, inducing_points=None, mean_type='constant', num_mixtures=5, num_quad_sites= 8):
+class DGPHiddenLayer(DeepGPLayer):
+
+    def __init__(self, input_dims, output_dims, device, num_inducing=128, mean_type='constant', num_mixtures=5):
         if output_dims is None:
             inducing_points = torch.randn(num_inducing, input_dims).to(device=device)
             batch_shape = torch.Size([])
         else:
             inducing_points = torch.randn(output_dims, num_inducing, input_dims).to(device=device)
             batch_shape = torch.Size([output_dims])
-
+        # Sparse Variational Formulation (inducing variables initialised as randn)
         variational_distribution = CholeskyVariationalDistribution(
             num_inducing_points=num_inducing,
             batch_shape=batch_shape
@@ -170,7 +174,7 @@ class DGPHiddenLayer(DSPPLayer):
             learn_inducing_locations=True
         )
 
-        super().__init__(variational_strategy, input_dims, output_dims, num_quad_sites)
+        super().__init__(variational_strategy, input_dims, output_dims)
         if mean_type == 'constant':
             self.mean_module = ConstantMean(batch_shape=batch_shape)
         elif mean_type == 'zero':
@@ -187,44 +191,30 @@ class DGPHiddenLayer(DSPPLayer):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return MultivariateNormal(mean_x, covar_x)
-
-    def integrate(self, inputs, quad_sites):
-        # Following the Source Code
-        expect_type = gpytorch.distributions.MultitaskMultivariateNormal
-        assert isinstance(inputs, expect_type)
-
-        mus, sigmas = inputs.mean, inputs.variance.sqrt()
-        qg = quad_sites.view([self.num_quad_sites] + [1] * (mus.dim() - 2) + [mus.size(-1)])
-        sigmas = sigmas * qg
-        return mus + sigmas 
-"""    
+   
     def __call__(self, x, *other_inputs, **kwargs):
-            
-        expect_type = gpytorch.distributions.MultitaskMultivariateNormal
-
+        """
+        Overriding __call__ isn't strictly necessary, but it lets us add concatenation based skip connections
+        easily. For example, hidden_layer2(hidden_layer1_outputs, inputs) will pass the concatenation of the first
+        hidden layer's outputs and the input data to hidden_layer2.
+        """
         if len(other_inputs):
+            if isinstance(x, gpytorch.distributions.MultitaskMultivariateNormal):
+                x = x.rsample()
 
-            each_sizes = [
-                inp.mean.size(-1) if isinstance(inp, expect_type) else inp.size(-1)
-                for inp in [x] + list(other_inputs)
-            ]
-
-            each_quad_sites = torch.split(self.quad_sites, each_sizes, dim=-1)
-
-            if isinstance(x, expect_type):
-                x = self.integrate(x, each_quad_sites[0])
-            
             processed_inputs = [
-                self.integrate(inp, each_quad_sites[i+1]) if isinstance(inp, expect_type) else inp.unsqueeze(0).expand(self.num_quad_sites, *inp.shape) 
-                for i, inp in enumerate(other_inputs)
+                inp.unsqueeze(0).expand(gpytorch.settings.num_likelihood_samples.value(), *inp.shape)
+                for inp in other_inputs
             ]
-            
+
             x = torch.cat([x] + processed_inputs, dim=-1)
 
-        return super().__call__(x, are_samples=bool(len(other_inputs)), **kwargs)
-"""
-class DeepGaussianProcesses(DSPP):
-    def __init__(self, input_size, output_size, device, num_inducing= 50, Q=8, max_cholesky_size=10000, **kwargs):
+        return super().__call__(x, are_samples=bool(len(other_inputs)))
+
+
+
+class DeepGaussianProcesses(DeepGP):
+    def __init__(self, input_size, output_size, device, num_inducing= 50, max_cholesky_size=10000, **kwargs):
         # pass hidden layer sizes as separate arguments as well as array
         for k, v in kwargs.items():
             if k=='mean_type':
@@ -241,7 +231,6 @@ class DeepGaussianProcesses(DSPP):
                       device = self.device,
                       num_inducing=num_inducing,
                       mean_type=self.mean_type,
-                      num_quad_sites=Q,
                       )
 
         # variable count of hidden layers and neurons
@@ -256,7 +245,6 @@ class DeepGaussianProcesses(DSPP):
                      device = self.device,
                      num_inducing=num_inducing,
                      mean_type='constant',
-                     num_quad_sites=Q,
                   )
                   for i in range(len(self.hidden_size) - 1)
               ])
@@ -270,19 +258,23 @@ class DeepGaussianProcesses(DSPP):
                      device = self.device,
                      num_inducing=num_inducing,
                      mean_type='zero',
-                     num_quad_sites=Q,
                   )
                   for i in range(len(self.hidden_size) - 1)
               ])
 
-        super().__init__(Q)
+        super().__init__()
 
         self.first_layer = first_layer
         self.hidden_layers = hidden_layers
-        self.likelihood = GaussianLikelihood()
+        if output_size is None:
+           self.likelihood = GaussianLikelihood()
+        else:
+           self.likelihood= MultitaskGaussianLikelihood(num_tasks=output_size)
         self.to(device=self.device)
 
     def forward(self, inputs):
+        #debugpy.breakpoint()
+        #print('break on this line')
         out = self.first_layer(inputs)
         for hidden in self.hidden_layers:
             out = hidden(out)
@@ -389,11 +381,10 @@ class RecurrentGP(DeepGP):
         lagging_actions = actions
         lagging_states = init_states
         for i in range(self.horizon_size):
-            # policy distribution
-            #s = lagging_states.unsqueeze(-1)     
-            #s = s.repeat(1, 1, 1, lagging_states.size(2))      
+            # policy distribution      
             print(f"new size of state : {lagging_states.size()}, latent size: {self.latent_size}, action size: {self.action_size}, lagging size: {self.lagging_size}")
-            a, a_v, a_l, a_u, a_s = self.policy_module.predict(lagging_states)
+            a, a_v, a_l, a_u, a_s = self.policy_module.predict(lagging_states.unsqueeze(-1))
+            print(f"size of mean action {a.size()} and {a}, {lagging_actions[..., self.action_size:].size()}")
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             print(f"size of lagging actions {lagging_actions.size()}")
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
