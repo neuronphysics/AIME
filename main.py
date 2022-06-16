@@ -177,6 +177,15 @@ reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurre
 
 rgp_training_episode = args.seed_episodes
 
+# We may need to freeze network parameter during the training discriminator and freeze discriminator durining training the network
+def free_params(module: nn.Module):
+    for p in module.parameters():
+        p.requires_grad = True
+
+def frozen_params(module: nn.Module):
+    for p in module.parameters():
+        p.requires_grad = False
+
 # Training (and testing)
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
   # Model fitting
@@ -198,6 +207,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           grad_clip = 1.0
           original_shape = observations.shape
           observations = observations.view(-1, original_shape[-3], original_shape[-2], original_shape[-1])
+          #free_params(discriminator)
+          #frozen_params(infinite_vae)
           for _ in range(hyperParams["CRITIC_ITERATIONS"]):
             X_recons_linear, mu_z, logvar_z, _, _, _, _, _, _, _, _, _ = infinite_vae(observations)
             z_fake = infinite_vae.encoder.reparameterize(mu_z, logvar_z)
@@ -213,6 +224,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
             loss_critic.backward(retain_graph=True)
             dis_optim.step()
 
+          #frozen_params(discriminator)
+          #free_params(infinite_vae)
           gen_fake = discriminator(z_fake).reshape(-1)
         
           loss_dict = infinite_vae.get_ELBO(observations)
@@ -260,7 +273,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), grad_clip)
           enc_optim.step()
           dec_optim.step()
-          #print("total_loss", total_loss)
+          #print("total_loss:", total_loss, "reward_loss:", loss_dict["reward_loss"], "WAE-GP:", loss_dict["WAE-GP"])
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
         optimiser.step()
         # Store loss
@@ -374,11 +387,11 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   current_transition_mll_loss = episode_transition_mll_loss.mean()
   
   planning_optimiser.zero_grad()
-  (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward(retain_graph=True)
+  (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
   # print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
-  print("value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
+  #print("value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
