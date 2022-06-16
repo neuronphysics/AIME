@@ -372,7 +372,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   current_transition_mll_loss = episode_transition_mll_loss.mean()
   
   planning_optimiser.zero_grad()
-  (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward(retain_graph=True)
+  (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
   #print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
