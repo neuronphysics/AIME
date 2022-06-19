@@ -79,6 +79,7 @@ parser.add_argument('--rgp-training-interval-ratio', type=float, default=1.1, me
 parser.add_argument('--num-gp-likelihood-samples', type=int, default=50, metavar='GP', help='Number of likelihood samples for GP')
 parser.add_argument('--input-size', type=int, default=64, metavar='InpS', help='observation input size')
 parser.add_argument('--infgmmvae-num-layer', type=int, default=4, metavar='Infnl', help='observation input size')
+parser.add_argument('--train-all-layers', action='store_true', help='train all layers of infGaussianVAE, default setting will only train encoder and decoder')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -147,9 +148,13 @@ else:
   enc_optim = torch.optim.Adam(vae_encoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
   dec_optim = torch.optim.Adam(vae_decoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
   dis_optim = torch.optim.Adam(discriminator.parameters(), lr = 0.5 * hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
-
-  enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
-  dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
+  if args.train_all_layers:
+    inf_optim = torch.optim.Adam(infinite_vae.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+  else:
+    enc_optim = torch.optim.Adam(vae_encoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+    dec_optim = torch.optim.Adam(vae_decoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+  #enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
+  #dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
   dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
   
   param_list = list(recurrent_gp.parameters())
@@ -271,16 +276,20 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           total_loss.backward()
           #reward_loss.backward()
           torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), grad_clip)
-          enc_optim.step()
-          dec_optim.step()
+          #
+          if args.train_all_layers:
+            inf_optim.step()
+          else:
+            enc_optim.step()
+            dec_optim.step()
           #print("total_loss:", total_loss, "reward_loss:", loss_dict["reward_loss"], "WAE-GP:", loss_dict["WAE-GP"])
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
         optimiser.step()
         # Store loss
         if args.use_regular_vae:
           losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item()])
-          #print("observation_loss", observation_loss, "reward_loss", reward_loss, "latent_kl_loss", latent_kl_loss)
-          #print("observation_loss + reward_loss + latent_kl_loss", observation_loss + reward_loss + latent_kl_loss)
+          print("observation_loss", observation_loss, "reward_loss", reward_loss, "latent_kl_loss", latent_kl_loss)
+          print("observation_loss + reward_loss + latent_kl_loss", observation_loss + reward_loss + latent_kl_loss)
         else:
           losses.append([0, 0, 0, 0, 0, reward_loss.item()])
           #print("losses", losses)
@@ -390,8 +399,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
-  # print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
-  #print("value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
+  print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
+  print("value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
