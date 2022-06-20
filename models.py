@@ -380,23 +380,30 @@ class RecurrentGP(DeepGP):
 
         lagging_actions = actions
         lagging_states = init_states
+
+        # init_states size <1, 8, 40>
+        # actions size <1, 8, 12>
         for i in range(self.horizon_size):
             # policy distribution      
             print(f"new size of state : {lagging_states.size()}, latent size: {self.latent_size}, action size: {self.action_size}, lagging size: {self.lagging_size}")
-            a, a_v, a_l, a_u, a_s = self.policy_module.predict(lagging_states.unsqueeze(-1))
+            a, a_v, a_l, a_u, a_s = self.policy_module.predict(lagging_states)#(.unsqueeze(-1)) lagging_states.shape = (1, 8, 40), unsqueeze(-1) -> (1, 8, 40, 1) TODO is removing unsqueeze(-1) the best solution?
+            # a has size <10, 1, 8, 6>
             print(f"size of mean action {a.size()} and {a}, {lagging_actions[..., self.action_size:].size()}")
-            lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
+            # lagging_actions[..., self.action_size:] has size <1, 8, 6>, we cannot concatnate with a <10, 1, 8, 6> at dim -1
+            lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a[0]], dim=-1) # TODO: is a[0] the best solution?
             print(f"size of lagging actions {lagging_actions.size()}")
-            z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
+            z_hat = torch.cat([lagging_states, lagging_actions], dim=-1) # z_hat has size <1, 8, 52>
             # transition distribution
             z, z_v, z_l, z_u, z_s = self.transition_module.predict(z_hat)
             print(f"latent state mean {z}, variance {z_v}, lower bound error {z_l}, upper bound error {z_u}, sample {z_s}")
-            lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
+            # z has shape <10, 1, 8, 20>, lagging_states[..., self.latent_size:] has shape <1, 8, 20>, cannot be concatenated together at dim -1
+            lagging_states = torch.cat([lagging_states[..., self.latent_size:], z[0]], dim=-1) # TODO: is z[0] the best solution?
         
         # last policy in the horizon
         a, _, _, _, _ = self.policy_module.predict(lagging_states)
-        lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
+        # similar to above lagging_actions[..., self.action_size:] has size <1, 8, 6>, we cannot concatnate with a <10, 1, 8, 6> at dim -1
+        lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a[0]], dim=-1) # TODO: is a[0] the best solution?
         z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
-        rewards, _, _, _, _ = self.reward_gp(z_hat)
+        rewards, _, _, _, _ = self.reward_gp.predict(z_hat) # self.reward_gp(z_hat) will return a MultivariateNormal object, assume using predict method, TODO: is this the best solution?
         return rewards
