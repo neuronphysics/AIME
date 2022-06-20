@@ -405,5 +405,6 @@ class RecurrentGP(DeepGP):
         lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a[0]], dim=-1) # TODO: is a[0] the best solution?
         z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
-        rewards, _, _, _, _ = self.reward_gp.predict(z_hat) # self.reward_gp(z_hat) will return a MultivariateNormal object, assume using predict method, TODO: is this the best solution?
+        rewards = self.reward_gp(z_hat) # self.reward_gp(z_hat) will return a MultivariateNormal object, TODO: is this the best solution?
+        #rewards, _, _, _, _ = self.reward_gp.predict(z_hat)
         return rewards
