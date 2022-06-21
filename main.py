@@ -69,14 +69,15 @@ parser.add_argument('--num-sample-trajectories', type=int, default=10, metavar='
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
 parser.add_argument('--discount-factor', type=float, default=0.999, metavar='Temp', help='Discount factor')
 parser.add_argument('--num-mixtures', type=int, default=25, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
-parser.add_argument('--w-dim', type=int, default=50, metavar='w', help='dimension of w')
-parser.add_argument('--hidden-size', type=int, default=20, metavar='H', help='Hidden size')
-parser.add_argument('--state-size', type=int, default=20, metavar='Z', help='State/latent size')
+parser.add_argument('--w-dim', type=int, default=10, metavar='w', help='dimension of w')
+parser.add_argument('--hidden-size', type=int, default=10, metavar='H', help='Hidden size')
+parser.add_argument('--state-size', type=int, default=10, metavar='Z', help='State/latent size')
 parser.add_argument('--include-elbo2', action='store_true', help='include elbo 2 loss')
 parser.add_argument('--use-regular-vae', action='store_true', help='use vae that uses single Gaussian mixture')
 parser.add_argument('--use-ada-bound', action='store_true', help='use AdaBound as the optimizer')
 parser.add_argument('--rgp-training-interval-ratio', type=float, default=1.1, metavar='In', help='RGP training interval ratio')
-parser.add_argument('--num-gp-likelihood-samples', type=int, default=50, metavar='GP', help='Number of likelihood samples for GP')
+parser.add_argument('--num-gp-likelihood-samples', type=int, default=1, metavar='GP', help='Number of likelihood samples for GP')
+parser.add_argument('--backward-once', action='store_true', help='true if backward using sum of losses')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -91,7 +92,7 @@ os.makedirs(results_dir, exist_ok=True)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 if torch.cuda.is_available() and not args.disable_cuda:
-  args.device = torch.device('cuda')
+  args.device = torch.device('cuda:0')
   torch.cuda.manual_seed(args.seed)
 else:
   args.device = torch.device('cpu')
@@ -181,11 +182,35 @@ transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_modu
 controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_module.likelihood, recurrent_gp.policy_module,args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size), beta=1.0))#latent_space
 rgp_training_episode = args.seed_episodes
 
+def _backward_infGaussianVAE(l):
+  vae_encoder.zero_grad()
+  vae_decoder.zero_grad()
+  l.backward()
+  torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), args.grad_clip_norm, norm_type=2)
+  enc_optim.step()
+  dec_optim.step()
+
+def find_model_size(model):
+  param_size = 0
+  for param in model.parameters():
+    param_size += param.nelement() * param.element_size()
+  buffer_size = 0
+  for buffer in model.buffers():
+    buffer_size += buffer.nelement() * buffer.element_size()
+
+  size_all_mb = (param_size + buffer_size) / 1024**2
+  print('model size: {:.3f}MB'.format(size_all_mb))
+find_model_size(recurrent_gp)
+find_model_size(observation_model)
+find_model_size(encoder)
+
+print("cuda memory states before training", torch.cuda.memory_stats(device=args.device), torch.cuda.mem_get_info(device=args.device), torch.cuda.memory_summary(device=args.device))
 # Training (and testing)
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
   # Model fitting
   losses = []
   if ((episode-1) == rgp_training_episode):
+    print("cuda memory states before rgp_training_episode", torch.cuda.memory_stats(device=args.device), torch.cuda.memory_summary(device=args.device))
     rgp_training_episode = int(rgp_training_episode * args.rgp_training_interval_ratio)
     if (not args.use_regular_vae):
       infinite_vae.batch_size = args.batch_size * args.chunk_size
@@ -198,8 +223,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           latent_dist = Normal(latent_mean, latent_std)
           latent_kl_loss = kl_divergence(latent_dist, global_prior).sum(dim=2).mean(dim=(0, 1))
           latent_states = latent_dist.rsample()
+          observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
+
         else:
-          grad_clip = 1.0
           original_shape = observations.shape
           observations = observations.view(-1, original_shape[-3], original_shape[-2], original_shape[-1])
           for _ in range(hyperParams["CRITIC_ITERATIONS"]):
@@ -217,58 +243,53 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
             loss_critic.backward(retain_graph=True)
             dis_optim.step()
           gen_fake = discriminator(z_fake).reshape(-1)
-        
-          loss_dict = infinite_vae.get_ELBO(observations)
-          loss_dict["wasserstein_loss"] =  -torch.mean(gen_fake)
-          vae_encoder.zero_grad()
-          vae_decoder.zero_grad()
-          
-          loss_dict["WAE-GP"]=loss_dict["loss"]+loss_dict["wasserstein_loss"]
-
-          loss_dict["WAE-GP"].backward()
-          
-          torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), grad_clip)
-
-          enc_optim.step()
-          dec_optim.step()
           
           latent_states = torch.reshape(infinite_vae.get_latent_states(observations), (original_shape[0], original_shape[1], args.state_size))
 
+          loss_dict = infinite_vae.get_ELBO(observations)
+          loss_dict["wasserstein_loss"] =  -torch.mean(gen_fake)
+  
+          loss_dict["WAE-GP"]=loss_dict["loss"]+loss_dict["wasserstein_loss"]
+
+          if not args.backward_once:
+            _backward_infGaussianVAE(loss_dict["WAE-GP"])
+
         init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
-        predicted_rewards = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
+        init_actions = actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)
+        predicted_rewards, predicted_action, predicted_latent = recurrent_gp(init_states, init_actions)
+        print("pred r, a, l", predicted_rewards, predicted_action, predicted_latent)
         if (not args.non_cumulative_reward):
           true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
         else:
           true_rewards = rewards[args.lagging_size+args.horizon_size:]
-        reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
-        ############### add controller & policy losses #################
-        ######## Need to be fixed in terms of inputs and outputs #######
-        init_transition  = torch.cat([init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)], dim=-1)
-        print(f"size of the input for the transition function {init_transition.size()}")
-        predicted_latent = recurrent_gp.transition_module(init_transition)#input:action+latent_space ??
-        predicted_action = recurrent_gp.policy_module(init_states)#input:latent_space
         true_latent      = latent_states[args.lagging_size:]
-        print(f"size of the output for the transition function {true_latent.size()}")
         true_action      = actions[args.lagging_size:]
-        transition_imagine_loss = -transition_mll(predicted_latent, true_latent)##??fix
-        
-        controller_imagine_loss = -controller_mll(predicted_action, true_action)##??fix
-        
+        reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
+        print("true r, a ,l", true_rewards.shape, true_action.shape, true_latent.shape)
+        transition_imagine_loss = -transition_mll(predicted_latent, true_latent).mean()
+        controller_imagine_loss = -controller_mll(predicted_action, true_action).mean()
+
+        recurrent_gaussian_loss = reward_loss + transition_imagine_loss + controller_imagine_loss
         ##################
-        if args.use_regular_vae:
-          observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
+        print("rgp losses, r, t, c", reward_loss, transition_imagine_loss, controller_imagine_loss, "total:", recurrent_gaussian_loss)
 
         # Apply linearly ramping learning rate schedule
         if args.learning_rate_schedule != 0:
           for group in optimiser.param_groups:
             group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
+        
         # Update model parameters 
         optimiser.zero_grad()
         #compute losses
         if args.use_regular_vae:
-          (observation_loss + reward_loss + latent_kl_loss + transition_imagine_loss + controller_imagine_loss).backward()
+          (observation_loss  + latent_kl_loss + recurrent_gaussian_loss).backward()
+          print("observation_loss", observation_loss, "latent_kl_loss", latent_kl_loss)
         else:
-          (reward_loss + transition_imagine_loss +  controller_imagine_loss).backward()
+          if args.backward_once:
+            _backward_infGaussianVAE(loss_dict["WAE-GP"] + recurrent_gaussian_loss)
+          else:
+            recurrent_gaussian_loss.backward()
+
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
         optimiser.step()
         # Store loss
@@ -276,6 +297,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item(), transition_imagine_loss.item(), controller_imagine_loss.item() ])
         else:
           losses.append([0, 0, 0, 0, 0, reward_loss.item(), transition_imagine_loss.item(), controller_imagine_loss.item()])
+        del true_latent, true_action, predicted_rewards, predicted_action, predicted_latent, init_states, latent_states, init_actions, actions, observations
+
+    print("cuda memory states after rgp_training_episode", torch.cuda.memory_stats(device=args.device), torch.cuda.memory_summary(device=args.device))
 
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
@@ -283,13 +307,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       metrics['observation_loss'].append(losses[0])
       metrics['reward_loss'].append(losses[1])
       metrics['latent_kl_loss'].append(losses[2])
-      metrics['imaginative_transition_loss'].append(losses[3])
-      metrics['imaginative_controller_loss'].append(losses[4])
+      metrics['transition_imagine_loss'].append(losses[3])
+      metrics['controller_imagine_loss'].append(losses[4])
       lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
       lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
       lineplot(metrics['episodes'][-len(metrics['latent_kl_loss']):], metrics['latent_kl_loss'], 'latent_kl_loss', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['imaginative_transition_loss']):], metrics['imaginative_transition_loss'], 'imaginative_transition_loss', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['imaginative_controller_loss']):], metrics['imaginative_controller_loss'], 'imaginative_controller_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'transition_imagine_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'controller_imagine_loss', results_dir)
     else:
       metrics['elbo1'].append(losses[0])
       metrics['elbo2'].append(losses[1])
@@ -297,16 +321,16 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       metrics['elbo4'].append(losses[3])
       metrics['elbo5'].append(losses[4])
       metrics['reward_loss'].append(losses[5])
-      metrics['imaginative_transition_loss'].append(losses[6])
-      metrics['imaginative_controller_loss'].append(losses[7])
+      metrics['transition_imagine_loss'].append(losses[6])
+      metrics['controller_imagine_loss'].append(losses[7])
       lineplot(metrics['episodes'][-len(metrics['elbo1']):], metrics['elbo1'], 'elbo1', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo2']):], metrics['elbo2'], 'elbo2', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo3']):], metrics['elbo3'], 'elbo3', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo4']):], metrics['elbo4'], 'elbo4', results_dir)
       lineplot(metrics['episodes'][-len(metrics['elbo5']):], metrics['elbo5'], 'elbo5', results_dir)
       lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['imaginative_transition_loss']):], metrics['imaginative_transition_loss'], 'imaginative_transition_loss', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['imaginative_controller_loss']):], metrics['imaginative_controller_loss'], 'imaginative_controller_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'transition_imagine_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'controller_imagine_loss', results_dir)
 
   # Data collection
   if args.use_regular_vae:
@@ -335,7 +359,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   time_steps = 0
   with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples):
     for t in pbar:
+      print("0 cuda memory states max_episode_length collection t", t, episode, torch.cuda.memory_stats(device=args.device), torch.cuda.memory_summary(device=args.device))
       action, action_log_prob, policy_mll_loss, value, q_value, transition_dist = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+      print("0-1 cuda memory states max_episode_length collection t", t, episode, torch.cuda.memory_stats(device=args.device), torch.cuda.memory_summary(device=args.device))
       episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
       episode_policy_mll_loss = torch.cat([episode_policy_mll_loss, policy_mll_loss.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
       observation, reward, done = env.step(action[0].cpu())
@@ -356,13 +382,15 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       episode_rewards = torch.cat([episode_rewards, torch.Tensor([[reward]]).to(device=args.device)], dim=0)
       D.append(observation, action.detach().cpu(), reward, done)
       total_reward = total_reward + reward
-      
+      del transition_dist
       if args.render:
         env.render()
       if done:
         pbar.close()
         break
-
+      
+      print("12 cuda memory states max_episode_length collection t", t, episode, torch.cuda.memory_stats(device=args.device), torch.cuda.memory_summary(device=args.device))
+      
   current_q_values = episode_q_values
   previous_q_values = episode_q_values
   current_rewards = episode_rewards
@@ -383,7 +411,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
-  
+  exit()
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
   metrics['q_loss'].append(q_loss.item())
@@ -406,6 +434,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     encoder.train()
   else:
     infinite_vae.train()
+
+
+  print("cuda memory states episode", episode, torch.cuda.memory_stats(device=args.device), torch.cuda.memory_summary(device=args.device))
 
   # Test model
   if episode % args.test_interval == 0:

@@ -302,14 +302,15 @@ class DeepGaussianProcesses(DeepGP):
             samples = []
             lowers=[]
             uppers=[]
-            preds = self.likelihood(self(x))
+            dist = self(x)
+            preds = self.likelihood(dist)
             mus.append(preds.mean)
             variances.append(preds.variance)
             lower, upper = preds.confidence_region()
             lowers.append(lower)
             uppers.append(upper)
             samples.append(preds.rsample())           
-        return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1), torch.cat(lowers, dim=-1), torch.cat(uppers, dim=-1), torch.cat(samples, dim=-1)
+        return torch.cat(mus, dim=-1), torch.cat(variances, dim=-1), torch.cat(lowers, dim=-1), torch.cat(uppers, dim=-1), torch.cat(samples, dim=-1), dist
 
     def retrieve_all_hyperparameter(self):
         all_sigma2 = []
@@ -343,18 +344,18 @@ def compute_EZ_trajectory(K, m, sigma2s, lengthscales):
 
 class TransitionGP(DeepGaussianProcesses):
     #transition probability  P(z_{t}|x_{t-k},...x_{t-1})=N(z_{t}|mu_x,sigma_x)---->T(x_{t-k},...x_{t-1})=z_{t}; x_{.}=[z_{.},a_{.}]
-    def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[50], mean_type= 'linear'):
+    def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[32], mean_type= 'linear'):
         input_size = (latent_size+action_size)*lagging_size
         super(TransitionGP, self).__init__(input_size=input_size, output_size=latent_size, device=device, hidden_size=hidden_size, mean_type=mean_type) 
       
 class PolicyGP(DeepGaussianProcesses):
     #policy P(z_{t})=a(t)--- input z:latent_space---> output a: action
-    def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[50], mean_type= 'constant'):
+    def __init__(self, latent_size, action_size, lagging_size, device, hidden_size=[32], mean_type= 'constant'):
         input_size =latent_size*lagging_size
         super(PolicyGP, self).__init__(input_size=input_size, output_size= action_size, device=device, hidden_size=hidden_size, mean_type=mean_type)
      
 class RewardGP(DeepGaussianProcesses):
-    def __init__(self, latent_size, action_size, lagging_size,  device, hidden_size=[50], mean_type= 'zero'):
+    def __init__(self, latent_size, action_size, lagging_size,  device, hidden_size=[32], mean_type= 'zero'):
        input_size =(latent_size+action_size)*lagging_size
        super(RewardGP, self).__init__(input_size=input_size, output_size= None, device=device, hidden_size=hidden_size, mean_type=mean_type)
 
@@ -380,31 +381,35 @@ class RecurrentGP(DeepGP):
 
         lagging_actions = actions
         lagging_states = init_states
-
+        predicted_latent = None
+        predicted_actions = None
         # init_states size <1, 8, 40>
         # actions size <1, 8, 12>
         for i in range(self.horizon_size):
             # policy distribution      
-            print(f"new size of state : {lagging_states.size()}, latent size: {self.latent_size}, action size: {self.action_size}, lagging size: {self.lagging_size}")
-            a, a_v, a_l, a_u, a_s = self.policy_module.predict(lagging_states)#(.unsqueeze(-1)) lagging_states.shape = (1, 8, 40), unsqueeze(-1) -> (1, 8, 40, 1) TODO is removing unsqueeze(-1) the best solution?
+            #print(f"new size of state : {lagging_states.size()}, latent size: {self.latent_size}, action size: {self.action_size}, lagging size: {self.lagging_size}")
+            _, _, _, _, a_s, a_d = self.policy_module.predict(lagging_states)#(.unsqueeze(-1)) lagging_states.shape = (1, 8, 40), unsqueeze(-1) -> (1, 8, 40, 1) TODO is removing unsqueeze(-1) the best solution?
             # a has size <10, 1, 8, 6>
-            print(f"size of mean action {a.size()} and {a}, {lagging_actions[..., self.action_size:].size()}")
+            #print(f"size of mean action {a.size()} and {a}, {lagging_actions[..., self.action_size:].size()}")
             # lagging_actions[..., self.action_size:] has size <1, 8, 6>, we cannot concatnate with a <10, 1, 8, 6> at dim -1
-            lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a[0]], dim=-1) # TODO: is a[0] the best solution?
-            print(f"size of lagging actions {lagging_actions.size()}")
+            lagging_actions = torch.cat([lagging_actions[..., self.action_size:], torch.mean(a_s, dim=0)], dim=-1) # TODO: is a[0] the best solution?
+            #print(f"size of lagging actions {lagging_actions.size()}")
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1) # z_hat has size <1, 8, 52>
             # transition distribution
-            z, z_v, z_l, z_u, z_s = self.transition_module.predict(z_hat)
-            print(f"latent state mean {z}, variance {z_v}, lower bound error {z_l}, upper bound error {z_u}, sample {z_s}")
+            _, _, _, _, z_s, z_d = self.transition_module.predict(z_hat)
+            #print(f"latent state mean {z}, variance {z_v}, lower bound error {z_l}, upper bound error {z_u}, sample {z_s}")
             # z has shape <10, 1, 8, 20>, lagging_states[..., self.latent_size:] has shape <1, 8, 20>, cannot be concatenated together at dim -1
-            lagging_states = torch.cat([lagging_states[..., self.latent_size:], z[0]], dim=-1) # TODO: is z[0] the best solution?
+            lagging_states = torch.cat([lagging_states[..., self.latent_size:], torch.mean(z_s, dim=0)], dim=-1) # TODO: is z[0] the best solution?
+            if i == 0:
+                predicted_latent = z_d
+                predicted_actions = a_d
         
         # last policy in the horizon
-        a, _, _, _, _ = self.policy_module.predict(lagging_states)
+        _, _, _, _, a_s, _ = self.policy_module.predict(lagging_states)
         # similar to above lagging_actions[..., self.action_size:] has size <1, 8, 6>, we cannot concatnate with a <10, 1, 8, 6> at dim -1
-        lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a[0]], dim=-1) # TODO: is a[0] the best solution?
+        lagging_actions = torch.cat([lagging_actions[..., self.action_size:], torch.mean(a_s, dim=0)], dim=-1) # TODO: is a[0] the best solution?
         z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
         rewards = self.reward_gp(z_hat) # self.reward_gp(z_hat) will return a MultivariateNormal object, TODO: is this the best solution?
         #rewards, _, _, _, _ = self.reward_gp.predict(z_hat)
-        return rewards
+        return rewards, predicted_actions, predicted_latent
