@@ -18,6 +18,9 @@ from utils import lineplot, write_video, AdaBound
 import gpytorch
 from gpytorch.mlls import DeepApproximateMLL, VariationalELBO, PredictiveLogLikelihood
 
+from var_gp.datasets import TransitionDataset
+from var_gp.train_utils_global import train
+
 # Hyperparameters
 parser = argparse.ArgumentParser(description='AIME')
 parser.add_argument('--id', type=str, default='default', help='Experiment ID')
@@ -25,8 +28,8 @@ parser.add_argument('--seed', type=int, default=1, metavar='S', help='Random see
 parser.add_argument('--disable-cuda', action='store_true', help='Disable CUDA')
 parser.add_argument('--env', type=str, default='Pendulum-v0', choices=GYM_ENVS + CONTROL_SUITE_ENVS + ['4lane', 'loop'], help='Gym/Control Suite environment')
 parser.add_argument('--symbolic-env', action='store_true', help='Symbolic features')
-parser.add_argument('--max-episode-length', type=int, default=1000, metavar='T', help='Max episode length')
-parser.add_argument('--experience-size', type=int, default=1000000, metavar='D', help='Experience replay size')  # Original implementation has an unlimited buffer size, but 1 million is the max experience collected anyway
+parser.add_argument('--max-episode-length', type=int, default=100, metavar='T', help='Max episode length')
+parser.add_argument('--experience-size', type=int, default=10000, metavar='D', help='Experience replay size')  # Original implementation has an unlimited buffer size, but 1 million is the max experience collected anyway
 parser.add_argument('--activation-function', type=str, default='relu', choices=dir(F), help='Model activation function')
 parser.add_argument('--embedding-size', type=int, default=1024, metavar='E', help='Observation embedding size')  # Note that the default encoder for visual observations outputs a 1024D vector; for other embedding sizes an additional fully-connected layer is used
 parser.add_argument('--belief-size', type=int, default=200, metavar='H', help='Belief/hidden size')
@@ -167,7 +170,6 @@ if args.models is not '' and os.path.exists(args.models):
     infinite_vae.load_state_dict(model_dicts['infinite_vae'])
   recurrent_gp.load_state_dict(model_dicts['recurrent_gp'])
   #save the controller & transition
-  recurrent_gp.transition_module.load_state_dict(model_dicts['transition_gp'])
   recurrent_gp.policy_module.load_state_dict(model_dicts['controller_gp'])
   optimizer.load_state_dict(model_dicts['optimizer'])
   actor_critic_planner.load_state_dict(model_dicts['actor_critic_planner'])
@@ -177,10 +179,10 @@ global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.
 free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.device)  # Allowed deviation in KL divergence
 
 reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
-transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_module.likelihood, recurrent_gp.transition_module, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
 controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_module.likelihood, recurrent_gp.policy_module, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
 
 rgp_training_episode = args.seed_episodes
+transition_prev_params = []
 
 # Training (and testing)
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
@@ -255,33 +257,32 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         actions_input = actions_input.reshape(actions_input.size(0), actions_input.size(1), -1)
         transition_input = torch.cat([policy_input, actions_input], dim=-1)
 
+        # train transition module first
+        transition_data = TransitionDataset(transition_input, transition_labels)
+        # transition_prev_params = [transition_prev_params[-1]]
+        for t in range(transition_input.size(0)):
+            transition_data.filter_by_idx(t)
+            transition_model = train(t, transition_data, None, None, batch_size=1, n_f=transition_input.size(2),
+                                                    prev_params=transition_prev_params, device=args.device)
+            transition_prev_params.append(transition_model.state_dict())
+        
+        # turn on eval mode
+        transition_model.eval()
+
         # Update model parameters
         optimizer.zero_grad()
-        predicted_rewards = recurrent_gp(init_states, init_actions)
+        predicted_rewards = recurrent_gp(init_states, init_actions, transition_model)
         reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
-        if args.use_regular_vae:
-          observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
-          (observation_loss + reward_loss + latent_kl_loss).backward()
-        else:
-          reward_loss.backward()
-        nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-        optimizer.step()
-
-        # Note the detach here is very important
-        optimizer.zero_grad()
         policy_module_output = recurrent_gp.policy_module(policy_input.detach())
         policy_module_loss = -controller_mll(policy_module_output, policy_labels.detach()).mean()
-        policy_module_loss.backward()
+        if args.use_regular_vae:
+          observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
+          (observation_loss + reward_loss + latent_kl_loss + policy_module_loss).backward()
+        else:
+          (reward_loss + policy_module_loss).backward()
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
         optimizer.step()
-
-        optimizer.zero_grad()
-        transition_module_output = recurrent_gp.transition_module(transition_input.detach())
-        transition_module_loss = -transition_mll(transition_module_output, transition_labels.detach()).mean()
-        transition_module_loss.backward()
-        nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-        optimizer.step()
-
+        
         # Store loss
         if args.use_regular_vae:
           losses.append([0, 0, latent_kl_loss.item(), transition_module_loss.item(), policy_module_loss.item()])

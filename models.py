@@ -185,14 +185,6 @@ class PolicyModel(DeepGP):
     def forward(self, x):
         return self.layer(x)
 
-class TransitionModel(DeepGP):
-    def __init__(self, latent_size, action_size, lagging_size, device):
-        super().__init__()
-        self.layer = TransitionGP(latent_size, action_size, lagging_size, device)
-        self.likelihood = MultitaskGaussianLikelihood(num_tasks=latent_size)
-
-    def forward(self, x):
-        return self.layer(x)
 
 class RecurrentGP(DeepGP):
     def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1):
@@ -201,13 +193,12 @@ class RecurrentGP(DeepGP):
         self.lagging_size = lagging_size
         self.action_size = action_size
         self.latent_size = latent_size
-        self.transition_module = TransitionModel(latent_size, action_size, lagging_size, device).to(device=device)
         self.policy_module = PolicyModel(latent_size, action_size, lagging_size, device).to(device=device)
         self.reward_gp = RewardGP(latent_size, action_size, lagging_size, device).to(device=device)
         self.num_mixture_samples = num_mixture_samples
         self.likelihood = GaussianLikelihood()
     
-    def forward(self, init_states, actions):
+    def forward(self, init_states, actions, transition_module):
         # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)      
         init_states = init_states.reshape((init_states.size(0), init_states.size(1), -1))
         actions = actions.reshape((actions.size(0), actions.size(1), -1))
@@ -221,7 +212,7 @@ class RecurrentGP(DeepGP):
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
             # transition distribution
-            z = self.transition_module(z_hat).rsample().mean(dim=0)
+            z = transition_module(z_hat)
             lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
         
         # last policy in the horizon
