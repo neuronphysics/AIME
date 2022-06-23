@@ -34,6 +34,7 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 ## affiliation: University of Waterloo ###
 ##########################################
 #set randoom seed
+
 #torch.random.seed()
 #np.random.seed()
 #if torch.cuda.is_available():
@@ -72,7 +73,7 @@ if torch.cuda.is_available():
    torch.cuda.manual_seed(42)
 np.random.seed(42)
 
-local_device = torch.device('cuda')
+local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 SMALL = torch.tensor(np.finfo(np.float32).eps, dtype=torch.float64, device=local_device)
 pi_   = torch.tensor(np.pi, dtype=torch.float64, device=local_device)
 log_norm_constant  = -0.5 * torch.log(2 * pi_)
