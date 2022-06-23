@@ -39,6 +39,8 @@ class ExperienceReplay():
     return idxs
 
   def _retrieve_batch(self, idxs, n, L):
+    # L: chunk_size
+    # n: batch_size
     vec_idxs = idxs.transpose().reshape(-1)  # Unroll indices
     observations = torch.as_tensor(self.observations[vec_idxs].astype(np.float32))
     if not self.symbolic_env:

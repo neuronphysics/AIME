@@ -37,20 +37,20 @@ class QNetwork(nn.Module):
     return self.fc2(hidden)
 
 class FirstPolicyLayer(DGPHiddenLayer):
-  def __init__(self, latent_size, num_sample_trajectories, hidden_size, device):
-    super(FirstPolicyLayer, self).__init__(latent_size+num_sample_trajectories, hidden_size, device)
+  def __init__(self, latent_size, num_sample_trajectories, hidden_size, num_inducing, device):
+    super(FirstPolicyLayer, self).__init__(latent_size+num_sample_trajectories, hidden_size, device, num_inducing=num_inducing)
     self.mean_module = LinearMean(latent_size+num_sample_trajectories)
 
 class SecondPolicyLayer(DGPHiddenLayer):
-  def __init__(self, hidden_size, action_size, device):
-    super(SecondPolicyLayer, self).__init__(hidden_size, action_size, device)
+  def __init__(self, hidden_size, action_size, num_inducing, device):
+    super(SecondPolicyLayer, self).__init__(hidden_size, action_size, device, num_inducing=num_inducing)
     self.mean_module = ConstantMean()
 
 class PolicyModel(DeepGP):
-  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, device):
+  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, num_inducing, device):
     super().__init__()
-    self.first_policy_layer = FirstPolicyLayer(latent_size, num_sample_trajectories, hidden_size, device)
-    self.second_policy_layer = SecondPolicyLayer(hidden_size, action_size, device)
+    self.first_policy_layer = FirstPolicyLayer(latent_size, num_sample_trajectories, hidden_size, num_inducing, device)
+    self.second_policy_layer = SecondPolicyLayer(hidden_size, action_size, num_inducing, device)
     self.likelihood = GaussianLikelihood()
   
   def forward(self, embedding):
@@ -58,20 +58,20 @@ class PolicyModel(DeepGP):
     return self.second_policy_layer(hidden)
 
 class FirstTransitionLayer(DGPHiddenLayer):
-  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, device):
-    super(FirstTransitionLayer, self).__init__(latent_size+num_sample_trajectories+action_size, hidden_size, device)
+  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, num_inducing, device):
+    super(FirstTransitionLayer, self).__init__(latent_size+num_sample_trajectories+action_size, hidden_size, device, num_inducing=num_inducing)
     self.mean_module = LinearMean(latent_size+num_sample_trajectories+action_size)
 
 class SecondTransitionLayer(DGPHiddenLayer):
-  def __init__(self, hidden_size, latent_size, device):
-    super(SecondTransitionLayer, self).__init__(hidden_size, latent_size, device)
+  def __init__(self, hidden_size, latent_size, num_inducing, device):
+    super(SecondTransitionLayer, self).__init__(hidden_size, latent_size, device, num_inducing=num_inducing)
     self.mean_module = ConstantMean()
 
 class TransitionModel(DeepGP):
-  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, device):
+  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, num_inducing, device):
     super().__init__()
-    self.first_transition_layer = FirstTransitionLayer(latent_size, action_size, num_sample_trajectories, hidden_size, device)
-    self.second_transition_layer = SecondTransitionLayer(hidden_size, latent_size, device)
+    self.first_transition_layer = FirstTransitionLayer(latent_size, action_size, num_sample_trajectories, hidden_size, num_inducing, device)
+    self.second_transition_layer = SecondTransitionLayer(hidden_size, latent_size, num_inducing, device)
     self.likelihood = GaussianLikelihood()
   
   def forward(self, embedding, action):
@@ -100,15 +100,15 @@ class RolloutEncoder(nn.Module):
 
 class ActorCriticPlanner(nn.Module):
   def __init__(self, lagging_size, latent_size, action_size, recurrent_gp, min_action, max_action,
-               num_sample_trajectories, hidden_size, num_gp_likelihood_samples, device):
+               num_sample_trajectories, hidden_size, num_gp_likelihood_samples, num_inducing, device):
     super().__init__()
     self.action_size, self.min_action, self.max_action = action_size, min_action, max_action
     self.action_scale = (self.max_action - self.min_action) / 2
     self.action_bias = (self.max_action + self.min_action) / 2
     self.latent_size = latent_size
-    self.actor = PolicyModel(latent_size, action_size, num_sample_trajectories, hidden_size, device)
+    self.actor = PolicyModel(latent_size, action_size, num_sample_trajectories, hidden_size, num_inducing, device)
     self.policy_mll = DeepApproximateMLL(VariationalELBO(self.actor.likelihood, self.actor, 1))
-    self.transition_model = TransitionModel(latent_size, action_size, num_sample_trajectories, hidden_size, device)
+    self.transition_model = TransitionModel(latent_size, action_size, num_sample_trajectories, hidden_size, num_inducing, device)
     self.transition_mll = DeepApproximateMLL(VariationalELBO(self.transition_model.likelihood, self.transition_model, 1))
     self.critic = ValueNetwork(latent_size, num_sample_trajectories, hidden_size)
     self.q_network = QNetwork(latent_size, num_sample_trajectories, action_size, hidden_size)
@@ -129,7 +129,7 @@ class ActorCriticPlanner(nn.Module):
     self.recurrent_gp.eval()
     with torch.no_grad():
       with gpytorch.settings.num_likelihood_samples(self.num_gp_likelihood_samples):
-        rewards, _, _ = self.recurrent_gp(
+        rewards = self.recurrent_gp(
           torch.flatten(lagging_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
           lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
         )
@@ -138,22 +138,12 @@ class ActorCriticPlanner(nn.Module):
     return rewards
   
   def act(self, prior_states, prior_actions, device=None):
-    print("0-0-1 cuda memory states max_episode_length collection", torch.cuda.memory_stats(device=device), torch.cuda.memory_summary(device=device))
     policy_dist, value, embedding = self.forward(prior_states, prior_actions, device)
-    print("0-0-2 cuda memory states max_episode_length collection", torch.cuda.memory_stats(device=device), torch.cuda.memory_summary(device=device))
     policy_action = policy_dist.rsample().mean(dim=0)
-    print("0-0-3 cuda memory states max_episode_length collection", torch.cuda.memory_stats(device=device), torch.cuda.memory_summary(device=device))
     policy_log_prob = policy_dist.log_prob(policy_action)
-    print("0-0-4 cuda memory states max_episode_length collection", torch.cuda.memory_stats(device=device), torch.cuda.memory_summary(device=device))
     policy_mll_loss = -self.policy_mll(policy_dist, policy_action)
-    print("0-0-5 cuda memory states max_episode_length collection", torch.cuda.memory_stats(device=device), torch.cuda.memory_summary(device=device))
     transition_dist = self.transition_model(embedding, policy_action)
-    print("0-0-6 cuda memory states max_episode_length collection", torch.cuda.memory_stats(device=device), torch.cuda.memory_summary(device=device))
     normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).to(device=device) + torch.tensor(self.action_bias).to(device=device)
-    print("0-0-7 cuda memory states max_episode_length collection", torch.cuda.memory_stats(device=device), torch.cuda.memory_summary(device=device))
     normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.tensor(self.min_action).to(device=device)), torch.tensor(self.max_action).to(device=device))
-    print("0-0-8 cuda memory states max_episode_length collection", torch.cuda.memory_stats(device=device), torch.cuda.memory_summary(device=device))
     q_value = self.q_network(embedding, policy_action)
-    print("0-0-9 cuda memory states max_episode_length collection", torch.cuda.memory_stats(device=device), torch.cuda.memory_summary(device=device))
-    del embedding, policy_dist
     return normalized_policy_action, policy_log_prob, policy_mll_loss, value, q_value, transition_dist
