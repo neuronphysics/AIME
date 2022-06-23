@@ -22,8 +22,8 @@ def postprocess_observation(observation, bit_depth):
   return np.clip(np.floor((observation + 0.5) * 2 ** bit_depth) * 2 ** (8 - bit_depth), 0, 2 ** 8 - 1).astype(np.uint8)
 
 
-def _images_to_observation(images, bit_depth):
-  images = torch.tensor(resize(images, [64, 64]).transpose(2, 0, 1), dtype=torch.float32)  # Resize and put channel first
+def _images_to_observation(images, bit_depth, obs_size=64):
+  images = torch.tensor(resize(images, [obs_size, obs_size]).transpose(2, 0, 1), dtype=torch.float32)  # Resize and put channel first
   preprocess_observation_(images, bit_depth)  # Quantise, centre and dequantise inplace
   images = torch.min(torch.max(images, torch.tensor(1e-20, dtype=torch.float)), torch.tensor(1-1e-20, dtype=torch.float))
   return images.unsqueeze(dim=0)  # Add batch dimension
@@ -283,7 +283,7 @@ class ControlSuiteEnv():
 
 
 class GymEnv():
-  def __init__(self, env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
+  def __init__(self, env, symbolic, seed, max_episode_length, action_repeat, bit_depth, obs_size=64):
     import logging
     import gym
     gym.logger.set_level(logging.ERROR)  # Ignore warnings from Gym logger
@@ -293,6 +293,7 @@ class GymEnv():
     self.max_episode_length = max_episode_length
     self.action_repeat = action_repeat
     self.bit_depth = bit_depth
+    self.obs_size = obs_size
 
   def reset(self):
     self.t = 0  # Reset internal timer
@@ -300,7 +301,7 @@ class GymEnv():
     if self.symbolic:
       return torch.tensor(state, dtype=torch.float32).unsqueeze(dim=0)
     else:
-      return _images_to_observation(self._env.render(mode='rgb_array'), self.bit_depth)
+      return _images_to_observation(self._env.render(mode='rgb_array'), self.bit_depth, self.obs_size)
   
   def step(self, action):
     action = action.detach().numpy()
@@ -315,7 +316,7 @@ class GymEnv():
     if self.symbolic:
       observation = torch.tensor(state, dtype=torch.float32).unsqueeze(dim=0)
     else:
-      observation = _images_to_observation(self._env.render(mode='rgb_array'), self.bit_depth)
+      observation = _images_to_observation(self._env.render(mode='rgb_array'), self.bit_depth, self.obs_size)
     return observation, reward, done
 
   def render(self):
@@ -413,11 +414,11 @@ class Hiway:
     return torch.from_numpy(self.action_space.sample())
 '''
 
-def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
+def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth, input_size=64):
   if env in GYM_ENVS:
-    return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
+    return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth, input_size)
   elif env in CONTROL_SUITE_ENVS:
-    return ControlSuiteEnv(env, seed, max_episode_length, action_repeat, bit_depth)
+    return ControlSuiteEnv(env, seed, max_episode_length, action_repeat, bit_depth, input_size)
   elif (env == 'loop' or env == '4lane'):
     '''
     AGENT_ID = "Agent-001"
