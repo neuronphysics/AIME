@@ -10,4 +10,4 @@
 module load python/3.8.10
 cd ..
 source ~/dm_control/bin/activate
-python main.py --id cheetah-run-seed-1 --seed 1 --env cheetah-run --use-regular-vae --max-episode-length 50 --batch-size 8 --chunk-size 8 --test-interval 2 --collect-interval 10 --episodes 4
+python main.py --id cheetah-run-seed-1 --seed 1 --env cheetah-run --use-regular-vae --max-episode-length 10 --batch-size 8 --chunk-size 8 --test-interval 2 --collect-interval 20 --episodes 120

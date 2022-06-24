@@ -15,9 +15,9 @@ from models import bottle, bottle_two_output, Encoder, ObservationModel, Recurre
 from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
 from planner import ActorCriticPlanner
 from utils import lineplot, write_video, AdaBound
+from main_utils import *
 import gpytorch
 from gpytorch.mlls import DeepApproximateMLL, VariationalELBO, PredictiveLogLikelihood
-
 # Hyperparameters
 parser = argparse.ArgumentParser(description='AIME')
 parser.add_argument('--id', type=str, default='default', help='Experiment ID')
@@ -55,7 +55,7 @@ parser.add_argument('--top-candidates', type=int, default=100, metavar='K', help
 parser.add_argument('--test', action='store_true', help='Test only')
 parser.add_argument('--test-interval', type=int, default=10, metavar='I', help='Test interval (episodes)')
 parser.add_argument('--test-episodes', type=int, default=1, metavar='E', help='Number of test episodes')
-parser.add_argument('--checkpoint-interval', type=int, default=50, metavar='I', help='Checkpoint interval (episodes)')
+parser.add_argument('--checkpoint-interval', type=int, default=100, metavar='I', help='Checkpoint interval (episodes)')
 parser.add_argument('--checkpoint-experience', action='store_true', help='Checkpoint experience replay')
 parser.add_argument('--models', type=str, default='', metavar='M', help='Load model checkpoint')
 parser.add_argument('--experience-replay', type=str, default='', metavar='ER', help='Load experience replay')
@@ -89,8 +89,88 @@ print(' ' * 26 + 'Options')
 for k, v in vars(args).items():
   print(' ' * 26 + k + ': ' + str(v))
 
+def _backward_infGaussianVAE(l, retain_graph=False):
+  if args.train_all_layers:
+    infGaussianVAE.zero_grad()
+  else:
+    vae_encoder.zero_grad()
+    vae_decoder.zero_grad()
+  l.backward(retain_graph=retain_graph)
+  torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), args.grad_clip_norm, norm_type=2)
 
-# Setup
+  if args.train_all_layers:
+    inf_optim.step()
+  else:
+    enc_optim.step()
+    dec_optim.step()
+
+def get_latent(observation):
+  if args.use_regular_vae:
+    current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
+    current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
+  else:
+    current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
+  return current_latent_state 
+
+def test(episode, metrics):
+  print("Testing at episode", episode)
+  # Set models to eval mode
+  if args.use_regular_vae:
+    observation_model.eval()
+    encoder.eval()
+  else:
+    infinite_vae.eval()
+  recurrent_gp.eval()
+  actor_critic_planner.eval()
+  # Initialise parallelised test environments
+  test_envs = EnvBatcher(Env, (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth), {}, args.test_episodes)
+  
+  with torch.no_grad():
+    observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
+    episode_states = torch.zeros(args.lagging_size, args.state_size, device=args.device)
+    current_latent_state = get_latent(observation)
+    episode_states[-1] = current_latent_state
+    episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
+    pbar = tqdm(range(args.max_episode_length // args.action_repeat))
+    for t in pbar:
+      with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples):
+        action, _, _, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+      observation, reward, done = test_envs.step(action.cpu())
+      current_latent_state = get_latent(observation)
+      episode_states = torch.cat([episode_states, current_latent_state], dim=0)
+      episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
+      total_rewards = total_reward + reward.numpy()
+      if not args.symbolic_env:  # Collect real vs. predicted frames for video
+        video_frames.append(make_grid(observation, nrow=5).numpy())  # Decentre
+      if done.sum().item() == args.test_episodes:
+        pbar.close()
+        break
+  
+  # Update and plot reward metrics (and write video if applicable) and save metrics
+  metrics['test_episodes'].append(episode)
+  metrics['test_rewards'].append(total_rewards.tolist())
+  lineplot(metrics['test_episodes'], metrics['test_rewards'], 'test_rewards', results_dir)
+  lineplot(np.asarray(metrics['steps'])[np.asarray(metrics['test_episodes']) - 1], metrics['test_rewards'], 'test_rewards_steps', results_dir, xaxis='step')
+  if not args.symbolic_env:
+    episode_str = str(episode).zfill(len(str(args.episodes)))
+    write_video(video_frames, 'test_episode_%s' % episode_str, results_dir)  # Lossy compression
+    save_image(torch.as_tensor(video_frames[-1]), os.path.join(results_dir, 'test_episode_%s.png' % episode_str))
+  torch.save(metrics, os.path.join(results_dir, 'metrics.pth'))
+
+  del episode_states, episode_actions
+
+  # Set models to train mode
+  if args.use_regular_vae:
+    observation_model.train()
+    encoder.train()
+  else:
+    infinite_vae.train()
+  recurrent_gp.train()
+  actor_critic_planner.train()
+  # Close test environments
+  test_envs.close()
+
+###### Setup
 results_dir = os.path.join('results', args.id)
 os.makedirs(results_dir, exist_ok=True)
 np.random.seed(args.seed)
@@ -104,7 +184,7 @@ metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': []
            'transition_imagine_loss':[], 'controller_imagine_loss':[], 'reward_loss': [], 'value_loss': [], 'policy_loss': [], 'q_loss': [], 
            'policy_mll_loss': [], 'transition_mll_loss': [], 'elbo1': [], 'elbo2': [], 'elbo3': [], 'elbo4': [], 'elbo5': []}
 
-# Initialise training environment and experience replay memory
+###### Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth, args.input_size)
 if args.experience_replay is not '' and os.path.exists(args.experience_replay):
   D = torch.load(args.experience_replay)
@@ -189,46 +269,16 @@ transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_modu
 controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_module.likelihood, recurrent_gp.policy_module,args.batch_size*(args.chunk_size-args.lagging_size), beta=1.0))#latent_space
 rgp_training_episode = args.seed_episodes
 
-def _backward_infGaussianVAE(l, retain_graph=False):
-  if args.train_all_layers:
-    infGaussianVAE.zero_grad()
-  else:
-    vae_encoder.zero_grad()
-    vae_decoder.zero_grad()
-  l.backward(retain_graph=retain_graph)
-  torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), args.grad_clip_norm, norm_type=2)
-
-  if args.train_all_layers:
-    inf_optim.step()
-  else:
-    enc_optim.step()
-    dec_optim.step()
-
-def free_params(module: nn.Module):
-    for p in module.parameters():
-        p.requires_grad = True
-
-def frozen_params(module: nn.Module):
-    for p in module.parameters():
-        p.requires_grad = False
-
-def find_model_size(model):
-  param_size = 0
-  for param in model.parameters():
-    param_size += param.nelement() * param.element_size()
-  buffer_size = 0
-  for buffer in model.buffers():
-    buffer_size += buffer.nelement() * buffer.element_size()
-
-  size_all_mb = (param_size + buffer_size) / 1024**2
-  print('model size: {:.3f}MB'.format(size_all_mb))
 find_model_size(recurrent_gp)
 if args.use_regular_vae:
   find_model_size(observation_model)
   find_model_size(encoder)
 else:
   find_model_size(infinite_vae)
-# Training (and testing)
+
+
+###### Training (and testing)
+
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
   # Model fitting
   losses = []
@@ -242,41 +292,12 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
         # observations: <chunk_size, batch_size, 3, input_dim, input_dim)
         if args.use_regular_vae:
-          latent_mean, latent_std = bottle_two_output(encoder, (observations, ))
-          latent_dist = Normal(latent_mean, latent_std)
-          latent_kl_loss = kl_divergence(latent_dist, global_prior).sum(dim=2).mean(dim=(0, 1))
-          latent_states = latent_dist.rsample()
-          observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
-          
+          observation_loss, latent_kl_loss, latent_states = get_regularVAE_loss_and_latent(observations, encoder, global_prior, observation_model, args)
         else:
           original_shape = observations.shape
           observations = observations.view(-1, original_shape[-3], original_shape[-2], original_shape[-1])
-          free_params(discriminator)
-          frozen_params(infinite_vae)
-          for _ in range(hyperParams["CRITIC_ITERATIONS"]):
-            X_recons_linear, mu_z, logvar_z, _, _, _, _, _, _, _, _, _ = infinite_vae(observations)
-            z_fake = infinite_vae.encoder.reparameterize(mu_z, logvar_z)
-            reconstruct_latent_components = infinite_vae.get_component_samples(hyperParams["batch_size"])
-            
-            critic_real = discriminator(reconstruct_latent_components).reshape(-1)
-            critic_fake = discriminator(z_fake).reshape(-1)
-            gp = gradient_penalty(discriminator, reconstruct_latent_components, z_fake, device=args.device)
-            loss_critic = (
-                -(torch.mean(critic_real) - torch.mean(critic_fake)) + hyperParams["LAMBDA_GP"] * gp
-            )
-            discriminator.zero_grad()
-            loss_critic.backward(retain_graph=True)
-            dis_optim.step()
-          frozen_params(discriminator)
-          free_params(infinite_vae)
-          gen_fake = discriminator(z_fake).reshape(-1)
-          
-          latent_states = torch.reshape(infinite_vae.get_latent_states(observations), (original_shape[0], original_shape[1], args.state_size))
-
-          loss_dict = infinite_vae.get_ELBO(observations)
-          loss_dict["wasserstein_loss"] =  -torch.mean(gen_fake)
-  
-          loss_dict["WAE-GP"]=loss_dict["loss"]+loss_dict["wasserstein_loss"]
+          z_fake = train_discriminator(observations, discriminator, infinite_vae, hyperParams, args, dis_optim)
+          loss_dict, latent_states = get_infGaussianVAE_loss_and_latent(discriminator, z_fake, infinite_vae, observations, original_shape, args)
 
         # latent_states : <chunk_size, batch_size, z_dim>
         init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
@@ -298,7 +319,6 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
         else:
           true_rewards = rewards[args.lagging_size+args.horizon_size:]
-        
         # true_latent size: <chunk_size - lagging_size, batch_size, latent_size>
         # true_action size: <chunk_size - lagging_size, batch_size, action_size>
         
@@ -335,49 +355,19 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         if args.use_regular_vae:
           (observation_loss  + latent_kl_loss + recurrent_gaussian_loss).backward()
           print("observation_loss", observation_loss, "latent_kl_loss", latent_kl_loss)
-        else:
-          _backward_infGaussianVAE(loss_dict["WAE-GP"] + recurrent_gaussian_loss)
-
-        nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-        optimiser.step()
-        # Store loss
-        if args.use_regular_vae:
           losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item(), transition_imagine_loss.item(), controller_imagine_loss.item() ])
         else:
+          _backward_infGaussianVAE(loss_dict["WAE-GP"] + recurrent_gaussian_loss)
+          print("infGaussianLoss", loss_dict["WAE-GP"].item() + recurrent_gaussian_loss.item())
           losses.append([0, 0, 0, 0, 0, reward_loss.item(), transition_imagine_loss.item(), controller_imagine_loss.item()])
+        # optimizer includes recurrent_gp and VAE is using regular VAE
+        nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
+        optimiser.step()
         del true_latent, true_action, predicted_rewards, predicted_action, predicted_latent, init_states, latent_states, init_actions, actions, observations
-
 
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
-    if args.use_regular_vae:
-      metrics['observation_loss'].append(losses[0])
-      metrics['reward_loss'].append(losses[1])
-      metrics['latent_kl_loss'].append(losses[2])
-      metrics['transition_imagine_loss'].append(losses[3])
-      metrics['controller_imagine_loss'].append(losses[4])
-      lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['latent_kl_loss']):], metrics['latent_kl_loss'], 'latent_kl_loss', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'transition_imagine_loss', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'controller_imagine_loss', results_dir)
-    else:
-      metrics['elbo1'].append(losses[0])
-      metrics['elbo2'].append(losses[1])
-      metrics['elbo3'].append(losses[2])
-      metrics['elbo4'].append(losses[3])
-      metrics['elbo5'].append(losses[4])
-      metrics['reward_loss'].append(losses[5])
-      metrics['transition_imagine_loss'].append(losses[6])
-      metrics['controller_imagine_loss'].append(losses[7])
-      lineplot(metrics['episodes'][-len(metrics['elbo1']):], metrics['elbo1'], 'elbo1', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['elbo2']):], metrics['elbo2'], 'elbo2', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['elbo3']):], metrics['elbo3'], 'elbo3', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['elbo4']):], metrics['elbo4'], 'elbo4', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['elbo5']):], metrics['elbo5'], 'elbo5', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'transition_imagine_loss', results_dir)
-      lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'controller_imagine_loss', results_dir)
+    metrics = update_plot_loss_metric(args, metrics, losses, results_dir)
 
   # Data collection
   if args.use_regular_vae:
@@ -387,44 +377,52 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     infinite_vae.batch_size = 1
   observation, total_reward, time_step = env.reset(), 0, 0
   with torch.no_grad():
-    if args.use_regular_vae:
-      current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
-      current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
-    else:
-      current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
-  episode_states = torch.zeros(args.lagging_size, args.state_size, device=args.device)
-  episode_states[-1] = current_latent_state
-  episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
-  episode_values = torch.zeros(args.lagging_size, 1, device=args.device)
-  episode_q_values = torch.zeros(args.lagging_size, 1, device=args.device)
-  episode_rewards = torch.zeros(args.lagging_size, 1, device=args.device)
-  episode_policy_kl = torch.zeros(args.lagging_size, 1, device=args.device)
-  episode_policy_mll_loss = torch.zeros(args.lagging_size, 1, device=args.device)
-  episode_transition_kl = torch.zeros(args.lagging_size, 1, device=args.device)
-  episode_transition_mll_loss = torch.zeros(args.lagging_size, 1, device=args.device)
+    current_latent_state = get_latent(observation)
+
+  (
+    episode_states,
+    episode_actions,
+    episode_values,
+    episode_q_values,
+    episode_rewards,
+    episode_policy_kl,
+    episode_policy_mll_loss,
+    episode_transition_kl,
+    episode_transition_mll_loss
+  ) = init_planner_states(args, current_latent_state, env)
+
   pbar = tqdm(range(args.max_episode_length // args.action_repeat)) # max_episode_length = 1000
   time_steps = 0
   with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples):
     for t in pbar:
-      action, action_log_prob, policy_mll_loss, value, q_value, transition_dist = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
-      episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
-      episode_policy_mll_loss = torch.cat([episode_policy_mll_loss, policy_mll_loss.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
+      (
+        action,
+        action_log_prob,
+        policy_mll_loss,
+        value, q_value,
+        transition_dist
+      ) = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+      
       observation, reward, done = env.step(action[0].cpu())
       with torch.no_grad():
-        if args.use_regular_vae:
-          current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
-          current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
-        else:
-          current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
-      transition_kl = -transition_dist.log_prob(current_latent_state)
-      transition_mll_loss = -actor_critic_planner.transition_mll(transition_dist, current_latent_state)
-      episode_transition_kl = torch.cat([episode_transition_kl, transition_kl.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
-      episode_transition_mll_loss = torch.cat([episode_transition_mll_loss, transition_mll_loss.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
-      episode_states = torch.cat([episode_states, current_latent_state], dim=0)
-      episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
-      episode_values = torch.cat([episode_values, value], dim=0)
-      episode_q_values = torch.cat([episode_q_values, q_value], dim=0)
-      episode_rewards = torch.cat([episode_rewards, torch.Tensor([[reward]]).to(device=args.device)], dim=0)
+        current_latent_state = get_latent(observation)
+      
+      (
+        episode_policy_kl,
+        episode_policy_mll_loss,
+        transition_kl,
+        transition_mll_loss,
+        episode_transition_kl,
+        episode_transition_mll_loss,
+        episode_states,
+        episode_actions,
+        episode_values,
+        episode_q_values,
+        episode_rewards
+      ) = update_planner_states(transition_dist, current_latent_state, actor_critic_planner, action, value, q_value, reward,
+                                episode_policy_kl, action_log_prob, episode_policy_mll_loss, policy_mll_loss, episode_transition_kl, 
+                                episode_transition_mll_loss, episode_states, episode_actions, episode_values, episode_q_values, episode_rewards, args)
+
       D.append(observation, action.detach().cpu(), reward, done)
       total_reward = total_reward + reward
       if args.render:
@@ -432,7 +430,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       if done:
         pbar.close()
         break
-      
+  
+  ### Compute loss and backward-prop
   current_q_values = episode_q_values
   previous_q_values = episode_q_values
   current_rewards = episode_rewards
@@ -451,29 +450,20 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   
   planning_optimiser.zero_grad()
   (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
+  print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
+  print("planning total loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
+  print("training rewards", total_reward)
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
-  metrics['value_loss'].append(value_loss.item())
-  metrics['policy_loss'].append(policy_loss.item())
-  metrics['q_loss'].append(q_loss.item())
-  metrics['policy_mll_loss'].append(current_policy_mll_loss.item())
-  metrics['transition_mll_loss'].append(current_transition_mll_loss.item())
-  # Update and plot train reward metrics
-  metrics['steps'].append(t + metrics['steps'][-1])
-  metrics['episodes'].append(episode)
-  metrics['train_rewards'].append(total_reward)
-  lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['policy_loss']):], metrics['policy_loss'], 'policy_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['policy_mll_loss']):], metrics['policy_mll_loss'], 'policy_mll_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['transition_mll_loss']):], metrics['transition_mll_loss'], 'transition_mll_loss', results_dir)
+
+  metrics = update_plot_planning_loss_metric(metrics, value_loss, policy_loss, q_loss, current_policy_mll_loss, current_transition_mll_loss, t, episode, total_reward, results_dir)
 
   # delete unused variables
   del episode_states, episode_actions, episode_values, episode_q_values, episode_rewards, episode_policy_kl, episode_policy_mll_loss, episode_transition_kl, episode_transition_mll_loss
   del action, action_log_prob, policy_mll_loss, value, q_value, transition_dist
   del current_q_values, previous_q_values, current_rewards, current_policy_kl, current_transition_kl, current_values, previous_values, soft_v_values, target_q_values, value_loss, q_loss, policy_loss 
   del current_policy_mll_loss, current_transition_mll_loss
+
   if args.use_regular_vae:
     encoder.train()
   else:
@@ -481,97 +471,17 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
   # Test model
   if episode % args.test_interval == 0:
-    print("Testing at episode", episode)
-    # Set models to eval mode
-    if args.use_regular_vae:
-      observation_model.eval()
-      encoder.eval()
-    else:
-      infinite_vae.eval()
-    recurrent_gp.eval()
-    actor_critic_planner.eval()
-    # Initialise parallelised test environments
-    test_envs = EnvBatcher(Env, (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth), {}, args.test_episodes)
-    
-    with torch.no_grad():
-      observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
-      episode_states = torch.zeros(args.lagging_size, args.state_size, device=args.device)
-      if args.use_regular_vae:
-        current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
-        current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
-      else:
-        current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
-      episode_states[-1] = current_latent_state
-      episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
-      pbar = tqdm(range(args.max_episode_length // args.action_repeat))
-      for t in pbar:
-        with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples):
-          action, _, _, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
-        observation, reward, done = test_envs.step(action.cpu())
-        if args.use_regular_vae:
-          current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
-          current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
-        else:
-          current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
-        episode_states = torch.cat([episode_states, current_latent_state], dim=0)
-        episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
-        total_rewards = total_reward + reward.numpy()
-        if not args.symbolic_env:  # Collect real vs. predicted frames for video
-          if args.use_regular_vae:
-            video_frames.append(make_grid(observation, nrow=5).numpy())  # Decentre
-          else:
-            video_frames.append(make_grid(observation, nrow=5).numpy())  # Decentre
-        if done.sum().item() == args.test_episodes:
-          pbar.close()
-          break
-    
-    # Update and plot reward metrics (and write video if applicable) and save metrics
-    metrics['test_episodes'].append(episode)
-    metrics['test_rewards'].append(total_rewards.tolist())
-    lineplot(metrics['test_episodes'], metrics['test_rewards'], 'test_rewards', results_dir)
-    lineplot(np.asarray(metrics['steps'])[np.asarray(metrics['test_episodes']) - 1], metrics['test_rewards'], 'test_rewards_steps', results_dir, xaxis='step')
-    if not args.symbolic_env:
-      episode_str = str(episode).zfill(len(str(args.episodes)))
-      write_video(video_frames, 'test_episode_%s' % episode_str, results_dir)  # Lossy compression
-      save_image(torch.as_tensor(video_frames[-1]), os.path.join(results_dir, 'test_episode_%s.png' % episode_str))
-    torch.save(metrics, os.path.join(results_dir, 'metrics.pth'))
-
-    del episode_states, episode_actions
-
-    # Set models to train mode
-    if args.use_regular_vae:
-      observation_model.train()
-      encoder.train()
-    else:
-      infinite_vae.train()
-    recurrent_gp.train()
-    actor_critic_planner.train()
-    # Close test environments
-    test_envs.close()
-
+    test(episode, metrics)
 
   # Checkpoint models
   if episode % args.checkpoint_interval == 0:
     if args.use_regular_vae:
-      torch.save({
-        'observation_model': observation_model.state_dict(),
-        'encoder': encoder.state_dict(),
-        'recurrent_gp': recurrent_gp.state_dict(),
-        'optimiser': optimiser.state_dict(),
-        'actor_critic_planner': actor_critic_planner.state_dict(),
-        'planning_optimiser': planning_optimiser.state_dict(),
-        }, os.path.join(results_dir, 'models_%d.pth' % episode))
+      save_regularVAE(observation_model, encoder, recurrent_gp, optimiser, actor_critic_planner, planning_optimiser, episode, results_dir)
     else:
-      torch.save({
-        'infinite_vae': infinite_vae.state_dict(),
-        'recurrent_gp': recurrent_gp.state_dict(),
-        'optimiser': optimiser.state_dict(),
-        'actor_critic_planner': actor_critic_planner.state_dict(),
-        'planning_optimiser': planning_optimiser.state_dict(),
-        }, os.path.join(results_dir, 'models_%d.pth' % episode))
+      save_infGaussianVAE(infinite_vae, recurrent_gp, optimiser, actor_critic_planner, planning_optimiser, episode, results_dir)
     if args.checkpoint_experience:
       torch.save(D, os.path.join(results_dir, 'experience.pth'))  # Warning: will fail with MemoryError with large memory sizes
-
-
+print("Done!")
+print(env)
 # Close training environment
 env.close()
