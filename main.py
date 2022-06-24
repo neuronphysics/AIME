@@ -91,7 +91,7 @@ for k, v in vars(args).items():
 
 def _backward_infGaussianVAE(l, retain_graph=False):
   if args.train_all_layers:
-    infGaussianVAE.zero_grad()
+    infinite_vae.zero_grad()
   else:
     vae_encoder.zero_grad()
     vae_decoder.zero_grad()
@@ -104,6 +104,7 @@ def _backward_infGaussianVAE(l, retain_graph=False):
     enc_optim.step()
     dec_optim.step()
 
+# return the latent state through encoder
 def get_latent(observation):
   if args.use_regular_vae:
     current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
@@ -112,7 +113,8 @@ def get_latent(observation):
     current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
   return current_latent_state 
 
-def test(episode, metrics):
+# test the agent
+def test(episode, metrics): 
   print("Testing at episode", episode)
   # Set models to eval mode
   if args.use_regular_vae:
@@ -203,7 +205,7 @@ elif not args.test:
     metrics['steps'].append(t * args.action_repeat + (0 if len(metrics['steps']) == 0 else metrics['steps'][-1]))
     metrics['episodes'].append(s)
 
-
+# init recurrent GP and VAE models
 recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, args.lagging_size, args.num_inducing_recurrent_gp, args.device).to(device=args.device)
 
 if args.use_regular_vae:
@@ -234,9 +236,10 @@ else:
     dec_optim = torch.optim.Adam(vae_decoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
   dis_optim = torch.optim.Adam(discriminator.parameters(), lr = 0.5 * hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
 
-  enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
-  dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
-  dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
+  # scheduler are not used currently
+  # enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
+  # dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
+  # dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
   #optimize transition function, controller and reward functions
   ##should we optimize these transition function and controller like the following?
   param_list    = list(recurrent_gp.parameters())
@@ -245,6 +248,8 @@ else:
 optimiser = AdaBound(param_list, lr=0.0001) if args.use_ada_bound else optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
 actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories, args.hidden_size, args.num_gp_likelihood_samples, args.num_inducing_planner, args.device).to(device=args.device)
+
+# set up optimizers
 planning_optimiser = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 if args.models is not '' and os.path.exists(args.models):
   model_dicts = torch.load(args.models)
@@ -282,6 +287,8 @@ else:
 for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics['episodes'][-1] + 1):
   # Model fitting
   losses = []
+
+  # training the observation models and recurrent GP 
   if ((episode-1) == rgp_training_episode):
     rgp_training_episode = int(rgp_training_episode * args.rgp_training_interval_ratio)
     if (not args.use_regular_vae):
@@ -369,7 +376,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     losses = tuple(zip(*losses))
     metrics = update_plot_loss_metric(args, metrics, losses, results_dir)
 
-  # Data collection
+  # Data collection and planning
   if args.use_regular_vae:
     encoder.eval()
   else:
@@ -482,6 +489,5 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     if args.checkpoint_experience:
       torch.save(D, os.path.join(results_dir, 'experience.pth'))  # Warning: will fail with MemoryError with large memory sizes
 print("Done!")
-print(env)
 # Close training environment
 env.close()
