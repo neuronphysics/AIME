@@ -9,6 +9,33 @@ from tqdm.auto import tqdm
 from .vargp import VARGP
 
 
+def train(task_id, train_set, val_set, test_set, ep_var_mean=True, map_est_hypers=False, dkl=False,
+          epochs=1, M=20, n_f=10, n_var_samples=3, batch_size=512, lr=1e-2, beta=1.0,
+          eval_interval=10, patience=20, prev_params=None, logger=None, device=None):
+  gp = VARGP.create_clf(train_set, M=M, n_f=n_f, n_var_samples=n_var_samples, prev_params=prev_params,
+                        ep_var_mean=ep_var_mean, map_est_hypers=map_est_hypers, dkl=dkl).to(device)
+
+  optim = torch_optimizer.Yogi(gp.parameters(), lr=lr)
+
+  N = len(train_set)
+  loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    
+  losses = []
+  for e in tqdm(range(epochs)):
+    for x, y in tqdm(loader, leave=False):
+      optim.zero_grad()
+
+      kl_hypers, kl_u, lik = gp.loss(x.to(device), y.to(device))
+
+      loss = beta * kl_hypers + kl_u + (N / x.size(0)) * lik
+      loss.backward()
+      losses.append(loss.item())
+
+      optim.step()
+
+  return gp, sum(losses) / len(losses)
+
+
 def set_seeds(seed=None):
   if seed:
     random.seed(seed)

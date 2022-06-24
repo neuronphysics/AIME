@@ -212,7 +212,14 @@ class RecurrentGP(DeepGP):
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
             # transition distribution
-            z = transition_module(z_hat)
+            transition_output = []
+            for z_hat_chunk in z_hat:
+                pred_mu, pred_var = transition_module(z_hat_chunk)
+                # distribution + sampling doesnt work
+                # currently just using mean
+                # print("================= shape? ", torch.distributions.MultivariateNormal(pred_mu, pred_var).sample())
+                transition_output.append(pred_mu.mean(dim=0))
+            z = torch.stack(transition_output)
             lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
         
         # last policy in the horizon

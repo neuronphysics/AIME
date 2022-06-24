@@ -19,7 +19,7 @@ import gpytorch
 from gpytorch.mlls import DeepApproximateMLL, VariationalELBO, PredictiveLogLikelihood
 
 from var_gp.datasets import TransitionDataset
-from var_gp.train_utils_global import train
+from var_gp.train_utils import train
 
 # Hyperparameters
 parser = argparse.ArgumentParser(description='AIME')
@@ -80,6 +80,7 @@ parser.add_argument('--use-regular-vae', action='store_true', help='use vae that
 parser.add_argument('--use-ada-bound', action='store_true', help='use AdaBound as the optimizer')
 parser.add_argument('--rgp-training-interval-ratio', type=float, default=1.1, metavar='In', help='RGP training interval ratio')
 parser.add_argument('--num-gp-likelihood-samples', type=int, default=50, metavar='GP', help='Number of likelihood samples for GP')
+parser.add_argument('--transition-retain-params', type=int, default=10, help="Number of prev_params to keep for the transition model")
 
 torch.autograd.set_detect_anomaly(True)
 args = parser.parse_args()
@@ -258,12 +259,12 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         transition_input = torch.cat([policy_input, actions_input], dim=-1)
 
         # train transition module first
-        transition_data = TransitionDataset(transition_input, transition_labels)
-        # transition_prev_params = [transition_prev_params[-1]]
+        transition_data = TransitionDataset(transition_input.detach(), transition_labels.detach())
+        transition_prev_params = transition_prev_params[:-args.transition_retain_params]
         for t in range(transition_input.size(0)):
             transition_data.filter_by_idx(t)
-            transition_model = train(t, transition_data, None, None, batch_size=1, n_f=transition_input.size(2),
-                                                    prev_params=transition_prev_params, device=args.device)
+            transition_model, transition_module_loss = train(t, transition_data, None, None, batch_size=1,
+                                     prev_params=transition_prev_params, device=args.device)
             transition_prev_params.append(transition_model.state_dict())
         
         # turn on eval mode
@@ -285,9 +286,9 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         
         # Store loss
         if args.use_regular_vae:
-          losses.append([0, 0, latent_kl_loss.item(), transition_module_loss.item(), policy_module_loss.item()])
+          losses.append([0, 0, latent_kl_loss.item(), transition_module_loss, policy_module_loss.item()])
         else:
-          losses.append([0, 0, 0, 0, 0, reward_loss.item(), transition_module_loss.item(), policy_module_loss.item()])
+          losses.append([0, 0, 0, 0, 0, reward_loss.item(), transition_module_loss, policy_module_loss.item()])
 
         # Apply linearly ramping learning rate schedule
         if args.learning_rate_schedule != 0:

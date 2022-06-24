@@ -5,7 +5,7 @@ from torch.distributions.kl import kl_divergence
 
 from .gp_utils import vec2tril, mat2trilvec, cholesky, rev_cholesky, gp_cond, linear_joint, linear_marginal_diag
 from .kernels import RBFKernel, DeepRBFKernel
-from .likelihoods import MulticlassSoftmax
+from .likelihoods import MulticlassSoftmax, GaussianLikelihood
 
 
 class VARGP(nn.Module):
@@ -201,7 +201,10 @@ class VARGP(nn.Module):
   def create_clf(dataset, M=20, n_f=10, n_var_samples=3, prev_params=None,
                  ep_var_mean=True, map_est_hypers=False, dkl=False):
     N = len(dataset)
-    out_size = torch.unique(dataset.targets).size(0)
+    out_size = dataset.targets.size(1)
+
+    # print("out size is: ", out_size)
+    # print("target shape: ", dataset.targets.shape)
 
     ## init inducing points at random data points.
     z = torch.stack([
@@ -237,7 +240,7 @@ class VARGP(nn.Module):
       kernel = RBFKernel(z.size(-1), prior_log_mean=prior_log_mean,
                          prior_log_logvar=prior_log_logvar, map_est=map_est_hypers)
 
-    likelihood = MulticlassSoftmax(n_f=n_f)
+    likelihood = GaussianLikelihood(out_size=out_size)
     gp = VARGP(z, kernel, likelihood, n_var_samples=n_var_samples,
                ep_var_mean=ep_var_mean, prev_params=prev_params)
     return gp
