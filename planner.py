@@ -117,15 +117,15 @@ class ActorCriticPlanner(nn.Module):
     self.lagging_size = lagging_size
     self.num_gp_likelihood_samples = num_gp_likelihood_samples
 
-  def forward(self, lagging_states, lagging_actions, device):
+  def forward(self, lagging_states, lagging_actions, device, softplus):
     current_state = lagging_states[-1].view(1, self.latent_size)
-    imagined_reward = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories).to(device=device)
+    imagined_reward = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories, softplus).to(device=device)
     embedding = torch.cat([current_state,imagined_reward], dim=-1)
     policy_dist = self.actor(embedding)
     value = self.critic(embedding)
     return policy_dist, value, embedding, imagined_reward
   
-  def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories):
+  def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories, softplus):
     self.recurrent_gp.eval()
     with torch.no_grad():
       with gpytorch.settings.num_likelihood_samples(self.num_gp_likelihood_samples):
@@ -133,12 +133,15 @@ class ActorCriticPlanner(nn.Module):
           torch.flatten(lagging_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
           lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
         )
-        rewards = rewards.sample().mean(dim=0)
+        if softplus:
+          rewards = torch.nn.Softplus()(rewards.sample()).mean(dim=0)
+        else:
+          rewards = rewards.sample().mean(dim=0)
     self.recurrent_gp.train()
     return rewards
   
-  def act(self, prior_states, prior_actions, device=None):
-    policy_dist, value, embedding, imagined_reward = self.forward(prior_states, prior_actions, device)
+  def act(self, prior_states, prior_actions, device=None, softplus=False):
+    policy_dist, value, embedding, imagined_reward = self.forward(prior_states, prior_actions, device, softplus)
     policy_action = policy_dist.rsample().mean(dim=0)
     policy_log_prob = policy_dist.log_prob(policy_action)
     policy_mll_loss = -self.policy_mll(policy_dist, policy_action)
