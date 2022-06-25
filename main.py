@@ -35,7 +35,7 @@ parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', hel
 parser.add_argument('--episodes', type=int, default=10000, metavar='E', help='Total number of episodes')
 parser.add_argument('--seed-episodes', type=int, default=100, metavar='S', help='Seed episodes')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C', help='Collect interval')
-parser.add_argument('--initial-collect-interval', type=int, default=10, metavar='C', help='First collect interval')
+parser.add_argument('--initial-collect-interval', type=int, default=1000, metavar='C', help='First collect interval')
 parser.add_argument('--batch-size', type=int, default=8, metavar='B', help='Batch size')
 parser.add_argument('--chunk-size', type=int, default=8, metavar='L', help='Chunk size')
 parser.add_argument('--overshooting-distance', type=int, default=50, metavar='D', help='Latent overshooting distance/latent overshooting weight for t = 1')
@@ -87,6 +87,7 @@ parser.add_argument('--infgmmvae-use-bce', action='store_true', help='use bce in
 parser.add_argument('--train-all-layers', action='store_true', help='train all layers of infGaussianVAE, default setting will only train encoder and decoder')
 parser.add_argument('--result-dir', type=str, default="results", help='result directory')
 parser.add_argument('--lineplot', action='store_true', help='lineplot metrics')
+parser.add_argument('--imaginary-rollout-softplus', action='store_true', help='add a softplus operation on imaginary_rollout of planner')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -160,7 +161,7 @@ def test(episode, metrics):
     imagined_rewards = []
     for t in pbar:
       with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples):
-        action, _, _, _, _, _, imagined_reward = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+        action, _, _, _, _, _, imagined_reward = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device, softplus=args.imaginary_rollout_softplus)
       observation, reward, done = test_envs.step(action.cpu())
       current_latent_state = get_latent(observation)
       episode_states = torch.cat([episode_states, current_latent_state], dim=0)
@@ -477,7 +478,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         value, q_value,
         transition_dist,
         imagined_reward
-      ) = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+      ) = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device, softplus=args.imaginary_rollout_softplus)
       
       observation, reward, done = env.step(action[0].cpu())
 
