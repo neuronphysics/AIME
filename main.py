@@ -35,6 +35,7 @@ parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', hel
 parser.add_argument('--episodes', type=int, default=10000, metavar='E', help='Total number of episodes')
 parser.add_argument('--seed-episodes', type=int, default=100, metavar='S', help='Seed episodes')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C', help='Collect interval')
+parser.add_argument('--initial-collect-interval', type=int, default=10, metavar='C', help='First collect interval')
 parser.add_argument('--batch-size', type=int, default=8, metavar='B', help='Batch size')
 parser.add_argument('--chunk-size', type=int, default=8, metavar='L', help='Chunk size')
 parser.add_argument('--overshooting-distance', type=int, default=50, metavar='D', help='Latent overshooting distance/latent overshooting weight for t = 1')
@@ -43,7 +44,7 @@ parser.add_argument('--overshooting-reward-scale', type=float, default=0, metava
 parser.add_argument('--global-kl-beta', type=float, default=0, metavar='βg', help='Global KL weight (0 to disable)')
 parser.add_argument('--free-nats', type=float, default=3, metavar='F', help='Free nats')
 parser.add_argument('--bit-depth', type=int, default=5, metavar='B', help='Image bit depth (quantisation)')
-parser.add_argument('--learning-rate', type=float, default=1e-3, metavar='α', help='Learning rate') 
+parser.add_argument('--learning-rate', type=float, default=1e-4, metavar='α', help='Learning rate') 
 parser.add_argument('--learning-rate-schedule', type=int, default=0, metavar='αS', help='Linear learning rate schedule (optimisation steps from 0 to final learning rate; 0 to disable)') 
 parser.add_argument('--adam-epsilon', type=float, default=1e-4, metavar='ε', help='Adam optimiser epsilon value') 
 
@@ -81,13 +82,22 @@ parser.add_argument('--num-inducing-recurrent-gp', type=int, default=16, metavar
 parser.add_argument('--num-inducing-planner', type=int, default=16, metavar='GP', help='Number of inducing points for DGPHiddenLayer in Planner')
 parser.add_argument('--input-size', type=int, default=64, metavar='InpS', help='observation input size')
 parser.add_argument('--infgmmvae-num-layer', type=int, default=4, metavar='Infnl', help='observation input size')
+parser.add_argument('--infgmmvae-use-mse', action='store_true', help='use mse in reconstruction loss of infGaussianVAE') # we need to scale output to [-0.5, 0.5]
+parser.add_argument('--infgmmvae-use-bce', action='store_true', help='use bce in reconstruction loss of infGaussianVAE') # we need to scale input to [0, 1]
 parser.add_argument('--train-all-layers', action='store_true', help='train all layers of infGaussianVAE, default setting will only train encoder and decoder')
+parser.add_argument('--result-dir', type=str, default="results", help='result directory')
+parser.add_argument('--lineplot', action='store_true', help='lineplot metrics')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
 print(' ' * 26 + 'Options')
 for k, v in vars(args).items():
   print(' ' * 26 + k + ': ' + str(v))
+
+if (args.infgmmvae_use_mse and args.infgmmvae_use_bce) or (not args.infgmmvae_use_bce and not args.infgmmvae_use_mse):
+  # if not specified or both specified, use MSE, we can alternate
+  args.infgmmvae_use_mse = True
+  args.infgmmvae_use_bce = False
 
 def _backward_infGaussianVAE(l, retain_graph=False):
   if args.train_all_layers:
@@ -113,6 +123,18 @@ def get_latent(observation):
     current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
   return current_latent_state 
 
+# return the reconstruct observation
+def get_reconstruct(observation):
+  with torch.no_grad():
+    if args.use_regular_vae:
+      current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
+      current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
+      reconstruct = observation_model(current_latent_state)
+    else:
+      reconstruct = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))[0]
+    reconstruct = reconstruct.view(observation.shape)
+  return reconstruct
+
 # test the agent
 def test(episode, metrics): 
   print("Testing at episode", episode)
@@ -134,16 +156,20 @@ def test(episode, metrics):
     episode_states[-1] = current_latent_state
     episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
     pbar = tqdm(range(args.max_episode_length // args.action_repeat))
+    true_rewards = []
+    imagined_rewards = []
     for t in pbar:
       with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples):
-        action, _, _, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+        action, _, _, _, _, _, imagined_reward = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
       observation, reward, done = test_envs.step(action.cpu())
       current_latent_state = get_latent(observation)
       episode_states = torch.cat([episode_states, current_latent_state], dim=0)
       episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
       total_rewards = total_reward + reward.numpy()
+      imagined_rewards.append(imagined_reward)
+      true_rewards.append(reward)
       if not args.symbolic_env:  # Collect real vs. predicted frames for video
-        video_frames.append(make_grid(observation, nrow=5).numpy())  # Decentre
+        video_frames.append(make_grid(observation.cpu(), nrow=5).numpy())  # Decentre
       if done.sum().item() == args.test_episodes:
         pbar.close()
         break
@@ -157,6 +183,14 @@ def test(episode, metrics):
     episode_str = str(episode).zfill(len(str(args.episodes)))
     write_video(video_frames, 'test_episode_%s' % episode_str, results_dir)  # Lossy compression
     save_image(torch.as_tensor(video_frames[-1]), os.path.join(results_dir, 'test_episode_%s.png' % episode_str))
+    save_image(torch.as_tensor(make_grid(observation.cpu(), nrow=5).numpy()), os.path.join(results_dir, 'test_episode_gt_%s.png' % episode_str))
+    recons = get_reconstruct(observation)
+    save_image(torch.as_tensor(make_grid(recons.cpu(), nrow=5).numpy()), os.path.join(results_dir, 'test_episode_recons_%s.png' % episode_str))
+    print("test observation", observation, observation.shape, "min:", torch.min(observation), "max:", torch.max(observation))
+    print("test recons", recons, recons.shape, "min:", torch.min(recons), "max:", torch.max(recons))
+  print("total test rewards", total_rewards)
+  print("imagined_rewards", imagined_rewards)
+  print("true_rewards", true_rewards)
   torch.save(metrics, os.path.join(results_dir, 'metrics.pth'))
 
   del episode_states, episode_actions
@@ -172,8 +206,115 @@ def test(episode, metrics):
   # Close test environments
   test_envs.close()
 
+def rgp_step(n_iter, losses):
+    if (not args.use_regular_vae):
+      infinite_vae.batch_size = args.batch_size * args.chunk_size
+    gp_pbar = tqdm(range(n_iter))
+    for s in gp_pbar:
+      with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples): # to do: make this a hyperparameter as well
+        # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
+        observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
+        #print("observations vision gp", observations.shape, observations[0][0], "min:", torch.min(observations), "max:", torch.max(observations))
+        # observations: <chunk_size, batch_size, 3, input_dim, input_dim)
+        if args.use_regular_vae:
+          observation_loss, latent_kl_loss, latent_states = get_regularVAE_loss_and_latent(observations, encoder, global_prior, observation_model, args)
+        else:
+          original_shape = observations.shape
+          observations = observations.view(-1, original_shape[-3], original_shape[-2], original_shape[-1])
+          z_fake = train_discriminator(observations, discriminator, infinite_vae, hyperParams, args, dis_optim)
+          loss_dict, latent_states = get_infGaussianVAE_loss_and_latent(discriminator, z_fake, infinite_vae, observations, original_shape, args)
+
+        # latent_states : <chunk_size, batch_size, z_dim>
+        init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
+        # init_states: <chunk_size - horizon_size - lagging_size, batch_size, latent_size, lagging_size>
+        init_actions = actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)
+        # init_actions: <chunk_size - horizon_size - lagging_size, batch_size, action_size, lagging_size> 
+
+        # without transpose, the result will be [t0, t1, t2, t0, t1, t2,...]
+        # We want [t0, t0, t1, t1, t2, t2, ...] so the lagging_actions[..., self.action_size:] works as expected
+        init_states = torch.transpose(init_states, -2, -1)
+        # init_states: <chunk_size - horizon_size - lagging_size, batch_size, lagging_size, latent_size>
+        init_actions = torch.transpose(init_actions, -2, -1)
+        # init_actions: <chunk_size - horizon_size - lagging_size, batch_size, lagging_size, action_size> 
+
+        predicted_rewards = recurrent_gp(init_states, init_actions)
+        
+        # true_rewards size: <chunk_size - horizon_size - lagging_size, batch_size>
+        if (not args.non_cumulative_reward):
+          true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
+        else:
+          true_rewards = rewards[args.lagging_size+args.horizon_size:]
+        # true_latent size: <chunk_size - lagging_size, batch_size, latent_size>
+        # true_action size: <chunk_size - lagging_size, batch_size, action_size>
+        
+        true_action = actions[args.lagging_size-1:-1].unfold(0, 1, 1)
+        true_action = true_action.reshape(true_action.size(0), true_action.size(1), -1)
+        policy_input = latent_states[:-1].unfold(0, args.lagging_size, 1)
+        policy_input = policy_input.reshape(policy_input.size(0), policy_input.size(1), -1)
+
+        true_latent = latent_states[args.lagging_size:].unfold(0, 1, 1)
+        true_latent = true_latent.reshape(true_latent.size(0), true_latent.size(1), -1)
+        actions_input = actions[:-1].unfold(0, args.lagging_size, 1)
+        actions_input = actions_input.reshape(actions_input.size(0), actions_input.size(1), -1)
+        transition_input = torch.cat([policy_input, actions_input], dim=-1)
+
+        predicted_action = recurrent_gp.policy_module(policy_input)
+        predicted_latent = recurrent_gp.transition_module(transition_input)
+
+        reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
+        transition_imagine_loss = -transition_mll(predicted_latent, true_latent).mean()
+        controller_imagine_loss = -controller_mll(predicted_action, true_action).mean()
+        print("true_rewards", true_rewards, true_rewards.shape)
+        print("predicted_rewards", predicted_rewards.rsample(), predicted_rewards.rsample().shape)
+        # print("predicted_rewards", predicted_rewards, "mean",  predicted_rewards.mean, "loc", predicted_rewards.loc, "variance" , predicted_rewards.variance, predicted_rewards.rsample(), predicted_rewards.rsample().shape)
+        # print("true_action", true_action, true_action.shape)
+        # print("predicted_action", predicted_action, "mean", predicted_action.mean, "loc", predicted_action.loc, "variance" , predicted_action.variance, predicted_action.rsample(), predicted_action.rsample().shape)
+        # print("true_latent", true_latent, true_latent.shape)
+        # print("predicted_latent", predicted_latent, "mean", predicted_latent.mean,"loc",  predicted_latent.loc, "variance" , predicted_latent.variance, predicted_latent.rsample(), predicted_latent.rsample().shape)
+
+        recurrent_gaussian_loss = reward_loss + transition_imagine_loss + controller_imagine_loss
+        ##################
+        print("rgp losses, r, t, c", reward_loss, transition_imagine_loss, controller_imagine_loss, "total:", recurrent_gaussian_loss)
+        #gp_pbar.set_description("rgpLoss:"+str(float(recurrent_gaussian_loss)))
+
+        # Apply linearly ramping learning rate schedule
+        if args.learning_rate_schedule != 0:
+          for group in optimiser.param_groups:
+            group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
+        
+        # Update model parameters 
+        optimiser.zero_grad()
+        #compute losses
+        if args.use_regular_vae:
+          (observation_loss  + latent_kl_loss + recurrent_gaussian_loss).backward()
+          print("observation_loss", observation_loss, "latent_kl_loss", latent_kl_loss)
+          losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item(), transition_imagine_loss.item(), controller_imagine_loss.item() ])
+          # gp_pbar.set_description("observation_loss:"+str(float(observation_loss)))
+          # gp_pbar.set_description("latent_kl_loss:"+str(float(latent_kl_loss)))
+          gp_pbar.set_description("observation_loss:"+str(float(observation_loss)) + " | rgpLoss:"+str(float(recurrent_gaussian_loss)) + " | latent_kl_loss:"+str(float(latent_kl_loss)))
+        else:
+          _backward_infGaussianVAE(loss_dict["WAE-GP"] + recurrent_gaussian_loss)
+          gp_pbar.set_description("WAE-GP:"+str(float(loss_dict["WAE-GP"].item())) + " | rgpLoss:"+str(float(recurrent_gaussian_loss)))
+          print("infGaussianLoss", loss_dict["WAE-GP"].item() + recurrent_gaussian_loss.item())
+          print("infGaussianLoss loss_dict", loss_dict)
+          losses.append([
+            loss_dict["c_cluster_kld"],
+            loss_dict["kumar2beta_kld"],
+            loss_dict["w_context_kld"],
+            loss_dict["z_latent_space_kld"],
+            loss_dict["recon"],
+            reward_loss.item(),
+            transition_imagine_loss.item(),
+            controller_imagine_loss.item()
+          ])
+        # optimizer includes recurrent_gp and VAE is using regular VAE
+        nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
+        optimiser.step()
+        del true_latent, true_action, predicted_rewards, predicted_action, predicted_latent, init_states, latent_states, init_actions, actions, observations
+    return losses
+  
 ###### Setup
-results_dir = os.path.join('results', args.id)
+results_dir = os.path.join(args.result_dir, args.id)
 os.makedirs(results_dir, exist_ok=True)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
@@ -196,11 +337,13 @@ elif not args.test:
   # Initialise dataset D with S random seed episodes
   for s in range(1, args.seed_episodes + 1):
     observation, done, t = env.reset(), False, 0
+    rewards = []
     while not done:
       action = env.sample_random_action()
       next_observation, reward, done = env.step(action)
       D.append(observation, action, reward, done)
       observation = next_observation
+      rewards.append(reward)
       t = t + 1
     metrics['steps'].append(t * args.action_repeat + (0 if len(metrics['steps']) == 0 else metrics['steps'][-1]))
     metrics['episodes'].append(s)
@@ -222,10 +365,10 @@ else:
                "latent_d": args.state_size,
                "latent_w": args.w_dim,
                "LAMBDA_GP": 10, #hyperparameter for WAE with gradient penalty
-               "LEARNING_RATE": 1e-4,
+               "LEARNING_RATE": args.learning_rate,
                "CRITIC_ITERATIONS" : 5
                }
-  infinite_vae = InfGaussMMVAE(hyperParams, hyperParams["K"], 3, hyperParams["latent_d"], hyperParams["latent_w"], hyperParams["hidden_d"], args.device, args.input_size, hyperParams["batch_size"], args.infgmmvae_num_layer, include_elbo2=True).to(device=args.device)
+  infinite_vae = InfGaussMMVAE(hyperParams, hyperParams["K"], 3, hyperParams["latent_d"], hyperParams["latent_w"], hyperParams["hidden_d"], args.device, args.input_size, hyperParams["batch_size"], args.infgmmvae_num_layer, include_elbo2=True, use_mse_loss=args.infgmmvae_use_mse).to(device=args.device)
   
   vae_encoder, vae_decoder, discriminator = infinite_vae.encoder, infinite_vae.decoder, VAECritic(infinite_vae.z_dim)
 
@@ -281,6 +424,7 @@ if args.use_regular_vae:
 else:
   find_model_size(infinite_vae)
 
+rgp_step(args.initial_collect_interval, [])
 
 ###### Training (and testing)
 
@@ -291,86 +435,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   # training the observation models and recurrent GP 
   if ((episode-1) == rgp_training_episode):
     rgp_training_episode = int(rgp_training_episode * args.rgp_training_interval_ratio)
-    if (not args.use_regular_vae):
-      infinite_vae.batch_size = args.batch_size * args.chunk_size
-    for s in tqdm(range(args.collect_interval)):
-      with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples): # to do: make this a hyperparameter as well
-        # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
-        observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)  # Transitions start at time t = 0
-        # observations: <chunk_size, batch_size, 3, input_dim, input_dim)
-        if args.use_regular_vae:
-          observation_loss, latent_kl_loss, latent_states = get_regularVAE_loss_and_latent(observations, encoder, global_prior, observation_model, args)
-        else:
-          original_shape = observations.shape
-          observations = observations.view(-1, original_shape[-3], original_shape[-2], original_shape[-1])
-          z_fake = train_discriminator(observations, discriminator, infinite_vae, hyperParams, args, dis_optim)
-          loss_dict, latent_states = get_infGaussianVAE_loss_and_latent(discriminator, z_fake, infinite_vae, observations, original_shape, args)
-
-        # latent_states : <chunk_size, batch_size, z_dim>
-        init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
-        # init_states: <chunk_size - horizon_size - lagging_size, batch_size, latent_size, lagging_size>
-        init_actions = actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)
-        # init_actions: <chunk_size - horizon_size - lagging_size, batch_size, action_size, lagging_size> 
-
-        # without transpose, the result will be [t0, t1, t2, t0, t1, t2,...]
-        # We want [t0, t0, t1, t1, t2, t2, ...] so the lagging_actions[..., self.action_size:] works as expected
-        init_states = torch.transpose(init_states, -2, -1)
-        # init_states: <chunk_size - horizon_size - lagging_size, batch_size, lagging_size, latent_size>
-        init_actions = torch.transpose(init_actions, -2, -1)
-        # init_actions: <chunk_size - horizon_size - lagging_size, batch_size, lagging_size, action_size> 
-
-        predicted_rewards = recurrent_gp(init_states, init_actions)
-        
-        # true_rewards size: <chunk_size - horizon_size - lagging_size, batch_size>
-        if (not args.non_cumulative_reward):
-          true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
-        else:
-          true_rewards = rewards[args.lagging_size+args.horizon_size:]
-        # true_latent size: <chunk_size - lagging_size, batch_size, latent_size>
-        # true_action size: <chunk_size - lagging_size, batch_size, action_size>
-        
-        true_action = actions[args.lagging_size-1:-1].unfold(0, 1, 1)
-        true_action = true_action.reshape(true_action.size(0), true_action.size(1), -1)
-        policy_input = latent_states[:-1].unfold(0, args.lagging_size, 1)
-        policy_input = policy_input.reshape(policy_input.size(0), policy_input.size(1), -1)
-
-        true_latent = latent_states[args.lagging_size:].unfold(0, 1, 1)
-        true_latent = true_latent.reshape(true_latent.size(0), true_latent.size(1), -1)
-        actions_input = actions[:-1].unfold(0, args.lagging_size, 1)
-        actions_input = actions_input.reshape(actions_input.size(0), actions_input.size(1), -1)
-        transition_input = torch.cat([policy_input, actions_input], dim=-1)
-
-        predicted_action = recurrent_gp.policy_module(policy_input)
-        predicted_latent = recurrent_gp.transition_module(transition_input)
-
-        reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
-        transition_imagine_loss = -transition_mll(predicted_latent, true_latent).mean()
-        controller_imagine_loss = -controller_mll(predicted_action, true_action).mean()
-        
-        recurrent_gaussian_loss = reward_loss + transition_imagine_loss + controller_imagine_loss
-        ##################
-        print("rgp losses, r, t, c", reward_loss, transition_imagine_loss, controller_imagine_loss, "total:", recurrent_gaussian_loss)
-
-        # Apply linearly ramping learning rate schedule
-        if args.learning_rate_schedule != 0:
-          for group in optimiser.param_groups:
-            group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
-        
-        # Update model parameters 
-        optimiser.zero_grad()
-        #compute losses
-        if args.use_regular_vae:
-          (observation_loss  + latent_kl_loss + recurrent_gaussian_loss).backward()
-          print("observation_loss", observation_loss, "latent_kl_loss", latent_kl_loss)
-          losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item(), transition_imagine_loss.item(), controller_imagine_loss.item() ])
-        else:
-          _backward_infGaussianVAE(loss_dict["WAE-GP"] + recurrent_gaussian_loss)
-          print("infGaussianLoss", loss_dict["WAE-GP"].item() + recurrent_gaussian_loss.item())
-          losses.append([0, 0, 0, 0, 0, reward_loss.item(), transition_imagine_loss.item(), controller_imagine_loss.item()])
-        # optimizer includes recurrent_gp and VAE is using regular VAE
-        nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-        optimiser.step()
-        del true_latent, true_action, predicted_rewards, predicted_action, predicted_latent, init_states, latent_states, init_actions, actions, observations
+    losses = rgp_step(args.collect_interval, losses)
 
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
@@ -382,6 +447,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   else:
     infinite_vae.eval()
     infinite_vae.batch_size = 1
+  recurrent_gp.eval()
   observation, total_reward, time_step = env.reset(), 0, 0
   with torch.no_grad():
     current_latent_state = get_latent(observation)
@@ -397,6 +463,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     episode_transition_kl,
     episode_transition_mll_loss
   ) = init_planner_states(args, current_latent_state, env)
+  imagined_rewards = []
+  true_rewards = []
 
   pbar = tqdm(range(args.max_episode_length // args.action_repeat)) # max_episode_length = 1000
   time_steps = 0
@@ -407,10 +475,15 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         action_log_prob,
         policy_mll_loss,
         value, q_value,
-        transition_dist
+        transition_dist,
+        imagined_reward
       ) = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
       
       observation, reward, done = env.step(action[0].cpu())
+
+      imagined_rewards.append(imagined_reward)
+      true_rewards.append(reward)
+      
       with torch.no_grad():
         current_latent_state = get_latent(observation)
       
@@ -460,10 +533,14 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
   print("planning total loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
   print("training rewards", total_reward)
+  print("current_rewards", current_rewards)
+  print("train observation", observation.shape, observation, "min:", torch.min(observation), "max:", torch.max(observation))
+  print("train imagined_rewards", imagined_rewards)
+  print("train true_rewards", true_rewards)
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
 
-  metrics = update_plot_planning_loss_metric(metrics, value_loss, policy_loss, q_loss, current_policy_mll_loss, current_transition_mll_loss, t, episode, total_reward, results_dir)
+  metrics = update_plot_planning_loss_metric(metrics, value_loss, policy_loss, q_loss, current_policy_mll_loss, current_transition_mll_loss, t, episode, total_reward, results_dir, args)
 
   # delete unused variables
   del episode_states, episode_actions, episode_values, episode_q_values, episode_rewards, episode_policy_kl, episode_policy_mll_loss, episode_transition_kl, episode_transition_mll_loss
@@ -475,6 +552,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     encoder.train()
   else:
     infinite_vae.train()
+  recurrent_gp.train()
 
   # Test model
   if episode % args.test_interval == 0:

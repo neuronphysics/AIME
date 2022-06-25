@@ -13,7 +13,7 @@ from gpytorch.kernels import RBFKernel, ScaleKernel, SpectralMixtureKernel
 from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.likelihoods import GaussianLikelihood, MultitaskGaussianLikelihood
-
+from gpytorch.constraints import Interval, GreaterThan, Positive, LessThan
 
 #import debugpy
 #debugpy.listen(5678)
@@ -207,10 +207,13 @@ class DGPHiddenLayer(DeepGPLayer):
             self.mean_module = ZeroMean(batch_shape=batch_shape)
         else:
             self.mean_module = LinearMean(input_dims)
-        
+        base_covar_module = RBFKernel()
+        # self.covar_module = ScaleKernel(
+        #     SpectralMixtureKernel(num_mixtures=num_mixtures, batch_shape=batch_shape, ard_num_dims=input_dims),
+        #     batch_shape=batch_shape, ard_num_dims=None, outputscale_constraint=Interval(1e-8, 1)
+        # )
         self.covar_module = ScaleKernel(
-            SpectralMixtureKernel(num_mixtures=num_mixtures, batch_shape=batch_shape, ard_num_dims=input_dims),
-            batch_shape=batch_shape, ard_num_dims=None
+            base_covar_module, batch_shape=batch_shape, ard_num_dims=None, outputscale_constraint=Interval(1e-8, 1)
         )
 
     def forward(self, x):
@@ -240,7 +243,7 @@ class DGPHiddenLayer(DeepGPLayer):
 
 
 class DeepGaussianProcesses(DeepGP):
-    def __init__(self, input_size, output_size, device, num_inducing, max_cholesky_size=10000, **kwargs):
+    def __init__(self, input_size, output_size, device, num_inducing, noise_constraint=None, max_cholesky_size=10000, **kwargs):
         # pass hidden layer sizes as separate arguments as well as array
         for k, v in kwargs.items():
             if k=='mean_type':
@@ -293,9 +296,9 @@ class DeepGaussianProcesses(DeepGP):
         self.first_layer = first_layer
         self.hidden_layers = hidden_layers
         if output_size is None:
-           self.likelihood = GaussianLikelihood()
+           self.likelihood = GaussianLikelihood(noise_constraint=noise_constraint)
         else:
-           self.likelihood= MultitaskGaussianLikelihood(num_tasks=output_size)
+           self.likelihood= MultitaskGaussianLikelihood(num_tasks=output_size, noise_constraint=noise_constraint)
         self.to(device=self.device)
 
     def forward(self, inputs):
@@ -372,18 +375,18 @@ class TransitionGP(DeepGaussianProcesses):
     #transition probability  P(z_{t}|x_{t-k},...x_{t-1})=N(z_{t}|mu_x,sigma_x)---->T(x_{t-k},...x_{t-1})=z_{t}; x_{.}=[z_{.},a_{.}]
     def __init__(self, latent_size, action_size, lagging_size, num_inducing, device, hidden_size=[32], mean_type= 'linear'):
         input_size = (latent_size+action_size)*lagging_size
-        super(TransitionGP, self).__init__(input_size=input_size, output_size=latent_size, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing) 
+        super(TransitionGP, self).__init__(input_size=input_size, output_size=latent_size, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing, noise_constraint=Interval(1e-4, 10)) 
       
 class PolicyGP(DeepGaussianProcesses):
     #policy P(z_{t})=a(t)--- input z:latent_space---> output a: action
     def __init__(self, latent_size, action_size, lagging_size, num_inducing, device, hidden_size=[32], mean_type= 'constant'):
         input_size =latent_size*lagging_size
-        super(PolicyGP, self).__init__(input_size=input_size, output_size= action_size, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing)
+        super(PolicyGP, self).__init__(input_size=input_size, output_size= action_size, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing, noise_constraint=Interval(1e-4, 10))
      
 class RewardGP(DeepGaussianProcesses):
     def __init__(self, latent_size, action_size, lagging_size, num_inducing, device, hidden_size=[32], mean_type= 'zero'):
        input_size =(latent_size+action_size)*lagging_size
-       super(RewardGP, self).__init__(input_size=input_size, output_size= None, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing)
+       super(RewardGP, self).__init__(input_size=input_size, output_size= None, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing, noise_constraint=Interval(1e-4, 10))
 
 
 class RecurrentGP(DeepGP):
@@ -414,7 +417,7 @@ class RecurrentGP(DeepGP):
             # policy distribution      
             _, _, _, _, a_s, a_d = self.policy_module.predict(lagging_states)
             # a_s has size <num_gp_likelihood_samples, chunk_size - horizon_size - lagging_size, batch_size, action_size>
-            lagging_actions = torch.cat([lagging_actions[..., self.action_size:], torch.mean(a_s, dim=0)], dim=-1) # TODO: is a[0] the best solution?
+            lagging_actions = torch.cat([lagging_actions[..., self.action_size:], torch.mean(a_s, dim=0)], dim=-1)
             
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1) # z_hat has size <1, 8, 52>
             # z_hat has shape # <chunk_size - horizon_size - lagging_size, batch_size, (action_size + latent_size)*lagging_size>
@@ -423,12 +426,12 @@ class RecurrentGP(DeepGP):
             _, _, _, _, z_s, z_d = self.transition_module.predict(z_hat)
             # z_s has size <num_gp_likelihood_samples, chunk_size - horizon_size - lagging_size, batch_size, latent_size>
             
-            lagging_states = torch.cat([lagging_states[..., self.latent_size:], torch.mean(z_s, dim=0)], dim=-1) # TODO: is z[0] the best solution?
+            lagging_states = torch.cat([lagging_states[..., self.latent_size:], torch.mean(z_s, dim=0)], dim=-1) 
         
         # last policy in the horizon
         _, _, _, _, a_s, _ = self.policy_module.predict(lagging_states)
-        lagging_actions = torch.cat([lagging_actions[..., self.action_size:], torch.mean(a_s, dim=0)], dim=-1) # TODO: is a[0] the best solution?
+        lagging_actions = torch.cat([lagging_actions[..., self.action_size:], torch.mean(a_s, dim=0)], dim=-1) 
         z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
         # output the final reward
-        rewards = self.reward_gp(z_hat) # self.reward_gp(z_hat) will return a MultivariateNormal object, TODO: is this the best solution?
+        rewards = self.reward_gp.predict(z_hat)[-1] # self.reward_gp(z_hat) will return a MultivariateNormal object
         return rewards

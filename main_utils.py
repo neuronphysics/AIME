@@ -118,7 +118,7 @@ def update_planner_states(transition_dist, current_latent_state, actor_critic_pl
   )
 
 
-def update_plot_planning_loss_metric(metrics, value_loss, policy_loss, q_loss, current_policy_mll_loss, current_transition_mll_loss, t, episode, total_reward, results_dir):
+def update_plot_planning_loss_metric(metrics, value_loss, policy_loss, q_loss, current_policy_mll_loss, current_transition_mll_loss, t, episode, total_reward, results_dir, args):
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
   metrics['q_loss'].append(q_loss.item())
@@ -128,12 +128,13 @@ def update_plot_planning_loss_metric(metrics, value_loss, policy_loss, q_loss, c
   metrics['steps'].append(t + metrics['steps'][-1])
   metrics['episodes'].append(episode)
   metrics['train_rewards'].append(total_reward)
-  lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['policy_loss']):], metrics['policy_loss'], 'policy_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['policy_mll_loss']):], metrics['policy_mll_loss'], 'policy_mll_loss', results_dir)
-  lineplot(metrics['episodes'][-len(metrics['transition_mll_loss']):], metrics['transition_mll_loss'], 'transition_mll_loss', results_dir)
+  if args.lineplot:
+    lineplot(metrics['episodes'][-len(metrics['train_rewards']):], metrics['train_rewards'], 'train_rewards', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'value_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['policy_loss']):], metrics['policy_loss'], 'policy_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'q_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['policy_mll_loss']):], metrics['policy_mll_loss'], 'policy_mll_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['transition_mll_loss']):], metrics['transition_mll_loss'], 'transition_mll_loss', results_dir)
   return metrics
 
 
@@ -144,11 +145,12 @@ def update_plot_loss_metric(args, metrics, losses, results_dir):
     metrics['latent_kl_loss'].append(losses[2])
     metrics['transition_imagine_loss'].append(losses[3])
     metrics['controller_imagine_loss'].append(losses[4])
-    lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['latent_kl_loss']):], metrics['latent_kl_loss'], 'latent_kl_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'transition_imagine_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'controller_imagine_loss', results_dir)
+    if args.lineplot:
+      lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'observation_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['latent_kl_loss']):], metrics['latent_kl_loss'], 'latent_kl_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'transition_imagine_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'controller_imagine_loss', results_dir)
   else:
     metrics['elbo1'].append(losses[0])
     metrics['elbo2'].append(losses[1])
@@ -158,14 +160,15 @@ def update_plot_loss_metric(args, metrics, losses, results_dir):
     metrics['reward_loss'].append(losses[5])
     metrics['transition_imagine_loss'].append(losses[6])
     metrics['controller_imagine_loss'].append(losses[7])
-    lineplot(metrics['episodes'][-len(metrics['elbo1']):], metrics['elbo1'], 'elbo1', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['elbo2']):], metrics['elbo2'], 'elbo2', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['elbo3']):], metrics['elbo3'], 'elbo3', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['elbo4']):], metrics['elbo4'], 'elbo4', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['elbo5']):], metrics['elbo5'], 'elbo5', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'transition_imagine_loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'controller_imagine_loss', results_dir)
+    if args.lineplot:
+      lineplot(metrics['episodes'][-len(metrics['elbo1']):], metrics['elbo1'], 'elbo1', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['elbo2']):], metrics['elbo2'], 'elbo2', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['elbo3']):], metrics['elbo3'], 'elbo3', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['elbo4']):], metrics['elbo4'], 'elbo4', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['elbo5']):], metrics['elbo5'], 'elbo5', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'transition_imagine_loss', results_dir)
+      lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'controller_imagine_loss', results_dir)
   return metrics
 
 def save_regularVAE(observation_model, encoder, recurrent_gp, optimiser, actor_critic_planner, planning_optimiser, episode, results_dir):

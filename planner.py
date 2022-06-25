@@ -123,7 +123,7 @@ class ActorCriticPlanner(nn.Module):
     embedding = torch.cat([current_state,imagined_reward], dim=-1)
     policy_dist = self.actor(embedding)
     value = self.critic(embedding)
-    return policy_dist, value, embedding
+    return policy_dist, value, embedding, imagined_reward
   
   def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories):
     self.recurrent_gp.eval()
@@ -138,7 +138,7 @@ class ActorCriticPlanner(nn.Module):
     return rewards
   
   def act(self, prior_states, prior_actions, device=None):
-    policy_dist, value, embedding = self.forward(prior_states, prior_actions, device)
+    policy_dist, value, embedding, imagined_reward = self.forward(prior_states, prior_actions, device)
     policy_action = policy_dist.rsample().mean(dim=0)
     policy_log_prob = policy_dist.log_prob(policy_action)
     policy_mll_loss = -self.policy_mll(policy_dist, policy_action)
@@ -146,4 +146,4 @@ class ActorCriticPlanner(nn.Module):
     normalized_policy_action = torch.tanh(policy_action) * torch.tensor(self.action_scale).to(device=device) + torch.tensor(self.action_bias).to(device=device)
     normalized_policy_action = torch.min(torch.max(normalized_policy_action, torch.tensor(self.min_action).to(device=device)), torch.tensor(self.max_action).to(device=device))
     q_value = self.q_network(embedding, policy_action)
-    return normalized_policy_action, policy_log_prob, policy_mll_loss, value, q_value, transition_dist
+    return normalized_policy_action, policy_log_prob, policy_mll_loss, value, q_value, transition_dist, imagined_reward

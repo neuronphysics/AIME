@@ -11,7 +11,7 @@ import torch.nn.init as init
 from copy import deepcopy
 from torch.autograd import Variable
 from types import SimpleNamespace as SN
-from sklearn.manifold import TSNE
+#from sklearn.manifold import TSNE
 import matplotlib
 import matplotlib.pyplot as plt
 from collections import OrderedDict
@@ -550,9 +550,9 @@ class GMMVAE(nn.Module):
     # https://github.com/bhavikngala/gaussian_mixture_vae
     # https://github.com/Nat-D/GMVAE
     # https://github.com/psanch21/VAE-GMVAE
-    def __init__(self, number_of_mixtures, nchannel, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4, small_conv=False):
+    def __init__(self, number_of_mixtures, nchannel, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4, small_conv=False, use_mse_loss=False):
         super(GMMVAE, self).__init__()
-
+        self.use_mse_loss = use_mse_loss
         self.K          = number_of_mixtures
         self.nchannel   = nchannel
         self.z_dim      = z_dim
@@ -639,6 +639,8 @@ class GMMVAE(nn.Module):
         Generated_X = self.decoder(z_input)
         Generated_X = F.pad(input=Generated_X, pad=(1, 1, 1, 1), mode='constant', value=0)
         #print(f'size of recounstructed image: {Generated_X.size()}')
+        if self.use_mse_loss:
+            Generated_X = Generated_X - 0.5 # map to [-0.5, 0.5]
         return Generated_X
 
     def GMM_encoder(self, data):
@@ -864,10 +866,10 @@ def frozen_params(module: nn.Module):
 ### Gaussian Mixture Model VAE Class
 class InfGaussMMVAE(GMMVAE,BetaSample):
     # based on this implementation :https://github.com/enalisnick/mixture_density_VAEs
-    def __init__(self, hyperParams, K, nchannel, z_dim, w_dim, hidden_dim, device, img_width, batch_size, num_layers = 4, include_elbo2=True):
+    def __init__(self, hyperParams, K, nchannel, z_dim, w_dim, hidden_dim, device, img_width, batch_size, num_layers = 4, include_elbo2=True, use_mse_loss=False):
         global local_device
         local_device = device
-        super(InfGaussMMVAE, self).__init__(K, nchannel, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=num_layers, small_conv=False)
+        super(InfGaussMMVAE, self).__init__(K, nchannel, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=num_layers, small_conv=False, use_mse_loss=use_mse_loss)
         BetaSample.__init__(self)
        
         self.priors          = {"alpha": hyperParams['prior_alpha'], "beta": hyperParams['prior_beta']}
@@ -878,6 +880,7 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
         self.include_elbo2   = include_elbo2
         self.to(device=self.device)
         self.dummy_param = nn.Parameter(torch.empty(0))
+        self.use_mse_loss = use_mse_loss
 
     # def __len__(self):
     #     return len(self.X)
@@ -1029,7 +1032,11 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
         
         #5) compute Reconstruction Cost = E_{q(z|x)}[P(x|z)]
         #
-        criterion = nn.BCELoss(reduction='sum')
+        if self.use_mse_loss:
+            criterion = nn.MSELoss(reduction='sum')
+        else:
+            criterion = nn.BCELoss(reduction='sum')
+            self.X = self.X + 0.5 # scalce to [0, 1]
         elbo5     = criterion(self.x_recons.view(-1, self.nchannel*self.img_size*self.img_size), self.X.view(-1, self.nchannel*self.img_size*self.img_size))
         
         assert torch.isfinite(elbo5)
