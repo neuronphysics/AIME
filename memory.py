@@ -36,6 +36,10 @@ class ExperienceReplay():
       idx = np.random.randint(0, self.size if self.full else self.idx - L)
       idxs = np.arange(idx, idx + L) % self.size
       valid_idx = not self.idx in idxs[1:]  # Make sure data does not cross the memory index
+      for i in idxs[:-1]: # not done in the middle of chunk
+        if not self.nonterminals[i]:
+          valid_idx = False
+          break
     return idxs
 
   def _retrieve_batch(self, idxs, n, L):
