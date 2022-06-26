@@ -87,6 +87,7 @@ parser.add_argument('--result-dir', type=str, default="results", help='result di
 parser.add_argument('--lineplot', action='store_true', help='lineplot metrics')
 parser.add_argument('--imaginary-rollout-softplus', action='store_true', help='add a softplus operation on imaginary_rollout of planner')
 parser.add_argument('--warm-up-vae', type=int, default=1000, metavar='Vae', help='warm up vae for some iterations')
+parser.add_argument('--recons-from-base', action='store_true', help='use base encoder and decoder in infGaussianVAE to reconstruct an input, instead of doing entire forward pass')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -132,7 +133,11 @@ def get_reconstruct(observation, unsqueeze=True):
       current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
       reconstruct = observation_model(current_latent_state)
     else:
-      reconstruct = infinite_vae(observation.to(device=args.device))[0]
+      if args.recons_from_base:
+        latent = infinite_vae.get_latent_states(observation.to(device=args.device))
+        reconstruct = infinite_vae.decoder(latent)
+      else:
+        reconstruct = infinite_vae(observation.to(device=args.device))[0]
     reconstruct = reconstruct.view(observation.shape)
   return reconstruct
 

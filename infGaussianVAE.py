@@ -543,8 +543,9 @@ class GMMVAE(nn.Module):
         self.to(device=self.device)
 
     def get_latent_states(self, X):
-        self.forward(X)
-        return self.z_x
+        z_x, _, _ = self.encoder(X)
+        #print("z_x", z_x.shape)
+        return z_x
 
     def Pz_given_wc(self, w_input):
         # Prior
