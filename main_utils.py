@@ -29,8 +29,8 @@ def find_model_size(model):
 
 # only called when using infGaussianVAE
 def train_discriminator(observations, discriminator, infinite_vae, hyperParams, args, dis_optim):
-  free_params(discriminator)
-  frozen_params(infinite_vae)
+  # free_params(discriminator)
+  # frozen_params(infinite_vae)
   for _ in range(hyperParams["CRITIC_ITERATIONS"]):
     X_recons_linear, mu_z, logvar_z, _, _, _, _, _, _, _, _, _ = infinite_vae(observations)
     z_fake = infinite_vae.encoder.reparameterize(mu_z, logvar_z)
@@ -45,8 +45,8 @@ def train_discriminator(observations, discriminator, infinite_vae, hyperParams, 
     discriminator.zero_grad()
     loss_critic.backward(retain_graph=True)
     dis_optim.step()
-  frozen_params(discriminator)
-  free_params(infinite_vae)
+  # frozen_params(discriminator)
+  # free_params(infinite_vae)
   return z_fake
 
 def get_regularVAE_loss_and_latent(observations, encoder, global_prior, observation_model, args):

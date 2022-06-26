@@ -22,6 +22,80 @@ from gpytorch.constraints import Interval, GreaterThan, Positive, LessThan
 #print("Attached!")
 
 
+def reparameterization(mu, logvar, latent_dim):
+    std = torch.exp(logvar / 2)
+    sampled_z = Variable(Tensor(np.random.normal(0, 1, (mu.size(0), latent_dim))))
+    z = sampled_z * std + mu
+    return z
+
+# used for 32 x 32 inputs
+class RegEncoder(nn.Module):
+    def __init__(self, latent_dim):
+        super(RegEncoder, self).__init__()
+        self.dim_h = 64
+        self.n_channel = 3
+
+        self.model = nn.Sequential(
+            nn.Conv2d(self.n_channel, self.dim_h, 5, 2, 1, bias=False),
+            nn.ReLU(True),
+            nn.Conv2d(self.dim_h, self.dim_h * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(self.dim_h * 2),
+            nn.ReLU(True),
+            nn.Conv2d(self.dim_h * 2, self.dim_h * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(self.dim_h * 4),
+            nn.ReLU(True),
+            nn.Conv2d(self.dim_h * 4, self.dim_h * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(self.dim_h * 8),
+            nn.ReLU(True),
+        )
+
+        self.mu = nn.Linear(self.dim_h * 8, latent_dim)
+        self.logvar = nn.Linear(self.dim_h * 8, latent_dim)
+
+    def forward(self, img):
+
+        x = self.model(img)
+        x = torch.flatten(x, 1)
+        mu = self.mu(x)
+        logvar = F.softplus(self.logvar(x))
+        #z = reparameterization(mu, logvar)
+        #return z
+        return mu, logvar
+
+
+class RegDecoder(nn.Module):
+    def __init__(self, latent_dim):
+        super(RegDecoder, self).__init__()
+
+        self.dim_h = 64
+        self.n_channel = 3
+
+        self.proj = nn.Sequential(
+            nn.Linear(latent_dim, self.dim_h * 8 * 4 * 4),
+            nn.ReLU()
+        )
+
+
+        self.model = nn.Sequential(
+            nn.ConvTranspose2d(self.dim_h * 8, self.dim_h * 4, 4, 2, 1),
+            nn.BatchNorm2d(self.dim_h * 4),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(self.dim_h * 4, self.dim_h * 2, 4, 2, 1),
+            nn.BatchNorm2d(self.dim_h * 2),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(self.dim_h * 2, self.n_channel, 4, 2, 1),
+            #nn.Sigmoid()
+        )
+
+    def forward(self, z):
+
+        x = self.proj(z)
+        x = x.view(-1, self.dim_h * 8, 4, 4)
+        x = self.model(x)
+        return x
+
+boundedConstraint = Interval(1e-4, 10)
+
 def hidden_size_extract(kwargs, name, delete_from_dict=False):
     if name not in kwargs:
         hidden_size = []
@@ -208,12 +282,13 @@ class DGPHiddenLayer(DeepGPLayer):
         else:
             self.mean_module = LinearMean(input_dims)
         base_covar_module = RBFKernel()
+        #base_covar_module = SpectralMixtureKernel(num_mixtures=num_mixtures, batch_shape=batch_shape, ard_num_dims=input_dims)
         # self.covar_module = ScaleKernel(
         #     SpectralMixtureKernel(num_mixtures=num_mixtures, batch_shape=batch_shape, ard_num_dims=input_dims),
         #     batch_shape=batch_shape, ard_num_dims=None, outputscale_constraint=Interval(1e-8, 1)
         # )
         self.covar_module = ScaleKernel(
-            base_covar_module, batch_shape=batch_shape, ard_num_dims=None, outputscale_constraint=Interval(1e-8, 1)
+            base_covar_module, batch_shape=batch_shape, ard_num_dims=None#, outputscale_constraint=Interval(1e-8, 1)
         )
 
     def forward(self, x):
@@ -375,18 +450,18 @@ class TransitionGP(DeepGaussianProcesses):
     #transition probability  P(z_{t}|x_{t-k},...x_{t-1})=N(z_{t}|mu_x,sigma_x)---->T(x_{t-k},...x_{t-1})=z_{t}; x_{.}=[z_{.},a_{.}]
     def __init__(self, latent_size, action_size, lagging_size, num_inducing, device, hidden_size=[32], mean_type= 'linear'):
         input_size = (latent_size+action_size)*lagging_size
-        super(TransitionGP, self).__init__(input_size=input_size, output_size=latent_size, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing, noise_constraint=Interval(1e-4, 10)) 
+        super(TransitionGP, self).__init__(input_size=input_size, output_size=latent_size, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing, noise_constraint=None) 
       
 class PolicyGP(DeepGaussianProcesses):
     #policy P(z_{t})=a(t)--- input z:latent_space---> output a: action
     def __init__(self, latent_size, action_size, lagging_size, num_inducing, device, hidden_size=[32], mean_type= 'constant'):
         input_size =latent_size*lagging_size
-        super(PolicyGP, self).__init__(input_size=input_size, output_size= action_size, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing, noise_constraint=Interval(1e-4, 10))
+        super(PolicyGP, self).__init__(input_size=input_size, output_size= action_size, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing, noise_constraint=None)
      
 class RewardGP(DeepGaussianProcesses):
     def __init__(self, latent_size, action_size, lagging_size, num_inducing, device, hidden_size=[32], mean_type= 'zero'):
        input_size =(latent_size+action_size)*lagging_size
-       super(RewardGP, self).__init__(input_size=input_size, output_size= None, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing, noise_constraint=Interval(1e-4, 10))
+       super(RewardGP, self).__init__(input_size=input_size, output_size= None, device=device, hidden_size=hidden_size, mean_type=mean_type, num_inducing=num_inducing, noise_constraint=None)
 
 
 class RecurrentGP(DeepGP):
