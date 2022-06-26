@@ -37,7 +37,7 @@ parser.add_argument('--action-repeat', type=int, default=1, metavar='R', help='A
 parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', help='Action noise')
 parser.add_argument('--episodes', type=int, default=10000, metavar='E', help='Total number of episodes')
 parser.add_argument('--seed-episodes', type=int, default=100, metavar='S', help='Seed episodes')
-parser.add_argument('--collect-interval', type=int, default=100, metavar='C', help='Collect interval')
+parser.add_argument('--collect-interval', type=int, default=5, metavar='C', help='Collect interval')
 parser.add_argument('--batch-size', type=int, default=10, metavar='B', help='Batch size')
 parser.add_argument('--chunk-size', type=int, default=10, metavar='L', help='Chunk size')
 parser.add_argument('--overshooting-distance', type=int, default=50, metavar='D', help='Latent overshooting distance/latent overshooting weight for t = 1')
@@ -251,19 +251,19 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         policy_labels = policy_labels.reshape(policy_labels.size(0), policy_labels.size(1), -1)
         policy_input = latent_states[:-1].unfold(0, args.lagging_size, 1)
         policy_input = policy_input.reshape(policy_input.size(0), policy_input.size(1), -1)
-
+        
         transition_labels = latent_states[args.lagging_size:].unfold(0, 1, 1)
         transition_labels = transition_labels.reshape(transition_labels.size(0), transition_labels.size(1), -1)
         actions_input = actions[:-1].unfold(0, args.lagging_size, 1)
         actions_input = actions_input.reshape(actions_input.size(0), actions_input.size(1), -1)
         transition_input = torch.cat([policy_input, actions_input], dim=-1)
-
+        
         # train transition module first
         transition_data = TransitionDataset(transition_input.detach(), transition_labels.detach())
         transition_prev_params = transition_prev_params[:-args.transition_retain_params]
         for t in range(transition_input.size(0)):
             transition_data.filter_by_idx(t)
-            transition_model, transition_module_loss = train(t, transition_data, None, None, batch_size=1,
+            transition_model, transition_module_loss = train(transition_data, None, None, batch_size=1,
                                      prev_params=transition_prev_params, device=args.device)
             transition_prev_params.append(transition_model.state_dict())
         
@@ -352,7 +352,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   time_steps = 0
   with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples):
     for t in pbar:
-      action, action_log_prob, policy_mll_loss, value, q_value, transition_dist = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+      action, action_log_prob, policy_mll_loss, value, q_value, transition_dist = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], transition_model, device=args.device)
       episode_policy_kl = torch.cat([episode_policy_kl, (-action_log_prob).unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
       episode_policy_mll_loss = torch.cat([episode_policy_mll_loss, policy_mll_loss.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
       observation, reward, done = env.step(action[0].cpu())

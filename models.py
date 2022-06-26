@@ -199,7 +199,7 @@ class RecurrentGP(DeepGP):
         self.likelihood = GaussianLikelihood()
     
     def forward(self, init_states, actions, transition_module):
-        # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)      
+        # need to stack actions and latent vectors together (also reshape so that the lagging length dimension is stacked as well)
         init_states = init_states.reshape((init_states.size(0), init_states.size(1), -1))
         actions = actions.reshape((actions.size(0), actions.size(1), -1))
         z_hat = torch.cat([init_states, actions], dim=-1)
@@ -211,15 +211,8 @@ class RecurrentGP(DeepGP):
             a = self.policy_module(lagging_states).rsample().mean(dim=0)
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
-            # transition distribution
-            transition_output = []
-            for z_hat_chunk in z_hat:
-                pred_mu, pred_var = transition_module(z_hat_chunk)
-                # distribution + sampling doesnt work
-                # currently just using mean
-                # print("================= shape? ", torch.distributions.MultivariateNormal(pred_mu, pred_var).sample())
-                transition_output.append(pred_mu.mean(dim=0))
-            z = torch.stack(transition_output)
+            size_1, size_2 = z_hat.size(0), z_hat.size(1)
+            z = transition_module.predict(z_hat.reshape(size_1 * size_2, -1)).reshape(size_1, size_2, -1)
             lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
         
         # last policy in the horizon
