@@ -450,7 +450,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
         with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples):
-          action, _, _, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device)
+          action, _, _, _, _, _ = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], transition_model, device=args.device)
         observation, reward, done = test_envs.step(action.cpu())
         if args.use_regular_vae:
           current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
