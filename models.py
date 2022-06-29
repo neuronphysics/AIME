@@ -176,7 +176,6 @@ class RewardGP(DGPHiddenLayer):
       super(RewardGP, self).__init__((latent_size+action_size)*lagging_size, None, device)
       self.mean_module = ZeroMean()
 
-# may be define a wrapper modules that encapsulate several DeepGP for action, transition, and reward ??
 class RecurrentGP(DeepGP):
     def __init__(self, horizon_size, latent_size, action_size, lagging_size, device, num_mixture_samples=1):
         super().__init__()
@@ -195,18 +194,16 @@ class RecurrentGP(DeepGP):
         init_states = init_states.reshape((init_states.size(0), init_states.size(1), -1))
         actions = actions.reshape((actions.size(0), actions.size(1), -1))
         z_hat = torch.cat([init_states, actions], dim=-1)
-        #w_hat = None
+
         lagging_actions = actions
         lagging_states = init_states
         for i in range(self.horizon_size):
             # policy distribution
-            #w_hat = lagging_states # may have to change this to lagging_states[:-1] later
             a = self.policy_modules[i](lagging_states).rsample().mean(dim=0)
             lagging_actions = torch.cat([lagging_actions[..., self.action_size:], a], dim=-1)
             z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
             # transition distribution
             z = self.transition_modules[i](z_hat).rsample().mean(dim=0)
-            # first dimension of z is the number of Gaussian mixtures (z.size(0))
             lagging_states = torch.cat([lagging_states[..., self.latent_size:], z], dim=-1)
         
         # last policy in the horizon

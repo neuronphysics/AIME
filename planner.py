@@ -137,7 +137,6 @@ class ActorCriticPlanner(nn.Module):
     return rewards
   
   def act(self, prior_states, prior_actions, device=None):
-    # to do: consider lagging actions and states for the first action actor, basically fake lagging actions and states before the episode starts
     policy_dist, value, embedding = self.forward(prior_states, prior_actions, device)
     policy_action = policy_dist.rsample().mean(dim=0)
     policy_log_prob = policy_dist.log_prob(policy_action)

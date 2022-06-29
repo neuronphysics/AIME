@@ -12,14 +12,14 @@ from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
 from models import bottle, bottle_two_output, Encoder, ObservationModel, RecurrentGP
-from Stick_Breaking_GMM_VAE import InfGaussMMVAE, AdaBound
+from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
 from planner import ActorCriticPlanner
-from utils import lineplot, write_video
+from utils import lineplot, write_video, AdaBound
 import gpytorch
 from gpytorch.mlls import DeepApproximateMLL, VariationalELBO
 
 # Hyperparameters
-parser = argparse.ArgumentParser(description='PlaNet')
+parser = argparse.ArgumentParser(description='AIME')
 parser.add_argument('--id', type=str, default='default', help='Experiment ID')
 parser.add_argument('--seed', type=int, default=1, metavar='S', help='Random seed')
 parser.add_argument('--disable-cuda', action='store_true', help='Disable CUDA')
@@ -33,9 +33,9 @@ parser.add_argument('--belief-size', type=int, default=200, metavar='H', help='B
 parser.add_argument('--action-repeat', type=int, default=1, metavar='R', help='Action repeat')
 parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', help='Action noise')
 parser.add_argument('--episodes', type=int, default=10000, metavar='E', help='Total number of episodes')
-parser.add_argument('--seed-episodes', type=int, default=50, metavar='S', help='Seed episodes')
+parser.add_argument('--seed-episodes', type=int, default=100, metavar='S', help='Seed episodes')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C', help='Collect interval')
-parser.add_argument('--batch-size', type=int, default=50, metavar='B', help='Batch size')
+parser.add_argument('--batch-size', type=int, default=10, metavar='B', help='Batch size')
 parser.add_argument('--chunk-size', type=int, default=10, metavar='L', help='Chunk size')
 parser.add_argument('--overshooting-distance', type=int, default=50, metavar='D', help='Latent overshooting distance/latent overshooting weight for t = 1')
 parser.add_argument('--overshooting-kl-beta', type=float, default=0, metavar='β>1', help='Latent overshooting KL weight for t > 1 (0 to disable)')
@@ -46,7 +46,7 @@ parser.add_argument('--bit-depth', type=int, default=5, metavar='B', help='Image
 parser.add_argument('--learning-rate', type=float, default=1e-3, metavar='α', help='Learning rate') 
 parser.add_argument('--learning-rate-schedule', type=int, default=0, metavar='αS', help='Linear learning rate schedule (optimisation steps from 0 to final learning rate; 0 to disable)') 
 parser.add_argument('--adam-epsilon', type=float, default=1e-4, metavar='ε', help='Adam optimiser epsilon value') 
-# Note that original has a linear learning rate decay, but it seems unlikely that this makes a significant difference
+
 parser.add_argument('--grad-clip-norm', type=float, default=1000, metavar='C', help='Gradient clipping norm')
 parser.add_argument('--planning-horizon', type=int, default=12, metavar='H', help='Planning horizon distance')
 parser.add_argument('--optimisation-iters', type=int, default=10, metavar='I', help='Planning optimisation iterations')
@@ -68,15 +68,15 @@ parser.add_argument('--non-cumulative-reward', action='store_true', help='Model 
 parser.add_argument('--num-sample-trajectories', type=int, default=10, metavar='nst', help='number of trajectories sample in the imagination part')
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
 parser.add_argument('--discount-factor', type=float, default=0.999, metavar='Temp', help='Discount factor')
-parser.add_argument('--num-mixtures', type=int, default=25, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
+parser.add_argument('--num-mixtures', type=int, default=10, metavar='Mix', help='Number of Gaussian mixtures used in the infinite VAE')
 parser.add_argument('--w-dim', type=int, default=10, metavar='w', help='dimension of w')
-parser.add_argument('--hidden-size', type=int, default=20, metavar='H', help='Hidden size')
+parser.add_argument('--hidden-size', type=int, default=10, metavar='H', help='Hidden size')
 parser.add_argument('--state-size', type=int, default=10, metavar='Z', help='State/latent size')
 parser.add_argument('--include-elbo2', action='store_true', help='include elbo 2 loss')
 parser.add_argument('--use-regular-vae', action='store_true', help='use vae that uses single Gaussian mixture')
 parser.add_argument('--use-ada-bound', action='store_true', help='use AdaBound as the optimizer')
 parser.add_argument('--rgp-training-interval-ratio', type=float, default=1.1, metavar='In', help='RGP training interval ratio')
-parser.add_argument('--num-gp-likelihood-samples', type=int, default=100, metavar='GP', help='Number of likelihood samples for GP')
+parser.add_argument('--num-gp-likelihood-samples', type=int, default=50, metavar='GP', help='Number of likelihood samples for GP')
 
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
@@ -119,9 +119,6 @@ elif not args.test:
     metrics['episodes'].append(s)
 
 
-# Initialise model parameters randomly
-#observation_model = ObservationModel(args.symbolic_env, env.observation_size, args.state_size, args.embedding_size, args.activation_function).to(device=args.device)
-#encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.state_size, args.activation_function).to(device=args.device)
 recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, args.lagging_size, args.device).to(device=args.device)
 
 if args.use_regular_vae:
@@ -129,15 +126,31 @@ if args.use_regular_vae:
   encoder = Encoder(args.symbolic_env, env.observation_size, args.embedding_size, args.state_size, args.activation_function).to(device=args.device)
   param_list = list(observation_model.parameters()) + list(encoder.parameters()) + list(recurrent_gp.parameters())
 else:
-  hyperParams = {"batch_size": args.batch_size,
-                "input_d": 1,
-                "prior": 1, #dirichlet_alpha'
-                "K": args.num_mixtures,
-                "hidden_d": args.hidden_size,
-                "latent_d": args.state_size,
-                "latent_w": args.w_dim}
-  infinite_vae = InfGaussMMVAE(hyperParams, args.num_mixtures, 3, 4, args.state_size, args.w_dim, args.hidden_size, args.device, 64, hyperParams["batch_size"], args.include_elbo2).to(device=args.device)
-  param_list = list(infinite_vae.parameters()) + list(recurrent_gp.parameters())
+  hyperParams = {"batch_size": args.batch_size * args.chunk_size,
+               "input_d": 1,
+               "prior_alpha": 7., #gamma_alpha
+               "prior_beta": 1., #gamma_beta
+               "K": args.num_mixtures,
+               "hidden_d": args.hidden_size, # 10
+               "latent_d": args.state_size, # 10
+               "latent_w": args.w_dim, # 10
+               "LAMBDA_GP": 10, #hyperparameter for WAE with gradient penalty
+               "LEARNING_RATE": 1e-4,
+               "CRITIC_ITERATIONS" : 5
+               }
+  infinite_vae = InfGaussMMVAE(hyperParams, hyperParams["K"], 3, hyperParams["latent_d"], hyperParams["latent_w"], hyperParams["hidden_d"], args.device, 64, hyperParams["batch_size"],include_elbo2=True).to(device=args.device)
+  
+  vae_encoder, vae_decoder, discriminator = infinite_vae.encoder, infinite_vae.decoder, VAECritic(infinite_vae.z_dim)
+
+  enc_optim = torch.optim.Adam(vae_encoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+  dec_optim = torch.optim.Adam(vae_decoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+  dis_optim = torch.optim.Adam(discriminator.parameters(), lr = 0.5 * hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+
+  enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
+  dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
+  dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
+  
+  param_list = list(recurrent_gp.parameters())
 
 optimiser = AdaBound(param_list, lr=0.0001) if args.use_ada_bound else optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
@@ -180,7 +193,42 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           latent_kl_loss = kl_divergence(latent_dist, global_prior).sum(dim=2).mean(dim=(0, 1))
           latent_states = latent_dist.rsample()
         else:
-          reconstructed_observations, latent_states = bottle_two_output(infinite_vae, (observations, ))
+          grad_clip = 1.0
+          original_shape = observations.shape
+          observations = observations.view(-1, original_shape[-3], original_shape[-2], original_shape[-1])
+          for _ in range(hyperParams["CRITIC_ITERATIONS"]):
+            X_recons_linear, mu_z, logvar_z, _, _, _, _, _, _, _, _, _ = infinite_vae(observations)
+            z_fake = infinite_vae.encoder.reparameterize(mu_z, logvar_z)
+            reconstruct_latent_components = infinite_vae.get_component_samples(hyperParams["batch_size"])
+            
+            critic_real = discriminator(reconstruct_latent_components).reshape(-1)
+            critic_fake = discriminator(z_fake).reshape(-1)
+            gp = gradient_penalty(discriminator, reconstruct_latent_components, z_fake, device=args.device)
+            loss_critic = (
+                -(torch.mean(critic_real) - torch.mean(critic_fake)) + hyperParams["LAMBDA_GP"] * gp
+            )
+            discriminator.zero_grad()
+            loss_critic.backward(retain_graph=True)
+            dis_optim.step()
+
+          gen_fake = discriminator(z_fake).reshape(-1)
+        
+          loss_dict = infinite_vae.get_ELBO(observations)
+          loss_dict["wasserstein_loss"] =  -torch.mean(gen_fake)
+          # vae_encoder.zero_grad()
+          # vae_decoder.zero_grad()
+          
+          loss_dict["WAE-GP"]=loss_dict["loss"]+loss_dict["wasserstein_loss"]
+
+          # loss_dict["WAE-GP"].backward()
+          
+          # torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), grad_clip)
+
+          # enc_optim.step()
+          # dec_optim.step()
+          
+          latent_states = torch.reshape(infinite_vae.get_latent_states(observations), (original_shape[0], original_shape[1], args.state_size))
+
         init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
         predicted_rewards = recurrent_gp(init_states, actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1))
         if (not args.non_cumulative_reward):
@@ -190,8 +238,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
         if args.use_regular_vae:
           observation_loss = F.mse_loss(bottle(observation_model, (latent_states,)), observations, reduction='none').sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
-        else:
-          elbo1, elbo2, elbo3, elbo4, elbo5 = infinite_vae.get_ELBO(observations.view(-1, 3, 64, 64))
+
         # Apply linearly ramping learning rate schedule
         if args.learning_rate_schedule != 0:
           for group in optimiser.param_groups:
@@ -201,14 +248,28 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         if args.use_regular_vae:
           (observation_loss + reward_loss + latent_kl_loss).backward()
         else:
-          (elbo1 + elbo2 + elbo3 + elbo4 + elbo5 + reward_loss).backward()
+          vae_encoder.zero_grad()
+          vae_decoder.zero_grad()
+
+          loss_dict["reward_loss"] = reward_loss
+          total_loss = loss_dict["reward_loss"] + loss_dict["WAE-GP"]
+          total_loss.backward()
+          #reward_loss.backward()
+          torch.nn.utils.clip_grad_norm_(infinite_vae.parameters(), grad_clip)
+          enc_optim.step()
+          dec_optim.step()
+          #print("total_loss", total_loss)
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
         optimiser.step()
         # Store loss
         if args.use_regular_vae:
           losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item()])
+          #print("observation_loss", observation_loss, "reward_loss", reward_loss, "latent_kl_loss", latent_kl_loss)
+          #print("observation_loss + reward_loss + latent_kl_loss", observation_loss + reward_loss + latent_kl_loss)
         else:
-          losses.append([elbo1.item(), elbo2.item(), elbo3.item(), elbo4.item(), elbo5.item(), reward_loss.item()])
+          losses.append([0, 0, 0, 0, 0, reward_loss.item()])
+          #print("losses", losses)
+          #print("loss_dict", loss_dict)
 
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
@@ -243,9 +304,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   with torch.no_grad():
     if args.use_regular_vae:
       current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
-      current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
+      current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std # (1, 10)
     else:
-      _, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
+      #print("infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))", infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device)).shape)
+      current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
+      #current_latent_state = torch.reshape(infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device)), (original_shape[0], original_shape[1], args.state_size))
+      #_, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
+
   episode_states = torch.zeros(args.lagging_size, args.state_size, device=args.device)
   episode_states[-1] = current_latent_state
   episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
@@ -269,7 +334,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
           current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
         else:
-          _, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
+          current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
+          #_, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
       transition_kl = -transition_dist.log_prob(current_latent_state)
       transition_mll_loss = -actor_critic_planner.transition_mll(transition_dist, current_latent_state)
       episode_transition_kl = torch.cat([episode_transition_kl, transition_kl.unsqueeze(dim=0).mean(dim=-1, keepdim=True)], dim=0)
@@ -282,13 +348,12 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       D.append(observation, action.detach().cpu(), reward, done)
       total_reward = total_reward + reward
       
-      #if (time_step % args.num_planning_steps == 0) or done:
-        # compute returns in reverse order in the episode reward list
       if args.render:
         env.render()
       if done:
         pbar.close()
         break
+      del current_latent_state
 
   current_q_values = episode_q_values
   previous_q_values = episode_q_values
@@ -310,6 +375,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
   planning_optimiser.step()
+  #print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
+  #print("value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
   
   metrics['value_loss'].append(value_loss.item())
   metrics['policy_loss'].append(policy_loss.item())
@@ -354,7 +421,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
         current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
       else:
-        reconstructed_observation, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
+        current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
       episode_states[-1] = current_latent_state
       episode_actions = torch.zeros(args.lagging_size, env.action_size, device=args.device) + torch.tensor((env.action_range[0] + env.action_range[1]) / 2).to(device=args.device)
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
@@ -366,7 +433,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
           current_latent_mean, current_latent_std = encoder(observation.unsqueeze(dim=0).to(device=args.device))
           current_latent_state = current_latent_mean + torch.randn_like(current_latent_mean) * current_latent_std
         else:
-          _, current_latent_state = infinite_vae(observation.unsqueeze(dim=0).to(device=args.device))
+          current_latent_state = infinite_vae.get_latent_states(observation.unsqueeze(dim=0).to(device=args.device))
         episode_states = torch.cat([episode_states, current_latent_state], dim=0)
         episode_actions = torch.cat([episode_actions, action.to(device=args.device)], dim=0)
         total_rewards = total_reward + reward.numpy()
