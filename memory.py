@@ -4,11 +4,11 @@ from env import postprocess_observation, preprocess_observation_
 
 
 class ExperienceReplay():
-  def __init__(self, size, symbolic_env, observation_size, action_size, bit_depth, device):
+  def __init__(self, size, symbolic_env, observation_size, action_size, bit_depth, device, obs_size=64):
     self.device = device
     self.symbolic_env = symbolic_env
     self.size = size
-    self.observations = np.empty((size, observation_size) if symbolic_env else (size, 3, 64, 64), dtype=np.float32 if symbolic_env else np.uint8)
+    self.observations = np.empty((size, observation_size) if symbolic_env else (size, 3, obs_size, obs_size), dtype=np.float32 if symbolic_env else np.uint8)
     self.actions = np.empty((size, action_size), dtype=np.float32)
     self.rewards = np.empty((size, ), dtype=np.float32) 
     self.nonterminals = np.empty((size, 1), dtype=np.float32)
@@ -36,9 +36,15 @@ class ExperienceReplay():
       idx = np.random.randint(0, self.size if self.full else self.idx - L)
       idxs = np.arange(idx, idx + L) % self.size
       valid_idx = not self.idx in idxs[1:]  # Make sure data does not cross the memory index
+      for i in idxs[:-1]: # not done in the middle of chunk
+        if not self.nonterminals[i]:
+          valid_idx = False
+          break
     return idxs
 
   def _retrieve_batch(self, idxs, n, L):
+    # L: chunk_size
+    # n: batch_size
     vec_idxs = idxs.transpose().reshape(-1)  # Unroll indices
     observations = torch.as_tensor(self.observations[vec_idxs].astype(np.float32))
     if not self.symbolic_env:
