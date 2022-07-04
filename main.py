@@ -62,6 +62,7 @@ parser.add_argument('--checkpoint-experience', action='store_true', help='Checkp
 parser.add_argument('--models', type=str, default='', metavar='M', help='Load model checkpoint')
 parser.add_argument('--experience-replay', type=str, default='', metavar='ER', help='Load experience replay')
 parser.add_argument('--render', action='store_true', help='Render environment')
+parser.add_argument('--skip-vae', action='store_true', help='use observation as latent states, enable for simple symbolic envs')
 
 ## extra hyperparameters for new model
 parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='Horizon size')

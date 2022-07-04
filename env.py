@@ -9,7 +9,9 @@ import gym
 GYM_ENVS = ['HumanoidBulletEnv-v0', 'Pendulum-v0', 'MountainCarContinuous-v0', 'CarRacing-v0', 'CartPoleContinuousBulletEnv-v0', 'AntBulletEnv-v0', 'HalfCheetahBulletEnv-v0', 'HopperBulletEnv-v0', 'HopperBulletEnv-v0', 'HumanoidStandup-v2', 'InvertedDoublePendulum-v2', 'InvertedPendulum-v2', 'Reacher-v2', 'Swimmer-v2', 'Walker2DBulletEnv-v0']
 CONTROL_SUITE_ENVS = ['cartpole-balance', 'cartpole-swingup', 'reacher-easy', 'finger-spin', 'cheetah-run', 'ball_in_cup-catch', 'walker-walk', 'hopper-hop', 'humanoid-walk', 'swimmer-swimmer6']
 CONTROL_SUITE_ACTION_REPEATS = {'cartpole': 8, 'reacher': 4, 'finger': 2, 'cheetah': 4, 'ball_in_cup': 6, 'walker': 2}
-
+REWARD_RANGE = {
+  "Pendulum-v0" : (-16.5, 0)
+}
 
 # Preprocesses an observation inplace (from float32 Tensor [0, 255] to [-0.5, 0.5])
 def preprocess_observation_(observation, bit_depth):
@@ -283,17 +285,20 @@ class ControlSuiteEnv():
 
 
 class GymEnv():
-  def __init__(self, env, symbolic, seed, max_episode_length, action_repeat, bit_depth, obs_size=64):
+  def __init__(self, env, symbolic, seed, max_episode_length, action_repeat, bit_depth, norm_reward=False, obs_size=64):
     import logging
     import gym
     gym.logger.set_level(logging.ERROR)  # Ignore warnings from Gym logger
     self.symbolic = symbolic
+    self.env = env
     self._env = gym.make(env)
     self._env.seed(seed)
     self.max_episode_length = max_episode_length
     self.action_repeat = action_repeat
     self.bit_depth = bit_depth
     self.obs_size = obs_size
+    self.norm_reward = norm_reward
+    print("Env name:", env)
 
   def reset(self):
     self.t = 0  # Reset internal timer
@@ -308,6 +313,10 @@ class GymEnv():
     reward = 0
     for k in range(self.action_repeat):
       state, reward_k, done, _ = self._env.step(action)
+      if self.norm_reward and self.env in REWARD_RANGE:
+        min_reward, max_reward = REWARD_RANGE[self.env]
+        reward_k = ((reward_k - min_reward) / (max_reward - min_reward) - 0.5) * 2 # normalize to [-1, 1]
+ 
       reward = reward + reward_k
       self.t =  self.t + 1  # Increment internal timer
       done = done or self.t == self.max_episode_length
@@ -414,9 +423,9 @@ class Hiway:
     return torch.from_numpy(self.action_space.sample())
 '''
 
-def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth, input_size=64):
+def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth, norm_reward, input_size=64):
   if env in GYM_ENVS:
-    return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth, input_size)
+    return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth, norm_reward, input_size)
   elif env in CONTROL_SUITE_ENVS:
     return ControlSuiteEnv(env, seed, max_episode_length, action_repeat, bit_depth, input_size)
   elif (env == 'loop' or env == '4lane'):

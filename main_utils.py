@@ -137,6 +137,15 @@ def update_plot_planning_loss_metric(metrics, value_loss, policy_loss, q_loss, c
     lineplot(metrics['episodes'][-len(metrics['transition_mll_loss']):], metrics['transition_mll_loss'], 'transition_mll_loss', results_dir)
   return metrics
 
+def update_gp_loss_metric(args, metrics, losses, results_dir):
+  metrics['reward_loss'].append(losses[0])
+  metrics['transition_imagine_loss'].append(losses[1])
+  metrics['controller_imagine_loss'].append(losses[2])
+  if args.lineplot:
+    lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'reward_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['transition_imagine_loss']):], metrics['transition_imagine_loss'], 'transition_imagine_loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['controller_imagine_loss']):], metrics['controller_imagine_loss'], 'controller_imagine_loss', results_dir)
+  return metrics
 
 def update_plot_loss_metric(args, metrics, losses, results_dir):
   if args.use_regular_vae:
