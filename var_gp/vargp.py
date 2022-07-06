@@ -134,7 +134,8 @@ class VARGP(nn.Module):
       pred_mu, pred_var = self.compute_pf_diag(theta, x, mu_leq_t, S_leq_t, z_leq_t)
 
       if isinstance(loss_cache, dict):
-        q_lt = dist.MultivariateNormal(mu_lt.squeeze(-1), covariance_matrix=S_lt)
+        # q_lt = dist.MultivariateNormal(mu_lt.squeeze(-1), covariance_matrix=S_lt)
+        q_lt = dist.MultivariateNormal(mu_lt.squeeze(-1), scale_tril=torch.tril(S_lt))
         u_lt = q_lt.rsample(torch.Size([self.n_v])).unsqueeze(-1)
         # u_lt = mu_lt.unsqueeze(0)
 
@@ -177,7 +178,7 @@ class VARGP(nn.Module):
   def loss(self, x, y):
     loss_cache = dict()
     pred_mu, pred_var = self(x, loss_cache=loss_cache)
-    nll = self.likelihood.loss(pred_mu, pred_var, y)
+    nll = self.likelihood.loss(pred_mu, pred_var, y.transpose(0, 1))
 
     var_dist = dist.MultivariateNormal(
       loss_cache.pop('var_mu_t'),
@@ -201,7 +202,7 @@ class VARGP(nn.Module):
   def create_clf(dataset, M=20, n_f=10, n_var_samples=3, prev_params=None,
                  ep_var_mean=True, map_est_hypers=False, dkl=False):
     N = len(dataset)
-    out_size = dataset.targets.size(1)
+    out_size = n_f
 
     # print("out size is: ", out_size)
     # print("target shape: ", dataset.targets.shape)
