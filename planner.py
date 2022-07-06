@@ -8,6 +8,7 @@ from torch.distributions import Normal
 import gpytorch
 
 from models import DGPHiddenLayer
+from recurrent_gp import AIMEDeepGP
 from gpytorch.models.deep_gps import DeepGP
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.means import ConstantMean, ZeroMean, LinearMean
@@ -16,7 +17,7 @@ from gpytorch.mlls import DeepApproximateMLL, VariationalELBO
 class ValueNetwork(nn.Module):
   def __init__(self, latent_size, num_sample_trajectories, hidden_size):
     super().__init__()
-    self.latent_size = latent_size
+    self.rlatent_size = latent_size
     self.fc1 = nn.Linear(latent_size + num_sample_trajectories, hidden_size)
     self.fc2 = nn.Linear(hidden_size, 1)
   
@@ -36,26 +37,10 @@ class QNetwork(nn.Module):
     hidden = F.relu(self.fc1(torch.cat([embedding, action], dim=-1)))
     return self.fc2(hidden)
 
-class FirstPolicyLayer(DGPHiddenLayer):
-  def __init__(self, latent_size, num_sample_trajectories, hidden_size, num_inducing, device):
-    super(FirstPolicyLayer, self).__init__(latent_size+num_sample_trajectories, hidden_size, device, num_inducing=num_inducing)
-    self.mean_module = LinearMean(latent_size+num_sample_trajectories)
-
-class SecondPolicyLayer(DGPHiddenLayer):
-  def __init__(self, hidden_size, action_size, num_inducing, device):
-    super(SecondPolicyLayer, self).__init__(hidden_size, action_size, device, num_inducing=num_inducing)
-    self.mean_module = ConstantMean()
-
-class PolicyModel(DeepGP):
-  def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, num_inducing, device):
-    super().__init__()
-    self.first_policy_layer = FirstPolicyLayer(latent_size, num_sample_trajectories, hidden_size, num_inducing, device)
-    self.second_policy_layer = SecondPolicyLayer(hidden_size, action_size, num_inducing, device)
-    self.likelihood = GaussianLikelihood()
-  
-  def forward(self, embedding):
-    hidden = self.first_policy_layer(embedding)
-    return self.second_policy_layer(hidden)
+class PolicyModel(AIMEDeepGP):
+  def __init__(self, latent_size, action_size, lagging_size, hidden_size, num_inducing, device):
+    input_size = latent_size*lagging_size
+    super(PolicyModel, self).__init__(input_dim=input_size, out_dim=action_size, device=device, hidden_dim=hidden_size, num_inducing=num_inducing, noise_constraint=None)
 
 class FirstTransitionLayer(DGPHiddenLayer):
   def __init__(self, latent_size, action_size, num_sample_trajectories, hidden_size, num_inducing, device):
@@ -121,6 +106,9 @@ class ActorCriticPlanner(nn.Module):
     current_state = lagging_states[-1].view(1, self.latent_size)
     imagined_reward = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories, softplus).to(device=device)
     embedding = torch.cat([current_state,imagined_reward], dim=-1)
+    # TODO we need to change the input to policy
+    print("lagging_states", lagging_states)
+    embedding = lagging_states.reshape()
     policy_dist = self.actor(embedding)
     value = self.critic(embedding)
     return policy_dist, value, embedding, imagined_reward
