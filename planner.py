@@ -40,6 +40,7 @@ class QNetwork(nn.Module):
 class PolicyModel(AIMEDeepGP):
   def __init__(self, latent_size, action_size, lagging_size, hidden_size, num_inducing, device):
     input_size = latent_size*lagging_size
+    print("policy", "input_size", input_size)
     super(PolicyModel, self).__init__(input_dim=input_size, out_dim=action_size, device=device, hidden_dim=hidden_size, num_inducing=num_inducing, noise_constraint=None)
 
 class FirstTransitionLayer(DGPHiddenLayer):
@@ -91,7 +92,7 @@ class ActorCriticPlanner(nn.Module):
     self.action_scale = (self.max_action - self.min_action) / 2
     self.action_bias = (self.max_action + self.min_action) / 2
     self.latent_size = latent_size
-    self.actor = PolicyModel(latent_size, action_size, num_sample_trajectories, hidden_size, num_inducing, device)
+    self.actor = PolicyModel(latent_size, action_size, lagging_size, hidden_size, num_inducing, device)
     self.policy_mll = DeepApproximateMLL(VariationalELBO(self.actor.likelihood, self.actor, 1))
     self.transition_model = TransitionModel(latent_size, action_size, num_sample_trajectories, hidden_size, num_inducing, device)
     self.transition_mll = DeepApproximateMLL(VariationalELBO(self.transition_model.likelihood, self.transition_model, 1))
@@ -117,9 +118,10 @@ class ActorCriticPlanner(nn.Module):
     self.recurrent_gp.eval()
     with torch.no_grad():
       with gpytorch.settings.num_likelihood_samples(self.num_gp_likelihood_samples):
-        rewards = self.recurrent_gp(
+        rewards, _, _ = self.recurrent_gp(
           torch.flatten(lagging_states).unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size * self.latent_size).unsqueeze(dim=0),
-          lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0)
+          lagging_actions.unsqueeze(dim=0).expand(num_sample_trajectories, self.lagging_size, self.action_size).unsqueeze(dim=0),
+          self.actor
         )
         if softplus:
           rewards = torch.nn.Softplus()(rewards.sample()).mean(dim=0)

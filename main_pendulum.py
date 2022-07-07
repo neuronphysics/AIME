@@ -12,10 +12,10 @@ from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
 #from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
-from infGaussianVAE import InfGaussMMVAE, VAECritic, gradient_penalty
+#from infGaussianVAE import InfGaussMMVAE, VAECritic, gradient_penalty
 from planner import ActorCriticPlanner
 from utils import lineplot, write_video, AdaBound
-from models import RecurrentGP
+from recurrent_gp import RecurrentGP
 from main_utils import *
 import gpytorch
 from gpytorch.mlls import DeepApproximateMLL, VariationalELBO, PredictiveLogLikelihood
@@ -35,7 +35,7 @@ parser.add_argument('--action-noise', type=float, default=0.3, metavar='ε', hel
 parser.add_argument('--episodes', type=int, default=10000, metavar='E', help='Total number of episodes')
 parser.add_argument('--seed-episodes', type=int, default=100, metavar='S', help='Seed episodes')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C', help='Collect interval')
-parser.add_argument('--initial-collect-interval', type=int, default=100, metavar='C', help='First collect interval')
+parser.add_argument('--initial-collect-interval', type=int, default=10000, metavar='C', help='First collect interval')
 parser.add_argument('--batch-size', type=int, default=8, metavar='B', help='Batch size')
 parser.add_argument('--chunk-size', type=int, default=8, metavar='L', help='Chunk size')
 parser.add_argument('--overshooting-distance', type=int, default=50, metavar='D', help='Latent overshooting distance/latent overshooting weight for t = 1')
@@ -150,8 +150,8 @@ def rgp_step(n_iter, losses):
         # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
         observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)    # Transitions start at time t = 0
         latent_states = observations
-        print("raw rewards", rewards)
-        print("actions", actions)
+        # print("raw rewards", rewards)
+        # print("actions", actions)
         # latent_states : <chunk_size, batch_size, z_dim>
         init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
         # init_states: <chunk_size - horizon_size - lagging_size, batch_size, latent_size, lagging_size>
@@ -165,8 +165,6 @@ def rgp_step(n_iter, losses):
         init_actions = torch.transpose(init_actions, -2, -1)
         # init_actions: <chunk_size - horizon_size - lagging_size, batch_size, lagging_size, action_size> 
 
-        predicted_rewards = recurrent_gp(init_states, init_actions)
-        
         # true_rewards size: <chunk_size - horizon_size - lagging_size, batch_size>
         if (not args.non_cumulative_reward):
           true_rewards = rewards[args.lagging_size:].unfold(0, args.horizon_size+1, 1).sum(dim=-1)
@@ -187,14 +185,15 @@ def rgp_step(n_iter, losses):
         actions_input = actions_input.reshape(actions_input.size(0), actions_input.size(1), -1)
         transition_input = torch.cat([policy_input, actions_input], dim=-1)
         transition_input = transition_input.reshape((transition_input.size(0) * transition_input.size(1), -1))
+        true_rewards = rewards[:-1]
+        true_rewards = true_rewards.reshape(true_rewards.size(0) * true_rewards.size(1))
 
-        optimiser.zero_grad()
+        optimizer.zero_grad()
         policy.zero_grad()
-        predicted_rewards, _, _ = recurrent_gp(init_states, init_actions, policy)
+        #predicted_rewards, _, _ = recurrent_gp(init_states, init_actions, policy)
         predicted_states = recurrent_gp.transition_module(transition_input)
-
-        predicted_action = recurrent_gp.policy_module(policy_input)
-        predicted_latent = recurrent_gp.transition_module(transition_input)
+        predicted_rewards = recurrent_gp.reward_module(transition_input)
+        
         loss_reward = -reward_mll(predicted_rewards, true_rewards)#.mean()
         loss_transition = -transition_mll(predicted_states, true_latent)#.mean()
         recurrent_gaussian_loss = loss_reward + loss_transition
@@ -207,10 +206,10 @@ def rgp_step(n_iter, losses):
         
         # Update model parameters 
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-        optimiser.step()
+        optimizer.step()
         gp_pbar.set_postfix(rgpLoss=recurrent_gaussian_loss.item(), rLoss=loss_reward.item(), TtLoss=loss_transition.item())
         losses.append([loss_reward.item(), loss_transition.item(), 0])
-        del true_latent, true_action, predicted_rewards, predicted_action, predicted_latent, init_states, latent_states, init_actions, actions, observations
+        del true_latent, true_action, predicted_rewards, predicted_states, init_states, latent_states, init_actions, actions, observations
     return losses
 
 def test_recurrent_gp(n_test):
