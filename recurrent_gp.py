@@ -147,7 +147,6 @@ class RecurrentGP(DeepGP):
     def forward(self, init_states, init_actions, policy):
         init_states = init_states.reshape((init_states.size(0) * init_states.size(1), -1))
         init_actions = init_actions.reshape((init_actions.size(0) * init_actions.size(1), -1))
-
         z_hat = torch.cat([init_states, init_actions], dim=-1)
         
         future_states = []
