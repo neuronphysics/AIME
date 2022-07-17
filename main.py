@@ -11,11 +11,12 @@ from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
 from memory import ExperienceReplay
-from models import bottle, bottle_two_output, Encoder, ObservationModel, RecurrentGP, RegDecoder, RegEncoder
+from models import bottle, bottle_two_output, Encoder, ObservationModel, RegDecoder, RegEncoder
 #from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
 from infGaussianVAE import InfGaussMMVAE, VAECritic, gradient_penalty
 from planner import ActorCriticPlanner
 from utils import lineplot, write_video, AdaBound
+from recurrent_gp import RecurrentGP
 from main_utils import *
 import gpytorch
 from gpytorch.mlls import DeepApproximateMLL, VariationalELBO, PredictiveLogLikelihood
@@ -62,11 +63,12 @@ parser.add_argument('--checkpoint-experience', action='store_true', help='Checkp
 parser.add_argument('--models', type=str, default='', metavar='M', help='Load model checkpoint')
 parser.add_argument('--experience-replay', type=str, default='', metavar='ER', help='Load experience replay')
 parser.add_argument('--render', action='store_true', help='Render environment')
+parser.add_argument('--norm-reward', action='store_true', help='nomormalize reward')
 parser.add_argument('--skip-vae', action='store_true', help='use observation as latent states, enable for simple symbolic envs')
 
 ## extra hyperparameters for new model
 parser.add_argument('--horizon-size', type=int, default=5, metavar='Ho', help='Horizon size')
-parser.add_argument('--lagging-size', type=int, default=2, metavar='La', help='Lagging size')
+parser.add_argument('--lagging-size', type=int, default=1, metavar='La', help='Lagging size') # changed to 1!!!!!!!!!!!!!!!!!!!!!!!!!
 parser.add_argument('--non-cumulative-reward', action='store_true', help='Model non-cumulative rewards')
 parser.add_argument('--num-sample-trajectories', type=int, default=10, metavar='nst', help='number of trajectories sample in the imagination part')
 parser.add_argument('--temperature-factor', type=float, default=1, metavar='Temp', help='Temperature factor')
@@ -154,7 +156,7 @@ def test(episode, metrics):
   recurrent_gp.eval()
   actor_critic_planner.eval()
   # Initialise parallelised test environments
-  test_envs = EnvBatcher(Env, (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth), {}, args.test_episodes)
+  test_envs = EnvBatcher(Env, (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth, args.norm_reward, args.input_size), {}, args.test_episodes) # Anudeep, new args added
   
   with torch.no_grad():
     observation, total_rewards, video_frames, time_step = test_envs.reset(), np.zeros((args.test_episodes, )), [], 0
@@ -287,7 +289,8 @@ def train_vae(n_iter, losses):
           gp_pbar.set_description("WAE-GP:"+str(float(loss_dict["WAE-GP"].item())))
         # optimizer includes recurrent_gp and VAE is using regular VAE
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-        optimiser.step()
+        optimizer.step()
+        # optimiser.step()
         if s % test_interval == 0:
           vae_test(s)
     return losses
@@ -325,7 +328,7 @@ def rgp_step(n_iter, losses):
         init_actions = torch.transpose(init_actions, -2, -1)
         # init_actions: <chunk_size - horizon_size - lagging_size, batch_size, lagging_size, action_size> 
 
-        predicted_rewards = recurrent_gp(init_states, init_actions)
+        # predicted_rewards = recurrent_gp(init_states, init_actions)
         
         # true_rewards size: <chunk_size - horizon_size - lagging_size, batch_size>
         if (not args.non_cumulative_reward):
@@ -334,6 +337,7 @@ def rgp_step(n_iter, losses):
           true_rewards = rewards[args.lagging_size+args.horizon_size:]
         # true_latent size: <chunk_size - lagging_size, batch_size, latent_size>
         # true_action size: <chunk_size - lagging_size, batch_size, action_size>
+        true_rewards = true_rewards.reshape((true_rewards.size(0) * true_rewards.size(1))) # Anudeep, new
         
         true_action = actions[args.lagging_size-1:-1].unfold(0, 1, 1)
         true_action = true_action.reshape(true_action.size(0), true_action.size(1), -1)
@@ -342,16 +346,26 @@ def rgp_step(n_iter, losses):
 
         true_latent = latent_states[args.lagging_size:].unfold(0, 1, 1)
         true_latent = true_latent.reshape(true_latent.size(0), true_latent.size(1), -1)
+        true_latent = true_latent.reshape((true_latent.size(0) * true_latent.size(1), -1)) # Anudeep, new
         actions_input = actions[:-1].unfold(0, args.lagging_size, 1)
         actions_input = actions_input.reshape(actions_input.size(0), actions_input.size(1), -1)
         transition_input = torch.cat([policy_input, actions_input], dim=-1)
+        transition_input = transition_input.reshape((transition_input.size(0) * transition_input.size(1), -1)) # Anudeep, new
+        
+        true_rewards = rewards[:-1]
+        true_rewards = true_rewards.reshape(true_rewards.size(0) * true_rewards.size(1))
+        
+        optimizer.zero_grad() #  Anudeep, new
+        policy.zero_grad()
 
-        predicted_action = recurrent_gp.policy_module(policy_input)
+        # predicted_action = recurrent_gp.policy_module(policy_input)
+        # predicted_action = policy(policy_input)
         predicted_latent = recurrent_gp.transition_module(transition_input)
+        predicted_rewards = recurrent_gp.reward_module(transition_input)
 
         reward_loss = -reward_mll(predicted_rewards, true_rewards).mean()
         transition_imagine_loss = -transition_mll(predicted_latent, true_latent).mean()
-        controller_imagine_loss = -controller_mll(predicted_action, true_action).mean()
+        # controller_imagine_loss = -controller_mll(predicted_action, true_action).mean()
         print("true_rewards", true_rewards, true_rewards.shape)
         print("predicted_rewards", predicted_rewards.rsample(), predicted_rewards.rsample().shape)
         # print("predicted_rewards", predicted_rewards, "mean",  predicted_rewards.mean, "loc", predicted_rewards.loc, "variance" , predicted_rewards.variance, predicted_rewards.rsample(), predicted_rewards.rsample().shape)
@@ -360,9 +374,11 @@ def rgp_step(n_iter, losses):
         # print("true_latent", true_latent, true_latent.shape)
         # print("predicted_latent", predicted_latent, "mean", predicted_latent.mean,"loc",  predicted_latent.loc, "variance" , predicted_latent.variance, predicted_latent.rsample(), predicted_latent.rsample().shape)
 
-        recurrent_gaussian_loss = reward_loss + transition_imagine_loss + controller_imagine_loss
+        recurrent_gaussian_loss = reward_loss + transition_imagine_loss #+ controller_imagine_loss  # anudeep, changes two lines
+        # recurrent_gaussian_loss.backward()
+        
         ##################
-        print("rgp losses, r, t, c", reward_loss, transition_imagine_loss, controller_imagine_loss, "total:", recurrent_gaussian_loss)
+        print("rgp losses, r, t", reward_loss, transition_imagine_loss, "total:", recurrent_gaussian_loss)
         #gp_pbar.set_description("rgpLoss:"+str(float(recurrent_gaussian_loss)))
 
         # Apply linearly ramping learning rate schedule
@@ -370,13 +386,11 @@ def rgp_step(n_iter, losses):
           for group in optimiser.param_groups:
             group['lr'] = min(group['lr'] + args.learning_rate / args.learning_rate_schedule, args.learning_rate)
         
-        # Update model parameters 
-        optimiser.zero_grad()
         #compute losses
         if args.use_regular_vae:
           (observation_loss  + latent_kl_loss + recurrent_gaussian_loss).backward()
           print("observation_loss", observation_loss, "latent_kl_loss", latent_kl_loss)
-          losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item(), transition_imagine_loss.item(), controller_imagine_loss.item() ])
+          losses.append([observation_loss.item(), reward_loss.item(), latent_kl_loss.item(), transition_imagine_loss.item(), 1.])
           # gp_pbar.set_description("observation_loss:"+str(float(observation_loss)))
           # gp_pbar.set_description("latent_kl_loss:"+str(float(latent_kl_loss)))
           gp_pbar.set_description("observation_loss:"+str(float(observation_loss)) + " | rgpLoss:"+str(float(recurrent_gaussian_loss)) + " | latent_kl_loss:"+str(float(latent_kl_loss)))
@@ -392,14 +406,85 @@ def rgp_step(n_iter, losses):
             loss_dict["recon"],
             reward_loss.item(),
             transition_imagine_loss.item(),
-            controller_imagine_loss.item()
+            # controller_imagine_loss.item()
           ])
           gp_pbar.set_description("WAE-GP:"+str(float(loss_dict["WAE-GP"].item())) + " | rgpLoss:"+str(float(recurrent_gaussian_loss)))
         # optimizer includes recurrent_gp and VAE is using regular VAE
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
-        optimiser.step()
-        del true_latent, true_action, predicted_rewards, predicted_action, predicted_latent, init_states, latent_states, init_actions, actions, observations
+        optimizer.step()
+        gp_pbar.set_postfix(rgpLoss=recurrent_gaussian_loss.item(), rLoss=reward_loss.item(), TtLoss=transition_imagine_loss.item())
+    del true_latent, true_action, predicted_rewards, predicted_latent, init_states, latent_states, init_actions, actions, observations
     return losses
+  
+def test_recurrent_gp(n_test):
+  recurrent_gp.eval()
+  policy.eval()
+  rmse_rewards_gp = 0
+  rmse_state = 0
+  rmse_rewards = 0
+  for s in range(n_test):
+    with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples): # to do: make this a hyperparameter as well
+    # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
+      observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)
+      latent_states = observations
+      # latent_states : <chunk_size, batch_size, z_dim>
+      init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
+      # init_states: <chunk_size - horizon_size - lagging_size, batch_size, latent_size, lagging_size>
+      init_actions = actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)
+      # init_actions: <chunk_size - horizon_size - lagging_size, batch_size, action_size, lagging_size> 
+
+      # without transpose, the result will be [t0, t1, t2, t0, t1, t2,...]
+      # We want [t0, t0, t1, t1, t2, t2, ...] so the lagging_actions[..., self.action_size:] works as expected
+      init_states = torch.transpose(init_states, -2, -1)
+      # init_states: <chunk_size - horizon_size - lagging_size, batch_size, lagging_size, latent_size>
+      init_actions = torch.transpose(init_actions, -2, -1)
+      # init_actions: <chunk_size - horizon_size - lagging_size, batch_size, lagging_size, action_size> 
+      # print("init_states", init_states.shape, init_states)
+      # print("init_actions", init_actions.shape, init_actions)
+    
+      true_rewards_gp = rewards[args.lagging_size+args.horizon_size:]
+      #print("true_rewards", true_rewards, true_rewards.shape)
+      true_rewards_gp = true_rewards_gp.reshape((true_rewards_gp.size(0) * true_rewards_gp.size(1)))
+      #print("true_rewards", true_rewards, true_rewards.shape)
+      true_action = actions[args.lagging_size-1:-1].unfold(0, 1, 1)
+      true_action = true_action.reshape(true_action.size(0), true_action.size(1), -1)
+      policy_input = latent_states[:-1].unfold(0, args.lagging_size, 1)
+      policy_input = policy_input.reshape(policy_input.size(0), policy_input.size(1), -1)
+      true_latent = latent_states[args.lagging_size:].unfold(0, 1, 1)
+      true_latent = true_latent.reshape(true_latent.size(0), true_latent.size(1), -1)
+      true_latent = true_latent.reshape((true_latent.size(0) * true_latent.size(1), -1))
+      actions_input = actions[:-1].unfold(0, args.lagging_size, 1)
+      actions_input = actions_input.reshape(actions_input.size(0), actions_input.size(1), -1)
+      transition_input = torch.cat([policy_input, actions_input], dim=-1)
+      transition_input = transition_input.reshape((transition_input.size(0) * transition_input.size(1), -1))
+
+      true_rewards = rewards[:-1]
+      true_rewards = true_rewards.reshape(true_rewards.size(0) * true_rewards.size(1))
+
+      # print(transition_input)
+      # print(observations)
+      # print(rewards)
+      # print(true_rewards)
+
+
+      predicted_rewards_gp = recurrent_gp.predict_recurrent_gp(init_states, init_actions, policy).mean(0)
+      predicted_states = recurrent_gp.predict_transition(transition_input).mean(0)
+      predicted_rewards = recurrent_gp.predict_reward(transition_input).mean(0)
+      # print("predicted_rewards_gp", predicted_rewards_gp.shape, true_rewards.shape)
+      # print("predicted_states", predicted_states.shape, true_latent.shape)
+      # print("predicted_rewards", predicted_rewards.shape, true_rewards.shape)
+      # print()
+
+      rmse_rewards_gp += torch.mean(torch.pow(predicted_rewards_gp - true_rewards_gp, 2)).sqrt()
+      rmse_state += torch.mean(torch.pow(predicted_states - true_latent, 2)).sqrt()
+      rmse_rewards += torch.mean(torch.pow(predicted_rewards - true_rewards, 2)).sqrt()
+
+  print(f"RMSE rmse_rewards_gp: {rmse_rewards_gp.item() / n_test}")
+  print(f"RMSE rmse_state: {rmse_state.item() / n_test}")
+  print(f"RMSE rmse_rewards: {rmse_rewards.item() / n_test}")
+  recurrent_gp.train()
+  policy.train()
+  
   
 ###### Setup
 results_dir = os.path.join(args.result_dir, args.id)
@@ -416,7 +501,7 @@ metrics = {'steps': [], 'episodes': [], 'train_rewards': [], 'test_episodes': []
            'policy_mll_loss': [], 'transition_mll_loss': [], 'elbo1': [], 'elbo2': [], 'elbo3': [], 'elbo4': [], 'elbo5': []}
 
 ###### Initialise training environment and experience replay memory
-env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth, args.input_size)
+env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth, args.norm_reward, args.input_size) # Anudeep, new
 if args.experience_replay is not '' and os.path.exists(args.experience_replay):
   D = torch.load(args.experience_replay)
   metrics['steps'], metrics['episodes'] = [D.steps] * D.episodes, list(range(1, D.episodes + 1))
@@ -438,6 +523,8 @@ elif not args.test:
 
 # init recurrent GP and VAE models
 recurrent_gp = RecurrentGP(args.horizon_size, args.state_size, env.action_size, args.lagging_size, args.num_inducing_recurrent_gp, args.device).to(device=args.device)
+param_list = list(recurrent_gp.parameters()) 
+optimizer = torch.optim.Adam(recurrent_gp.parameters(), lr=0.002)
 
 if args.use_regular_vae:
   if args.input_size == 32:
@@ -485,6 +572,7 @@ else:
 optimiser = AdaBound(param_list, lr=0.0001) if args.use_ada_bound else optim.Adam(param_list, lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
 
 actor_critic_planner = ActorCriticPlanner(args.lagging_size, args.state_size, env.action_size, recurrent_gp, env.action_range[0], env.action_range[1], args.num_sample_trajectories, args.hidden_size, args.num_gp_likelihood_samples, args.num_inducing_planner, args.device).to(device=args.device)
+policy = actor_critic_planner.actor
 
 # set up optimizers
 planning_optimiser = optim.Adam(actor_critic_planner.parameters(), lr=0 if args.learning_rate_schedule != 0 else args.learning_rate, eps=args.adam_epsilon)
@@ -504,12 +592,15 @@ if args.models is not '' and os.path.exists(args.models):
 global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.device), torch.ones(args.batch_size, args.state_size, device=args.device))  # Global prior N(0, I)
 free_nats = torch.full((1, ), args.free_nats, dtype=torch.float32, device=args.device)  # Allowed deviation in KL divergence
 
-reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
+# reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.likelihood, recurrent_gp, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size)))
 #### ELBO objective for the transition and controller GP ### ???? need to be fixed
-transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_module.likelihood, recurrent_gp.transition_module, args.batch_size*(args.chunk_size-args.lagging_size), beta=1.0))#what X=action+latent_space
+# transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_module.likelihood, recurrent_gp.transition_module, args.batch_size*(args.chunk_size-args.lagging_size), beta=1.0))#what X=action+latent_space
 #transition_mll = DeepApproximateMLL(PredictiveLogLikelihood(recurrent_gp.transition_modules.likelihood, recurrent_gp.transition_modules, args.batch_size*(args.chunk_size-args.lagging_size-args.horizon_size), beta=1.0)) #typically produces better predictive variances than the ELBO
-controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_module.likelihood, recurrent_gp.policy_module,args.batch_size*(args.chunk_size-args.lagging_size), beta=1.0))#latent_space
+# controller_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.policy_module.likelihood, recurrent_gp.policy_module,args.batch_size*(args.chunk_size-args.lagging_size), beta=1.0))#latent_space
 rgp_training_episode = args.seed_episodes
+
+reward_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.reward_module.likelihood, recurrent_gp.reward_module, args.experience_size))
+transition_mll = DeepApproximateMLL(VariationalELBO(recurrent_gp.transition_module.likelihood, recurrent_gp.transition_module, args.experience_size))
 
 find_model_size(recurrent_gp)
 if args.use_regular_vae:
@@ -520,8 +611,11 @@ else:
 
 
 train_vae(args.warm_up_vae, [])
-
-rgp_step(args.initial_collect_interval, [])
+# print("Test Recurrent GP before Pretraining:")
+# test_recurrent_gp(1000)
+rgp_step(args.initial_collect_interval, []) # Anudeep, pretraining?
+# print("Test Recurrent GP after Pretraining:")
+# test_recurrent_gp(1000)
 
 ###### Training (and testing)
 
@@ -532,7 +626,11 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   # training the observation models and recurrent GP 
   if ((episode-1) == rgp_training_episode):
     rgp_training_episode = int(rgp_training_episode * args.rgp_training_interval_ratio)
+    # print("Test Recurrent GP before rgp_training_episode:")
+    # test_recurrent_gp(1000)
     losses = rgp_step(args.collect_interval, losses)
+    # print("Test Recurrent GP after rgp_training_episode:")
+    # test_recurrent_gp(1000)
 
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
@@ -655,6 +753,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   else:
     infinite_vae.train()
   recurrent_gp.train()
+  policy.train() # Anudeep, New
 
   # Test model
   if episode % args.test_interval == 0:
