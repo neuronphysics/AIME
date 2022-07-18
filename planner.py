@@ -104,8 +104,10 @@ class ActorCriticPlanner(nn.Module):
     self.num_gp_likelihood_samples = num_gp_likelihood_samples
 
   def forward(self, lagging_states, lagging_actions, device, softplus):
+    print('Forward')
     current_state = lagging_states[-1].view(1, self.latent_size)
     imagined_reward = self.imaginary_rollout(lagging_states, lagging_actions, self.num_sample_trajectories, softplus).to(device=device)
+    print(f'current state shape: {current_state.shape}')
     embedding = torch.cat([current_state,imagined_reward], dim=-1)
     # TODO we need to change the input to policy
     print("lagging_states", lagging_states)
@@ -115,6 +117,7 @@ class ActorCriticPlanner(nn.Module):
     return policy_dist, value, embedding, imagined_reward
   
   def imaginary_rollout(self, lagging_states, lagging_actions, num_sample_trajectories, softplus):
+    print('Imaginary rollout')
     self.recurrent_gp.eval()
     with torch.no_grad():
       with gpytorch.settings.num_likelihood_samples(self.num_gp_likelihood_samples):
@@ -131,6 +134,7 @@ class ActorCriticPlanner(nn.Module):
     return rewards
   
   def act(self, prior_states, prior_actions, device=None, softplus=False):
+    print('act')
     policy_dist, value, embedding, imagined_reward = self.forward(prior_states, prior_actions, device, softplus)
     policy_action = policy_dist.rsample().mean(dim=0)
     policy_log_prob = policy_dist.log_prob(policy_action)

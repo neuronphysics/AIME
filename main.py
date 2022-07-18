@@ -614,6 +614,7 @@ train_vae(args.warm_up_vae, [])
 # print("Test Recurrent GP before Pretraining:")
 # test_recurrent_gp(1000)
 rgp_step(args.initial_collect_interval, []) # Anudeep, pretraining?
+print('Finished rgp_step')
 # print("Test Recurrent GP after Pretraining:")
 # test_recurrent_gp(1000)
 
@@ -635,8 +636,10 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
     metrics = update_plot_loss_metric(args, metrics, losses, results_dir)
-
+    print('Plotted')
+  
   # Data collection and planning
+  print('Data collection and planning begins')
   if args.use_regular_vae:
     encoder.eval()
   else:
@@ -649,6 +652,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
       current_latent_state = get_latent(observation + 0.5)
     else:
       current_latent_state = get_latent(observation)
+      print('Got latent')
 
   (
     episode_states,
@@ -661,55 +665,60 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
     episode_transition_kl,
     episode_transition_mll_loss
   ) = init_planner_states(args, current_latent_state, env)
+  print('Initialized planner states')
   imagined_rewards = []
   true_rewards = []
 
-  pbar = tqdm(range(args.max_episode_length // args.action_repeat)) # max_episode_length = 1000
-  time_steps = 0
-  with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples):
-    for t in pbar:
-      (
-        action,
-        action_log_prob,
-        policy_mll_loss,
-        value, q_value,
-        transition_dist,
-        imagined_reward
-      ) = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device, softplus=args.imaginary_rollout_softplus)
-      
-      observation, reward, done = env.step(action[0].cpu())
+  # pbar = tqdm(range(args.max_episode_length // args.action_repeat)) # max_episode_length = 1000
+  # time_steps = 0
+  # with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples):
+  #   for t in pbar:
+  #     (
+  #       action,
+  #       action_log_prob,
+  #       policy_mll_loss,
+  #       value, q_value,
+  #       transition_dist,
+  #       imagined_reward
+  #     ) = actor_critic_planner.act(episode_states[-args.lagging_size:], episode_actions[-args.lagging_size:], device=args.device, softplus=args.imaginary_rollout_softplus)
+  #     print('actor_critic_planner acted')
+  #     observation, reward, done = env.step(action[0].cpu())
+  #     print('Stepped')
 
-      imagined_rewards.append(imagined_reward)
-      true_rewards.append(reward)
+  #     imagined_rewards.append(imagined_reward)
+  #     true_rewards.append(reward)
       
-      with torch.no_grad():
-        if not args.use_regular_vae:
-          current_latent_state = get_latent(observation + 0.5)
-        else:
-          current_latent_state = get_latent(observation)
-      (
-        episode_policy_kl,
-        episode_policy_mll_loss,
-        transition_kl,
-        transition_mll_loss,
-        episode_transition_kl,
-        episode_transition_mll_loss,
-        episode_states,
-        episode_actions,
-        episode_values,
-        episode_q_values,
-        episode_rewards
-      ) = update_planner_states(transition_dist, current_latent_state, actor_critic_planner, action, value, q_value, reward,
-                                episode_policy_kl, action_log_prob, episode_policy_mll_loss, policy_mll_loss, episode_transition_kl, 
-                                episode_transition_mll_loss, episode_states, episode_actions, episode_values, episode_q_values, episode_rewards, args)
-
-      D.append(observation, action.detach().cpu(), reward, done)
-      total_reward = total_reward + reward
-      if args.render:
-        env.render()
-      if done:
-        pbar.close()
-        break
+  #     with torch.no_grad():
+  #       if not args.use_regular_vae:
+  #         current_latent_state = get_latent(observation + 0.5)
+  #       else:
+  #         current_latent_state = get_latent(observation)
+  #       print('Got latent')
+  #     (
+  #       episode_policy_kl,
+  #       episode_policy_mll_loss,
+  #       transition_kl,
+  #       transition_mll_loss,
+  #       episode_transition_kl,
+  #       episode_transition_mll_loss,
+  #       episode_states,
+  #       episode_actions,
+  #       episode_values,
+  #       episode_q_values,
+  #       episode_rewards
+  #     ) = update_planner_states(transition_dist, current_latent_state, actor_critic_planner, action, value, q_value, reward,
+  #                               episode_policy_kl, action_log_prob, episode_policy_mll_loss, policy_mll_loss, episode_transition_kl, 
+  #                               episode_transition_mll_loss, episode_states, episode_actions, episode_values, episode_q_values, episode_rewards, args)
+  #     print('Updated planner state')
+      
+  #     D.append(observation, action.detach().cpu(), reward, done)
+  #     print('Added to replay buffer')
+  #     total_reward = total_reward + reward
+      # if args.render:
+      #   env.render()
+      # if done:
+        # pbar.close()
+        # break
   
   ### Compute loss and backward-prop
   current_q_values = episode_q_values
@@ -728,8 +737,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   current_policy_mll_loss = episode_policy_mll_loss.mean()
   current_transition_mll_loss = episode_transition_mll_loss.mean()
   
-  planning_optimiser.zero_grad()
-  (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
+  # planning_optimiser.zero_grad()
+  # (value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss).backward()
   print("value_loss", value_loss, "q_loss", q_loss, "policy_loss", policy_loss, "current_policy_mll_loss", current_policy_mll_loss, "current_transition_mll_loss", current_transition_mll_loss)
   print("planning total loss", value_loss + q_loss + policy_loss + current_policy_mll_loss + current_transition_mll_loss)
   print("training rewards", total_reward)
@@ -738,13 +747,13 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
   print("train imagined_rewards", imagined_rewards)
   print("train true_rewards", true_rewards)
   nn.utils.clip_grad_norm_(actor_critic_planner.parameters(), args.grad_clip_norm, norm_type=2)
-  planning_optimiser.step()
+  # planning_optimiser.step()
 
   metrics = update_plot_planning_loss_metric(metrics, value_loss, policy_loss, q_loss, current_policy_mll_loss, current_transition_mll_loss, t, episode, total_reward, results_dir, args)
 
   # delete unused variables
   del episode_states, episode_actions, episode_values, episode_q_values, episode_rewards, episode_policy_kl, episode_policy_mll_loss, episode_transition_kl, episode_transition_mll_loss
-  del action, action_log_prob, policy_mll_loss, value, q_value, transition_dist
+  # del action, action_log_prob, policy_mll_loss, value, q_value, transition_dist
   del current_q_values, previous_q_values, current_rewards, current_policy_kl, current_transition_kl, current_values, previous_values, soft_v_values, target_q_values, value_loss, q_loss, policy_loss 
   del current_policy_mll_loss, current_transition_mll_loss
 
@@ -757,7 +766,7 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
 
   # Test model
   if episode % args.test_interval == 0:
-    test(episode, metrics)
+    test_recurrent_gp(1000)
 
   # Checkpoint models
   if episode % args.checkpoint_interval == 0:
