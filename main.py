@@ -84,7 +84,7 @@ parser.add_argument('--rgp-training-interval-ratio', type=float, default=1.1, me
 parser.add_argument('--num-gp-likelihood-samples', type=int, default=1, metavar='GP', help='Number of likelihood samples for GP')
 parser.add_argument('--num-inducing-recurrent-gp', type=int, default=16, metavar='GP', help='Number of inducing points for DGPHiddenLayer in Recurrent GP')
 parser.add_argument('--num-inducing-planner', type=int, default=16, metavar='GP', help='Number of inducing points for DGPHiddenLayer in Planner')
-parser.add_argument('--input-size', type=int, default=64, metavar='InpS', help='observation input size')
+parser.add_argument('--input-size', type=int, default=32, metavar='InpS', help='observation input size')
 parser.add_argument('--train-all-layers', action='store_true', help='train all layers of infGaussianVAE, default setting will only train encoder and decoder')
 parser.add_argument('--result-dir', type=str, default="results", help='result directory')
 parser.add_argument('--lineplot', action='store_true', help='lineplot metrics')
@@ -349,6 +349,8 @@ def rgp_step(n_iter, losses):
         true_latent = true_latent.reshape((true_latent.size(0) * true_latent.size(1), -1)) # Anudeep, new
         actions_input = actions[:-1].unfold(0, args.lagging_size, 1)
         actions_input = actions_input.reshape(actions_input.size(0), actions_input.size(1), -1)
+        print(f'policy_input shape: {policy_input.shape}')
+        print(f'actions_input shape: {actions_input.shape}')
         transition_input = torch.cat([policy_input, actions_input], dim=-1)
         transition_input = transition_input.reshape((transition_input.size(0) * transition_input.size(1), -1)) # Anudeep, new
         
@@ -360,6 +362,7 @@ def rgp_step(n_iter, losses):
 
         # predicted_action = recurrent_gp.policy_module(policy_input)
         # predicted_action = policy(policy_input)
+        print(f'transition_input shape: {transition_input.shape}')
         predicted_latent = recurrent_gp.transition_module(transition_input)
         predicted_rewards = recurrent_gp.reward_module(transition_input)
 
@@ -430,12 +433,15 @@ def test_recurrent_gp(n_test):
       # latent_states : <chunk_size, batch_size, z_dim>
       init_states = latent_states[1:-args.horizon_size].unfold(0, args.lagging_size, 1)
       # init_states: <chunk_size - horizon_size - lagging_size, batch_size, latent_size, lagging_size>
+      print(f'init_states prior to unfold, {init_states.shape}')
       init_actions = actions[:-args.horizon_size-1].unfold(0, args.lagging_size, 1)
+      print(f'init_states after unfold, {init_states.shape}')
       # init_actions: <chunk_size - horizon_size - lagging_size, batch_size, action_size, lagging_size> 
 
       # without transpose, the result will be [t0, t1, t2, t0, t1, t2,...]
       # We want [t0, t0, t1, t1, t2, t2, ...] so the lagging_actions[..., self.action_size:] works as expected
       init_states = torch.transpose(init_states, -2, -1)
+      print(f'init_states after transpose, {init_states.shape}')
       # init_states: <chunk_size - horizon_size - lagging_size, batch_size, lagging_size, latent_size>
       init_actions = torch.transpose(init_actions, -2, -1)
       # init_actions: <chunk_size - horizon_size - lagging_size, batch_size, lagging_size, action_size> 
