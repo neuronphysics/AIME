@@ -146,26 +146,50 @@ class RecurrentGP(DeepGP):
 
     def forward(self, init_states, init_actions, policy):
         init_states = init_states.reshape((init_states.size(0) * init_states.size(1), -1))
+        # init_states = init_states.reshape(init_states.size(0), init_states.size(1), -1)
         init_actions = init_actions.reshape((init_actions.size(0) * init_actions.size(1), -1))
-        z_hat = torch.cat([init_states, init_actions], dim=-1)
-        z_hat = z_hat.reshape((z_hat.size(0) * z_hat.size(1), -1))
+        # init_actions = init_actions.reshape(init_actions.size(0), init_actions.size(1), -1)
+        print(f'Anudeep, init_states shape: {init_states.shape}')
+        print(f'Anudeep, init_actions shape: {init_actions.shape}')
+        z_hat = torch.cat([init_states, init_actions], dim=-1).T
+        # z_hat = z_hat.reshape((z_hat.size(0) * z_hat.size(1), -1))
         
         future_states = []
         future_actions = []
-        lagging_actions = init_actions
-        lagging_states = init_states
+        lagging_actions = init_actions.T
+        lagging_states = init_states.T
 
         for i in range(self.horizon_size):
-          next_state = self.transition_module.predict_sample(z_hat).mean(0)
-          lagging_states = torch.cat([lagging_states[..., self.latent_size:], next_state], dim=-1) 
-          next_action = policy.predict_sample(lagging_states).mean(0)
-          lagging_actions = torch.cat([lagging_actions[..., self.action_size:], next_action], dim=-1)
-          z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
-          future_states.append(next_state)
-          future_actions.append(next_action)
+            next_state = self.transition_module.predict_sample(z_hat)
+            # z_s has size <num_gp_likelihood_samples, chunk_size - horizon_size - lagging_size, batch_size, latent_size>
+            print(f'Next state shape: {next_state.shape}')
+            print(f'Lagging state view : {lagging_states[..., self.latent_size:].shape}')
+            lagging_states = torch.cat([lagging_states[..., self.latent_size:], torch.mean(next_state, dim=0)[:lagging_states.size(0),:]], dim=0) 
+            
+            next_action = policy.predict_sample(lagging_states)
+            # a_s has size <num_gp_likelihood_samples, chunk_size - horizon_size - lagging_size, batch_size, action_size>
+            lagging_actions = torch.cat([lagging_actions[..., self.action_size:], torch.mean(next_action, dim=0)], dim=-1)
+
+
+            # transition distribution
+            z_hat = torch.cat([lagging_states, lagging_actions], dim=-1) 
+            
+            # policy distribution      
+            
+            # z_hat = torch.cat([lagging_states, lagging_actions], dim=-1) # z_hat has size <1, 8, 52>
+            # # z_hat has shape # <chunk_size - horizon_size - lagging_size, batch_size, (action_size + latent_size)*lagging_size>
+
+        
+        # last policy in the horizon
+        a_s = policy.predict_sample(lagging_states)
+        lagging_actions = torch.cat([lagging_actions[..., self.action_size:], torch.mean(a_s, dim=0)], dim=-1) 
+        z_hat = torch.cat([lagging_states, lagging_actions], dim=-1)
+        future_states.append(next_state)
+        future_actions.append(next_action)
+        # output the final reward
         pred_rewards = self.reward_module(z_hat)
         future_states = torch.stack(future_states, dim=0) if len(future_states) > 0 else None
         future_actions = torch.stack(future_actions, dim=0) if len(future_actions) > 0 else None
-
+        
         return pred_rewards, future_states, future_actions
 
