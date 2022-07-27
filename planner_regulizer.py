@@ -449,10 +449,10 @@ class Agent(object):
     step = self._global_step.numpy()
     utils.write_summary(summary_writer, step, info)
 
-  def save(self):
+  def _build_checkpointer(self):
       pass
 
-  def restore(self):
+  def _load_checkpoint(self):
       pass
 
   @property
@@ -854,7 +854,7 @@ class D2EAgent(Agent):
           checkpoint["alpha_entropy_optimizer"] = self._ae_optimizer.state_dict()   
       torch.save(checkpoint, self.checkpoint_path)
     
-  def load_agent_checkpoint(self):
+  def _load_checkpoint(self):
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device)  # can load gpu's data on cpu machine
         for q_fn, q_fn_target in self._q_fns:
             q_fn.load_state_dict(checkpoint["q_net"])
