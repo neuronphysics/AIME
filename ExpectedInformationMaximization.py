@@ -11,6 +11,14 @@ from planner_regulizer import Split
 from tqdm import tqdm
 import warnings
 import logging
+import matplotlib.pyplot as plt
+import matplotlib.animation as anim
+
+def fanin_init(size, fanin=None):
+	fanin = fanin or size[0]
+	v = 1. / np.sqrt(fanin)
+	return torch.Tensor(size).uniform_(-v, v)
+
 class RecorderKeys:
     TRAIN_ITER = "train_iteration_module"
     INITIAL = "initial_module"
@@ -101,7 +109,7 @@ def build_dense_network(input_dim, output_dim, output_activation, params, with_o
             
         if activation=="relu":
             layers.append(nn.ReLU())
-        elif activation=="leaky_relu":
+        elif activation=="LeakyRelu":
             layers.append(nn.LeakyReLU(0.1,inplace=True))
         else:
             pass  
@@ -316,7 +324,9 @@ class ConditionalGaussian(nn.Module):
                                                   params=self._hidden_dict, with_output_layer=False)
 
         self._mean_t = nn.Linear(self._hidden_net._modules[next(iter(next(reversed(self._hidden_net._modules.items()))))].out_features, self._sample_dim)
+        self._mean_t.weight.data = fanin_init(self._mean_t.weight.data.size())
         self._chol_covar_raw = nn.Linear(self._hidden_net._modules[next(iter(next(reversed(self._hidden_net._modules.items()))))].out_features, self._sample_dim ** 2)
+        self._chol_covar_raw.weight.data = fanin_init(self._chol_covar_raw.weight.data.size())
         #based on this  shorturl.at/pTVZ3
         self._chol_covar =  LambdaLayer( lambda x:self._create_chol(x))(self._chol_covar_raw)
     
@@ -422,7 +432,7 @@ class Softmax(nn.Module):
         self._hidden_dict = hidden_dict
         self._trainable = trainable
 
-        self._logit_net = build_dense_network(self._context_dim, self._z_dim, output_activation=None,
+        self._logit_net, self._logit_regularizer = build_dense_network(self._context_dim, self._z_dim, output_activation=None,
                                                  params=self._hidden_dict)
 
         if self._weight_path is not None:
@@ -569,7 +579,7 @@ class DensityRatioEstimator:
     def _build(self):
         input_dim = self._target_train_samples.shape[-1]
     
-        self._ldre_net = build_dense_network(input_dim=input_dim, output_dim=1,
+        self._ldre_net, self._ldre_regularizer = build_dense_network(input_dim=input_dim, output_dim=1,
                                              output_activation="linear", params=self.hidden_params)
 
         self._p_samples = nn.Linear(input_dim,input_dim)
@@ -607,7 +617,8 @@ class DensityRatioEstimator:
                 self._train_model_p_outputs, self._train_model_q_outputs= self.model(x)
 
                 # Calculate loss score
-                loss = logistic_regression_loss(self._train_model_p_outputs, self._train_model_q_outputs)
+                #should I add the regularizer loss here?
+                loss = logistic_regression_loss(self._train_model_p_outputs, self._train_model_q_outputs) + self._ldre_regularizer
                 L   += loss.detach().cpu().numpy()
                 # Back prop
                 
@@ -621,15 +632,19 @@ class DensityRatioEstimator:
         return self._ldre_net(samples)
 
     def eval(self, target_samples, model):
-        if self._conditional_model:
-            model_samples = torch.cat([target_samples[0], model.sample(target_samples[0])], dim=-1)
-            target_samples = torch.cat(target_samples, dim=-1)
-        else:
-            model_samples = model.sample(self._target_train_samples.shape[0])
-        target_ldre = self(target_samples)
-        model_ldre = self(model_samples)
-        target_prob = nn.Sigmoid(target_ldre)
-        model_prob = nn.Sigmoid(model_ldre)
+        #Turns off training-time behavior
+        model.eval()
+        
+        with torch.no_grad():
+            if self._conditional_model:
+               model_samples = torch.cat([target_samples[0], model.sample(target_samples[0])], dim=-1)
+               target_samples = torch.cat(target_samples, dim=-1)
+            else:
+               model_samples = model.sample(self._target_train_samples.shape[0])
+            target_ldre = self(target_samples)
+            model_ldre = self(model_samples)
+            target_prob = nn.Sigmoid(target_ldre)
+            model_prob = nn.Sigmoid(model_ldre)
 
         ikl_estem = torch.mean(- model_ldre)
         acc = accuracy(target_ldre, model_ldre)
@@ -650,6 +665,110 @@ class DensityRatioEstimator:
             return model_train_samples, model_val_samples
         return model_train_samples
     
+class Recorder:
+
+    def __init__(self, modules_dict,
+                 plot_realtime, save,
+                 save_path=os.path.abspath("rec"),
+                 fps=3, img_dpi=1200, vid_dpi=500):
+        """
+        Initializes and handles recording modules
+        :param modules_dict: Dictionary containing all recording modules
+        :param plot_realtime: whether to plot in realtime while algorithm is running
+        :param save: whether to save plots/images
+        :param save_path: path to save data to
+        :param fps: video frame rate
+        :param img_dpi: image resolution
+        :param vid_dpi: video resolution
+        """
+        self.save_path = save_path
+        self._modules_dict = modules_dict
+
+        self._plot_realtime = plot_realtime
+        self._save = save
+
+        self._fps = fps
+        self._img_dpi = img_dpi
+        self._vid_dpi = vid_dpi
+
+        if not os.path.exists(save_path):
+             warnings.warn('Path ' + save_path + ' not found - creating')
+             os.makedirs(save_path)
+
+    def handle_plot(self, name, plot_fn, data=None):
+        if self._plot_realtime:
+            plt.figure(name)
+            plt.clf()
+            plot_fn() if data is None else plot_fn(data)
+            plt.pause(0.0001)
+
+    def save_img(self, name, plot_fn, data=None):
+        """
+        Saves an image
+        :param name: file name
+        :param plot_fn: function generating the plot
+        :param data: data provided to plot_fn to generate plot
+        :return:
+        """
+        fig = plt.figure(name)
+        plot_fn() if data is None else plot_fn(data)
+        fig.savefig(os.path.join(self.save_path, name + ".pdf"), format="pdf", dpi=self._img_dpi)
+        plt.close(name)
+
+    def save_vid(self, name, update_fn, frames):
+        """
+        Saves a video
+        :param name: file name
+        :param update_fn: function generating plots from data
+        :param frames: list containing data for frames
+        :return:
+        """
+        def _update_fn_wrapper(i):
+            plt.clf()
+            update_fn(i)
+
+        if self._save:
+            fig = plt.figure()
+            ani = anim.FuncAnimation(fig,
+                                     func=_update_fn_wrapper,
+                                     frames=frames)
+            writer = anim.writers['imagemagick'](fps=self._fps)
+            ani.save(os.path.join(self.save_path, name+".mp4"),
+                     writer=writer,
+                     dpi=(500 if self._vid_dpi > 500 else self._vid_dpi))
+
+    def save_vid_raw(self, name, data, preprocess_fn=None):
+        save_dict = {}
+        preprocess_fn = (lambda x: x) if preprocess_fn is None else preprocess_fn
+        for i, d in enumerate(data):
+            save_dict[str(i)] = preprocess_fn(data[i])
+        np.savez(os.path.join(self.save_path, name + "_raw.npz"), **save_dict)
+
+    def initialize_module(self, name, *args, **kwargs):
+        module = self._modules_dict.get(name)
+        if module is not None:
+            module.initialize(self, self._plot_realtime, self._save, *args, **kwargs)
+
+    def __call__(self, module, *args, **kwargs):
+        module = self._modules_dict.get(module)
+        if module is not None:
+            module.record(*args, **kwargs)
+
+    def snapshot(self):
+        for key in self._modules_dict.keys():
+            self._modules_dict[key].snapshot()
+
+    def finalize_training(self):
+        for key in self._modules_dict.keys():
+            m = self._modules_dict[key]
+            if m.is_initialized:
+                m.finalize()
+
+    def get_last_rec(self):
+        last_rec = {}
+        for key in self._modules_dict.keys():
+            last_rec = {**last_rec, **self._modules_dict[key].get_last_rec()}
+        return last_rec
 
 class ConditionalMixtureEIM:
 
@@ -683,10 +802,10 @@ class ConditionalMixtureEIM:
         c.finalize_adding()
         return c
 
-    def __init__(self, config: ConfigDict, train_samples: np.ndarray, recorder: Recorder,
-                 val_samples: np.ndarray = None, seed: int = 0):
-        # supress tensorflow casting warnings
-        logging.getLogger("tensorflow").setLevel(logging.ERROR)
+    def __init__(self, config: ConfigDict, train_samples: torch.Tensor, recorder: Recorder,
+                 val_samples: torch.Tensor = None, seed: int = 0):
+        # supress pytorch casting warnings
+        logging.getLogger("pytorch").setLevel(logging.ERROR)
 
         self.c = config
         self.c.finalize_modifying()
@@ -695,7 +814,7 @@ class ConditionalMixtureEIM:
 
         self._context_dim = train_samples[0].shape[-1]
         self._sample_dim = train_samples[1].shape[-1]
-        self._train_contexts = tf.constant(train_samples[0], dtype=tf.float32)
+        self._train_contexts = torch.tensor(train_samples[0], dtype=torch.float32)
 
         c_net_hidden_dict = {NetworkKeys.NUM_UNITS: self.c.components_net_hidden_layers,
                              NetworkKeys.ACTIVATION: "relu",
@@ -711,13 +830,13 @@ class ConditionalMixtureEIM:
 
         self._model = GaussianEMM(self._context_dim, self._sample_dim, self.c.num_components,
                                   c_net_hidden_dict, g_net_hidden_dict, seed=seed)
-        self._c_opts = [k.optimizers.Adam(self.c.components_learning_rate, 0.5) for _ in self._model.components]
-        self._g_opt = k.optimizers.Adam(self.c.gating_learning_rate, 0.5)
+        
 
         dre_params = {NetworkKeys.NUM_UNITS: self.c.dre_hidden_layers,
-                      NetworkKeys.ACTIVATION: k.activations.relu,
+                      NetworkKeys.ACTIVATION: "relu",
                       NetworkKeys.DROP_PROB: self.c.dre_drop_prob,
                       NetworkKeys.L2_REG_FACT: self.c.dre_reg_loss_fact}
+        
         self._dre = DensityRatioEstimator(target_train_samples=train_samples,
                                           hidden_params=dre_params,
                                           early_stopping=self.c.dre_early_stopping, target_val_samples=val_samples,
@@ -729,6 +848,7 @@ class ConditionalMixtureEIM:
         self._recorder.initialize_module(RecorderKeys.WEIGHTS_UPDATE, self.c.train_epochs)
         self._recorder.initialize_module(RecorderKeys.COMPONENT_UPDATE, self.c.train_epochs, self.c.num_components)
         self._recorder.initialize_module(RecorderKeys.DRE, self.c.train_epochs)
+        self.device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     def train(self):
         for i in range(self.c.train_epochs):
@@ -772,24 +892,24 @@ class ConditionalMixtureEIM:
             res_list.append((self.c.components_num_epochs, expected_kl, expected_entropy, ""))
         return res_list
 
-    @tf.function
+
     def _components_train_step(self, importance_weights, old_means, old_chol_precisions):
+        self._c_opts = [ torch.optim.Adam(self._model.components[i].trainable_variables, lr=self.c.components_learning_rate, betas=(0.5, 0.999)) for i in self._model.components]
+        
         for i in range(self._model.num_components):
-            dt = (self._train_contexts, importance_weights[:, i], old_means, old_chol_precisions)
-            data = tf.data.Dataset.from_tensor_slices(dt)
-            data = data.shuffle(self._train_contexts.shape[0]).batch(self.c.components_batch_size)
+            dataset = torch.utils.data.TensorDataset(self._train_contexts, importance_weights[:, i], old_means, old_chol_precisions)
+            loader = torch.utils.data.DataLoader( dataset, shuffle = True, batch_size=self.c.components_batch_siz)
 
-            for context_batch, iw_batch, old_means_batch, old_chol_precisions_batch in data:
+            for batch_idx, (context_batch, iw_batch, old_means_batch, old_chol_precisions_batch) in enumerate(loader):
                 iw_batch = iw_batch / torch.sum(iw_batch)
-                with tf.GradientTape() as tape:
-                    samples = self._model.components[i].sample(context_batch)
-                    losses = - torch.squeeze(self._dre(torch.cat([context_batch, samples], dim=-1)))
-                    kls = self._model.components[i].kls_other_chol_inv(context_batch, old_means_batch[:, i],
+                samples = self._model.components[i].sample(context_batch)
+                losses = - torch.squeeze(self._dre(torch.cat([context_batch, samples], dim=-1)))
+                kls = self._model.components[i].kls_other_chol_inv(context_batch, old_means_batch[:, i],
                                                                   old_chol_precisions_batch[:, i])
-                    loss = torch.mean(iw_batch * (losses + kls))
-                gradients = tape.gradient(loss, self._model.components[i].trainable_variables)
-                self._c_opts[i].apply_gradients(zip(gradients, self._model.components[i].trainable_variables))
-
+                loss = torch.mean(iw_batch * (losses + kls))
+                loss.backward()
+                self._c_opts[i].zero_grad()
+                self._c_opts[i].step()
 
     """gating update"""
     def update_gating(self):
@@ -802,23 +922,23 @@ class ConditionalMixtureEIM:
 
         return i + 1, expected_kl, expected_entropy, ""
 
-    @tf.function
     def _gating_train_step(self, old_probs):
+        self._g_opt = torch.optim.Adam(self._model.gating_distribution.trainable_variables, lr=self.c.gating_learning_rate, betas=(0.5, 0.999))
         losses = []
         for i in range(self.c.num_components):
             samples = self._model.components[i].sample(self._train_contexts)
             losses.append(- self._dre(torch.cat([self._train_contexts, samples], dim=-1)))
 
         losses = torch.cat(losses, dim=1)
-        data = tf.data.Dataset.from_tensor_slices((self._train_contexts, losses, old_probs))
-        data = data.shuffle(self._train_contexts.shape[0]).batch(self.c.gating_batch_size)
-        for context_batch, losses_batch, old_probs_batch in data:
-            with tf.GradientTape() as tape:
-                probabilities = self._model.gating_distribution.probabilities(context_batch)
-                kl = self._model.gating_distribution.expected_kl(context_batch, old_probs_batch)
-                loss = torch.sum(torch.mean(probabilities * losses_batch, 0)) + kl
-            gradients = tape.gradient(loss, self._model.gating_distribution.trainable_variables)
-            self._g_opt.apply_gradients(zip(gradients, self._model.gating_distribution.trainable_variables))
+        dataset = torch.utils.data.TensorDataset(self._train_contexts, losses, old_probs)
+        loader = torch.utils.data.DataLoader( dataset, shuffle = True, batch_size=self.c.gating_batch_size)
+        for batch_idx, (context_batch, losses_batch, old_probs_batch) in enumerate(loader):
+            probabilities = self._model.gating_distribution.probabilities(context_batch)
+            kl = self._model.gating_distribution.expected_kl(context_batch, old_probs_batch)
+            loss = torch.sum(torch.mean(probabilities * losses_batch, 0)) + kl
+            loss.backward()
+            self._g_opt[0].zero_grad()
+            self._g_opt[0].step()
 
     @property
     def model(self):
