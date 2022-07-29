@@ -937,8 +937,8 @@ class ConditionalMixtureEIM:
             kl = self._model.gating_distribution.expected_kl(context_batch, old_probs_batch)
             loss = torch.sum(torch.mean(probabilities * losses_batch, 0)) + kl
             loss.backward()
-            self._g_opt[0].zero_grad()
-            self._g_opt[0].step()
+            self._g_opt.zero_grad()
+            self._g_opt.step()
 
     @property
     def model(self):
