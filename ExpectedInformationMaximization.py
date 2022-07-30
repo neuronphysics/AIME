@@ -4,8 +4,6 @@ import torch.nn as nn
 from collections import OrderedDict
 from torch.distributions import normal
 import numpy as np
-import shutil
-import yaml
 import os
 from planner_regulizer import Split
 from tqdm import tqdm
@@ -13,7 +11,10 @@ import warnings
 import logging
 import matplotlib.pyplot as plt
 import matplotlib.animation as anim
-
+"""
+    minimizing Kullback-Leibler divergences by estimating density ratios
+    Based on https://github.com/pbecker93/ExpectedInformationMaximization/ 
+"""
 def fanin_init(size, fanin=None):
 	fanin = fanin or size[0]
 	v = 1. / torch.sqrt(torch.tensor(fanin).float())
@@ -943,3 +944,536 @@ class ConditionalMixtureEIM:
     @property
     def model(self):
         return self._model
+#########################################
+from ObstacleData import ObstacleData
+import json
+
+
+
+class RecorderModule:
+    """RecorderModule Superclass"""
+
+    def __init__(self):
+        self.__recorder = None
+        self._plot_realtime = None
+        self._save = None
+        self._logger = logging.getLogger(self.logger_name)
+
+    @property
+    def _save_path(self):
+        return self._recorder.save_path
+
+    @property
+    def _recorder(self):
+        assert self.__recorder is not None, "recorder not set yet - Recorder module called before proper initialization "
+        return self.__recorder
+
+    @property
+    def is_initialized(self):
+        return self.__recorder is not None
+
+    def initialize(self, recorder, plot_realtime, save, *args):
+        self.__recorder = recorder
+        self._save = save
+        self._plot_realtime = plot_realtime
+
+    def record(self, *args):
+        raise NotImplementedError
+
+    @property
+    def logger_name(self):
+        raise NotImplementedError
+
+    def finalize(self):
+        pass
+
+    def get_last_rec(self):
+        return {}
+
+
+class ConfigInitialRecMod(RecorderModule):
+
+    def record(self, name, config):
+        self._logger.info((10 + len(name)) * "-")
+        self._logger.info("---- " + name + " ----")
+        self._logger.info((10 + len(name)) * "-")
+        for k in config.keys():
+            self._logger.info(str(k) + " : " + str(config[k]))
+        if self._save:
+            filename = os.path.join(self._save_path, "config.json")
+            with open(filename, "w") as file:
+                json.dump(config.__dict__, file, separators=(",\n", ": "))
+
+    @property
+    def logger_name(self):
+        return "Config"
+    
+"""Simple recording models - most of them just print information"""
+class TrainIterationRecMod(RecorderModule):
+    """Prints out current training iteration"""
+    def record(self, iteration):
+        self._logger.info("--- Iteration {:5d} ---".format(iteration))
+
+    @property
+    def logger_name(self):
+        return "Iteration"
+
+"""Runs the obstacles experiments described in section 5.4 of the paper"""
+#########################################
+########################################
+"""configure experiment"""
+plot_realtime = True
+plot_save = False
+record_dual_opt = True
+record_discriminator = True
+num_components = 3
+
+"""generate data"""
+
+data = ObstacleData(10000, 5000, 5000, num_obstacles=3, samples_per_context=10, seed=0)
+context_dim, sample_dim = data.dim
+
+class Colors:
+    """Provides colors for plotting """
+    def __init__(self, pyplot_color_cycle=True):
+        if pyplot_color_cycle:
+            self._colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+        else:
+            #Todo implement color list with more colors...
+            raise NotImplementedError("Not yet implemented")
+
+    def __call__(self, i):
+        return self._colors[i % len(self._colors)]
+
+"""eval and recording"""
+def save_model(model, path: str, filename: str):
+    if isinstance(model, GMM):
+        save_gmm(model, path, filename)
+    elif isinstance(model, GaussianEMM):
+        save_gaussian_gmm(model, path, filename)
+
+    else:
+        raise NotImplementedError("Saving not implemented for " + str(model.__class__))
+def save_gaussian_gmm(model: GaussianEMM, path: str, filename: str):
+    model.save(path, filename)
+
+
+def save_gmm(model: GMM, path: str, filename: str):
+    means = np.stack([c.mean for c in model.components], axis=0)
+    covars = np.stack([c.covar for c in model.components], axis=0)
+    model_dict = {"weights": model.weight_distribution.p, "means": means, "covars": covars}
+    np.savez_compressed(os.path.join(path, filename + ".npz"), **model_dict)
+
+
+def eval_fn(model):
+    contexts = data.raw_test_samples[0]
+    samples = np.zeros([contexts.shape[0], 10, data.dim[1]])
+    for i in range(10):
+        samples[:, i] = model.sample(contexts)
+    return data.rewards_from_contexts(contexts, samples)
+
+class ModelRecMod(RecorderModule):
+    """Records current eim performance: Log Likelihood and if true (unnormalized) log density is provided the
+    i-projection kl (plus constant)"""
+    def __init__(self, train_samples, test_samples, true_log_density=None, eval_fn=None,
+                 test_log_iters=50, save_log_iters=50):
+        super().__init__()
+        self._train_samples = train_samples
+        self._test_samples = test_samples
+        self._true_log_density = true_log_density
+        self._eval_fn = eval_fn
+
+        self._test_log_iters = test_log_iters
+        self._save_log_iters = save_log_iters
+
+        self._train_ll_list = []
+        self._train_kl_list = []
+
+        self._test_ll_list = []
+        self._test_kl_list = []
+        self._test_eval_list = []
+
+        self.__num_iters = None
+        self._colors = Colors()
+
+    @property
+    def _num_iters(self):
+        assert self.__num_iters is not None, "Model Recorder not initialized properly"
+        return self.__num_iters
+
+    def initialize(self, recorder, plot_realtime, save, num_iters):
+        super().initialize(recorder, plot_realtime, save)
+        self.__num_iters = num_iters
+
+    def _log_train(self, model):
+        if isinstance(self._train_samples, np.ndarray):
+            self._train_ll_list.append(np.array(model.log_likelihood(self._train_samples)))
+        else:
+            self._train_ll_list.append(np.array(model.log_likelihood(self._train_samples[0], self._train_samples[1])))
+        log_str = "Training LL: " + str(self._train_ll_list[-1])
+        if self._true_log_density is not None:
+            if isinstance(self._train_samples, np.ndarray):
+                model_train_samples = model.sample(len(self._train_samples))
+                self._train_kl_list.append(np.mean(model.log_density(model_train_samples) -
+                                                   self._true_log_density(model_train_samples)))
+            else:
+                model_train_samples = model.sample(self._train_samples[0])
+                self._train_kl_list.append(np.mean(model.log_density(self._train_samples[0], model_train_samples) -
+                                                   self._true_log_density(self._train_samples[0], model_train_samples)))
+
+            log_str += " KL (MC-Estimate): " + str(self._train_kl_list[-1])
+        self._logger.info(log_str)
+        if self._plot_realtime:
+            self._recorder.handle_plot("Loss", self._plot)
+
+    def _log_test(self, model, model_test_samples=None):
+        if isinstance(self._test_samples, np.ndarray):
+            self._test_ll_list.append(np.array(model.log_likelihood(self._test_samples)))
+        else:
+            self._test_ll_list.append(np.array(model.log_likelihood(self._test_samples[0], self._test_samples[1])))
+
+        log_str = "Test: Likelihood " + str(self._test_ll_list[-1])
+
+        if self._true_log_density is not None:
+            if isinstance(self._train_samples, np.ndarray):
+                model_test_samples = model.sample(len(self._test_samples))
+                self._test_kl_list.append(np.mean(model.log_density(model_test_samples) -
+                                                   self._true_log_density(model_test_samples)))
+            else:
+                model_test_samples = model.sample(self._test_samples[0])
+                self._test_kl_list.append(np.mean(model.log_density(self._test_samples[0], model_test_samples) -
+                                                   self._true_log_density(self._test_samples[0], model_test_samples)))
+            log_str += " KL (MC-Estimate): " + str(self._test_kl_list[-1])
+        if self._eval_fn is not None:
+            self._test_eval_list.append(self._eval_fn(model))
+            log_str += " Eval Loss: " + str(self._test_eval_list[-1])
+        self._logger.info(log_str)
+
+    def record(self, model, iteration):
+        if self._save and (iteration % self._save_log_iters == 0):
+            save_model(model, self._save_path, "modelAtIter{:05d}".format(iteration))
+        self._log_train(model)
+        if iteration % self._test_log_iters == 0:
+            self._log_test(model)
+
+    def _plot(self):
+        plt.subplot(2 if self._true_log_density is not None else 1, 1, 1)
+        plt.title("Train Log Likelihood")
+
+        plt.plot(np.arange(0, len(self._train_ll_list)), np.array(self._train_ll_list))
+        plt.xlim(0, self._num_iters)
+        if self._true_log_density is not None:
+            plt.subplot(2, 1, 2)
+            plt.title("I-Projection KL (MC-Estimate)")
+            plt.plot(np.arange(0, len(self._train_kl_list)), np.array(self._train_kl_list))
+            plt.xlim((0, self._num_iters))
+        plt.tight_layout()
+
+    def finalize(self):
+        if self._save:
+            save_dict = {"ll_train": self._train_ll_list,
+                         "ll_test": self._test_ll_list}
+            if self._true_log_density is not None:
+                save_dict["kl_train"] = self._train_kl_list
+                save_dict["kl_test"] = self._test_kl_list
+            if self._eval_fn is not None:
+                save_dict["eval_test"] = self._test_eval_list
+            np.savez_compressed(os.path.join(self._save_path, "losses_raw.npz"), **save_dict)
+            self._recorder.save_img("Loss", self._plot)
+
+    def get_last_rec(self):
+        res_dict = {"ll_train": self._train_ll_list[-1]}
+        if self._true_log_density is not None:
+            res_dict["kl_train"] = self._train_kl_list[-1]
+
+        return res_dict
+
+    @property
+    def logger_name(self):
+        return "Model"
+    
+class ModelRecModWithModelVis(ModelRecMod):
+    """Superclass - Standard eim recording + eim visualization
+    (actual visualization needs to be implemented individually depending on data/task)"""
+
+    def record(self, model, iteration):
+        super().record(model, iteration)
+        if self._plot_realtime:
+            plt_fn = lambda x: self._plot_model(x, title="Iteration {:5d}".format(iteration))
+            self._recorder.handle_plot("Model", plt_fn, model)
+
+    def _plot_model(self, model, title):
+        raise NotImplementedError("Not Implemented")
+
+    @staticmethod
+    def _draw_2d_covariance(mean, covmatrix, chisquare_val=2.4477, return_raw=False, *args, **kwargs):
+        (largest_eigval, smallest_eigval), eigvec = np.linalg.eig(covmatrix)
+        phi = -np.arctan2(eigvec[0, 1], eigvec[0, 0])
+
+        a = chisquare_val * np.sqrt(largest_eigval)
+        b = chisquare_val * np.sqrt(smallest_eigval)
+
+        ellipse_x_r = a * np.cos(np.linspace(0, 2 * np.pi))
+        ellipse_y_r = b * np.sin(np.linspace(0, 2 * np.pi))
+
+        R = np.array([[np.cos(phi), np.sin(phi)], [-np.sin(phi), np.cos(phi)]])
+        r_ellipse = np.array([ellipse_x_r, ellipse_y_r]).T @ R
+        if return_raw:
+            return mean[0] + r_ellipse[:, 0], mean[1] + r_ellipse[:, 1]
+        else:
+            return plt.plot(mean[0] + r_ellipse[:, 0], mean[1] + r_ellipse[:, 1], *args, **kwargs)
+
+class ObstacleModelRecMod(ModelRecModWithModelVis):
+
+    def __init__(self, obstacle_data, train_samples, test_samples, true_log_density=None, eval_fn=None,
+                 test_log_iters=50, save_log_iters=50):
+        super().__init__(train_samples, test_samples, true_log_density, eval_fn, test_log_iters, save_log_iters)
+        self._data = obstacle_data
+
+    def _plot_model(self, model, title):
+        x_plt = np.arange(0, 1, 1e-2)
+        color = Colors()
+        contexts = self._data.raw_test_samples[0][:10]
+        for i in range(9):
+            plt.subplot(3, 3, i + 1)
+            context = contexts[i:i + 1]
+            plt.imshow(self._data.img_from_context(context[0]))
+            lines = []
+            for k, c in enumerate(model.components):
+                m = (c.mean(context)[0] + 1) / 2
+                cov = c.covar(context)[0]
+                mx, my = m[::2], m[1::2]
+                plt.scatter(200 * mx, 100 * my, c=color(k))
+                for j in range(mx.shape[0]):
+                    mean = np.array([mx[j], my[j]])
+                    cov_j = cov[2 * j: 2 * (j + 1), 2 * j: 2 * (j + 1)]
+                    plt_cx, plt_cy = self._draw_2d_covariance(mean, cov_j, 1, return_raw=True)
+                    plt.plot(200 * plt_cx, 100 * plt_cy, c=color(k), linestyle="dotted", linewidth=2)
+                for j in range(10):
+                    s = np.array(c.sample(contexts[i:i + 1]))
+                    spline = self._data.get_spline(s[0])
+                    l, = plt.plot(200 * x_plt, 100 * spline(x_plt), c=color(k), linewidth=1)
+                lines.append(l)
+            for j in range(10):
+                s = self._data.raw_test_samples[1][i, j]
+                spline = self._data.get_spline(s)
+                plt.plot(200 * x_plt, 100 * spline(x_plt), c=color(model.num_components), linewidth=1, linestyle="dashed")
+
+            weights = model.gating_distribution.probabilities(context)[0]
+            strs = ["{:.3f}".format(weights[i]) for i in range(model.num_components)]
+            plt.legend(lines, strs, loc=1)
+            plt.gca().set_axis_off()
+            plt.gca().set_xlim(0, 200)
+            plt.gca().set_ylim(0, 100)
+            
+def log_res(res, key_prefix):
+    num_iters, kl, entropy, add_text = [np.array(x) for x in res]
+    last_rec = {key_prefix + "_num_iterations": num_iters, key_prefix + "_kl": kl, key_prefix + "_entropy": entropy}
+    log_string = "Updated for {:d} iterations. ".format(num_iters)
+    log_string += "KL: {:.5f}. ".format(kl)
+    log_string += "Entropy: {:.5f} ".format(entropy)
+    log_string += str(add_text)
+    return log_string, last_rec
+
+class ComponentUpdateRecMod(RecorderModule):
+
+    def __init__(self, plot, summarize=True):
+        super().__init__()
+        self._plot = plot
+        self._last_rec = None
+        self._summarize = summarize
+        self._kls = None
+        self._entropies = None
+        self._num_iters = -1
+        self._num_components = -1
+        self._c = Colors()
+
+    def initialize(self, recorder, plot_realtime, save, num_iters, num_components):
+        super().initialize(recorder, plot_realtime, save)
+        self._num_iters = num_iters
+        self._num_components = num_components
+        self._kls = [[] for _ in range(self._num_components)]
+        self._entropies = [[] for _ in range(self._num_components)]
+
+    def record(self, res_list):
+        self._last_rec = {}
+        for i, res in enumerate(res_list):
+            cur_log_string, cur_last_rec = log_res(res, "component_{:d}".format(i))
+            self._last_rec = {**self._last_rec, **cur_last_rec}
+            if not self._summarize:
+                self._logger.info("Component{:d}: ".format(i + 1) + cur_log_string)
+            if self._plot:
+                self._kls[i].append(self._last_rec["component_{:d}_kl".format(i)])
+                self._entropies[i].append(self._last_rec["component_{:d}_entropy".format(i)])
+        if self._summarize:
+            self._summarize_results(res_list)
+        if self._plot:
+            self._recorder.handle_plot("Component Update", self._plot_fn)
+
+    def _summarize_results(self, res_list):
+        fail_ct = 0
+        for res in res_list:
+            if "failed" in str(res[-1]).lower():
+                fail_ct += 1
+        num_updt = len(res_list)
+        log_str = "{:d} components updated - {:d} successful".format(num_updt, num_updt - fail_ct)
+        self._logger.info(log_str)
+
+class WeightUpdateRecMod(RecorderModule):
+
+    def __init__(self, plot):
+        super().__init__()
+        self._last_rec = None
+        self._plot = plot
+        self._kls = []
+        self._entropies = []
+        self._num_iters = -1
+
+    def initialize(self, recorder, plot_realtime, save, num_iters):
+        super().initialize(recorder, plot_realtime, save)
+        self._num_iters = num_iters
+
+    def record(self, res):
+        log_string, self._last_rec = log_res(res, "weights")
+        self._logger.info(log_string)
+        if self._plot:
+            self._kls.append(self._last_rec["weights_kl"])
+            self._entropies.append(self._last_rec["weights_entropy"])
+            self._recorder.handle_plot("Weight Update", self._plot_fn)
+
+    def _plot_fn(self):
+        plt.subplot(2, 1, 1)
+        plt.title("Expected KL")
+        plt.plot(self._kls)
+        plt.xlim(0, self._num_iters)
+        plt.subplot(2, 1, 2)
+        plt.title("Expected Entropy")
+        plt.plot(self._entropies)
+        plt.xlim(0, self._num_iters)
+        plt.tight_layout()
+
+    @property
+    def logger_name(self):
+        return "Weight Update"
+
+    def get_last_rec(self):
+        assert self._last_rec is not None
+        return self._last_rec
+
+    def finalize(self):
+        if self._plot:
+            self._recorder.save_img("WeightUpdates", self._plot_fn)
+
+
+class DRERecMod(RecorderModule):
+    """Records current Density Ratio Estimator performance - loss, accuracy and mean output for true and fake samples"""
+    def __init__(self, true_samples, target_ld=None):
+        super().__init__()
+        if isinstance(true_samples, np.ndarray):
+            self._target_samples = true_samples.astype(np.float32)
+        else:
+            self._target_samples = [x.astype(np.float32) for x in true_samples]
+        self._steps = []
+        self._estm_ikl = []
+        self._loss = []
+        self._acc = []
+        self._true_mean = []
+        self._fake_mean = []
+        self.__num_iters = None
+        self._target_ld = target_ld
+        self._dre_type = None
+        if self._target_ld is not None:
+            self._dre_rmse = []
+        self._conditional = not isinstance(true_samples, np.ndarray)
+
+    def initialize(self, recorder, plot_realtime, save, num_iters):
+        super().initialize(recorder, plot_realtime, save)
+        self.__num_iters = num_iters
+
+    @property
+    def _num_iters(self):
+        assert self.__num_iters is not None, "Density Ratio Estimator Recorder not properly initialized"
+        return self.__num_iters
+
+    def _dre_rmse_fn(self, idx, dre, model, samples):
+        mld = model.log_density(samples)
+        return tf.squeeze(dre(samples, idx)) - (self._target_ld(samples) - mld)
+
+    def record(self, dre, model, iteration, steps):
+        if iteration == 0 and self._target_ld is not None:
+            for _ in model.components:
+                self._dre_rmse.append([])
+        estm_ikl, loss, acc, true_mean, fake_mean = [np.array(x) for x in dre.eval(self._target_samples, model)]
+        log_str = "Density Ratio Estimator ran for " + str(steps) + " steps. "
+        log_str += "Loss {:.4f} ".format(loss)
+        log_str += "Estimated IKL: {:.4f} ".format(estm_ikl)
+        log_str += "Accuracy: {:.4f} ".format(acc)
+        log_str += "True Mean IKL: {:.4f} ".format(true_mean)
+        log_str += "Fake Mean IKL: {:.4f} ".format(fake_mean)
+
+        if self._target_ld is not None:
+            all_errs = []
+            for i, c in enumerate(model.components):
+                samples = c.sample(1000)
+                errs = np.array(self._dre_rmse_fn(i, dre, model, samples))
+                all_errs.append(errs)
+                self._dre_rmse[i].append(np.sqrt(np.mean(errs**2)))
+                log_str += "Component {:d}: DRE RMSE: {:.4f} ".format(i, self._dre_rmse[i][-1])
+            self._recorder.handle_plot("Err Hist", self._plot_hist, all_errs)
+        self._logger.info(log_str)
+
+        self._steps.append(steps)
+        self._estm_ikl.append(estm_ikl)
+        self._loss.append(loss)
+        self._acc.append(acc)
+        self._true_mean.append(true_mean)
+        self._fake_mean.append(fake_mean)
+        if self._plot_realtime:
+            self._recorder.handle_plot("Discriminator Evaluation", self._plot)
+"""Recording"""
+recorder_dict = {
+    RecorderKeys.TRAIN_ITER: TrainIterationRecMod(),
+    RecorderKeys.INITIAL: ConfigInitialRecMod(),
+    RecorderKeys.MODEL: ObstacleModelRecMod(data,
+                                        train_samples=data.train_samples,
+                                        test_samples=data.test_samples,
+                                        test_log_iters=1,
+                                        eval_fn=eval_fn,
+                                        save_log_iters=50),
+    RecorderKeys.DRE: DRERecMod(data.train_samples),
+    RecorderKeys.COMPONENT_UPDATE: ComponentUpdateRecMod(plot=True, summarize=False)}
+if num_components > 1:
+    recorder_dict[RecorderKeys.WEIGHTS_UPDATE] = WeightUpdateRecMod(plot=True)
+
+
+recorder = Recorder(recorder_dict, plot_realtime=plot_realtime, save=plot_save, save_path="rec")
+
+
+"""Configure EIM"""
+
+config = ConditionalMixtureEIM.get_default_config()
+config.train_epochs = 1000
+config.num_components = num_components
+
+config.components_net_hidden_layers = [64, 64]
+config.components_batch_size = 1000
+config.components_num_epochs = 10
+config.components_net_reg_loss_fact = 0.0
+config.components_net_drop_prob = 0.0
+
+config.gating_net_hidden_layers = [64, 64]
+config.gating_batch_size = 1000
+config.gating_num_epochs = 10
+config.gating_net_reg_loss_fact = 0.0
+config.gating_net_drop_prob = 0.0
+
+config.dre_reg_loss_fact = 0.0005
+config.dre_early_stopping = True
+config.dre_drop_prob = 0.0
+config.dre_num_iters = 50
+config.dre_batch_size = 1000
+config.dre_hidden_layers = [128, 128, 128]
+
+"""Build and Run EIM"""
+model = ConditionalMixtureEIM(config, train_samples=data.train_samples, seed=42 * 7, recorder=recorder, val_samples=data.val_samples)
+model.train()
