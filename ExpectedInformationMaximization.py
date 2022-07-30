@@ -944,7 +944,9 @@ class ConditionalMixtureEIM:
     @property
     def model(self):
         return self._model
-#########################################
+################################################################################
+#################  Running an experiment to test the model #####################
+################################################################################
 from ObstacleData import ObstacleData
 import json
 
