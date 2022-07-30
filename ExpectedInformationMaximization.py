@@ -16,7 +16,7 @@ import matplotlib.animation as anim
 
 def fanin_init(size, fanin=None):
 	fanin = fanin or size[0]
-	v = 1. / np.sqrt(fanin)
+	v = 1. / torch.sqrt(torch.tensor(fanin).float())
 	return torch.Tensor(size).uniform_(-v, v)
 
 class RecorderKeys:
