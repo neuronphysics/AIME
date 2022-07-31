@@ -3,8 +3,9 @@ import torch
 from torch import jit
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.distributions import Normal
-
+from torch.distributions.normal import Normal
+from torch.distributions import transforms as tT
+from torch.distributions.transformed_distribution import TransformedDistribution
 import gpytorch
 
 from models import DGPHiddenLayer
@@ -91,9 +92,16 @@ class ActorNetwork(nn.Module):
       log_std = torch.tanh(log_std)
       log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
       std = torch.exp(log_std)
-      base_distribution = torch.normal(0.0, 1.0)
-      transforms = torch.distributions.transforms.ComposeTransform([torch.distributions.transforms.AffineTransform(loc=self._action_means, scale=self._action_mag, event_dim=mean.shape[-1]), torch.nn.Tanh(),torch.distributions.transforms.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])])
-      a_distribution = torch.distributions.transformed_distribution.TransformedDistribution(base_distribution, transforms)
+      #base_distribution = torch.normal(0.0, 1.0)
+      #transforms = torch.distributions.transforms.ComposeTransform([torch.distributions.transforms.AffineTransform(loc=self._action_means, scale=self._action_mag, event_dim=mean.shape[-1]), torch.nn.Tanh(),torch.distributions.transforms.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])])
+      #a_distribution = torch.distributions.transformed_distribution.TransformedDistribution(base_distribution, transforms)
+      a_distribution = TransformedDistribution(
+                        base_distribution=Normal(loc=torch.full_like(mean, 0), 
+                                                 scale=torch.full_like(mean, 1)), 
+                        transforms=tT.ComposeTransform([
+                                   tT.AffineTransform(loc=self._action_means, scale=self._action_mag, event_dim=mean.shape[-1]), 
+                                   tT.TanhTransform(),
+                                   tT.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])]))
       #https://www.ccoderun.ca/programming/doxygen/pytorch/classtorch_1_1distributions_1_1transformed__distribution_1_1TransformedDistribution.html
       return a_distribution, a_tanh_mode
 
