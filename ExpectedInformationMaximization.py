@@ -1399,7 +1399,7 @@ class DRERecMod(RecorderModule):
 
     def _dre_rmse_fn(self, idx, dre, model, samples):
         mld = model.log_density(samples)
-        return tf.squeeze(dre(samples, idx)) - (self._target_ld(samples) - mld)
+        return torch.squeeze(dre(samples, idx)) - (self._target_ld(samples) - mld)
 
     def record(self, dre, model, iteration, steps):
         if iteration == 0 and self._target_ld is not None:
@@ -1432,6 +1432,53 @@ class DRERecMod(RecorderModule):
         self._fake_mean.append(fake_mean)
         if self._plot_realtime:
             self._recorder.handle_plot("Discriminator Evaluation", self._plot)
+
+    def finalize(self):
+        if self._save:
+            save_dict = {"estm_ikl": self._estm_ikl, "loss": self._loss, "acc": self._acc, "true_mean":
+                         self._true_mean, "fake_mean": self._fake_mean}
+            np.savez_compressed(os.path.join(self._save_path, "DensityRatioEstimatorEval_raw.npz"), **save_dict)
+            self._recorder.save_img("DensityRatioEstimatorEval", self._plot)
+
+    def _subplot(self, i, title, data_list, data_list2=None, y_lim=None):
+        plt.subplot(5 if self._target_ld is not None else 4, 1, i)
+        plt.title(title)
+        plt.plot(np.array(data_list))
+        if data_list2 is not None:
+            plt.plot(np.array(data_list2))
+        plt.xlim(0, self._num_iters)
+        if y_lim is not None:
+            plt.ylim(y_lim[0], y_lim[1])
+
+    def _plot_hist(self, errs):
+        for i, err in enumerate(errs):
+            plt.subplot(len(errs), 1, i+1)
+            plt.hist(err, density=True, bins=25)
+        plt.tight_layout()
+
+    def _plot(self):
+        self._subplot(1, "Estimated I-Projection", self._estm_ikl)
+        self._subplot(2, "Density Ratio Estimator Loss", self._loss)
+        self._subplot(3, "Density Ratio Estimator Accuracy", self._acc, y_lim=(-0.1, 1.1))
+        self._subplot(4, "", self._true_mean, self._fake_mean, y_lim=(-0.1, 1.1))
+        plt.legend(["Mean output true samples", "Mean output fake samples"])
+        if self._target_ld is not None:
+            plt.subplot(5, 1, 5)
+            for i in range(len(self._dre_rmse)):
+                self._subplot(5, "DRE RMSE", self._dre_rmse[i])
+        plt.tight_layout()
+
+    def get_last_rec(self):
+        lr = {"steps": self._steps[-1], "estimated_ikl": self._estm_ikl[-1], "dre_loss": self._loss[-1],
+              "accuracy": self._acc[-1], "true_mean": self._true_mean[-1], "fake_mean": self._fake_mean[-1]}
+        if self._target_ld is not None:
+            for i in range(len(self._dre_rmse)):
+                lr["dre_rmse{:d}".format(i)] = self._dre_rmse[i][-1]
+        return lr
+
+    @property
+    def logger_name(self):
+        return "DRE"
 """Recording"""
 recorder_dict = {
     RecorderKeys.TRAIN_ITER: TrainIterationRecMod(),
