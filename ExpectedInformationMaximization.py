@@ -308,6 +308,7 @@ class LambdaLayer(nn.Module):
 class ConditionalGaussian(nn.Module):
 
     def __init__(self, context_dim, sample_dim, hidden_dict, seed, trainable=True, weight_path=None):
+        super(ConditionalGaussian, self).__init__() 
         self._context_dim = context_dim
         self._sample_dim = sample_dim
         self._seed = seed
