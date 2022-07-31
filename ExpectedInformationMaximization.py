@@ -1108,19 +1108,19 @@ class ModelRecMod(RecorderModule):
         self.__num_iters = num_iters
 
     def _log_train(self, model):
-        if isinstance(self._train_samples, np.ndarray):
-            self._train_ll_list.append(np.array(model.log_likelihood(self._train_samples)))
+        if isinstance(self._train_samples,torch.Tensor):
+            self._train_ll_list.append(torch.tensor(model.log_likelihood(self._train_samples)))
         else:
-            self._train_ll_list.append(np.array(model.log_likelihood(self._train_samples[0], self._train_samples[1])))
+            self._train_ll_list.append(torch.tensor(model.log_likelihood(self._train_samples[0], self._train_samples[1])))
         log_str = "Training LL: " + str(self._train_ll_list[-1])
         if self._true_log_density is not None:
-            if isinstance(self._train_samples, np.ndarray):
+            if isinstance(self._train_samples, torch.Tensor):
                 model_train_samples = model.sample(len(self._train_samples))
-                self._train_kl_list.append(np.mean(model.log_density(model_train_samples) -
+                self._train_kl_list.append(torch.mean(model.log_density(model_train_samples) -
                                                    self._true_log_density(model_train_samples)))
             else:
                 model_train_samples = model.sample(self._train_samples[0])
-                self._train_kl_list.append(np.mean(model.log_density(self._train_samples[0], model_train_samples) -
+                self._train_kl_list.append(torch.mean(model.log_density(self._train_samples[0], model_train_samples) -
                                                    self._true_log_density(self._train_samples[0], model_train_samples)))
 
             log_str += " KL (MC-Estimate): " + str(self._train_kl_list[-1])
@@ -1129,21 +1129,21 @@ class ModelRecMod(RecorderModule):
             self._recorder.handle_plot("Loss", self._plot)
 
     def _log_test(self, model, model_test_samples=None):
-        if isinstance(self._test_samples, np.ndarray):
-            self._test_ll_list.append(np.array(model.log_likelihood(self._test_samples)))
+        if isinstance(self._test_samples, torch.Tensor):
+            self._test_ll_list.append(torch.tensor(model.log_likelihood(self._test_samples)))
         else:
-            self._test_ll_list.append(np.array(model.log_likelihood(self._test_samples[0], self._test_samples[1])))
+            self._test_ll_list.append(torch.tensor(model.log_likelihood(self._test_samples[0], self._test_samples[1])))
 
         log_str = "Test: Likelihood " + str(self._test_ll_list[-1])
 
         if self._true_log_density is not None:
-            if isinstance(self._train_samples, np.ndarray):
+            if isinstance(self._train_samples, torch.Tensor):
                 model_test_samples = model.sample(len(self._test_samples))
-                self._test_kl_list.append(np.mean(model.log_density(model_test_samples) -
+                self._test_kl_list.append(torch.mean(model.log_density(model_test_samples) -
                                                    self._true_log_density(model_test_samples)))
             else:
                 model_test_samples = model.sample(self._test_samples[0])
-                self._test_kl_list.append(np.mean(model.log_density(self._test_samples[0], model_test_samples) -
+                self._test_kl_list.append(torch.mean(model.log_density(self._test_samples[0], model_test_samples) -
                                                    self._true_log_density(self._test_samples[0], model_test_samples)))
             log_str += " KL (MC-Estimate): " + str(self._test_kl_list[-1])
         if self._eval_fn is not None:
@@ -1320,6 +1320,33 @@ class ComponentUpdateRecMod(RecorderModule):
         num_updt = len(res_list)
         log_str = "{:d} components updated - {:d} successful".format(num_updt, num_updt - fail_ct)
         self._logger.info(log_str)
+    def _plot_fn(self):
+        plt.subplot(2, 1, 1)
+        plt.title("Expected KL")
+        for i in range(self._num_components):
+            plt.plot(self._kls[i], c=self._c(i))
+        plt.legend(["Component {:d}".format(i + 1) for i in range(self._num_components)])
+        plt.xlim(0, self._num_iters)
+        plt.subplot(2, 1, 2)
+        plt.title("Expected Entropy")
+        for i in range(self._num_components):
+            plt.plot(self._entropies[i], c=self._c(i))
+        plt.xlim(0, self._num_iters)
+        plt.tight_layout()
+
+    @property
+    def logger_name(self):
+        return "Component Update"
+
+    def get_last_rec(self):
+        assert self._last_rec is not None
+        return self._last_rec
+
+    def finalize(self):
+        if self._plot:
+            self._recorder.save_img("ComponentUpdates", self._plot_fn)
+            
+#############
 
 class WeightUpdateRecMod(RecorderModule):
 
@@ -1371,10 +1398,10 @@ class DRERecMod(RecorderModule):
     """Records current Density Ratio Estimator performance - loss, accuracy and mean output for true and fake samples"""
     def __init__(self, true_samples, target_ld=None):
         super().__init__()
-        if isinstance(true_samples, np.ndarray):
-            self._target_samples = true_samples.astype(np.float32)
+        if isinstance(true_samples, torch.Tensor):
+            self._target_samples = true_samples.type(torch.float32)
         else:
-            self._target_samples = [x.astype(np.float32) for x in true_samples]
+            self._target_samples = [x.type(np.float32) for x in true_samples]
         self._steps = []
         self._estm_ikl = []
         self._loss = []
@@ -1386,7 +1413,7 @@ class DRERecMod(RecorderModule):
         self._dre_type = None
         if self._target_ld is not None:
             self._dre_rmse = []
-        self._conditional = not isinstance(true_samples, np.ndarray)
+        self._conditional = not isinstance(true_samples, torch.Tensor)
 
     def initialize(self, recorder, plot_realtime, save, num_iters):
         super().initialize(recorder, plot_realtime, save)
@@ -1405,7 +1432,7 @@ class DRERecMod(RecorderModule):
         if iteration == 0 and self._target_ld is not None:
             for _ in model.components:
                 self._dre_rmse.append([])
-        estm_ikl, loss, acc, true_mean, fake_mean = [np.array(x) for x in dre.eval(self._target_samples, model)]
+        estm_ikl, loss, acc, true_mean, fake_mean = [torch.tensor(x) for x in dre.eval(self._target_samples, model)]
         log_str = "Density Ratio Estimator ran for " + str(steps) + " steps. "
         log_str += "Loss {:.4f} ".format(loss)
         log_str += "Estimated IKL: {:.4f} ".format(estm_ikl)
@@ -1417,9 +1444,9 @@ class DRERecMod(RecorderModule):
             all_errs = []
             for i, c in enumerate(model.components):
                 samples = c.sample(1000)
-                errs = np.array(self._dre_rmse_fn(i, dre, model, samples))
+                errs = torch.tensor(self._dre_rmse_fn(i, dre, model, samples))
                 all_errs.append(errs)
-                self._dre_rmse[i].append(np.sqrt(np.mean(errs**2)))
+                self._dre_rmse[i].append(torch.sqrt(torch.mean(errs**2)))
                 log_str += "Component {:d}: DRE RMSE: {:.4f} ".format(i, self._dre_rmse[i][-1])
             self._recorder.handle_plot("Err Hist", self._plot_hist, all_errs)
         self._logger.info(log_str)
@@ -1443,9 +1470,9 @@ class DRERecMod(RecorderModule):
     def _subplot(self, i, title, data_list, data_list2=None, y_lim=None):
         plt.subplot(5 if self._target_ld is not None else 4, 1, i)
         plt.title(title)
-        plt.plot(np.array(data_list))
+        plt.plot(data_list.detach().numpy())
         if data_list2 is not None:
-            plt.plot(np.array(data_list2))
+            plt.plot(data_list2.detach().numpy())
         plt.xlim(0, self._num_iters)
         if y_lim is not None:
             plt.ylim(y_lim[0], y_lim[1])
@@ -1479,6 +1506,7 @@ class DRERecMod(RecorderModule):
     @property
     def logger_name(self):
         return "DRE"
+    
 """Recording"""
 recorder_dict = {
     RecorderKeys.TRAIN_ITER: TrainIterationRecMod(),
@@ -1489,7 +1517,7 @@ recorder_dict = {
                                         test_log_iters=1,
                                         eval_fn=eval_fn,
                                         save_log_iters=50),
-    RecorderKeys.DRE: DRERecMod(data.train_samples),
+    RecorderKeys.DRE: DRERecMod(torch.from_numpy(np.asarray(data.train_samples))),
     RecorderKeys.COMPONENT_UPDATE: ComponentUpdateRecMod(plot=True, summarize=False)}
 if num_components > 1:
     recorder_dict[RecorderKeys.WEIGHTS_UPDATE] = WeightUpdateRecMod(plot=True)
