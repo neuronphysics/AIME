@@ -298,13 +298,16 @@ def gaussian_log_density(samples, means, chol_covars):
 def gaussian_density(samples, means, chol_covars):
     return torch.exp(ConditionalGaussian.gaussian_log_density(samples, means, chol_covars))
 
-class LambdaLayer(nn.Module):
-    def __init__(self, lambd):
-        super(LambdaLayer, self).__init__()
-        self.lambd = lambd
-    def forward(self, x):
-        return self.lambd(x)
-    
+
+
+class Lambda(nn.Module):
+    def __init__(self, func):
+        super().__init__()
+        self.func = func
+
+    def forward(self, x): return self.func(x)
+
+       
 class ConditionalGaussian(nn.Module):
 
     def __init__(self, context_dim, sample_dim, hidden_dict, seed, trainable=True, weight_path=None):
@@ -317,7 +320,7 @@ class ConditionalGaussian(nn.Module):
         self.trainable = trainable
 
         self._model = self._build()
-        if self._weight_path is not None:
+        if weight_path is not None:
            self._model.load_state_dict(torch.load(weight_path))
             
 
@@ -325,20 +328,22 @@ class ConditionalGaussian(nn.Module):
         self._hidden_net, self.regularizer = build_dense_network(self._context_dim, output_dim=-1, output_activation=None,
                                                   params=self._hidden_dict, with_output_layer=False)
 
-        self._mean_t = nn.Linear(self._hidden_net._modules[next(iter(next(reversed(self._hidden_net._modules.items()))))].out_features, self._sample_dim)
+        #print(next(iter(next(reversed(self._hidden_net._modules.items())))))
+        self._mean_t = nn.Linear(self._hidden_net._modules[list(self._hidden_net._modules)[-2]].out_features, self._sample_dim)
         self._mean_t.weight.data = fanin_init(self._mean_t.weight.data.size())
-        self._chol_covar_raw = nn.Linear(self._hidden_net._modules[next(iter(next(reversed(self._hidden_net._modules.items()))))].out_features, self._sample_dim ** 2)
+        self._chol_covar_raw = nn.Linear(self._hidden_net._modules[list(self._hidden_net._modules)[-2]].out_features, self._sample_dim ** 2)
         self._chol_covar_raw.weight.data = fanin_init(self._chol_covar_raw.weight.data.size())
         #based on this  shorturl.at/pTVZ3
-        self._chol_covar =  LambdaLayer( lambda x:self._create_chol(x))(self._chol_covar_raw)
+        self._chol_covar =  Lambda(self._create_chol)
     
         
 
     def forward(self, contexts):
-        h = nn.ReLu(self._hidden_net(contexts))
-        mean=self._mean_t(h)
-        chol_covar =self._chol_covar(h)
-        covar= torch.matmult(torch.transpose(chol_covar, 0, 1),chol_covar)
+        h          = nn.ReLu(self._hidden_net(contexts))
+        mean       = self._mean_t(h)
+        covar      = self._chol_covar_raw(h)
+        chol_covar = self._chol_covar(covar)
+        covar      = torch.matmult(torch.transpose(chol_covar, 0, 1),chol_covar)
         return mean, covar, chol_covar 
     
     def mean(self, contexts):
@@ -428,6 +433,7 @@ class ConditionalGaussian(nn.Module):
 class Softmax(nn.Module):
 
     def __init__(self, context_dim, z_dim, hidden_dict, seed, trainable=True, weight_path=None):
+        super(Softmax, self).__init__()
         self._context_dim = context_dim
         self._z_dim = z_dim
         self._seed = seed
@@ -437,7 +443,7 @@ class Softmax(nn.Module):
         self._logit_net, self._logit_regularizer = build_dense_network(self._context_dim, self._z_dim, output_activation=None,
                                                  params=self._hidden_dict)
 
-        if self._weight_path is not None:
+        if weight_path is not None:
            self._logit_net.load_state_dict(torch.load(weight_path))
         
 
