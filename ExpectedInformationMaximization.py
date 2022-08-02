@@ -12,16 +12,87 @@ import logging
 import matplotlib.pyplot as plt
 import matplotlib.animation as anim
 from typing import List
-
+import math
 from itertools import chain
 """
     minimizing Kullback-Leibler divergences by estimating density ratios
     Based on https://github.com/pbecker93/ExpectedInformationMaximization/ 
 """
-def fanin_init(size, fanin=None):
-	fanin = fanin or size[0]
-	v = 1. / torch.sqrt(torch.tensor(fanin).float())
-	return torch.Tensor(size).uniform_(-v, v)
+def weights_init(modules, type='xavier'):
+    "Based on shorturl.at/jmqV3"
+    m = modules
+    if isinstance(m, nn.Conv2d):
+        if type == 'xavier':
+            torch.nn.init.xavier_normal_(m.weight)
+        elif type == 'kaiming':  # msra
+            torch.nn.init.kaiming_normal_(m.weight)
+        else:
+            n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            m.weight.data.normal_(0, math.sqrt(2. / n))
+
+        if m.bias is not None:
+            m.bias.data.zero_()
+    elif isinstance(m, nn.ConvTranspose2d):
+        if type == 'xavier':
+            torch.nn.init.xavier_normal_(m.weight)
+        elif type == 'kaiming':  # msra
+            torch.nn.init.kaiming_normal_(m.weight)
+        else:
+            n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            m.weight.data.normal_(0, math.sqrt(2. / n))
+
+        if m.bias is not None:
+            m.bias.data.zero_()
+    elif isinstance(m, nn.BatchNorm2d):
+        m.weight.data.fill_(1.0)
+        m.bias.data.zero_()
+    elif isinstance(m, nn.Linear):
+        if type == 'xavier':
+            torch.nn.init.xavier_normal_(m.weight)
+        elif type == 'kaiming':  # msra
+            torch.nn.init.kaiming_normal_(m.weight)
+        else:
+            m.weight.data.fill_(1.0)
+
+        if m.bias is not None:
+            m.bias.data.zero_()
+    elif isinstance(m, nn.Sequential):
+        for k, v in m._modules.items():
+            if isinstance(v, nn.Conv2d):
+                if type == 'xavier':
+                    torch.nn.init.xavier_normal_(v.weight)
+                elif type == 'kaiming':  # msra
+                    torch.nn.init.kaiming_normal_(v.weight)
+                else:
+                    n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
+                    v.weight.data.normal_(0, np.sqrt(2. / n))
+
+                if v.bias is not None:
+                    v.bias.data.zero_()
+            elif isinstance(v, nn.ConvTranspose2d):
+                if type == 'xavier':
+                    torch.nn.init.xavier_normal_(v.weight)
+                elif type == 'kaiming':  # msra
+                    torch.nn.init.kaiming_normal_(v.weight)
+                else:
+                    n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
+                    v.weight.data.normal_(0, np.sqrt(2. / n))
+
+                if v.bias is not None:
+                    v.bias.data.zero_()
+            elif isinstance(v, nn.BatchNorm2d):
+                v.weight.data.fill_(1.0)
+                v.bias.data.zero_()
+            elif isinstance(v, nn.Linear):
+                if type == 'xavier':
+                    torch.nn.init.xavier_normal_(v.weight)
+                elif type == 'kaiming':  # msra
+                    torch.nn.init.kaiming_normal_(v.weight)
+                else:
+                    v.weight.data.fill_(1.0)
+
+                if v.bias is not None:
+                    v.bias.data.zero_()
 
 class RecorderKeys:
     TRAIN_ITER = "train_iteration_module"
@@ -129,7 +200,8 @@ def build_dense_network(input_dim, output_dim, output_activation, params, with_o
     model = nn.Sequential(*layers)   
     regularizer = l2_penalty(model, l2_lambda=0.001) if l2_reg_fact > 0 else None
     return model, regularizer
-#### Distributions:
+###########################################
+#############  Distributions  #############
 
 class Gaussian:
 
@@ -337,14 +409,15 @@ class ConditionalGaussian(nn.Module):
                                                   params=self._hidden_dict, with_output_layer=False)
         
         self._model = self._hidden_net
-        idx = list(self._model._modules.keys())[-1] #get the index of last component in Sequential   
+        idx = list(self._model._modules.keys())[-1] #get the index of last component in Sequential 
+        hidden_dim = self._hidden_net._modules[list(self._hidden_net._modules)[-2]].out_features  
         #add a linear layer for a combination of mean and covariance
         self._model._modules[str(int(idx)+1)] = torch.nn.ReLU()
-        self._model._modules[str(int(idx)+2)] = nn.Linear(self._hidden_net._modules[list(self._hidden_net._modules)[-2]].out_features, self._sample_dim+self._sample_dim ** 2)
+        self._model._modules[str(int(idx)+2)] = nn.Linear(hidden_dim, self._sample_dim+self._sample_dim ** 2)
         #print(next(iter(next(reversed(self._hidden_net._modules.items())))))
         
-        self._model.weight.data = fanin_init(self._model.weight.data.size())
         
+        weights_init(self._model, 'xavier')
         #based on this  shorturl.at/pTVZ3
         self._chol_covar =  Lambda(self._create_chol)
         
