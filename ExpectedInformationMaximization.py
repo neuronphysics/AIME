@@ -675,19 +675,20 @@ class DensityRatioEstimator:
         self._conditional_model = conditional_model
 
         if self._conditional_model:
-            self._train_contexts = target_train_samples[0].type(torch.float32)
-            self._target_train_samples = torch.cat(target_train_samples, -1).type(torch.float32)
+            self._train_contexts = torch.from_numpy(target_train_samples[0]).type(torch.float32)
+            
+            self._target_train_samples = torch.cat([torch.from_numpy(x) for x in target_train_samples], -1).type(torch.float32)
         else:
-            self._target_train_samples = target_train_samples.type(torch.float32)
+            self._target_train_samples = torch.from_numpy(target_train_samples).type(torch.float32)
 
         if self._early_stopping:
             assert target_val_samples is not None, \
                 "For early stopping validation data needs to be provided via target_val_samples"
             if self._conditional_model:
-                self._val_contexts = target_val_samples[0].type(torch.float32)
-                self._target_val_samples = torch.cat(target_val_samples, -1).type(torch.float32)
+                self._val_contexts = torch.from_numpy(target_val_samples[0]).type(torch.float32)
+                self._target_val_samples = torch.cat([torch.from_numpy(x) for x in target_val_samples], -1).type(torch.float32)
             else:
-                self._target_val_samples = target_val_samples.type(torch.float32)
+                self._target_val_samples = torch.from_numpy(target_val_samples).type(torch.float32)
         self.hidden_params=hidden_params
         self.device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self._model=self._build()
