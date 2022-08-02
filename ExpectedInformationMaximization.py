@@ -337,9 +337,9 @@ class ConditionalGaussian(nn.Module):
                                                   params=self._hidden_dict, with_output_layer=False)
         
         self._model = self._hidden_net
-        idx = list(model._modules.keys())[-1] #get the index of last component in Sequential   
+        idx = list(self._model._modules.keys())[-1] #get the index of last component in Sequential   
         #add a linear layer for a combination of mean and covariance
-        self._model._modules[str(int(idx)+1)] = nn.ReLu()
+        self._model._modules[str(int(idx)+1)] = torch.nn.ReLU()
         self._model._modules[str(int(idx)+2)] = nn.Linear(self._hidden_net._modules[list(self._hidden_net._modules)[-2]].out_features, self._sample_dim+self._sample_dim ** 2)
         #print(next(iter(next(reversed(self._hidden_net._modules.items())))))
         
