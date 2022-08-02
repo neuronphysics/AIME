@@ -479,7 +479,7 @@ class Softmax(nn.Module):
         return self(contexts)
 
     def probabilities(self, contexts):
-        return nn.Softmax(self(contexts))
+        return nn.Softmax(self.logits(contexts))
 
     def log_probabilities(self, contexts):
         return torch.log(self.probabilities(contexts) + 1e-12)
