@@ -11,6 +11,9 @@ import warnings
 import logging
 import matplotlib.pyplot as plt
 import matplotlib.animation as anim
+from typing import List
+
+from itertools import chain
 """
     minimizing Kullback-Leibler divergences by estimating density ratios
     Based on https://github.com/pbecker93/ExpectedInformationMaximization/ 
@@ -307,7 +310,17 @@ class Lambda(nn.Module):
 
     def forward(self, x): return self.func(x)
 
-       
+###############################################
+def SplitLayer(layer,x,y):
+    r      = layer.chunk(x+y, dim = 1)
+    first  = torch.cat([i for i in r[:x]],dim=1)
+    second = torch.cat([i for i in r[x::]], dim=1)
+    return first, second
+
+
+###############################################
+
+#################  conditional ################    
 class ConditionalGaussian(nn.Module):
 
     def __init__(self, context_dim, sample_dim, hidden_dict, seed, trainable=True, weight_path=None):
@@ -319,38 +332,38 @@ class ConditionalGaussian(nn.Module):
 
         self.trainable = trainable
 
-        self._model = self._build()
-        if weight_path is not None:
-           self._model.load_state_dict(torch.load(weight_path))
-            
 
-    def _build(self):
         self._hidden_net, self.regularizer = build_dense_network(self._context_dim, output_dim=-1, output_activation=None,
                                                   params=self._hidden_dict, with_output_layer=False)
-
+        
+        self._model = self._hidden_net
+        idx = list(model._modules.keys())[-1] #get the index of last component in Sequential   
+        #add a linear layer for a combination of mean and covariance
+        self._model._modules[str(int(idx)+1)] = nn.ReLu()
+        self._model._modules[str(int(idx)+2)] = nn.Linear(self._hidden_net._modules[list(self._hidden_net._modules)[-2]].out_features, self._sample_dim+self._sample_dim ** 2)
         #print(next(iter(next(reversed(self._hidden_net._modules.items())))))
-        self._mean_t = nn.Linear(self._hidden_net._modules[list(self._hidden_net._modules)[-2]].out_features, self._sample_dim)
-        self._mean_t.weight.data = fanin_init(self._mean_t.weight.data.size())
-        self._chol_covar_raw = nn.Linear(self._hidden_net._modules[list(self._hidden_net._modules)[-2]].out_features, self._sample_dim ** 2)
-        self._chol_covar_raw.weight.data = fanin_init(self._chol_covar_raw.weight.data.size())
+        
+        self._model.weight.data = fanin_init(self._model.weight.data.size())
+        
         #based on this  shorturl.at/pTVZ3
         self._chol_covar =  Lambda(self._create_chol)
-    
         
+        if weight_path is not None:
+           self._model.load_state_dict(torch.load(weight_path))
+
 
     def forward(self, contexts):
-        h          = nn.ReLu(self._hidden_net(contexts))
-        mean       = self._mean_t(h)
-        covar      = self._chol_covar_raw(h)
-        chol_covar = self._chol_covar(covar)
-        covar      = torch.matmult(torch.transpose(chol_covar, 0, 1),chol_covar)
-        return mean, covar, chol_covar 
+        output      = self._model(contexts)
+        mean, covar = SplitLayer(output,self._sample_dim,self._sample_dim ** 2)
+        chol_covar  = self._chol_covar(covar)
+        covariance  = torch.matmult(torch.transpose(chol_covar, 0, 1),chol_covar)
+        return mean, covariance, chol_covar 
     
     def mean(self, contexts):
-        return self._model(contexts)[0]
+        return self(contexts)[0]
 
     def covar(self, contexts):
-        return self._model(contexts)[1]
+        return self(contexts)[1]
            
 
     def _create_chol(self, chol_raw):
@@ -362,13 +375,13 @@ class ConditionalGaussian(nn.Module):
         
 
     def sample(self, contexts):
-        mean, _, chol_covar = self._model(contexts)
+        mean, _, chol_covar = self(contexts)
         torch.random.manual_seed(self._seed)
         eps = torch.normal(mean=0,std=1,size=(torch.shape(mean)[0], torch.shape(mean)[1], 1))
         return mean + torch.reshape(torch.matmul(chol_covar, eps), torch.shape(mean))
 
     def log_density(self, contexts, samples):
-        mean,_, chol_covar = self._model(contexts)
+        mean, _, chol_covar = self(contexts)
         return gaussian_log_density(samples, mean, chol_covar)
 
     def density(self, contexts, samples):
@@ -376,12 +389,12 @@ class ConditionalGaussian(nn.Module):
 
     @staticmethod
     def expected_entropy(self, contexts):
-        _, _, chol_covars = self._model(contexts)
+        _, _, chol_covars = self(contexts)
         return 0.5 * (self._sample_dim * np.log(torch.tensor(2 * np.e * np.pi, requires_grad=False)) + torch.mean(self._covar_logdets(chol_covars)))
     
     @staticmethod
     def entropies(self, contexts):
-        _, _, chol_covars = self._model(contexts)
+        _, _, chol_covars = self(contexts)
         return 0.5 * (self._sample_dim * torch.log(torch.tensor(2 * np.e * np.pi, requires_grad=False)) + self._covar_logdets(chol_covars))
     
     @staticmethod
@@ -390,7 +403,7 @@ class ConditionalGaussian(nn.Module):
 
     @staticmethod
     def kls(self, contexts, other_means, other_chol_covars):
-        means, _, chol_covars = self._model(contexts)
+        means, _, chol_covars = self(contexts)
         kl = self._covar_logdets(other_chol_covars) - self._covar_logdets(chol_covars) - self._sample_dim
         kl += torch.sum(torch.square(torch.linalg.solve_triangular(other_chol_covars, chol_covars)), (-2, -1))
         diff = torch.unsqueeze(other_means - means, -1)
@@ -399,7 +412,7 @@ class ConditionalGaussian(nn.Module):
 
     @staticmethod
     def kls_other_chol_inv(self, contexts, other_means, other_chol_inv):
-        means, _, chol_covars = self._model(contexts)
+        means, _, chol_covars = self(contexts)
         kl = - self._covar_logdets(other_chol_inv) - self._covar_logdets(chol_covars) - self._sample_dim
         kl += torch.sum(torch.square(torch.matmul(other_chol_inv, chol_covars)),( -2, -1))
         diff = torch.unsqueeze(other_means - means, -1)
@@ -420,8 +433,19 @@ class ConditionalGaussian(nn.Module):
         return map(nn.Parameter, self.build(contexts))
 
     @property
-    def trainable_variables(self):
-        return filter(lambda p: p.requires_grad, self._model.parameters())
+    def trainable_variables(self) -> List[nn.Parameter]:
+        """The list of trainable variables (parameters) of the module.
+        Parameters of this module and all its submodules are included.
+        .. note::
+            The list returned may contain duplicate parameters (e.g. output
+            layer shares parameters with embeddings). For most usages, it's not
+            necessary to ensure uniqueness.
+        """
+        param = [x for x in self._model.parameters() if x.requires_grad]
+        chol  = [x for x in self._chol_covar.parameters() if x.requires_grad]
+        param.extend(chol)
+        
+        return param
 
     @property
     def sample_dim(self):
@@ -429,6 +453,8 @@ class ConditionalGaussian(nn.Module):
 
     def save_model_params(self, filepath):
         torch.save(self._model.state_dict(), filepath )
+    
+
 
 class Softmax(nn.Module):
 
@@ -445,13 +471,15 @@ class Softmax(nn.Module):
 
         if weight_path is not None:
            self._logit_net.load_state_dict(torch.load(weight_path))
-        
+     
+    def forward(self, x):
+        return self._logit_net(x)    
 
     def logits(self, contexts):
-        return self._logit_net(contexts)
+        return self(contexts)
 
     def probabilities(self, contexts):
-        return nn.Softmax(self.logits(contexts))
+        return nn.Softmax(self(contexts))
 
     def log_probabilities(self, contexts):
         return torch.log(self.probabilities(contexts) + 1e-12)
@@ -478,8 +506,15 @@ class Softmax(nn.Module):
         return torch.min(idx, -1)
 
     @property
-    def trainable_variables(self):
-        return filter(lambda p: p.requires_grad, self._logit_net.parameters())
+    def trainable_variables(self)-> List[nn.Parameter]:
+        """The list of trainable variables (parameters) of the module.
+        Parameters of this module and all its submodules are included.
+        .. note::
+            The list returned may contain duplicate parameters (e.g. output
+            layer shares parameters with embeddings). For most usages, it's not
+            necessary to ensure uniqueness.
+        """
+        return [x for x in self._logit_net.parameters() if x.requires_grad]
 
     def save_model_params(self, filepath):
         torch.save(self._logit_net.state_dict(), filepath )
