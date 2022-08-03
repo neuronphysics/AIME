@@ -16,6 +16,9 @@ tensorboard --logdir="~/scalar" --port=6010
 ## Then you can open the browser and copy the following web address
 http://localhost:16010 
 
+## Requirement:
+pip install -e git+https://github.com/ncullen93/torchsample.git#egg=torchsample 
+
 # Reference
 1. https://github.com/zhenwendai/RGP
 2. https://github.com/EmbodiedVision/dlgpd
