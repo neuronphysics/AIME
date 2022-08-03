@@ -18,7 +18,8 @@ from torchsample.callbacks import EarlyStopping, ReduceLROnPlateau
 from torchsample.modules import ModuleTrainer
 from torchsample.metrics import Metric
 from torchsample.regularizers import L2Regularizer
-from torchsample.callbacks import CallbackModule, History,TQDM
+from torchsample.initializers import XavierUniform
+
 """
     minimizing Kullback-Leibler divergences by estimating density ratios
     Based on https://github.com/pbecker93/ExpectedInformationMaximization/ 
@@ -576,7 +577,7 @@ class Softmax(nn.Module):
         return self(contexts)
 
     def probabilities(self, contexts):
-        return nn.Softmax(self.logits(contexts))
+        return nn.Softmax(dim=1)(self.logits(contexts))
 
     def log_probabilities(self, contexts):
         return torch.log(self.probabilities(contexts) + 1e-12)
@@ -595,11 +596,11 @@ class Softmax(nn.Module):
         thresholds = torch.cumsum(p, dim=-1)
         # ensure the last threshold is always exactly one - it can be slightly smaller due to numerical inaccuracies
         # of cumsum, causing problems in extremely rare cases if a "n" is samples that's larger than the last threshold
-        thresholds = torch.cat([thresholds[..., :-1], torch.ones([torch.size(thresholds)[0], 1])], -1)
+        thresholds = torch.cat([thresholds[..., :-1], torch.ones([thresholds.size()[0], 1])], -1)
         torch.random.manual_seed(self._seed)
-        n=torch.distributions.uniform.Uniform(0.0,1.0).rsample((torch.size(thresholds)[0], 1))
-        idx = torch.where(torch.lt(n, thresholds), torch.range(self._z_dim) * torch.ones(thresholds.shape, dtype=torch.int32),
-                       self._z_dim * torch.ones(thresholds.shape, dtype=torch.int32))
+        n=torch.distributions.uniform.Uniform(0.0,1.0).rsample((thresholds.size()[0], 1))
+        idx = torch.where(torch.lt(n, thresholds), torch.arange(self._z_dim) * torch.ones(thresholds.shape, dtype=torch.int64),
+                       self._z_dim * torch.ones(thresholds.shape, dtype=torch.int64))
         return torch.min(idx, -1)
 
     @property
@@ -616,11 +617,11 @@ class Softmax(nn.Module):
     def save_model_params(self, filepath):
         torch.save(self._logit_net.state_dict(), filepath )
 
-class GaussianEMM:
+class GaussianEMM(nn.Module):
 
     def __init__(self, context_dim, sample_dim, number_of_components, component_hidden_dict, gating_hidden_dict,
                  seed=0, trainable=True, weight_path=None):
-
+        super().__init__()
         self._context_dim = context_dim
         self._sample_dim = sample_dim
         self._number_of_components = number_of_components
@@ -662,7 +663,7 @@ class GaussianEMM:
         samples = torch.zeros([contexts.shape[0], self._sample_dim])
         for i in range(self._number_of_components):
             idx = (modes == i)
-            if torch.any(idx):
+            if np.any(idx):
                 samples[idx] = self._components[i].sample(contexts[idx])
         return samples
 
@@ -689,7 +690,7 @@ class GaussianEMM:
 
 
 ############# Main Class of the Model ###########
-logging.config.fileConfig('etc/logging.conf')
+
 class DensityRatioEstimator(nn.Module):
 
     def __init__(self, target_train_samples, hidden_params, early_stopping=False, target_val_samples=None,
@@ -742,18 +743,13 @@ class DensityRatioEstimator(nn.Module):
 
     def train(self, model, batch_size, num_iters):
         #compile the model
-        logging.info('eim.pth.tar')
-        if os.path.exists('eim.pth.tar'):
-           return True
-        logging.info(" Trainer ......")
         #https://github.com/ncullen93/torchsample
         self.trainer   = ModuleTrainer(model)
         
-        self.metric    = DensityRatioAccuracy()
-        self.criterion = logistic_regression_loss()
-        self.trainer.set_optimizer(torch.optim.Adam, lr=1e-4)
-        self.trainer.set_loss(self.criterion)
-        self.trainer.set_metrics(self.metric)
+        metrics   = [DensityRatioAccuracy()]
+        criterion = [logistic_regression_loss()]
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+        initializers = [XavierUniform(bias=False, module_filter='*')]
         regularizers   = [L2Regularizer(scale=1e-4)]
         self.trainer.set_regularizers(regularizers)
         if self._early_stopping:
@@ -765,7 +761,12 @@ class DensityRatioEstimator(nn.Module):
            model_train_samples = self.sample_model(model)
            callbacks = []
            validation_data = None
-        self.trainer.set_callbacks(callbacks)
+        self.trainer.compile(loss=criterion,
+                             optimizer=optimizer,
+                             regularizers=regularizers,
+                             initializers=initializers,
+                             metrics=metrics, 
+                             callbacks=callbacks)
 
         self.trainer.fit((self._target_train_samples, model_train_samples),
                          val_data=validation_data,
@@ -773,7 +774,6 @@ class DensityRatioEstimator(nn.Module):
                          num_epoch= num_iters,
                          verbose=1)
         train_loss = self.trainer.evaluate(self._target_train_samples, model_train_samples,batch_size=batch_size,verbose=1)
-        logging.info(train_loss)
         print(self.trainer.history['acc_metric'])
         print(self.trainer.history['loss'])
         last_epoch = self.trainer.epoch[-1]
