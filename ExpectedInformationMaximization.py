@@ -14,6 +14,11 @@ import matplotlib.animation as anim
 from typing import List
 import math
 from itertools import chain
+from torchsample.callbacks import EarlyStopping, ReduceLROnPlateau
+from torchsample.modules import ModuleTrainer
+from torchsample.metrics import Metric
+from torchsample.regularizers import L2Regularizer
+from torchsample.callbacks import CallbackModule, History,TQDM
 """
     minimizing Kullback-Leibler divergences by estimating density ratios
     Based on https://github.com/pbecker93/ExpectedInformationMaximization/ 
@@ -352,15 +357,34 @@ class GMM:
     def weight_distribution(self):
         return self._weight_distribution
 
-def accuracy(p_outputs, q_outputs):
-    p_prob = torch.nn.Sigmoid(p_outputs)
-    q_prob = torch.nn.Sigmoid(q_outputs)
-    return torch.mean(torch.cat([torch.greater_equal(p_prob, 0.5), torch.lt(q_prob, 0.5)], 0).type(torch.float32))
 
 
-def logistic_regression_loss(p_outputs, q_outputs):
-    return - torch.mean(torch.log(torch.nn.Sigmoid(p_outputs) + 1e-12)) \
-           - torch.mean(torch.log(1 - torch.nn.Sigmoid(q_outputs) + 1e-12))
+class DensityRatioAccuracy(Metric):
+
+    def __init__(self):
+        super(DensityRatioAccuracy, self).__init__()
+        self.p_prob = 0
+        self.q_prob = 0
+
+        self._name = 'DRAC_metric'
+
+    def reset(self):
+        self.p_prob = 0
+        self.q_prob = 0
+
+    def __call__(self, p_outputs, q_outputs):
+        self.p_prob = torch.nn.Sigmoid(p_outputs)
+        self.q_prob = torch.nn.Sigmoid(q_outputs)
+        acc         = torch.mean(torch.cat([torch.greater_equal(self.p_prob, 0.5), torch.lt(self.q_prob, 0.5)], 0).type(torch.float32))
+        return acc.cpu().detach().numpy()
+
+class logistic_regression_loss(nn.Module):
+    def __init__(self, epsilon= 1e-12):
+        super(logistic_regression_loss, self).__init__()
+        self.epsilon=epsilon
+    def forward(self,p_outputs, q_outputs):
+        return - torch.mean(torch.log(torch.nn.Sigmoid(p_outputs) +self.epsilon)) \
+               - torch.mean(torch.log(1 - torch.nn.Sigmoid(q_outputs) + self.epsilon))
 
   
 
@@ -664,13 +688,13 @@ class GaussianEMM:
         return torch.stack(means, 1), torch.stack(chol_covars, 1)
 
 
-
-
-class DensityRatioEstimator:
+############# Main Class of the Model ###########
+logging.config.fileConfig('etc/logging.conf')
+class DensityRatioEstimator(nn.Module):
 
     def __init__(self, target_train_samples, hidden_params, early_stopping=False, target_val_samples=None,
                  conditional_model=False):
-
+        super(DensityRatioEstimator,self).__init__()
         self._early_stopping = early_stopping
         self._conditional_model = conditional_model
 
@@ -691,9 +715,7 @@ class DensityRatioEstimator:
                 self._target_val_samples = torch.from_numpy(target_val_samples).type(torch.float32)
         self.hidden_params=hidden_params
         self.device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self._model=self._build()
         
-    def _build(self):
         input_dim = self._target_train_samples.shape[-1]
     
         self._ldre_net, self._ldre_regularizer = build_dense_network(input_dim=input_dim, output_dim=1,
@@ -701,8 +723,9 @@ class DensityRatioEstimator:
 
         self._p_samples = nn.Linear(input_dim,input_dim)
         self._q_samples = nn.Linear(input_dim,input_dim)
+        self.to(self.device)
         
-    def forward(self,x):
+    def forward(self, x):
         p = self._p_samples(x)
         q = self._q_samples(x)
         combined = torch.cat((p.view(p.size(0), -1),
@@ -713,40 +736,50 @@ class DensityRatioEstimator:
         )
         p_output, q_output =self._split_layers(combined)
         return p_output, q_output 
-    
-    def train(self, pre_epoch=30):
-        model = self._model.to(self.device)
-
-        # Create the optimizer
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, betas=(0.5, 0.999))
-        epoch_bar = tqdm(range(pre_epoch))
-        for _ in epoch_bar:
-            L = 0
-            for batchidx, (x, y) in enumerate(self.train_loader):
-                # Send data and labels to device
-                x = x.to(self.device)
-                y = y.to(self.device)
-
-                # Zero the optimizer
-                optimizer.zero_grad()
-
-                # Forward pass
-                self._train_model_p_outputs, self._train_model_q_outputs= self.model(x)
-
-                # Calculate loss score
-                #should I add the regularizer loss here?
-                loss = logistic_regression_loss(self._train_model_p_outputs, self._train_model_q_outputs) + self._ldre_regularizer
-                L   += loss.detach().cpu().numpy()
-                # Back prop
-                
-                loss.backward()
-                optimizer.step()    
-                self._acc = accuracy(self._train_model_p_outputs, self._train_model_q_outputs)
-            epoch_bar.write('\nL={:.4f} accuracy={:.4f}}\n'.format(L / len(self.train_loader), self._acc))
-        
 
     def __call__(self, samples):
         return self._ldre_net(samples)
+
+    def train(self, model, batch_size, num_iters):
+        #compile the model
+        logging.info('eim.pth.tar')
+        if os.path.exists('eim.pth.tar'):
+           return True
+        logging.info(" Trainer ......")
+        #https://github.com/ncullen93/torchsample
+        self.trainer   = ModuleTrainer(model)
+        
+        self.metric    = DensityRatioAccuracy()
+        self.criterion = logistic_regression_loss()
+        self.trainer.set_optimizer(torch.optim.Adam, lr=1e-4)
+        self.trainer.set_loss(self.criterion)
+        self.trainer.set_metrics(self.metric)
+        regularizers   = [L2Regularizer(scale=1e-4)]
+        self.trainer.set_regularizers(regularizers)
+        if self._early_stopping:
+           model_train_samples, model_val_samples = self.sample_model(model)
+           callbacks = [EarlyStopping(monitor='val_loss', patience=10),
+                        ReduceLROnPlateau(factor=0.5, patience=5)]
+           validation_data = ((self._target_val_samples, model_val_samples), None)
+        else:
+           model_train_samples = self.sample_model(model)
+           callbacks = []
+           validation_data = None
+        self.trainer.set_callbacks(callbacks)
+
+        self.trainer.fit((self._target_train_samples, model_train_samples),
+                         val_data=validation_data,
+                         batch_size=batch_size, 
+                         num_epoch= num_iters,
+                         verbose=1)
+        train_loss = self.trainer.evaluate(self._target_train_samples, model_train_samples,batch_size=batch_size,verbose=1)
+        logging.info(train_loss)
+        print(self.trainer.history['acc_metric'])
+        print(self.trainer.history['loss'])
+        last_epoch = self.trainer.epoch[-1]
+        return last_epoch+1, self.trainer.history.losses[-1],self.trainer.history.batch_metrics[-1]
+        
+
 
     def eval(self, target_samples, model):
         #Turns off training-time behavior
@@ -764,8 +797,10 @@ class DensityRatioEstimator:
             model_prob = nn.Sigmoid(model_ldre)
 
         ikl_estem = torch.mean(- model_ldre)
+        accuracy  = DensityRatioAccuracy()
         acc = accuracy(target_ldre, model_ldre)
-        bce = logistic_regression_loss(target_ldre, model_ldre)
+        
+        bce = self.criterion(target_ldre, model_ldre)
         return ikl_estem, bce, acc, torch.mean(target_prob), torch.mean(model_prob)
 
     def sample_model(self, model):
