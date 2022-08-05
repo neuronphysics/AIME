@@ -379,13 +379,7 @@ class DensityRatioAccuracy(Metric):
         acc         = torch.mean(torch.cat([torch.greater_equal(self.p_prob, 0.5), torch.lt(self.q_prob, 0.5)], 0).type(torch.float32))
         return acc.cpu().detach().numpy()
 
-class logistic_regression_loss(nn.Module):
-    def __init__(self, epsilon= 1e-12):
-        super(logistic_regression_loss, self).__init__()
-        self.epsilon=epsilon
-    def forward(self,p_outputs, q_outputs):
-        return - torch.mean(torch.log(torch.nn.Sigmoid(p_outputs) +self.epsilon)) \
-               - torch.mean(torch.log(1 - torch.nn.Sigmoid(q_outputs) + self.epsilon))
+
 
   
 
@@ -468,8 +462,10 @@ class ConditionalGaussian(nn.Module):
         #tensorflow.linalg.band_part(input, num_lower, num_upper, name=None) 
         #num_lower: A Tensor. The number of subdiagonals to preserve. Negative values ​​preserve all lower triangles
         #num_upper: A Tensor. The number of superdiagonals to preserve. Negative values ​​preserve all upper triangles.
-        samples =torch.triu(torch.reshape(chol_raw, [-1, self._sample_dim, self._sample_dim]).t(), diagonal=0).t()
-        return samples.fill_diagonal_(torch.exp(torch.diagonal(samples, dim1=-2, dim2=-1))+ 1e-12)
+        samples = torch.triu(torch.reshape(chol_raw, [-1, self._sample_dim, self._sample_dim]).t(), diagonal=0).t()
+        output  = samples.fill_diagonal_(torch.exp(torch.diagonal(samples, dim1=-2, dim2=-1))+ 1e-12)
+        print(output.size())
+        return output
         
 
     def sample(self, contexts):
@@ -616,9 +612,11 @@ class Softmax(nn.Module):
 
     def save_model_params(self, filepath):
         torch.save(self._logit_net.state_dict(), filepath )
+############################
 
+#############################
 class GaussianEMM(nn.Module):
-
+    """gated mixture of experts """
     def __init__(self, context_dim, sample_dim, number_of_components, component_hidden_dict, gating_hidden_dict,
                  seed=0, trainable=True, weight_path=None):
         super().__init__()
@@ -632,7 +630,13 @@ class GaussianEMM(nn.Module):
         wp = None if weight_path is None else os.path.join(weight_path, self._mixture_params_file_name())
         self._gating_distribution = Softmax(self._context_dim, self._number_of_components, gating_hidden_dict,
                                             seed=seed, trainable=trainable, weight_path=wp)
-
+        
+        self._gating_output_size = list(self._gating_distribution._modules.values())[-1][-1].out_features
+        # input features: 6
+        self._gating_input_size  = list(self._gating_distribution._modules.values())[-1][0].in_features
+        print(self._gating_output_size,self._gating_input_size)
+        
+        
         self._components = []
         for i in range(number_of_components):
             h_dict = component_hidden_dict[i] if isinstance(component_hidden_dict, list) else component_hidden_dict
@@ -640,11 +644,17 @@ class GaussianEMM(nn.Module):
             c = ConditionalGaussian(self._context_dim, self._sample_dim, h_dict,
                                     trainable=trainable, seed=seed, weight_path=wp)
             self._components.append(c)
-
+        #iput features: 6
+        self._component_input_size  = list(self._components[-1]._modules.values())[0][0].in_features
+        print(self._component_input_size)
+        #number_of_components: 3
         self.trainable_variables = self._gating_distribution.trainable_variables
         for c in self._components:
             self.trainable_variables += c.trainable_variables
 
+    def forward(self, inputs):
+        pass
+   
     def density(self, contexts, samples):
         p = self._gating_distribution.probabilities(contexts)
         density = p[:, 0] * self._components[0].density(contexts, samples)
@@ -688,8 +698,17 @@ class GaussianEMM(nn.Module):
             chol_covars.append(cc)
         return torch.stack(means, 1), torch.stack(chol_covars, 1)
 
-
-############# Main Class of the Model ###########
+#################  Define Loss  #################
+class LogisticRegressionLoss(nn.Module):
+    def __init__(self, epsilon= 1e-12):
+       super(LogisticRegressionLoss, self).__init__();
+       self.epsilon=epsilon
+    def forward(self,p_outputs, q_outputs, ):
+        return - torch.mean(torch.log(torch.nn.Sigmoid(p_outputs) +self.epsilon)) \
+               - torch.mean(torch.log(1 - torch.nn.Sigmoid(q_outputs) + self.epsilon))
+ 
+  
+############# Main Class of the Model #############
 
 class DensityRatioEstimator(nn.Module):
 
@@ -745,9 +764,9 @@ class DensityRatioEstimator(nn.Module):
         #compile the model
         #https://github.com/ncullen93/torchsample
         self.trainer   = ModuleTrainer(model)
-        
+        self.batch_size= batch_size
         metrics   = [DensityRatioAccuracy()]
-        criterion = [logistic_regression_loss()]
+        criterion = LogisticRegressionLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
         initializers = [XavierUniform(bias=False, module_filter='*')]
         regularizers   = [L2Regularizer(scale=1e-4)]
@@ -756,7 +775,7 @@ class DensityRatioEstimator(nn.Module):
            model_train_samples, model_val_samples = self.sample_model(model)
            callbacks = [EarlyStopping(monitor='val_loss', patience=10),
                         ReduceLROnPlateau(factor=0.5, patience=5)]
-           validation_data = ((self._target_val_samples, model_val_samples), None)
+           validation_data = (self._target_val_samples, model_val_samples)
         else:
            model_train_samples = self.sample_model(model)
            callbacks = []
@@ -767,13 +786,15 @@ class DensityRatioEstimator(nn.Module):
                              initializers=initializers,
                              metrics=metrics, 
                              callbacks=callbacks)
-
-        self.trainer.fit((self._target_train_samples, model_train_samples),
-                         val_data=validation_data,
-                         batch_size=batch_size, 
-                         num_epoch= num_iters,
-                         verbose=1)
-        train_loss = self.trainer.evaluate(self._target_train_samples, model_train_samples,batch_size=batch_size,verbose=1)
+        print("shape of input data....")
+        print(self._target_train_samples.size(), model_train_samples.size())
+        self.trainer.fit(inputs    = self._target_train_samples, 
+                         targets   = model_train_samples,
+                         val_data  = validation_data,
+                         batch_size= batch_size, 
+                         num_epoch = num_iters,
+                         verbose   = 0)
+        
         print(self.trainer.history['acc_metric'])
         print(self.trainer.history['loss'])
         last_epoch = self.trainer.epoch[-1]
@@ -781,27 +802,21 @@ class DensityRatioEstimator(nn.Module):
         
 
 
-    def eval(self, target_samples, model):
+    def eval(self, target_samples):
         #Turns off training-time behavior
-        model.eval()
-        
-        with torch.no_grad():
-            if self._conditional_model:
-               model_samples = torch.cat([target_samples[0], model.sample(target_samples[0])], dim=-1)
-               target_samples = torch.cat(target_samples, dim=-1)
-            else:
-               model_samples = model.sample(self._target_train_samples.shape[0])
-            target_ldre = self(target_samples)
-            model_ldre = self(model_samples)
-            target_prob = nn.Sigmoid(target_ldre)
-            model_prob = nn.Sigmoid(model_ldre)
-
+        if self._conditional_model:
+            model_samples = torch.cat([target_samples[0], model.sample(target_samples[0])], dim=-1)
+            target_samples = torch.cat(target_samples, dim=-1)
+        else:
+            model_samples = model.sample(self._target_train_samples.shape[0])
+        target_ldre = self(target_samples)
+        model_ldre = self(model_samples)
+        target_prob = nn.Sigmoid(target_ldre)
+        model_prob = nn.Sigmoid(model_ldre)
+        eval_loss = self.trainer.evaluate(target_ldre, model_ldre, batch_size=self.batch_size, verbose=1)
         ikl_estem = torch.mean(- model_ldre)
-        accuracy  = DensityRatioAccuracy()
-        acc = accuracy(target_ldre, model_ldre)
         
-        bce = self.criterion(target_ldre, model_ldre)
-        return ikl_estem, bce, acc, torch.mean(target_prob), torch.mean(model_prob)
+        return ikl_estem, eval_loss, torch.mean(target_prob), torch.mean(model_prob)
 
     def sample_model(self, model):
         """Sample model for density ratio estimator training"""
@@ -1705,3 +1720,4 @@ config.dre_hidden_layers = [128, 128, 128]
 """Build and Run EIM"""
 model = ConditionalMixtureEIM(config, train_samples=data.train_samples, seed=42 * 7, recorder=recorder, val_samples=data.val_samples)
 model.train()
+
