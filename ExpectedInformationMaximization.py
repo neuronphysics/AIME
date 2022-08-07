@@ -19,7 +19,9 @@ from torchsample.modules import ModuleTrainer
 from torchsample.metrics import Metric
 from torchsample.regularizers import L2Regularizer
 from torchsample.initializers import XavierUniform
-
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+from torchsample.datasets import TensorDataset
 """
     minimizing Kullback-Leibler divergences by estimating density ratios
     Based on https://github.com/pbecker93/ExpectedInformationMaximization/ 
@@ -653,7 +655,7 @@ class GaussianEMM(nn.Module):
             self.trainable_variables += c.trainable_variables
 
     def forward(self, inputs):
-        pass
+        return 
    
     def density(self, contexts, samples):
         p = self._gating_distribution.probabilities(contexts)
@@ -698,16 +700,11 @@ class GaussianEMM(nn.Module):
             chol_covars.append(cc)
         return torch.stack(means, 1), torch.stack(chol_covars, 1)
 
-#################  Define Loss  #################
-class LogisticRegressionLoss(nn.Module):
-    def __init__(self, epsilon= 1e-12):
-       super(LogisticRegressionLoss, self).__init__();
-       self.epsilon=epsilon
-    def forward(self,p_outputs, q_outputs, ):
-        return - torch.mean(torch.log(torch.nn.Sigmoid(p_outputs) +self.epsilon)) \
-               - torch.mean(torch.log(1 - torch.nn.Sigmoid(q_outputs) + self.epsilon))
+
+###################################################
+
+
  
-  
 ############# Main Class of the Model #############
 
 class DensityRatioEstimator(nn.Module):
@@ -766,34 +763,40 @@ class DensityRatioEstimator(nn.Module):
         self.trainer   = ModuleTrainer(model)
         self.batch_size= batch_size
         metrics   = [DensityRatioAccuracy()]
-        criterion = LogisticRegressionLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
         initializers = [XavierUniform(bias=False, module_filter='*')]
         regularizers   = [L2Regularizer(scale=1e-4)]
-        self.trainer.set_regularizers(regularizers)
+        LogisticRegressionLoss  = lambda p_outputs, q_outputs: - torch.mean(torch.log(torch.sigmoid(p_outputs) +1e-12))- torch.mean(torch.log(1 - torch.sigmoid(q_outputs) + 1e-12))
+
         if self._early_stopping:
            model_train_samples, model_val_samples = self.sample_model(model)
            callbacks = [EarlyStopping(monitor='val_loss', patience=10),
                         ReduceLROnPlateau(factor=0.5, patience=5)]
-           validation_data = (self._target_val_samples, model_val_samples)
+           print(f" size of validation data : {model_val_samples.size(0)}")
+           val_dataset =  TensorDataset(self._target_val_samples, model_val_samples)
+           val_loader  = DataLoader(val_dataset, batch_size=1, num_workers=0, shuffle=True)
         else:
            model_train_samples = self.sample_model(model)
-           callbacks = []
-           validation_data = None
-        self.trainer.compile(loss=criterion,
+           callbacks  = []
+           val_loader = None
+        train_dataset =  TensorDataset(self._target_train_samples, model_train_samples)
+        
+        train_loader  = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
+        print(batch_size,num_iters)
+
+        self.trainer.compile(loss=LogisticRegressionLoss,
                              optimizer=optimizer,
                              regularizers=regularizers,
                              initializers=initializers,
                              metrics=metrics, 
                              callbacks=callbacks)
-        print("shape of input data....")
-        print(self._target_train_samples.size(), model_train_samples.size())
-        self.trainer.fit(inputs    = self._target_train_samples, 
-                         targets   = model_train_samples,
-                         val_data  = validation_data,
-                         batch_size= batch_size, 
-                         num_epoch = num_iters,
-                         verbose   = 0)
+        #print("shape of input data....")
+        #torch.Size([10000, 12]) torch.Size([10000, 12])
+        #print(self._target_train_samples.size(), model_train_samples.size())
+        self.trainer.fit_loader(train_loader, 
+                               val_loader,
+                               num_epoch = num_iters,
+                               verbose   = 1)
         
         print(self.trainer.history['acc_metric'])
         print(self.trainer.history['loss'])
