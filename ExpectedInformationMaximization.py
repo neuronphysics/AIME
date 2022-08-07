@@ -773,15 +773,17 @@ class DensityRatioEstimator(nn.Module):
            callbacks = [EarlyStopping(monitor='val_loss', patience=10),
                         ReduceLROnPlateau(factor=0.5, patience=5)]
            print(f" size of validation data : {model_val_samples.size(0)}")
-           val_dataset =  TensorDataset(self._target_val_samples, model_val_samples)
-           val_loader  = DataLoader(val_dataset, batch_size=1, num_workers=0, shuffle=True)
+           #val_dataset =  TensorDataset(self._target_val_samples, model_val_samples)
+           #val_loader  = DataLoader(val_dataset, batch_size=1, num_workers=0, shuffle=True)
+           validation_data = (self._target_val_samples, model_val_samples)
         else:
            model_train_samples = self.sample_model(model)
            callbacks  = []
-           val_loader = None
-        train_dataset =  TensorDataset(self._target_train_samples, model_train_samples)
+           #val_loader = None
+           validation_data = None
+        #train_dataset =  TensorDataset(self._target_train_samples, model_train_samples)
         
-        train_loader  = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
+        #train_loader  = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
         print(batch_size,num_iters)
 
         self.trainer.compile(loss=LogisticRegressionLoss,
@@ -793,10 +795,11 @@ class DensityRatioEstimator(nn.Module):
         #print("shape of input data....")
         #torch.Size([10000, 12]) torch.Size([10000, 12])
         #print(self._target_train_samples.size(), model_train_samples.size())
-        self.trainer.fit_loader(train_loader, 
-                               val_loader,
-                               num_epoch = num_iters,
-                               verbose   = 1)
+        self.trainer.fit(self._target_train_samples, model_train_samples,
+                         val_data  = validation_data,
+                         batch_size= batch_size,
+                         num_epoch = num_iters,
+                         verbose   = 1)
         
         print(self.trainer.history['acc_metric'])
         print(self.trainer.history['loss'])
