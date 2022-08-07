@@ -671,7 +671,7 @@ class GaussianEMM(nn.Module):
            self.gating_losses["loss"]=torch.cat(self.gating_losses, dim=2)
            expected_entropy = self.gating_distribution.expected_entropy(inputs)
            self.gating_losses["expected_kl"] = self.gating_distribution.expected_kl(inputs, old_probs)
-           self.gating_losses["total_loss"] = torch.sum(torch.mean(probabilities * torch.mean(self.gating_losses["loss"],dim=2), 0)) + self.gating_losses["expected_kl"]
+           self.gating_losses["total_loss"] = torch.sum(torch.mean(old_probs * torch.mean(self.gating_losses["loss"],dim=2), 0)) + self.gating_losses["expected_kl"]
         importance_weights = self.gating_distribution.probabilities(inputs)
         importance_weights = importance_weights / torch.sum(importance_weights, dim=0, keepdims=True)
         #is importance_weights a distribution? Test it?
@@ -696,10 +696,9 @@ class GaussianEMM(nn.Module):
         self.components_loss["KL"]=torch.cat(kls_components,dim=1)
         self.components_loss["each_componnent_network"]=torch.cat(component_net_losses,dim=1)
         self.components_loss["total_loss"]=torch.cat(loss,dim=1)
-        comp = D.Independent(D.Normal(
-             old_means, old_chol_covars), 1)
-        gmm = MixtureSameFamily(importance_weights, comp)
-        return gmm
+        #not sure about this 
+        gmm = GMM(importance_weights, old_means, old_chol_covars)
+        return gmm(inputs)
 
     def density(self, contexts, samples):
         p = self._gating_distribution.probabilities(contexts)
