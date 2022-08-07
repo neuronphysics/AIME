@@ -813,11 +813,11 @@ class DensityRatioEstimator(nn.Module):
         else:
             model_samples = model.sample(self._target_train_samples.shape[0])
         target_ldre = self(target_samples)
-        model_ldre = self(model_samples)
-        target_prob = nn.Sigmoid(target_ldre)
-        model_prob = nn.Sigmoid(model_ldre)
-        eval_loss = self.trainer.evaluate(target_ldre, model_ldre, batch_size=self.batch_size, verbose=1)
-        ikl_estem = torch.mean(- model_ldre)
+        model_ldre  = self(model_samples)
+        target_prob = torch.sigmoid(target_ldre)
+        model_prob  = torch.sigmoid(model_ldre)
+        eval_loss   = self.trainer.evaluate(target_ldre, model_ldre, batch_size=self.batch_size, verbose=1)
+        ikl_estem   = torch.mean(- model_ldre)
         
         return ikl_estem, eval_loss, torch.mean(target_prob), torch.mean(model_prob)
 
