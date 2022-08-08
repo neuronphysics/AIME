@@ -1,3 +1,4 @@
+import utils_planner as utils
 from math import inf
 import torch
 from torch import jit
@@ -6,23 +7,23 @@ from torch.nn import functional as F
 from torch.distributions.normal import Normal
 from torch.distributions import transforms as tT
 from torch.distributions.transformed_distribution import TransformedDistribution
-import gpytorch
 
-from models import DGPHiddenLayer
-from gpytorch.models.deep_gps import DeepGP
-from gpytorch.likelihoods import GaussianLikelihood
-from gpytorch.means import ConstantMean, ZeroMean, LinearMean
-from gpytorch.mlls import DeepApproximateMLL, VariationalELBO
 from torch.autograd import Variable
-import utils_planner as utils
+
 import collections
-from absl import logging
 import numpy as np
 import os
 import gin
 import gym
-from typing import Callable
-  
+import mujoco_py
+from absl import app
+from absl import flags
+from absl import logging
+
+import time
+import alf_gym_wrapper
+import importlib  
+
 LOG_STD_MIN = -5
 LOG_STD_MAX = 0
 
@@ -470,6 +471,23 @@ class Agent(object):
     return self._global_step.numpy()
   
 ################# Policies #################
+class GaussianRandomSoftPolicy(nn.Module):
+  """Adds Gaussian noise to actor's action."""
+
+  def __init__(self, a_network, std=0.1, clip_eps=1e-3):
+    super(GaussianRandomSoftPolicy, self).__init__()
+    self._a_network = a_network
+    self._std = std
+    self._clip_eps = clip_eps
+
+  def __call__(self, observation, state=()):
+    action = self._a_network(observation)[1]
+    noise = torch.normal(mean=action.shape, std=self._std)
+    action = action + noise
+    spec = self._a_network.action_spec
+    action = torch.clamp(action, spec.minimum + self._clip_eps,
+                              spec.maximum - self._clip_eps)
+    return action, state
   
 class DeterministicSoftPolicy(nn.Module):
   """Returns mode of policy distribution."""
@@ -520,6 +538,8 @@ class MaxQSoftPolicy(nn.Module):
 #############################################
 ################ D2E Agent ################## 
 #############################################
+gin.clear_config()
+gin.config._REGISTRY.clear()
 @gin.configurable
 class D2EAgent(Agent):
   """D2E dual agent class."""
@@ -885,10 +905,59 @@ class D2EAgent(Agent):
         print("load checkpoint from \"" + self.checkpoint_path +
               "\" at " + str(self._global_step) + " time step")
 
-##########################
-#work in progress
-#Needs to convert to a pytorch code
-#shorturl.at/oprZ1
+PolicyConfig = collections.namedtuple(
+    'PolicyConfig', 'ptype, ckpt, wrapper, model_params')
+
+
+PTYPES = [
+    'randinit',
+    'load',
+]
+
+WRAPPER_TYPES = [
+    'none',
+    'gaussian',
+]
+
+# params: (wrapper_type, *wrapper_params)
+# wrapper_type: none, eps, gaussian, gaussianeps
+
+
+def wrap_policy(a_net, wrapper):
+  """Wraps actor network with desired randomization."""
+  if wrapper[0] == 'none':
+    policy = RandomSoftPolicy(a_net)
+  elif wrapper[0] == 'gaussian':
+    policy = GaussianRandomSoftPolicy(
+        a_net, std=wrapper[1])
+  return policy
+
+
+def load_policy(policy_cfg, action_spec):
+  """Loads policy based on config."""
+  if policy_cfg.ptype not in PTYPES:
+    raise ValueError('Unknown policy type %s.' % policy_cfg.ptype)
+  if policy_cfg.ptype in ['randinit', 'load']:
+    a_net = ActorNetwork(
+        action_spec,
+        fc_layer_params=policy_cfg.model_params)
+    if policy_cfg.ptype == 'load':
+      logging.info('Loading policy from %s...', policy_cfg.ckpt)
+      a_net = torch.load(policy_cfg.ckpt)
+    policy = wrap_policy(a_net, policy_cfg.wrapper)
+  return policy
+
+
+def parse_policy_cfg(policy_cfg):
+  return PolicyConfig(*policy_cfg)
+
+def maybe_makedirs(log_dir):
+  import os.path
+  if not os.path.exists(log_dir):
+     os.mkdir(log_dir)
+#####################################
+#from train_eval_utils
+from typing import Callable
 Transition = collections.namedtuple(
     'Transition', 's1, s2, a1, a2, discount, reward')
 
@@ -903,8 +972,8 @@ def eval_policy_episodes(env, policy, n_episodes):
       time_step = env.step(action)
       total_rewards += time_step.reward
     results.append(total_rewards)
-  results = np.array(results)
-  return float(np.mean(results)), float(np.std(results))
+  results = torch.tensor(results)
+  return torch.mean(results).to(dtype=torch.float32), torch.std(results).to(dtype=torch.float32)
 
 
 def eval_policies(env, policies, n_episodes):
@@ -917,7 +986,6 @@ def eval_policies(env, policies, n_episodes):
     infos[name]['episode_mean'] = mean
   results = results_episode_return
   return results, infos
-
 
 def map_structure(func: Callable, structure):
     
@@ -932,11 +1000,21 @@ def map_structure(func: Callable, structure):
 
     return func(structure)
 
-# TODO(wuyifan): external version for loading environments
-def env_factory(env_name):
-  py_env = gym.make(env_name)
-  # tf_env = tf_py_environment.TFPyEnvironment(py_env)
-  return py_env
+
+###############
+
+MUJOCO_ENVS = [
+    "Ant-v2",
+    "HalfCheetah-v2",
+    "Hopper-v2",
+    "Humanoid-v2",
+    "InvertedPendulum-v2",
+    "InvertedDoublePendulum-v2",
+    "Reacher-v2",
+    "Swimmer-v2",
+    "Walker2d-v2"
+]
+
 
 
 def get_transition(time_step, next_time_step, action, next_action):
@@ -947,8 +1025,7 @@ def get_transition(time_step, next_time_step, action, next_action):
       a2=next_action,
       reward=next_time_step.reward,
       discount=next_time_step.discount)
-
-
+  
 class DataCollector(object):
   """Class for collecting sequence of environment experience."""
 
@@ -974,8 +1051,29 @@ class DataCollector(object):
       return 1
     else:
       return 0
+  
+#######################
+def gather(params, indices, axis = None):
+    if axis is None:
+        axis = 0
+    if axis < 0:
+        axis = len(params.shape) + axis
+    if axis == 0:
+        return params[indices]
+    elif axis == 1:
+        return params[:, indices]
+    elif axis == 2:
+        return params[:, :, indices]
+    elif axis == 3:
+        return params[:,:,:, indices]
 
-
+def scatter_update(tensor, indices, updates):
+    tensor = torch.tensor(tensor)
+    indices = torch.tensor(indices, dtype=torch.long)
+    updates = torch.tensor(updates)
+    tensor[indices] = updates
+    return tensor
+  
 class DatasetView(object):
   """Interface for reading from dataset."""
 
@@ -991,7 +1089,6 @@ class DatasetView(object):
   def size(self):
     return self._indices.shape[0]
 
-
 def save_copy(data, ckpt_name):
   """Creates a copy of the current data and save as a checkpoint."""
   new_data = Dataset(
@@ -1002,8 +1099,7 @@ def save_copy(data, ckpt_name):
   full_batch = data.get_batch(np.arange(data.size))
   new_data.add_transitions(full_batch)
   torch.save(new_data, ckpt_name+".pt")
-
-
+  
 class Dataset(nn.Module):
   """Tensorflow module of dataset of transitions."""
 
@@ -1021,11 +1117,10 @@ class Dataset(nn.Module):
     obs_type = observation_spec.dtype
     action_shape = list(action_spec.shape)
     action_type = action_spec.dtype
-    print(f'size in init is: {size}')
-    self._s1 = self._zeros([size] + obs_shape, torch.float32)
-    self._s2 = self._zeros([size] + obs_shape, torch.float32)
-    self._a1 = self._zeros([size] + action_shape, torch.float32)
-    self._a2 = self._zeros([size] + action_shape, torch.float32)
+    self._s1 = self._zeros([size] + obs_shape, obs_type)
+    self._s2 = self._zeros([size] + obs_shape, obs_type)
+    self._a1 = self._zeros([size] + action_shape, action_type)
+    self._a2 = self._zeros([size] + action_shape, action_type)
     self._discount = self._zeros([size], torch.float32)
     self._reward = self._zeros([size], torch.float32)
     self._data = Transition(
@@ -1050,9 +1145,8 @@ class Dataset(nn.Module):
   def get_batch(self, indices):
     indices = torch.LongTensor(indices)
     def get_batch_(data_):
-      return data_[indices]
+      return gather(data_, indices)
     transition_batch = map_structure(get_batch_, self._data)
-
     return transition_batch
 
   @property
@@ -1069,132 +1163,180 @@ class Dataset(nn.Module):
 
   def _zeros(self, shape, dtype):
     """Create a variable initialized with zeros."""
-    return torch.zeros(tuple(shape))
+    return torch.autograd.Variable(torch.zeros(shape, dtype))
 
   def add_transitions(self, transitions):
     assert isinstance(transitions, Transition)
     batch_size = transitions.s1.shape[0]
     effective_batch_size = torch.minimum(
-        torch.tensor(batch_size), torch.tensor(self._size - self._current_idx))
+        batch_size, self._size - self._current_idx)
     indices = self._current_idx + torch.arange(effective_batch_size)
     for key in transitions._asdict().keys():
       data = getattr(self._data, key)
       batch = getattr(transitions, key)
-      for i, index in enumerate(indices):
-        data[index] = batch[:effective_batch_size][i]
+      scatter_update(data, indices, batch[:effective_batch_size])
     # Update size and index.
     if torch.less(self._current_size, self._size):
-      self._current_size.assign_add(effective_batch_size)
-    self._current_idx.assign_add(effective_batch_size)
+      self._current_size+=effective_batch_size
+    self._current_idx+=effective_batch_size
     if self._circular:
       if torch.greater_equal(self._current_idx, self._size):
-        self._current_idx.assign(0)
+        self._current_idx=0
+#########################
+
+#app.flags.DEFINE_string('f', '', 'kernel')
+#FLAGS =app.flags.FLAGS
+
+# def del_all_flags(FLAGS):
+flags_dict = flags.FLAGS._flags()
+keys_list = [keys for keys in flags_dict]
+for keys in keys_list:
+  flags.FLAGS.__delattr__(keys)
+#FLAGS = flags.FLAGS
+#app.flags.DEFINE_string('f', '', 'kernel')
+
+flags.DEFINE_string('root_offlinerl_dir', '/tmp/offlinerl/data','Root directory for saving data.')
+flags.DEFINE_string('sub_offlinerl_dir', '0', 'sub directory for saving data.')
+flags.DEFINE_string('env_name', 'HalfCheetah-v2', 'env name.')
+flags.DEFINE_string('data_name', 'random', 'data name.')
+flags.DEFINE_string('env_loader', 'mujoco', 'env loader, suite/gym.')
+flags.DEFINE_string('config_dir',
+                    'behavior_regularized_offline_rl.brac.configs',
+                    'config file dir.')
+flags.DEFINE_string('config_file', 'dcfg_pure', 'config file name.')
+flags.DEFINE_string('policy_root_dir', None,
+                    'Directory in which to find the behavior policy.')
+flags.DEFINE_integer('n_samples', int(1e6), 'number of transitions to collect.')
+flags.DEFINE_integer('n_eval_episodes', 20,
+                     'number episodes to eval each policy.')
+flags.DEFINE_multi_string('gin_file', None, 'Paths to the gin-config files.')
+flags.DEFINE_multi_string('gin_bindings', None, 'Gin binding parameters.')
+flags.DEFINE_string('hiddenflags', '0', 'Hidden flags parameter.') 
+
+FLAGS = flags.FLAGS
+
+def get_sample_counts(n, distr):
+  """Provides size of each sub-dataset based on desired distribution."""
+  distr = torch.tensor(distr)
+  distr = distr / torch.sum(distr)
+  counts = []
+  remainder = n
+  for i in range(distr.shape[0] - 1):
+    count = int(n * distr[i])
+    remainder -= count
+    counts.append(count)
+  counts.append(remainder)
+  return counts
 
 
-def shuffle_indices_with_steps(n, steps=1, rand=None):
-  """Randomly shuffling indices while keeping segments."""
-  if steps == 0:
-    return np.arange(n)
-  if rand is None:
-    rand = np.random
-  print(n)
-  print(steps)
-  n_segments = int(n // steps)
-  n_effective = n_segments * steps
-  batch_indices = rand.permutation(n_segments)
-  batches = np.arange(n_effective).reshape([n_segments, steps])
-  shuffled_batches = batches[batch_indices]
-  shuffled_indices = np.arange(n)
-  shuffled_indices[:n_effective] = shuffled_batches.reshape([-1])
-  return shuffled_indices
-
-env = env_factory('Pendulum-v0')
-# print(dir(env.spec))
-observation_spec = env.observation_space
-action_spec = env.action_space
-size = 1000
-# print(dir(observation_spec.shape))
-ds = Dataset(observation_spec=observation_spec, action_spec=action_spec, size=size)
-
-# Agent args.
-model_params=(((200, 200),), 2),
-optimizers=(('adam', 0.001),),
-batch_size=256,
-weight_decays=(0.0,),
-update_freq=1,
-update_rate=0.005,
-discount=0.99,
-shuffle_steps=0,
-rand = np.random.RandomState(0)
-n_train = int(1e6)
+def collect_n_transitions(tf_env, policy, data, n, log_freq=10000):
+  """Adds desired number of transitions to dataset."""
+  collector = DataCollector(tf_env, policy, data)
+  time_st = time.time()
+  timed_at_step = 0
+  steps_collected = 0
+  while steps_collected < n:
+    count = collector.collect_transition()
+    steps_collected += count
+    if (steps_collected % log_freq == 0
+        or steps_collected == n) and count > 0:
+      steps_per_sec = ((steps_collected - timed_at_step)
+                       / (time.time() - time_st))
+      timed_at_step = steps_collected
+      time_st = time.time()
+      logging.info('(%d/%d) steps collected at %.4g steps/s.', steps_collected,
+                   n, steps_per_sec)
 
 
-env2 = gym.make('Pendulum-v0')
-X = []
-y = [] 
-state = env.reset()
-reward_min = -16.5
-reward_max = 0
-n = size
-action = env2.action_space.sample()
-for i in range(n):
-  next_action = env2.action_space.sample()
-  new_state, reward, done, _ = env.step(action)
-  transition = Transition(
-      s1=torch.from_numpy(state),
-      s2=torch.from_numpy(new_state),
-      a1=torch.from_numpy(action),
-      a2=torch.from_numpy(next_action),
-      reward=torch.from_numpy(np.array([reward])),
-      discount=torch.from_numpy(np.array(discount)))
-  ds.add_transitions(transitions=transition)
+def collect_data(
+    log_dir,
+    data_config,
+    n_samples=int(1e6),
+    env_name='HalfCheetah-v2',
+    log_freq=int(1e4),
+    n_eval_episodes=20,
+    ):
+  """Creates dataset of transitions based on desired config."""
+  seed=0
+  torch.manual_seed(seed)
+  np.random.seed(seed)
+  dm_env = gym.spec(env_name).make()
+  env = alf_gym_wrapper.AlfGymWrapper(dm_env)
+  
+  observation_spec = env.observation_space.shape[0]
+  action_spec = env.action_space.shape[0]
+  observation_spec = env.observation_spec()
+  action_spec = env.action_spec()
 
-  action = next_action
-  # train_x_sample = torch.cat([torch.tensor(state).float(), torch.tensor(action).float()])
-  # X.append(train_x_sample)
-  # y.append(torch.tensor(new_state).float())
-  state = new_state
-  if done:
-    state = env2.reset()
+  # Initialize dataset.
+  sample_sizes = list([cfg[-1] for cfg in data_config])
+  sample_sizes = get_sample_counts(n_samples, sample_sizes)
+  data = Dataset(
+        observation_spec,
+        action_spec,
+        n_samples,
+        circular=False)
+  
+  # Collect data for each policy in data_config.
+  time_st = time.time()
+  test_results = collections.OrderedDict()
+  for (policy_name, policy_cfg, _), n_transitions in zip(
+      data_config, sample_sizes):
+    policy_cfg = parse_policy_cfg(policy_cfg)
+    policy = load_policy(policy_cfg, action_spec)
+    logging.info('Testing policy %s...', policy_name)
+    eval_mean, eval_std = eval_policy_episodes(
+        env, policy, n_eval_episodes)
+    test_results[policy_name] = [eval_mean, eval_std]
+    logging.info('Return mean %.4g, std %.4g.', eval_mean, eval_std)
+    logging.info('Collecting data from policy %s...', policy_name)
+    collect_n_transitions(env, policy, data, n_transitions, log_freq)
+
+  # Save final dataset.
+  assert data.size == data.capacity
+  data_ckpt_name = os.path.join(log_dir, 'data')
+  torch.save(data,data_ckpt_name)
+  time_cost = time.time() - time_st
+  logging.info('Finished: %d transitions collected, '
+               'saved at %s, '
+               'time cost %.4gs.', n_samples, data_ckpt_name, time_cost)
 
 
+def main(argv):
+  del argv
+  logging.set_verbosity(logging.INFO)
+  gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_bindings)
+  sub_dir = FLAGS.sub_offlinerl_dir
+  log_dir = os.path.join(
+      FLAGS.root_offlinerl_dir,
+      FLAGS.env_name,
+      FLAGS.data_name,
+      sub_dir,
+      )
+  utils.maybe_makedirs(log_dir)
+  config_module = importlib.import_module(
+      '{}.{}'.format(FLAGS.config_dir, FLAGS.config_file))
+  collect_data(
+      log_dir=log_dir,
+      data_config=config_module.get_data_config(FLAGS.env_name,
+                                                FLAGS.policy_root_dir),
+      n_samples=FLAGS.n_samples,
+      env_name=FLAGS.env_name,
+      n_eval_episodes=FLAGS.n_eval_episodes)
 
+def test_collect_data():
+    flags.FLAGS.sub_offlinerl_dir = '0'
+    flags.FLAGS.env_name = 'HalfCheetah-v2'
+    flags.FLAGS.data_name = 'example'
+    flags.FLAGS.config_file = 'dcfg_example'
+    data_dir = 'testdata'
+    flags.FLAGS.policy_root_dir = os.path.join(flags.FLAGS.test_srcdir,
+                                               data_dir)
 
-print(f'ds_size: {ds._size}')
-shuffled_indices = shuffle_indices_with_steps(
-      n=ds._size, rand=rand)
-train_indices = shuffled_indices[:n_train]
-train_data = ds.create_view(train_indices)
-agent_module = D2EAgent()
+    flags.FLAGS.n_samples = 1000000  # Short collection.
+    #flags.FLAGS.n_eval_episodes = 1
 
+    main(None)
+test_collect_data()
 
-class Flags(object):
-
-  def __init__(self, **kwargs):
-    for key, val in kwargs.items():
-      setattr(self, key, val)
-
-
-agent_flags = Flags(
-      observation_spec=observation_spec,
-      action_spec=action_spec,
-      model_params=model_params,
-      optimizers=optimizers,
-      batch_size=batch_size,
-      weight_decays=weight_decays,
-      update_freq=update_freq,
-      update_rate=update_rate,
-      discount=discount,
-      train_data=train_data)
-      
-# class Config(D2EAgent.Config):
-
-#   def _get_modules(self):
-#     return get_modules(
-#         self._agent_flags.model_params,
-#         self._agent_flags.action_spec)
-
-agent_args = agent_module.Config(agent_flags).agent_args
-agent = agent_module.Agent(**vars(agent_args))
-
-# agent = D2EAgent()
+  
