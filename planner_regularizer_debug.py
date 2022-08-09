@@ -1348,6 +1348,7 @@ def test_collect_data():
     flags.FLAGS.data_name = 'example'
     flags.FLAGS.config_file = 'dcfg_example'
     data_dir = 'testdata'
+    flags.FLAGS.test_srcdir= '0'
     flags.FLAGS.policy_root_dir = os.path.join(flags.FLAGS.test_srcdir,
                                                data_dir)
     flags.FLAGS.n_samples = 10000  # Short collection.
