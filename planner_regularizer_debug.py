@@ -7,7 +7,7 @@ from torch.nn import functional as F
 from torch.distributions.normal import Normal
 from torch.distributions import transforms as tT
 from torch.distributions.transformed_distribution import TransformedDistribution
-
+from tensorboardX import SummaryWriter
 from torch.autograd import Variable
 
 import collections
@@ -1183,7 +1183,25 @@ class Dataset(nn.Module):
       if torch.greater_equal(self._current_idx, self._size):
         self._current_idx=0
 #########################
+#utils.py
+def shuffle_indices_with_steps(n, steps=1, rand=None):
+  """Randomly shuffling indices while keeping segments."""
+  if steps == 0:
+    return np.arange(n)
+  if rand is None:
+    rand = np.random
+  n_segments = int(n // steps)
+  n_effective = n_segments * steps
+  batch_indices = rand.permutation(n_segments)
+  batches = np.arange(n_effective).reshape([n_segments, steps])
+  shuffled_batches = batches[batch_indices]
+  shuffled_indices = np.arange(n)
+  shuffled_indices[:n_effective] = shuffled_batches.reshape([-1])
+  return shuffled_indices
 
+
+#########################
+#collect_data.py
 #app.flags.DEFINE_string('f', '', 'kernel')
 #FLAGS =app.flags.FLAGS
 
@@ -1313,7 +1331,7 @@ def main(argv):
       FLAGS.data_name,
       sub_dir,
       )
-  utils.maybe_makedirs(log_dir)
+  maybe_makedirs(log_dir)
   config_module = importlib.import_module(
       '{}.{}'.format(FLAGS.config_dir, FLAGS.config_file))
   collect_data(
@@ -1336,7 +1354,193 @@ def test_collect_data():
     flags.FLAGS.n_samples = 1000000  # Short collection.
     #flags.FLAGS.n_eval_episodes = 1
 
-    main(None)
-test_collect_data()
+########################
+@gin.configurable
+def train_eval_offline(
+    # Basic args.
+    log_dir,
+    data_file,
+    agent_module,
+    env_name='HalfCheetah-v2',
+    n_train=int(1e6),
+    shuffle_steps=0,
+    seed=0,
+    use_seed_for_data=False,
+    # Train and eval args.
+    total_train_steps=int(1e6),
+    summary_freq=100,
+    print_freq=1000,
+    save_freq=int(2e4),
+    eval_freq=5000,
+    n_eval_episodes=20,
+    # Agent args.
+    model_params=(((200, 200),), 2),
+    optimizers=(('adam', 0.001),),
+    batch_size=256,
+    weight_decays=(0.0,),
+    update_freq=1,
+    update_rate=0.005,
+    discount=0.99,
+    ):
+  """Training a policy with a fixed dataset."""
+  # Create tf_env to get specs.
+  dm_env = gym.spec(env_name).make()
+  env = alf_gym_wrapper.AlfGymWrapper(dm_env)
+  
+  observation_spec = env.observation_spec()
+  action_spec = env.action_spec()
+
+  # Prepare data.
+  logging.info('Loading data from %s ...', data_file)
+  data_size = utils.load_variable_from_ckpt(data_file, 'data._capacity')
+  full_data = Dataset(observation_spec, action_spec, data_size)
+  # Split data.
+  n_train = min(n_train, full_data.size)
+  logging.info('n_train %s.', n_train)
+  if use_seed_for_data:
+    rand = np.random.RandomState(seed)
+  else:
+    rand = np.random.RandomState(0)
+  shuffled_indices = shuffle_indices_with_steps(
+      n=full_data.size, steps=shuffle_steps, rand=rand)
+  train_indices = shuffled_indices[:n_train]
+  train_data = full_data.create_view(train_indices)
+
+  # Create agent.
+  agent_flags = Flags(
+      observation_spec=observation_spec,
+      action_spec=action_spec,
+      model_params=model_params,
+      optimizers=optimizers,
+      batch_size=batch_size,
+      weight_decays=weight_decays,
+      update_freq=update_freq,
+      update_rate=update_rate,
+      discount=discount,
+      train_data=train_data)
+  agent_args = agent_module.Config(agent_flags).agent_args
+  agent = agent_module.Agent(**vars(agent_args))
+  agent_ckpt_name = os.path.join(log_dir, 'agent')
+
+  # Restore agent from checkpoint if there exists one.
+  if os.path.exists('{}.index'.format(agent_ckpt_name)):
+    logging.info('Checkpoint found at %s.', agent_ckpt_name)
+    torch.load(agent, agent_ckpt_name)
+
+  # Train agent.
+  train_summary_dir = os.path.join(log_dir, 'train')
+  eval_summary_dir = os.path.join(log_dir, 'eval')
+  train_summary_writer = SummaryWriter(
+      logdir=train_summary_dir)
+  eval_summary_writers = collections.OrderedDict()
+  for policy_key in agent.test_policies.keys():
+    eval_summary_writer = SummaryWriter(
+        logdir=os.path.join(eval_summary_dir, policy_key))
+    eval_summary_writers[policy_key] = eval_summary_writer
+  eval_results = []
+
+  time_st_total = time.time()
+  time_st = time.time()
+  step = agent.global_step
+  timed_at_step = step
+  while step < total_train_steps:
+    agent.train_step()
+    step = agent.global_step
+    if step % summary_freq == 0 or step == total_train_steps:
+      agent.write_train_summary(train_summary_writer)
+    if step % print_freq == 0 or step == total_train_steps:
+      agent.print_train_info()
+    if step % eval_freq == 0 or step == total_train_steps:
+      time_ed = time.time()
+      time_cost = time_ed - time_st
+      logging.info(
+          'Training at %.4g steps/s.', (step - timed_at_step) / time_cost)
+      eval_result, eval_infos = eval_policies(
+          env, agent.test_policies, n_eval_episodes)
+      eval_results.append([step] + eval_result)
+      logging.info('Testing at step %d:', step)
+      for policy_key, policy_info in eval_infos.items():
+        logging.info(utils.get_summary_str(
+            step=None, info=policy_info, prefix=policy_key+': '))
+        utils.write_summary(eval_summary_writers[policy_key], step, policy_info)
+      time_st = time.time()
+      timed_at_step = step
+    if step % save_freq == 0:
+      torch.save(agent, agent_ckpt_name)
+      logging.info('Agent saved at %s.', agent_ckpt_name)
+
+  torch.save(agent, agent_ckpt_name)
+  time_cost = time.time() - time_st_total
+  logging.info('Training finished, time cost %.4gs.', time_cost)
+  return torch.tensor(eval_results)
+
+##############################
+###train_offline.py
+flags.DEFINE_string('data_root_dir',
+                    os.path.join(os.getenv('HOME', '/'),
+                                 'tmp/offlinerl/data'),
+                    'Root directory for data.')
+flags.DEFINE_string('data_sub_dir', '0', '')
+flags.DEFINE_string('data_name', 'eps1', 'data name.')
+flags.DEFINE_string('data_file_name', 'data', 'data checkpoint file name.')
+
+# Flags for offline training.
+flags.DEFINE_string('root_dir',
+                    os.path.join(os.getenv('HOME', '/'), 'tmp/offlinerl/learn'),
+                    'Root directory for writing logs/summaries/checkpoints.')
+flags.DEFINE_string('sub_dir', '0', '')
+flags.DEFINE_string('agent_name', 'D2E', 'agent name.')
+flags.DEFINE_string('env_name', 'HalfCheetah-v2', 'env name.')
+flags.DEFINE_integer('seed', 0, 'random seed, mainly for training samples.')
+flags.DEFINE_integer('total_train_steps', int(5e5), '')
+flags.DEFINE_integer('n_eval_episodes', 20, '')
+flags.DEFINE_integer('n_train', int(1e6), '')
+flags.DEFINE_multi_string('gin_file', None, 'Paths to the gin-config files.')
+flags.DEFINE_multi_string('gin_bindings', None, 'Gin binding parameters.')
+
+FLAGS = flags.FLAGS
+AGENT_MODULES_DICT = {
+    'D2E': brac_dual_agent,
+}
+
+def main(_):
+  logging.set_verbosity(logging.INFO)
+  gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_bindings)
+  # Setup data file path.
+  data_dir = os.path.join(
+      FLAGS.data_root_dir,
+      FLAGS.env_name,
+      FLAGS.data_name,
+      FLAGS.data_sub_dir,
+      )
+  data_file = os.path.join(
+      data_dir, FLAGS.data_file_name)
+
+  # Setup log dir.
+  if FLAGS.sub_dir == 'auto':
+    sub_dir = utils.get_datetime()
+  else:
+    sub_dir = FLAGS.sub_dir
+  log_dir = os.path.join(
+      FLAGS.root_dir,
+      FLAGS.env_name,
+      FLAGS.data_name,
+      'n'+str(FLAGS.n_train),
+      FLAGS.agent_name,
+      sub_dir,
+      str(FLAGS.seed),
+      )
+  maybe_makedirs(log_dir)
+  train_eval_offline(
+      log_dir=log_dir,
+      data_file=data_file,
+      agent_module=AGENT_MODULES_DICT[FLAGS.agent_name],
+      env_name=FLAGS.env_name,
+      n_train=FLAGS.n_train,
+      total_train_steps=FLAGS.total_train_steps,
+      n_eval_episodes=FLAGS.n_eval_episodes,
+      )
+#more hyperparameter run_dual.sh
+
 
   
