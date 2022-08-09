@@ -251,7 +251,7 @@ class AgentModule(nn.Module):
   def q_source_weights(self):
       q_weights = []
       for q_net, _ in self._q_nets:
-         for k, net in q_net._modules.items():
+         for _, net in q_net._modules.values():
              q_weights += net.weight.data
       return q_weights
 
@@ -259,7 +259,7 @@ class AgentModule(nn.Module):
   def q_target_weights(self):
     q_weights = []
     for _, q_net in self._q_nets:
-        for k, net in q_net._modules.items():
+        for k, net in q_net._modules.values():
             q_weights += net.weight.data
     return q_weights
 
