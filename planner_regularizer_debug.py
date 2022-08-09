@@ -9,6 +9,8 @@ from torch.distributions import transforms as tT
 from torch.distributions.transformed_distribution import TransformedDistribution
 from tensorboardX import SummaryWriter
 from torch.autograd import Variable
+import datetime
+import re
 
 import collections
 import numpy as np
@@ -160,7 +162,8 @@ class CriticNetwork(nn.Module):
         for l in self._layers:
             hidden = l(hidden)
         return hidden
-
+############################
+##From utils.py
 class Flags(object):
 
   def __init__(self, **kwargs):
@@ -1280,11 +1283,9 @@ def collect_data(
   np.random.seed(seed)
   dm_env = gym.spec(env_name).make()
   env = alf_gym_wrapper.AlfGymWrapper(dm_env)
-  
-  observation_spec = env.observation_space.shape[0]
-  action_spec = env.action_space.shape[0]
   observation_spec = env.observation_spec()
   action_spec = env.action_spec()
+  
 
   # Initialize dataset.
   sample_sizes = list([cfg[-1] for cfg in data_config])
@@ -1311,7 +1312,6 @@ def collect_data(
     collect_n_transitions(env, policy, data, n_transitions, log_freq)
 
   # Save final dataset.
-  assert data.size == data.capacity
   data_ckpt_name = os.path.join(log_dir, 'data')
   torch.save(data,data_ckpt_name)
   time_cost = time.time() - time_st
@@ -1350,11 +1350,16 @@ def test_collect_data():
     data_dir = 'testdata'
     flags.FLAGS.policy_root_dir = os.path.join(flags.FLAGS.test_srcdir,
                                                data_dir)
-
-    flags.FLAGS.n_samples = 1000000  # Short collection.
-    #flags.FLAGS.n_eval_episodes = 1
+    flags.FLAGS.n_samples = 10000  # Short collection.
+    flags.FLAGS.n_eval_episodes = 1
+    main(None)
 
 ########################
+def get_datetime():
+  now = datetime.datetime.now().isoformat()
+  now = re.sub(r'\D', '', now)[:-6]
+  return now
+
 @gin.configurable
 def train_eval_offline(
     # Basic args.
@@ -1392,7 +1397,8 @@ def train_eval_offline(
 
   # Prepare data.
   logging.info('Loading data from %s ...', data_file)
-  data_size = utils.load_variable_from_ckpt(data_file, 'data._capacity')
+  data  = torch.load(data_file)
+  data_size = data.size()      
   full_data = Dataset(observation_spec, action_spec, data_size)
   # Split data.
   n_train = min(n_train, full_data.size)
@@ -1518,7 +1524,7 @@ def main(_):
 
   # Setup log dir.
   if FLAGS.sub_dir == 'auto':
-    sub_dir = utils.get_datetime()
+    sub_dir = get_datetime()
   else:
     sub_dir = FLAGS.sub_dir
   log_dir = os.path.join(
