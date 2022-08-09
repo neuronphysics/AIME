@@ -11,7 +11,7 @@ from tensorboardX import SummaryWriter
 from torch.autograd import Variable
 import datetime
 import re
-
+from torch.testing._internal.common_utils import TestCase
 import collections
 import numpy as np
 import os
@@ -1425,7 +1425,7 @@ def train_eval_offline(
       discount=discount,
       train_data=train_data)
   agent_args = agent_module.Config(agent_flags).agent_args
-  agent = agent_module.Agent(**vars(agent_args))
+  agent = agent_module.Agent(**vars(agent_args)) #ATTENTION: Debugg ====> should it be D2EAgent here??
   agent_ckpt_name = os.path.join(log_dir, 'agent')
 
   # Restore agent from checkpoint if there exists one.
@@ -1506,7 +1506,7 @@ flags.DEFINE_multi_string('gin_bindings', None, 'Gin binding parameters.')
 
 FLAGS = flags.FLAGS
 AGENT_MODULES_DICT = {
-    'D2E': brac_dual_agent,
+    'D2E': D2EAgent, ###Debug ===> is it correct to set it here??? 
 }
 
 def main(_):
@@ -1546,6 +1546,26 @@ def main(_):
       total_train_steps=FLAGS.total_train_steps,
       n_eval_episodes=FLAGS.n_eval_episodes,
       )
+
+
+class TrainOfflineTest(TestCase):
+
+  def test_train_offline(self):
+    data_dir = 'testdata/data'
+    flags.FLAGS.data_root_dir = os.path.join(flags.FLAGS.test_srcdir, data_dir)
+    flags.FLAGS.sub_dir = '0'
+    flags.FLAGS.env_name = 'HalfCheetah-v2'
+    flags.FLAGS.data_name = 'example'
+    flags.FLAGS.agent_name = 'D2E'
+    flags.FLAGS.gin_bindings = [
+        'train_eval_offline.model_params=((200, 200),)',
+        'train_eval_offline.optimizers=(("adam", 5e-4),)']
+    flags.FLAGS.n_train = 100
+    flags.FLAGS.n_eval_episodes = 1
+    flags.FLAGS.total_train_steps = 100  # Short training.
+
+    main(None)  # Just test that it runs.
+
 #more hyperparameter run_dual.sh
 
 
