@@ -249,16 +249,18 @@ class AgentModule(nn.Module):
 
   @property
   def q_source_weights(self):
-    q_weights = []
-    for q_net, _ in self._q_nets:
-      q_weights += q_net.weight.data
-    return q_weights
+      q_weights = []
+      for q_net, _ in self._q_nets:
+         for k, net in q_net._modules.items():
+             q_weights += net.weight.data
+      return q_weights
 
   @property
   def q_target_weights(self):
     q_weights = []
     for _, q_net in self._q_nets:
-      q_weights += q_net.weight.data
+        for k, net in q_net._modules.items():
+            q_weights += net.weight.data
     return q_weights
 
   @property
@@ -627,6 +629,7 @@ class D2EAgent(Agent):
     return torch.stack(norms).sum(dim=0)
 
   def ensemble_q(self, qs):
+    #compute the ensemble value of different Q networks
     lambda_ = self._ensemble_q_lambda
     return (lambda_ *torch.min(qs, dim=-1)
             + (1 - lambda_) * torch.max(qs, dim=-1))
@@ -657,12 +660,12 @@ class D2EAgent(Agent):
     div_estimate = self._divergence.dual_estimate(
         s2, a2_p, a2_b, self._c_fn)
     v2_target = q2_target - self._get_alpha_entropy() * log_pi_a2_p
-    if self._value_penalty:
+    if self._value_penalty: #Equation (5)
        v2_target = v2_target - self._get_alpha() * div_estimate
-    with torch.no_grad():
+    with torch.no_grad(): #Q(s,a)=R(s,a)+discount*v(s')
          q1_target = r + dsc * self._discount * v2_target
     q_losses = []
-    for q1_pred in q1_preds:
+    for q1_pred in q1_preds: #Equation (6)
       q_loss_ = torch.mean(torch.square(q1_pred - q1_target))
       q_losses.append(q_loss_)
     q_loss = torch.add(q_losses)
@@ -693,6 +696,7 @@ class D2EAgent(Agent):
     div_estimate = self._divergence.dual_estimate(
         s, a_p, a_b, self._c_fn)
     q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
+    #Equation 7
     p_loss = torch.mean(
         self._get_alpha_entropy() * log_pi_a_p
         + self._get_alpha() * div_estimate
