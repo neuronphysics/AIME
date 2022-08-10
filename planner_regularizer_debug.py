@@ -898,7 +898,7 @@ class D2EAgent(Agent):
             q_fn_target.load_state_dict(checkpoint["q_net_target"])
         self._p_fn.load_state_dict(checkpoint["policy_net"])
         self._c_fn.load_state_dict(checkpoint["critic_net"])
-        self._p_optimizer.load_state_dict(checkpoint["policy_optimizer1"])
+        self._p_optimizer.load_state_dict(checkpoint["policy_optimizer"])
         self._q_optimizer.load_state_dict(checkpoint["q_optimizer"])
         self._c_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self._global_step = checkpoint["train_step"]
