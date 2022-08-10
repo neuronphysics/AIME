@@ -24,6 +24,9 @@ import torch.nn.functional as F
 import numpy as np
 import math
 from torch.optim import Optimizer
+import datetime
+import re
+import os
 
 EPS = 1e-8  # Epsilon for avoiding numerical issues.
 CLIP_EPS = 1e-3  # Epsilon for clipping actions.
@@ -817,3 +820,41 @@ class AdaBoundW(Optimizer):
                     p.data.add_(-step_size)
 
         return loss
+
+
+def shuffle_indices_with_steps(n, steps=1, rand=None):
+  """Randomly shuffling indices while keeping segments."""
+  if steps == 0:
+    return np.arange(n)
+  if rand is None:
+    rand = np.random
+  n_segments = int(n // steps)
+  n_effective = n_segments * steps
+  batch_indices = rand.permutation(n_segments)
+  batches = np.arange(n_effective).reshape([n_segments, steps])
+  shuffled_batches = batches[batch_indices]
+  shuffled_indices = np.arange(n)
+  shuffled_indices[:n_effective] = shuffled_batches.reshape([-1])
+  return shuffled_indices
+
+
+def get_datetime():
+    now = datetime.datetime.now().isoformat()
+    now = re.sub(r'\D', '', now)[:-6]
+    return now
+
+def maybe_makedirs(log_dir):
+  import os.path
+  if not os.path.exists(log_dir):
+     os.mkdir(log_dir)
+
+def make_base_dir(list_of_dir):
+    first = list_of_dir[0]
+    if not os.path.exists(first):
+      os.mkdir(first)
+    for dir in list_of_dir[1:]:   
+        first = os.path.join(first, dir)
+        if not os.path.exists(first):
+            os.mkdir(first)
+
+    return first
