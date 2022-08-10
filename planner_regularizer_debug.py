@@ -429,11 +429,13 @@ class Agent(object):
         a2=transition_batch.a2,
         )
     return batch
-
+  
+  def _optimize_step(self, batch):
+      pass
             
   def train_step(self):
       train_batch = self._get_train_batch()
-      loss = self._build_loss(train_batch)
+      loss = self._optimize_step(train_batch)
       self._optimizer.zero_grad()
       loss.backward()
       self._optimizer.step()
