@@ -431,7 +431,7 @@ class Agent(object):
     return batch
 
             
-  def _train_step(self):
+  def train_step(self):
       train_batch = self._get_train_batch()
       loss = self._build_loss(train_batch)
       self._optimizer.zero_grad()
@@ -668,7 +668,7 @@ class D2EAgent(Agent):
     for q1_pred in q1_preds: #Equation (6)
       q_loss_ = torch.mean(torch.square(q1_pred - q1_target))
       q_losses.append(q_loss_)
-    q_loss = torch.add(q_losses)
+    q_loss = torch.sum(torch.stack(q_losses))
     q_w_norm = self._get_q_weight_norm()
     norm_loss = self._weight_decays[0] * q_w_norm
     loss = q_loss + norm_loss
@@ -842,7 +842,7 @@ class D2EAgent(Agent):
       self._extra_c_step(train_batch)
     for key, val in info.items():
       self._train_info[key] = val.numpy()
-    self._global_step.add(1)
+    self._global_step+=1
 
 
   def _build_test_policies(self):
