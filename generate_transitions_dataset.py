@@ -1,3 +1,4 @@
+from planner_D2E_regularizer import wrap_policy
 import utils_planner as utils
 from math import inf
 import torch
@@ -27,7 +28,7 @@ import importlib
 
 from dataset import Dataset, save_copy
 from collect_data import DataCollector, env_factory
-from planner_regularizer_debug import ActorNetwork, eval_policies, ContinuousRandomPolicy
+from planner_regularizer_debug import ActorNetwork, AgentModule, eval_policies, ContinuousRandomPolicy, Agent
 
 @gin.configurable
 def generate_dataset(
@@ -96,12 +97,27 @@ def generate_dataset(
             logging.info('(%d/%d) steps collected at %.4g steps/s.', steps_collected,
                    initial_explore_steps, steps_per_sec)
 
+    agent_flags = utils.Flags(
+      action_spec=action_spec,
+      model_params=model_params,
+      optimizers=optimizers,
+      batch_size=batch_size,
+      weight_decays=weight_decays,
+      update_freq=update_freq,
+      update_rate=update_rate,
+      discount=discount,
+      train_data=train_data)
+    agent_args = agent_module.Config(agent_flags).agent_args
+    agent = agent_module.Agent(**vars(agent_args))
+
   # Construct agent.
     actor = ActorNetwork(action_spec)
+    wrapped_actor_policy = wrap_policy(actor, ['none'])
+    # agent = Agent(action_spec=action_spec)
 
     # Prepare savers for models and results.
-    train_summary_dir = os.path.join(log_dir, 'train')
-    eval_summary_dir = os.path.join(log_dir, 'eval')
+    # train_summary_dir = os.path.join(log_dir, 'train')
+    # eval_summary_dir = os.path.join(log_dir, 'eval')
     # train_summary_writer = tf.compat.v2.summary.create_file_writer(
     #   train_summary_dir)
     # eval_summary_writers = collections.OrderedDict()
@@ -118,14 +134,14 @@ def generate_dataset(
     timed_at_step = 0
     target_partial_policy_saved = False
     collector = DataCollector(
-        tf_env, None, train_data)
+        tf_env, wrapped_actor_policy, train_data)
     step = 0
     for _ in range(total_train_steps):
-        # collector.collect_transition()
-        a_tanh_mode, a_sample, log_pi_a = actor.sample()
-        # agent.train_step()
-        # step = agent.global_step
-        step += 1
+        collector.collect_transition()
+        # a_tanh_mode, a_sample, log_pi_a = actor.sample()
+        agent.train_step()
+        step = agent.global_step
+        # step += 1
         # if step % summary_freq == 0 or step == total_train_steps:
         #     utils.write_train_summary(train_summary_writer, step)
         # if step % print_freq == 0 or step == total_train_steps:
@@ -137,7 +153,7 @@ def generate_dataset(
             logging.info(
                 'Training at %.4g steps/s.', (step - timed_at_step) / time_cost)
             eval_result, eval_infos = eval_policies(
-                tf_env_test, agent.test_policies, n_eval_episodes)
+                tf_env_test, wrapped_actor_policy, n_eval_episodes)
             eval_results.append([step] + eval_result)
             # Cecide whether to save a partially trained policy based on current model
             # performance.
@@ -212,7 +228,7 @@ def main(_):
   utils.maybe_makedirs(log_dir)
   generate_dataset(
       log_dir=log_dir,
-      agent_module=ActorNetwork,
+      agent_module=AgentModule,
       env_name=args.env_name,
       total_train_steps=args.total_train_steps,
       n_eval_episodes=args.n_eval_episodes,
