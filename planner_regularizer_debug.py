@@ -668,7 +668,7 @@ class D2EAgent(Agent):
     for q1_pred in q1_preds: #Equation (6)
       q_loss_ = torch.mean(torch.square(q1_pred - q1_target))
       q_losses.append(q_loss_)
-    q_loss = torch.sum(torch.stack(q_losses))
+    q_loss = torch.stack(q_losses).sum(dim=0)
     q_w_norm = self._get_q_weight_norm()
     norm_loss = self._weight_decays[0] * q_w_norm
     loss = q_loss + norm_loss
