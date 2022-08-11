@@ -185,6 +185,115 @@ class TensorSpec(object):
         if outer_dims is not None:
             shape = tuple(outer_dims) + shape
         return torch.randn(*shape, dtype=self._dtype)
+    
+def _random_uniform_int(shape, outer_dims, minval, maxval, dtype, seed=None):
+  """Iterates over n-d tensor minval, maxval limits to sample uniformly."""
+  # maxval in BoundedTensorSpec is bound inclusive.
+  # tf.random_uniform is upper bound exclusive, +1 to fix the sampling
+  # behavior.
+  # However +1 could cause overflow, in such cases we use the original maxval.
+  maxval = torch.broadcast_to(maxval, minval.shape).to(dtype)
+  minval = torch.broadcast_to(minval, maxval.shape).to(dtype)
+
+  sampling_maxval = maxval
+
+  if not torch.all(shape[-len(minval.shape):] == minval.shape):
+    raise ValueError(
+        "%s == shape[-%d:] != minval.shape == %s.  shape == %s." %
+        (shape[len(minval.shape):], len(minval.shape), minval.shape, shape))
+
+  # Example:
+  #  minval = [1.0, 2.0]
+  #  shape = [3, 2]
+  #  outer_dims = [5]
+  # Sampling becomes:
+  #  sample [5, 3] for minval 1.0
+  #  sample [5, 3] for minval 2.0
+  #  stack on innermost axis to get [5, 3, 2]
+  #  reshape to get [5, 3, 2]
+  samples = []
+  shape = torch.as_tensor(shape, dtype=torch.int32)
+  sample_shape = torch.cat((outer_dims, shape[:-len(minval.shape)]), dim=0)
+  full_shape = torch.cat((outer_dims, shape), dim=0)
+  if seed==None:
+      torch.manual_seed(0)
+  else:
+      torch.manual_seed(seed) 
+  for (single_min, single_max) in zip(minval.flat, sampling_maxval.flat):
+    samples.append(torch.tensor(sample_shape,dtype=dtype).uniform_(single_min, single_max))
+  samples = torch.stack(samples, axis=-1)
+  samples = torch.reshape(samples, full_shape)
+  return samples
+
+def sample_bounded_spec(spec, seed=None, outer_dims=None):
+  """Samples uniformily the given bounded spec.
+  Args:
+    spec: A BoundedSpec to sample.
+    seed: A seed used for sampling ops
+    outer_dims: An optional `Tensor` specifying outer dimensions to add to the
+      spec shape before sampling.
+  Returns:
+    A Tensor sample of the requested spec.
+    #based onn https://github.com/PeterJaq/optical-film-maker/blob/04db98357ed3ba7b0830b7e48fb3ddb4c6dc9194/agents/tf_agents/specs/tensor_spec.py
+  """
+  minval = spec.minimum
+  maxval = spec.maximum
+  dtype = spec.dtype
+
+  # To sample uint8 we will use int32 and cast later. This is needed for two
+  # reasons:
+  #  - tf.random_uniform does not currently support uint8
+  #  - if you want to sample [0, 255] range, there's no way to do this since
+  #    tf.random_uniform has exclusive upper bound and 255 + 1 would overflow.
+  is_uint8 = dtype == torch.uint8
+  sampling_dtype = torch.int32 if is_uint8 else dtype
+
+
+  if outer_dims is None:
+    outer_dims = torch.tensor([], dtype=torch.int32)
+  else:
+    outer_dims = torch.as_tensor(outer_dims, dtype=torch.int32)
+
+  def _unique_vals(vals):
+    if vals.size > 0:
+      if vals.ndim > 0:
+        return np.all(vals == vals[0])
+    return True
+
+  if (minval.ndim != 0 or
+      maxval.ndim != 0) and not (_unique_vals(minval) and _unique_vals(maxval)):
+    # tf.random_uniform can only handle minval/maxval 0-d tensors.
+
+    res = _random_uniform_int(
+        shape=spec.shape,
+        outer_dims=outer_dims,
+        minval=minval,
+        maxval=maxval,
+        dtype=sampling_dtype,
+        seed=seed)
+  else:
+    minval = minval.item(0) if minval.ndim != 0 else minval
+    maxval = maxval.item(0) if maxval.ndim != 0 else maxval
+    # BoundedTensorSpec are bounds inclusive.
+    # tf.random_uniform is upper bound exclusive, +1 to fix the sampling
+    # behavior.
+    # However +1 will cause overflow, in such cases we use the original maxval.
+
+    shape = torch.as_tensor(spec.shape, dtype=torch.int32)
+    full_shape = torch.cat((outer_dims, shape), dim=0)
+    g = torch.Generator()
+    if not seed is None:
+      g.manual_seed(seed)
+    else:
+      g.manual_seed(0) 
+    
+    print(f"type {type(minval)}")
+    res=torch.tensor(full_shape,dtype=sampling_dtype).uniform_(float(minval), float(maxval))
+
+  if is_uint8:
+    res =torch.tensor(res, dtype=dtype)
+
+  return res
 
 
 @gin.configurable
