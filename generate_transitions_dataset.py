@@ -28,6 +28,7 @@ import importlib
 from dataset import Dataset, save_copy
 from collect_data import DataCollector, env_factory
 from planner_regularizer_debug import ActorNetwork, AgentModule, eval_policies, ContinuousRandomPolicy, Agent, wrap_policy
+import alf_gym_wrapper
 
 
 def train_agent(agent_flags, agent_module, 
@@ -158,8 +159,10 @@ def generate_dataset(
     # Create tf_env to get specs.
     tf_env = env_factory(env_name)
     tf_env_test = env_factory(env_name)
-    observation_spec = tf_env.observation_spec()
-    action_spec = tf_env.action_spec()
+    observation_spec = tf_env.reset()
+    action = tf_env.action_space.sample()
+    action_spec = action
+    initial_state = tf_env.reset()
 
     # Initialize dataset.
     train_data = Dataset(
@@ -178,9 +181,9 @@ def generate_dataset(
     steps_collected = 0
     log_freq = 5000
     logging.info('Collecting data ...')
-    collector = DataCollector(tf_env, explore_policy, train_data)
+    collector = DataCollector(tf_env, explore_policy, train_data, discount)
     while steps_collected < initial_explore_steps:
-        count = collector.collect_transition()
+        count = collector.collect_transition(initial_state, steps_collected)
         steps_collected += count
         if (steps_collected % log_freq == 0
             or steps_collected == initial_explore_steps) and count > 0:
@@ -220,7 +223,7 @@ parser.add_argument('--root_dir', type=str, default= os.path.join('./offlinerl')
 parser.add_argument('--sub_dir', type=str, default='auto', help='sub directory for saving results.')
 
 parser.add_argument('--agent_name', type=str, default='sac', help='agent name.')
-parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.')
+parser.add_argument('--env_name', type=str, default='Pendulum-v0', help='env name.')
 parser.add_argument('--env_loader', type=str, default='mujoco', help='env loader, suite/gym.')
 parser.add_argument('--eval_target', type=int, default=1000, help='threshold for a paritally trained policy')
 

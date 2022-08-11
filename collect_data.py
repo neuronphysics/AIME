@@ -17,6 +17,7 @@ import argparse
 
 from planner_regularizer_debug import parse_policy_cfg, load_policy, eval_policy_episodes
 import importlib
+from dataset import Transition
 
 
 
@@ -183,45 +184,49 @@ class PolicyTest():
 
 def env_factory(env_name):
   py_env = gym.make(env_name)
+  # py_env = gym.spec(env_name).make()
   # tf_env = tf_py_environment.TFPyEnvironment(py_env)
   return py_env
   
 
-def get_transition(time_step, next_time_step, action, next_action):
-  return Dataset.Transition(
-      s1=time_step.observation,
-      s2=next_time_step.observation,
+def get_transition(state, next_state, action, next_action, reward, discount):
+  return Transition(
+      s1=state,
+      s2=next_state,
       a1=action,
       a2=next_action,
-      reward=next_time_step.reward,
-      discount=next_time_step.discount)
+      reward=reward,
+      discount= discount)
   
 
 class DataCollector(object):
   """Class for collecting sequence of environment experience."""
 
-  def __init__(self, env, policy, data):
+  def __init__(self, env, policy, data, discount=0.99):
     self._env = env
     self._policy = policy
     self._data = data
     self._saved_action = None
+    self.discount = discount
 
-  def collect_transition(self):
+  def collect_transition(self, state, steps_so_far):
     """Collect single transition from environment. Actions are from policy"""
-    time_step = self._env.current_time_step()
+    # time_step = self._env.current_time_step()
     if self._saved_action is None:
-      self._saved_action = self._policy(time_step.observation)[0]
+      self._saved_action = self._policy(state)[0]
       if self._saved_action == 'random':
-        self._saved_action = self.env.action_space.sample()
+        self._saved_action = self._env.action_space.sample()
     action = self._saved_action
-    next_time_step = self._env.step(action)
-    next_action = self._policy(next_time_step.observation)[0]
+    new_state, reward, done, _ = self._env.step(action)
+    next_action = self._policy(new_state)[0]
     if next_action == 'random':
-        next_action = self.env.action_space.sample()
+        next_action = self._env.action_space.sample()
     self._saved_action = next_action
-    if not time_step.is_last()[0].numpy():
-      transition = get_transition(time_step, next_time_step,
-                                  action, next_action)
+    if not done:
+      # Assuming standard discounted reward
+      transition = get_transition(state, new_state,
+                                  action, next_action, 
+                                  reward, self.discount**steps_so_far)
       self._data.add_transitions(transition)
       return 1
     else:
