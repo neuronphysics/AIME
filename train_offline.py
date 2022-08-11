@@ -59,11 +59,14 @@ def train_eval_offline(
     ):
   """Training a policy with a fixed dataset."""
   # Create tf_env to get specs.
-  dm_env = gym.spec(env_name).make()
-  env = alf_gym_wrapper.AlfGymWrapper(dm_env)
+  env = gym.spec(env_name).make()
+  # env = alf_gym_wrapper.AlfGymWrapper(dm_env)
   
-  observation_spec = env.observation_spec()
-  action_spec = env.action_spec()
+  observation_spec = env.reset()
+  action = env.action_space.sample()
+  action_spec = action
+  initial_state = env.reset()
+  
 
   # Prepare data.
   logging.info('Loading data from %s ...', data_file)
@@ -101,18 +104,18 @@ def train_eval_offline(
   # Restore agent from checkpoint if there exists one.
   if os.path.exists('{}.index'.format(agent_ckpt_name)):
     logging.info('Checkpoint found at %s.', agent_ckpt_name)
-    torch.load(agent, agent_ckpt_name)
+    agent = torch.load(agent_ckpt_name)
 
   # Train agent.
   train_summary_dir = os.path.join(log_dir, 'train')
   eval_summary_dir = os.path.join(log_dir, 'eval')
-  train_summary_writer = SummaryWriter(
-      logdir=train_summary_dir)
-  eval_summary_writers = collections.OrderedDict()
-  for policy_key in agent.test_policies.keys():
-    eval_summary_writer = SummaryWriter(
-        logdir=os.path.join(eval_summary_dir, policy_key))
-    eval_summary_writers[policy_key] = eval_summary_writer
+  # train_summary_writer = SummaryWriter(
+  #     logdir=train_summary_dir)
+  # eval_summary_writers = collections.OrderedDict()
+  # for policy_key in agent.test_policies.keys():
+  #   eval_summary_writer = SummaryWriter(
+  #       logdir=os.path.join(eval_summary_dir, policy_key))
+  #   eval_summary_writers[policy_key] = eval_summary_writer
   eval_results = []
 
   time_st_total = time.time()
@@ -122,10 +125,10 @@ def train_eval_offline(
   while step < total_train_steps:
     agent.train_step()
     step = agent.global_step
-    if step % summary_freq == 0 or step == total_train_steps:
-      agent.write_train_summary(train_summary_writer)
-    if step % print_freq == 0 or step == total_train_steps:
-      agent.print_train_info()
+    # if step % summary_freq == 0 or step == total_train_steps:
+    #   agent.write_train_summary(train_summary_writer)
+    # if step % print_freq == 0 or step == total_train_steps:
+    #   agent.print_train_info()
     if step % eval_freq == 0 or step == total_train_steps:
       time_ed = time.time()
       time_cost = time_ed - time_st
@@ -138,14 +141,14 @@ def train_eval_offline(
       for policy_key, policy_info in eval_infos.items():
         logging.info(utils.get_summary_str(
             step=None, info=policy_info, prefix=policy_key+': '))
-        utils.write_summary(eval_summary_writers[policy_key], step, policy_info)
+        # utils.write_summary(eval_summary_writers[policy_key], step, policy_info)
       time_st = time.time()
       timed_at_step = step
     if step % save_freq == 0:
-      torch.save(agent, agent_ckpt_name)
+      torch.save(agent, agent_ckpt_name+'.pt')
       logging.info('Agent saved at %s.', agent_ckpt_name)
 
-  torch.save(agent, agent_ckpt_name)
+  torch.save(agent, agent_ckpt_name+'.pt')
   time_cost = time.time() - time_st_total
   logging.info('Training finished, time cost %.4gs.', time_cost)
   return torch.tensor(eval_results)
