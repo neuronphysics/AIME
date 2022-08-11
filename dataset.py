@@ -54,9 +54,9 @@ def gather(params, indices, axis = None):
         return params[:,:,:, indices]
 
 def scatter_update(tensor, indices, updates):
-    tensor = torch.tensor(tensor)
+    tensor = torch.tensor(tensor, dtype=torch.float32)
     indices = torch.tensor(indices, dtype=torch.long)
-    updates = torch.tensor(updates)
+    updates = torch.tensor(updates, dtype=torch.float32)
     tensor[indices] = updates
     return tensor
   
@@ -157,11 +157,17 @@ class Dataset(nn.Module):
     assert isinstance(transitions, Transition)
     batch_size = transitions.s1.shape[0]
     effective_batch_size = torch.minimum(
-        batch_size, self._size - self._current_idx)
+        torch.tensor(batch_size), torch.tensor(self._size - self._current_idx))
     indices = self._current_idx + torch.arange(effective_batch_size)
     for key in transitions._asdict().keys():
       data = getattr(self._data, key)
       batch = getattr(transitions, key)
+      print(batch)
+      try:
+        if len(batch) == 0:
+          batch = [batch]
+      except:
+        batch = [batch]
       scatter_update(data, indices, batch[:effective_batch_size])
     # Update size and index.
     if torch.less(self._current_size, self._size):
