@@ -1,4 +1,3 @@
-from planner_D2E_regularizer import wrap_policy
 import utils_planner as utils
 from math import inf
 import torch
@@ -28,85 +27,25 @@ import importlib
 
 from dataset import Dataset, save_copy
 from collect_data import DataCollector, env_factory
-from planner_regularizer_debug import ActorNetwork, AgentModule, eval_policies, ContinuousRandomPolicy, Agent
+from planner_regularizer_debug import ActorNetwork, AgentModule, eval_policies, ContinuousRandomPolicy, Agent, wrap_policy
 
-@gin.configurable
-def generate_dataset(
-    # Basic args.
-    log_dir,
-    agent_module,
-    env_name='HalfCheetah-v2',
-    # Train and eval args.
-    total_train_steps=int(1e6),
-    summary_freq=100,
-    print_freq=1000,
-    save_freq=int(1e8),
-    eval_freq=5000,
-    n_eval_episodes=20,
-    # For saving a partially trained policy.
-    eval_target=None,  # Target return value to stop training.
-    eval_target_n=2,  # Stop after n consecutive evals above eval_target.
-    # Agent train args.
-    initial_explore_steps=10000,
-    replay_buffer_size=int(1e6),
-    model_params=(((200, 200),), 2),
-    optimizers=(('adam', 0.001),),
-    batch_size=256,
-    weight_decays=(0.0,),
-    update_freq=1,
-    update_rate=0.005,
-    discount=0.99,
-    ):
-    """Generating the dataset with ActorNetwork."""
-    # Create tf_env to get specs.
-    tf_env = env_factory(env_name)
-    tf_env_test = env_factory(env_name)
-    observation_spec = tf_env.observation_spec()
-    action_spec = tf_env.action_spec()
 
-    # Initialize dataset.
-    train_data = Dataset(
-        observation_spec,
-        action_spec,
-        replay_buffer_size,
-        circular=True,
-    )
-    # checkpoint
-    data_ckpt = torch.save(train_data, os.path.join(log_dir, utils.get_datetime()))
-    data_ckpt_name = os.path.join(log_dir, 'replay')
+def train_agent(agent_flags, agent_module, 
+        action_spec, 
+        train_data, 
+        log_dir, 
+        tf_env, 
+        total_train_steps, 
+        eval_freq, 
+        tf_env_test, 
+        n_eval_episodes, 
+        eval_target, 
+        eval_target_n, 
+        data_ckpt_name, 
+        data_ckpt, 
+        save_freq, 
+        time_st_total):
 
-    time_st_total = time.time()
-    time_st = time.time()
-    timed_at_step = 0
-
-    # Collect data from random policy.
-    explore_policy = ContinuousRandomPolicy(action_spec)
-    steps_collected = 0
-    log_freq = 5000
-    logging.info('Collecting data ...')
-    collector = DataCollector(tf_env, explore_policy, train_data)
-    while steps_collected < initial_explore_steps:
-        count = collector.collect_transition()
-        steps_collected += count
-        if (steps_collected % log_freq == 0
-            or steps_collected == initial_explore_steps) and count > 0:
-            steps_per_sec = ((steps_collected - timed_at_step)
-                       / (time.time() - time_st))
-            timed_at_step = steps_collected
-            time_st = time.time()
-            logging.info('(%d/%d) steps collected at %.4g steps/s.', steps_collected,
-                   initial_explore_steps, steps_per_sec)
-
-    agent_flags = utils.Flags(
-      action_spec=action_spec,
-      model_params=model_params,
-      optimizers=optimizers,
-      batch_size=batch_size,
-      weight_decays=weight_decays,
-      update_freq=update_freq,
-      update_rate=update_rate,
-      discount=discount,
-      train_data=train_data)
     agent_args = agent_module.Config(agent_flags).agent_args
     agent = agent_module.Agent(**vars(agent_args))
 
@@ -126,6 +65,7 @@ def generate_dataset(
     #     os.path.join(eval_summary_dir, policy_key))
     # eval_summary_writers[policy_key] = eval_summary_writer
     actor_ckpt_name = os.path.join(log_dir, 'actor')
+    agent_ckpt_name = os.path.join(log_dir, 'actor')
     eval_results = []
 
     # Train actor.
@@ -176,21 +116,106 @@ def generate_dataset(
             time_st = time.time()
             timed_at_step = step
         if step % save_freq == 0:
-            torch.save(actor_ckpt_name + '-' + str(step))
+            torch.save(actor, actor_ckpt_name + '-' + str(step) + '.pt')
 
     # Final save after training.
-    torch.save(actor_ckpt_name + '_final')
-    data_ckpt.write(data_ckpt_name + '_final')
+    torch.save(agent, agent_ckpt_name + '_final.pt')
+    torch.save(actor, actor_ckpt_name + '_final.pt')
+    torch.save(collector, data_ckpt_name + '_final.pt')
     time_cost = time.time() - time_st_total
     logging.info('Training finished, time cost %.4gs.', time_cost)
     return np.array(eval_results)
 
 
+@gin.configurable
+def generate_dataset(
+    # Basic args.
+    log_dir,
+    agent_module,
+    env_name='HalfCheetah-v2',
+    # Train and eval args.
+    total_train_steps=int(1e6),
+    summary_freq=100,
+    print_freq=1000,
+    save_freq=int(1e8),
+    eval_freq=5000,
+    n_eval_episodes=20,
+    # For saving a partially trained policy.
+    eval_target=None,  # Target return value to stop training.
+    eval_target_n=2,  # Stop after n consecutive evals above eval_target.
+    # Agent train args.
+    initial_explore_steps=10000,
+    replay_buffer_size=int(1e6),
+    model_params=(((200, 200),), 2),
+    optimizers=(('adam', 0.001),),
+    batch_size=256,
+    weight_decays=(0.0,),
+    update_freq=1,
+    update_rate=0.005,
+    discount=0.99,
+    ):
+    """Generating the dataset with ActorNetwork."""
+    # Create tf_env to get specs.
+    tf_env = env_factory(env_name)
+    tf_env_test = env_factory(env_name)
+    observation_spec = tf_env.observation_spec()
+    action_spec = tf_env.action_spec()
+
+    # Initialize dataset.
+    train_data = Dataset(
+        observation_spec,
+        action_spec,
+        replay_buffer_size,
+        circular=True,
+    )
+
+    time_st_total = time.time()
+    time_st = time.time()
+    timed_at_step = 0
+
+    # Collect data from random policy.
+    explore_policy = ContinuousRandomPolicy(action_spec)
+    steps_collected = 0
+    log_freq = 5000
+    logging.info('Collecting data ...')
+    collector = DataCollector(tf_env, explore_policy, train_data)
+    while steps_collected < initial_explore_steps:
+        count = collector.collect_transition()
+        steps_collected += count
+        if (steps_collected % log_freq == 0
+            or steps_collected == initial_explore_steps) and count > 0:
+            steps_per_sec = ((steps_collected - timed_at_step)
+                       / (time.time() - time_st))
+            timed_at_step = steps_collected
+            time_st = time.time()
+            logging.info('(%d/%d) steps collected at %.4g steps/s.', steps_collected,
+                   initial_explore_steps, steps_per_sec)
+
+    # checkpoint
+    data_ckpt_name = os.path.join(log_dir, 'replay')
+    torch.save(train_data, os.path.join(log_dir, data_ckpt_name)+'.pt')
+
+    agent_flags = utils.Flags(
+      action_spec=action_spec,
+      model_params=model_params,
+      optimizers=optimizers,
+      batch_size=batch_size,
+      weight_decays=weight_decays,
+      update_freq=update_freq,
+      update_rate=update_rate,
+      discount=discount,
+      train_data=train_data)
+
+    return
+
+    # return train_agent(agent_flags, agent_module, action_spec, train_data, log_dir, tf_env, total_train_steps, eval_freq, tf_env_test, n_eval_episodes, eval_target, eval_target_n, data_ckpt_name, data_ckpt, save_freq, time_st_total )
+    
+
+
 
 parser = argparse.ArgumentParser(description='AIME')
 
-parser.add_argument('--root_dir', type=str, default= os.path.join(os.getenv('HOME', '/'),
-                                 'tmp/offlinerl/policies'), 
+parser.add_argument('--root_dir', type=str, default= os.path.join('./offlinerl'), 
                                  help='Root directory for writing logs/summaries/checkpoints.')
 parser.add_argument('--sub_dir', type=str, default='auto', help='sub directory for saving results.')
 
@@ -219,12 +244,14 @@ def main(_):
     sub_dir = utils.get_datetime()
   else:
     sub_dir = args.sub_dir
-  log_dir = os.path.join(
-      args.root_dir,
-      args.env_name,
-      args.agent_name,
-      sub_dir,
-      )
+#   log_dir = os.path.join(
+#       args.root_dir,
+#       args.env_name,
+#       args.agent_name,
+#       sub_dir,
+#       )
+  base_dir = utils.make_base_dir([args.root_dir, 'datasets', args.env_name, args.agent_name, sub_dir])
+  log_dir = os.path.join(base_dir, sub_dir)
   utils.maybe_makedirs(log_dir)
   generate_dataset(
       log_dir=log_dir,
