@@ -531,7 +531,6 @@ class ContinuousRandomPolicy(nn.Module):
     #     self._action_spec, outer_dims=[observation.shape[0]])
     # action = self._action_spec.sample()
     # return action, state
-    print('In call')
     return ["random"]
 
 

@@ -179,7 +179,7 @@ def generate_dataset(
     # Collect data from random policy.
     explore_policy = ContinuousRandomPolicy(action_spec)
     steps_collected = 0
-    log_freq = 5000
+    log_freq = 500
     logging.info('Collecting data ...')
     collector = DataCollector(tf_env, explore_policy, train_data, discount)
     while steps_collected < initial_explore_steps:
@@ -209,9 +209,9 @@ def generate_dataset(
       discount=discount,
       train_data=train_data)
 
-    return
+    # return
 
-    # return train_agent(agent_flags, agent_module, action_spec, train_data, log_dir, tf_env, total_train_steps, eval_freq, tf_env_test, n_eval_episodes, eval_target, eval_target_n, data_ckpt_name, data_ckpt, save_freq, time_st_total )
+    return train_agent(agent_flags, agent_module, action_spec, train_data, log_dir, tf_env, total_train_steps, eval_freq, tf_env_test, n_eval_episodes, eval_target, eval_target_n, data_ckpt_name, data_ckpt, save_freq, time_st_total )
     
 
 
@@ -223,7 +223,7 @@ parser.add_argument('--root_dir', type=str, default= os.path.join('./offlinerl')
 parser.add_argument('--sub_dir', type=str, default='auto', help='sub directory for saving results.')
 
 parser.add_argument('--agent_name', type=str, default='sac', help='agent name.')
-parser.add_argument('--env_name', type=str, default='Pendulum-v0', help='env name.')
+parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.') # HalfCheetah-v2
 parser.add_argument('--env_loader', type=str, default='mujoco', help='env loader, suite/gym.')
 parser.add_argument('--eval_target', type=int, default=1000, help='threshold for a paritally trained policy')
 
@@ -253,7 +253,7 @@ def main(_):
 #       args.agent_name,
 #       sub_dir,
 #       )
-  base_dir = utils.make_base_dir([args.root_dir, 'datasets', args.env_name, args.agent_name, sub_dir])
+  base_dir = utils.make_base_dir([args.root_dir, 'datasets2', args.env_name, args.agent_name, sub_dir])
   log_dir = os.path.join(base_dir, sub_dir)
   utils.maybe_makedirs(log_dir)
   generate_dataset(
