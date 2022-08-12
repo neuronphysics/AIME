@@ -376,15 +376,10 @@ class DensityRatioAccuracy(Metric):
         self.q_prob = 0
 
     def __call__(self, pq_outputs):
-        #print("pq_outputs", pq_outputs)
         p_outputs, q_outputs = pq_outputs
         self.p_prob = torch.nn.Sigmoid()(p_outputs)
         self.q_prob = torch.nn.Sigmoid()(q_outputs)
         acc         = torch.mean(torch.cat([torch.greater_equal(self.p_prob, 0.5), torch.lt(self.q_prob, 0.5)], 0).type(torch.float32))
-        #print("self.p_prob, self.q_prob", self.p_prob, self.q_prob)
-        #print("torch.greater_equal(self.p_prob, 0.5)", torch.greater_equal(self.p_prob, 0.5))
-        #print("torch.lt(self.q_prob, 0.5)", torch.lt(self.q_prob, 0.5))
-        #print("acc", acc)
         return acc.cpu().detach().numpy()
 
 
@@ -441,7 +436,6 @@ class ConditionalGaussian(nn.Module):
         #add a linear layer for a combination of mean and covariance
         self._model._modules[str(int(idx)+1)] = torch.nn.ReLU()
         self._model._modules[str(int(idx)+2)] = nn.Linear(hidden_dim, self._sample_dim+self._sample_dim ** 2)
-        #print(next(iter(next(reversed(self._hidden_net._modules.items())))))
 
 
         weights_init(self._model, 'xavier')
@@ -453,16 +447,11 @@ class ConditionalGaussian(nn.Module):
 
 
     def forward(self, contexts):
-        #print("contexts", contexts.shape)
         
         output      = self._model(contexts)
-        #print("output", output.shape)
         mean, covar = SplitLayer(output,self._sample_dim,self._sample_dim ** 2)
-        #print("self._sample_dim", self._sample_dim)
-        #print("mean", mean.shape)
-        #print("covar", covar.shape)
+
         chol_covar  = self._chol_covar(covar)
-        #print("chol_covar", chol_covar.shape, chol_covar[0])
         covariance  = torch.matmul(chol_covar, torch.transpose(chol_covar, -2, -1))
         return mean, covariance, chol_covar
 
@@ -485,23 +474,16 @@ class ConditionalGaussian(nn.Module):
         # print("torch.triu(torch.reshape(chol_raw, [-1, self._sample_dim, self._sample_dim]).t(), diagonal=0).t()", torch.transpose(torch.triu(torch.transpose(torch.reshape(chol_raw, [-1, self._sample_dim, self._sample_dim]), 1, 2), diagonal=0), 1, 2).shape, torch.transpose(torch.triu(torch.transpose(torch.reshape(chol_raw, [-1, self._sample_dim, self._sample_dim]), 1, 2), diagonal=0), 1, 2)[0])
         # samples = torch.triu(torch.reshape(chol_raw, [-1, self._sample_dim, self._sample_dim]).t(), diagonal=0).t()
         samples = torch.tril(torch.reshape(chol_raw, [-1, self._sample_dim, self._sample_dim]), diagonal=0)
-        #print("samples", samples.shape, samples[0])
-        #print("torch.exp(torch.diagonal(samples, dim1=-2, dim2=-1)", torch.exp(torch.diagonal(samples, dim1=-2, dim2=-1))[0], torch.exp(torch.diagonal(samples, dim1=-2, dim2=-1)).shape)
         
         samples[:, range(self._sample_dim), range(self._sample_dim)] = torch.exp(torch.diagonal(samples, dim1=-2, dim2=-1))+ 1e-12
-        #print("samples", samples.shape, samples[0])
-        #output  = samples.fill_diagonal_(torch.exp(torch.diagonal(samples, dim1=-2, dim2=-1))+ 1e-12)
-        #print(output.size())
         return samples
 
 
     def sample(self, contexts):
         mean, _, chol_covar = self(contexts)
         torch.random.manual_seed(self._seed)
-        #print("mean", mean.shape)
         eps = torch.normal(mean=0,std=1,size=(mean.shape[0], mean.shape[1], 1))
-        #print("eps", eps.shape)
-        #print("ConditionalGaussian sample", mean + torch.reshape(torch.matmul(chol_covar, eps), mean.shape))
+
         return mean + torch.reshape(torch.matmul(chol_covar, eps), mean.shape)
 
     def log_density(self, contexts, samples):
@@ -602,7 +584,6 @@ class Softmax(nn.Module):
            self._logit_net.load_state_dict(torch.load(weight_path))
 
     def forward(self, x):
-        #print("x.shape", x.shape)
         return self._logit_net(x)
 
     def logits(self, contexts):
@@ -693,7 +674,6 @@ class GaussianEMM(nn.Module):
 
 
     def forward(self, inputs):
-        #print("inputs", inputs.shape)
         if (self._number_of_components > 1):
           
            old_probs = self.gating_distribution.probabilities(inputs)
@@ -749,21 +729,15 @@ class GaussianEMM(nn.Module):
         return torch.log(self.density(contexts, samples) + 1e-12)
 
     def log_likelihood(self, contexts, samples):
-        #print("contexts", contexts, contexts.shape)
-        #print("samples", samples, samples.shape)
         return torch.mean(self.log_density(contexts, samples))
 
     def sample(self, contexts):
         modes = self._gating_distribution.sample(contexts)
         samples = torch.zeros([contexts.shape[0], self._sample_dim])
-        #print("modes", modes, "_number_of_components", self._number_of_components)
         for i in range(self._number_of_components):
             idx = modes == i
-            #print(idx)
-            #print(torch.eq(modes, i))
             if torch.any(idx):
                 samples[idx] = self._components[i].sample(contexts[idx])
-        #print("GaussianEMM samples", samples, samples.shape)
         return samples
 
     @property
@@ -829,21 +803,17 @@ class DensityRatioEstimator(nn.Module):
 
         self._ldre_net, self._ldre_regularizer = build_dense_network(input_dim=input_dim, output_dim=1,
                                              output_activation="linear", params=self.hidden_params)
-        #print("_ldre_net input", input_dim)
 
         self._p_samples = nn.Linear(input_dim,input_dim)
         self._q_samples = nn.Linear(input_dim,input_dim)
         self.to(self.device)
 
     def forward(self, x, inTrain=True):
-        #print("forward x", x.shape, "inTrain", inTrain)
         if inTrain:
           p = self._p_samples(x)
           q = self._q_samples(x)
           p = x[:, 0, :]
           q = x[:, 1, :]
-          # print("p.shape", p.shape)
-          # print("q.shape", q.shape)
           combined = torch.cat((p.view(p.size(0), -1),
                                 q.view(q.size(0), -1)), dim=0)
           self._split_layers = Split(
@@ -877,7 +847,6 @@ class DensityRatioEstimator(nn.Module):
            model_train_samples, model_val_samples = self.sample_model(model)
            callbacks = [EarlyStopping(monitor='val_loss', patience=10),
                         ReduceLROnPlateau(factor=0.5, patience=5)]
-           #print(f" size of validation data : {model_val_samples.size(0)}")
            val_dataset =  TensorDataset([self._target_val_samples, model_val_samples])
            val_loader  = DataLoader(val_dataset, batch_size=1, num_workers=0, shuffle=True)
            #val_data = torch.tensor([[target, train] for target, train in zip(self._target_val_samples, model_val_samples)])
@@ -906,13 +875,10 @@ class DensityRatioEstimator(nn.Module):
                              callbacks=callbacks)
         #print("shape of input data....")
         #torch.Size([10000, 12]) torch.Size([10000, 12])
-        #print(self._target_train_samples.size(), model_train_samples.size())
         # self.trainer.fit_loader(train_loader,
         #                         val_loader,
         #                         num_epoch = num_iters,
         #                         verbose = 1)
-        #print("train_data", train_data.shape)
-        #print("val_data", val_data.shape)
         last_epoch = self.trainer.fit(train_data, 
                            targets=None,
                            val_data=val_data,
@@ -1159,7 +1125,6 @@ class ConditionalMixtureEIM:
 
         if self._model.num_components > 1:
             w_res = self.update_gating()
-            #print("w_res", w_res)
             with torch.no_grad():
               self._recorder(RecorderKeys.WEIGHTS_UPDATE, w_res)
 
@@ -1180,7 +1145,6 @@ class ConditionalMixtureEIM:
 
         stab_fact = 1e-20
         old_chol_inv = torch.linalg.solve_triangular(old_chol_covars + stab_fact * rhs, rhs, upper=False)
-        #print("old_chol_inv", old_chol_inv.shape, old_chol_inv)
         for i in range(self.c.components_num_epochs):
             self._components_train_step(importance_weights, old_means, old_chol_inv)
 
@@ -1198,16 +1162,13 @@ class ConditionalMixtureEIM:
 
         for i in range(self._model.num_components):
             dataset = torch.utils.data.TensorDataset(self._train_contexts, importance_weights[:, i], old_means, old_chol_precisions)
-            #print("self.c.components_batch_size", self.c.components_batch_size)
-            #print("self._train_contexts, importance_weights[:, i], old_means, old_chol_precisions", self._train_contexts.shape, importance_weights[:, i].shape, old_means.shape, old_chol_precisions.shape)
-            
+
             loader = torch.utils.data.DataLoader( dataset, shuffle = True, batch_size=self.c.components_batch_size)
             
             for batch_idx, (context_batch, iw_batch, old_means_batch, old_chol_precisions_batch) in enumerate(loader):
                 self._c_opts[i].zero_grad()
                 iw_batch = iw_batch / torch.sum(iw_batch)
                 samples = self._model.components[i].sample(context_batch)
-                #print("torch.cat([context_batch, samples], dim=-1)", torch.cat([context_batch, samples], dim=-1).shape)
                 #with torch.no_grad():
                 losses = - torch.squeeze(self._dre(torch.cat([context_batch, samples], dim=-1), inTrain=False))
                 kls = self._model.components[i].kls_other_chol_inv(context_batch, old_means_batch[:, i], old_chol_precisions_batch[:, i])
@@ -1240,7 +1201,6 @@ class ConditionalMixtureEIM:
         losses = []
         for i in range(self.c.num_components):
             samples = self._model.components[i].sample(self._train_contexts)
-            #print("torch.cat([self._train_contexts, samples], dim=-1)", torch.cat([self._train_contexts, samples], dim=-1).shape)
             with torch.no_grad():
               losses.append(- self._dre(torch.cat([self._train_contexts, samples], dim=-1), inTrain=False))
 
@@ -1389,8 +1349,6 @@ def eval_fn(model):
     samples = np.zeros([contexts.shape[0], 10, data.dim[1]])
     for i in range(10):
         samples[:, i] = model.sample(contexts).detach().numpy()
-    #print("context", contexts.shape, contexts)
-    #print("samples", samples.shape, samples)
     return data.rewards_from_contexts(contexts.detach().numpy(), samples)
 
 class ModelRecMod(RecorderModule):
@@ -1427,7 +1385,6 @@ class ModelRecMod(RecorderModule):
         self.__num_iters = num_iters
 
     def _log_train(self, model):
-        #print("self._train_samples", self._train_samples)
         if isinstance(self._train_samples,torch.Tensor):
             self._train_ll_list.append(torch.tensor(model.log_likelihood(self._train_samples)))
         else:
@@ -1593,15 +1550,12 @@ class ObstacleModelRecMod(ModelRecModWithModelVis):
             plt.gca().set_ylim(0, 100)
 
 def to_numpy(x):
-    #print("x", x)
     if torch.is_tensor(x):
       return x.detach().numpy()
     else:
       return np.array(x)
 def log_res(res, key_prefix):
-    #print("res", res)
     num_iters, kl, entropy, add_text = [to_numpy(x) for x in res]
-    #print("num_iters, kl, entropy, add_text", num_iters, kl, entropy, add_text)
     last_rec = {key_prefix + "_num_iterations": num_iters, key_prefix + "_kl": kl, key_prefix + "_entropy": entropy}
     log_string = "Updated for {:d} iterations. ".format(num_iters)
     log_string += "KL: {:.5f}. ".format(kl)
@@ -1790,11 +1744,8 @@ class DRERecMod(RecorderModule):
         self._acc.append(acc.item())
         self._true_mean.append(true_mean.item())
         self._fake_mean.append(fake_mean.item())
-        #print("self._estm_ikl", self._estm_ikl)
         print("self._loss", self._loss)
         print("self._acc", self._acc)
-        # print("self._true_mean", self._true_mean)
-        # print("self._fake_mean", self._fake_mean)
         if self._plot_realtime:
             self._recorder.handle_plot("Discriminator Evaluation", self._plot)
 
