@@ -208,6 +208,33 @@ class DataCollector(object):
     self._data = data
     self._saved_action = None
     self.discount = discount
+    self.states = []
+    self.next_states = []
+    self.actions = []
+    self.next_actions = []
+    self.rewards = []
+    self.discounts = []
+
+  
+  def addTransitionData(self, state, next_state, action, next_action, reward, steps_so_far):
+    self.states.append(state)
+    self.next_states.append(next_state)
+    self.actions.append(action)
+    self.next_actions.append(next_action)
+    self.rewards.append(reward)
+
+    discount = self.discount**steps_so_far
+    self.discounts.append(discount)
+
+  
+  def saveCollection(self, filename):
+    torch.save(self.states, filename+'_states.pt')
+    torch.save(self.next_states, filename+'_next_states.pt')
+    torch.save(self.actions, filename+'_actions.pt')
+    torch.save(self.next_actions, filename+'_next_actions.pt')
+    torch.save(self.rewards, filename+'_rewards.pt')
+    torch.save(self.discounts, filename+'_discounts.pt')
+
 
   def collect_transition(self, state, steps_so_far):
     """Collect single transition from environment. Actions are from policy"""
@@ -217,17 +244,19 @@ class DataCollector(object):
       if self._saved_action == 'random':
         self._saved_action = self._env.action_space.sample()
     action = self._saved_action
-    new_state, reward, done, _ = self._env.step(action)
-    next_action = self._policy(new_state)[0]
+    next_state, reward, done, _ = self._env.step(action)
+    next_action = self._policy(next_state)[0]
     if next_action == 'random':
         next_action = self._env.action_space.sample()
     self._saved_action = next_action
     if not done:
       # Assuming standard discounted reward
-      transition = get_transition(state, new_state,
-                                  action, next_action, 
-                                  reward, self.discount**steps_so_far)
-      self._data.add_transitions(transition)
+      # transition = get_transition(state, new_state,
+      #                             action, next_action, 
+      #                             reward, self.discount**steps_so_far)
+      # self._data.add_transitions(transition)
+      print('Adding transition')
+      self.addTransitionData(state, next_state, action, next_action, reward, self.discount**steps_so_far)
       return 1
     else:
       return 0
