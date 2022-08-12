@@ -239,10 +239,3 @@ if __name__ == "__main__":
            # plt.subplot(11, 1, j+2)
           #  plt.imshow(patches[i, j])
     plt.show()
-
-
-
-
-
-
-
