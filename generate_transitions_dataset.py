@@ -26,7 +26,7 @@ import alf_gym_wrapper
 import importlib  
 
 from dataset import Dataset, save_copy
-from collect_data import DataCollector, env_factory
+from collect_data import DataCollector, env_factory, USE_LISTS
 from planner_regularizer_debug import ActorNetwork, AgentModule, eval_policies, ContinuousRandomPolicy, Agent, wrap_policy
 import alf_gym_wrapper
 
@@ -182,10 +182,13 @@ def generate_dataset(
     steps_collected = 0
     log_freq = 500
     logging.info('Collecting data ...')
+    next_state = initial_state
     collector = DataCollector(tf_env, explore_policy, train_data, discount)
     while steps_collected < initial_explore_steps:
-        logging.info('Going to collect transition')
-        count = collector.collect_transition(initial_state, steps_collected)
+        # logging.info('Going to collect transition')
+        count, next_state = collector.collect_transition(next_state, steps_collected)
+        if next_state is None:
+            next_state = tf_env.reset()
         steps_collected += count
         if (steps_collected % log_freq == 0
             or steps_collected == initial_explore_steps) and count > 0:
@@ -198,18 +201,12 @@ def generate_dataset(
 
     # checkpoint
     data_ckpt_name = os.path.join(log_dir, 'replay')
-    collector.saveCollection(data_ckpt_name)
+    # if using individual arrays, save them via the following function
+    if USE_LISTS:
+        collector.saveCollection(data_ckpt_name)
+    else:
+        torch.save(train_data, data_ckpt_name+'_dataset.pt')
 
-    agent_flags = utils.Flags(
-      action_spec=action_spec,
-      model_params=model_params,
-      optimizers=optimizers,
-      batch_size=batch_size,
-      weight_decays=weight_decays,
-      update_freq=update_freq,
-      update_rate=update_rate,
-      discount=discount,
-      train_data=train_data)
 
     return
 
