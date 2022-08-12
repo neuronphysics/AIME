@@ -18,8 +18,10 @@ import argparse
 from planner_regularizer_debug import parse_policy_cfg, load_policy, eval_policy_episodes
 import importlib
 from dataset import Transition
+import pickle
 
 
+USE_LISTS = True
 
 
 parser = argparse.ArgumentParser(description='AIME')
@@ -228,12 +230,15 @@ class DataCollector(object):
 
   
   def saveCollection(self, filename):
-    torch.save(self.states, filename+'_states.pt')
-    torch.save(self.next_states, filename+'_next_states.pt')
-    torch.save(self.actions, filename+'_actions.pt')
-    torch.save(self.next_actions, filename+'_next_actions.pt')
-    torch.save(self.rewards, filename+'_rewards.pt')
-    torch.save(self.discounts, filename+'_discounts.pt')
+    suffix_map = {'states':self.states, 
+                  'next_states':self.next_states,
+                  'actions':self.actions,
+                  'next_actions':self.next_actions,
+                  'rewards': self.rewards,
+                  'discounts':self.discounts}
+    for k, v in suffix_map.items():
+      with open(filename+'_'+k+'.pkl', 'wb') as f:
+        pickle.dump(v, f)
 
 
   def collect_transition(self, state, steps_so_far):
@@ -251,15 +256,19 @@ class DataCollector(object):
     self._saved_action = next_action
     if not done:
       # Assuming standard discounted reward
-      # transition = get_transition(state, new_state,
-      #                             action, next_action, 
-      #                             reward, self.discount**steps_so_far)
-      # self._data.add_transitions(transition)
-      print('Adding transition')
-      self.addTransitionData(state, next_state, action, next_action, reward, self.discount**steps_so_far)
-      return 1
+      # CAN CHOOSE TO USE EITHER DATASET CLASS OR INDIVIDUAL LISTS
+      if USE_LISTS:
+        self.addTransitionData(state, next_state, action, next_action, reward, self.discount**steps_so_far)
+      else:
+        transition = get_transition(state, next_state,
+                                    action, next_action, 
+                                    reward, self.discount**steps_so_far)
+        self._data.add_transitions(transition)
+      return 1, next_state
     else:
-      return 0
+      if USE_LISTS:
+        self.addTransitionData(state, next_state, action, None, reward, self.discount**steps_so_far)
+      return 0, None
 
 
 if __name__ == '__main__':
