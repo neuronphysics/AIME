@@ -48,7 +48,8 @@ class Split(torch.nn.Module):
         self._module = module
 
     def forward(self, inputs):
-        output = self._module(inputs)
+        print(f'inputs shape in split.forward is: {inputs.shape}')
+        output = self._module(inputs) # .T
         chunk_size = output.shape[self._dim] // self._n_parts
         return torch.split(output, chunk_size, dim=self._dim)
       
@@ -66,10 +67,11 @@ class ActorNetwork(nn.Module):
       ):
     super(ActorNetwork, self).__init__()
     self._action_spec = action_spec
+    self._latent_spec = latent_spec
     self._layers = nn.ModuleList()
     for hidden_size in fc_layer_params:
         if len(self._layers)==0:
-           self._layers.append(nn.Linear(latent_spec.size, hidden_size))
+           self._layers.append(nn.Linear(self._latent_spec.size, hidden_size))
         else:
            self._layers.append(nn.Linear(hidden_size, hidden_size))
         self._layers.append(nn.ReLU())
@@ -86,12 +88,14 @@ class ActorNetwork(nn.Module):
 
   def _get_outputs(self, state):
       h = state
-      for l in self._layers:
+      for l in self._layers[:-1]:
           h = l(h)
       self._mean_logvar_layers = Split(
          self._layers[-1],
-         parts=2,
+         n_parts=2,
       )
+      print(f'latent_spec size is: {self._latent_spec.size}')
+      print(f'h size is: {h.size()}')
       mean, log_std = self._mean_logvar_layers(h)
       a_tanh_mode = torch.tanh(mean) * self._action_mags + self._action_means
       log_std = torch.tanh(log_std)
@@ -104,7 +108,7 @@ class ActorNetwork(nn.Module):
                         base_distribution=Normal(loc=torch.full_like(mean, 0), 
                                                  scale=torch.full_like(mean, 1)), 
                         transforms=tT.ComposeTransform([
-                                   tT.AffineTransform(loc=self._action_means, scale=self._action_mag, event_dim=mean.shape[-1]), 
+                                   tT.AffineTransform(loc=self._action_means, scale=self._action_mags, event_dim=mean.shape[-1]), 
                                    tT.TanhTransform(),
                                    tT.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])]))
       #https://www.ccoderun.ca/programming/doxygen/pytorch/classtorch_1_1distributions_1_1transformed__distribution_1_1TransformedDistribution.html
@@ -124,7 +128,10 @@ class ActorNetwork(nn.Module):
 
   def __call__(self, state):
     a_dist, a_tanh_mode = self._get_outputs(state)
+    print(f' a_dist: {a_dist}')
+    print(f' a_tanh_mode: {a_tanh_mode}')
     a_sample = a_dist.sample()
+    print(f' a_sample: {a_sample}')
     log_pi_a = a_dist.log_prob(a_sample)
     return a_tanh_mode, a_sample, log_pi_a
 
@@ -157,11 +164,16 @@ class CriticNetwork(nn.Module):
       output_layer = nn.Linear(hidden_size,1)
       self._layers.append(output_layer)
   
-    def forward(self, embedding):
+    def forward(self, state, action):
+        print(state.shape) # 256 x 3
+        print(action.shape) # 256 x 1
+        # if len(action.shape) > 2 and action.shape[-1] == 1:
+        #   action = action.squeeze()
+        embedding = torch.cat((state, action), dim=-1)
         hidden = embedding
         for l in self._layers:
             hidden = l(hidden)
-        return hidden
+        return hidden.squeeze()
 ############################
 ##From utils.py
 class Flags(object):
@@ -260,8 +272,13 @@ class AgentModule:
   def q_source_weights(self):
       q_weights = []
       for q_net, _ in self._q_nets:
-         for _, net in q_net._modules.values():
-             q_weights += net.weight.data
+         print(f'q_net._modules.values(): {q_net._modules.values()}')
+         for net in list(q_net._modules.values()):
+          for layer in list(net):
+            # print(layer)
+            # print(type(layer))
+            if isinstance(layer, nn.Linear):
+              q_weights += layer.weight.data
       return q_weights
 
   @property
@@ -278,7 +295,7 @@ class AgentModule:
     for q_net, _ in self._q_nets:
         vars = q_net.parameters()
         for v in vars:
-            print(v.is_leaf) # It is indeed a leaf here
+            # print(v.is_leaf) # It is indeed a leaf here
             if v.requires_grad:
                vars_.append(v)
     return tuple(vars_)
@@ -290,7 +307,7 @@ class AgentModule:
         vars = q_net.parameters()
         for v in vars:
             if v.requires_grad:
-               vars_ += v
+               vars_.append(v)
     return tuple(vars_)
 
   @property
@@ -302,7 +319,14 @@ class AgentModule:
 
   @property
   def p_weights(self):
-    return self._p_net.weight.data
+    pw = []
+    print(list(self.p_net.modules()))
+    for layer in list(self.p_net.modules()):
+          # print(layer)
+          # print(type(layer))
+          if isinstance(layer, nn.Linear):
+            pw += layer.weight.data
+    return pw
 
   @property
   def p_variables(self):
@@ -319,7 +343,14 @@ class AgentModule:
 
   @property
   def c_weights(self):
-    return self._c_net.weight.data
+    cw = []
+    print(list(self.c_net.modules()))
+    for layer in list(self.c_net.modules()):
+          # print(layer)
+          # print(type(layer))
+          if isinstance(layer, nn.Linear):
+            cw += layer.weight.data
+    return cw
 
   @property
   def c_variables(self):
@@ -372,7 +403,8 @@ class Agent(object):
     """Builds agent components."""
     self._build_fns()
     self._build_optimizers()
-    self._global_step = torch.tensor(0.0, requires_grad=True)
+    self._global_step = torch.tensor(0.0, requires_grad=False) # Why requires_grad=True? 
+    #   Making it false because "RuntimeError: a leaf Variable that requires grad is being used in an in-place operation." when incrementing it
     self._train_info = collections.OrderedDict()
     self._checkpointer = self._build_checkpointer()
     self._test_policies = collections.OrderedDict()
@@ -428,18 +460,33 @@ class Agent(object):
 
   def _get_train_batch(self):
     """Samples and constructs batch of transitions."""
-    batch_indices = np.random.choice(self._train_data.size, self._batch_size)
+    batch_indices = np.random.choice(len(self._train_data[-1]), self._batch_size)
+    # batch_indices = np.random.choice(self._train_data.size, self._batch_size)
     # print(self._train_data._dataset.capacity)
     # print(self._batch_size)
-    batch_ = self._train_data.get_batch(batch_indices)
-    transition_batch = batch_
+    # batch_ = self._train_data.get_batch(batch_indices)
+  
+    # transition_batch = batch_
+    transition_batch = []
+    # train data contains 6 lists, one for each s1, s2, r, gamma, a1, a2
+    for element in self._train_data:
+      transition_batch.append(element[batch_indices])
+    # batch = dict(
+    #     s1=transition_batch.s1,
+    #     s2=transition_batch.s2,
+    #     r=transition_batch.reward,
+    #     dsc=transition_batch.discount,
+    #     a1=transition_batch.a1,
+    #     a2=transition_batch.a2,
+    # )
+
     batch = dict(
-        s1=transition_batch.s1,
-        s2=transition_batch.s2,
-        r=transition_batch.reward,
-        dsc=transition_batch.discount,
-        a1=transition_batch.a1,
-        a2=transition_batch.a2,
+        s1=transition_batch[3], # state
+        s2=transition_batch[4], # next state
+        r=transition_batch[0], # reward
+        dsc=transition_batch[5], # discount
+        a1=transition_batch[1], # action1
+        a2=transition_batch[2], # action2
         )
     return batch
   
@@ -488,7 +535,7 @@ class Agent(object):
 
   @property
   def global_step(self):
-    return self._global_step.numpy()
+    return self._global_step.detach().numpy()
   
 ################# Policies #################
 class GaussianRandomSoftPolicy(nn.Module):
@@ -645,6 +692,7 @@ class D2EAgent(Agent):
     return torch.stack(norms).sum(dim=0)
 
   def _get_p_weight_norm(self):
+    print(self._agent_module.p_net.modules())
     weights = self._agent_module.p_weights
     norms = []
     for w in weights:
@@ -663,8 +711,16 @@ class D2EAgent(Agent):
   def ensemble_q(self, qs):
     #compute the ensemble value of different Q networks
     lambda_ = self._ensemble_q_lambda
-    return (lambda_ *torch.min(qs, dim=-1)
-            + (1 - lambda_) * torch.max(qs, dim=-1))
+    # lambda_ = int(lambda_)
+    # print(f'qs shape is :{qs.shape}')
+    # print(qs.dtype)
+    # print(lambda_)
+    # print(f' torch.min(qs, dim=-1): {torch.min(qs, dim=-1)}')
+    # print(f'lambda_ shape is :{lambda_.shape}')
+    # print(lambda_.dtype) # lambda_ is a float
+    to_ret = lambda_ * torch.min(qs, dim=-1).values + (1. - lambda_) * torch.max(qs, dim=-1).values
+    print(f'to_ret is length of: {len(to_ret)}')
+    return to_ret
 
   def _ensemble_q2_target(self, q2_targets):
     return self.ensemble_q(q2_targets)
@@ -673,12 +729,13 @@ class D2EAgent(Agent):
     return self.ensemble_q(q1s)
 
   def _build_q_loss(self, batch):
-    s1 = batch['s1']
-    s2 = batch['s2']
-    a1 = batch['a1']
-    a2_b = batch['a2']
-    r = batch['r']
-    dsc = batch['dsc']
+    print(batch['a2'].shape)
+    s1 = torch.from_numpy(batch['s1'])
+    s2 = torch.from_numpy(batch['s2']).type(torch.FloatTensor)
+    a1 = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1))
+    a2_b = torch.from_numpy(np.expand_dims(batch['a2'], axis=-1))
+    r = torch.from_numpy(batch['r'])
+    dsc = torch.from_numpy(batch['dsc'])
     _, a2_p, log_pi_a2_p = self._p_fn(s2)
     q2_targets = []
     q1_preds = []
@@ -687,13 +744,21 @@ class D2EAgent(Agent):
       q1_pred = q_fn(s1, a1)
       q1_preds.append(q1_pred)
       q2_targets.append(q2_target_)
+      print(f'q2_target shape: {q2_target_.shape}')
     q2_targets = torch.stack(q2_targets, dim=-1)
     q2_target = self._ensemble_q2_target(q2_targets)
     div_estimate = self._divergence.dual_estimate(
         s2, a2_p, a2_b, self._c_fn)
-    v2_target = q2_target - self._get_alpha_entropy() * log_pi_a2_p
+    print(f'q2_target length {len(q2_target)}') # tuple
+    alpha_entropy_val, alpha_entropy_grad = self._get_alpha_entropy()
+    print(f'alpha_entropy_val: {alpha_entropy_val} ')
+    print(f'alpha_entropy_grad: {alpha_entropy_grad}')
+    print(f'log_pi_a2_p shape {log_pi_a2_p.shape}')
+    v2_target = (q2_target - alpha_entropy_val) * log_pi_a2_p
+
+    alpha_val, alpha_grad = self._get_alpha()
     if self._value_penalty: #Equation (5)
-       v2_target = v2_target - self._get_alpha() * div_estimate
+       v2_target = v2_target - alpha_val * div_estimate
     with torch.no_grad(): #Q(s,a)=R(s,a)+discount*v(s')
          q1_target = r + dsc * self._discount * v2_target
     q_losses = []
@@ -716,8 +781,8 @@ class D2EAgent(Agent):
     return loss, info
 
   def _build_p_loss(self, batch):
-    s = batch['s1']
-    a_b = batch['a1']
+    s = torch.from_numpy(batch['s1'])
+    a_b = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1))
     _, a_p, log_pi_a_p = self._p_fn(s)
     q1s = []
     for q_fn, _ in self._q_fns:
@@ -729,9 +794,11 @@ class D2EAgent(Agent):
         s, a_p, a_b, self._c_fn)
     q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
     #Equation 7
+    alpha_val, alpha_grad = self._get_alpha()
+    alpha_entropy_val, alpha_entropy_grad = self._get_alpha_entropy()
     p_loss = torch.mean(
-        self._get_alpha_entropy() * log_pi_a_p
-        + self._get_alpha() * div_estimate
+        alpha_entropy_val * log_pi_a_p
+        + alpha_val * div_estimate
         - q1 * q_start)
     p_w_norm = self._get_p_weight_norm()
     norm_loss = self._weight_decays[1] * p_w_norm
@@ -744,8 +811,10 @@ class D2EAgent(Agent):
     return loss, info
 
   def _build_c_loss(self, batch):
-    s = batch['s1']
-    a_b = batch['a1']
+    s = torch.from_numpy(batch['s1']) # 256 x 3
+    a_b = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1)) 
+    print(f's shape: {s.shape}')
+    print(f'a_b shape: {a_b.shape}')
     _, a_p, _ = self._p_fn(s)
     c_loss = self._divergence.dual_critic_loss(
         s, a_p, a_b, self._c_fn)
@@ -761,9 +830,9 @@ class D2EAgent(Agent):
 
   def _build_a_loss(self, batch):
     s = batch['s1']
-    a_b = batch['a1']
+    a_b = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1))
     _, a_p, _ = self._p_fn(s)
-    alpha = self._get_alpha()
+    alpha, alpha_grad = self._get_alpha()
     div_estimate = self._divergence.dual_estimate(
         s, a_p, a_b, self._c_fn)
     a_loss = - torch.mean(alpha * (div_estimate - self._target_divergence))
@@ -777,9 +846,9 @@ class D2EAgent(Agent):
     return a_loss, info
 
   def _build_ae_loss(self, batch):
-    s = batch['s1']
+    s = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1))
     _, _, log_pi_a = self._p_fn(s)
-    alpha = self._get_alpha_entropy()
+    alpha, alpha_grad = self._get_alpha_entropy()
     ae_loss = torch.mean(alpha * (- log_pi_a - self._target_entropy))
 
     info = collections.OrderedDict()
@@ -802,7 +871,7 @@ class D2EAgent(Agent):
       self._weight_decays = tuple([self._weight_decays[0]] * 3)
     print(f'weight_decays are: {self._weight_decays}')
     print(f'opts are : {opts}')
-    print('Seeing the q_vars')
+    # print('Seeing the q_vars')
     self._q_optimizer = utils.OptMirrorAdam(self._get_q_vars(),lr=opts[0][1], betas=(opts[0][2],opts[0][3]), weight_decay=self._weight_decays[0])
     self._p_optimizer = utils.OptMirrorAdam(self._get_p_vars(),lr=opts[1][1], betas=(opts[1][2],opts[1][3]), weight_decay=self._weight_decays[1])
     self._c_optimizer = utils.OptMirrorAdam(self._get_c_vars(),lr=opts[2][1], betas=(opts[2][2],opts[2][3]), weight_decay=self._weight_decays[2])
@@ -811,37 +880,67 @@ class D2EAgent(Agent):
 
   def _optimize_step(self, batch):
     info = collections.OrderedDict()
-    if torch.equal(self._global_step % self._update_freq, 0):
+    if self._global_step % self._update_freq == 0:
       source_vars, target_vars = self._get_source_target_vars()
       self._update_target_fns(source_vars, target_vars)
     # Update policy network parameter
     #https://bit.ly/3Bno0GC
     # policy network's update should be done before updating q network, or there will make some errors
+    def closure_p():
+        self._p_optimizer.zero_grad()
+        policy_loss,_=self._build_p_loss(batch)
+        policy_loss.backward(retain_graph=True)
+        return policy_loss
+
     self._p_optimizer.zero_grad()
     policy_loss,_=self._build_p_loss(batch)
     policy_loss.backward(retain_graph=True)
-    self._p_optimizer.step()
+    policy_loss = self._p_optimizer.step(closure_p)
+
     # Update q networks parameter
+    def closure_q():
+      self._q_optimizer.zero_grad()
+      q_losses,q_info= self._build_q_loss(batch)
+      q_losses.backward()
+      return q_losses
     self._q_optimizer.zero_grad()
     q_losses,q_info= self._build_q_loss(batch)
     q_losses.backward()
-    self._q_optimizer.step()
+    q_losses = self._q_optimizer.step(closure_q)
+
     #Update critic network parameter
+    def closure_c():
+      self._c_optimizer.zero_grad()
+      critic_loss,_= self._build_c_loss( batch)
+      critic_loss.backward()
+      return critic_loss
     self._c_optimizer.zero_grad()
     critic_loss,_= self._build_c_loss( batch)
     critic_loss.backward()
-    self._c_optimizer.step()
+    c_losses = self._c_optimizer.step(closure_c)
     
     if self._train_alpha:
-       self._a_optimizer.zero_grad()
-       a_loss,a_info = self._build_a_loss( batch)
-       a_loss.backward()
-       self._a_optimizer.step()
+      def closure_alpha():
+        self._a_optimizer.zero_grad()
+        a_loss,a_info = self._build_a_loss( batch)
+        a_loss.backward()
+        return a_loss
+      self._a_optimizer.zero_grad()
+      a_loss,a_info = self._build_a_loss( batch)
+      a_loss.backward()
+      a_loss = self._a_optimizer.step(closure_alpha)
+
     if self._train_alpha_entropy:
+      def closure_alpha_entropy():
        self._ae_optimizer.zero_grad()
        ae_loss,ae_info = self._build_ae_loss( batch)
        ae_loss.backward()
-       self._ae_optimizer.step()
+       return ae_loss
+      self._ae_optimizer.zero_grad()
+      ae_loss,ae_info = self._build_ae_loss( batch)
+      ae_loss.backward()
+      ae_loss = self._ae_optimizer.step(closure_alpha_entropy)
+
     #1)policy loss
     info["policy_loss"]=policy_loss.cpu().item()
     #2)Q loss
@@ -863,10 +962,15 @@ class D2EAgent(Agent):
     return info
   
   def _extra_c_step(self, batch):
+    def closure_c():
       self._c_optimizer.zero_grad()
       critic_loss,_ = self._build_c_loss( batch)
       critic_loss.backward()
-      self._c_optimizer.step()
+    self._c_optimizer.zero_grad()
+    critic_loss,_ = self._build_c_loss( batch)
+    critic_loss.backward()
+    critic_loss = self._c_optimizer.step(closure_c)
+    return critic_loss
 
   def train_step(self):
     train_batch = self._get_train_batch()
@@ -875,7 +979,7 @@ class D2EAgent(Agent):
       train_batch = self._get_train_batch()
       self._extra_c_step(train_batch)
     for key, val in info.items():
-      self._train_info[key] = val.numpy()
+      self._train_info[key] = val #.numpy()
     self._global_step+=1
 
 
@@ -1002,12 +1106,16 @@ def eval_policy_episodes(env, policy, n_episodes):
   """Evaluates policy performance."""
   results = []
   for _ in range(n_episodes):
-    time_step = env.reset()
+    state = env.reset()
+    print(f' initial state shape is: {state.shape}')
     total_rewards = 0.0
-    while not time_step.is_last().numpy()[0]:
-      action = policy(time_step.observation)[0]
-      time_step = env.step(action)
-      total_rewards += time_step.reward
+    done = False
+    while not done:
+      print(f'state: {state}')
+      action = policy(torch.FloatTensor(np.expand_dims(state, axis=0)))[0]
+      next_state, reward, done, _ = env.step(action.detach())
+      total_rewards += reward
+      state = next_state
     results.append(total_rewards)
   results = torch.tensor(results)
   return torch.mean(results).to(dtype=torch.float32), torch.std(results).to(dtype=torch.float32)

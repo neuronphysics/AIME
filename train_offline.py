@@ -1,6 +1,7 @@
 import utils_planner as utils
 from math import inf
 import torch
+import numpy as np
 from torch import jit
 import torch.nn as nn
 from torch.nn import functional as F
@@ -20,6 +21,7 @@ from absl import app
 from absl import flags
 from absl import logging
 import argparse
+import math
 
 import time
 import alf_gym_wrapper
@@ -35,7 +37,8 @@ import planner_regularizer_debug
 def train_eval_offline(
     # Basic args.
     log_dir,
-    data_file,
+    data_files,
+    # data_file,
     agent_module,
     env_name='HalfCheetah-v2',
     n_train=int(1e6),
@@ -50,7 +53,7 @@ def train_eval_offline(
     eval_freq=5000,
     n_eval_episodes=20,
     # Agent args.
-    model_params=(((200, 200),), 2),
+    model_params=(((256, 256),), 2),
     optimizers=(('adam', 0.001, 0.0, 0.99),),
     batch_size=256,
     weight_decays=(0.0,),
@@ -70,24 +73,67 @@ def train_eval_offline(
   
 
   # Prepare data.
-  logging.info('Loading data from %s ...', data_file)
-  full_data  = torch.load(data_file)
+  full_data = []
+  none_indices = []
+  for data_file in data_files:
+    print('Loading data from %s ...', data_file)
+    loaded  = np.array(torch.load(data_file), dtype=np.float32)
+    if data_file.split('\\')[-1] == 'replay_actions.pt':
+      loaded = loaded.squeeze()
+    elif data_file.split('\\')[-1] == 'replay_next_actions.pt':
+      loaded = loaded.squeeze()
+      for idx, item in enumerate(loaded):
+        if item is None or math.isnan(item):
+          print("We have a None")
+          none_indices.append(idx)
+
+    print(loaded.shape)
+    print(loaded[0])
+    full_data.append(loaded)
+
+  # print(f"This is an {error}")
+  # full_data = np.concatenate(full_data)
+
+  # print('Loading data from %s ...', data_file)
+  # full_data  = torch.load(data_file)
+
+  # All the following comments show the real shapes from the list version of the dataset, not the Dataset version. 
+  #   Need to verify the second dimension
+  # print(f'full_data a1 shape: {full_data._a1.shape}') # action 1 shape (10050,)
+  # print(f'full_data a2 shape: {full_data._a2.shape}') # action 2 shape (10050,)
+  # print(f'full_data s1 shape: {full_data._s1.shape}') # state shape (10050, 3)
+  # print(f'full_data s2 shape: {full_data._s2.shape}') # next state shape (10050, 3)
+  # print(f'full_data discount shape: {full_data._discount.shape}') # dsicount shape (10050,)
+  # print(f'full_data reward shape: {full_data._reward.shape}') #reward shape (10050,)
+
+
   print(type(full_data))
-  print(f'data size: {full_data._current_size}')
+  # Remove the potential nans and nones
+  # for i, data in enumerate(full_data):
+  #   full_data[i] = [item for j, item in enumerate(data) if j not in none_indices]
+
+  # print(f'data size: {full_data._current_size}')
   # data_size = data.size()      
   # full_data = Dataset(observation_spec, action_spec, data_size)
 
   # Split data.
-  n_train = min(n_train, full_data.size)
+  # n_train = min(n_train, full_data.size)
+  n_train = min(n_train, len(full_data[-1]))
   logging.info('n_train %s.', n_train)
   if use_seed_for_data:
     rand = np.random.RandomState(seed)
   else:
     rand = np.random.RandomState(0)
   shuffled_indices = utils.shuffle_indices_with_steps(
-      n=full_data.size, steps=shuffle_steps, rand=rand)
-  train_indices = shuffled_indices[:n_train]
-  train_data = full_data.create_view(train_indices)
+      n=len(full_data[-1]), steps=shuffle_steps, rand=rand)
+  # shuffled_indices = utils.shuffle_indices_with_steps(
+  #       n=full_data.size, steps=shuffle_steps, rand=rand)
+
+  # train_indices = shuffled_indices[:n_train]
+  # train_data = full_data.create_view(train_indices)
+  # print(train_indices[:10])
+  train_data = full_data[:]
+
 
   # Create agent.
   agent_flags = Flags(
@@ -149,7 +195,7 @@ def train_eval_offline(
     if step % eval_freq == 0 or step == total_train_steps:
       time_ed = time.time()
       time_cost = time_ed - time_st
-      logging.info(
+      print(
           'Training at %.4g steps/s.', (step - timed_at_step) / time_cost)
       eval_result, eval_infos = eval_policies(
           env, agent.test_policies, n_eval_episodes)
@@ -226,8 +272,15 @@ def main(_):
     #     )
     # data_file = os.path.join(
     #     data_dir, args.data_file_name)
-    data_file = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220812105050","20220812105050", "replay_dataset.pt")
+    # data_file = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220812105050","20220812105050", "replay_dataset.pt")
+    data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_rewards.pt")
+    data_file_actions = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_actions.pt")
+    data_file_next_actions = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_next_actions.pt")
+    data_file_states = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_states.pt")
+    data_file_next_states = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_next_states.pt")
+    data_file_discounts = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_discounts.pt")
 
+    data_files = [data_file_rewards, data_file_actions, data_file_next_actions, data_file_states, data_file_next_states, data_file_discounts]
     # Setup log dir.
     if args.sub_dir == 'auto':
         sub_dir = utils.get_datetime()
@@ -239,32 +292,14 @@ def main(_):
     utils.maybe_makedirs(log_dir)
     train_eval_offline(
         log_dir=log_dir,
-        data_file=data_file,
+        data_files=data_files,
+        # data_file = data_file,
         agent_module=planner_regularizer_debug,
         env_name=args.env_name,
         n_train=args.n_train,
         total_train_steps=args.total_train_steps,
         n_eval_episodes=args.n_eval_episodes,
     )
-
-
-# class TrainOfflineTest(TestCase):
-
-#   def test_train_offline(self):
-#     data_dir = 'testdata/data'
-#     flags.FLAGS.data_root_dir = os.path.join(flags.FLAGS.test_srcdir, data_dir)
-#     flags.FLAGS.sub_dir = '0'
-#     flags.FLAGS.env_name = 'HalfCheetah-v2'
-#     flags.FLAGS.data_name = 'example'
-#     flags.FLAGS.agent_name = 'D2E'
-#     flags.FLAGS.gin_bindings = [
-#         'train_eval_offline.model_params=((200, 200),)',
-#         'train_eval_offline.optimizers=(("adam", 5e-4),)']
-#     flags.FLAGS.n_train = 100
-#     flags.FLAGS.n_eval_episodes = 1
-#     flags.FLAGS.total_train_steps = 100  # Short training.
-
-#     main(None)  # Just test that it runs.
 
 if __name__ == '__main__':
   main(None)

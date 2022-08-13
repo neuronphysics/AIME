@@ -23,6 +23,7 @@ from torchsample.initializers import XavierUniform
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torchsample.datasets import TensorDataset
+import re
 
 import os
 if not os.path.exists("EIM_out_imgs"):
@@ -709,52 +710,9 @@ class GaussianEMM(nn.Module):
 
 
     def forward(self, inputs):
-        if (self._number_of_components > 1):
-          
-           old_probs = self.gating_distribution.probabilities(inputs)
-           self.gating_losses={}
-           for i in range(self.gating_num_epochs):
-               gating_losses = []
-               for j in range(self._number_of_components):
-                   samples = self._components[j].sample(inputs)
-                   gating_losses.append(- self._net(torch.cat([inputs, samples], dim=-1)))
-               gating_losses.append( torch.cat(gating_losses, dim=1))
-           self.gating_losses["loss"]=torch.cat(self.gating_losses, dim=2)
-           expected_entropy = self.gating_distribution.expected_entropy(inputs)
-           _, self.gating_losses["expected_kl"] = self.gating_distribution.expected_kl(inputs, old_probs)
-           self.gating_losses["total_loss"] = torch.sum(torch.mean(probabilities * torch.mean(self.gating_losses["loss"],dim=2), 0)) + self.gating_losses["expected_kl"]
-        importance_weights = self.gating_distribution.probabilities(inputs)
-        importance_weights = importance_weights / torch.sum(importance_weights, dim=0, keepdims=True)
-        #is importance_weights a distribution? Test it?
-        old_means, old_chol_covars = self.get_component_parameters(inputs)
 
-        print("[forward] old_means, old_chol_covars", old_means.shape, old_chol_covars.shape)
-        rhs = torch.eye(old_means.shape[-1], batch_shape=old_chol_covars.shape[:-2]).to(device)
-        stab_fact = 1e-20
-        try:
-            old_chol_inv = torch.linalg.solve_triangular(old_chol_covars + stab_fact * rhs, rhs, upper=False)
-        except AttributeError:
-            old_chol_inv = torch.triangular_solve(rhs, old_chol_covars + stab_fact * rhs, upper=False)[0]
-        self.components_loss={}
-        kls_components=[]
-        component_net_losses=[]
-        total_losses=[]
-        for i in range(self._number_of_components):
-            iw_batch = importance_weights[:, i] / torch.sum(importance_weights[:, i])
-            samples = self._components[i].sample(inputs)
-            component_losses = - torch.squeeze(self._net(torch.cat([inputs, samples], dim=-1)))
-            kls =self._components[i].kls_other_chol_inv(inputs, old_means[:, i],old_chol_inv[:, i])
-            kls_components.append(kls)
-            component_net_losses.append(component_losses)
-            loss = torch.mean(iw_batch * (component_losses + kls))
-            total_losses.append(loss)
-        self.components_loss["KL"]=torch.cat(kls_components,dim=1)
-        self.components_loss["each_componnent_network"]=torch.cat(component_net_losses,dim=1)
-        self.components_loss["total_loss"]=torch.cat(loss,dim=1)
-        comp = D.Independent(D.Normal(
-             old_means, old_chol_covars), 1)
-        gmm = MixtureSameFamily(importance_weights, comp)
-        return gmm
+        pass
+    
 
     def density(self, contexts, samples):
         p = self._gating_distribution.probabilities(contexts)
@@ -1599,11 +1557,12 @@ class ObstacleModelRecMod(ModelRecModWithModelVis):
 
             weights = model.gating_distribution.probabilities(context)[0]
             strs = ["{:.3f}".format(weights[i]) for i in range(model.num_components)]
-            plt.legend(lines, strs, loc=1)
+            plt.legend(lines, strs, loc='upper left' , bbox_to_anchor=(-0.05, 1.25), fontsize='xx-small', ncol= 3)
             plt.gca().set_axis_off()
             plt.gca().set_xlim(0, 200)
             plt.gca().set_ylim(0, 100)
-        plt.savefig("EIM_out_imgs/" + title + ".png")
+        plt.savefig("EIM_out_imgs/" + re.sub(r"\s+", '-', title) + ".png")
+
 
 def to_numpy(x):
     if torch.is_tensor(x):
@@ -1891,13 +1850,13 @@ config.num_components = num_components
 
 config.components_net_hidden_layers = [64, 64]
 config.components_batch_size = 1000
-config.components_num_epochs = 10
+config.components_num_epochs = 20
 config.components_net_reg_loss_fact = 0.0
 config.components_net_drop_prob = 0.0
 
 config.gating_net_hidden_layers = [64, 64]
 config.gating_batch_size = 1000
-config.gating_num_epochs = 10
+config.gating_num_epochs = 20
 config.gating_net_reg_loss_fact = 0.0
 config.gating_net_drop_prob = 0.0
 
