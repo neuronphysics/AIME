@@ -5,12 +5,13 @@ from collections import OrderedDict
 from torch.distributions import normal
 import numpy as np
 import os
-from planner_regulizer_EIM import Split
+from planner_regularizer_EIM import Split
 from tqdm import tqdm
 import warnings
 import logging
 import matplotlib.pyplot as plt
 import matplotlib.animation as anim
+import sys
 from typing import List
 import math
 from itertools import chain
@@ -22,6 +23,27 @@ from torchsample.initializers import XavierUniform
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torchsample.datasets import TensorDataset
+
+class _CWFormatter(logging.Formatter):
+    def __init__(self):
+        #self.std_formatter = logging.Formatter('[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s')
+        self.std_formatter = logging.Formatter('[%(name)s] %(message)s')
+        self.red_formatter = logging.Formatter('[%(asctime)s] %(message)s')
+
+    def format(self, record: logging.LogRecord):
+        if record.levelno <= logging.ERROR:
+            return self.std_formatter.format(record)
+        else:
+            return self.red_formatter.format(record)
+
+sh = logging.StreamHandler(sys.stdout)
+formatter = _CWFormatter()
+sh.setFormatter(formatter)
+sh.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO, handlers=[sh])
+
+device  = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 """
     minimizing Kullback-Leibler divergences by estimating density ratios
     Based on https://github.com/pbecker93/ExpectedInformationMaximization/
@@ -216,9 +238,8 @@ class Gaussian:
     def __init__(self, mean, covar):
         self._dim = mean.shape[-1]
         self.update_parameters(mean, covar)
-        self.device  = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.log2pi  = torch.log(torch.tensor(2*np.pi, requires_grad=False)).to(self.device)
-        self.log2piE = torch.log(torch.tensor(2 * np.pi * np.e, requires_grad=False)).to(self.device)
+        self.log2pi  = torch.log(torch.tensor(2*np.pi, requires_grad=False)).to(device)
+        self.log2piE = torch.log(torch.tensor(2 * np.pi * np.e, requires_grad=False)).to(device)
 
     def density(self, samples):
         return torch.exp(self.log_density(samples))
@@ -294,8 +315,7 @@ class Categorical:
 
     def __init__(self, probabilities):
         self._p = probabilities
-        self.device  = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.to(device=self.device)
+        self.to(device=device)
     def sample(self, num_samples):
         thresholds = torch.unsqueeze(torch.cumsum(self._p, dim=0), dim=0)
         thresholds[0, -1] = 1.0
@@ -380,7 +400,7 @@ class DensityRatioAccuracy(Metric):
         self.p_prob = torch.nn.Sigmoid()(p_outputs)
         self.q_prob = torch.nn.Sigmoid()(q_outputs)
         acc         = torch.mean(torch.cat([torch.greater_equal(self.p_prob, 0.5), torch.lt(self.q_prob, 0.5)], 0).type(torch.float32))
-        return acc.cpu().detach().numpy()
+        return to_numpy(acc)
 
 
 
@@ -444,6 +464,7 @@ class ConditionalGaussian(nn.Module):
 
         if weight_path is not None:
            self._model.load_state_dict(torch.load(weight_path))
+        self.to(device)
 
 
     def forward(self, contexts):
@@ -482,7 +503,7 @@ class ConditionalGaussian(nn.Module):
     def sample(self, contexts):
         mean, _, chol_covar = self(contexts)
         torch.random.manual_seed(self._seed)
-        eps = torch.normal(mean=0,std=1,size=(mean.shape[0], mean.shape[1], 1))
+        eps = torch.normal(mean=0,std=1,size=(mean.shape[0], mean.shape[1], 1)).to(device)
 
         return mean + torch.reshape(torch.matmul(chol_covar, eps), mean.shape)
 
@@ -582,6 +603,7 @@ class Softmax(nn.Module):
 
         if weight_path is not None:
            self._logit_net.load_state_dict(torch.load(weight_path))
+        self.to(device)
 
     def forward(self, x):
         return self._logit_net(x)
@@ -608,11 +630,11 @@ class Softmax(nn.Module):
         thresholds = torch.cumsum(p, dim=-1)
         # ensure the last threshold is always exactly one - it can be slightly smaller due to numerical inaccuracies
         # of cumsum, causing problems in extremely rare cases if a "n" is samples that's larger than the last threshold
-        thresholds = torch.cat([thresholds[..., :-1], torch.ones([thresholds.size()[0], 1])], -1)
+        thresholds = torch.cat([thresholds[..., :-1], torch.ones([thresholds.size()[0], 1]).to(device)], -1)
         torch.random.manual_seed(self._seed)
-        n=torch.distributions.uniform.Uniform(0.0,1.0).rsample((thresholds.size()[0], 1))
-        idx = torch.where(torch.lt(n, thresholds), torch.arange(self._z_dim) * torch.ones(thresholds.shape, dtype=torch.int64),
-                       self._z_dim * torch.ones(thresholds.shape, dtype=torch.int64))
+        n=torch.distributions.uniform.Uniform(0.0,1.0).rsample((thresholds.size()[0], 1)).to(device)
+        idx = torch.where(torch.lt(n, thresholds), torch.arange(self._z_dim).to(device) * torch.ones(thresholds.shape, dtype=torch.int64).to(device),
+                       self._z_dim * torch.ones(thresholds.shape, dtype=torch.int64).to(device))
         return torch.min(idx, -1)[0]
 
     @property
@@ -694,7 +716,7 @@ class GaussianEMM(nn.Module):
         old_means, old_chol_covars = self.get_component_parameters(inputs)
 
         print("[forward] old_means, old_chol_covars", old_means.shape, old_chol_covars.shape)
-        rhs = torch.eye(old_means.shape[-1], batch_shape=old_chol_covars.shape[:-2])
+        rhs = torch.eye(old_means.shape[-1], batch_shape=old_chol_covars.shape[:-2]).to(device)
         stab_fact = 1e-20
         old_chol_inv = torch.linalg.solve_triangular(old_chol_covars + stab_fact * rhs, rhs, upper=False)
         self.components_loss={}
@@ -733,7 +755,7 @@ class GaussianEMM(nn.Module):
 
     def sample(self, contexts):
         modes = self._gating_distribution.sample(contexts)
-        samples = torch.zeros([contexts.shape[0], self._sample_dim])
+        samples = torch.zeros([contexts.shape[0], self._sample_dim]).to(device)
         for i in range(self._number_of_components):
             idx = modes == i
             if torch.any(idx):
@@ -782,22 +804,21 @@ class DensityRatioEstimator(nn.Module):
         self._conditional_model = conditional_model
 
         if self._conditional_model:
-            self._train_contexts = torch.from_numpy(target_train_samples[0]).type(torch.float32)
+            self._train_contexts = torch.from_numpy(target_train_samples[0]).type(torch.float32).to(device)
 
-            self._target_train_samples = torch.cat([torch.from_numpy(x) for x in target_train_samples], -1).type(torch.float32)
+            self._target_train_samples = torch.cat([torch.from_numpy(x) for x in target_train_samples], -1).type(torch.float32).to(device)
         else:
-            self._target_train_samples = torch.from_numpy(target_train_samples).type(torch.float32)
+            self._target_train_samples = torch.from_numpy(target_train_samples).type(torch.float32).to(device)
 
         if self._early_stopping:
             assert target_val_samples is not None, \
                 "For early stopping validation data needs to be provided via target_val_samples"
             if self._conditional_model:
-                self._val_contexts = torch.from_numpy(target_val_samples[0]).type(torch.float32)
-                self._target_val_samples = torch.cat([torch.from_numpy(x) for x in target_val_samples], -1).type(torch.float32)
+                self._val_contexts = torch.from_numpy(target_val_samples[0]).type(torch.float32).to(device)
+                self._target_val_samples = torch.cat([torch.from_numpy(x) for x in target_val_samples], -1).type(torch.float32).to(device)
             else:
-                self._target_val_samples = torch.from_numpy(target_val_samples).type(torch.float32)
+                self._target_val_samples = torch.from_numpy(target_val_samples).type(torch.float32).to(device)
         self.hidden_params=hidden_params
-        self.device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         input_dim = self._target_train_samples.shape[-1]
 
@@ -806,7 +827,7 @@ class DensityRatioEstimator(nn.Module):
 
         self._p_samples = nn.Linear(input_dim,input_dim)
         self._q_samples = nn.Linear(input_dim,input_dim)
-        self.to(self.device)
+        self.to(device)
 
     def forward(self, x, inTrain=True):
         if inTrain:
@@ -861,7 +882,8 @@ class DensityRatioEstimator(nn.Module):
         #train_data = torch.tensor([[target, train] for target, train in zip(self._target_train_samples, model_train_samples)])
         #train_data = torch.cat([self._target_train_samples, model_train_samples], dim=1)
         train_data = torch.stack([self._target_train_samples, model_train_samples], dim=1)
-
+        #print("_target_train_samples", self._target_train_samples)
+        #print("model_train_samples", model_train_samples)
         train_loader  = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
         # print(batch_size,num_iters)
         # print(self._target_val_samples.shape, model_val_samples.shape)
@@ -879,6 +901,8 @@ class DensityRatioEstimator(nn.Module):
         #                         val_loader,
         #                         num_epoch = num_iters,
         #                         verbose = 1)
+        #train_data = train_data.to(device)
+        #val_data = val_data.to(device)
         last_epoch = self.trainer.fit(train_data, 
                            targets=None,
                            val_data=val_data,
@@ -897,8 +921,8 @@ class DensityRatioEstimator(nn.Module):
             target_samples = torch.cat([target_samples[0], target_samples[1]], dim=-1)
         else:
             model_samples = model.sample(self._target_train_samples.shape[0])
-        target_ldre = self(target_samples, inTrain=False)
-        model_ldre  = self(model_samples, inTrain=False)
+        target_ldre = self(target_samples.to(device), inTrain=False)
+        model_ldre  = self(model_samples.to(device), inTrain=False)
         target_prob = torch.sigmoid(target_ldre)
         model_prob  = torch.sigmoid(model_ldre)
         #eval_loss   = self.trainer.evaluate(target_ldre, model_ldre, batch_size=self.batch_size, verbose=1, inTrain=False)
@@ -1072,7 +1096,7 @@ class ConditionalMixtureEIM:
         self._context_dim = train_samples[0].shape[-1]
         self._sample_dim = train_samples[1].shape[-1]
         print("train_samples", train_samples[0].shape, train_samples[1].shape, "_context_dim", self._context_dim, "_sample_dim", self._sample_dim)
-        self._train_contexts = torch.tensor(train_samples[0], dtype=torch.float32)
+        self._train_contexts = torch.tensor(train_samples[0], dtype=torch.float32).to(device)
 
         c_net_hidden_dict = {NetworkKeys.NUM_UNITS: self.c.components_net_hidden_layers,
                              NetworkKeys.ACTIVATION: "relu",
@@ -1109,7 +1133,6 @@ class ConditionalMixtureEIM:
         self._recorder.initialize_module(RecorderKeys.WEIGHTS_UPDATE, self.c.train_epochs)
         self._recorder.initialize_module(RecorderKeys.COMPONENT_UPDATE, self.c.train_epochs, self.c.num_components)
         self._recorder.initialize_module(RecorderKeys.DRE, self.c.train_epochs)
-        self.device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     def train_emm(self):
         for i in range(self.c.train_epochs):
@@ -1141,7 +1164,7 @@ class ConditionalMixtureEIM:
           importance_weights = importance_weights / torch.sum(importance_weights, dim=0, keepdims=True)
           old_means, old_chol_covars = self._model.get_component_parameters(self._train_contexts)
   
-        rhs = torch.eye(old_means.shape[-1]).repeat(*old_chol_covars.shape[:-2], 1, 1)
+        rhs = torch.eye(old_means.shape[-1]).repeat(*old_chol_covars.shape[:-2], 1, 1).to(device)
 
         stab_fact = 1e-20
         old_chol_inv = torch.linalg.solve_triangular(old_chol_covars + stab_fact * rhs, rhs, upper=False)
@@ -1204,7 +1227,7 @@ class ConditionalMixtureEIM:
             with torch.no_grad():
               losses.append(- self._dre(torch.cat([self._train_contexts, samples], dim=-1), inTrain=False))
 
-        losses = torch.cat(losses, dim=1)
+        losses = torch.cat(losses, dim=1).to(device)
         dataset = torch.utils.data.TensorDataset(self._train_contexts, losses, old_probs)
         loader = torch.utils.data.DataLoader( dataset, shuffle = True, batch_size=self.c.gating_batch_size)
         for batch_idx, (context_batch, losses_batch, old_probs_batch) in enumerate(loader):
@@ -1345,11 +1368,11 @@ def save_gmm(model: GMM, path: str, filename: str):
 
 
 def eval_fn(model):
-    contexts = torch.tensor(data.raw_test_samples[0]).float()
+    contexts = torch.tensor(data.raw_test_samples[0]).float().to(device)
     samples = np.zeros([contexts.shape[0], 10, data.dim[1]])
     for i in range(10):
-        samples[:, i] = model.sample(contexts).detach().numpy()
-    return data.rewards_from_contexts(contexts.detach().numpy(), samples)
+        samples[:, i] = to_numpy(model.sample(contexts))
+    return data.rewards_from_contexts(to_numpy(contexts), samples)
 
 class ModelRecMod(RecorderModule):
     """Records current eim performance: Log Likelihood and if true (unnormalized) log density is provided the
@@ -1357,8 +1380,8 @@ class ModelRecMod(RecorderModule):
     def __init__(self, train_samples, test_samples, true_log_density=None, eval_fn=None,
                  test_log_iters=50, save_log_iters=50):
         super().__init__()
-        self._train_samples = train_samples if torch.is_tensor(train_samples) else (torch.tensor(train_samples)[0].float(), torch.tensor(train_samples)[1].float())
-        self._test_samples = test_samples if torch.is_tensor(test_samples) else (torch.tensor(test_samples)[0].float(), torch.tensor(test_samples)[1].float())
+        self._train_samples = train_samples if torch.is_tensor(train_samples) else (torch.tensor(train_samples)[0].float().to(device), torch.tensor(train_samples)[1].float().to(device))
+        self._test_samples = test_samples if torch.is_tensor(test_samples) else (torch.tensor(test_samples)[0].float().to(device), torch.tensor(test_samples)[1].float().to(device))
         self._true_log_density = true_log_density
         self._eval_fn = eval_fn
 
@@ -1386,9 +1409,9 @@ class ModelRecMod(RecorderModule):
 
     def _log_train(self, model):
         if isinstance(self._train_samples,torch.Tensor):
-            self._train_ll_list.append(torch.tensor(model.log_likelihood(self._train_samples)))
+            self._train_ll_list.append(to_numpy(model.log_likelihood(self._train_samples)))
         else:
-            self._train_ll_list.append(torch.tensor(model.log_likelihood(self._train_samples[0], self._train_samples[1])))
+            self._train_ll_list.append(to_numpy(model.log_likelihood(self._train_samples[0], self._train_samples[1])))
         log_str = "Training LL: " + str(self._train_ll_list[-1])
         if self._true_log_density is not None:
             if isinstance(self._train_samples, torch.Tensor):
@@ -1427,7 +1450,7 @@ class ModelRecMod(RecorderModule):
         if self._eval_fn is not None:
             self._test_eval_list.append(self._eval_fn(model))
             log_str += " Eval Loss: " + str(self._test_eval_list[-1])
-        print(log_str)
+        #print(log_str)
         self._logger.info(log_str)
 
     def record(self, model, iteration):
@@ -1449,6 +1472,7 @@ class ModelRecMod(RecorderModule):
             plt.plot(np.arange(0, len(self._train_kl_list)), np.array(self._train_kl_list))
             plt.xlim((0, self._num_iters))
         plt.tight_layout()
+        plt.savefig("train_log_likelihood.png")
 
     def finalize(self):
         if self._save:
@@ -1516,15 +1540,15 @@ class ObstacleModelRecMod(ModelRecModWithModelVis):
     def _plot_model(self, model, title):
         x_plt = np.arange(0, 1, 1e-2)
         color = Colors()
-        contexts = torch.tensor(self._data.raw_test_samples[0][:10]).float()
+        contexts = torch.tensor(self._data.raw_test_samples[0][:10]).float().to(device)
         for i in range(9):
             plt.subplot(3, 3, i + 1)
             context = contexts[i:i + 1]
             plt.imshow(self._data.img_from_context(context[0]))
             lines = []
             for k, c in enumerate(model.components):
-                m = (c.mean(context)[0] + 1) / 2
-                cov = c.covar(context)[0]
+                m = to_numpy((c.mean(context)[0] + 1) / 2)
+                cov = to_numpy(c.covar(context)[0])
                 mx, my = m[::2], m[1::2]
                 plt.scatter(200 * mx, 100 * my, c=color(k))
                 for j in range(mx.shape[0]):
@@ -1533,7 +1557,7 @@ class ObstacleModelRecMod(ModelRecModWithModelVis):
                     plt_cx, plt_cy = self._draw_2d_covariance(mean, cov_j, 1, return_raw=True)
                     plt.plot(200 * plt_cx, 100 * plt_cy, c=color(k), linestyle="dotted", linewidth=2)
                 for j in range(10):
-                    s = np.array(c.sample(contexts[i:i + 1]))
+                    s = to_numpy(c.sample(contexts[i:i + 1]))
                     spline = self._data.get_spline(s[0])
                     l, = plt.plot(200 * x_plt, 100 * spline(x_plt), c=color(k), linewidth=1)
                 lines.append(l)
@@ -1548,12 +1572,16 @@ class ObstacleModelRecMod(ModelRecModWithModelVis):
             plt.gca().set_axis_off()
             plt.gca().set_xlim(0, 200)
             plt.gca().set_ylim(0, 100)
+        plt.savefig(title + ".png")
 
 def to_numpy(x):
     if torch.is_tensor(x):
+      if x.is_cuda:
+        return x.cpu().detach().numpy()
       return x.detach().numpy()
     else:
       return np.array(x)
+
 def log_res(res, key_prefix):
     num_iters, kl, entropy, add_text = [to_numpy(x) for x in res]
     last_rec = {key_prefix + "_num_iterations": num_iters, key_prefix + "_kl": kl, key_prefix + "_entropy": entropy}
@@ -1620,6 +1648,7 @@ class ComponentUpdateRecMod(RecorderModule):
             plt.plot(self._entropies[i], c=self._c(i))
         plt.xlim(0, self._num_iters)
         plt.tight_layout()
+        plt.savefig("component_update_plot.png")
 
     @property
     def logger_name(self):
@@ -1667,6 +1696,7 @@ class WeightUpdateRecMod(RecorderModule):
         plt.plot(self._entropies)
         plt.xlim(0, self._num_iters)
         plt.tight_layout()
+        plt.savefig("weights_expected_kl_entropy.png")
 
     @property
     def logger_name(self):
@@ -1680,15 +1710,19 @@ class WeightUpdateRecMod(RecorderModule):
         if self._plot:
             self._recorder.save_img("WeightUpdates", self._plot_fn)
 
+def to_tensor(x):
+    if torch.is_tensor(x):
+        return x
+    elif isinstance(x, np.ndarray):
+        return torch.from_numpy(x).to(device)
+    else:
+        return torch.tensor(x).to(device)
 
 class DRERecMod(RecorderModule):
     """Records current Density Ratio Estimator performance - loss, accuracy and mean output for true and fake samples"""
     def __init__(self, true_samples, target_ld=None):
         super().__init__()
-        if isinstance(true_samples, torch.Tensor):
-            self._target_samples = true_samples.type(torch.float32)
-        else:
-            self._target_samples = [x.type(np.float32) for x in true_samples]
+        self._target_samples = true_samples.type(torch.float32).to(device)
         self._steps = []
         self._estm_ikl = []
         self._loss = []
@@ -1719,7 +1753,7 @@ class DRERecMod(RecorderModule):
         if iteration == 0 and self._target_ld is not None:
             for _ in model.components:
                 self._dre_rmse.append([])
-        estm_ikl, loss, acc, true_mean, fake_mean = [torch.tensor(x) for x in dre.eval(self._target_samples, model)]
+        estm_ikl, loss, acc, true_mean, fake_mean = [to_tensor(x) for x in dre.eval(self._target_samples, model)]
         log_str = "Density Ratio Estimator ran for " + str(steps) + " steps. "
         log_str += "Loss {:.4f} ".format(loss)
         log_str += "Estimated IKL: {:.4f} ".format(estm_ikl)
@@ -1759,10 +1793,10 @@ class DRERecMod(RecorderModule):
     def _subplot(self, i, title, data_list, data_list2=None, y_lim=None):
         plt.subplot(5 if self._target_ld is not None else 4, 1, i)
         plt.title(title)
-        print("i, title, data_list", i, title, data_list)
-        plt.plot(np.array(data_list))
+        #print("i, title, data_list", i, title, data_list)
+        plt.plot(to_numpy(data_list))
         if data_list2 is not None:
-            plt.plot(np.array(data_list2))
+            plt.plot(to_numpy(data_list2))
         plt.xlim(0, self._num_iters)
         if y_lim is not None:
             plt.ylim(y_lim[0], y_lim[1])
@@ -1772,6 +1806,7 @@ class DRERecMod(RecorderModule):
             plt.subplot(len(errs), 1, i+1)
             plt.hist(err, density=True, bins=25)
         plt.tight_layout()
+        plt.savefig("dre_plot_hist.png")
 
     def _plot(self):
         self._subplot(1, "Estimated I-Projection", self._estm_ikl)
@@ -1784,6 +1819,7 @@ class DRERecMod(RecorderModule):
             for i in range(len(self._dre_rmse)):
                 self._subplot(5, "DRE RMSE", self._dre_rmse[i])
         plt.tight_layout()
+        plt.savefig("dre_plot.png")
 
     def get_last_rec(self):
         lr = {"steps": self._steps[-1], "estimated_ikl": self._estm_ikl[-1], "dre_loss": self._loss[-1],
