@@ -97,6 +97,10 @@ class ActorNetwork(nn.Module):
       print(f'latent_spec size is: {self._latent_spec.size}')
       print(f'h size is: {h.size()}')
       mean, log_std = self._mean_logvar_layers(h)
+      print(f'mean is : {mean}')
+      print(f'log_std is: {log_std}')
+      print(f'action_mags is: {self._action_mags}')
+      print(f'action_means is: {self._action_means}')
       a_tanh_mode = torch.tanh(mean) * self._action_mags + self._action_means
       log_std = torch.tanh(log_std)
       log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
@@ -127,6 +131,7 @@ class ActorNetwork(nn.Module):
     return w_list
 
   def __call__(self, state):
+    print(f'state in actor __call__: {state}')
     a_dist, a_tanh_mode = self._get_outputs(state)
     print(f' a_dist: {a_dist}')
     print(f' a_tanh_mode: {a_tanh_mode}')
@@ -814,6 +819,7 @@ class D2EAgent(Agent):
     s = torch.from_numpy(batch['s1']) # 256 x 3
     a_b = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1)) 
     print(f's shape: {s.shape}')
+    print(f's in _build_c_loss is: {s}')
     print(f'a_b shape: {a_b.shape}')
     _, a_p, _ = self._p_fn(s)
     c_loss = self._divergence.dual_critic_loss(
@@ -917,7 +923,7 @@ class D2EAgent(Agent):
     self._c_optimizer.zero_grad()
     critic_loss,_= self._build_c_loss( batch)
     critic_loss.backward()
-    c_losses = self._c_optimizer.step(closure_c)
+    critic_loss = self._c_optimizer.step(closure_c)
     
     if self._train_alpha:
       def closure_alpha():
@@ -1116,6 +1122,7 @@ def eval_policy_episodes(env, policy, n_episodes):
       next_state, reward, done, _ = env.step(action.detach())
       total_rewards += reward
       state = next_state
+      
     results.append(total_rewards)
   results = torch.tensor(results)
   return torch.mean(results).to(dtype=torch.float32), torch.std(results).to(dtype=torch.float32)
