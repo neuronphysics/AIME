@@ -51,7 +51,7 @@ class gradient_penalty(object):
     alpha = torch.rand([batch_size], device=self.device)
     #print(a_p, self.device, alpha, a_b, a_p)
     a_intpl = a_p + alpha[:, None] * (a_b - a_p)
-    c_intpl = self.c(s.size()[0], s.size()[1], s, a_intpl, task_z)
+    c_intpl = self.c(s, a_intpl)
     slope = torch.sqrt(EPS + torch.sum(c_intpl ** 2, axis=-1))
     grad_penalty = torch.mean(torch.max(slope - 1.0, torch.zeros_like(slope)) ** 2)
     return grad_penalty * gamma
@@ -78,8 +78,9 @@ class FDivergence(Divergence):
   """Interface for f-divergence."""
 
   def dual_estimate(self, s, a_p, a_b, task_z):
-    logits_p = self.c(s.size()[0], s.size()[1], s, a_p, task_z)
-    logits_b = self.c(s.size()[0], s.size()[1], s, a_b, task_z)
+    print(type(self.c))
+    logits_p = self.c(s, a_p)
+    logits_b = self.c(s, a_b)
     return self._dual_estimate_with_logits(logits_p, logits_b)
 
   def _dual_estimate_with_logits(self, logits_p, logits_b):
@@ -161,7 +162,11 @@ def get_divergence(name, c, device):
   return CLS_DICT[name](c, device)
 
 def soft_variables_update(source_variables, target_variables, tau=1.0):
+    print(f'source_variables len: {len(source_variables)}')
+    print(f'target_variables len: {len(target_variables)}')
     for (v_s, v_t) in zip(source_variables, target_variables):
+        print(f'v_s: {v_s.shape}')
+        print(f'v_t: {v_t.shape}')
         v_t = (1 - tau) * v_t + tau * v_s
     return v_t
 
@@ -202,7 +207,7 @@ def clip_v2(x, low, high):
 
 def relu_v2(x):
   """Relu with modified gradient behavior."""
-  value = torch.nn.ReLU(x)
+  value = torch.nn.ReLU()(x)
   def grad(dy):
      if_y_pos = torch.gt(dy, 0.0).type(torch.float32)
      if_x_pos = torch.gt(x, 0.0).type(torch.float32)
