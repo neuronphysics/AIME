@@ -161,8 +161,7 @@ def generate_dataset(
     tf_env = env_factory(env_name)
     tf_env_test = env_factory(env_name)
     observation_spec = tf_env.reset()
-    action = tf_env.action_space.sample()
-    action_spec = action
+    action_spec = tf_env.action_space
     initial_state = tf_env.reset()
 
     # Initialize dataset.
