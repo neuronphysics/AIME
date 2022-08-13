@@ -843,6 +843,33 @@ class DensityRatioEstimator(nn.Module):
 
         self._p_samples = nn.Linear(input_dim,input_dim)
         self._q_samples = nn.Linear(input_dim,input_dim)
+        self._split_layers = Split(
+            self._ldre_net,
+            n_parts=2,
+            dim = 0
+        )
+
+        self.trainer   = ModuleTrainer(self) # model
+        self.metrics   = [self.acc_fn]
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0001)
+        self.initializers = [XavierUniform(bias=False, module_filter='*')]
+        self.regularizers   = [L2Regularizer(scale=1e-4)]
+        
+        if self._early_stopping:
+
+            self.callbacks = [EarlyStopping(monitor='val_loss', patience=10),
+                        ReduceLROnPlateau(factor=0.5, patience=5)]
+        else:
+            self.callbacks  = []
+        
+        self.trainer.compile(loss=LogisticRegressionLoss,
+                             optimizer=self.optimizer,
+                             regularizers=self.regularizers,
+                             initializers=self.initializers,
+                             metrics=self.metrics,
+                             callbacks=self.callbacks)
+
+
         self.to(device)
 
     def forward(self, x, inTrain=True):
@@ -853,11 +880,7 @@ class DensityRatioEstimator(nn.Module):
           q = x[:, 1, :]
           combined = torch.cat((p.view(p.size(0), -1),
                                 q.view(q.size(0), -1)), dim=0)
-          self._split_layers = Split(
-           self._ldre_net,
-           n_parts=2,
-           dim = 0
-          )
+          
           p_output, q_output =self._split_layers(combined)
           return p_output, q_output
         else:
@@ -872,18 +895,12 @@ class DensityRatioEstimator(nn.Module):
     def train_dre(self, model, batch_size, num_iters):
         #compile the model
         #https://github.com/ncullen93/torchsample
-        self.trainer   = ModuleTrainer(self) # model
-        self.batch_size= batch_size
-        metrics   = [self.acc_fn]
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.0001)
-        initializers = [XavierUniform(bias=False, module_filter='*')]
-        regularizers   = [L2Regularizer(scale=1e-4)]
+        
         #LogisticRegressionLoss  = lambda p_outputs, q_outputs: - torch.mean(torch.log(torch.sigmoid(p_outputs) +1e-12))- torch.mean(torch.log(1 - torch.sigmoid(q_outputs) + 1e-12))
-
+        self.batch_size= batch_size
         if self._early_stopping:
            model_train_samples, model_val_samples = self.sample_model(model)
-           callbacks = [EarlyStopping(monitor='val_loss', patience=10),
-                        ReduceLROnPlateau(factor=0.5, patience=5)]
+    
            val_dataset =  TensorDataset([self._target_val_samples, model_val_samples])
            val_loader  = DataLoader(val_dataset, batch_size=1, num_workers=0, shuffle=True)
            #val_data = torch.tensor([[target, train] for target, train in zip(self._target_val_samples, model_val_samples)])
@@ -891,7 +908,7 @@ class DensityRatioEstimator(nn.Module):
            
         else:
            model_train_samples = self.sample_model(model)
-           callbacks  = []
+           
            val_loader = None
            val_data = None
         train_dataset =  TensorDataset([self._target_train_samples, model_train_samples])
@@ -905,12 +922,7 @@ class DensityRatioEstimator(nn.Module):
         # print(self._target_val_samples.shape, model_val_samples.shape)
         # print(self._target_train_samples.shape, model_train_samples.shape)
 
-        self.trainer.compile(loss=LogisticRegressionLoss,
-                             optimizer=optimizer,
-                             regularizers=regularizers,
-                             initializers=initializers,
-                             metrics=metrics,
-                             callbacks=callbacks)
+        
         #print("shape of input data....")
         #torch.Size([10000, 12]) torch.Size([10000, 12])
         # self.trainer.fit_loader(train_loader,
