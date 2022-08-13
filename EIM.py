@@ -24,6 +24,10 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torchsample.datasets import TensorDataset
 
+import os
+if not os.path.exists("EIM_out_imgs"):
+    os.makedirs("EIM_out_imgs")
+
 class _CWFormatter(logging.Formatter):
     def __init__(self):
         #self.std_formatter = logging.Formatter('[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s')
@@ -1472,7 +1476,7 @@ class ModelRecMod(RecorderModule):
             plt.plot(np.arange(0, len(self._train_kl_list)), np.array(self._train_kl_list))
             plt.xlim((0, self._num_iters))
         plt.tight_layout()
-        plt.savefig("train_log_likelihood.png")
+        plt.savefig("EIM_out_imgs/train_log_likelihood.png")
 
     def finalize(self):
         if self._save:
@@ -1572,7 +1576,7 @@ class ObstacleModelRecMod(ModelRecModWithModelVis):
             plt.gca().set_axis_off()
             plt.gca().set_xlim(0, 200)
             plt.gca().set_ylim(0, 100)
-        plt.savefig(title + ".png")
+        plt.savefig("EIM_out_imgs/" + title + ".png")
 
 def to_numpy(x):
     if torch.is_tensor(x):
@@ -1648,7 +1652,7 @@ class ComponentUpdateRecMod(RecorderModule):
             plt.plot(self._entropies[i], c=self._c(i))
         plt.xlim(0, self._num_iters)
         plt.tight_layout()
-        plt.savefig("component_update_plot.png")
+        plt.savefig("EIM_out_imgs/component_update_plot.png")
 
     @property
     def logger_name(self):
@@ -1696,7 +1700,7 @@ class WeightUpdateRecMod(RecorderModule):
         plt.plot(self._entropies)
         plt.xlim(0, self._num_iters)
         plt.tight_layout()
-        plt.savefig("weights_expected_kl_entropy.png")
+        plt.savefig("EIM_out_imgs/weights_expected_kl_entropy.png")
 
     @property
     def logger_name(self):
@@ -1806,7 +1810,7 @@ class DRERecMod(RecorderModule):
             plt.subplot(len(errs), 1, i+1)
             plt.hist(err, density=True, bins=25)
         plt.tight_layout()
-        plt.savefig("dre_plot_hist.png")
+        plt.savefig("EIM_out_imgs/dre_plot_hist.png")
 
     def _plot(self):
         self._subplot(1, "Estimated I-Projection", self._estm_ikl)
@@ -1819,7 +1823,7 @@ class DRERecMod(RecorderModule):
             for i in range(len(self._dre_rmse)):
                 self._subplot(5, "DRE RMSE", self._dre_rmse[i])
         plt.tight_layout()
-        plt.savefig("dre_plot.png")
+        plt.savefig("EIM_out_imgs/dre_plot.png")
 
     def get_last_rec(self):
         lr = {"steps": self._steps[-1], "estimated_ikl": self._estm_ikl[-1], "dre_loss": self._loss[-1],
