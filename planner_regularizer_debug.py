@@ -29,10 +29,11 @@ LOG_STD_MIN = -5
 LOG_STD_MAX = 0
 
 def get_spec_means_mags(spec):
-  means = (spec.maximum + spec.minimum) / 2.0
-  mags = (spec.maximum - spec.minimum) / 2.0
-  means = Variable(means.type(torch.FloatTensor), requires_grad=False)
-  mags  = Variable(mags.type(torch.FloatTensor), requires_grad=False)
+  print(f'spec in get_spec_means: {spec}')
+  means = (spec.high + spec.low) / 2.0
+  mags = (spec.high - spec.low) / 2.0
+  means = Variable(torch.from_numpy(means), requires_grad=False)
+  mags  = Variable(torch.from_numpy(mags), requires_grad=False)
   return means, mags
 
 class Split(torch.nn.Module):
@@ -68,7 +69,7 @@ class ActorNetwork(nn.Module):
     self._layers = nn.ModuleList()
     for hidden_size in fc_layer_params:
         if len(self._layers)==0:
-           self._layers.append(nn.Linear(latent_spec.size(0), hidden_size))
+           self._layers.append(nn.Linear(latent_spec.size, hidden_size))
         else:
            self._layers.append(nn.Linear(hidden_size, hidden_size))
         self._layers.append(nn.ReLU())
@@ -149,7 +150,7 @@ class CriticNetwork(nn.Module):
       self._layers = nn.ModuleList()
       for hidden_size in fc_layer_params:
           if len(self._layers)==0:
-              self._layers.append(nn.Linear(latent_spec.size(0)+action_spec(0), hidden_size))
+              self._layers.append(nn.Linear(latent_spec.size+action_spec.shape[0], hidden_size))
           else:
               self._layers.append(nn.Linear(hidden_size, hidden_size))
           self._layers.append(nn.ReLU())
@@ -176,15 +177,20 @@ def get_modules(model_params, action_spec):
     model_params = tuple([model_params[0]] * 3)
   elif len(model_params) < 3:
     raise ValueError('Bad model parameters %s.' % model_params)
-  def q_net_factory():
+  def q_net_factory(latent_spec, action_spec):
     return CriticNetwork(
+        latent_spec,
+        action_spec,
         fc_layer_params=model_params[0])
-  def p_net_factory():
+  def p_net_factory(latent_spec, action_spec):
     return ActorNetwork(
+        latent_spec,
         action_spec,
         fc_layer_params=model_params[1])
-  def c_net_factory():
+  def c_net_factory(latent_spec, action_spec):
     return CriticNetwork(
+        latent_spec,
+        action_spec,
         fc_layer_params=model_params[2])
   modules = Flags(
       q_net_factory=q_net_factory,
@@ -198,26 +204,30 @@ def get_modules(model_params, action_spec):
 #######################################
 ALPHA_MAX = 500.0
 
-class AgentModule(nn.Module):
+class AgentModule:
   """Pytorch module for BRAC dual agent."""
   def __init__(
       self,
       modules=None,
+      latent_spec=None,
+      action_spec=None
       ):
-    super(AgentModule, self).__init__()
-    self._modules = modules
-    self._build_modules()
-    
-  def _build_modules(self):
+    print(f'latent spec in AgentModule: {latent_spec}')
+    self._modules = modules # This is a Flags object
+    self._build_modules(latent_spec, action_spec)
+
+
+  def _build_modules(self, latent_spec, action_spec):
     self._q_nets = []
     n_q_fns = self._modules.n_q_fns
+    # print(type(n_q_fns))
     for _ in range(n_q_fns):
       self._q_nets.append(
-          [self._modules.q_net_factory(),  # Learned Q-value.
-           self._modules.q_net_factory(),]  # Target Q-value.
+          [self._modules.q_net_factory(latent_spec, action_spec),  # Learned Q-value.
+           self._modules.q_net_factory(latent_spec, action_spec),]  # Target Q-value.
           )
-    self._p_net = self._modules.p_net_factory()
-    self._c_net = self._modules.c_net_factory()
+    self._p_net = self._modules.p_net_factory(latent_spec, action_spec)
+    self._c_net = self._modules.c_net_factory(latent_spec, action_spec)
     self._alpha_var = torch.tensor(1.0, requires_grad=True)
     self._alpha_entropy_var = torch.tensor(1.0, requires_grad=True)
 
@@ -268,8 +278,9 @@ class AgentModule(nn.Module):
     for q_net, _ in self._q_nets:
         vars = q_net.parameters()
         for v in vars:
+            print(v.is_leaf) # It is indeed a leaf here
             if v.requires_grad:
-               vars_ += v
+               vars_.append(v)
     return tuple(vars_)
 
   @property
@@ -352,10 +363,10 @@ class Agent(object):
     self._resume = resume 
     self.device = torch.device(
                     'cuda' if torch.cuda.is_available() else 'cpu')
-    self._build_agent()
     directory = os.getcwd()
     checkpoint_dir=directory+"/run"
     self.checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pth")
+    self._build_agent()
 
   def _build_agent(self):
     """Builds agent components."""
@@ -370,8 +381,9 @@ class Agent(object):
     train_batch = self._get_train_batch()
     self._init_vars(train_batch)
 
-  def _build_fns(self):
-    self._agent_module = AgentModule(modules=self._modules)
+  # This never actually runs. Self._build_fns in _duild_agent calls child class's _build_fns
+  def _build_fns(self, latent_spec, action_spec):
+    self._agent_module = AgentModule(modules = self._modules, latent_spec=self._latent_spec, action_spec=self._action_spec)
 
   def _get_vars(self):
     return []
@@ -380,7 +392,7 @@ class Agent(object):
      opt = self._optimizers[0]
      self._optimizer = torch.optim.Adam(
             self._agent_module.parameters(),
-            lr= opt[0],
+            lr= opt[0], # actually opt[0] might be the name of the optimizer
             betas=(opt[1], opt[2]),
         )
     
@@ -417,6 +429,8 @@ class Agent(object):
   def _get_train_batch(self):
     """Samples and constructs batch of transitions."""
     batch_indices = np.random.choice(self._train_data.size, self._batch_size)
+    # print(self._train_data._dataset.capacity)
+    # print(self._batch_size)
     batch_ = self._train_data.get_batch(batch_indices)
     transition_batch = batch_
     batch = dict(
@@ -592,15 +606,17 @@ class D2EAgent(Agent):
     self._warm_start = warm_start
     self._c_iter = c_iter
     self._ensemble_q_lambda = ensemble_q_lambda
-    super(Agent, self).__init__(**kwargs)
+    super(D2EAgent, self).__init__(**kwargs)
 
   def _build_fns(self):
-    self._agent_module = AgentModule(modules=self._modules)
+    self._agent_module = AgentModule(modules=self._modules, latent_spec=self._latent_spec, action_spec = self._action_spec)
     self._q_fns = self._agent_module.q_nets
-    self._p_fn = self._agent_module.p_fn
+    self._p_fn = self._agent_module.p_net
     self._c_fn = self._agent_module.c_net
     self._divergence = utils.get_divergence(
-        name=self._divergence_name)
+        name=self._divergence_name,
+        c = self._c_fn,
+        device = self.device)
     self._agent_module.assign_alpha(self._alpha)
     if self._target_entropy is None:
       self._target_entropy = - self._action_spec.shape[0]
@@ -784,12 +800,14 @@ class D2EAgent(Agent):
       raise ValueError('Bad optimizers %s.' % opts)
     if len(self._weight_decays) == 1:
       self._weight_decays = tuple([self._weight_decays[0]] * 3)
-      
-    self._q_optimizer = utils.OptMirrorAdam(self._get_q_vars(),lr=opts[0][0], betas=(opts[0][1],opts[0][2]), weight_decay=self._weight_decays[0])
-    self._p_optimizer = utils.OptMirrorAdam(self._get_p_vars(),lr=opts[1][0], betas=(opts[1][1],opts[1][2]), weight_decay=self._weight_decays[1])
-    self._c_optimizer = utils.OptMirrorAdam(self._get_c_vars(),lr=opts[2][0], betas=(opts[2][1],opts[2][2]), weight_decay=self._weight_decays[2])
-    self._a_optimizer = torch.optim.Adam(self._a_vars, lr=opts[3][0], betas=(opts[3][1],opts[3][2]))
-    self._ae_optimizer = torch.optim.Adam(self._ae_vars, lr=opts[3][0], betas=(opts[3][1],opts[3][2]))
+    print(f'weight_decays are: {self._weight_decays}')
+    print(f'opts are : {opts}')
+    print('Seeing the q_vars')
+    self._q_optimizer = utils.OptMirrorAdam(self._get_q_vars(),lr=opts[0][1], betas=(opts[0][2],opts[0][3]), weight_decay=self._weight_decays[0])
+    self._p_optimizer = utils.OptMirrorAdam(self._get_p_vars(),lr=opts[1][1], betas=(opts[1][2],opts[1][3]), weight_decay=self._weight_decays[1])
+    self._c_optimizer = utils.OptMirrorAdam(self._get_c_vars(),lr=opts[2][1], betas=(opts[2][2],opts[2][3]), weight_decay=self._weight_decays[2])
+    self._a_optimizer = torch.optim.Adam(self._agent_module.a_variables, lr=opts[3][1], betas=(opts[3][1],opts[3][3]))
+    self._ae_optimizer = torch.optim.Adam(self._agent_module.ae_variables, lr=opts[3][1], betas=(opts[3][1],opts[3][3]))
 
   def _optimize_step(self, batch):
     info = collections.OrderedDict()
@@ -894,7 +912,7 @@ class D2EAgent(Agent):
             "critic_optimizer": self._c_optimizer.state_dict(),
             "policy_optimizer": self._p_optimizer.state_dict(),
             "train_step": self._global_step,
-            "episode_num": self.episode_num ###fix??
+            # "episode_num": self.episode_num ###fix??
       }
       for q_fn, q_fn_target in self._q_fns:
           checkpoint["q_net"]        = q_fn.state_dict()
@@ -918,7 +936,7 @@ class D2EAgent(Agent):
         self._q_optimizer.load_state_dict(checkpoint["q_optimizer"])
         self._c_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self._global_step = checkpoint["train_step"]
-        self.episode_num = checkpoint["episode_num"]###???fix
+        # self.episode_num = checkpoint["episode_num"]###???fix
         if self._train_alpha:
             self._alpha_var = checkpoint["alpha"]
             self._a_optimizer.load_state_dict(checkpoint["alpha_optimizer"])
@@ -1020,32 +1038,42 @@ def map_structure(func: Callable, structure):
     return func(structure)
 
 
-# class Config(object):
-#   """Class for handling agent parameters."""
+class AgentConfig(object):
+  """Class for handling agent parameters."""
 
-#   def __init__(self, agent_flags):
-#     self._agent_flags = agent_flags
-#     self._agent_args = self._get_agent_args()
+  def __init__(self, agent_flags):
+    self._agent_flags = agent_flags
+    self._agent_args = self._get_agent_args()
 
-#   def _get_agent_args(self):
-#     """Gets agent parameters associated with config."""
-#     agent_flags = self._agent_flags
-#     agent_args = utils.Flags(
-#         action_spec=agent_flags.action_spec,
-#         optimizers=agent_flags.optimizers,
-#         batch_size=agent_flags.batch_size,
-#         weight_decays=agent_flags.weight_decays,
-#         update_rate=agent_flags.update_rate,
-#         update_freq=agent_flags.update_freq,
-#         discount=agent_flags.discount,
-#         train_data=agent_flags.train_data,
-#         )
-#     agent_args.modules = self._get_modules()
-#     return agent_args
+  def _get_agent_args(self):
+    """Gets agent parameters associated with config."""
+    agent_flags = self._agent_flags
+    agent_args = Flags(
+        latent_spec=agent_flags.latent_spec,
+        action_spec=agent_flags.action_spec,
+        optimizers=agent_flags.optimizers,
+        batch_size=agent_flags.batch_size,
+        weight_decays=agent_flags.weight_decays,
+        update_rate=agent_flags.update_rate,
+        update_freq=agent_flags.update_freq,
+        discount=agent_flags.discount,
+        train_data=agent_flags.train_data,
+        )
+    agent_args.modules = self._get_modules()
+    return agent_args
 
-#   def _get_modules(self):
-#     raise NotImplementedError
+  def _get_modules(self):
+    raise NotImplementedError
 
-#   @property
-#   def agent_args(self):
-#     return self._agent_args
+  @property
+  def agent_args(self):
+    return self._agent_args
+
+
+
+class Config(AgentConfig):
+
+  def _get_modules(self):
+    return get_modules(
+        self._agent_flags.model_params,
+        self._agent_flags.action_spec)

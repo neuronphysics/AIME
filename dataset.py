@@ -40,11 +40,14 @@ def map_structure(func: Callable, structure):
   
 #######################
 def gather(params, indices, axis = None):
+    to_ret = []
     if axis is None:
         axis = 0
     if axis < 0:
         axis = len(params.shape) + axis
     if axis == 0:
+        for i in indices:
+          to_ret.append(params[i])
         return params[indices]
     elif axis == 1:
         return params[:, indices]
@@ -146,7 +149,7 @@ class Dataset(nn.Module):
 
   @property
   def size(self):
-    return self._current_size.numpy()
+    return self._current_size
 
   def _zeros(self, shape, dtype):
     """Create a variable initialized with zeros."""
