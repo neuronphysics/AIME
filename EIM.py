@@ -413,7 +413,10 @@ class DensityRatioAccuracy(Metric):
 def gaussian_log_density(samples, means, chol_covars):
     covar_logdet = 2 *torch.sum(torch.log(torch.diagonal(chol_covars, dim1=-2, dim2=-1)+1e-15),dim=-1)
     diff = torch.unsqueeze(samples - means, -1)
-    exp_term = torch.sum(torch.square(torch.linalg.solve_triangular(chol_covars, diff, upper=False)), (-2, -1))
+    try:
+        exp_term = torch.sum(torch.square(torch.linalg.solve_triangular(chol_covars, diff, upper=False)), (-2, -1))
+    except AttributeError:
+        exp_term = torch.sum(torch.square(torch.triangular_solve(diff, chol_covars, upper=False)), (-2, -1))
     return - 0.5 * (samples.size()[-1] * torch.log(2 * torch.tensor(np.pi, requires_grad=False)) + covar_logdet + exp_term)
 
 def gaussian_density(samples, means, chol_covars):
@@ -536,9 +539,15 @@ class ConditionalGaussian(nn.Module):
     def kls(self, contexts, other_means, other_chol_covars):
         means, _, chol_covars = self(contexts)
         kl = self._covar_logdets(other_chol_covars) - self._covar_logdets(chol_covars) - self._sample_dim
-        kl += torch.sum(torch.square(torch.linalg.solve_triangular(other_chol_covars, chol_covars, upper=False)), (-2, -1))
+        try:
+            kl += torch.sum(torch.square(torch.linalg.solve_triangular(other_chol_covars, chol_covars, upper=False)), (-2, -1))
+        except AttributeError:
+            kl += torch.sum(torch.square(torch.linalg.triangular_solve(chol_covars, other_chol_covars, upper=False)), (-2, -1))
         diff = torch.unsqueeze(other_means - means, -1)
-        kl += torch.sum(torch.square(torch.linalg.solve_triangular(other_chol_covars, diff, upper=False)), (-2, -1))
+        try:
+            kl += torch.sum(torch.square(torch.linalg.solve_triangular(other_chol_covars, diff, upper=False)), (-2, -1))
+        except AttributeError:
+            kl += torch.sum(torch.square(torch.linalg.triangular_solve(diff, other_chol_covars, upper=False)), (-2, -1))
         return 0.5 * kl
 
     ##@staticmethod
@@ -722,7 +731,10 @@ class GaussianEMM(nn.Module):
         print("[forward] old_means, old_chol_covars", old_means.shape, old_chol_covars.shape)
         rhs = torch.eye(old_means.shape[-1], batch_shape=old_chol_covars.shape[:-2]).to(device)
         stab_fact = 1e-20
-        old_chol_inv = torch.linalg.solve_triangular(old_chol_covars + stab_fact * rhs, rhs, upper=False)
+        try:
+            old_chol_inv = torch.linalg.solve_triangular(old_chol_covars + stab_fact * rhs, rhs, upper=False)
+        except AttributeError:
+            old_chol_inv = torch.linalg.triangular_solve(rhs, old_chol_covars + stab_fact * rhs, upper=False)
         self.components_loss={}
         kls_components=[]
         component_net_losses=[]
@@ -1171,7 +1183,10 @@ class ConditionalMixtureEIM:
         rhs = torch.eye(old_means.shape[-1]).repeat(*old_chol_covars.shape[:-2], 1, 1).to(device)
 
         stab_fact = 1e-20
-        old_chol_inv = torch.linalg.solve_triangular(old_chol_covars + stab_fact * rhs, rhs, upper=False)
+        try:
+            old_chol_inv = torch.linalg.solve_triangular(old_chol_covars + stab_fact * rhs, rhs, upper=False)
+        except AttributeError:
+            old_chol_inv = torch.linalg.triangular_solve(rhs, old_chol_covars + stab_fact * rhs, upper=False)
         for i in range(self.c.components_num_epochs):
             self._components_train_step(importance_weights, old_means, old_chol_inv)
 
