@@ -28,6 +28,7 @@ import importlib
 from dataset import Dataset
 from collect_data import DataCollector
 from planner_regularizer_debug import Flags, D2EAgent, eval_policies
+import planner_regularizer_debug
 
 
 
@@ -50,7 +51,7 @@ def train_eval_offline(
     n_eval_episodes=20,
     # Agent args.
     model_params=(((200, 200),), 2),
-    optimizers=(('adam', 0.001),),
+    optimizers=(('adam', 0.001, 0.0, 0.99),),
     batch_size=256,
     weight_decays=(0.0,),
     update_freq=1,
@@ -63,16 +64,19 @@ def train_eval_offline(
   # env = alf_gym_wrapper.AlfGymWrapper(dm_env)
   
   observation_spec = env.reset()
-  action = env.action_space.sample()
+  action = env.action_space
   action_spec = action
   initial_state = env.reset()
   
 
   # Prepare data.
   logging.info('Loading data from %s ...', data_file)
-  data  = torch.load(data_file)
-  data_size = data.size()      
-  full_data = Dataset(observation_spec, action_spec, data_size)
+  full_data  = torch.load(data_file)
+  print(type(full_data))
+  print(f'data size: {full_data._current_size}')
+  # data_size = data.size()      
+  # full_data = Dataset(observation_spec, action_spec, data_size)
+
   # Split data.
   n_train = min(n_train, full_data.size)
   logging.info('n_train %s.', n_train)
@@ -87,7 +91,7 @@ def train_eval_offline(
 
   # Create agent.
   agent_flags = Flags(
-      observation_spec=observation_spec,
+      latent_spec=observation_spec,
       action_spec=action_spec,
       model_params=model_params,
       optimizers=optimizers,
@@ -97,8 +101,21 @@ def train_eval_offline(
       update_rate=update_rate,
       discount=discount,
       train_data=train_data)
-  agent_args = agent_module.Config(agent_flags).agent_args
-  agent = agent_module.Agent(**vars(agent_args)) #ATTENTION: Debugg ====> should it be D2EAgent here??
+  print(f'Agent flags latent spec: {agent_flags.latent_spec}')
+  agent_args = agent_module.Config(agent_flags).agent_args # agent_module is a file name
+  agent = agent_module.D2EAgent(**vars(agent_args)) #ATTENTION: Debugg ====> should it be D2EAgent here?? Yes
+  # if agent_name == 'D2E':
+    # agent = D2EAgent(latent_spec=observation_spec,
+  #       action_spec=action_spec,
+  #       # model_params=model_params,
+  #       optimizers=optimizers,
+  #       batch_size=batch_size,
+  #       weight_decays=weight_decays,
+  #       update_freq=update_freq,
+  #       update_rate=update_rate,
+  #       discount=discount,
+  #       train_data=train_data)
+  
   agent_ckpt_name = os.path.join(log_dir, 'agent')
 
   # Restore agent from checkpoint if there exists one.
@@ -159,17 +176,17 @@ parser = argparse.ArgumentParser(description='AIME')
 
 # parser.add_argument('--test_srcdir', type=str, default='0', help='directory for saving test data.')
 
-parser.add_argument('--data_root_dir', type=str, default=os.getenv('HOME', '/'), help='Root directory for data.')
-parser.add_argument('--data_subdir', type=str, default='auto', help='sub directory for saving data.')
-parser.add_argument('--data_name', type=str, default='eps1', help='data name.')
-parser.add_argument('--data_file_name', type=str, default='data', help='data checkpoint file name.')
+parser.add_argument('--data_root_dir', type=str, default='offline_rl', help='Root directory for data.')
+parser.add_argument('--dataset_dir_name', type=str, default='new_datasets3rand', help='Root directory for data.')
+parser.add_argument('--data_subdir', type=str, default=os.path.join('sac','20220812105050','20220812105050'), help='sub directory for saved data.')
+parser.add_argument('--data_file_name', type=str, default='replay_dataset.pt', help='data checkpoint file name.')
 
 
 parser.add_argument('--root_dir', type=str, default='./offlinerl', help='Root directory for writing logs/summaries/checkpoints.')
 parser.add_argument('--sub_dir', type=str, default='auto', help='sub directory for saving results.')
 
 parser.add_argument('--agent_name', type=str, default='D2E', help='agent name.')
-parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.')
+parser.add_argument('--env_name', type=str, default='Pendulum-v0', help='env name.')
 parser.add_argument('--env_loader', type=str, default='mujoco', help='env loader, suite/gym.')
 
 # parser.add_argument('--config_dir',
@@ -201,16 +218,15 @@ def main(_):
     gin.parse_config_files_and_bindings(args.gin_file, args.gin_bindings)
 
     # Setup data file path.
-    if args.data_subdir == 'auto':
-        data_subdir = utils.get_datetime()
-    data_dir = os.path.join(
-        args.data_root_dir,
-        args.env_name,
-        args.data_name,
-        data_subdir,
-        )
-    data_file = os.path.join(
-        data_dir, args.data_file_name)
+    # data_dir = os.path.join(
+    #     args.data_root_dir,
+    #     args.dataset_dir_name,
+    #     args.env_name,
+    #     args.data_subdir,
+    #     )
+    # data_file = os.path.join(
+    #     data_dir, args.data_file_name)
+    data_file = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220812105050","20220812105050", "replay_dataset.pt")
 
     # Setup log dir.
     if args.sub_dir == 'auto':
@@ -218,13 +234,13 @@ def main(_):
     else:
         sub_dir = args.sub_dir
 
-    base_dir = utils.make_base_dir([args.root_dir, args.env_name, args.data_name,'n'+str(args.n_train),args.agent_name,sub_dir])
+    base_dir = utils.make_base_dir([args.root_dir, args.env_name,'n'+str(args.n_train), args.agent_name, sub_dir])
     log_dir = os.path.join(base_dir, str(args.seed),)
     utils.maybe_makedirs(log_dir)
     train_eval_offline(
         log_dir=log_dir,
         data_file=data_file,
-        agent_module=AGENT_MODULES_DICT[args.agent_name],
+        agent_module=planner_regularizer_debug,
         env_name=args.env_name,
         n_train=args.n_train,
         total_train_steps=args.total_train_steps,
