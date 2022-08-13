@@ -433,6 +433,21 @@ class ModuleTrainer(object):
                 else:
                     for out_idx in range(len_outputs):
                         prediction_lists[out_idx].append(output_batch[out_idx])
+        # for batch_idx in range(num_batches):
+        #     input_batch, _ = predict_helper.grab_batch(batch_idx, batch_size, inputs, None, volatile=True)
+        #     if cuda_device >= 0:
+        #         inputs = predict_helper.move_to_cuda(cuda_device, inputs)
+        #     output_batch = pred_forward_fn(input_batch)
+
+        #     if batch_idx == 0:
+        #         len_outputs = 1 if not _is_tuple_or_list(output_batch) else len(output_batch)
+        #         prediction_lists = [[] for _ in range(len_outputs)]
+
+        #     if len_outputs == 1:
+        #         prediction_lists[0].append(output_batch)
+        #     else:
+        #         for out_idx in range(len_outputs):
+        #             prediction_lists[out_idx].append(output_batch[out_idx])
             
         final_pred_list = [th.cat(pred_list,0) for pred_list in prediction_lists]
         self.model.train(mode=True)
@@ -474,7 +489,20 @@ class ModuleTrainer(object):
                 else:
                     for out_idx in range(len_outputs):
                         prediction_lists[out_idx].append(output_batch[out_idx])
-            
+        # for batch_idx in _range:
+        #     input_batch, _ = predict_helper.grab_batch_from_loader(loader_iter, volatile=True)
+        #     if cuda_device >= 0:
+        #         input_batch, _ = predict_helper.move_to_cuda(cuda_device, input_batch)
+        #     output_batch = pred_forward_fn(input_batch)
+        #     if batch_idx == 0:
+        #         len_outputs = 1 if not _is_tuple_or_list(output_batch) else len(output_batch)
+        #         prediction_lists = [[] for _ in range(len_outputs)]
+        #     if len_outputs == 1:
+        #         prediction_lists[0].append(output_batch)
+        #     else:
+        #         for out_idx in range(len_outputs):
+        #             prediction_lists[out_idx].append(output_batch[out_idx])
+        
         final_pred_list = [th.cat(pred_list,0) for pred_list in prediction_lists]
         self.model.train(mode=True)
         return final_pred_list if len_outputs > 1 else final_pred_list[0]
@@ -518,6 +546,18 @@ class ModuleTrainer(object):
                 if self._has_metrics:
                     metrics_logs = metric_container(output_batch, target_batch)
                     eval_logs.update(metrics_logs)
+        # for batch_idx in range(num_batches):
+        #     input_batch, target_batch = evaluate_helper.grab_batch(batch_idx, batch_size, inputs, targets, volatile=True)
+        #     if cuda_device >= 0:
+        #         input_batch, target_batch = evaluate_helper.move_to_cuda(cuda_device, input_batch, target_batch)
+        #     self._optimizer.zero_grad()
+        #     output_batch = eval_forward_fn(input_batch, **kwargs)
+        #     loss = eval_loss_fn(output_batch, target_batch)
+        #     samples_seen += batch_size
+        #     eval_logs['val_loss'] = (samples_seen*eval_logs['val_loss'] + loss.item()*batch_size) / (samples_seen+batch_size)
+        #     if self._has_metrics:
+        #         metrics_logs = metric_container(output_batch, target_batch)
+        #         eval_logs.update(metrics_logs)
 
         self.model.train(mode=True)
         return eval_logs
@@ -560,6 +600,21 @@ class ModuleTrainer(object):
                 if self._has_metrics:
                     metrics_logs = metric_container(output_batch, target_batch)
                     eval_logs.update(metrics_logs)
+        # for batch_idx in range(num_batches):
+        #     input_batch, target_batch = evaluate_helper.grab_batch_from_loader(loader_iter, volatile=True)
+        #     if cuda_device >= 0:
+        #         input_batch, target_batch = evaluate_helper.move_to_cuda(cuda_device, input_batch, target_batch)
+
+        #     self._optimizer.zero_grad()
+        #     output_batch = eval_forward_fn(input_batch)
+        #     loss = eval_loss_fn(output_batch, target_batch)
+            
+        #     samples_seen += batch_size
+        #     eval_logs['val_loss'] = (samples_seen*eval_logs['val_loss'] + loss.data[0]*batch_size) / (samples_seen+batch_size)
+            
+        #     if self._has_metrics:
+        #         metrics_logs = metric_container(output_batch, target_batch)
+        #         eval_logs.update(metrics_logs)
 
         self.model.train(mode=True)
         return eval_logs
