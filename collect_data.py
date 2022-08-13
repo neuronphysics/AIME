@@ -266,8 +266,8 @@ class DataCollector(object):
         self._data.add_transitions(transition)
       return 1, next_state
     else:
-      if USE_LISTS:
-        self.addTransitionData(state, next_state, action, None, reward, self.discount**steps_so_far)
+      # if USE_LISTS:
+      #   self.addTransitionData(state, next_state, action, None, reward, self.discount**steps_so_far)
       return 0, None
 
 
