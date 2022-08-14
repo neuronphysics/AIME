@@ -35,6 +35,11 @@ def map_structure(func: Callable, structure):
     if isinstance(structure, dict):
         return {key: map_structure(func, structure[key]) for key in structure}
 
+    if isinstance(structure, Transition):
+        return Transition(
+          s1 = map_structure(func, structure.s1), s2 = map_structure(func, structure.s2), a1 = map_structure(func, structure.a1), 
+          a2 = map_structure(func, structure.a2), discount = map_structure(func, structure.discount), reward = map_structure(func, structure.reward))
+
     return func(structure)
 
   
@@ -46,8 +51,6 @@ def gather(params, indices, axis = None):
     if axis < 0:
         axis = len(params.shape) + axis
     if axis == 0:
-        for i in indices:
-          to_ret.append(params[i])
         return params[indices]
     elif axis == 1:
         return params[:, indices]
