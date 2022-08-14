@@ -97,10 +97,14 @@ class ActorNetwork(nn.Module):
       print(f'latent_spec size is: {self._latent_spec.size}')
       print(f'h size is: {h.size()}')
       mean, log_std = self._mean_logvar_layers(h)
-      print(f'mean is : {mean}')
-      print(f'log_std is: {log_std}')
-      print(f'action_mags is: {self._action_mags}')
-      print(f'action_means is: {self._action_means}')
+      print(f'mean is : {mean.shape}')
+      utils.check_for_nans_and_nones(mean)
+
+      print(f'log_std is: {log_std.shape}')
+      utils.check_for_nans_and_nones(log_std)
+
+      print(f'action_mags shape is: {self._action_mags.shape}')
+      print(f'action_means shape is: {self._action_means.shape}')
       a_tanh_mode = torch.tanh(mean) * self._action_mags + self._action_means
       log_std = torch.tanh(log_std)
       log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
@@ -131,12 +135,19 @@ class ActorNetwork(nn.Module):
     return w_list
 
   def __call__(self, state):
-    print(f'state in actor __call__: {state}')
+    print(f'state shape in actor __call__: {state.shape}')
+    print(f'statee type is: {type(state)}')
+    # utils.check_for_nans_and_nones(state)
+
     a_dist, a_tanh_mode = self._get_outputs(state)
-    print(f' a_dist: {a_dist}')
-    print(f' a_tanh_mode: {a_tanh_mode}')
+    print(f' a_dist : {a_dist}')
+    print(f' a_tanh_mode shape: {a_tanh_mode.shape}')
+    utils.check_for_nans_and_nones(a_tanh_mode)
+
     a_sample = a_dist.sample()
-    print(f' a_sample: {a_sample}')
+    print(f' a_sample shape: {a_sample.shape}')
+    utils.check_for_nans_and_nones(a_sample)
+
     log_pi_a = a_dist.log_prob(a_sample)
     return a_tanh_mode, a_sample, log_pi_a
 
@@ -819,7 +830,7 @@ class D2EAgent(Agent):
     s = torch.from_numpy(batch['s1']) # 256 x 3
     a_b = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1)) 
     print(f's shape: {s.shape}')
-    print(f's in _build_c_loss is: {s}')
+    # print(f's in _build_c_loss is: {s}')
     print(f'a_b shape: {a_b.shape}')
     _, a_p, _ = self._p_fn(s)
     c_loss = self._divergence.dual_critic_loss(
