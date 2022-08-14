@@ -82,10 +82,7 @@ def train_eval_offline(
       loaded = loaded.squeeze()
     elif data_file.split('\\')[-1] == 'replay_next_actions.pt':
       loaded = loaded.squeeze()
-      for idx, item in enumerate(loaded):
-        if item is None or math.isnan(item):
-          print("We have a None")
-          none_indices.append(idx)
+      none_indices = utils.check_for_nans_and_nones(loaded)
 
     print(loaded.shape)
     print(loaded[0])
@@ -274,6 +271,8 @@ def main(_):
     #     data_dir, args.data_file_name)
     # data_file = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220812105050","20220812105050", "replay_dataset.pt")
     data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_rewards.pt")
+    # data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220812105358","20220812105358", "replay_rewards.pt")
+    # data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220814105542","20220814105542", "replay_rewards.pt")
     data_file_actions = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_actions.pt")
     data_file_next_actions = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_next_actions.pt")
     data_file_states = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_states.pt")

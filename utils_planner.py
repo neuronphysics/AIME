@@ -863,3 +863,18 @@ def make_base_dir(list_of_dir):
             os.mkdir(first)
 
     return first
+
+def check_for_nans_and_nones(arr):
+    none_indices = []
+    checker_fn = lambda iterable : math.isnan(iterable)
+    if isinstance(arr, np.ndarray):
+        checker_fn = lambda iterable : np.isnan(iterable)
+    elif isinstance(arr, np.ndarray):
+        checker_fn = lambda iterable : torch.isnan(iterable).any()
+
+    for idx, item in enumerate(arr):
+        if item is None or checker_fn(item):
+            print("We have a None")
+            none_indices.append(idx)
+            
+    return none_indices
