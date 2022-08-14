@@ -20,8 +20,7 @@ from absl import app
 from absl import flags
 from absl import logging
 import argparse
-
-from EIM import weights_init
+import math
 
 import time
 import alf_gym_wrapper
@@ -29,6 +28,82 @@ import importlib
 
 LOG_STD_MIN = -5
 LOG_STD_MAX = 0
+
+def weights_init(modules, type='xavier'):
+    "Based on shorturl.at/jmqV3"
+    m = modules
+    if isinstance(m, nn.Conv2d):
+        if type == 'xavier':
+            torch.nn.init.xavier_normal_(m.weight)
+        elif type == 'kaiming':  # msra
+            torch.nn.init.kaiming_normal_(m.weight)
+        else:
+            n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            m.weight.data.normal_(0, math.sqrt(2. / n))
+
+        if m.bias is not None:
+            m.bias.data.zero_()
+    elif isinstance(m, nn.ConvTranspose2d):
+        if type == 'xavier':
+            torch.nn.init.xavier_normal_(m.weight)
+        elif type == 'kaiming':  # msra
+            torch.nn.init.kaiming_normal_(m.weight)
+        else:
+            n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            m.weight.data.normal_(0, math.sqrt(2. / n))
+
+        if m.bias is not None:
+            m.bias.data.zero_()
+    elif isinstance(m, nn.BatchNorm2d):
+        m.weight.data.fill_(1.0)
+        m.bias.data.zero_()
+    elif isinstance(m, nn.Linear):
+        if type == 'xavier':
+            torch.nn.init.xavier_normal_(m.weight)
+        elif type == 'kaiming':  # msra
+            torch.nn.init.kaiming_normal_(m.weight)
+        else:
+            m.weight.data.fill_(1.0)
+
+        if m.bias is not None:
+            m.bias.data.zero_()
+    elif isinstance(m, nn.Sequential):
+        for k, v in m._modules.items():
+            if isinstance(v, nn.Conv2d):
+                if type == 'xavier':
+                    torch.nn.init.xavier_normal_(v.weight)
+                elif type == 'kaiming':  # msra
+                    torch.nn.init.kaiming_normal_(v.weight)
+                else:
+                    n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
+                    v.weight.data.normal_(0, np.sqrt(2. / n))
+
+                if v.bias is not None:
+                    v.bias.data.zero_()
+            elif isinstance(v, nn.ConvTranspose2d):
+                if type == 'xavier':
+                    torch.nn.init.xavier_normal_(v.weight)
+                elif type == 'kaiming':  # msra
+                    torch.nn.init.kaiming_normal_(v.weight)
+                else:
+                    n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
+                    v.weight.data.normal_(0, np.sqrt(2. / n))
+
+                if v.bias is not None:
+                    v.bias.data.zero_()
+            elif isinstance(v, nn.BatchNorm2d):
+                v.weight.data.fill_(1.0)
+                v.bias.data.zero_()
+            elif isinstance(v, nn.Linear):
+                if type == 'xavier':
+                    torch.nn.init.xavier_normal_(v.weight)
+                elif type == 'kaiming':  # msra
+                    torch.nn.init.kaiming_normal_(v.weight)
+                else:
+                    v.weight.data.fill_(1.0)
+
+                if v.bias is not None:
+                    v.bias.data.zero_()
 
 def get_spec_means_mags(spec):
   print(f'spec in get_spec_means: {spec}')
@@ -83,8 +158,11 @@ class ActorNetwork(nn.Module):
     self._layers.append(output_layer)
     self._action_means, self._action_mags = get_spec_means_mags(
         self._action_spec)
-        
-    weights_init(self._modules)
+
+    # print(self._layers)
+    for layer in self._layers:
+      weights_init(layer)
+    # print(f'This is an {error}')
 
   @property
   def action_spec(self):
