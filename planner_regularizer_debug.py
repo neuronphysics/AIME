@@ -21,6 +21,8 @@ from absl import flags
 from absl import logging
 import argparse
 
+from EIM import weights_init
+
 import time
 import alf_gym_wrapper
 import importlib  
@@ -81,6 +83,8 @@ class ActorNetwork(nn.Module):
     self._layers.append(output_layer)
     self._action_means, self._action_mags = get_spec_means_mags(
         self._action_spec)
+        
+    weights_init(self._modules)
 
   @property
   def action_spec(self):
@@ -136,7 +140,7 @@ class ActorNetwork(nn.Module):
 
   def __call__(self, state):
     print(f'state shape in actor __call__: {state.shape}')
-    print(f'statee type is: {type(state)}')
+    print(f'state type is: {type(state)}')
     # utils.check_for_nans_and_nones(state)
 
     a_dist, a_tanh_mode = self._get_outputs(state)
@@ -906,7 +910,7 @@ class D2EAgent(Agent):
     def closure_p():
         self._p_optimizer.zero_grad()
         policy_loss,_=self._build_p_loss(batch)
-        policy_loss.backward(retain_graph=True)
+        policy_loss.backward()
         return policy_loss
 
     self._p_optimizer.zero_grad()
