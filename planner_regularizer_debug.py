@@ -1122,7 +1122,7 @@ def eval_policy_episodes(env, policy, n_episodes):
       next_state, reward, done, _ = env.step(action.detach())
       total_rewards += reward
       state = next_state
-      
+
     results.append(total_rewards)
   results = torch.tensor(results)
   return torch.mean(results).to(dtype=torch.float32), torch.std(results).to(dtype=torch.float32)

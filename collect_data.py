@@ -237,8 +237,9 @@ class DataCollector(object):
                   'rewards': self.rewards,
                   'discounts':self.discounts}
     for k, v in suffix_map.items():
-      with open(filename+'_'+k+'.pkl', 'wb') as f:
-        pickle.dump(v, f)
+      torch.save(v, filename+'_'+k+'.pt')
+      # with open(filename+'_'+k+'.pkl', 'wb') as f:
+      #   pickle.dump(v, f)
 
 
   def collect_transition(self, state, steps_so_far):
