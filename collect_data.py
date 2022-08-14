@@ -21,7 +21,7 @@ from dataset import Transition
 import pickle
 
 
-USE_LISTS = True
+USE_LISTS = False
 
 
 # PLEASE USE GENERATE_TRANSITIONS_DATASET.PY TO CALL FUNCTIONS IN THIS MODULE

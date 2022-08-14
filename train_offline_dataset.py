@@ -272,7 +272,7 @@ def main(_):
     # data_file = os.path.join(
     #     data_dir, args.data_file_name)
 
-    data_file = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220812105050","20220812105050", "replay_dataset.pt")
+    data_file = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220814172356","20220814172356", "replay_dataset.pt")
     
     # data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_rewards.pt")
     # data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220812105358","20220812105358", "replay_rewards.pt")
