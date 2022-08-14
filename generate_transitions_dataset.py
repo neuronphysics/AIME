@@ -27,7 +27,7 @@ import importlib
 
 from dataset import Dataset, save_copy
 from collect_data import DataCollector, env_factory, USE_LISTS
-from planner_regularizer_debug import ActorNetwork, AgentModule, eval_policies, ContinuousRandomPolicy, Agent, wrap_policy
+from planner_regularizer_debug_dataset import ActorNetwork, AgentModule, eval_policies, ContinuousRandomPolicy, Agent, wrap_policy
 import alf_gym_wrapper
 
 

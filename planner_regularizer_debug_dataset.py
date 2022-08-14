@@ -21,6 +21,7 @@ from absl import flags
 from absl import logging
 import argparse
 import math
+import tensor_specs
 
 import time
 import alf_gym_wrapper
@@ -687,10 +688,10 @@ class ContinuousRandomPolicy(nn.Module):
     self._action_spec = action_spec
 
   def __call__(self, observation, state=()):
-    # action = tensor_spec.sample_bounded_spec(
-    #     self._action_spec, outer_dims=[observation.shape[0]])
-    # action = self._action_spec.sample()
-    # return action, state
+    action = tensor_specs.sample_bounded_spec(
+        self._action_spec, outer_dims=[observation.shape[0]])
+    action = self._action_spec.sample()
+    return action, state
     return ["random"]
 
 
