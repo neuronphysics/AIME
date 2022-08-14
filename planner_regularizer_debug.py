@@ -21,6 +21,8 @@ from absl import flags
 from absl import logging
 import argparse
 import math
+import tensor_specs
+import json
 
 import time
 import alf_gym_wrapper
@@ -28,6 +30,19 @@ import importlib
 
 LOG_STD_MIN = -5
 LOG_STD_MAX = 0
+
+class WeightClipper(object):
+
+    def __init__(self, frequency=5):
+        self.frequency = frequency
+
+    def __call__(self, module):
+        # filter the variables to get the ones you want
+        if hasattr(module, 'weight'):
+            w = module.weight.data
+            w = w.clamp(-1,1)
+            module.weight.data = w
+
 
 def weights_init(modules, type='xavier'):
     "Based on shorturl.at/jmqV3"
@@ -145,6 +160,7 @@ class ActorNetwork(nn.Module):
     super(ActorNetwork, self).__init__()
     self._action_spec = action_spec
     self._latent_spec = latent_spec
+    print(f' latent_spec when creating actor :{latent_spec.shape}')
     self._layers = nn.ModuleList()
     for hidden_size in fc_layer_params:
         if len(self._layers)==0:
@@ -171,18 +187,21 @@ class ActorNetwork(nn.Module):
   def _get_outputs(self, state):
       h = state
       for l in self._layers[:-1]:
-          h = l(h)
+        if isinstance(l, nn.Linear):
+          print(f'l weight is: {l.weight}')
+        h = l(h)
       self._mean_logvar_layers = Split(
          self._layers[-1],
          n_parts=2,
       )
       print(f'latent_spec size is: {self._latent_spec.size}')
-      print(f'h size is: {h.size()}')
+      print(f'h is: {h}')
+      print(f'state is: {state}')
       mean, log_std = self._mean_logvar_layers(h)
-      print(f'mean is : {mean.shape}')
+      print(f'mean is : {mean}')
       utils.check_for_nans_and_nones(mean)
 
-      print(f'log_std is: {log_std.shape}')
+      print(f'log_std is: {log_std}')
       utils.check_for_nans_and_nones(log_std)
 
       print(f'action_mags shape is: {self._action_mags.shape}')
@@ -586,6 +605,7 @@ class Agent(object):
         a1=transition_batch[1], # action1
         a2=transition_batch[2], # action2
         )
+    print(f' batch is: {batch}')
     return batch
   
   def _optimize_step(self, batch):
@@ -686,10 +706,10 @@ class ContinuousRandomPolicy(nn.Module):
     self._action_spec = action_spec
 
   def __call__(self, observation, state=()):
-    # action = tensor_spec.sample_bounded_spec(
-    #     self._action_spec, outer_dims=[observation.shape[0]])
-    # action = self._action_spec.sample()
-    # return action, state
+    action = tensor_specs.sample_bounded_spec(
+        self._action_spec, outer_dims=[observation.shape[0]])
+    action = self._action_spec.sample()
+    return action, state
     return ["random"]
 
 
@@ -985,38 +1005,57 @@ class D2EAgent(Agent):
     # Update policy network parameter
     #https://bit.ly/3Bno0GC
     # policy network's update should be done before updating q network, or there will make some errors
+    clipper = WeightClipper()
     def closure_p():
         self._p_optimizer.zero_grad()
         policy_loss,_=self._build_p_loss(batch)
         policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self._p_fn.parameters(), 0.9)
         return policy_loss
 
     self._p_optimizer.zero_grad()
     policy_loss,_=self._build_p_loss(batch)
     policy_loss.backward(retain_graph=True)
+    torch.nn.utils.clip_grad_norm_(self._p_fn.parameters(), 0.9)
     policy_loss = self._p_optimizer.step(closure_p)
+    self._p_fn.apply(clipper)
 
     # Update q networks parameter
     def closure_q():
       self._q_optimizer.zero_grad()
       q_losses,q_info= self._build_q_loss(batch)
       q_losses.backward()
+      for q_fn, q_fn_target in self._q_fns:
+        torch.nn.utils.clip_grad_norm_(q_fn.parameters(), 0.9)
+        torch.nn.utils.clip_grad_norm_(q_fn_target.parameters(), 0.9)
+
       return q_losses
+
     self._q_optimizer.zero_grad()
     q_losses,q_info= self._build_q_loss(batch)
-    q_losses.backward()
+    q_losses.backward(retain_graph=True)
+    for q_fn, q_fn_target in self._q_fns:
+        torch.nn.utils.clip_grad_norm_(q_fn.parameters(), 0.9)
+        torch.nn.utils.clip_grad_norm_(q_fn_target.parameters(), 0.9)
     q_losses = self._q_optimizer.step(closure_q)
+    for q_fn, q_fn_target in self._q_fns:
+      q_fn.apply(clipper)
+      q_fn_target.apply(clipper)
 
     #Update critic network parameter
     def closure_c():
       self._c_optimizer.zero_grad()
       critic_loss,_= self._build_c_loss( batch)
-      critic_loss.backward()
+      critic_loss.backward(retain_graph=True)
+      torch.nn.utils.clip_grad_norm_(self._c_fn.parameters(), 0.9)
       return critic_loss
+
     self._c_optimizer.zero_grad()
     critic_loss,_= self._build_c_loss( batch)
-    critic_loss.backward()
+    critic_loss.backward(retain_graph=True)
+    torch.nn.utils.clip_grad_norm_(self._c_fn.parameters(), 0.9)
     critic_loss = self._c_optimizer.step(closure_c)
+    self._c_fn.apply(clipper)
     
     if self._train_alpha:
       def closure_alpha():
@@ -1026,7 +1065,7 @@ class D2EAgent(Agent):
         return a_loss
       self._a_optimizer.zero_grad()
       a_loss,a_info = self._build_a_loss( batch)
-      a_loss.backward()
+      a_loss.backward(retain_graph=True)
       a_loss = self._a_optimizer.step(closure_alpha)
 
     if self._train_alpha_entropy:
@@ -1037,7 +1076,7 @@ class D2EAgent(Agent):
        return ae_loss
       self._ae_optimizer.zero_grad()
       ae_loss,ae_info = self._build_ae_loss( batch)
-      ae_loss.backward()
+      ae_loss.backward(retain_graph=True)
       ae_loss = self._ae_optimizer.step(closure_alpha_entropy)
 
     #1)policy loss
@@ -1061,19 +1100,27 @@ class D2EAgent(Agent):
     return info
   
   def _extra_c_step(self, batch):
+    clipper = WeightClipper()
     def closure_c():
       self._c_optimizer.zero_grad()
-      critic_loss,_ = self._build_c_loss( batch)
-      critic_loss.backward()
+      critic_loss,_ = self._build_c_loss(batch)
+      critic_loss.backward(retain_graph=True)
+      torch.nn.utils.clip_grad_norm_(self._c_fn.parameters(), 0.9)
+      
     self._c_optimizer.zero_grad()
-    critic_loss,_ = self._build_c_loss( batch)
-    critic_loss.backward()
+    critic_loss,_ = self._build_c_loss(batch)
+    critic_loss.backward(retain_graph=True)
+    torch.nn.utils.clip_grad_norm_(self._c_fn.parameters(), 0.9)
     critic_loss = self._c_optimizer.step(closure_c)
+    self._c_fn.apply(clipper)
     return critic_loss
 
   def train_step(self):
     train_batch = self._get_train_batch()
     info = self._optimize_step(train_batch)
+    with open('info_file4.txt', 'a') as f:
+      f.write(json.dumps(info))
+      f.write('\n')
     for _ in range(self._c_iter - 1):
       train_batch = self._get_train_batch()
       self._extra_c_step(train_batch)

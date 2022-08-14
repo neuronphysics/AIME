@@ -152,7 +152,7 @@ class ActorNetwork(nn.Module):
            self._layers.append(nn.Linear(self._latent_spec.size, hidden_size))
         else:
            self._layers.append(nn.Linear(hidden_size, hidden_size))
-        self._layers.append(nn.ReLU())
+        self._layers.append(nn.LeakyReLU())
     output_layer = nn.Linear(hidden_size,
         self._action_spec.shape[0] * 2
         )
@@ -178,7 +178,8 @@ class ActorNetwork(nn.Module):
          n_parts=2,
       )
       print(f'latent_spec size is: {self._latent_spec.size}')
-      print(f'h size is: {h.size()}')
+      print(f'state is {state}')
+      print(f'h is: {h}')
       mean, log_std = self._mean_logvar_layers(h)
       print(f'mean is : {mean.shape}')
       utils.check_for_nans_and_nones(mean)
@@ -225,11 +226,11 @@ class ActorNetwork(nn.Module):
     a_dist, a_tanh_mode = self._get_outputs(state)
     print(f' a_dist : {a_dist}')
     print(f' a_tanh_mode shape: {a_tanh_mode.shape}')
-    utils.check_for_nans_and_nones(a_tanh_mode)
+    nans_dist = utils.check_for_nans_and_nones(a_tanh_mode)
 
     a_sample = a_dist.sample()
     print(f' a_sample shape: {a_sample.shape}')
-    utils.check_for_nans_and_nones(a_sample)
+    nans_sample = utils.check_for_nans_and_nones(a_sample)
 
     log_pi_a = a_dist.log_prob(a_sample)
     return a_tanh_mode, a_sample, log_pi_a
@@ -562,6 +563,7 @@ class Agent(object):
     print(f'{len(self._train_data._indices)}')
     # print(f' train_data size: {self._train_data.size}')
     batch_ = self._train_data.get_batch(batch_indices)
+    print(f'batch is {batch_}')
   
     transition_batch = batch_
     # transition_batch = []
@@ -1075,6 +1077,7 @@ class D2EAgent(Agent):
 
   def train_step(self):
     train_batch = self._get_train_batch()
+    print(f' train_batch is {train_batch}')
     info = self._optimize_step(train_batch)
     for _ in range(self._c_iter - 1):
       train_batch = self._get_train_batch()

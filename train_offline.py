@@ -183,6 +183,7 @@ def train_eval_offline(
   step = agent.global_step
   timed_at_step = step
   while step < total_train_steps:
+    print(f'Starting iter: {step}')
     agent.train_step()
     step = agent.global_step
     # if step % summary_freq == 0 or step == total_train_steps:
@@ -268,16 +269,17 @@ def main(_):
     #     args.data_subdir,
     #     )
     # data_file = os.path.join(
-    #     data_dir, args.data_file_name)
+    #     data_dir, args.data_file_name) 
     # data_file = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220812105050","20220812105050", "replay_dataset.pt")
-    data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_rewards.pt")
+    # data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_rewards.pt")
     # data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220812105358","20220812105358", "replay_rewards.pt")
     # data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220814105542","20220814105542", "replay_rewards.pt")
-    data_file_actions = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_actions.pt")
-    data_file_next_actions = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_next_actions.pt")
-    data_file_states = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_states.pt")
-    data_file_next_states = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_next_states.pt")
-    data_file_discounts = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220813181447","20220813181447", "replay_discounts.pt")
+    data_file_rewards = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220814172203","20220814172203", "replay_rewards.pt")
+    data_file_actions = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220814172203","20220814172203", "replay_actions.pt")
+    data_file_next_actions = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220814172203","20220814172203", "replay_next_actions.pt")
+    data_file_states = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220814172203","20220814172203", "replay_states.pt")
+    data_file_next_states = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220814172203","20220814172203", "replay_next_states.pt")
+    data_file_discounts = os.path.join("offlinerl","new_datasets3rand","Pendulum-v0","sac","20220814172203","20220814172203", "replay_discounts.pt")
 
     data_files = [data_file_rewards, data_file_actions, data_file_next_actions, data_file_states, data_file_next_states, data_file_discounts]
     # Setup log dir.
