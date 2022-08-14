@@ -24,6 +24,8 @@ import pickle
 USE_LISTS = True
 
 
+# PLEASE USE GENERATE_TRANSITIONS_DATASET.PY TO CALL FUNCTIONS IN THIS MODULE
+
 parser = argparse.ArgumentParser(description='AIME')
 parser.add_argument('--root_offlinerl_dir', type=str, default='./offlinerl', help='Experiment ID')
 parser.add_argument('--sub_offlinerl_dir', type=str, default='.', help='sub directory for saving data.')
@@ -272,8 +274,3 @@ class DataCollector(object):
       return 0, None
 
 
-if __name__ == '__main__':
-  # tot = TrainOffline()
-  # tot.main(None)
-  datacollect = PolicyTest()
-  # datacollect.test_collect_data()
