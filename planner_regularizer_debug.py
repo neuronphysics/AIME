@@ -42,6 +42,9 @@ class WeightClipper(object):
             w = module.weight.data
             w = w.clamp(-1,1)
             module.weight.data = w
+            print(type(module.weight))
+            print(f' we have weight: {module.weight}')
+            utils.check_for_nans_and_nones(module.weight.data)
 
 
 def weights_init(modules, type='xavier'):
@@ -167,7 +170,7 @@ class ActorNetwork(nn.Module):
            self._layers.append(nn.Linear(self._latent_spec.size, hidden_size))
         else:
            self._layers.append(nn.Linear(hidden_size, hidden_size))
-        self._layers.append(nn.ReLU())
+        self._layers.append(nn.LeakyReLU())
     output_layer = nn.Linear(hidden_size,
         self._action_spec.shape[0] * 2
         )
@@ -188,20 +191,22 @@ class ActorNetwork(nn.Module):
       h = state
       for l in self._layers[:-1]:
         if isinstance(l, nn.Linear):
-          print(f'l weight is: {l.weight}')
+          print(f'l weight {l.weight.data}')
+          utils.check_for_nans_and_nones(l.weight.data)
         h = l(h)
       self._mean_logvar_layers = Split(
          self._layers[-1],
          n_parts=2,
       )
       print(f'latent_spec size is: {self._latent_spec.size}')
-      print(f'h is: {h}')
+      print(f'h: {h}')
+      utils.check_for_nans_and_nones(h)
       print(f'state is: {state}')
       mean, log_std = self._mean_logvar_layers(h)
-      print(f'mean is : {mean}')
+      print(f'mean')
       utils.check_for_nans_and_nones(mean)
 
-      print(f'log_std is: {log_std}')
+      print(f'log_std')
       utils.check_for_nans_and_nones(log_std)
 
       print(f'action_mags shape is: {self._action_mags.shape}')
@@ -238,7 +243,7 @@ class ActorNetwork(nn.Module):
   def __call__(self, state):
     print(f'state shape in actor __call__: {state.shape}')
     print(f'state type is: {type(state)}')
-    # utils.check_for_nans_and_nones(state)
+    utils.check_for_nans_and_nones(state)
 
     a_dist, a_tanh_mode = self._get_outputs(state)
     print(f' a_dist : {a_dist}')
@@ -280,6 +285,9 @@ class CriticNetwork(nn.Module):
           self._layers.append(nn.ReLU())
       output_layer = nn.Linear(hidden_size,1)
       self._layers.append(output_layer)
+
+      for layer in self._layers:
+        weights_init(layer)
   
     def forward(self, state, action):
         print(state.shape) # 256 x 3
@@ -598,12 +606,12 @@ class Agent(object):
     # )
 
     batch = dict(
-        s1=transition_batch[3], # state
-        s2=transition_batch[4], # next state
-        r=transition_batch[0], # reward
-        dsc=transition_batch[5], # discount
-        a1=transition_batch[1], # action1
-        a2=transition_batch[2], # action2
+        s1=torch.from_numpy(transition_batch[3]).type(torch.FloatTensor), # state
+        s2=torch.from_numpy(transition_batch[4]).type(torch.FloatTensor), # next state
+        r=torch.from_numpy(transition_batch[0]), # reward
+        dsc=torch.from_numpy(transition_batch[5]), # discount
+        a1=torch.from_numpy(np.expand_dims(transition_batch[1], axis=-1)), # action1
+        a2=torch.from_numpy(np.expand_dims(transition_batch[2], axis=-1)), # action2
         )
     print(f' batch is: {batch}')
     return batch
@@ -838,6 +846,7 @@ class D2EAgent(Agent):
     # print(lambda_.dtype) # lambda_ is a float
     to_ret = lambda_ * torch.min(qs, dim=-1).values + (1. - lambda_) * torch.max(qs, dim=-1).values
     print(f'to_ret is length of: {len(to_ret)}')
+    utils.check_for_nans_and_nones(to_ret)
     return to_ret
 
   def _ensemble_q2_target(self, q2_targets):
@@ -848,12 +857,12 @@ class D2EAgent(Agent):
 
   def _build_q_loss(self, batch):
     print(batch['a2'].shape)
-    s1 = torch.from_numpy(batch['s1'])
-    s2 = torch.from_numpy(batch['s2']).type(torch.FloatTensor)
-    a1 = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1))
-    a2_b = torch.from_numpy(np.expand_dims(batch['a2'], axis=-1))
-    r = torch.from_numpy(batch['r'])
-    dsc = torch.from_numpy(batch['dsc'])
+    s1 = batch['s1']
+    s2 = batch['s2']
+    a1 = batch['a1']
+    a2_b = batch['a2']
+    r = batch['r']
+    dsc = batch['dsc']
     _, a2_p, log_pi_a2_p = self._p_fn(s2)
     q2_targets = []
     q1_preds = []
@@ -899,8 +908,8 @@ class D2EAgent(Agent):
     return loss, info
 
   def _build_p_loss(self, batch):
-    s = torch.from_numpy(batch['s1'])
-    a_b = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1))
+    s = batch['s1']
+    a_b = batch['a1']
     _, a_p, log_pi_a_p = self._p_fn(s)
     q1s = []
     for q_fn, _ in self._q_fns:
@@ -929,8 +938,8 @@ class D2EAgent(Agent):
     return loss, info
 
   def _build_c_loss(self, batch):
-    s = torch.from_numpy(batch['s1']) # 256 x 3
-    a_b = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1)) 
+    s = batch['s1'] # 256 x 3
+    a_b = batch['a1'] 
     print(f's shape: {s.shape}')
     # print(f's in _build_c_loss is: {s}')
     print(f'a_b shape: {a_b.shape}')
@@ -949,7 +958,7 @@ class D2EAgent(Agent):
 
   def _build_a_loss(self, batch):
     s = batch['s1']
-    a_b = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1))
+    a_b = batch['a1']
     _, a_p, _ = self._p_fn(s)
     alpha, alpha_grad = self._get_alpha()
     div_estimate = self._divergence.dual_estimate(
@@ -965,7 +974,7 @@ class D2EAgent(Agent):
     return a_loss, info
 
   def _build_ae_loss(self, batch):
-    s = torch.from_numpy(np.expand_dims(batch['a1'], axis=-1))
+    s = batch['a1']
     _, _, log_pi_a = self._p_fn(s)
     alpha, alpha_grad = self._get_alpha_entropy()
     ae_loss = torch.mean(alpha * (- log_pi_a - self._target_entropy))
@@ -1118,7 +1127,7 @@ class D2EAgent(Agent):
   def train_step(self):
     train_batch = self._get_train_batch()
     info = self._optimize_step(train_batch)
-    with open('info_file4.txt', 'a') as f:
+    with open('info_file6.txt', 'a') as f:
       f.write(json.dumps(info))
       f.write('\n')
     for _ in range(self._c_iter - 1):
@@ -1258,7 +1267,7 @@ def eval_policy_episodes(env, policy, n_episodes):
     done = False
     while not done:
       print(f'state: {state}')
-      action = policy(torch.FloatTensor(np.expand_dims(state, axis=0)))[0]
+      action = policy(torch.FloatTensor(state, axis=0))[0]
       next_state, reward, done, _ = env.step(action.detach())
       total_rewards += reward
       state = next_state

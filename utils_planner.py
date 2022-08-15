@@ -868,9 +868,15 @@ def check_for_nans_and_nones(arr):
     none_indices = []
     checker_fn = lambda iterable : math.isnan(iterable)
     if isinstance(arr, np.ndarray):
-        checker_fn = lambda iterable : np.isnan(iterable)
-    elif isinstance(arr, np.ndarray):
-        checker_fn = lambda iterable : torch.isnan(iterable).any()
+        # checker_fn = lambda iterable : np.isnan(iterable)
+        if np.isnan(arr).any():
+            print(f'We have {np.isnan(arr).sum()} nones in this np array')
+        return
+    elif isinstance(arr, torch.Tensor) or isinstance(arr, torch.nn.parameter.Parameter):
+        # checker_fn = lambda iterable : torch.isnan(iterable).any()
+        if torch.isnan(arr).any():
+            print(f'We have {torch.isnan(arr).sum()} nones in this torch array')
+        return
 
     for idx, item in enumerate(arr):
         if item is None or checker_fn(item):
