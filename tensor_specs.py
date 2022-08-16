@@ -236,8 +236,8 @@ def sample_bounded_spec(spec, seed=None, outer_dims=None):
     A Tensor sample of the requested spec.
     #based onn https://github.com/PeterJaq/optical-film-maker/blob/04db98357ed3ba7b0830b7e48fb3ddb4c6dc9194/agents/tf_agents/specs/tensor_spec.py
   """
-  minval = spec.low
-  maxval = spec.high
+  minval = spec.minimum
+  maxval = spec.maximum
   dtype = spec.dtype
 
   # To sample uint8 we will use int32 and cast later. This is needed for two
@@ -246,12 +246,8 @@ def sample_bounded_spec(spec, seed=None, outer_dims=None):
   #  - if you want to sample [0, 255] range, there's no way to do this since
   #    tf.random_uniform has exclusive upper bound and 255 + 1 would overflow.
 #   print(dtype)
-  if str(dtype) == 'float32':
-    dtype = torch.float32
-  else:
-    print('Not float32')
-#   is_uint8 = True # = dtype == torch.uint8
-  sampling_dtype = torch.float32 #if is_uint8 else dtype
+  is_uint8 = dtype == torch.uint8
+  sampling_dtype = torch.int32 if is_uint8 else dtype
 
 
   if outer_dims is None:
@@ -295,8 +291,8 @@ def sample_bounded_spec(spec, seed=None, outer_dims=None):
     # print(f"type {type(minval)}")
     res=torch.tensor(full_shape,dtype=sampling_dtype).uniform_(float(minval), float(maxval))
 
-#   if is_uint8:
-#     res =torch.tensor(res, dtype=dtype)
+    if is_uint8:
+     res =torch.tensor(res, dtype=dtype)
 
   return res
 
