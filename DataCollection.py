@@ -10,6 +10,7 @@ from absl import logging
 import tensor_specs
 import time
 import alf_gym_wrapper
+from alf_environment import TimeLimit
 import importlib 
 import torch 
 import torch.nn as nn
@@ -19,7 +20,7 @@ from torch.distributions.transformed_distribution import TransformedDistribution
 import sys
 import shutil
 import argparse
-
+from alf_environment import TimeLimit
 from typing import Callable
 from PIL import Image
 from planner_behavior_regularizer_actor_critic import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
@@ -39,7 +40,17 @@ MUJOCO_ENVS = [
     "Swimmer-v2",
     "Walker2d-v2"
 ]
-
+MUJOCO_ENVS_LENNGTH={"Ant-v2":1000,
+    "HalfCheetah-v2":1000,
+    "Hopper-v2":1000,
+    "Humanoid-v2":1000,
+    "InvertedPendulum-v2":1000,
+    "InvertedDoublePendulum-v2":1000,
+    "Reacher-v2":50,
+    "Swimmer-v2":1000,
+    "Walker2d-v2":1000,
+    "Pendulum-v0":200
+    }
 
 
 def get_transition(time_step, next_time_step, action, next_action):
@@ -193,19 +204,22 @@ class Dataset(nn.Module):
   def add_transitions(self, transitions):
     assert isinstance(transitions, Transition)
     batch_size = transitions.s1.shape[0]
-    effective_batch_size = torch.minimum(
+    #fix
+    effective_batch_size = min(
         batch_size, self._size - self._current_idx)
     indices = self._current_idx + torch.arange(effective_batch_size)
     for key in transitions._asdict().keys():
-      data = getattr(self._data, key)
-      batch = getattr(transitions, key)
-      scatter_update(data, indices, batch[:effective_batch_size])
+        #fix
+        if key in ['s1','s2']:
+           data = getattr(self._data, key)
+           batch = getattr(transitions, key)
+           scatter_update(data, indices, batch[:effective_batch_size])       
     # Update size and index.
-    if torch.less(self._current_size, self._size):
+    if (self._current_size < self._size): #fix
       self._current_size+=effective_batch_size
     self._current_idx+=effective_batch_size
     if self._circular:
-      if torch.greater_equal(self._current_idx, self._size):
+      if (self._current_idx >= self._size):#fix
         self._current_idx=0
 #########################
 #utils.py
@@ -309,6 +323,7 @@ def collect_data(
   np.random.seed(seed)
   dm_env = gym.spec(env_name).make()
   env = alf_gym_wrapper.AlfGymWrapper(dm_env)
+  env = TimeLimit(env, MUJOCO_ENVS_LENNGTH[env_name])
   observation_spec = env.observation_spec()
   action_spec = env.action_spec()
   
@@ -377,7 +392,7 @@ def collect_gym_data(args):
     args.test_srcdir = os.getcwd()
     args.policy_root_dir = os.path.join(args.test_srcdir,
                                                data_dir)
-    args.n_samples = 100  # Short collection.
+    args.n_samples = 1000 # Short collection.
     args.n_eval_episodes = 1
     main(args)
 if __name__ == "__main__":
