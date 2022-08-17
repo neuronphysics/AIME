@@ -91,7 +91,7 @@ class ActorNetwork(nn.Module):
           h = l(h)
       self._mean_logvar_layers = Split(
          self._layers[-1],
-         parts=2,
+         n_parts=2,
       )
       mean, log_std = self._mean_logvar_layers(h)
       a_tanh_mode = torch.tanh(mean) * self._action_mags + self._action_means
@@ -968,7 +968,7 @@ def load_policy(policy_cfg, action_spec, observation_spec):
         observation_spec,
         action_spec,
         fc_layer_params=policy_cfg.model_params)
-    if policy_cfg.ptype == 'load':
+    if policy_cfg.ptype == 'load' and os.path.exists(policy_cfg.ckpt):
       logging.info('Loading policy from %s...', policy_cfg.ckpt)
       a_net = torch.load(policy_cfg.ckpt)
     policy = wrap_policy(a_net, policy_cfg.wrapper)
@@ -995,7 +995,7 @@ def eval_policy_episodes(env, policy, n_episodes):
     time_step = env.reset()
     total_rewards = 0.0
     while not time_step.is_last():
-      action = policy(time_step.observation)[0]
+      action = policy(torch.from_numpy(time_step.observation))[0]
       time_step = env.step(action)
       total_rewards += time_step.reward
     results.append(total_rewards)
