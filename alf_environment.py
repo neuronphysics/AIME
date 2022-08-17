@@ -19,11 +19,11 @@ Adapted from TF-Agents Environment API as seen in:
 
 import abc
 import six
+import torch
+from data_structures import time_step_spec, StepType, _is_numpy_array
+from tensor_specs import TensorSpec
 
-
-from data_structures import time_step_spec
-
-
+###
 @six.add_metaclass(abc.ABCMeta)
 class AlfEnvironment(object):
     """Abstract base class for ALF RL environments.
@@ -250,3 +250,124 @@ class AlfEnvironment(object):
         """Starts a new sequence, returns the first ``TimeStep`` of this sequence.
         See ``reset(self)`` docstring for more details
         """
+        
+        
+class AlfEnvironmentBaseWrapper(AlfEnvironment):
+    """AlfEnvironment wrapper forwards calls to the given environment."""
+
+    def __init__(self, env):
+        """Create an ALF environment base wrapper.
+        Args:
+            env (AlfEnvironment): An AlfEnvironment instance to wrap.
+        Returns:
+            A wrapped AlfEnvironment
+        """
+        super(AlfEnvironmentBaseWrapper, self).__init__()
+        self._env = env
+
+    def __getattr__(self, name):
+        """Forward all other calls to the base environment."""
+        if name.startswith('_'):
+            raise AttributeError(
+                "attempted to get missing private attribute '{}'".format(name))
+        return getattr(self._env, name)
+
+    @property
+    def batched(self):
+        return self._env.batched
+
+    @property
+    def batch_size(self):
+        return self._env.batch_size
+
+    @property
+    def num_tasks(self):
+        return self._env.num_tasks
+
+    @property
+    def task_names(self):
+        return self._env.task_names
+
+    def _reset(self):
+        return self._env.reset()
+
+    def _step(self, action):
+        return self._env.step(action)
+
+    def get_info(self):
+        return self._env.get_info()
+
+    def env_info_spec(self):
+        return self._env.env_info_spec()
+
+    def time_step_spec(self):
+        return self._env.time_step_spec()
+
+    def observation_spec(self):
+        return self._env.observation_spec()
+
+    def action_spec(self):
+        return self._env.action_spec()
+
+    def reward_spec(self):
+        return self._env.reward_spec()
+
+    def close(self):
+        return self._env.close()
+
+    def render(self, mode='rgb_array'):
+        return self._env.render(mode)
+
+    def seed(self, seed):
+        return self._env.seed(seed)
+
+    def wrapped_env(self):
+        return self._env
+
+
+# Used in ALF
+#@alf.configurable
+class TimeLimit(AlfEnvironmentBaseWrapper):
+    """End episodes after specified number of steps."""
+
+    def __init__(self, env, duration):
+        """Create a TimeLimit ALF environment.
+        Args:
+            env (AlfEnvironment): An AlfEnvironment instance to wrap.
+            duration (int): time limit, usually set to be the max_eposode_steps
+                of the environment.
+        """
+        super(TimeLimit, self).__init__(env)
+        self._duration = duration
+        self._num_steps = None
+        assert self.batch_size is None or self.batch_size == 1, (
+            "does not support batched environment with batch size larger than one"
+        )
+
+    def _reset(self):
+        self._num_steps = 0
+        return self._env.reset()
+
+    def _step(self, action):
+        if self._num_steps is None:
+            return self.reset()
+
+        time_step = self._env.step(action)
+
+        self._num_steps += 1
+        if self._num_steps >= self._duration:
+            if _is_numpy_array(time_step.step_type):
+                time_step = time_step._replace(step_type=StepType.LAST)
+            else:
+                time_step = time_step._replace(
+                    step_type=torch.full_like(time_step.step_type, StepType.
+                                              LAST))
+
+        if time_step.is_last():
+            self._num_steps = None
+
+        return time_step
+
+    @property
+    def duration(self):
+        return self._duration
