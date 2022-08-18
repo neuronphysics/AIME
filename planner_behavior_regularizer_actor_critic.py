@@ -50,8 +50,12 @@ class Split(torch.nn.Module):
 
     def forward(self, inputs):
         output = self._module(inputs)
-        chunk_size = output.shape[self._dim] // self._n_parts
-        return torch.split(output, chunk_size, dim=self._dim)
+        if output.ndim==1:
+           result=torch.hsplit(output, self._n_parts )
+        else:
+           chunk_size = output.shape[self._dim] // self._n_parts
+           result =torch.split(output, chunk_size, dim=self._dim)
+        return result
       
 ###############################################
 ##################  Networks  #################
@@ -75,8 +79,8 @@ class ActorNetwork(nn.Module):
            self._layers.append(nn.Linear(hidden_size, hidden_size))
         self._layers.append(nn.ReLU())
         
-    #output_layer = nn.Linear(hidden_size,self._action_spec.shape[0] * 2 )
-    output_layer = nn.LazyLinear(self._action_spec.shape[0] * 2) #make it more flexible
+    output_layer = nn.Linear(hidden_size,self._action_spec.shape[0] * 2 )
+
     self._layers.append(output_layer)
     self._action_means, self._action_mags = get_spec_means_mags(
         self._action_spec)
@@ -89,7 +93,6 @@ class ActorNetwork(nn.Module):
       h = state
       for l in nn.Sequential(*(list(self._layers.children())[:-1])):
           h = l(h)
-      h = h.unsqueeze(-1)
       self._mean_logvar_layers = Split(
          self._layers[-1],
          n_parts=2,
