@@ -74,9 +74,9 @@ class ActorNetwork(nn.Module):
         else:
            self._layers.append(nn.Linear(hidden_size, hidden_size))
         self._layers.append(nn.ReLU())
-    output_layer = nn.Linear(hidden_size,
-        self._action_spec.shape[0] * 2
-        )
+        
+    #output_layer = nn.Linear(hidden_size,self._action_spec.shape[0] * 2 )
+    output_layer = nn.LazyLinear(self._action_spec.shape[0] * 2) #make it more flexible
     self._layers.append(output_layer)
     self._action_means, self._action_mags = get_spec_means_mags(
         self._action_spec)
@@ -87,12 +87,14 @@ class ActorNetwork(nn.Module):
 
   def _get_outputs(self, state):
       h = state
-      for l in self._layers:
+      for l in nn.Sequential(*(list(self._layers.children())[:-1])):
           h = l(h)
+      h = h.unsqueeze(-1)
       self._mean_logvar_layers = Split(
          self._layers[-1],
          n_parts=2,
       )
+
       mean, log_std = self._mean_logvar_layers(h)
       a_tanh_mode = torch.tanh(mean) * self._action_mags + self._action_means
       log_std = torch.tanh(log_std)
@@ -105,7 +107,7 @@ class ActorNetwork(nn.Module):
                         base_distribution=Normal(loc=torch.full_like(mean, 0), 
                                                  scale=torch.full_like(mean, 1)), 
                         transforms=tT.ComposeTransform([
-                                   tT.AffineTransform(loc=self._action_means, scale=self._action_mag, event_dim=mean.shape[-1]), 
+                                   tT.AffineTransform(loc=self._action_means, scale=self._action_mags, event_dim=mean.shape[-1]), 
                                    tT.TanhTransform(),
                                    tT.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])]))
       #https://www.ccoderun.ca/programming/doxygen/pytorch/classtorch_1_1distributions_1_1transformed__distribution_1_1TransformedDistribution.html

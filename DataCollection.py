@@ -75,10 +75,10 @@ class DataCollector(object):
     """Collect single transition from environment."""
     time_step = self._env.current_time_step()
     if self._saved_action is None:
-      self._saved_action = self._policy(time_step.observation)[0]
+      self._saved_action = self._policy(torch.from_numpy(time_step.observation))[0]
     action = self._saved_action
     next_time_step = self._env.step(action)
-    next_action = self._policy(next_time_step.observation)[0]
+    next_action = self._policy(torch.from_numpy(next_time_step.observation))[0]
     self._saved_action = next_action
     if not time_step.is_last()[0].numpy():
       transition = get_transition(time_step, next_time_step,
