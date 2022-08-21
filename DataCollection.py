@@ -203,24 +203,24 @@ class Dataset(nn.Module):
 
   def add_transitions(self, transitions):
     assert isinstance(transitions, Transition)
+    for i in transitions._fields:
+        attr=getattr(transitions,i)
+        transitions=transitions._replace(**{i:np.expand_dims(attr,axis=0)})
     batch_size = transitions.s1.shape[0]
-    #fix
-    effective_batch_size = min(
-        batch_size, self._size - self._current_idx)
+    effective_batch_size = torch.minimum( torch.tensor(batch_size), torch.tensor(self._size - self._current_idx))
     indices = self._current_idx + torch.arange(effective_batch_size)
     for key in transitions._asdict().keys():
-        #fix
-        if key in ['s1','s2']:
-           data = getattr(self._data, key)
-           batch = getattr(transitions, key)
-           scatter_update(data, indices, batch[:effective_batch_size])       
+        data = getattr(self._data, key)
+        batch = getattr(transitions, key)
+        data[indices]= torch.tensor(batch[:effective_batch_size])
     # Update size and index.
-    if (self._current_size < self._size): #fix
+    if torch.less(self._current_size, self._size):
       self._current_size+=effective_batch_size
     self._current_idx+=effective_batch_size
     if self._circular:
-      if (self._current_idx >= self._size):#fix
+      if torch.greater_equal(self._current_idx, self._size):
         self._current_idx=0
+
 #########################
 #utils.py
 def shuffle_indices_with_steps(n, steps=1, rand=None):
