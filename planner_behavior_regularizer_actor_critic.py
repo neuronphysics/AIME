@@ -103,6 +103,7 @@ class ActorNetwork(nn.Module):
       log_std = torch.tanh(log_std)
       log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
       std = torch.exp(log_std)
+      print(f"stdev = {std}")
       #base_distribution = torch.normal(0.0, 1.0)
       #transforms = torch.distributions.transforms.ComposeTransform([torch.distributions.transforms.AffineTransform(loc=self._action_means, scale=self._action_mag, event_dim=mean.shape[-1]), torch.nn.Tanh(),torch.distributions.transforms.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])])
       #a_distribution = torch.distributions.transformed_distribution.TransformedDistribution(base_distribution, transforms)
@@ -494,7 +495,9 @@ class ContinuousRandomPolicy(nn.Module):
 
   def __call__(self, observation, state=()):
     action = tensor_specs.sample_bounded_spec(
-        self._action_spec, outer_dims=[observation.shape[0]])
+        self._action_spec,
+        #outer_dims=[observation.shape[0]]
+        )
     return action, state
   
 class GaussianRandomSoftPolicy(nn.Module):
@@ -508,7 +511,7 @@ class GaussianRandomSoftPolicy(nn.Module):
 
   def __call__(self, observation, state=()):
     action = self._a_network(observation)[1]
-    noise = torch.normal(mean=action.shape, std=self._std)
+    noise = torch.normal(mean=torch.zeros(action.shape), std=self._std)
     action = action + noise
     spec = self._a_network.action_spec
     action = torch.clamp(action, spec.minimum + self._clip_eps,
@@ -1001,8 +1004,11 @@ def eval_policy_episodes(env, policy, n_episodes):
     total_rewards = 0.0
     while not time_step.is_last():
       action = policy(torch.from_numpy(time_step.observation))[0]
-      time_step = env.step(action)
-      total_rewards += time_step.reward
+      if action.ndim<1:
+          time_step= env.step(action.unsqueeze(0)) 
+      else:  
+          time_step= env.step(action)
+      total_rewards += time_step.reward or 0.
     results.append(total_rewards)
   results = torch.tensor(results)
   return torch.mean(results).to(dtype=torch.float32), torch.std(results).to(dtype=torch.float32)
@@ -1033,219 +1039,6 @@ def map_structure(func: Callable, structure):
     return func(structure)
 
 
-"""
-########################
-def get_datetime():
-  now = datetime.datetime.now().isoformat()
-  now = re.sub(r'\D', '', now)[:-6]
-  return now
-
-@gin.configurable
-def train_eval_offline(
-    # Basic args.
-    log_dir,
-    data_file,
-    agent_module,
-    env_name='HalfCheetah-v2',
-    n_train=int(1e6),
-    shuffle_steps=0,
-    seed=0,
-    use_seed_for_data=False,
-    # Train and eval args.
-    total_train_steps=int(1e6),
-    summary_freq=100,
-    print_freq=1000,
-    save_freq=int(2e4),
-    eval_freq=5000,
-    n_eval_episodes=20,
-    # Agent args.
-    model_params=(((200, 200),), 2),
-    optimizers=(('adam', 0.001),),
-    batch_size=256,
-    weight_decays=(0.0,),
-    update_freq=1,
-    update_rate=0.005,
-    discount=0.99,
-    ):
-  ###Training a policy with a fixed dataset.###
-  # Create tf_env to get specs.
-  dm_env = gym.spec(env_name).make()
-  env = alf_gym_wrapper.AlfGymWrapper(dm_env)
-  
-  observation_spec = env.observation_spec()
-  action_spec = env.action_spec()
-
-  # Prepare data.
-  logging.info('Loading data from %s ...', data_file)
-  data  = torch.load(data_file)
-  data_size = data.size()      
-  full_data = Dataset(observation_spec, action_spec, data_size)
-  # Split data.
-  n_train = min(n_train, full_data.size)
-  logging.info('n_train %s.', n_train)
-  if use_seed_for_data:
-    rand = np.random.RandomState(seed)
-  else:
-    rand = np.random.RandomState(0)
-  shuffled_indices = shuffle_indices_with_steps(
-      n=full_data.size, steps=shuffle_steps, rand=rand)
-  train_indices = shuffled_indices[:n_train]
-  train_data = full_data.create_view(train_indices)
-
-  # Create agent.
-  agent_flags = Flags(
-      observation_spec=observation_spec,
-      action_spec=action_spec,
-      model_params=model_params,
-      optimizers=optimizers,
-      batch_size=batch_size,
-      weight_decays=weight_decays,
-      update_freq=update_freq,
-      update_rate=update_rate,
-      discount=discount,
-      train_data=train_data)
-  agent_args = agent_module.Config(agent_flags).agent_args
-  agent = agent_module.Agent(**vars(agent_args)) #ATTENTION: Debugg ====> should it be D2EAgent here??
-  agent_ckpt_name = os.path.join(log_dir, 'agent')
-
-  # Restore agent from checkpoint if there exists one.
-  if os.path.exists('{}.index'.format(agent_ckpt_name)):
-    logging.info('Checkpoint found at %s.', agent_ckpt_name)
-    torch.load(agent, agent_ckpt_name)
-
-  # Train agent.
-  train_summary_dir = os.path.join(log_dir, 'train')
-  eval_summary_dir = os.path.join(log_dir, 'eval')
-  train_summary_writer = SummaryWriter(
-      logdir=train_summary_dir)
-  eval_summary_writers = collections.OrderedDict()
-  for policy_key in agent.test_policies.keys():
-    eval_summary_writer = SummaryWriter(
-        logdir=os.path.join(eval_summary_dir, policy_key))
-    eval_summary_writers[policy_key] = eval_summary_writer
-  eval_results = []
-
-  time_st_total = time.time()
-  time_st = time.time()
-  step = agent.global_step
-  timed_at_step = step
-  while step < total_train_steps:
-    agent.train_step()
-    step = agent.global_step
-    if step % summary_freq == 0 or step == total_train_steps:
-      agent.write_train_summary(train_summary_writer)
-    if step % print_freq == 0 or step == total_train_steps:
-      agent.print_train_info()
-    if step % eval_freq == 0 or step == total_train_steps:
-      time_ed = time.time()
-      time_cost = time_ed - time_st
-      logging.info(
-          'Training at %.4g steps/s.', (step - timed_at_step) / time_cost)
-      eval_result, eval_infos = eval_policies(
-          env, agent.test_policies, n_eval_episodes)
-      eval_results.append([step] + eval_result)
-      logging.info('Testing at step %d:', step)
-      for policy_key, policy_info in eval_infos.items():
-        logging.info(utils.get_summary_str(
-            step=None, info=policy_info, prefix=policy_key+': '))
-        utils.write_summary(eval_summary_writers[policy_key], step, policy_info)
-      time_st = time.time()
-      timed_at_step = step
-    if step % save_freq == 0:
-      torch.save(agent, agent_ckpt_name)
-      logging.info('Agent saved at %s.', agent_ckpt_name)
-
-  torch.save(agent, agent_ckpt_name)
-  time_cost = time.time() - time_st_total
-  logging.info('Training finished, time cost %.4gs.', time_cost)
-  return torch.tensor(eval_results)
-
-##############################
-###train_offline.py
-flags.DEFINE_string('data_root_dir',
-                    os.path.join(os.getenv('HOME', '/'),
-                                 'tmp/offlinerl/data'),
-                    'Root directory for data.')
-flags.DEFINE_string('data_sub_dir', '0', '')
-flags.DEFINE_string('data_name', 'eps1', 'data name.')
-flags.DEFINE_string('data_file_name', 'data', 'data checkpoint file name.')
-
-# Flags for offline training.
-flags.DEFINE_string('root_dir',
-                    os.path.join(os.getenv('HOME', '/'), 'tmp/offlinerl/learn'),
-                    'Root directory for writing logs/summaries/checkpoints.')
-flags.DEFINE_string('sub_dir', '0', '')
-flags.DEFINE_string('agent_name', 'D2E', 'agent name.')
-flags.DEFINE_string('env_name', 'HalfCheetah-v2', 'env name.')
-flags.DEFINE_integer('seed', 0, 'random seed, mainly for training samples.')
-flags.DEFINE_integer('total_train_steps', int(5e5), '')
-flags.DEFINE_integer('n_eval_episodes', 20, '')
-flags.DEFINE_integer('n_train', int(1e6), '')
-flags.DEFINE_multi_string('gin_file', None, 'Paths to the gin-config files.')
-flags.DEFINE_multi_string('gin_bindings', None, 'Gin binding parameters.')
-
-FLAGS = flags.FLAGS
-AGENT_MODULES_DICT = {
-    'D2E': D2EAgent, ###Debug ===> is it correct to set it here??? 
-}
-
-def main(_):
-  logging.set_verbosity(logging.INFO)
-  gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_bindings)
-  # Setup data file path.
-  data_dir = os.path.join(
-      FLAGS.data_root_dir,
-      FLAGS.env_name,
-      FLAGS.data_name,
-      FLAGS.data_sub_dir,
-      )
-  data_file = os.path.join(
-      data_dir, FLAGS.data_file_name)
-
-  # Setup log dir.
-  if FLAGS.sub_dir == 'auto':
-    sub_dir = get_datetime()
-  else:
-    sub_dir = FLAGS.sub_dir
-  log_dir = os.path.join(
-      FLAGS.root_dir,
-      FLAGS.env_name,
-      FLAGS.data_name,
-      'n'+str(FLAGS.n_train),
-      FLAGS.agent_name,
-      sub_dir,
-      str(FLAGS.seed),
-      )
-  maybe_makedirs(log_dir)
-  train_eval_offline(
-      log_dir=log_dir,
-      data_file=data_file,
-      agent_module=AGENT_MODULES_DICT[FLAGS.agent_name],
-      env_name=FLAGS.env_name,
-      n_train=FLAGS.n_train,
-      total_train_steps=FLAGS.total_train_steps,
-      n_eval_episodes=FLAGS.n_eval_episodes,
-      )
-
-
-class TrainOfflineTest(TestCase):
-
-  def test_train_offline(self):
-    data_dir = 'testdata/data'
-    flags.FLAGS.data_root_dir = os.path.join(flags.FLAGS.test_srcdir, data_dir)
-    flags.FLAGS.sub_dir = '0'
-    flags.FLAGS.env_name = 'HalfCheetah-v2'
-    flags.FLAGS.data_name = 'example'
-    flags.FLAGS.agent_name = 'D2E'
-    flags.FLAGS.gin_bindings = [
-        'train_eval_offline.model_params=((200, 200),)',
-        'train_eval_offline.optimizers=(("adam", 5e-4),)']
-    flags.FLAGS.n_train = 100
-    flags.FLAGS.n_eval_episodes = 1
-    flags.FLAGS.total_train_steps = 100  # Short training.
-
-    main(None)  # Just test that it runs.
-"""
 #more hyperparameter run_dual.sh
 
 

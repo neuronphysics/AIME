@@ -20,7 +20,7 @@ from torch.distributions.transformed_distribution import TransformedDistribution
 import sys
 import shutil
 import argparse
-from alf_environment import TimeLimit
+
 from typing import Callable
 from PIL import Image
 from planner_behavior_regularizer_actor_critic import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
@@ -76,11 +76,16 @@ class DataCollector(object):
     time_step = self._env.current_time_step()
     if self._saved_action is None:
       self._saved_action = self._policy(torch.from_numpy(time_step.observation))[0]
+      
     action = self._saved_action
-    next_time_step = self._env.step(action)
+    if action.ndim<1:
+          next_time_step = self._env.step(action.unsqueeze(0))
+    else:
+          next_time_step = self._env.step(action)
+
     next_action = self._policy(torch.from_numpy(next_time_step.observation))[0]
     self._saved_action = next_action
-    if not time_step.is_last()[0].numpy():
+    if not time_step.is_last():
       transition = get_transition(time_step, next_time_step,
                                   action, next_action)
       self._data.add_transitions(transition)
@@ -392,8 +397,8 @@ def collect_gym_data(args):
     args.test_srcdir = os.getcwd()
     args.policy_root_dir = os.path.join(args.test_srcdir,
                                                data_dir)
-    args.n_samples = 1000 # Short collection.
-    args.n_eval_episodes = 1
+    args.n_samples = 10000 # Short collection.
+    args.n_eval_episodes = 20
     main(args)
 if __name__ == "__main__":
   args = parser.parse_args(sys.argv[1:])
