@@ -139,7 +139,7 @@ def save_copy(data, ckpt_name):
       circular=False)
   full_batch = data.get_batch(np.arange(data.size))
   new_data.add_transitions(full_batch)
-  torch.save(new_data, ckpt_name+".pt")
+  torch.save(new_data.state_dict(), ckpt_name+".pt")
   
 class Dataset(nn.Module):
   """Tensorflow module of dataset of transitions."""

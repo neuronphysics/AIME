@@ -1037,8 +1037,42 @@ def map_structure(func: Callable, structure):
         return {key: map_structure(func, structure[key]) for key in structure}
 
     return func(structure)
+class AgentConfig(object):
+  """Class for handling agent parameters."""
 
+  def __init__(self, agent_flags):
+    self._agent_flags = agent_flags
+    self._agent_args = self._get_agent_args()
 
+  def _get_agent_args(self):
+    """Gets agent parameters associated with config."""
+    agent_flags = self._agent_flags
+    agent_args = utils.Flags(
+        action_spec=agent_flags.action_spec,
+        optimizers=agent_flags.optimizers,
+        batch_size=agent_flags.batch_size,
+        weight_decays=agent_flags.weight_decays,
+        update_rate=agent_flags.update_rate,
+        update_freq=agent_flags.update_freq,
+        discount=agent_flags.discount,
+        train_data=agent_flags.train_data,
+        )
+    agent_args.modules = self._get_modules()
+    return agent_args
+
+  def _get_modules(self):
+    raise NotImplementedError
+
+  @property
+  def agent_args(self):
+    return self._agent_args
+  
+class Config(AgentConfig):
+
+  def _get_modules(self):
+    return get_modules(
+        self._agent_flags.model_params,
+        self._agent_flags.action_spec)
 #more hyperparameter run_dual.sh
 
 

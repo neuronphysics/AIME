@@ -73,7 +73,12 @@ class Divergence(object):
   def primal_estimate(self, s, p_fn, b_fn, n_samples, action_spec=None):
     raise NotImplementedError
 
+class Flags(object):
 
+  def __init__(self, **kwargs):
+    for key, val in kwargs.items():
+      setattr(self, key, val)
+      
 class FDivergence(Divergence):
   """Interface for f-divergence."""
 

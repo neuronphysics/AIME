@@ -21,25 +21,20 @@ from alf_environment import TimeLimit
 import DataCollection as dc
 import utils_planner as utils
 from DataCollection import dir_path, MUJOCO_ENVS_LENNGTH
-from planner_behavior_regularizer_actor_critic import maybe_makedirs
+from planner_behavior_regularizer_actor_critic import Flags, D2EAgent, Config
 import sys
 def get_datetime():
   now = datetime.datetime.now().isoformat()
   now = re.sub(r'\D', '', now)[:-6]
   return now
 
-class Flags(object):
 
-  def __init__(self, **kwargs):
-    for key, val in kwargs.items():
-      setattr(self, key, val)
       
 @gin.configurable
 def train_eval_offline(
     # Basic args.
     log_dir,
     data_file,
-    agent_module,
     env_name='HalfCheetah-v2',
     n_train=int(1e6),
     shuffle_steps=0,
@@ -71,9 +66,11 @@ def train_eval_offline(
 
   # Prepare data.
   logging.info('Loading data from %s ...', data_file)
-  data  = torch.load(data_file)
-  data_size = data.size()      
-  full_data = dc.Dataset(observation_spec, action_spec, data_size)
+  full_data = dc.Dataset(observation_spec,action_spec,1e3)
+  data_ckpt_name = os.path.join(data_file, 'data_{}.pt'.format(env_name))
+  full_data.load_state_dict( torch.load(data_ckpt_name))
+  print(f"loaded data : {full_data.size}")   
+  
   # Split data.
   n_train = min(n_train, full_data.size)
   logging.info('n_train %s.', n_train)
@@ -98,8 +95,8 @@ def train_eval_offline(
       update_rate=update_rate,
       discount=discount,
       train_data=train_data)
-  agent_args = agent_module.Config(agent_flags).agent_args
-  agent = agent_module.Agent(**vars(agent_args)) #ATTENTION: Debugg ====> should it be D2EAgent here??
+  agent_args = Config(agent_flags).agent_args
+  agent = D2EAgent(**vars(agent_args)) #ATTENTION: Debugg ====> should it be D2EAgent here??
   agent_ckpt_name = os.path.join(log_dir, 'agent')
 
   # Restore agent from checkpoint if there exists one.
@@ -162,10 +159,10 @@ parser.add_argument('--data_root_offlinerl_dir', type=dir_path, default=os.path.
 parser.add_argument('--data_sub_offlinerl_dir',type=str, default=None, help= '')
 parser.add_argument('--test_srcdir', type=str, default=None, help='directory for saving test data.')
 parser.add_argument('--data_name', type=str, default='eps1',help= 'data name.')
-parser.add_argument('--data_file_name', type=str, default='data',help= 'data checkpoint file name.')
+parser.add_argument('--data_file_name', type=str, default='',help= 'data checkpoint file name.')
 
 # Flags for offline training.
-parser.add_argument('--root_dir',type=dir_path, default= os.path.join(os.getenv('HOME', '/'), 'tmp/offlinerl/learn'),
+parser.add_argument('--root_dir',type=dir_path, default= os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/offlinerl/learn'),
                     help='Root directory for writing logs/summaries/checkpoints.')
 parser.add_argument('--sub_dir', type=str, default='0', help='')
 
@@ -180,9 +177,7 @@ parser.add_argument("--gin_file", type=str, default=[], nargs='*', help = 'Paths
 parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help = 'Gin binding parameters.')
 args = parser.parse_args()
 
-AGENT_MODULES_DICT = {
-    'D2E': D2EAgent, ###Debug ===> is it correct to set it here??? 
-}
+
 
 def main(args):
   logging.set_verbosity(logging.INFO)
@@ -211,11 +206,12 @@ def main(args):
       sub_dir,
       str(args.seed),
       )
-  maybe_makedirs(log_dir)
+  if not os.path.exists(log_dir):
+     os.makedirs(log_dir)
+  
   train_eval_offline(
       log_dir=log_dir,
       data_file=data_file,
-      agent_module=AGENT_MODULES_DICT[args.agent_name],
       env_name=args.env_name,
       n_train=args.n_train,
       total_train_steps=args.total_train_steps,
@@ -224,7 +220,7 @@ def main(args):
 
 
 def Train_offline_brac(args):
-    data_dir = 'testdata'
+    data_dir = 'offlinerl'
     args.test_srcdir = os.getcwd()
     args.data_root_offlinerl_dir = os.path.join(args.test_srcdir, data_dir)
     args.data_sub_offlinerl_dir = '0'
