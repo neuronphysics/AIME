@@ -20,7 +20,7 @@ from torch.distributions.transformed_distribution import TransformedDistribution
 import sys
 import shutil
 import argparse
-
+import pickle
 from typing import Callable
 from PIL import Image
 from planner_behavior_regularizer_actor_critic import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
@@ -139,7 +139,9 @@ def save_copy(data, ckpt_name):
       circular=False)
   full_batch = data.get_batch(np.arange(data.size))
   new_data.add_transitions(full_batch)
-  torch.save(new_data.state_dict(), ckpt_name+".pt")
+  torch.save([new_data.size, new_data.state_dict()], ckpt_name+".pt")
+  with open( ckpt_name+'.pth', 'wb') as filehandler: 
+    pickle.dump(new_data, filehandler)
   
 class Dataset(nn.Module):
   """Tensorflow module of dataset of transitions."""
@@ -357,10 +359,13 @@ def collect_data(
     logging.info('Return mean %.4g, std %.4g.', eval_mean, eval_std)
     logging.info('Collecting data from policy %s...', policy_name)
     collect_n_transitions(env, policy, data, n_transitions, log_freq)
-  print(f"Final data {data}")
   # Save final dataset.
+  assert data.size == data.capacity
   data_ckpt_name = os.path.join(log_dir, 'data_{}.pt'.format(env_name))
-  torch.save(data, data_ckpt_name)
+  torch.save([data.capacity, data.state_dict()], data_ckpt_name)
+  whole_data_ckpt_name = os.path.join(log_dir, 'data_{}.pth'.format(env_name))
+  with open( whole_data_ckpt_name, 'wb') as filehandler: 
+    pickle.dump(data, filehandler)
   time_cost = time.time() - time_st
   logging.info('Finished: %d transitions collected, '
                'saved at %s, '
