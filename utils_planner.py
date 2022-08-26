@@ -83,8 +83,8 @@ class FDivergence(Divergence):
   """Interface for f-divergence."""
 
   def dual_estimate(self, s, a_p, a_b):
-    logits_p = self.c(s, a_p)
-    logits_b = self.c(s, a_b)
+    logits_p = self.c.cuda()(s, a_p)
+    logits_b = self.c.cuda()(s, a_b)
     return self._dual_estimate_with_logits(logits_p, logits_b)
 
   def _dual_estimate_with_logits(self, logits_p, logits_b):
