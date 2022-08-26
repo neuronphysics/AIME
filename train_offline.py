@@ -303,4 +303,5 @@ def main(_):
     )
 
 if __name__ == '__main__':
+  torch.autograd.set_detect_anomaly(True)
   main(None)
