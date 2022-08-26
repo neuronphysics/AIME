@@ -26,15 +26,18 @@ import tensor_specs
 import time
 import alf_gym_wrapper
 import importlib  
+from torch.testing._internal.common_utils import TestCase
 
+from collections import Counter
+  
 LOG_STD_MIN = -5
 LOG_STD_MAX = 0
 
 def get_spec_means_mags(spec):
   means = (spec.maximum + spec.minimum) / 2.0
   mags = (spec.maximum - spec.minimum) / 2.0
-  means = Variable(torch.from_numpy(np.asarray(means)).type(torch.FloatTensor), requires_grad=False)
-  mags  = Variable(torch.from_numpy(np.asarray(mags)).type(torch.FloatTensor), requires_grad=False)
+  means = Variable(torch.tensor(means).type(torch.FloatTensor), requires_grad=False)
+  mags  = Variable(torch.tensor(mags).type(torch.FloatTensor), requires_grad=False)
   return means, mags
 
 class Split(torch.nn.Module):
@@ -55,6 +58,7 @@ class Split(torch.nn.Module):
         else:
            chunk_size = output.shape[self._dim] // self._n_parts
            result =torch.split(output, chunk_size, dim=self._dim)
+
         return result
       
 ###############################################
@@ -78,10 +82,10 @@ class ActorNetwork(nn.Module):
         else:
            self._layers.append(nn.Linear(hidden_size, hidden_size))
         self._layers.append(nn.ReLU())
-        
-    output_layer = nn.Linear(hidden_size,self._action_spec.shape[0] * 2 )
-
+    output_layer = nn.Linear(hidden_size,self._action_spec.shape[0] * 2)
+    #output_layer = nn.LazyLinear(self._action_spec.shape[0] * 2)
     self._layers.append(output_layer)
+    
     self._action_means, self._action_mags = get_spec_means_mags(
         self._action_spec)
 
@@ -91,19 +95,20 @@ class ActorNetwork(nn.Module):
 
   def _get_outputs(self, state):
       h = state
+      
       for l in nn.Sequential(*(list(self._layers.children())[:-1])):
           h = l(h)
+
       self._mean_logvar_layers = Split(
          self._layers[-1],
          n_parts=2,
       )
-
       mean, log_std = self._mean_logvar_layers(h)
+      
       a_tanh_mode = torch.tanh(mean) * self._action_mags + self._action_means
       log_std = torch.tanh(log_std)
       log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
       std = torch.exp(log_std)
-      print(f"stdev = {std}")
       #base_distribution = torch.normal(0.0, 1.0)
       #transforms = torch.distributions.transforms.ComposeTransform([torch.distributions.transforms.AffineTransform(loc=self._action_means, scale=self._action_mag, event_dim=mean.shape[-1]), torch.nn.Tanh(),torch.distributions.transforms.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])])
       #a_distribution = torch.distributions.transformed_distribution.TransformedDistribution(base_distribution, transforms)
@@ -157,35 +162,41 @@ class CriticNetwork(nn.Module):
       self._layers = nn.ModuleList()
       for hidden_size in fc_layer_params:
           if len(self._layers)==0:
-              self._layers.append(nn.Linear(latent_spec.size(0)+action_spec(0), hidden_size))
+              
+              self._layers.append(nn.Linear(latent_spec.shape[0]+action_spec.shape[0], hidden_size))
           else:
               self._layers.append(nn.Linear(hidden_size, hidden_size))
           self._layers.append(nn.ReLU())
       output_layer = nn.Linear(hidden_size,1)
       self._layers.append(output_layer)
   
-    def forward(self, embedding):
-        hidden = embedding
+    def forward(self, state,action):
+        hidden = torch.cat([state,action],dim=-1)
         for l in self._layers:
             hidden = l(hidden)
         return hidden
-############################
-##From utils.py
+
 class Flags(object):
 
   def __init__(self, **kwargs):
     for key, val in kwargs.items():
-      setattr(self, key, val)
+      if kwargs.get(key) is not None:
+         setattr(self, key, val)
+      else:
+         pass
 
-def get_modules(model_params, action_spec, observation_spec):
+def get_modules(model_params, observation_spec, action_spec):
   """Gets pytorch modules for Q-function, policy, and discriminator."""
   model_params, n_q_fns = model_params
+  
   if len(model_params) == 1:
     model_params = tuple([model_params[0]] * 3)
   elif len(model_params) < 3:
     raise ValueError('Bad model parameters %s.' % model_params)
   def q_net_factory():
     return CriticNetwork(
+        observation_spec, 
+        action_spec,
         fc_layer_params=model_params[0])
   def p_net_factory():
     return ActorNetwork(
@@ -194,39 +205,51 @@ def get_modules(model_params, action_spec, observation_spec):
         fc_layer_params=model_params[1])
   def c_net_factory():
     return CriticNetwork(
+        observation_spec, 
+        action_spec,
         fc_layer_params=model_params[2])
-  modules = Flags(
+  modules_list = Flags(
       q_net_factory=q_net_factory,
       p_net_factory=p_net_factory,
       c_net_factory=c_net_factory,
       n_q_fns=n_q_fns,
       )
-  return modules
+  return modules_list
 #######################################
 ################ AGENT ################
 #######################################
 ALPHA_MAX = 500.0
+class GeneralAgent(nn.Module):
+  """Tensorflow module for agent."""
 
-class AgentModule(nn.Module):
-  """Pytorch module for BRAC dual agent."""
   def __init__(
       self,
-      modules=None,
+      modules_list=None,
       ):
-    super(AgentModule, self).__init__()
-    self._modules = modules
+    super(GeneralAgent, self).__init__()
+    self._modules_list = modules_list
     self._build_modules()
-    
+    self.device= torch.device('cuda' if torch.cuda.is_available() else 'cpu')
   def _build_modules(self):
-    self._q_nets = []
-    n_q_fns = self._modules.n_q_fns
+    pass
+
+
+
+class AgentModule(GeneralAgent):
+  """Pytorch module for BRAC dual agent."""
+  def __init__(self,modules_list):
+    # invoking the __init__ of the parent class
+    super().__init__(modules_list)
+  def _build_modules(self):
+    self._q_nets = list()  
+    n_q_fns = self._modules_list.n_q_fns
     for _ in range(n_q_fns):
       self._q_nets.append(
-          [self._modules.q_net_factory(),  # Learned Q-value.
-           self._modules.q_net_factory(),]  # Target Q-value.
+          [self._modules_list.q_net_factory(),  # Learned Q-value.
+           self._modules_list.q_net_factory(),]  # Target Q-value.
           )
-    self._p_net = self._modules.p_net_factory()
-    self._c_net = self._modules.c_net_factory()
+    self._p_net = self._modules_list.p_net_factory()
+    self._c_net = self._modules_list.c_net_factory()
     self._alpha_var = torch.tensor(1.0, requires_grad=True)
     self._alpha_entropy_var = torch.tensor(1.0, requires_grad=True)
 
@@ -257,39 +280,39 @@ class AgentModule(nn.Module):
 
   @property
   def q_source_weights(self):
-      q_weights = []
-      for q_net, _ in self._q_nets:
-         for _, net in q_net._modules.values():
-             q_weights += net.weight.data
-      return q_weights
+    q_weights = []
+    for q_net, _ in self._q_nets:
+      for name, param in q_net._layers.named_parameters():
+          if 'weight' in name:
+             q_weights += list(param)
+    return q_weights
 
   @property
   def q_target_weights(self):
     q_weights = []
     for _, q_net in self._q_nets:
-        for k, net in q_net._modules.values():
-            q_weights += net.weight.data
+      for name, param in q_net._layers.named_parameters():
+          if 'weight' in name:
+             q_weights += list(param)
     return q_weights
 
   @property
   def q_source_variables(self):
-    vars_ = []
+    vars_=[]
     for q_net, _ in self._q_nets:
-        vars = q_net.parameters()
-        for v in vars:
-            if v.requires_grad:
-               vars_ += v
-    return tuple(vars_)
-
+        for param in q_net._layers:
+            if not isinstance(param, nn.ReLU):
+               vars_+=list(param.parameters())
+    return vars_
+ 
   @property
   def q_target_variables(self):
     vars_ = []
     for _, q_net in self._q_nets:
-        vars = q_net.parameters()
-        for v in vars:
-            if v.requires_grad:
-               vars_ += v
-    return tuple(vars_)
+        for param in q_net._layers:
+            if not isinstance(param, nn.ReLU):
+               vars_+=list(param.parameters())
+    return vars_
 
   @property
   def p_net(self):
@@ -300,15 +323,19 @@ class AgentModule(nn.Module):
 
   @property
   def p_weights(self):
-    return self._p_net.weight.data
+    p_weights = []
+    for name, param in self._p_net._layers.named_parameters():
+        if 'weight' in name:
+            p_weights += list(param)
+    return p_weights
+
 
   @property
   def p_variables(self):
-    vars = self._p_net.parameters()
     vars_=[]
-    for v in vars:
-        if v.requires_grad:
-           vars_.append(v)   
+    for param in self._p_net._layers:
+        if not isinstance(param, nn.ReLU):
+           vars_+=list(param.parameters())
     return vars_
 
   @property
@@ -317,15 +344,18 @@ class AgentModule(nn.Module):
 
   @property
   def c_weights(self):
-    return self._c_net.weight.data
+    c_weights = []
+    for name, param in self._c_net._layers.named_parameters():
+        if 'weight' in name:
+            c_weights += list(param)
+    return c_weights
 
   @property
   def c_variables(self):
-    vars = self._c_net.parameters()
     vars_=[]
-    for v in vars:
-        if v.requires_grad:
-           vars_.append(v)   
+    for param in self._c_net._layers:
+        if not isinstance(param, nn.ReLU):
+           vars_+=list(param.parameters())
     return vars_
 
 class Agent(object):
@@ -333,7 +363,7 @@ class Agent(object):
 
   def __init__(
       self,
-      latent_spec=None,
+      observation_spec=None,
       action_spec=None,
       time_step_spec=None,
       modules=None,
@@ -347,10 +377,10 @@ class Agent(object):
       resume=False, 
       device=None
       ):
-    self._latent_spec = latent_spec
+    self._latent_spec = observation_spec
     self._action_spec = action_spec
     self._time_step_spec = time_step_spec
-    self._modules = modules
+    self._modules_list = modules
     self._optimizers = optimizers
     self._batch_size = batch_size
     self._weight_decays = weight_decays
@@ -369,18 +399,19 @@ class Agent(object):
   def _build_agent(self):
     """Builds agent components."""
     self._build_fns()
+    train_batch = self._get_train_batch()
+    self._init_vars(train_batch)
     self._build_optimizers()
-    self._global_step = torch.tensor(0.0, requires_grad=True)
+    self._global_step = torch.tensor(0.0, requires_grad=False)
     self._train_info = collections.OrderedDict()
     self._checkpointer = self._build_checkpointer()
     self._test_policies = collections.OrderedDict()
     self._build_test_policies()
     self._online_policy = self._build_online_policy()
-    train_batch = self._get_train_batch()
-    self._init_vars(train_batch)
+    
 
   def _build_fns(self):
-    self._agent_module = AgentModule(modules=self._modules)
+    self._agent_module = AgentModule(modules_list=self._modules_list)
 
   def _get_vars(self):
     return []
@@ -398,21 +429,22 @@ class Agent(object):
     raise NotImplementedError
 
   def _update_target_vars(self):
-        # requires self._vars_learning and self._vars_target as state_dict`s
-        for var_name, var_t in self._vars_target.items():
-            updated_val = (self._update_rate
+      #?
+      # requires self._vars_learning and self._vars_target as state_dict`s
+      for var_name, var_t in self._vars_target.items():
+          updated_val = (self._update_rate
                     * self._vars_learning[var_name].data
                     + (1.0 - self._update_rate) * var_t.data)
-            var_t.data.copy_(updated_val)
+          var_t.data.copy_(updated_val)
 
   def _build_test_policies(self):
-    raise NotImplementedError
+      raise NotImplementedError
 
   def _build_online_policy(self):
-    return None
+      return None
   
-  def _random_policy_fn(self, state):
-      return self._action_spec.sample(), None
+  #def _random_policy_fn(self, state):
+  #    return self._action_spec.sample(), None
 
 
   @property
@@ -437,13 +469,11 @@ class Agent(object):
         a2=transition_batch.a2,
         )
     return batch
-  
-  def _optimize_step(self, batch):
-      pass
+
             
-  def train_step(self):
+  def _train_step(self):
       train_batch = self._get_train_batch()
-      loss = self._optimize_step(train_batch)
+      loss = self._build_loss(train_batch)
       self._optimizer.zero_grad()
       loss.backward()
       self._optimizer.step()
@@ -476,9 +506,11 @@ class Agent(object):
     utils.write_summary(summary_writer, step, info)
 
   def _build_checkpointer(self):
+      #?save
       pass
 
   def _load_checkpoint(self):
+      #?restore
       pass
 
   @property
@@ -495,11 +527,11 @@ class ContinuousRandomPolicy(nn.Module):
 
   def __call__(self, observation, state=()):
     action = tensor_specs.sample_bounded_spec(
-        self._action_spec,
+        self._action_spec, 
         #outer_dims=[observation.shape[0]]
         )
     return action, state
-  
+
 class GaussianRandomSoftPolicy(nn.Module):
   """Adds Gaussian noise to actor's action."""
 
@@ -570,8 +602,8 @@ class MaxQSoftPolicy(nn.Module):
 gin.clear_config()
 gin.config._REGISTRY.clear()
 @gin.configurable
-class D2EAgent(Agent):
-  """D2E dual agent class."""
+class BRACAgent(Agent):
+  """dual agent class."""
 
   def __init__(
       self,
@@ -600,15 +632,17 @@ class D2EAgent(Agent):
     self._warm_start = warm_start
     self._c_iter = c_iter
     self._ensemble_q_lambda = ensemble_q_lambda
-    super(Agent, self).__init__(**kwargs)
+    super(BRACAgent, self).__init__(**kwargs)
 
   def _build_fns(self):
-    self._agent_module = AgentModule(modules=self._modules)
+    self._agent_module = AgentModule(modules_list=self._modules_list)
     self._q_fns = self._agent_module.q_nets
     self._p_fn = self._agent_module.p_fn
     self._c_fn = self._agent_module.c_net
     self._divergence = utils.get_divergence(
-        name=self._divergence_name)
+        name=self._divergence_name, 
+        c=self._c_fn,
+        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     self._agent_module.assign_alpha(self._alpha)
     if self._target_entropy is None:
       self._target_entropy = - self._action_spec.shape[0]
@@ -653,10 +687,9 @@ class D2EAgent(Agent):
     return torch.stack(norms).sum(dim=0)
 
   def ensemble_q(self, qs):
-    #compute the ensemble value of different Q networks
     lambda_ = self._ensemble_q_lambda
-    return (lambda_ *torch.min(qs, dim=-1)
-            + (1 - lambda_) * torch.max(qs, dim=-1))
+    return (lambda_ *torch.min(qs, dim=-1).values
+            + (1 - lambda_) * torch.max(qs, dim=-1).values)
 
   def _ensemble_q2_target(self, q2_targets):
     return self.ensemble_q(q2_targets)
@@ -682,17 +715,18 @@ class D2EAgent(Agent):
     q2_targets = torch.stack(q2_targets, dim=-1)
     q2_target = self._ensemble_q2_target(q2_targets)
     div_estimate = self._divergence.dual_estimate(
-        s2, a2_p, a2_b, self._c_fn)
-    v2_target = q2_target - self._get_alpha_entropy() * log_pi_a2_p
-    if self._value_penalty: #Equation (5)
-       v2_target = v2_target - self._get_alpha() * div_estimate
-    with torch.no_grad(): #Q(s,a)=R(s,a)+discount*v(s')
+        s2, a2_p, a2_b)
+    
+    v2_target = q2_target - self._get_alpha_entropy()[0] * log_pi_a2_p.view(-1,1)
+    if self._value_penalty:
+       v2_target = v2_target - self._get_alpha()[0] * div_estimate
+    with torch.no_grad():
          q1_target = r + dsc * self._discount * v2_target
     q_losses = []
-    for q1_pred in q1_preds: #Equation (6)
+    for q1_pred in q1_preds:
       q_loss_ = torch.mean(torch.square(q1_pred - q1_target))
       q_losses.append(q_loss_)
-    q_loss = torch.stack(q_losses).sum(dim=0)
+    q_loss = torch.sum(torch.FloatTensor(q_losses))
     q_w_norm = self._get_q_weight_norm()
     norm_loss = self._weight_decays[0] * q_w_norm
     loss = q_loss + norm_loss
@@ -718,9 +752,8 @@ class D2EAgent(Agent):
     q1s = torch.stack(q1s, dim=-1)
     q1 = self._ensemble_q1(q1s)
     div_estimate = self._divergence.dual_estimate(
-        s, a_p, a_b, self._c_fn)
+        s, a_p, a_b)
     q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
-    #Equation 7
     p_loss = torch.mean(
         self._get_alpha_entropy() * log_pi_a_p
         + self._get_alpha() * div_estimate
@@ -757,7 +790,7 @@ class D2EAgent(Agent):
     _, a_p, _ = self._p_fn(s)
     alpha = self._get_alpha()
     div_estimate = self._divergence.dual_estimate(
-        s, a_p, a_b, self._c_fn)
+        s, a_p, a_b)
     a_loss = - torch.mean(alpha * (div_estimate - self._target_divergence))
 
     info = collections.OrderedDict()
@@ -786,6 +819,7 @@ class D2EAgent(Agent):
 
   def _build_optimizers(self):
     opts = self._optimizers
+    
     if len(opts) == 1:
       opts = tuple([opts[0]] * 4)
     elif len(opts) < 4:
@@ -866,7 +900,7 @@ class D2EAgent(Agent):
       self._extra_c_step(train_batch)
     for key, val in info.items():
       self._train_info[key] = val.numpy()
-    self._global_step+=1
+    self._global_step.add(1)
 
 
   def _build_test_policies(self):
@@ -922,7 +956,7 @@ class D2EAgent(Agent):
             q_fn_target.load_state_dict(checkpoint["q_net_target"])
         self._p_fn.load_state_dict(checkpoint["policy_net"])
         self._c_fn.load_state_dict(checkpoint["critic_net"])
-        self._p_optimizer.load_state_dict(checkpoint["policy_optimizer"])
+        self._p_optimizer.load_state_dict(checkpoint["policy_optimizer1"])
         self._q_optimizer.load_state_dict(checkpoint["q_optimizer"])
         self._c_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self._global_step = checkpoint["train_step"]
@@ -935,6 +969,8 @@ class D2EAgent(Agent):
             self._ae_optimizer.load_state_dict(checkpoint["alpha_entropy_optimizer"])
         print("load checkpoint from \"" + self.checkpoint_path +
               "\" at " + str(self._global_step) + " time step")
+
+
 
 PolicyConfig = collections.namedtuple(
     'PolicyConfig', 'ptype, ckpt, wrapper, model_params')
@@ -1037,6 +1073,8 @@ def map_structure(func: Callable, structure):
         return {key: map_structure(func, structure[key]) for key in structure}
 
     return func(structure)
+############################
+
 class AgentConfig(object):
   """Class for handling agent parameters."""
 
@@ -1048,6 +1086,7 @@ class AgentConfig(object):
     """Gets agent parameters associated with config."""
     agent_flags = self._agent_flags
     agent_args = utils.Flags(
+        observation_spec=agent_flags.observation_spec,
         action_spec=agent_flags.action_spec,
         optimizers=agent_flags.optimizers,
         batch_size=agent_flags.batch_size,
@@ -1072,6 +1111,7 @@ class Config(AgentConfig):
   def _get_modules(self):
     return get_modules(
         self._agent_flags.model_params,
+        self._agent_flags.observation_spec,
         self._agent_flags.action_spec)
 #more hyperparameter run_dual.sh
 
