@@ -76,11 +76,17 @@ class Divergence(object):
   def primal_estimate(self, s, p_fn, b_fn, n_samples, action_spec=None):
     raise NotImplementedError
 
+
 class Flags(object):
 
   def __init__(self, **kwargs):
-    for key, val in kwargs.items():
-      setattr(self, key, val)
+     self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu') 
+     for key, val in kwargs.items():
+        if kwargs.get(key) is not None:
+           setattr(self, key, val)
+        else:
+           pass
+
 
 class FDivergence(Divergence):
   """Interface for f-divergence."""
@@ -170,11 +176,8 @@ def get_divergence(name, c, device):
   return CLS_DICT[name](c, device)
 
 def soft_variables_update(source_variables, target_variables, tau=1.0):
-    print(f'source_variables len: {len(source_variables)}')
-    print(f'target_variables len: {len(target_variables)}')
     for (v_s, v_t) in zip(source_variables, target_variables):
-        print(f'v_s: {v_s.shape}')
-        print(f'v_t: {v_t.shape}')
+
         v_t = (1 - tau) * v_t + tau * v_s
     return v_t
 
@@ -236,7 +239,7 @@ def relu_v2(x):
 #     if_x_l_high = torch.le(x, 500.).type(torch.float32)
 #     return (if_y_pos * if_x_g_low +
 #             (1.0 - if_y_pos) * if_x_l_high) * grad_cpy
-def soft_relu(x, device):
+def soft_relu(x, device=local_device):
   """Compute log(1 + exp(x))."""
   # Note: log(sigmoid(x)) = x - soft_relu(x) = - soft_relu(-x).
   #       log(1 - sigmoid(x)) = - soft_relu(x)

@@ -20,10 +20,12 @@ import argparse
 from alf_environment import TimeLimit
 import utils_planner as utils
 from DataCollection import *
-from planner_behavior_regularizer_actor_critic import Flags, BRACAgent, Config
+from planner_behavior_regularizer_actor_critic import BRACAgent, Config
+import utils_planner as utils
 import sys
 import pickle
 import dill
+
 gin.clear_config()
 def get_datetime():
   now = datetime.datetime.now().isoformat()
@@ -31,6 +33,10 @@ def get_datetime():
   return now
 
 class CustomUnpickler(dill.Unpickler):
+    #https://github.com/pytorch/pytorch/issues/16797#issuecomment-777059657
+    def __init__(self, *args, map_location= "cpu", **kwargs):
+        self._map_location = map_location
+        super().__init__(*args, **kwargs)
 
     def find_class(self, module, name):
         try:
@@ -75,7 +81,7 @@ def train_eval_offline(
   env = TimeLimit(env, MUJOCO_ENVS_LENNGTH[env_name])
   observation_spec = env.observation_spec()
   action_spec = env.action_spec()
-
+  
   # Prepare data.
   logging.info('Loading data from %s ...', data_file)
   
@@ -91,7 +97,7 @@ def train_eval_offline(
     with open(whole_data_ckpt_name, "rb") as f:
         # if file is not empty scores will be equal
         # to the value unpickled
-          full_data =CustomUnpickler(f).load()
+          full_data =CustomUnpickler(f,map_location=device).load()
  
   logging.info('Loading data from dataset with size %d , %d ...', data_size, full_data.size)  
   for k, v in full_data._config.items():
@@ -107,13 +113,15 @@ def train_eval_offline(
     rand = np.random.RandomState(seed)
   else:
     rand = np.random.RandomState(0)
+  
   shuffled_indices = shuffle_indices_with_steps(
       n=full_data.size, steps=shuffle_steps, rand=rand)
+  
   train_indices = shuffled_indices[:n_train]
   train_data = full_data.create_view(train_indices)
-
+  logging.info('DEBUG: creating agent ....')
   # Create agent.
-  agent_flags = Flags(
+  agent_flags = utils.Flags(
       observation_spec=observation_spec,
       action_spec=action_spec,
       model_params=model_params,
@@ -124,8 +132,11 @@ def train_eval_offline(
       update_rate=update_rate,
       discount=discount,
       train_data=train_data)
+  
+  
   agent_args = Config(agent_flags).agent_args
-  agent = BRACAgent(**vars(agent_args)) #ATTENTION: Debugg ====> should it be D2EAgent here??
+  logging.info('DEBUG: Initialize a brac agent ....')
+  agent = BRACAgent(**vars(agent_args)) #ATTENTION: Debugg
   agent_ckpt_name = os.path.join(log_dir, 'agent')
 
   # Restore agent from checkpoint if there exists one.
