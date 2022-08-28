@@ -13,6 +13,7 @@ import datetime
 import re
 from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.common_utils import run_tests
+from collections import Counter
 import collections
 import numpy as np
 import os
@@ -27,11 +28,11 @@ import time
 import alf_gym_wrapper
 import importlib  
 from torch.testing._internal.common_utils import TestCase
-
 from collections import Counter
-  
+import torch.distributions as pyd
+import math
 LOG_STD_MIN = -5
-LOG_STD_MAX = 0
+LOG_STD_MAX = 2
 
 def get_spec_means_mags(spec):
   means = (spec.maximum + spec.minimum) / 2.0
@@ -50,7 +51,9 @@ class Split(torch.nn.Module):
         self._n_parts = n_parts
         self._dim = dim
         self._module = module
-
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.to(device=self.device)
+        
     def forward(self, inputs):
         output = self._module(inputs)
         if output.ndim==1:
@@ -60,7 +63,33 @@ class Split(torch.nn.Module):
            result =torch.split(output, chunk_size, dim=self._dim)
 
         return result
-      
+
+class TanhTransform(pyd.transforms.Transform):
+    domain = pyd.constraints.real
+    codomain = pyd.constraints.interval(-1.0, 1.0)
+    bijective = True
+    sign = +1
+
+    def __init__(self, cache_size=1):
+        super().__init__(cache_size=cache_size)
+
+    @staticmethod
+    def atanh(x):
+        return 0.5 * (x.log1p() - (-x).log1p())
+
+    def __eq__(self, other):
+        return isinstance(other, TanhTransform)
+
+    def _call(self, x):
+        return x.tanh()
+
+    def _inverse(self, y):
+        return self.atanh(y.clamp(-0.99, 0.99))
+
+    def log_abs_det_jacobian(self, x, y):
+        return 2.0 * (math.log(2.0) - x - F.softplus(-2.0 * x))
+
+
 ###############################################
 ##################  Networks  #################
 ###############################################
@@ -76,6 +105,7 @@ class ActorNetwork(nn.Module):
     super(ActorNetwork, self).__init__()
     self._action_spec = action_spec
     self._layers = nn.ModuleList()
+    
     for hidden_size in fc_layer_params:
         if len(self._layers)==0:
            self._layers.append(nn.Linear(latent_spec.shape[0], hidden_size))
@@ -83,11 +113,15 @@ class ActorNetwork(nn.Module):
            self._layers.append(nn.Linear(hidden_size, hidden_size))
         self._layers.append(nn.ReLU())
     output_layer = nn.Linear(hidden_size,self._action_spec.shape[0] * 2)
-    #output_layer = nn.LazyLinear(self._action_spec.shape[0] * 2)
     self._layers.append(output_layer)
     
     self._action_means, self._action_mags = get_spec_means_mags(
         self._action_spec)
+    self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    self.to(device=self.device)
+
+  def to(self, *args, **kwargs):
+      super().to(*args, **kwargs)
 
   @property
   def action_spec(self):
@@ -113,18 +147,18 @@ class ActorNetwork(nn.Module):
       #transforms = torch.distributions.transforms.ComposeTransform([torch.distributions.transforms.AffineTransform(loc=self._action_means, scale=self._action_mag, event_dim=mean.shape[-1]), torch.nn.Tanh(),torch.distributions.transforms.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])])
       #a_distribution = torch.distributions.transformed_distribution.TransformedDistribution(base_distribution, transforms)
       a_distribution = TransformedDistribution(
-                        base_distribution=Normal(loc=torch.full_like(mean, 0), 
-                                                 scale=torch.full_like(mean, 1)), 
+                        base_distribution=Normal(loc=torch.full_like(mean, 0).to(device=self.device), 
+                                                 scale=torch.full_like(mean, 1).to(device=self.device)), 
                         transforms=tT.ComposeTransform([
                                    tT.AffineTransform(loc=self._action_means, scale=self._action_mags, event_dim=mean.shape[-1]), 
-                                   tT.TanhTransform(),
+                                   TanhTransform(),
                                    tT.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])]))
       #https://www.ccoderun.ca/programming/doxygen/pytorch/classtorch_1_1distributions_1_1transformed__distribution_1_1TransformedDistribution.html
       return a_distribution, a_tanh_mode
 
   def get_log_density(self, state, action):
-    a_dist, _ = self._get_outputs(state)
-    log_density = a_dist.log_prob(action)
+    a_dist, _ = self._get_outputs(state.to(device=self.device))
+    log_density = a_dist.log_prob(action.to(device=self.device))
     return log_density
 
   @property
@@ -135,14 +169,14 @@ class ActorNetwork(nn.Module):
     return w_list
 
   def __call__(self, state):
-    a_dist, a_tanh_mode = self._get_outputs(state)
+    a_dist, a_tanh_mode = self._get_outputs(state.to(device=self.device))
     a_sample = a_dist.sample()
     log_pi_a = a_dist.log_prob(a_sample)
     return a_tanh_mode, a_sample, log_pi_a
 
   def sample_n(self, state, n=1):
-    a_dist, a_tanh_mode = self._get_outputs(state)
-    a_sample = a_dist.sample(n)
+    a_dist, a_tanh_mode = self._get_outputs(state.to(device=self.device))
+    a_sample = a_dist.sample([n])
     log_pi_a = a_dist.log_prob(a_sample)
     return a_tanh_mode, a_sample, log_pi_a
 
@@ -169,9 +203,11 @@ class CriticNetwork(nn.Module):
           self._layers.append(nn.ReLU())
       output_layer = nn.Linear(hidden_size,1)
       self._layers.append(output_layer)
-  
+      self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+      self.to(device=self.device)
+
     def forward(self, state,action):
-        hidden = torch.cat([state,action],dim=-1)
+        hidden = torch.cat([state.to(device=self.device),action.to(device=self.device)],dim=-1)
         for l in self._layers:
             hidden = l(hidden)
         return hidden
@@ -230,9 +266,10 @@ class GeneralAgent(nn.Module):
     self._modules_list = modules_list
     self._build_modules()
     self.device= torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    self.to(device=self.device)
+    
   def _build_modules(self):
     pass
-
 
 
 class AgentModule(GeneralAgent):
@@ -389,20 +426,28 @@ class Agent(object):
     self._update_rate = update_rate
     self._discount = discount
     self._resume = resume 
-    self.device = torch.device(
+    if device is None:
+       self.device = torch.device(
                     'cuda' if torch.cuda.is_available() else 'cpu')
-    self._build_agent()
+    else:
+       self.device=device
+    
     directory = os.getcwd()
     checkpoint_dir=directory+"/run"
+    if not os.path.exists(checkpoint_dir):
+      os.makedirs(checkpoint_dir)
     self.checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pth")
+    self._build_agent()
 
   def _build_agent(self):
     """Builds agent components."""
+    if len(self._weight_decays) == 1:
+       self._weight_decays = tuple([self._weight_decays[0]] * 3)
     self._build_fns()
     train_batch = self._get_train_batch()
+    self._global_step = torch.tensor(0.0, requires_grad=False)
     self._init_vars(train_batch)
     self._build_optimizers()
-    self._global_step = torch.tensor(0.0, requires_grad=False)
     self._train_info = collections.OrderedDict()
     self._checkpointer = self._build_checkpointer()
     self._test_policies = collections.OrderedDict()
@@ -540,10 +585,13 @@ class GaussianRandomSoftPolicy(nn.Module):
     self._a_network = a_network
     self._std = std
     self._clip_eps = clip_eps
+    self.device = torch.device(
+                    'cuda' if torch.cuda.is_available() else 'cpu')
+    self.to(device=self.device)
 
   def __call__(self, observation, state=()):
-    action = self._a_network(observation)[1]
-    noise = torch.normal(mean=torch.zeros(action.shape), std=self._std)
+    action = self._a_network(observation.to(device=self.device))[1]
+    noise = torch.normal(mean=torch.zeros(action.shape), std=self._std).to(device=self.device)
     action = action + noise
     spec = self._a_network.action_spec
     action = torch.clamp(action, spec.minimum + self._clip_eps,
@@ -582,22 +630,25 @@ class MaxQSoftPolicy(nn.Module):
     self._a_network = a_network
     self._q_network = q_network
     self._n = n
+    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    self.to(self.device)
 
   def __call__(self, latent_state):
-    batch_size = latent_state.shape[0]
-    actions = self._a_network.sample_n(latent_state, self._n)[1]
+
+    actions = self._a_network.sample_n(latent_state.to(device=self.device), self._n)[1]
+    batch_size = actions.shape[0]
     actions_ = torch.reshape(actions, [self._n * batch_size, -1])
-    states_ = torch.tile(latent_state[None], (self._n, 1, 1))
+    states_ = torch.tile(latent_state[None].to(device=self.device), (self._n, 1, 1))
     states_ = torch.reshape(states_, [self._n * batch_size, -1])
     qvals = self._q_network(states_, actions_)
-    qvals = torch.reshape(qvals, [self._n, batch_size])
-    a_indices = torch.argmax(qvals, dim=0)
+    qvals = torch.reshape(qvals, [self._n, batch_size]).to(device=self.device)
+    a_indices = torch.argmax(qvals, dim=0).to(device=self.device)
     gather_indices = torch.stack(
-        [a_indices, torch.range(batch_size, dtype=torch.int64)], dim=-1)
+        [a_indices, torch.arange(batch_size, dtype=torch.int64).to(device=self.device)], dim=-1)
     action = utils.gather_nd(actions, gather_indices)
     return action
 #############################################
-################ D2E Agent ################## 
+################ BRAC Agent ################## 
 #############################################
 gin.clear_config()
 gin.config._REGISTRY.clear()
@@ -632,6 +683,7 @@ class BRACAgent(Agent):
     self._warm_start = warm_start
     self._c_iter = c_iter
     self._ensemble_q_lambda = ensemble_q_lambda
+    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     super(BRACAgent, self).__init__(**kwargs)
 
   def _build_fns(self):
@@ -642,7 +694,7 @@ class BRACAgent(Agent):
     self._divergence = utils.get_divergence(
         name=self._divergence_name, 
         c=self._c_fn,
-        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        device=self.device)
     self._agent_module.assign_alpha(self._alpha)
     if self._target_entropy is None:
       self._target_entropy = - self._action_spec.shape[0]
@@ -704,24 +756,24 @@ class BRACAgent(Agent):
     a2_b = batch['a2']
     r = batch['r']
     dsc = batch['dsc']
-    _, a2_p, log_pi_a2_p = self._p_fn(s2)
+    _, a2_p, log_pi_a2_p = self._p_fn(s2.to(device=self.device))
     q2_targets = []
     q1_preds = []
     for q_fn, q_fn_target in self._q_fns:
-      q2_target_ = q_fn_target(s2, a2_p)
-      q1_pred = q_fn(s1, a1)
+      q2_target_ = q_fn_target(s2.to(device=self.device), a2_p)
+      q1_pred = q_fn(s1.to(device=self.device), a1.to(device=self.device))
       q1_preds.append(q1_pred)
       q2_targets.append(q2_target_)
     q2_targets = torch.stack(q2_targets, dim=-1)
     q2_target = self._ensemble_q2_target(q2_targets)
     div_estimate = self._divergence.dual_estimate(
-        s2, a2_p, a2_b)
+        s2.to(device=self.device), a2_p, a2_b.to(device=self.device))
     
     v2_target = q2_target - self._get_alpha_entropy()[0] * log_pi_a2_p.view(-1,1)
     if self._value_penalty:
        v2_target = v2_target - self._get_alpha()[0] * div_estimate
     with torch.no_grad():
-         q1_target = r + dsc * self._discount * v2_target
+         q1_target = r.to(device=self.device) + dsc.to(device=self.device) * self._discount * v2_target
     q_losses = []
     for q1_pred in q1_preds:
       q_loss_ = torch.mean(torch.square(q1_pred - q1_target))
@@ -747,16 +799,16 @@ class BRACAgent(Agent):
     _, a_p, log_pi_a_p = self._p_fn(s)
     q1s = []
     for q_fn, _ in self._q_fns:
-      q1_ = q_fn(s, a_p)
-      q1s.append(q1_)
+        q1_ = q_fn(s, a_p)
+        q1s.append(q1_)
     q1s = torch.stack(q1s, dim=-1)
     q1 = self._ensemble_q1(q1s)
     div_estimate = self._divergence.dual_estimate(
         s, a_p, a_b)
     q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
     p_loss = torch.mean(
-        self._get_alpha_entropy() * log_pi_a_p
-        + self._get_alpha() * div_estimate
+        self._get_alpha_entropy()[0] * log_pi_a_p
+        + self._get_alpha()[0] * div_estimate
         - q1 * q_start)
     p_w_norm = self._get_p_weight_norm()
     norm_loss = self._weight_decays[1] * p_w_norm
@@ -773,7 +825,7 @@ class BRACAgent(Agent):
     a_b = batch['a1']
     _, a_p, _ = self._p_fn(s)
     c_loss = self._divergence.dual_critic_loss(
-        s, a_p, a_b, self._c_fn)
+        s, a_p, a_b)
     c_w_norm = self._get_c_weight_norm()
     norm_loss = self._weight_decays[2] * c_w_norm
     loss = c_loss + norm_loss
@@ -824,37 +876,37 @@ class BRACAgent(Agent):
       opts = tuple([opts[0]] * 4)
     elif len(opts) < 4:
       raise ValueError('Bad optimizers %s.' % opts)
-    if len(self._weight_decays) == 1:
-      self._weight_decays = tuple([self._weight_decays[0]] * 3)
       
-    self._q_optimizer = utils.OptMirrorAdam(self._get_q_vars(),lr=opts[0][0], betas=(opts[0][1],opts[0][2]), weight_decay=self._weight_decays[0])
-    self._p_optimizer = utils.OptMirrorAdam(self._get_p_vars(),lr=opts[1][0], betas=(opts[1][1],opts[1][2]), weight_decay=self._weight_decays[1])
-    self._c_optimizer = utils.OptMirrorAdam(self._get_c_vars(),lr=opts[2][0], betas=(opts[2][1],opts[2][2]), weight_decay=self._weight_decays[2])
+    self._q_optimizer = torch.optim.Adam(self._get_q_vars(),lr=opts[0][0], betas=(opts[0][1],opts[0][2]), weight_decay=self._weight_decays[0])
+    self._p_optimizer = torch.optim.Adam(self._get_p_vars(),lr=opts[1][0], betas=(opts[1][1],opts[1][2]), weight_decay=self._weight_decays[1])
+    self._c_optimizer = torch.optim.Adam(self._get_c_vars(),lr=opts[2][0], betas=(opts[2][1],opts[2][2]), weight_decay=self._weight_decays[2])
     self._a_optimizer = torch.optim.Adam(self._a_vars, lr=opts[3][0], betas=(opts[3][1],opts[3][2]))
     self._ae_optimizer = torch.optim.Adam(self._ae_vars, lr=opts[3][0], betas=(opts[3][1],opts[3][2]))
 
   def _optimize_step(self, batch):
     info = collections.OrderedDict()
-    if torch.equal(self._global_step % self._update_freq, 0):
+    if torch.equal(self._global_step % torch.tensor(self._update_freq), torch.tensor(0, dtype=torch.float32)):
       source_vars, target_vars = self._get_source_target_vars()
       self._update_target_fns(source_vars, target_vars)
     # Update policy network parameter
     #https://bit.ly/3Bno0GC
     # policy network's update should be done before updating q network, or there will make some errors
+    self._agent_module.p_net.train()
     self._p_optimizer.zero_grad()
     policy_loss,_=self._build_p_loss(batch)
     policy_loss.backward(retain_graph=True)
     self._p_optimizer.step()
     # Update q networks parameter
+    for q_fn, q_fn_target in self._q_fns:
+        q_fn.train()
+        q_fn_target.train()
     self._q_optimizer.zero_grad()
     q_losses,q_info= self._build_q_loss(batch)
     q_losses.backward()
     self._q_optimizer.step()
     #Update critic network parameter
-    self._c_optimizer.zero_grad()
-    critic_loss,_= self._build_c_loss( batch)
-    critic_loss.backward()
-    self._c_optimizer.step()
+    self._agent_module.c_net.train()
+    self._extra_c_step( batch)
     
     if self._train_alpha:
        self._a_optimizer.zero_grad()
@@ -875,7 +927,7 @@ class BRACAgent(Agent):
     info["q1_target_mean"]=q_info["q1_target_mean"].cpu().item()
     info["q2_target_mean"]=q_info["q2_target_mean"].cpu().item()
     #7) critic loss
-    info["critic_loss"]=critic_loss.cpu().item()
+    info["critic_loss"] = self.critic_loss.cpu().item()
     #8)alpha loss
     if self._train_alpha:
        info["alpha_loss"]=a_loss.cpu().item()
@@ -888,8 +940,8 @@ class BRACAgent(Agent):
   
   def _extra_c_step(self, batch):
       self._c_optimizer.zero_grad()
-      critic_loss,_ = self._build_c_loss( batch)
-      critic_loss.backward()
+      self.critic_loss,_ = self._build_c_loss( batch)
+      self.critic_loss.backward()
       self._c_optimizer.step()
 
   def train_step(self):
@@ -899,8 +951,8 @@ class BRACAgent(Agent):
       train_batch = self._get_train_batch()
       self._extra_c_step(train_batch)
     for key, val in info.items():
-      self._train_info[key] = val.numpy()
-    self._global_step.add(1)
+        self._train_info[key] = val
+    self._global_step += 1
 
 
   def _build_test_policies(self):
@@ -930,13 +982,12 @@ class BRACAgent(Agent):
 
   def _build_checkpointer(self):
       checkpoint = {
-            "policy_net": self._p_fn.state_dict(),
-            "critic_net": self._c_fn.state_dict(),
+            "policy_net": self._agent_module.p_net.state_dict(),
+            "critic_net": self._agent_module.c_net.state_dict(),
             "q_optimizer": self._q_optimizer.state_dict(),
             "critic_optimizer": self._c_optimizer.state_dict(),
             "policy_optimizer": self._p_optimizer.state_dict(),
-            "train_step": self._global_step,
-            "episode_num": self.episode_num ###fix??
+            "train_step": self._global_step
       }
       for q_fn, q_fn_target in self._q_fns:
           checkpoint["q_net"]        = q_fn.state_dict()
@@ -954,13 +1005,12 @@ class BRACAgent(Agent):
         for q_fn, q_fn_target in self._q_fns:
             q_fn.load_state_dict(checkpoint["q_net"])
             q_fn_target.load_state_dict(checkpoint["q_net_target"])
-        self._p_fn.load_state_dict(checkpoint["policy_net"])
-        self._c_fn.load_state_dict(checkpoint["critic_net"])
+        self._agent_module.p_net.load_state_dict(checkpoint["policy_net"])
+        self._agent_module.c_net.load_state_dict(checkpoint["critic_net"])
         self._p_optimizer.load_state_dict(checkpoint["policy_optimizer1"])
         self._q_optimizer.load_state_dict(checkpoint["q_optimizer"])
         self._c_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self._global_step = checkpoint["train_step"]
-        self.episode_num = checkpoint["episode_num"]###???fix
         if self._train_alpha:
             self._alpha_var = checkpoint["alpha"]
             self._a_optimizer.load_state_dict(checkpoint["alpha_optimizer"])
@@ -1041,9 +1091,9 @@ def eval_policy_episodes(env, policy, n_episodes):
     while not time_step.is_last():
       action = policy(torch.from_numpy(time_step.observation))[0]
       if action.ndim<1:
-          time_step= env.step(action.unsqueeze(0)) 
+          time_step= env.step(action.unsqueeze(0).detach().cpu()) 
       else:  
-          time_step= env.step(action)
+          time_step= env.step(action.detach().cpu())
       total_rewards += time_step.reward or 0.
     results.append(total_rewards)
   results = torch.tensor(results)

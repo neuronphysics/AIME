@@ -28,8 +28,11 @@ import datetime
 import re
 import os
 
-EPS = 1e-8  # Epsilon for avoiding numerical issues.
-CLIP_EPS = 1e-3  # Epsilon for clipping actions.
+local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+# Epsilon for avoiding numerical issues.
+EPS = torch.tensor(1e-8, dtype=torch.float64, device=local_device,requires_grad=False)
+# Epsilon for clipping actions.
+CLIP_EPS = torch.tensor(1e-3 , dtype=torch.float64, device=local_device,requires_grad=False)
 
 def gather_nd(params, indices):
     # this function has a limit that MAX_ADVINDEX_CALC_DIMS=5
@@ -40,22 +43,22 @@ def gather_nd(params, indices):
     slices += [Ellipsis]
     return params[slices].view(*output_shape)
 
+
 @gin.configurable
 class gradient_penalty(object):
   def __init__(self, c, device):
     self.c = c
     self.device = device
+    
   def forward(self, s, a_p, a_b, gamma=5.0):
     """Calculates interpolated gradient penalty."""
     batch_size = s.shape[0]
     alpha = torch.rand([batch_size], device=self.device)
-    #print(a_p, self.device, alpha, a_b, a_p)
-    a_intpl = a_p + alpha[:, None] * (a_b - a_p)
-    c_intpl = self.c(s, a_intpl)
+    a_intpl = a_p.to(device=self.device) + alpha[:, None] * (a_b.to(device=self.device) - a_p.to(device=self.device))
+    c_intpl = self.c(s.to(device=self.device), a_intpl)
     slope = torch.sqrt(EPS + torch.sum(c_intpl ** 2, axis=-1))
     grad_penalty = torch.mean(torch.max(slope - 1.0, torch.zeros_like(slope)) ** 2)
     return grad_penalty * gamma
-
 
 class Divergence(object):
   """Basic interface for divergence."""
@@ -78,7 +81,7 @@ class Flags(object):
   def __init__(self, **kwargs):
     for key, val in kwargs.items():
       setattr(self, key, val)
-      
+
 class FDivergence(Divergence):
   """Interface for f-divergence."""
 
@@ -104,6 +107,7 @@ class FDivergence(Divergence):
   def _primal_estimate_with_densities(
       self, apn_logp, apn_logb, abn_logp, abn_logb):
     raise NotImplementedError
+
 
 
 class KL(FDivergence):
@@ -189,7 +193,7 @@ def get_summary_str(step=None, info=None, prefix=''):
 def write_summary(writer, info, step):
     """For pytorch. Write summary to tensorboard."""
     for key, val in info.items():
-        if isinstance(val, 
+        if isinstance(val,
                 (int, float, np.int32, np.int64, np.float32, np.float64)):
             writer.add_scalar(key, val, step)
 
@@ -216,7 +220,7 @@ def relu_v2(x):
      if_y_pos = torch.gt(dy, 0.0).type(torch.float32)
      if_x_pos = torch.gt(x, 0.0).type(torch.float32)
      return (if_y_pos * if_x_pos + (1.0 - if_y_pos)) * dy
-  return value, grad  
+  return value, grad
 
 # class clip_v2(torch.autograd.Function):
 #   @staticmethod
@@ -232,12 +236,12 @@ def relu_v2(x):
 #     if_x_l_high = torch.le(x, 500.).type(torch.float32)
 #     return (if_y_pos * if_x_g_low +
 #             (1.0 - if_y_pos) * if_x_l_high) * grad_cpy
-
-def soft_relu(x):
+def soft_relu(x, device):
   """Compute log(1 + exp(x))."""
   # Note: log(sigmoid(x)) = x - soft_relu(x) = - soft_relu(-x).
   #       log(1 - sigmoid(x)) = - soft_relu(x)
-  return torch.log(1.0 + torch.exp(-torch.abs(x))) + torch.max(x, torch.zeros_like(x))
+  return torch.log(1.0 + torch.exp(-torch.abs(x))).to(device=device) + torch.max(x, torch.zeros_like(x)).to(device=device)
+
 
 def local_global_loss(l_enc, g_enc, measure, mode):
         '''
@@ -277,7 +281,7 @@ def get_negative_expectation(q_samples, measure, average=True):
         Eq = -0.5 * ((torch.sqrt(q_samples ** 2) + 1.) ** 2)
     elif measure == 'KL':
         q_samples = torch.clamp(q_samples,-1e6,9.5)
-        
+
         #print("neg q samples ",q_samples.cpu().data.numpy())
         Eq = torch.exp(q_samples - 1.)
     elif measure == 'RKL':
@@ -307,9 +311,9 @@ def get_positive_expectation(p_samples, measure, average=True):
         Ep = p_samples ** 2
     elif measure == 'KL':
         Ep = p_samples
-    
+
     elif measure == 'RKL':
-    
+
         Ep = -torch.exp(-p_samples)
     elif measure == 'DV':
         Ep = p_samples
@@ -515,16 +519,16 @@ def multi_donsker_varadhan_loss(l, m):
     loss = E_neg - E_pos
     return loss
 
-# Optimistic Mirror Adam - works GREAT 
+# Optimistic Mirror Adam - works GREAT
 
 
 class OptMirrorAdam(Optimizer):
     """
-    Implements Optimistic Mirror Descent on Adam algorithm. 
-    
-        Built on official implementation of Adam by pytorch. 
+    Implements Optimistic Mirror Descent on Adam algorithm.
+
+        Built on official implementation of Adam by pytorch.
        See "Optimistic Mirror Descent in Saddle-Point Problems: Gointh the Extra (-Gradient) Mile"
-       double blind review, paper: https://openreview.net/pdf?id=Bkg8jjC9KQ 
+       double blind review, paper: https://openreview.net/pdf?id=Bkg8jjC9KQ
 
     Standard Adam::
 
@@ -574,17 +578,17 @@ class OptMirrorAdam(Optimizer):
             closure (callable, optional): A closure that reevaluates the model
                 and returns the loss.
         """
-        
+
         loss = None
-        
-        # Do not allow training with out closure 
+
+        # Do not allow training with out closure
         if closure is  None:
             raise ValueError("This algorithm requires a closure definition for the evaluation of the intermediate gradient")
-            
-        
-        # Create a copy of the initial parameters 
+
+
+        # Create a copy of the initial parameters
         param_groups_copy = self.param_groups.copy()
-        
+
         # ############### First update of gradients ############################################
         # ######################################################################################
         for group in self.param_groups:
@@ -611,23 +615,23 @@ class OptMirrorAdam(Optimizer):
                         # Maintains max of all exp. moving avg. of sq. grad. values
                         state['max_exp_avg_sq_1'] = torch.zeros_like(p.data)
                         state['max_exp_avg_sq_2'] = torch.zeros_like(p.data)
-                # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ 
-                        
-                        
-                        
-                        
+                # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+
+
                 exp_avg1, exp_avg_sq1 = state['exp_avg_1'], state['exp_avg_sq_1']
                 if amsgrad:
                     max_exp_avg_sq1 = state['max_exp_avg_sq_1']
                 beta1, beta2 = group['betas']
 
-                
-                # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ 
-                # Step will be updated once  
+
+                # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+                # Step will be updated once
                 state['step'] += 1
                 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-                
-                
+
+
                 if group['weight_decay'] != 0:
                     grad = grad.add(group['weight_decay'], p.data)
 
@@ -639,11 +643,11 @@ class OptMirrorAdam(Optimizer):
                 bias_correction2 = 1 - beta2 ** state['step']
 
                 # *****************************************************
-                # Additional steps, to get bias corrected running means  
+                # Additional steps, to get bias corrected running means
                 exp_avg1 = torch.div(exp_avg1, bias_correction1)
                 exp_avg_sq1 = torch.div(exp_avg_sq1, bias_correction2)
                 # *****************************************************
-                                
+
                 if amsgrad:
                     # Maintains the maximum of all 2nd moment running avg. till now
                     torch.max(max_exp_avg_sq1, exp_avg_sq1, out=max_exp_avg_sq1)
@@ -657,11 +661,11 @@ class OptMirrorAdam(Optimizer):
                 p.data.addcdiv_(-step_size1, exp_avg1, denom1)
 
 
-        
-        # Perform additional backward step to calculate stochastic gradient - WATING STATE 
+
+        # Perform additional backward step to calculate stochastic gradient - WATING STATE
         loss = closure()
-        
-        # Re run the optimization with the second averaged moments 
+
+        # Re run the optimization with the second averaged moments
         # ############### Second evaluation of gradients ###########################################
         # ######################################################################################
         for (group, group_copy) in zip(self.param_groups,param_groups_copy ):
@@ -675,14 +679,14 @@ class OptMirrorAdam(Optimizer):
 
                 state = self.state[p]
 
-                        
-                        
+
+
                 exp_avg2, exp_avg_sq2 = state['exp_avg_2'], state['exp_avg_sq_2']
                 if amsgrad:
                     max_exp_avg_sq2 = state['max_exp_avg_sq_2']
                 beta1, beta2 = group['betas']
-                
-                
+
+
                 if group['weight_decay'] != 0:
                     grad = grad.add(group['weight_decay'], p.data)
 
@@ -691,11 +695,11 @@ class OptMirrorAdam(Optimizer):
                 exp_avg_sq2.mul_(beta2).addcmul_(1 - beta2, grad, grad)
 
                 # *****************************************************
-                # Additional steps, to get bias corrected running means  
+                # Additional steps, to get bias corrected running means
                 exp_avg2 = torch.div(exp_avg2, bias_correction1)
                 exp_avg_sq2 = torch.div(exp_avg_sq2, bias_correction2)
                 # *****************************************************
-                                
+
                 if amsgrad:
                     # Maintains the maximum of all 2nd moment running avg. till now
                     torch.max(max_exp_avg_sq2, exp_avg_sq2, out=max_exp_avg_sq2)
@@ -708,12 +712,12 @@ class OptMirrorAdam(Optimizer):
 
                 p_copy.data.addcdiv_(-step_size2, exp_avg2, denom2)
                 p = p_copy
-        
-        
-        
-        
+
+
+
+
         return loss
-    
+
 class AdaBoundW(Optimizer):
     """Implements AdaBound algorithm with Decoupled Weight Decay (arxiv.org/abs/1711.05101)
     It has been proposed in `Adaptive Gradient Methods with Dynamic Bound of Learning Rate`_.
@@ -861,7 +865,7 @@ def make_base_dir(list_of_dir):
     first = list_of_dir[0]
     if not os.path.exists(first):
       os.mkdir(first)
-    for dir in list_of_dir[1:]:   
+    for dir in list_of_dir[1:]:
         first = os.path.join(first, dir)
         if not os.path.exists(first):
             os.mkdir(first)
@@ -886,5 +890,5 @@ def check_for_nans_and_nones(arr):
         if item is None or checker_fn(item):
             print("We have a None")
             none_indices.append(idx)
-            
+
     return none_indices
