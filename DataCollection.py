@@ -120,6 +120,7 @@ class DatasetView(object):
   def __init__(self, dataset, indices):
     self._dataset = dataset
     self._indices = indices
+    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
   def get_batch(self, indices):
     real_indices = self._indices[indices]

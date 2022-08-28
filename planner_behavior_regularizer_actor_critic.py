@@ -31,14 +31,18 @@ from torch.testing._internal.common_utils import TestCase
 from collections import Counter
 import torch.distributions as pyd
 import math
-LOG_STD_MIN = -5
-LOG_STD_MAX = 2
 
-def get_spec_means_mags(spec):
+local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+LOG_STD_MIN = torch.tensor(-5, dtype=torch.float64, device=local_device,requires_grad=False)
+
+LOG_STD_MAX = torch.tensor(2 , dtype=torch.float64, device=local_device,requires_grad=False)
+
+def get_spec_means_mags(spec,device):
   means = (spec.maximum + spec.minimum) / 2.0
   mags = (spec.maximum - spec.minimum) / 2.0
-  means = Variable(torch.tensor(means).type(torch.FloatTensor), requires_grad=False)
-  mags  = Variable(torch.tensor(mags).type(torch.FloatTensor), requires_grad=False)
+  means = Variable(torch.tensor(means).type(torch.FloatTensor).to(device), requires_grad=False)
+  mags  = Variable(torch.tensor(mags).type(torch.FloatTensor).to(device), requires_grad=False)
   return means, mags
 
 class Split(torch.nn.Module):
@@ -71,6 +75,7 @@ class TanhTransform(pyd.transforms.Transform):
     sign = +1
 
     def __init__(self, cache_size=1):
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         super().__init__(cache_size=cache_size)
 
     @staticmethod
@@ -114,10 +119,10 @@ class ActorNetwork(nn.Module):
         self._layers.append(nn.ReLU())
     output_layer = nn.Linear(hidden_size,self._action_spec.shape[0] * 2)
     self._layers.append(output_layer)
-    
-    self._action_means, self._action_mags = get_spec_means_mags(
-        self._action_spec)
     self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    self._action_means, self._action_mags = get_spec_means_mags(
+        self._action_spec, self.device)
+    
     self.to(device=self.device)
 
   def to(self, *args, **kwargs):
@@ -140,7 +145,7 @@ class ActorNetwork(nn.Module):
       mean, log_std = self._mean_logvar_layers(h)
       
       a_tanh_mode = torch.tanh(mean) * self._action_mags + self._action_means
-      log_std = torch.tanh(log_std)
+      log_std = torch.tanh(log_std).to(device=self.device)
       log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
       std = torch.exp(log_std)
       #base_distribution = torch.normal(0.0, 1.0)
@@ -212,14 +217,7 @@ class CriticNetwork(nn.Module):
             hidden = l(hidden)
         return hidden
 
-class Flags(object):
 
-  def __init__(self, **kwargs):
-    for key, val in kwargs.items():
-      if kwargs.get(key) is not None:
-         setattr(self, key, val)
-      else:
-         pass
 
 def get_modules(model_params, observation_spec, action_spec):
   """Gets pytorch modules for Q-function, policy, and discriminator."""
@@ -244,7 +242,7 @@ def get_modules(model_params, observation_spec, action_spec):
         observation_spec, 
         action_spec,
         fc_layer_params=model_params[2])
-  modules_list = Flags(
+  modules_list = utils.Flags(
       q_net_factory=q_net_factory,
       p_net_factory=p_net_factory,
       c_net_factory=c_net_factory,
@@ -548,7 +546,7 @@ class Agent(object):
   def write_train_summary(self, summary_writer):
     info = self._train_info
     step = self._global_step.numpy()
-    utils.write_summary(summary_writer, step, info)
+    utils.write_summary(summary_writer, info, step)
 
   def _build_checkpointer(self):
       #?save
@@ -569,7 +567,9 @@ class ContinuousRandomPolicy(nn.Module):
   def __init__(self, action_spec):
     super(ContinuousRandomPolicy, self).__init__()
     self._action_spec = action_spec
-
+    self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    self.to(device=self.device)
+    
   def __call__(self, observation, state=()):
     action = tensor_specs.sample_bounded_spec(
         self._action_spec, 
@@ -604,7 +604,8 @@ class DeterministicSoftPolicy(nn.Module):
   def __init__(self, a_network):
     super(DeterministicSoftPolicy, self).__init__()
     self._a_network = a_network
-
+    self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    self.to(device=self.device)
 
   def __call__(self, latent_states):
     action = self._a_network(latent_states)[0]
@@ -616,7 +617,8 @@ class RandomSoftPolicy(nn.Module):
   def __init__(self, a_network):
     super(RandomSoftPolicy, self).__init__()
     self._a_network = a_network
-
+    self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    self.to(device=self.device)
 
   def __call__(self, latent_states):
     action = self._a_network(latent_states)[1]
@@ -796,15 +798,15 @@ class BRACAgent(Agent):
   def _build_p_loss(self, batch):
     s = batch['s1']
     a_b = batch['a1']
-    _, a_p, log_pi_a_p = self._p_fn(s)
+    _, a_p, log_pi_a_p = self._p_fn(s.to(device=self.device))
     q1s = []
     for q_fn, _ in self._q_fns:
-        q1_ = q_fn(s, a_p)
+        q1_ = q_fn(s.to(device=self.device), a_p)
         q1s.append(q1_)
     q1s = torch.stack(q1s, dim=-1)
     q1 = self._ensemble_q1(q1s)
     div_estimate = self._divergence.dual_estimate(
-        s, a_p, a_b)
+        s.to(device=self.device), a_p, a_b.to(device=self.device))
     q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
     p_loss = torch.mean(
         self._get_alpha_entropy()[0] * log_pi_a_p
@@ -823,9 +825,9 @@ class BRACAgent(Agent):
   def _build_c_loss(self, batch):
     s = batch['s1']
     a_b = batch['a1']
-    _, a_p, _ = self._p_fn(s)
+    _, a_p, _ = self._p_fn(s.to(device=self.device))
     c_loss = self._divergence.dual_critic_loss(
-        s, a_p, a_b)
+        s.to(device=self.device), a_p, a_b.to(device=self.device))
     c_w_norm = self._get_c_weight_norm()
     norm_loss = self._weight_decays[2] * c_w_norm
     loss = c_loss + norm_loss
@@ -839,10 +841,10 @@ class BRACAgent(Agent):
   def _build_a_loss(self, batch):
     s = batch['s1']
     a_b = batch['a1']
-    _, a_p, _ = self._p_fn(s)
+    _, a_p, _ = self._p_fn(s.to(device=self.device))
     alpha = self._get_alpha()
     div_estimate = self._divergence.dual_estimate(
-        s, a_p, a_b)
+        s.to(device=self.device), a_p, a_b.to(device=self.device))
     a_loss = - torch.mean(alpha * (div_estimate - self._target_divergence))
 
     info = collections.OrderedDict()
@@ -855,7 +857,7 @@ class BRACAgent(Agent):
 
   def _build_ae_loss(self, batch):
     s = batch['s1']
-    _, _, log_pi_a = self._p_fn(s)
+    _, _, log_pi_a = self._p_fn(s.to(device=self.device))
     alpha = self._get_alpha_entropy()
     ae_loss = torch.mean(alpha * (- log_pi_a - self._target_entropy))
 
@@ -1131,6 +1133,7 @@ class AgentConfig(object):
   def __init__(self, agent_flags):
     self._agent_flags = agent_flags
     self._agent_args = self._get_agent_args()
+    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
   def _get_agent_args(self):
     """Gets agent parameters associated with config."""
