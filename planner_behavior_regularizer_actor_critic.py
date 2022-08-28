@@ -638,10 +638,11 @@ class MaxQSoftPolicy(nn.Module):
   def __call__(self, latent_state):
 
     actions = self._a_network.sample_n(latent_state.to(device=self.device), self._n)[1]
-    batch_size = actions.shape[0]
+    #logging.info("latent states shape:{}, n: {}, actions: {}......".format(latent_state.shape, self._n, actions.shape))
+    batch_size = actions.shape[-1]
     actions_ = torch.reshape(actions, [self._n * batch_size, -1])
-    states_ = torch.tile(latent_state[None].to(device=self.device), (self._n, 1, 1))
-    states_ = torch.reshape(states_, [self._n * batch_size, -1])
+    states_  = torch.tile(latent_state[None].to(device=self.device), (self._n, 1, 1))
+    states_  = torch.reshape(states_, [self._n * batch_size, -1])
     qvals = self._q_network(states_, actions_)
     qvals = torch.reshape(qvals, [self._n, batch_size]).to(device=self.device)
     a_indices = torch.argmax(qvals, dim=0).to(device=self.device)

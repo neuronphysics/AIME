@@ -190,7 +190,8 @@ def train_eval_offline(
   agent._build_checkpointer()
   time_cost = time.time() - time_st_total
   logging.info('Training finished, time cost %.4gs.', time_cost)
-  return torch.tensor(eval_results)
+  logging.info("{}......".format(eval_results[0]))
+  return torch.cat([x.unsqueeze(0) for x in eval_results[0][1:]], dim=-1)
 
 ##############################
 ###train_offline.py
@@ -274,9 +275,9 @@ def Train_offline_brac(args):
     args.gin_bindings = [
         'train_eval_offline.model_params=((200, 200),)',
         'train_eval_offline.optimizers=((5e-4, 0.5, 0.99),)']
-    args.n_train = 100
+    args.n_train = 10000
     args.n_eval_episodes = 20
-    args.total_train_steps = 100  # Short training.
+    args.total_train_steps = 10000  # Short training.
 
     main(args)  # Just test that it runs.
 
