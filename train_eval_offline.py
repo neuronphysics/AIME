@@ -18,15 +18,26 @@ import numpy as np
 import datetime
 import argparse
 from alf_environment import TimeLimit
-import DataCollection as dc
 import utils_planner as utils
-from DataCollection import dir_path, MUJOCO_ENVS_LENNGTH
-from planner_behavior_regularizer_actor_critic import Flags, D2EAgent, Config
+from DataCollection import *
+from planner_behavior_regularizer_actor_critic import Flags, BRACAgent, Config
 import sys
+import pickle
+import dill
+gin.clear_config()
 def get_datetime():
   now = datetime.datetime.now().isoformat()
   now = re.sub(r'\D', '', now)[:-6]
   return now
+
+class CustomUnpickler(dill.Unpickler):
+
+    def find_class(self, module, name):
+        try:
+            return super().find_class(__name__, name)
+        except AttributeError:
+            return super().find_class(module, name)
+
 
 
       
@@ -49,28 +60,46 @@ def train_eval_offline(
     n_eval_episodes=20,
     # Agent args.
     model_params=(((200, 200),), 2),
-    optimizers=(('adam', 0.001),),
+    optimizers=(( 0.0001, 0.5, 0.99),),
     batch_size=256,
     weight_decays=(0.0,),
     update_freq=1,
     update_rate=0.005,
     discount=0.99,
+    device=None
     ):
   ###Training a policy with a fixed dataset.###
   # Create tf_env to get specs.
   dm_env = gym.spec(env_name).make()
-  env = alf_gym_wrapper.AlfGymWrapper(dm_env)
+  env = alf_gym_wrapper.AlfGymWrapper(dm_env,discount=discount)
   env = TimeLimit(env, MUJOCO_ENVS_LENNGTH[env_name])
   observation_spec = env.observation_spec()
   action_spec = env.action_spec()
 
   # Prepare data.
   logging.info('Loading data from %s ...', data_file)
-  full_data = dc.Dataset(observation_spec,action_spec,1e3)
-  data_ckpt_name = os.path.join(data_file, 'data_{}.pt'.format(env_name))
-  full_data.load_state_dict( torch.load(data_ckpt_name))
-  print(f"loaded data : {full_data.size}")   
   
+  
+  data_ckpt_name = os.path.join(data_file, 'data_{}.pt'.format(env_name))
+  whole_data_ckpt_name = os.path.join(data_file, 'data_{}.pth'.format(env_name))
+  
+  data_size, state = torch.load(data_ckpt_name, map_location=device)
+  
+  
+
+  if os.path.getsize(whole_data_ckpt_name) > 0:       
+    with open(whole_data_ckpt_name, "rb") as f:
+        # if file is not empty scores will be equal
+        # to the value unpickled
+          full_data =CustomUnpickler(f).load()
+ 
+  logging.info('Loading data from dataset with size %d , %d ...', data_size, full_data.size)  
+  for k, v in full_data._config.items():
+      if k =='observation_spec':
+          full_data._config['observation_spec']=observation_spec
+      elif k=='action_spec':
+          full_data._config['action_spec']=action_spec
+ 
   # Split data.
   n_train = min(n_train, full_data.size)
   logging.info('n_train %s.', n_train)
@@ -78,7 +107,7 @@ def train_eval_offline(
     rand = np.random.RandomState(seed)
   else:
     rand = np.random.RandomState(0)
-  shuffled_indices = dc.shuffle_indices_with_steps(
+  shuffled_indices = shuffle_indices_with_steps(
       n=full_data.size, steps=shuffle_steps, rand=rand)
   train_indices = shuffled_indices[:n_train]
   train_data = full_data.create_view(train_indices)
@@ -96,7 +125,7 @@ def train_eval_offline(
       discount=discount,
       train_data=train_data)
   agent_args = Config(agent_flags).agent_args
-  agent = D2EAgent(**vars(agent_args)) #ATTENTION: Debugg ====> should it be D2EAgent here??
+  agent = BRACAgent(**vars(agent_args)) #ATTENTION: Debugg ====> should it be D2EAgent here??
   agent_ckpt_name = os.path.join(log_dir, 'agent')
 
   # Restore agent from checkpoint if there exists one.
@@ -139,14 +168,15 @@ def train_eval_offline(
       for policy_key, policy_info in eval_infos.items():
         logging.info(utils.get_summary_str(
             step=None, info=policy_info, prefix=policy_key+': '))
-        utils.write_summary(eval_summary_writers[policy_key], step, policy_info)
+        utils.write_summary(eval_summary_writers[policy_key], policy_info, step)
       time_st = time.time()
       timed_at_step = step
     if step % save_freq == 0:
-      torch.save(agent, agent_ckpt_name)
-      logging.info('Agent saved at %s.', agent_ckpt_name)
+       agent.checkpoint_path=agent_ckpt_name
+       agent._build_checkpointer()
+       logging.info('Agent saved at %s.', agent_ckpt_name)
 
-  torch.save(agent, agent_ckpt_name)
+  agent._build_checkpointer()
   time_cost = time.time() - time_st_total
   logging.info('Training finished, time cost %.4gs.', time_cost)
   return torch.tensor(eval_results)
@@ -154,10 +184,10 @@ def train_eval_offline(
 ##############################
 ###train_offline.py
 parser = argparse.ArgumentParser(description='BRAC')
-parser.add_argument('--data_root_offlinerl_dir', type=dir_path, default=os.path.join(os.getenv('HOME', '/'),'TEST/AIME/start-with-brac/offlinerl'),
+parser.add_argument('--data_root_offlinerl_dir', type=dir_path, default='/home/memole/TEST/AIME/start-with-brac/offlinerl',
                      help='Root directory for data.')
 parser.add_argument('--data_sub_offlinerl_dir',type=str, default=None, help= '')
-parser.add_argument('--test_srcdir', type=str, default=None, help='directory for saving test data.')
+parser.add_argument('--test_srcdir', type=str, default='/home/memole/TEST/AIME/start-with-brac/', help='directory for saving test data.')
 parser.add_argument('--data_name', type=str, default='eps1',help= 'data name.')
 parser.add_argument('--data_file_name', type=str, default='',help= 'data checkpoint file name.')
 
@@ -191,14 +221,14 @@ def main(args):
       )
   data_file = os.path.join(
       data_dir, args.data_file_name)
-
+  logging.info('Data directory %s.', args.data_root_offlinerl_dir)
   # Setup log dir.
   if args.sub_dir == 'auto':
     sub_dir = get_datetime()
   else:
     sub_dir = args.sub_dir
   log_dir = os.path.join(
-      args.root_dir,
+      args.data_root_offlinerl_dir,
       args.env_name,
       args.data_name,
       'n'+str(args.n_train),
@@ -208,6 +238,8 @@ def main(args):
       )
   if not os.path.exists(log_dir):
      os.makedirs(log_dir)
+  else:
+    pass
   
   train_eval_offline(
       log_dir=log_dir,
@@ -216,20 +248,21 @@ def main(args):
       n_train=args.n_train,
       total_train_steps=args.total_train_steps,
       n_eval_episodes=args.n_eval_episodes,
+      device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
       )
 
 
 def Train_offline_brac(args):
     data_dir = 'offlinerl'
-    args.test_srcdir = os.getcwd()
+    #args.test_srcdir = os.getcwd()
     args.data_root_offlinerl_dir = os.path.join(args.test_srcdir, data_dir)
     args.data_sub_offlinerl_dir = '0'
     args.env_name = 'Pendulum-v0'
     args.data_name = 'example'
-    args.agent_name = 'D2E'
+    args.agent_name = 'BRAC'
     args.gin_bindings = [
         'train_eval_offline.model_params=((200, 200),)',
-        'train_eval_offline.optimizers=(("adam", 5e-4),)']
+        'train_eval_offline.optimizers=((5e-4, 0.5, 0.99),)']
     args.n_train = 100
     args.n_eval_episodes = 20
     args.total_train_steps = 100  # Short training.
@@ -238,4 +271,7 @@ def Train_offline_brac(args):
 
 if __name__ == "__main__":
   args = parser.parse_args(sys.argv[1:])
+  gin.parse_config_files_and_bindings([], args.gin_bindings,finalize_config=False, skip_unknown=True, print_includes_and_imports=True)
   Train_offline_brac(args)
+  gin.clear_config()
+  gin.config._REGISTRY.clear()

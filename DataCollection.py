@@ -14,9 +14,6 @@ from alf_environment import TimeLimit
 import importlib 
 import torch 
 import torch.nn as nn
-from torch.distributions.normal import Normal
-from torch.distributions import transforms as tT
-from torch.distributions.transformed_distribution import TransformedDistribution
 import sys
 import shutil
 import argparse
@@ -24,6 +21,8 @@ import pickle
 from typing import Callable
 from PIL import Image
 from planner_behavior_regularizer_actor_critic import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
+import dill
+import nest
 #####################################
 #from train_eval_utils
 
@@ -79,9 +78,9 @@ class DataCollector(object):
       
     action = self._saved_action
     if action.ndim<1:
-          next_time_step = self._env.step(action.unsqueeze(0))
+          next_time_step = self._env.step(action.unsqueeze(0).detach().cpu())
     else:
-          next_time_step = self._env.step(action)
+          next_time_step = self._env.step(action.detach().cpu())
 
     next_action = self._policy(torch.from_numpy(next_time_step.observation))[0]
     self._saved_action = next_action
@@ -141,7 +140,7 @@ def save_copy(data, ckpt_name):
   new_data.add_transitions(full_batch)
   torch.save([new_data.size, new_data.state_dict()], ckpt_name+".pt")
   with open( ckpt_name+'.pth', 'wb') as filehandler: 
-    pickle.dump(new_data, filehandler)
+    dill.dump(new_data, filehandler)
   
 class Dataset(nn.Module):
   """Tensorflow module of dataset of transitions."""
@@ -177,7 +176,7 @@ class Dataset(nn.Module):
         action_spec=action_spec,
         size=size,
         circular=circular)
-
+    self.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
   @property
   def config(self):
     return self._config
@@ -186,10 +185,10 @@ class Dataset(nn.Module):
     return DatasetView(self, indices)
 
   def get_batch(self, indices):
-    indices = torch.LongTensor(indices,requires_grad=False)
+    indices = torch.tensor(indices, dtype=torch.int64, requires_grad=False, device=self.device)
     def get_batch_(data_):
       return gather(data_, indices)
-    transition_batch = map_structure(get_batch_, self._data)
+    transition_batch = nest.map_structure(get_batch_, self._data)
     return transition_batch
 
   @property
@@ -212,6 +211,8 @@ class Dataset(nn.Module):
     assert isinstance(transitions, Transition)
     for i in transitions._fields:
         attr=getattr(transitions,i)
+        if torch.is_tensor(attr):
+           attr=attr.detach().cpu()
         transitions=transitions._replace(**{i:np.expand_dims(attr,axis=0)})
     batch_size = transitions.s1.shape[0]
     effective_batch_size = torch.minimum( torch.tensor(batch_size), torch.tensor(self._size - self._current_idx))
@@ -248,19 +249,13 @@ def shuffle_indices_with_steps(n, steps=1, rand=None):
 
 #########################
 #collect_data.py
-#app.flags.DEFINE_string('f', '', 'kernel')
-#FLAGS =app.flags.FLAGS
 
-# def del_all_flags(FLAGS):
 def dir_path(path):
     if os.path.isdir(path):
         return path
     else:
         raise argparse.ArgumentTypeError(f"readable_dir:{path} is not a valid path")
 
-
-#FLAGS = flags.FLAGS
-#app.flags.DEFINE_string('f', '', 'kernel')
 
 parser = argparse.ArgumentParser(description='BRAC')
 parser.add_argument('--root_offlinerl_dir', type=dir_path, default='/home/memole/TEST/AIME/start-with-brac/offlinerl', help='Root directory for saving data')
@@ -329,7 +324,7 @@ def collect_data(
   torch.manual_seed(seed)
   np.random.seed(seed)
   dm_env = gym.spec(env_name).make()
-  env = alf_gym_wrapper.AlfGymWrapper(dm_env)
+  env = alf_gym_wrapper.AlfGymWrapper(dm_env, discount=0.99)
   env = TimeLimit(env, MUJOCO_ENVS_LENNGTH[env_name])
   observation_spec = env.observation_spec()
   action_spec = env.action_spec()
@@ -382,7 +377,7 @@ def main(args):
       sub_dir,
       )
   maybe_makedirs(log_dir)
-  print(args.config_dir)
+  #print(args.config_dir)
   config_module = importlib.import_module(
       '{}.{}'.format(args.config_dir, args.config_file))
   collect_data(
