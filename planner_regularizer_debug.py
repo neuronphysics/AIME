@@ -39,12 +39,14 @@ class WeightClipper(object):
     def __call__(self, module):
         # filter the variables to get the ones you want
         if hasattr(module, 'weight'):
-            w = module.weight.data
-            w = w.clamp(-1,1)
-            module.weight.data = w
-            print(type(module.weight))
-            print(f' we have weight: {module.weight}')
-            utils.check_for_nans_and_nones(module.weight.data)
+            with torch.no_grad():
+              w = module.weight.data
+              w = w.clamp(-1,1)
+              module.weight.data = w
+              # print(type(module.weight))
+              print(f' we have weight: {module.weight}')
+              utils.check_for_nans_and_nones(module.weight.data)
+              print(f'weight gradient: {module.weight.grad}')
 
 
 def weights_init(modules, type='xavier'):
@@ -163,6 +165,8 @@ class ActorNetwork(nn.Module):
     super(ActorNetwork, self).__init__()
     self._action_spec = action_spec
     self._latent_spec = latent_spec
+    self.device = torch.device(
+                    'cuda' if torch.cuda.is_available() else 'cpu')
     print(f' latent_spec when creating actor :{latent_spec.shape}')
     self._layers = nn.ModuleList()
     for hidden_size in fc_layer_params:
@@ -177,6 +181,8 @@ class ActorNetwork(nn.Module):
     self._layers.append(output_layer)
     self._action_means, self._action_mags = get_spec_means_mags(
         self._action_spec)
+    self._action_means = self._action_means.to(self.device)
+    self._action_mags = self._action_mags.to(self.device)
 
     # print(self._layers)
     for layer in self._layers:
@@ -192,6 +198,7 @@ class ActorNetwork(nn.Module):
       for l in self._layers[:-1]:
         if isinstance(l, nn.Linear):
           print(f'l weight {l.weight.data}')
+          print(f'l weight device is {l.weight.get_device()}')
           utils.check_for_nans_and_nones(l.weight.data)
         h = l(h)
       self._mean_logvar_layers = Split(
@@ -203,6 +210,8 @@ class ActorNetwork(nn.Module):
       utils.check_for_nans_and_nones(h)
       print(f'state is: {state}')
       mean, log_std = self._mean_logvar_layers(h)
+      mean = mean.to(self.device)
+      log_std = log_std.to(self.device)
       print(f'mean')
       utils.check_for_nans_and_nones(mean)
 
@@ -253,8 +262,9 @@ class ActorNetwork(nn.Module):
     a_sample = a_dist.sample()
     print(f' a_sample shape: {a_sample.shape}')
     utils.check_for_nans_and_nones(a_sample)
+    print(f'a_sample: {a_sample}')
 
-    log_pi_a = a_dist.log_prob(a_sample)
+    log_pi_a = a_dist.log_prob(a_sample) # This line is the root of all problems
     return a_tanh_mode, a_sample, log_pi_a
 
   def sample_n(self, state, n=1):
@@ -282,7 +292,7 @@ class CriticNetwork(nn.Module):
               self._layers.append(nn.Linear(latent_spec.size+action_spec.shape[0], hidden_size))
           else:
               self._layers.append(nn.Linear(hidden_size, hidden_size))
-          self._layers.append(nn.ReLU())
+          self._layers.append(nn.LeakyReLU())
       output_layer = nn.Linear(hidden_size,1)
       self._layers.append(output_layer)
 
@@ -495,7 +505,7 @@ class Agent(object):
       action_spec=None,
       time_step_spec=None,
       modules=None,
-      optimizers= ((0.001, 0.5, 0.99),),
+      optimizers= ((0.0001, 0.5, 0.99),),
       batch_size=64,
       weight_decays=(0.0,),
       update_freq=1,
@@ -606,12 +616,12 @@ class Agent(object):
     # )
 
     batch = dict(
-        s1=torch.from_numpy(transition_batch[3]).type(torch.FloatTensor), # state
-        s2=torch.from_numpy(transition_batch[4]).type(torch.FloatTensor), # next state
-        r=torch.from_numpy(transition_batch[0]), # reward
-        dsc=torch.from_numpy(transition_batch[5]), # discount
-        a1=torch.from_numpy(np.expand_dims(transition_batch[1], axis=-1)), # action1
-        a2=torch.from_numpy(np.expand_dims(transition_batch[2], axis=-1)), # action2
+        s1=torch.from_numpy(transition_batch[3]).type(torch.FloatTensor).to(self.device), # state
+        s2=torch.from_numpy(transition_batch[4]).type(torch.FloatTensor).to(self.device), # next state
+        r=torch.from_numpy(transition_batch[0]).to(self.device), # reward
+        dsc=torch.from_numpy(transition_batch[5]).to(self.device), # discount
+        a1=torch.from_numpy(np.expand_dims(transition_batch[1], axis=-1)).to(self.device), # action1
+        a2=torch.from_numpy(np.expand_dims(transition_batch[2], axis=-1)).to(self.device), # action2
         )
     print(f' batch is: {batch}')
     return batch
@@ -863,31 +873,43 @@ class D2EAgent(Agent):
     a2_b = batch['a2']
     r = batch['r']
     dsc = batch['dsc']
-    _, a2_p, log_pi_a2_p = self._p_fn(s2)
+    _, a2_p, log_pi_a2_p = self._p_fn.cuda()(s2)
     q2_targets = []
     q1_preds = []
     for q_fn, q_fn_target in self._q_fns:
-      q2_target_ = q_fn_target(s2, a2_p)
-      q1_pred = q_fn(s1, a1)
+      q2_target_ = q_fn_target.cuda()(s2, a2_p)
+      q1_pred = q_fn.cuda()(s1, a1)
       q1_preds.append(q1_pred)
       q2_targets.append(q2_target_)
-      print(f'q2_target shape: {q2_target_.shape}')
     q2_targets = torch.stack(q2_targets, dim=-1)
+    print(f'q2_target before ensemble: {q2_targets}')
+    utils.check_for_nans_and_nones(q2_targets)
     q2_target = self._ensemble_q2_target(q2_targets)
+    print(f'q1_preds: {q1_preds}')
+    # utils.check_for_nans_and_nones(q1_preds)
+    print(f'q2_target: {q2_target}')
+    utils.check_for_nans_and_nones(q2_target)
     div_estimate = self._divergence.dual_estimate(
-        s2, a2_p, a2_b, self._c_fn)
+        s2, a2_p, a2_b)
     print(f'q2_target length {len(q2_target)}') # tuple
     alpha_entropy_val, alpha_entropy_grad = self._get_alpha_entropy()
     print(f'alpha_entropy_val: {alpha_entropy_val} ')
     print(f'alpha_entropy_grad: {alpha_entropy_grad}')
-    print(f'log_pi_a2_p shape {log_pi_a2_p.shape}')
+    print(f'a2p: {a2_p}')
+    print(f'log_pi_a2_p: {log_pi_a2_p}') # nan originates here!!!!!!!!!!!!!!!
+    print(f'alpha entropy val: {alpha_entropy_val}')
     v2_target = (q2_target - alpha_entropy_val) * log_pi_a2_p
 
     alpha_val, alpha_grad = self._get_alpha()
+    print(f'v2_target before: {v2_target}')
     if self._value_penalty: #Equation (5)
        v2_target = v2_target - alpha_val * div_estimate
+    print(f'v2_target after: {v2_target}')
     with torch.no_grad(): #Q(s,a)=R(s,a)+discount*v(s')
-         q1_target = r + dsc * self._discount * v2_target
+         q1_target = r + self._discount * v2_target
+         print(f'r: {r}')
+         print(f'q1_target: {q1_target}')
+         utils.check_for_nans_and_nones(q1_target)
     q_losses = []
     for q1_pred in q1_preds: #Equation (6)
       q_loss_ = torch.mean(torch.square(q1_pred - q1_target))
@@ -895,6 +917,10 @@ class D2EAgent(Agent):
     q_loss = torch.stack(q_losses).sum(dim=0)
     q_w_norm = self._get_q_weight_norm()
     norm_loss = self._weight_decays[0] * q_w_norm
+    print(f'q_loss in building: {q_loss}')
+    utils.check_for_nans_and_nones(q_loss)
+    print(f'norm loss in building: {norm_loss}')
+    utils.check_for_nans_and_nones(norm_loss)
     loss = q_loss + norm_loss
 
     info = collections.OrderedDict()
@@ -910,15 +936,15 @@ class D2EAgent(Agent):
   def _build_p_loss(self, batch):
     s = batch['s1']
     a_b = batch['a1']
-    _, a_p, log_pi_a_p = self._p_fn(s)
+    _, a_p, log_pi_a_p = self._p_fn.cuda()(s)
     q1s = []
     for q_fn, _ in self._q_fns:
-      q1_ = q_fn(s, a_p)
+      q1_ = q_fn.cuda()(s, a_p)
       q1s.append(q1_)
     q1s = torch.stack(q1s, dim=-1)
     q1 = self._ensemble_q1(q1s)
     div_estimate = self._divergence.dual_estimate(
-        s, a_p, a_b, self._c_fn)
+        s, a_p, a_b)
     q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
     #Equation 7
     alpha_val, alpha_grad = self._get_alpha()
@@ -943,9 +969,9 @@ class D2EAgent(Agent):
     print(f's shape: {s.shape}')
     # print(f's in _build_c_loss is: {s}')
     print(f'a_b shape: {a_b.shape}')
-    _, a_p, _ = self._p_fn(s)
+    _, a_p, _ = self._p_fn.cuda()(s)
     c_loss = self._divergence.dual_critic_loss(
-        s, a_p, a_b, self._c_fn)
+        s, a_p, a_b)
     c_w_norm = self._get_c_weight_norm()
     norm_loss = self._weight_decays[2] * c_w_norm
     loss = c_loss + norm_loss
@@ -962,7 +988,7 @@ class D2EAgent(Agent):
     _, a_p, _ = self._p_fn(s)
     alpha, alpha_grad = self._get_alpha()
     div_estimate = self._divergence.dual_estimate(
-        s, a_p, a_b, self._c_fn)
+        s, a_p, a_b)
     a_loss = - torch.mean(alpha * (div_estimate - self._target_divergence))
 
     info = collections.OrderedDict()
@@ -1024,9 +1050,13 @@ class D2EAgent(Agent):
 
     self._p_optimizer.zero_grad()
     policy_loss,_=self._build_p_loss(batch)
+    print(f' policy_loss after building: {policy_loss}')
+    utils.check_for_nans_and_nones(policy_loss)
     policy_loss.backward(retain_graph=True)
     torch.nn.utils.clip_grad_norm_(self._p_fn.parameters(), 0.9)
     policy_loss = self._p_optimizer.step(closure_p)
+    print(f' policy_loss after building: {policy_loss}')
+    utils.check_for_nans_and_nones(policy_loss)
     self._p_fn.apply(clipper)
 
     # Update q networks parameter
@@ -1042,11 +1072,15 @@ class D2EAgent(Agent):
 
     self._q_optimizer.zero_grad()
     q_losses,q_info= self._build_q_loss(batch)
+    print(f' q_losses after building: {q_losses}')
+    utils.check_for_nans_and_nones(q_losses)
     q_losses.backward(retain_graph=True)
     for q_fn, q_fn_target in self._q_fns:
         torch.nn.utils.clip_grad_norm_(q_fn.parameters(), 0.9)
         torch.nn.utils.clip_grad_norm_(q_fn_target.parameters(), 0.9)
     q_losses = self._q_optimizer.step(closure_q)
+    print(f' q_losses after step: {q_losses}')
+    utils.check_for_nans_and_nones(q_losses)
     for q_fn, q_fn_target in self._q_fns:
       q_fn.apply(clipper)
       q_fn_target.apply(clipper)
@@ -1127,7 +1161,7 @@ class D2EAgent(Agent):
   def train_step(self):
     train_batch = self._get_train_batch()
     info = self._optimize_step(train_batch)
-    with open('info_file6.txt', 'a') as f:
+    with open('info_file8.txt', 'a') as f:
       f.write(json.dumps(info))
       f.write('\n')
     for _ in range(self._c_iter - 1):
