@@ -7,6 +7,7 @@ from torch.nn import functional as F
 from torch.distributions.normal import Normal
 from torch.distributions import transforms as tT
 from torch.distributions.transformed_distribution import TransformedDistribution
+import torch.distributions as pyd
 from tensorboardX import SummaryWriter
 from torch.autograd import Variable
 from torch.testing._internal.common_utils import TestCase
@@ -133,6 +134,37 @@ def get_spec_means_mags(spec):
   mags  = Variable(torch.from_numpy(mags), requires_grad=False)
   return means, mags
 
+
+class CustomTanhTransform(tT.Transform):
+    domain = pyd.constraints.real
+    codomain = pyd.constraints.interval(-1.0, 1.0)
+    bijective = True
+    sign = +1
+
+    def __init__(self, cache_size=1):
+        super().__init__(cache_size=cache_size)
+
+    @staticmethod
+    def atanh(x):
+        return 0.5 * (x.log1p() - (-x).log1p())
+
+    def __eq__(self, other):
+        return isinstance(other, CustomTanhTransform)
+
+    def _call(self, x):
+        return x.tanh()
+
+    def _inverse(self, y):
+        # We do not clamp to the boundary here as it may degrade the performance of certain algorithms.
+        # one should use `cache_size=1` instead
+        return self.atanh(y)
+
+    def log_abs_det_jacobian(self, x, y):
+        # We use a formula that is more numerically stable, see details in the following link
+        # https://github.com/tensorflow/probability/commit/ef6bb176e0ebd1cf6e25c6b5cecdd2428c22963f#diff-e120f70e92e6741bca649f04fcd907b7
+        return 2.0 * (math.log(2.0) - x - F.softplus(-2.0 * x))
+
+
 class Split(torch.nn.Module):
     """
     models a split in the network. works with convolutional models (not FC).
@@ -232,7 +264,7 @@ class ActorNetwork(nn.Module):
                                                  scale=torch.full_like(mean, 1)), 
                         transforms=tT.ComposeTransform([
                                    tT.AffineTransform(loc=self._action_means, scale=self._action_mags, event_dim=mean.shape[-1]), 
-                                   tT.TanhTransform(),
+                                   CustomTanhTransform(),
                                    tT.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])]))
       #https://www.ccoderun.ca/programming/doxygen/pytorch/classtorch_1_1distributions_1_1transformed__distribution_1_1TransformedDistribution.html
       return a_distribution, a_tanh_mode
