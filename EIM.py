@@ -1845,7 +1845,7 @@ recorder = Recorder(recorder_dict, plot_realtime=plot_realtime, save=plot_save, 
 """Configure EIM"""
 
 config = ConditionalMixtureEIM.get_default_config()
-config.train_epochs = 1000
+config.train_epochs = 5000
 config.num_components = num_components
 
 config.components_net_hidden_layers = [64, 64]
@@ -1868,5 +1868,6 @@ config.dre_batch_size = 1000
 config.dre_hidden_layers = [128, 128, 128]
 
 """Build and Run EIM"""
-model = ConditionalMixtureEIM(config, train_samples=data.train_samples, seed=42 * 7, recorder=recorder, val_samples=data.val_samples)
-model.train_emm()
+if __name__ == "__main__":
+   model = ConditionalMixtureEIM(config, train_samples=data.train_samples, seed=42 * 7, recorder=recorder, val_samples=data.val_samples)
+   model.train_emm()
