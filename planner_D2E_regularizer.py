@@ -727,7 +727,6 @@ class D2EAgent(Agent):
       divergence_name='kl',
       warm_start=2000,
       c_iter=3,
-      transition_iter=10, #number of iterations to update transition ratio distribution
       ensemble_q_lambda=1.0,
       **kwargs):
     self._alpha = alpha
@@ -742,7 +741,6 @@ class D2EAgent(Agent):
     self._EIM_config = EIM_config
     self._warm_start = warm_start
     self._c_iter = c_iter
-    self._transition_iter= transition_iter #new param
     self._ensemble_q_lambda = ensemble_q_lambda
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     super(D2EAgent, self).__init__(**kwargs)
