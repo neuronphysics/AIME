@@ -31,12 +31,14 @@ from torch.testing._internal.common_utils import TestCase
 from collections import Counter
 import torch.distributions as pyd
 import math
-from EIM import ConditionalMixtureEIM
+from ExpectedInformationMaximization import ConditionalMixtureEIM, TrainIterationRecMod, ConfigInitialRecMod, DRERecMod, ComponentUpdateRecMod, WeightUpdateRecMod, Recorder, to_tensor
+from MUJOCORecorder import MujocoData, MujocoModelRecMod 
+import ExpectedInformationMaximization as EIM
 local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-LOG_STD_MIN = torch.tensor(-5, dtype=torch.float64, device=local_device,requires_grad=False)
+LOG_STD_MIN = torch.tensor(-5, dtype=torch.float32, device=local_device,requires_grad=False)
 
-LOG_STD_MAX = torch.tensor(2 , dtype=torch.float64, device=local_device,requires_grad=False)
+LOG_STD_MAX = torch.tensor(2 , dtype=torch.float32, device=local_device,requires_grad=False)
 
 def get_spec_means_mags(spec,device):
   means = (spec.maximum + spec.minimum) / 2.0
@@ -123,7 +125,7 @@ class ActorNetwork(nn.Module):
     self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     self._action_means, self._action_mags = get_spec_means_mags(
         self._action_spec, self.device)
-    
+    self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     self.to(device=self.device)
 
   def to(self, *args, **kwargs):
@@ -383,6 +385,7 @@ class AgentModule(GeneralAgent):
             if not isinstance(param, nn.ReLU):
                vars_+=list(param.parameters())
     return vars_
+  
   @property
   def v_net(self):
     return self._v_net
@@ -462,6 +465,7 @@ class Agent(object):
       update_freq=1,
       update_rate=0.005,
       discount=0.99,
+      env_name='HalfCheetah-v2',      
       train_data=None,
       resume=False, 
       device=None
@@ -477,6 +481,7 @@ class Agent(object):
     self._update_freq = update_freq
     self._update_rate = update_rate
     self._discount = discount
+    self._env_name = env_name    
     self._resume = resume 
     if device is None:
        self.device = torch.device(
@@ -705,8 +710,10 @@ class MaxQSoftPolicy(nn.Module):
     action = utils.gather_nd(actions, gather_indices)
     return action
 #############################################
-################ BRAC Agent ################## 
+################ D2E Agent ################## 
 #############################################
+
+
 gin.clear_config()
 gin.config._REGISTRY.clear()
 @gin.configurable
@@ -758,8 +765,8 @@ class D2EAgent(Agent):
     #################################################################################################################################
     ############ Setting Up Configuration parameters of the EIM model to compute desity ratio of the transition function ############
     #################################################################################################################################
-    self._EIM_config.train_epochs = 20
-    self._EIM_config.num_components = self._latent_spec.shape[1]//2 #number of dimension of latent space
+    self._EIM_config.train_epochs = 25
+    self._EIM_config.num_components = self._latent_spec.shape[0] #number of dimension of latent space
 
     self._EIM_config.components_net_hidden_layers = [30, 30]
     self._EIM_config.components_batch_size = self._latent_spec.shape[0] #is it a correct batch size???
@@ -776,7 +783,7 @@ class D2EAgent(Agent):
     self._EIM_config.dre_reg_loss_fact = 0.0005
     self._EIM_config.dre_early_stopping = True
     self._EIM_config.dre_drop_prob = 0.0
-    self._EIM_config.dre_num_iters =  10
+    self._EIM_config.dre_num_iters =  25
     self._EIM_config.dre_batch_size = self._latent_spec.shape[0] ###???
     self._EIM_config.dre_hidden_layers = [30, 30]
     ########################################################################################################################
@@ -921,6 +928,27 @@ class D2EAgent(Agent):
 
     return loss, info
   
+  def _recorder_EIM(self,data):
+      """configure experiment"""
+      plot_realtime = True
+      plot_save = False    
+      print(f"env: {self._env_name}")
+      """Recording"""
+      recorder_dict = {
+         RecorderKeys.TRAIN_ITER: TrainIterationRecMod(),
+         RecorderKeys.INITIAL: ConfigInitialRecMod(),
+         #RecorderKeys.MODEL: MujocoModelRecMod(data,
+         #                                      self._env_name,
+         #                                      train_samples=data.train_samples,
+         #                                      test_samples=data.test_samples),
+         RecorderKeys.DRE: DRERecMod(data.train_samples),
+         RecorderKeys.COMPONENT_UPDATE: ComponentUpdateRecMod(plot=True, summarize=False)}
+      if self._EIM_config.num_components > 1:
+         recorder_dict[RecorderKeys.WEIGHTS_UPDATE] = WeightUpdateRecMod(plot=True)
+
+
+      return Recorder(recorder_dict, plot_realtime=plot_realtime, save=plot_save, save_path="rec")
+
   def _build_v_loss(self, batch):
     s1  = batch['s1']
     a_b = batch['a1']
@@ -937,18 +965,24 @@ class D2EAgent(Agent):
         s1.to(device=self.device), a_p, a_b.to(device=self.device))
     #########################
     #input_data next_state (s2) and state (s1) 
-    self._EIM_model = ConditionalMixtureEIM(self._EIM_config, train_samples=(s1, s2), seed=torch.initial_seed())
-    EIM_gate_res=0
+    data = MujocoData(s1,s2)
+    self._EIM_model = ConditionalMixtureEIM(self._EIM_config, train_samples=data.train_samples, seed=torch.initial_seed(), recorder=self._recorder_EIM(data), val_samples=data.val_samples)
+    EIM_gate_KL=0
     if self._EIM_model._model.num_components > 1:
        EIM_gate_res =self._EIM_model.update_gating()
-    
+       for i in range(self._EIM_model._model.num_components):
+           EIM_gate_KL=EIM_gate_res[i][1]
     EIM_res = self._EIM_model.update_components()
+    EIM_KL=0 
+    for i in range(len(EIM_res)):
+        EIM_KL+=EIM_res[i][1]
+
     #Equation 20 in Dream to Explore paper
     v_loss = torch.mean(q1_target_ensemble - v_target
         - self._get_alpha()[0] * (div_estimate 
-        + EIM_res + EIM_gate_res))
+        + EIM_KL + EIM_gate_KL))
     v_w_norm = self._get_v_weight_norm()
-    norm_loss = self._weight_decays[4] * v_w_norm
+    norm_loss = self._weight_decays[3] * v_w_norm
     loss = v_loss + norm_loss
 
     info = collections.OrderedDict()
@@ -1050,8 +1084,14 @@ class D2EAgent(Agent):
     self._q_optimizer.step()
     #Update critic network parameter
     self._agent_module.c_net.train()
+    self._c_optimizer.zero_grad()
+    critic_loss,_= self._build_c_loss( batch)
+    critic_loss.backward()
+    self._c_optimizer.step()
     self._extra_c_step( batch)
+    #train expected information maximization to compute transition ratio
     self._EIM_model.train_emm()
+    
     if self._train_alpha:
        self._a_optimizer.zero_grad()
        a_loss,a_info = self._build_a_loss( batch)
@@ -1297,6 +1337,7 @@ class AgentConfig(object):
         update_rate=agent_flags.update_rate,
         update_freq=agent_flags.update_freq,
         discount=agent_flags.discount,
+        env_name=agent_flags.env_name,
         train_data=agent_flags.train_data,
         )
     agent_args.modules = self._get_modules()
