@@ -20,7 +20,7 @@ import argparse
 import pickle
 from typing import Callable
 from PIL import Image
-from planner_behavior_regularizer_actor_critic import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
+from planner_D2E_regularizer import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
 import dill
 import nest
 #####################################
