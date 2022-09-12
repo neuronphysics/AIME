@@ -8,6 +8,7 @@ from dm_control.mujoco.wrapper.mjbindings import mjlib
 import torch
 import torch.utils.data as data
 import scipy.interpolate as inter
+import re
 # PyMJCF
 from dm_control import mjcf
 
@@ -22,6 +23,7 @@ from dm_control.composer.variation import noises
 from dm_control.locomotion.arenas import floors
 
 # Control Suite
+import dm_control
 from dm_control import suite
 
 # Run through corridor example
@@ -45,7 +47,7 @@ import glob
 import matplotlib
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
-from EIM import Colors, ModelRecModWithModelVis
+from ExpectedInformationMaximization import Colors, ModelRecModWithModelVis
 import PIL.Image
 from dm_control import mujoco
 from dm_control.rl import control
@@ -55,7 +57,8 @@ from dm_control.utils import containers
 from dm_control.utils import rewards
 from dm_control.utils import io as resources
 from IPython.display import HTML
-import re
+
+
 def substringFinder(words):
     words.sort(key=lambda x:len(x))
     search = words.pop(0)
@@ -72,12 +75,6 @@ def substringFinder(words):
 
 
 
-# Use svg backend for figure rendering
-fig, ax = plt.subplots()
-image_format = 'svg' # e.g .png, .svg, etc.
-image_name = 'myimage.svg'
-
-fig.savefig(image_name, format=image_format, dpi=1200)
 
 
 # Font sizes
@@ -92,6 +89,8 @@ plt.rc('ytick', labelsize=SMALL_SIZE)    # fontsize of the tick labels
 plt.rc('legend', fontsize=SMALL_SIZE)    # legend fontsize
 plt.rc('figure', titlesize=BIGGER_SIZE)  # fontsize of the figure title
 
+
+##############################  Start  ###################################
 def display_video(frames, framerate=30, return_anim=False, filename=None):
     #https://github.com/raymond-van/planet/blob/ebe8632967ac9f638b78d6e4fc822e0740b96c86/utils.py
     height, width, _ = frames[0].shape
@@ -220,7 +219,7 @@ class MujocoDataset(data.Dataset):
     def __init__(self, observation, next_observation):
         super(MujocoDataset, self).__init__()
         self.dataset1 = observation
-        self.dataset2 =next_observation
+        self.dataset2 = next_observation
 
     def __len__(self):
         return len(self.dataset1)
@@ -229,10 +228,24 @@ class MujocoDataset(data.Dataset):
         obs1=self.dataset1[index]
         obs2=self.dataset2[index]
         return obs1, obs2
+
+def shufflerow(tensor1, tensor2, axis):
+    row_perm = torch.rand(tensor1.shape[:axis+1]).argsort(axis)  # get permutation indices
+    for _ in range(tensor1.ndim-axis-1): row_perm.unsqueeze_(-1)
+    row_perm = row_perm.repeat(*[1 for _ in range(axis+1)], *(tensor1.shape[axis+1:]))  # reformat this for the gather operation
+    return tensor1.gather(axis, row_perm),tensor2.gather(axis, row_perm)
+
+def split_data(data,valid_portion,dim):
+    indices=torch.randperm(data[0].shape[dim])
+    valid_size=int(len(indices)*valid_portion)
+    train_size=len(indices)-valid_size
+    train_data=(data[0][:train_size,:],data[1][:train_size,:])
+    valid_data=(data[0][train_size:,:],data[1][train_size:,:])
+    return train_data, valid_data 
     
 class MujocoData:
 
-    def __init__(self, observation, next_observation, num_obstacles=2, samples_per_context=None, seed=0):
+    def __init__(self, observation, next_observation, num_obstacles=2, train_valid_split_portion=7/8, samples_per_context=None, seed=0):
         self.data =(observation, next_observation)
         self._num_obstacles = num_obstacles
         self._rng = np.random.RandomState(seed)
@@ -243,9 +256,16 @@ class MujocoData:
            self._samples_per_context = samples_per_context
         else:
           self._samples_per_context = observation.shape[0]//2
-        mujoco_dataset=MujocoDataset(observation, next_observation)
-        self.raw_train_samples =data.DataLoader(mujoco_dataset, batch_size=observation.shape[0], shuffle=True)
-        self.raw_test_samples = data.DataLoader(mujoco_dataset, batch_size=observation.shape[0], shuffle=True)
+        #mujoco_dataset=MujocoDataset(observation, next_observation)
+        #self.train_samples =data.DataLoader(mujoco_dataset, batch_size=1, shuffle=True)
+        training_samples, validation_samples=split_data((observation,next_observation),train_valid_split_portion,0)
+
+        self.train_samples = training_samples
+        #self.test_samples = data.DataLoader(mujoco_dataset, batch_size=1, shuffle=True)
+        self.test_samples = shufflerow(training_samples[0], training_samples[1], 0)
+
+        self.val_samples = validation_samples
+        
     def get_spline(self, x):
         x_ext = np.zeros(2 * self._num_obstacles + 4, dtype=x.dtype)
         x_ext[0] = 0.0
@@ -257,27 +277,27 @@ class MujocoData:
         return inter.interp1d(x_ext[::2], x_ext[1::2], kind=k)
 
 
-
 class MujocoModelRecMod(ModelRecModWithModelVis):
       def __init__(self, mujoco_data, env_name, train_samples, test_samples, true_log_density=None, eval_fn=None,
-                 test_log_iters=50, save_log_iters=50):
+                 test_log_iters=50, save_log_iters=50,device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")):
         super().__init__( train_samples, test_samples, true_log_density, eval_fn, test_log_iters, save_log_iters)
-        self._data = mujoco_data
+        self._data = mujoco_data.data
         self._env_name= env_name
-        
+        self._test_samples = test_samples
+        self.device = device
+        self.environment=None
+        """Returns a tuple containing the model XML string and a dict of assets."""
+        root_dir = os.path.dirname(dm_control.__file__)+'/suite/'
+        #root_dir = '/usr/local/lib/python3.7/dist-packages/dm_control/suite/'
+        for files in glob.glob(os.path.join(root_dir, '*.xml')):
+            base=os.path.basename(files)
+            filename=os.path.splitext(base)[0]
+            if filename in env_name.split('-')[0].lower():
+               self.environment=files
+               #print(f" deepmind control env: {self.environment}")      
       def get_model_and_assets(self):
-          """Returns a tuple containing the model XML string and a dict of assets."""
-          root_dir = '/home/memole/dm_control/lib/python3.8/site-packages/dm_control/suite/'
-          self.environment=dict()
-          for files in glob.glob(os.path.join(root_dir, '*.xml')):
-              head, tail = os.path.split(files)
-              x=substringFinder([self._env_name.lower(), tail])
-              if not isinstance(x, bool):
-                 if len(x)>=3:
-                    self.environment[x]=files
-          if len(self.environment)>0:
-              d = max(self.environment, key=len)
-              xml = resources.GetResource(self.environment[d])
+          if self.environment is not None:
+              xml = resources.GetResource(self.environment)
               return xml, common.ASSETS
           else: 
              raise ValueError('There is no environment here.')
@@ -310,7 +330,7 @@ class MujocoModelRecMod(ModelRecModWithModelVis):
             x_plt = np.arange(0, 1, 1e-2)
             color = Colors()
             self.physics = mujoco.Physics.from_xml_string(*self.get_model_and_assets())
-            contexts =[]
+            objects  =[]
             pixels   =[]
             # Visualize the joint axis.
             scene_option = mujoco.wrapper.core.MjvOption()
@@ -320,34 +340,43 @@ class MujocoModelRecMod(ModelRecModWithModelVis):
                """Returns a copy of the generalized positions (system configuration)."""
                #position=physics.data.qpos[:]
                pos_size = self.physics.data.qpos[:].shape[0]
+               print(f"size of data {self.physics.data.qpos[:].shape}, {observation.shape}")
                """Returns a copy of the generalized velocities."""
                #velocity=physics.data.qvel[:]
                #observation = np.concatenate([position, velocity]).ravel()
-               self.physics.data.qpos[:], self.physics.data.qvel[:] = observation[:pos_size, ...], observation[pos_size:, ...]
+               position=self.physics.named.data.geom_xpos.copy()
+               print(f"size of position {position.shape}")
+               self.physics.named.data.geom_xpos[:] = observation[:pos_size, ...]
                pixels.append(self.physics.render(scene_option=scene_option, camera_id=1, segmentation=True))
                height, width, _ = pixels[0].shape
                """Observations consist of an OrderedDict containing one or more NumPy arrays"""
-               contexts.append( self.gt_keypoints(height, width))
-               self.physics.data.qpos[:], self.physics.data.qvel[:] = next_observation[:pos_size, ...], next_observation[pos_size:, ...]
+               objects.append( self.gt_keypoints(height, width))
+               self.physics.named.data.geom_xpos[:] = next_observation[:pos_size, ...]
                pixels.append(self.physics.render(scene_option=scene_option, camera_id=1, segmentation=True))
-               contexts.append( self.gt_keypoints(height, width))
+               objects.append( self.gt_keypoints(height, width))
             fig, ax = plt.subplots(1, 1)
             PIL.Image.fromarray(pixels[0][:,:,0])
+            if isinstance(self._test_samples,tuple):
+               contexts=tuple(item.to(device=self.device, dtype=torch.float32) for item in self._test_samples)
+            else:
+               contexts = self._test_samples.to(device=self.device,dtype=torch.float32)
             for i in range(len(contexts)):
-                context= contexts[i,i+1]
+                context= contexts[i]
                 lines=[]
                 for k, c in enumerate(model.components):
+                    #needs to be debugged here 
                     m = (c.mean(context)[0] + 1) / 2
+                    print(m.shape)
                     cov = c.covar(context)[0]
-                    mx, my = m[::2], m[1::2]
+                    mx, my = m[::2].cpu().detach().numpy(), m[1::2].cpu().detach().numpy()
                     plt.scatter(200 * mx, 100 * my, c=color(k))
                     for j in range(mx.shape[0]):
                        mean = np.array([mx[j], my[j]])
-                       cov_j = cov[2 * j: 2 * (j + 1), 2 * j: 2 * (j + 1)]
+                       cov_j = cov[2 * j: 2 * (j + 1), 2 * j: 2 * (j + 1)].cpu().detach().numpy()
                        plt_cx, plt_cy = self._draw_2d_covariance(mean, cov_j, 1, return_raw=True)
                        plt.plot(200 * plt_cx, 100 * plt_cy, c=color(k), linestyle="dotted", linewidth=2)
                     for j in range(2):
-                        s = np.array(c.sample(contexts[i:i + 1]))
+                        s = np.array(c.sample(contexts[i].cpu().detach().numpy()))
                         spline = self._data.get_spline(s[0])
                         l, = plt.plot(200 * x_plt, 100 * spline(x_plt), c=color(k), linewidth=1)
      
@@ -359,5 +388,3 @@ class MujocoModelRecMod(ModelRecModWithModelVis):
                 plt.gca().set_xlim(0, 200)
                 plt.gca().set_ylim(0, 100)
             plt.savefig("EIM_out_imgs/" + re.sub(r"\s+", '-', title) + ".png")
-
-
