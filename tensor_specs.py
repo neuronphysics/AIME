@@ -234,7 +234,7 @@ def sample_bounded_spec(spec, seed=None, outer_dims=None):
       spec shape before sampling.
   Returns:
     A Tensor sample of the requested spec.
-    #based onn https://github.com/PeterJaq/optical-film-maker/blob/04db98357ed3ba7b0830b7e48fb3ddb4c6dc9194/agents/tf_agents/specs/tensor_spec.py
+    #based on https://github.com/tensorflow/agents/blob/master/tf_agents/specs/tensor_spec.py
   """
   minval = spec.minimum
   maxval = spec.maximum
@@ -279,17 +279,26 @@ def sample_bounded_spec(spec, seed=None, outer_dims=None):
     # tf.random_uniform is upper bound exclusive, +1 to fix the sampling
     # behavior.
     # However +1 will cause overflow, in such cases we use the original maxval.
-
+    """
     shape = torch.as_tensor(spec.shape, dtype=torch.int32)
-    full_shape = torch.cat((outer_dims, shape), dim=0)
+    full_shape = torch.cat((outer_dims, shape), dim=1)
     g = torch.Generator()
     if not seed is None:
       g.manual_seed(seed)
     else:
       g.manual_seed(0) 
     
-    # print(f"type {type(minval)}")
     res=torch.tensor(full_shape,dtype=sampling_dtype).uniform_(float(minval), float(maxval))
+    """
+    shape = torch.as_tensor(spec.shape, dtype=torch.int32)
+    g = torch.Generator()
+    if not seed is None:
+      g.manual_seed(seed)
+    else:
+      g.manual_seed(0) 
+    
+    dist = torch.distributions.uniform.Uniform(float(minval), float(maxval))
+    res=dist.sample(shape).to(dtype=sampling_dtype)
 
     if is_uint8:
      res =torch.tensor(res, dtype=dtype)

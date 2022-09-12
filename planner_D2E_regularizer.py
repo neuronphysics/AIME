@@ -34,7 +34,6 @@ import math
 from ExpectedInformationMaximization import ConditionalMixtureEIM, TrainIterationRecMod, ConfigInitialRecMod, DRERecMod, ComponentUpdateRecMod, WeightUpdateRecMod, Recorder, to_tensor
 from MUJOCORecorder import MujocoData, MujocoModelRecMod 
 import ExpectedInformationMaximization as EIM
-os.environ['DISABLE_MUJOCO_RENDERING'] = '1'
 from dm_control import suite
 import dm_control
 local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -125,10 +124,11 @@ class ActorNetwork(nn.Module):
         self._layers.append(nn.ReLU())
     output_layer = nn.Linear(hidden_size,self._action_spec.shape[0] * 2)
     self._layers.append(output_layer)
+
     self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     self._action_means, self._action_mags = get_spec_means_mags(
         self._action_spec, self.device)
-    self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    
     self.to(device=self.device)
 
   def to(self, *args, **kwargs):
@@ -161,8 +161,9 @@ class ActorNetwork(nn.Module):
                         base_distribution=Normal(loc=torch.full_like(mean, 0).to(device=self.device), 
                                                  scale=torch.full_like(mean, 1).to(device=self.device)), 
                         transforms=tT.ComposeTransform([
-                                   tT.AffineTransform(loc=self._action_means, scale=self._action_mags, event_dim=mean.shape[-1]), 
-                                   TanhTransform(),
+                                   tT.AffineTransform(loc=self._action_means.to(device=self.device), scale=self._action_mags.to(device=self.device), event_dim=mean.shape[-1]), 
+                                   tT.TanhTransform(cache_size=1),
+                                   #TanhTransform(),
                                    tT.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])]))
       #https://www.ccoderun.ca/programming/doxygen/pytorch/classtorch_1_1distributions_1_1transformed__distribution_1_1TransformedDistribution.html
       return a_distribution, a_tanh_mode
@@ -213,13 +214,13 @@ class CriticNetwork(nn.Module):
           else:
               self._layers.append(nn.Linear(hidden_size, hidden_size))
           self._layers.append(nn.ReLU())
-      output_layer = nn.Linear(hidden_size,1)
+      output_layer = nn.Linear(hidden_size, 1)
       self._layers.append(output_layer)
       self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
       self.to(device=self.device)
 
     def forward(self, state,action):
-        hidden = torch.cat([state.to(device=self.device),action.to(device=self.device)],dim=-1)
+        hidden = torch.cat([state.to(device=self.device), action.to(device=self.device)], dim=-1)
         for l in self._layers:
             hidden = l(hidden)
         return hidden
@@ -635,7 +636,7 @@ class ContinuousRandomPolicy(nn.Module):
   def __call__(self, observation, state=()):
     action = tensor_specs.sample_bounded_spec(
         self._action_spec, 
-        #outer_dims=[observation.shape[0]]
+        outer_dims=[observation.shape[0]]
         )
     return action, state
 
@@ -1284,7 +1285,9 @@ def eval_policy_episodes(env, policy, n_episodes):
     time_step = env.reset()
     total_rewards = 0.0
     while not time_step.is_last():
+      print(f"observation size: {time_step.observation.shape}")
       action = policy(torch.from_numpy(time_step.observation))[0]
+      print(f"action size in eval policy: {action.shape}")
       if action.ndim<1:
           time_step= env.step(action.unsqueeze(0).detach().cpu()) 
       else:  
