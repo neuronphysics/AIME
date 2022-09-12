@@ -43,6 +43,7 @@ import os
 import itertools
 import numpy as np
 import glob
+os.environ['DISABLE_MUJOCO_RENDERING'] = '1'
 # Graphics-related
 import matplotlib
 import matplotlib.animation as animation

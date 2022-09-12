@@ -34,6 +34,9 @@ import math
 from ExpectedInformationMaximization import ConditionalMixtureEIM, TrainIterationRecMod, ConfigInitialRecMod, DRERecMod, ComponentUpdateRecMod, WeightUpdateRecMod, Recorder, to_tensor
 from MUJOCORecorder import MujocoData, MujocoModelRecMod 
 import ExpectedInformationMaximization as EIM
+os.environ['DISABLE_MUJOCO_RENDERING'] = '1'
+from dm_control import suite
+import dm_control
 local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 LOG_STD_MIN = torch.tensor(-5, dtype=torch.float32, device=local_device,requires_grad=False)
