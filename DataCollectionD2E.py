@@ -259,7 +259,7 @@ def dir_path(path):
 
 
 parser = argparse.ArgumentParser(description='DreamToExplore')
-parser.add_argument('--root_offlinerl_dir', type=dir_path, default='/home/memole/TEST/AIME/start-with-brac/offlinerl', help='Root directory for saving data')
+parser.add_argument('--root_offlinerl_dir', type=dir_path, default='/home/memole/TEST/AIME/start-with-brac/start-with-brac/offlinerl', help='Root directory for saving data')
 parser.add_argument('--sub_offlinerl_dir', type=str, default=None, help='sub directory for saving data.')
 parser.add_argument('--test_srcdir', type=str, default=None, help='directory for saving test data.')
 parser.add_argument('--env_name', type=str, default='HalfCheetah-v2',help = 'env name.')
@@ -274,8 +274,8 @@ parser.add_argument("--gin_file", type=str, default=[], nargs='*', help = 'Paths
 
 parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help = 'Gin binding parameters.')
 args = parser.parse_args()
-if not os.path.exists("/home/memole/TEST/AIME/start-with-brac/offlinerl/HalfCheetah-v2/example/0"):
-   os.makedirs("/home/memole/TEST/AIME/start-with-brac/offlinerl/HalfCheetah-v2/example/0")
+if not os.path.exists("/home/memole/TEST/AIME/start-with-brac/start-with-brac/offlinerl/HalfCheetah-v2/example/0"):
+   os.makedirs("/home/memole/TEST/AIME/start-with-brac/offlinerl/start-with-brac/HalfCheetah-v2/example/0")
 def get_sample_counts(n, distr):
   """Provides size of each sub-dataset based on desired distribution."""
   distr = torch.tensor(distr)
@@ -391,7 +391,7 @@ def main(args):
 
 def collect_gym_data(args):
     args.sub_offlinerl_dir = '0'
-    args.env_name = 'Pendulum-v0'
+    #args.env_name = 'HalfCheetah-v2'
     args.data_name = 'example'
     args.config_file = 'D2E_example'
     data_dir = 'testdata'
