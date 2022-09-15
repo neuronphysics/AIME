@@ -796,13 +796,13 @@ class D2EAgent(Agent):
     self._EIM_config.num_components = self._latent_spec.shape[0] #number of dimension of latent space
 
     self._EIM_config.components_net_hidden_layers = [30, 30]
-    self._EIM_config.components_batch_size = self._latent_spec.shape[0] #is it a correct batch size???
+    self._EIM_config.components_batch_size = self._batch_size #is it a correct batch size???
     self._EIM_config.components_num_epochs = 10
     self._EIM_config.components_net_reg_loss_fact = 0.0
     self._EIM_config.components_net_drop_prob = 0.0
 
     self._EIM_config.gating_net_hidden_layers = [30, 30]
-    self._EIM_config.gating_batch_size = self._latent_spec.shape[0] #???
+    self._EIM_config.gating_batch_size = self._batch_size #???
     self._EIM_config.gating_num_epochs = 10
     self._EIM_config.gating_net_reg_loss_fact = 0.0
     self._EIM_config.gating_net_drop_prob = 0.0
@@ -811,7 +811,7 @@ class D2EAgent(Agent):
     self._EIM_config.dre_early_stopping = True
     self._EIM_config.dre_drop_prob = 0.0
     self._EIM_config.dre_num_iters =  25
-    self._EIM_config.dre_batch_size = self._latent_spec.shape[0] ###???
+    self._EIM_config.dre_batch_size = self._batch_size ###???
     self._EIM_config.dre_hidden_layers = [30, 30]
     ########################################################################################################################
     ##########################################   END of EIM cofiguration SETUP    ##########################################
@@ -999,7 +999,7 @@ class D2EAgent(Agent):
        EIM_gate_res =self._EIM_model.update_gating()
        print(f"EIM gate residual {EIM_gate_res}")
        for i in range(self._EIM_model._model.num_components):
-           EIM_gate_KL=EIM_gate_res[i][1]
+           EIM_gate_KL=EIM_gate_res[1][i]
     EIM_res = self._EIM_model.update_components()
     EIM_KL=0 
     for i in range(len(EIM_res)):
