@@ -31,7 +31,7 @@ from torch.testing._internal.common_utils import TestCase
 from collections import Counter
 import torch.distributions as pyd
 import math
-
+from torch.distributions import Distribution, Independent, MultivariateNormal
 local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 LOG_STD_MIN = torch.tensor(-5, dtype=torch.float64, device=local_device,requires_grad=False)
@@ -148,9 +148,7 @@ class ActorNetwork(nn.Module):
       log_std = torch.tanh(log_std).to(device=self.device)
       log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
       std = torch.exp(log_std)
-      #base_distribution = torch.normal(0.0, 1.0)
-      #transforms = torch.distributions.transforms.ComposeTransform([torch.distributions.transforms.AffineTransform(loc=self._action_means, scale=self._action_mag, event_dim=mean.shape[-1]), torch.nn.Tanh(),torch.distributions.transforms.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])])
-      #a_distribution = torch.distributions.transformed_distribution.TransformedDistribution(base_distribution, transforms)
+      """
       a_distribution = TransformedDistribution(
                         base_distribution=Normal(loc=torch.full_like(mean, 0).to(device=self.device), 
                                                  scale=torch.full_like(mean, 1).to(device=self.device)), 
@@ -158,6 +156,18 @@ class ActorNetwork(nn.Module):
                                    tT.AffineTransform(loc=self._action_means, scale=self._action_mags, event_dim=mean.shape[-1]), 
                                    TanhTransform(),
                                    tT.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])]))
+      """
+      a_distribution= TransformedDistribution(
+                                    MultivariateNormal(torch.full_like(mean, 0).to(device=self.device), torch.diag(torch.full_like(mean, 1).to(device=self.device))),
+                                          tT.ComposeTransform([
+                                               tT.AffineTransform(loc=self._action_means.to(device=self.device), scale=self._action_mags.to(device=self.device),event_dim=1),
+                                               #tT.TanhTransform(cache_size=0),
+                                               TanhTransform(),
+                                               tT.AffineTransform(loc=mean, scale=std, event_dim= 1 )]))
+      
+
+      a_distribution.base_dist._batch_shape=torch.Size([1])
+      
       #https://www.ccoderun.ca/programming/doxygen/pytorch/classtorch_1_1distributions_1_1transformed__distribution_1_1TransformedDistribution.html
       return a_distribution, a_tanh_mode
 
@@ -591,6 +601,7 @@ class GaussianRandomSoftPolicy(nn.Module):
 
   def __call__(self, observation, state=()):
     action = self._a_network(observation.to(device=self.device))[1]
+    action = action.squeeze()
     noise = torch.normal(mean=torch.zeros(action.shape), std=self._std).to(device=self.device)
     action = action + noise
     spec = self._a_network.action_spec

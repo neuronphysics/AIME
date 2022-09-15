@@ -25,8 +25,10 @@ import utils_planner as utils
 import sys
 import pickle
 import dill
-
-gin.clear_config()
+import gin.torch.external_configurables
+from typing import Dict, Any
+config: Dict[str, Any] = {}
+#gin.clear_config()
 def get_datetime():
   now = datetime.datetime.now().isoformat()
   now = re.sub(r'\D', '', now)[:-6]
@@ -195,17 +197,21 @@ def train_eval_offline(
   return torch.cat([x.unsqueeze(0) for x in eval_results[0][1:]], dim=-1)
 
 ##############################
+if not os.path.exists(os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/learn')):
+  os.makedirs(os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/learn'))
+else:
+  pass
 ###train_offline.py
-parser = argparse.ArgumentParser(description='DreamToExplore')
-parser.add_argument('--data_root_offlinerl_dir', type=dir_path, default='/home/memole/TEST/AIME/start-with-brac/offlinerl',
+parser = argparse.ArgumentParser(description='DreamToExplore', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('--data_root_offlinerl_dir', type=dir_path, default=os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl'),
                      help='Root directory for data.')
 parser.add_argument('--data_sub_offlinerl_dir',type=str, default=None, help= '')
-parser.add_argument('--test_srcdir', type=str, default='/home/memole/TEST/AIME/start-with-brac/', help='directory for saving test data.')
+parser.add_argument('--test_srcdir', type=str, default='/home/memole/TEST/AIME/start-with-brac/start-with-brac/', help='directory for saving test data.')
 parser.add_argument('--data_name', type=str, default='eps1',help= 'data name.')
 parser.add_argument('--data_file_name', type=str, default='',help= 'data checkpoint file name.')
 
 # Flags for offline training.
-parser.add_argument('--root_dir',type=dir_path, default= os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/offlinerl/learn'),
+parser.add_argument('--root_dir',type=dir_path, default= os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/learn'),
                     help='Root directory for writing logs/summaries/checkpoints.')
 parser.add_argument('--sub_dir', type=str, default='0', help='')
 
@@ -219,8 +225,9 @@ parser.add_argument("--gin_file", type=str, default=[], nargs='*', help = 'Paths
 
 parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help = 'Gin binding parameters.')
 args = parser.parse_args()
-
-
+#print(args)
+config.update(vars(parser.parse_args()))
+logging.info("Parsed %i arguments.", len(config))
 
 def main(args):
   logging.set_verbosity(logging.INFO)
@@ -270,7 +277,7 @@ def Train_offline_D2E(args):
     #args.test_srcdir = os.getcwd()
     args.data_root_offlinerl_dir = os.path.join(args.test_srcdir, data_dir)
     args.data_sub_offlinerl_dir = '0'
-    args.env_name = 'Pendulum-v0'
+    #args.env_name = 'Pendulum-v0'
     args.data_name = 'example'
     args.agent_name = 'DreamToExplore'
     args.gin_bindings = [
@@ -284,7 +291,8 @@ def Train_offline_D2E(args):
 
 if __name__ == "__main__":
   args = parser.parse_args(sys.argv[1:])
-  gin.parse_config_files_and_bindings([], args.gin_bindings,finalize_config=False, skip_unknown=True, print_includes_and_imports=True)
+  #print(' '.join(f'{k}={v}' for k, v in vars(args).items()))
+  #gin.parse_config_files_and_bindings(args.gin_file, args.gin_bindings)
   Train_offline_D2E(args)
-  gin.clear_config()
-  gin.config._REGISTRY.clear()
+  #gin.clear_config()
+  #gin.config._REGISTRY.clear()

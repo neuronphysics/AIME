@@ -28,10 +28,11 @@ import time
 import alf_gym_wrapper
 import importlib  
 from torch.testing._internal.common_utils import TestCase
+from torch.distributions import Distribution, Independent, MultivariateNormal
 from collections import Counter
 import torch.distributions as pyd
 import math
-from ExpectedInformationMaximization import ConditionalMixtureEIM, TrainIterationRecMod, ConfigInitialRecMod, DRERecMod, ComponentUpdateRecMod, WeightUpdateRecMod, Recorder, to_tensor
+from ExpectedInformationMaximization import ConditionalMixtureEIM, RecorderKeys, TrainIterationRecMod, ConfigInitialRecMod, DRERecMod, ComponentUpdateRecMod, WeightUpdateRecMod, Recorder, to_tensor
 from MUJOCORecorder import MujocoData, MujocoModelRecMod 
 import ExpectedInformationMaximization as EIM
 from dm_control import suite
@@ -154,17 +155,38 @@ class ActorNetwork(nn.Module):
       log_std = torch.tanh(log_std).to(device=self.device)
       log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
       std = torch.exp(log_std)
-      #base_distribution = torch.normal(0.0, 1.0)
-      #transforms = torch.distributions.transforms.ComposeTransform([torch.distributions.transforms.AffineTransform(loc=self._action_means, scale=self._action_mag, event_dim=mean.shape[-1]), torch.nn.Tanh(),torch.distributions.transforms.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])])
-      #a_distribution = torch.distributions.transformed_distribution.TransformedDistribution(base_distribution, transforms)
+      """
       a_distribution = TransformedDistribution(
                         base_distribution=Normal(loc=torch.full_like(mean, 0).to(device=self.device), 
                                                  scale=torch.full_like(mean, 1).to(device=self.device)), 
                         transforms=tT.ComposeTransform([
                                    tT.AffineTransform(loc=self._action_means.to(device=self.device), scale=self._action_mags.to(device=self.device), event_dim=mean.shape[-1]), 
-                                   tT.TanhTransform(cache_size=1),
-                                   #TanhTransform(),
+                                   TanhTransform(),
                                    tT.AffineTransform(loc=mean, scale=std, event_dim=mean.shape[-1])]))
+      """
+      #print(f"size of mean with batch : {mean.shape}")
+      if mean.ndim>1:
+          mvn = MultivariateNormal(torch.full_like(mean, 0).to(device=self.device), torch.diag_embed(torch.full_like(mean, 1).to(device=self.device)))
+          mvn._batch_shape=torch.Size([mean.shape[0]])
+          #print(mvn.batch_shape, mvn.event_shape)
+          a_distribution= TransformedDistribution(
+                                          mvn,
+                                          tT.ComposeTransform([
+                                          tT.AffineTransform(loc=self._action_means.to(device=self.device), scale=self._action_mags.to(device=self.device),event_dim=2),
+                                          TanhTransform(),
+                                          tT.AffineTransform(loc=mean, scale=std, event_dim= 2 )]))
+      else:
+          mvn = MultivariateNormal(torch.full_like(mean, 0).to(device=self.device), torch.diag(torch.full_like(mean, 1).to(device=self.device)))
+          mvn._batch_shape=torch.Size([1])
+          a_distribution= TransformedDistribution(
+                                          mvn,
+                                          tT.ComposeTransform([
+                                          tT.AffineTransform(loc=self._action_means.to(device=self.device), scale=self._action_mags.to(device=self.device),event_dim=1),
+                                          TanhTransform(),
+                                          tT.AffineTransform(loc=mean, scale=std, event_dim= 1 )]))
+      
+
+      #a_distribution.base_dist._batch_shape=torch.Size([1])
       #https://www.ccoderun.ca/programming/doxygen/pytorch/classtorch_1_1distributions_1_1transformed__distribution_1_1TransformedDistribution.html
       return a_distribution, a_tanh_mode
 
@@ -654,6 +676,7 @@ class GaussianRandomSoftPolicy(nn.Module):
 
   def __call__(self, observation, state=()):
     action = self._a_network(observation.to(device=self.device))[1]
+    action=action.squeeze()
     noise = torch.normal(mean=torch.zeros(action.shape), std=self._std).to(device=self.device)
     action = action + noise
     spec = self._a_network.action_spec
@@ -974,6 +997,7 @@ class D2EAgent(Agent):
     EIM_gate_KL=0
     if self._EIM_model._model.num_components > 1:
        EIM_gate_res =self._EIM_model.update_gating()
+       print(f"EIM gate residual {EIM_gate_res}")
        for i in range(self._EIM_model._model.num_components):
            EIM_gate_KL=EIM_gate_res[i][1]
     EIM_res = self._EIM_model.update_components()
@@ -1285,9 +1309,7 @@ def eval_policy_episodes(env, policy, n_episodes):
     time_step = env.reset()
     total_rewards = 0.0
     while not time_step.is_last():
-      print(f"observation size: {time_step.observation.shape}")
       action = policy(torch.from_numpy(time_step.observation))[0]
-      print(f"action size in eval policy: {action.shape}")
       if action.ndim<1:
           time_step= env.step(action.unsqueeze(0).detach().cpu()) 
       else:  
