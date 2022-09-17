@@ -997,9 +997,8 @@ class D2EAgent(Agent):
     EIM_gate_KL=0
     if self._EIM_model._model.num_components > 1:
        EIM_gate_res =self._EIM_model.update_gating()
-       print(f"EIM gate residual {EIM_gate_res}")
-       for i in range(self._EIM_model._model.num_components):
-           EIM_gate_KL=EIM_gate_res[1][i]
+       print(f"EIM gate residual {EIM_gate_res[1]}")
+       EIM_gate_KL=EIM_gate_res[1]
     EIM_res = self._EIM_model.update_components()
     EIM_KL=0 
     for i in range(len(EIM_res)):
@@ -1079,7 +1078,7 @@ class D2EAgent(Agent):
     self._q_optimizer = torch.optim.Adam(self._get_q_vars(),lr=opts[0][0], betas=(opts[0][1],opts[0][2]), weight_decay=self._weight_decays[0])
     self._p_optimizer = torch.optim.Adam(self._get_p_vars(),lr=opts[1][0], betas=(opts[1][1],opts[1][2]), weight_decay=self._weight_decays[1])
     self._c_optimizer = torch.optim.Adam(self._get_c_vars(),lr=opts[2][0], betas=(opts[2][1],opts[2][2]), weight_decay=self._weight_decays[2])
-    self._c_optimizer = torch.optim.Adam(self._get_v_vars(),lr=opts[3][0], betas=(opts[3][1],opts[3][2]), weight_decay=self._weight_decays[3])
+    self._v_optimizer = torch.optim.Adam(self._get_v_vars(),lr=opts[3][0], betas=(opts[3][1],opts[3][2]), weight_decay=self._weight_decays[3])
     self._a_optimizer = torch.optim.Adam(self._a_vars, lr=opts[4][0], betas=(opts[4][1],opts[4][2]))
     self._ae_optimizer = torch.optim.Adam(self._ae_vars, lr=opts[4][0], betas=(opts[4][1],opts[4][2]))
 
