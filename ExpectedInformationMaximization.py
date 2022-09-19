@@ -1492,6 +1492,7 @@ class ModelRecMod(RecorderModule):
             plt.xlim((0, self._num_iters))
         plt.tight_layout()
         plt.savefig("EIM_out_imgs/train_log_likelihood.png")
+        plt.close()
 
     def finalize(self):
         if self._save:
@@ -1592,6 +1593,7 @@ class ObstacleModelRecMod(ModelRecModWithModelVis):
             plt.gca().set_xlim(0, 200)
             plt.gca().set_ylim(0, 100)
         plt.savefig("EIM_out_imgs/" + re.sub(r"\s+", '-', title) + ".png")
+        plt.close()
 
 
 def to_numpy(x):
@@ -1669,6 +1671,7 @@ class ComponentUpdateRecMod(RecorderModule):
         plt.xlim(0, self._num_iters)
         plt.tight_layout()
         plt.savefig("EIM_out_imgs/component_update_plot.png")
+        plt.close()
 
     @property
     def logger_name(self):
@@ -1717,6 +1720,7 @@ class WeightUpdateRecMod(RecorderModule):
         plt.xlim(0, self._num_iters)
         plt.tight_layout()
         plt.savefig("EIM_out_imgs/weights_expected_kl_entropy.png")
+        plt.close()
 
     @property
     def logger_name(self):
@@ -1823,6 +1827,7 @@ class DRERecMod(RecorderModule):
             plt.hist(err, density=True, bins=25)
         plt.tight_layout()
         plt.savefig("EIM_out_imgs/dre_plot_hist.png")
+        plt.close()
 
     def _plot(self):
         self._subplot(1, "Estimated I-Projection", self._estm_ikl)
@@ -1836,6 +1841,7 @@ class DRERecMod(RecorderModule):
                 self._subplot(5, "DRE RMSE", self._dre_rmse[i])
         plt.tight_layout()
         plt.savefig("EIM_out_imgs/dre_plot.png")
+        plt.close()
 
     def get_last_rec(self):
         lr = {"steps": self._steps[-1], "estimated_ikl": self._estm_ikl[-1], "dre_loss": self._loss[-1],

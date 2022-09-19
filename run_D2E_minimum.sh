@@ -21,4 +21,4 @@ pip install dill --no-index
 #python DataCollectionD2E.py --env_name=HalfCheetah-v2
 python train_eval_offline_D2E.py --env_name=HalfCheetah-v2
 
-#python main.py --id cheetah-run-seed-1 --seed 1 --env cheetah-run --use-regular-vae  
+#python main.py --id cheetah-run-seed-1 --seed 1 --env cheetah-run --use-regular-vae

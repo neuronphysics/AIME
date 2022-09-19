@@ -63,6 +63,7 @@ def train_eval_offline(
     total_train_steps=int(1e6),
     summary_freq=100,
     print_freq=1000,
+    plot_train_freq=1000,
     save_freq=int(2e4),
     eval_freq=5000,
     n_eval_episodes=20,
@@ -164,12 +165,15 @@ def train_eval_offline(
   step = agent.global_step
   timed_at_step = step
   while step < total_train_steps:
+    print(f"at step {int(step)}/{total_train_steps}")
     agent.train_step()
     step = agent.global_step
     if step % summary_freq == 0 or step == total_train_steps:
       agent.write_train_summary(train_summary_writer)
     if step % print_freq == 0 or step == total_train_steps:
       agent.print_train_info()
+    if step % plot_train_freq == 0 or step == total_train_steps:
+      agent.plot_train_info(os.path.join(log_dir, "train"))
     if step % eval_freq == 0 or step == total_train_steps:
       time_ed = time.time()
       time_cost = time_ed - time_st
@@ -195,39 +199,6 @@ def train_eval_offline(
   logging.info('Training finished, time cost %.4gs.', time_cost)
   logging.info("{}......".format(eval_results[0]))
   return torch.cat([x.unsqueeze(0) for x in eval_results[0][1:]], dim=-1)
-
-##############################
-if not os.path.exists(os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/learn')):
-  os.makedirs(os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/learn'))
-else:
-  pass
-###train_offline.py
-parser = argparse.ArgumentParser(description='DreamToExplore', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('--data_root_offlinerl_dir', type=dir_path, default=os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl'),
-                     help='Root directory for data.')
-parser.add_argument('--data_sub_offlinerl_dir',type=str, default=None, help= '')
-parser.add_argument('--test_srcdir', type=str, default='/home/memole/TEST/AIME/start-with-brac/start-with-brac/', help='directory for saving test data.')
-parser.add_argument('--data_name', type=str, default='eps1',help= 'data name.')
-parser.add_argument('--data_file_name', type=str, default='',help= 'data checkpoint file name.')
-
-# Flags for offline training.
-parser.add_argument('--root_dir',type=dir_path, default= os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/learn'),
-                    help='Root directory for writing logs/summaries/checkpoints.')
-parser.add_argument('--sub_dir', type=str, default='0', help='')
-
-parser.add_argument('--agent_name',  type=str, default='DreamToExplore', help='agent name.')
-parser.add_argument('--env_name', type=str, default='HalfCheetah-v2',help = 'env name.')
-parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
-parser.add_argument('--total_train_steps', type=int, default=int(5e5), help='')
-parser.add_argument('--n_eval_episodes',type=int, default= 20,help= '')
-parser.add_argument('--n_train', type=int, default=int(1e6),help= '')
-parser.add_argument("--gin_file", type=str, default=[], nargs='*', help = 'Paths to the gin-config files.')
-
-parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help = 'Gin binding parameters.')
-args = parser.parse_args()
-#print(args)
-config.update(vars(parser.parse_args()))
-logging.info("Parsed %i arguments.", len(config))
 
 def main(args):
   logging.set_verbosity(logging.INFO)
@@ -268,6 +239,9 @@ def main(args):
       n_train=args.n_train,
       total_train_steps=args.total_train_steps,
       n_eval_episodes=args.n_eval_episodes,
+      print_freq=args.print_freq,
+      summary_freq=args.summary_freq,
+      plot_train_freq=args.plot_train_freq,
       device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
       )
 
@@ -290,7 +264,43 @@ def Train_offline_D2E(args):
     main(args)  # Just test that it runs.
 
 if __name__ == "__main__":
-  args = parser.parse_args(sys.argv[1:])
+
+  repo_dir = "/home/memole/TEST/AIME/start-with-brac/start-with-brac"
+  ##############################
+  if not os.path.exists(os.path.join(os.getenv('HOME', '/'), repo_dir, 'offlinerl/learn')):
+    os.makedirs(os.path.join(os.getenv('HOME', '/'), repo_dir, 'offlinerl/learn'))
+  else:
+    pass
+  ###train_offline.py
+  parser = argparse.ArgumentParser(description='DreamToExplore', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+  parser.add_argument('--data_root_offlinerl_dir', type=dir_path, default=os.path.join(os.getenv('HOME', '/'), repo_dir, 'offlinerl'),
+                       help='Root directory for data.')
+  parser.add_argument('--data_sub_offlinerl_dir',type=str, default=None, help= '')
+  parser.add_argument('--test_srcdir', type=str, default=str(os.path.join(os.getenv('HOME', '/'), repo_dir)), help='directory for saving test data.')
+  parser.add_argument('--data_name', type=str, default='eps1',help= 'data name.')
+  parser.add_argument('--data_file_name', type=str, default='',help= 'data checkpoint file name.')
+
+  # Flags for offline training.
+  parser.add_argument('--root_dir',type=dir_path, default= os.path.join(os.getenv('HOME', '/'), repo_dir, 'offlinerl/learn'),
+                      help='Root directory for writing logs/summaries/checkpoints.')
+  parser.add_argument('--sub_dir', type=str, default='0', help='')
+  parser.add_argument('--print_freq',type=int, default=100,help= 'print train info frequency')
+  parser.add_argument('--summary_freq',type=int, default=1000,help= 'write summary frequency')
+  parser.add_argument('--plot_train_freq',type=int, default=100,help= 'plot train info frequency')
+  parser.add_argument('--agent_name',  type=str, default='DreamToExplore', help='agent name.')
+  parser.add_argument('--env_name', type=str, default='HalfCheetah-v2',help = 'env name.')
+  parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
+  parser.add_argument('--total_train_steps', type=int, default=int(5e5), help='')
+  parser.add_argument('--n_eval_episodes',type=int, default= 20,help= '')
+  parser.add_argument('--n_train', type=int, default=int(1e6),help= '')
+  parser.add_argument("--gin_file", type=str, default=[], nargs='*', help = 'Paths to the gin-config files.')
+  parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help = 'Gin binding parameters.')
+  args = parser.parse_args()
+  #print(args)
+  config.update(vars(parser.parse_args()))
+  logging.info("Parsed %i arguments.", len(config))
+  #args = parser.parse_args(sys.argv[1:])
+  args = parser.parse_args()
   #print(' '.join(f'{k}={v}' for k, v in vars(args).items()))
   #gin.parse_config_files_and_bindings(args.gin_file, args.gin_bindings)
   Train_offline_D2E(args)

@@ -532,6 +532,7 @@ class Agent(object):
     self._init_vars(train_batch)
     self._build_optimizers()
     self._train_info = collections.OrderedDict()
+    self._all_train_info = collections.OrderedDict()
     self._checkpointer = self._build_checkpointer()
     self._test_policies = collections.OrderedDict()
     self._build_test_policies()
@@ -632,6 +633,10 @@ class Agent(object):
     info = self._train_info
     step = self._global_step.numpy()
     utils.write_summary(summary_writer, info, step)
+
+  def plot_train_info(self, plot_save_path):
+      for k,v in self._all_train_info.items():
+        utils.plot_train_info(v, k, os.path.join(plot_save_path, f"{k}.png"))
 
   def _build_checkpointer(self):
       #?save
@@ -1165,6 +1170,11 @@ class D2EAgent(Agent):
       self._extra_c_step(train_batch)
     for key, val in info.items():
         self._train_info[key] = val
+        if isinstance(val, (int, np.int32, np.int64, float, np.float32, np.float64)):
+          if key in self._all_train_info:
+            self._all_train_info[key].append(val)
+          else:
+            self._all_train_info[key] = [val]
     self._global_step += 1
 
 
