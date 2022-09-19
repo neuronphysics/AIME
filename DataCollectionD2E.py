@@ -257,25 +257,6 @@ def dir_path(path):
     else:
         raise argparse.ArgumentTypeError(f"readable_dir:{path} is not a valid path")
 
-
-parser = argparse.ArgumentParser(description='DreamToExplore')
-parser.add_argument('--root_offlinerl_dir', type=dir_path, default='/home/memole/TEST/AIME/start-with-brac/start-with-brac/offlinerl', help='Root directory for saving data')
-parser.add_argument('--sub_offlinerl_dir', type=str, default=None, help='sub directory for saving data.')
-parser.add_argument('--test_srcdir', type=str, default=None, help='directory for saving test data.')
-parser.add_argument('--env_name', type=str, default='HalfCheetah-v2',help = 'env name.')
-parser.add_argument('--data_name', type=str, default='random', help = 'data name.')
-parser.add_argument('--env_loader', type=str, default='mujoco', help = 'env loader, suite/gym.')
-parser.add_argument('--config_dir', type=str, default='configs', help = 'config file dir.')
-parser.add_argument('--config_file', type=str, default='d2e_pure', help = 'config file name.')
-parser.add_argument('--policy_root_dir', type=str, default=None,help = 'Directory in which to find the behavior policy.')
-parser.add_argument('--n_samples', type=int, default=int(1e3), help = 'number of transitions to collect.')
-parser.add_argument('--n_eval_episodes', type=int, default=20, help = 'number episodes to eval each policy.')
-parser.add_argument("--gin_file", type=str, default=[], nargs='*', help = 'Paths to the gin-config files.')
-
-parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help = 'Gin binding parameters.')
-args = parser.parse_args()
-if not os.path.exists("/home/memole/TEST/AIME/start-with-brac/start-with-brac/offlinerl/HalfCheetah-v2/example/0"):
-   os.makedirs("/home/memole/TEST/AIME/start-with-brac/offlinerl/start-with-brac/HalfCheetah-v2/example/0")
 def get_sample_counts(n, distr):
   """Provides size of each sub-dataset based on desired distribution."""
   distr = torch.tensor(distr)
@@ -402,5 +383,26 @@ def collect_gym_data(args):
     args.n_eval_episodes = 50
     main(args)
 if __name__ == "__main__":
-  args = parser.parse_args(sys.argv[1:])
+  repo_dir = "TEST/AIME/start-with-brac/start-with-brac"
+  
+  parser = argparse.ArgumentParser(description='DreamToExplore')
+  parser.add_argument('--root_offlinerl_dir', type=dir_path, default=os.path.join(os.getenv('HOME', '/'), repo_dir, 'offlinerl'), help='Root directory for saving data')
+  parser.add_argument('--sub_offlinerl_dir', type=str, default=None, help='sub directory for saving data.')
+  parser.add_argument('--test_srcdir', type=str, default=None, help='directory for saving test data.')
+  parser.add_argument('--env_name', type=str, default='HalfCheetah-v2',help = 'env name.')
+  parser.add_argument('--data_name', type=str, default='random', help = 'data name.')
+  parser.add_argument('--env_loader', type=str, default='mujoco', help = 'env loader, suite/gym.')
+  parser.add_argument('--config_dir', type=str, default='configs', help = 'config file dir.')
+  parser.add_argument('--config_file', type=str, default='d2e_pure', help = 'config file name.')
+  parser.add_argument('--policy_root_dir', type=str, default=None,help = 'Directory in which to find the behavior policy.')
+  parser.add_argument('--n_samples', type=int, default=int(1e3), help = 'number of transitions to collect.')
+  parser.add_argument('--n_eval_episodes', type=int, default=20, help = 'number episodes to eval each policy.')
+  parser.add_argument("--gin_file", type=str, default=[], nargs='*', help = 'Paths to the gin-config files.')
+
+  parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help = 'Gin binding parameters.')
+  args = parser.parse_args()
+  if not os.path.exists(os.path.join(args.root_offlinerl_dir, f"{args.env_name}/example/0")):
+     os.makedirs(os.path.join(args.root_offlinerl_dir, f"{args.env_name}/example/0"))
+
+  ##############################
   collect_gym_data(args)

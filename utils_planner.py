@@ -27,7 +27,7 @@ from torch.optim import Optimizer
 import datetime
 import re
 import os
-
+import matplotlib.pyplot as plt
 local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 # Epsilon for avoiding numerical issues.
 EPS = torch.tensor(1e-8, dtype=torch.float64, device=local_device,requires_grad=False)
@@ -174,6 +174,22 @@ CLS_DICT = dict(
 
 def get_divergence(name, c, device):
   return CLS_DICT[name](c, device)
+
+def clear_plot():
+    plt.cla()
+    plt.clf()
+    plt.close()
+
+def plot_train_info(vals, name, savepath):
+    clear_plot()
+    x = np.array(list(range(1, len(vals) + 1)))
+    y = np.array(vals)
+    plt.plot(x, y)
+    plt.title(name)
+    plt.xlabel("iteration")
+    plt.ylabel(name)
+    plt.savefig(savepath)
+    clear_plot()
 
 def soft_variables_update(source_variables, target_variables, tau=1.0):
     for (v_s, v_t) in zip(source_variables, target_variables):
