@@ -907,7 +907,7 @@ class D2EAgent(Agent):
     div_estimate = self._divergence.dual_estimate(
         s2.to(device=self.device), a2_p, a2_b.to(device=self.device))
     
-    v2_target = q2_target - self._v_fn(s2.to(device=self.device))# Equation 21 in Dream to Explore
+    v2_target = q2_target - self._v_fn(s2.to(device=self.device))- self._get_alpha_entropy()[0] * log_pi_a2_p# Equation 21 in Dream to Explore
     if self._value_penalty:
        v2_target = v2_target - self._get_alpha()[0] * div_estimate
     with torch.no_grad():
@@ -948,7 +948,7 @@ class D2EAgent(Agent):
     q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
     p_loss = torch.mean(
         self._get_alpha_entropy()[0] * log_pi_a_p
-        + self._get_alpha()[0] * div_estimate + v1 #new term based on Equation 10 in dream to explore paper
+        + self._get_alpha()[0] * div_estimate - v1 #new term based on Equation 10 in dream to explore paper
         - q1 * q_start)
     p_w_norm = self._get_p_weight_norm()
     norm_loss = self._weight_decays[1] * p_w_norm
