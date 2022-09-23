@@ -791,31 +791,33 @@ def LogisticRegressionLoss(pq_outputs):
 
 class DensityRatioEstimator(nn.Module):
 
-    def __init__(self, target_train_samples, hidden_params, early_stopping=False, target_val_samples=None,
-                 conditional_model=False):
+    def __init__(self, hidden_params, input_dim, early_stopping=False, conditional_model=False):
+        
         self.acc_fn = DensityRatioAccuracy()
         super(DensityRatioEstimator,self).__init__()
         self._early_stopping = early_stopping
         self._conditional_model = conditional_model
 
-        if self._conditional_model:
-            self._train_contexts = to_tensor(target_train_samples[0], device)
+        # if self._conditional_model:
+        #     self._train_contexts = to_tensor(target_train_samples[0], device)
 
-            self._target_train_samples = torch.cat([to_tensor(x, device) for x in target_train_samples], -1)
-        else:
-            self._target_train_samples = to_tensor(target_train_samples, device)
+        #     self._target_train_samples = torch.cat([to_tensor(x, device) for x in target_train_samples], -1)
+        # else:
+        #     self._target_train_samples = to_tensor(target_train_samples, device)
 
-        if self._early_stopping:
-            assert target_val_samples is not None, \
-                "For early stopping validation data needs to be provided via target_val_samples"
-            if self._conditional_model:
-                self._val_contexts = to_tensor(target_val_samples[0], device)
-                self._target_val_samples = torch.cat([to_tensor(x, device) for x in target_val_samples], -1)
-            else:
-                self._target_val_samples = to_tensor(target_val_samples, device)
+        # if self._early_stopping:
+        #     assert target_val_samples is not None, \
+        #         "For early stopping validation data needs to be provided via target_val_samples"
+        #     if self._conditional_model:
+        #         self._val_contexts = to_tensor(target_val_samples[0], device)
+        #         self._target_val_samples = torch.cat([to_tensor(x, device) for x in target_val_samples], -1)
+        #     else:
+        #         self._target_val_samples = to_tensor(target_val_samples, device)
+
         self.hidden_params=hidden_params
 
-        input_dim = self._target_train_samples.shape[-1]
+        #input_dim = self._target_train_samples.shape[-1]
+        print("DensityRatioEstimator input_dim", input_dim)
 
         self._ldre_net, self._ldre_regularizer = build_dense_network(input_dim=input_dim, output_dim=1,
                                              output_activation="linear", params=self.hidden_params)
@@ -851,6 +853,25 @@ class DensityRatioEstimator(nn.Module):
 
         self.to(device)
 
+    def process_data(self, target_train_samples, target_val_samples=None):
+        if self._conditional_model:
+            self._train_contexts = to_tensor(target_train_samples[0], device)
+            print("DensityRatioEstimator _train_contexts", self._train_contexts.shape)
+
+            self._target_train_samples = torch.cat([to_tensor(x, device) for x in target_train_samples], -1)
+        else:
+            self._target_train_samples = to_tensor(target_train_samples, device)
+
+        if self._early_stopping:
+            assert target_val_samples is not None, \
+                "For early stopping validation data needs to be provided via target_val_samples"
+            if self._conditional_model:
+                self._val_contexts = to_tensor(target_val_samples[0], device)
+                print("DensityRatioEstimator _val_contexts", self._val_contexts.shape)
+                self._target_val_samples = torch.cat([to_tensor(x, device) for x in target_val_samples], -1)
+            else:
+                self._target_val_samples = to_tensor(target_val_samples, device)
+
     def forward(self, x, inTrain=True):
         if inTrain:
           p = self._p_samples(x)
@@ -872,6 +893,7 @@ class DensityRatioEstimator(nn.Module):
 
 
     def train_dre(self, model, batch_size, num_iters):
+        #self.process_data(target_train_samples, target_val_samples)
         #compile the model
         #https://github.com/ncullen93/torchsample
 
@@ -880,23 +902,23 @@ class DensityRatioEstimator(nn.Module):
         if self._early_stopping:
            model_train_samples, model_val_samples = self.sample_model(model)
 
-           val_dataset =  TensorDataset([self._target_val_samples, model_val_samples])
-           val_loader  = DataLoader(val_dataset, batch_size=1, num_workers=0, shuffle=True)
+           #val_dataset =  TensorDataset([self._target_val_samples, model_val_samples])
+           #val_loader  = DataLoader(val_dataset, batch_size=1, num_workers=0, shuffle=True)
            #val_data = torch.tensor([[target, train] for target, train in zip(self._target_val_samples, model_val_samples)])
            val_data = torch.stack([self._target_val_samples, model_val_samples], dim=1)
 
         else:
            model_train_samples = self.sample_model(model)
 
-           val_loader = None
+           #val_loader = None
            val_data = None
-        train_dataset =  TensorDataset([self._target_train_samples, model_train_samples])
+        #train_dataset =  TensorDataset([self._target_train_samples, model_train_samples])
         #train_data = torch.tensor([[target, train] for target, train in zip(self._target_train_samples, model_train_samples)])
         #train_data = torch.cat([self._target_train_samples, model_train_samples], dim=1)
         train_data = torch.stack([self._target_train_samples, model_train_samples], dim=1)
         #print("_target_train_samples", self._target_train_samples)
         #print("model_train_samples", model_train_samples)
-        train_loader  = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
+        #train_loader  = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
         # print(batch_size,num_iters)
         # print(self._target_val_samples.shape, model_val_samples.shape)
         # print(self._target_train_samples.shape, model_train_samples.shape)
@@ -915,7 +937,7 @@ class DensityRatioEstimator(nn.Module):
                            val_data=val_data,
                            num_epoch=num_iters,
                            verbose=1)
-        eval_loss = self.trainer.evaluate(train_data)
+        #eval_loss = self.trainer.evaluate(train_data)
         #print(f"eval_loss:{eval_loss}")
         #print(self.trainer.history)
         #self.trainer.fit((self._target_train_samples, model_train_samples), targets=None, val_data=)
@@ -1094,8 +1116,7 @@ class ConditionalMixtureEIM:
         c.finalize_adding()
         return c
 
-    def __init__(self, config: ConfigDict, train_samples: torch.Tensor, recorder: Recorder,
-                 val_samples: torch.Tensor = None, seed: int = 0):
+    def __init__(self, config: ConfigDict, recorder: Recorder, context_dim: int, sample_dim: int, seed: int = 0):
         # supress pytorch casting warnings
         logging.getLogger("pytorch").setLevel(logging.ERROR)
 
@@ -1104,10 +1125,8 @@ class ConditionalMixtureEIM:
 
         self._recorder = recorder
 
-        self._context_dim = train_samples[0].shape[-1]
-        self._sample_dim = train_samples[1].shape[-1]
-        #print("train_samples", train_samples[0].shape, train_samples[1].shape, "_context_dim", self._context_dim, "_sample_dim", self._sample_dim)
-        self._train_contexts = torch.tensor(train_samples[0], dtype=torch.float32).to(device)
+        self._context_dim = context_dim
+        self._sample_dim = sample_dim
 
         c_net_hidden_dict = {NetworkKeys.NUM_UNITS: self.c.components_net_hidden_layers,
                              NetworkKeys.ACTIVATION: "relu",
@@ -1127,16 +1146,13 @@ class ConditionalMixtureEIM:
                       NetworkKeys.L2_REG_FACT: self.c.dre_reg_loss_fact}
 
 
-        self._dre = DensityRatioEstimator(target_train_samples=train_samples,
-                                          hidden_params=dre_params,
-                                          early_stopping=self.c.dre_early_stopping, target_val_samples=val_samples,
+        self._dre = DensityRatioEstimator(hidden_params=dre_params,
+                                          input_dim=self._context_dim + self._sample_dim,
+                                          early_stopping=self.c.dre_early_stopping,
                                           conditional_model=True)
 
         self._model = GaussianEMM(self._context_dim, self._sample_dim, self.c.num_components, self.c.gating_num_epochs, self._dre,
                                   c_net_hidden_dict, g_net_hidden_dict, seed=seed)
-
-
-
 
         self._recorder.initialize_module(RecorderKeys.INITIAL)
         self._recorder(RecorderKeys.INITIAL, "Nonlinear Conditional EIM - Reparametrization", config)
@@ -1145,17 +1161,28 @@ class ConditionalMixtureEIM:
         self._recorder.initialize_module(RecorderKeys.COMPONENT_UPDATE, self.c.train_epochs, self.c.num_components)
         self._recorder.initialize_module(RecorderKeys.DRE, self.c.train_epochs)
 
-    def train_emm(self):
+    def _set_train_contexts(self, train_samples):
+        self._train_samples = train_samples
+        self._train_contexts = torch.tensor(train_samples[0], dtype=torch.float32).to(device)
+
+    def train_emm(self, train_samples, val_samples):
+        self._dre.process_data(train_samples, val_samples)
+        self._set_train_contexts(train_samples)
         for i in range(self.c.train_epochs):
             self._recorder(RecorderKeys.TRAIN_ITER, i)
             self.train_iter(i)
 
     #   extra function to allow running from cluster work
-    def train_iter(self, i):
+    def train_iter(self, i, train_samples=None, val_samples=None):
+        # if pass train_samples and val_samples, overwrite the exsiting cache
+        if train_samples is not None:
+            self._set_train_contexts(train_samples)
+            if val_samples is not None:
+                self._dre.process_data(train_samples, val_samples)
 
         dre_steps, loss, acc = self._dre.train_dre(self._model, self.c.dre_batch_size, self.c.dre_num_iters)
         with torch.no_grad():
-          self._recorder(RecorderKeys.DRE, self._dre, self._model, i, dre_steps)
+          self._recorder(RecorderKeys.DRE, self._dre, self._model, i, dre_steps, self._train_samples)
 
         if self._model.num_components > 1:
             w_res = self.update_gating()
@@ -1165,11 +1192,16 @@ class ConditionalMixtureEIM:
         c_res = self.update_components()
         with torch.no_grad():
           self._recorder(RecorderKeys.COMPONENT_UPDATE, c_res)
+        return w_res, c_res
 
           #self._recorder(RecorderKeys.MODEL, self._model, i)
 
     """component update"""
-    def update_components(self):
+    def update_components(self, train_samples=None):
+        # if pass train_samples, overwrite the exsiting cache
+        if train_samples is not None:
+            self._set_train_contexts(train_samples)
+
         with torch.no_grad():
           importance_weights = self._model.gating_distribution.probabilities(self._train_contexts)
           importance_weights = importance_weights / torch.sum(importance_weights, dim=0, keepdims=True)
@@ -1222,7 +1254,11 @@ class ConditionalMixtureEIM:
             self._c_opts[i].zero_grad()
 
     """gating update"""
-    def update_gating(self):
+    def update_gating(self, train_samples=None):
+        # if pass train_samples, overwrite the exsiting cache
+        if train_samples is not None:
+            self._set_train_contexts(train_samples)
+
         with torch.no_grad():
           old_probs = self._model.gating_distribution.probabilities(self._train_contexts)
         for i in range(self.c.gating_num_epochs):
@@ -1737,10 +1773,10 @@ class WeightUpdateRecMod(RecorderModule):
 
 class DRERecMod(RecorderModule):
     """Records current Density Ratio Estimator performance - loss, accuracy and mean output for true and fake samples"""
-    def __init__(self, true_samples, target_ld=None, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
+    def __init__(self, target_ld=None, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
         super().__init__()
         #print(true_samples)
-        self._target_samples = to_tensor(true_samples, device)
+        #self._target_samples = to_tensor(true_samples, device)
         #print(f"target_sample {self._target_samples}")
         self._steps = []
         self._estm_ikl = []
@@ -1754,7 +1790,7 @@ class DRERecMod(RecorderModule):
         self.device= device
         if self._target_ld is not None:
             self._dre_rmse = []
-        self._conditional = not isinstance(true_samples, torch.Tensor)
+        #self._conditional = not isinstance(true_samples, torch.Tensor)
 
     def initialize(self, recorder, plot_realtime, save, num_iters):
         super().initialize(recorder, plot_realtime, save)
@@ -1769,7 +1805,8 @@ class DRERecMod(RecorderModule):
         mld = model.log_density(samples)
         return torch.squeeze(dre(samples, idx)) - (self._target_ld(samples) - mld)
 
-    def record(self, dre, model, iteration, steps):
+    def record(self, dre, model, iteration, steps, true_samples):
+        self._target_samples = to_tensor(true_samples, device)
         if iteration == 0 and self._target_ld is not None:
             for _ in model.components:
                 self._dre_rmse.append([])
@@ -1855,51 +1892,51 @@ class DRERecMod(RecorderModule):
     def logger_name(self):
         return "DRE"
 
-"""Recording"""
-recorder_dict = {
-    RecorderKeys.TRAIN_ITER: TrainIterationRecMod(),
-    RecorderKeys.INITIAL: ConfigInitialRecMod(),
-    #RecorderKeys.MODEL: ObstacleModelRecMod(data,
-    #                                    train_samples=data.train_samples,
-    #                                    test_samples=data.test_samples,
-    #                                    test_log_iters=1,
-    #                                    eval_fn=eval_fn,
-    #                                    save_log_iters=50),
-    RecorderKeys.DRE: DRERecMod(torch.from_numpy(np.asarray(data.train_samples))),
-    RecorderKeys.COMPONENT_UPDATE: ComponentUpdateRecMod(plot=True, summarize=False)}
-if num_components > 1:
-    recorder_dict[RecorderKeys.WEIGHTS_UPDATE] = WeightUpdateRecMod(plot=True)
-
-
-recorder = Recorder(recorder_dict, plot_realtime=plot_realtime, save=plot_save, save_path="rec")
-
-
-"""Configure EIM"""
-
-config = ConditionalMixtureEIM.get_default_config()
-config.train_epochs = 5000
-config.num_components = num_components
-
-config.components_net_hidden_layers = [64, 64]
-config.components_batch_size = 1000
-config.components_num_epochs = 20
-config.components_net_reg_loss_fact = 0.0
-config.components_net_drop_prob = 0.0
-
-config.gating_net_hidden_layers = [64, 64]
-config.gating_batch_size = 1000
-config.gating_num_epochs = 20
-config.gating_net_reg_loss_fact = 0.0
-config.gating_net_drop_prob = 0.0
-
-config.dre_reg_loss_fact = 0.0005
-config.dre_early_stopping = True
-config.dre_drop_prob = 0.0
-config.dre_num_iters =  50
-config.dre_batch_size = 1000
-config.dre_hidden_layers = [128, 128, 128]
-
 """Build and Run EIM"""
 if __name__ == "__main__":
-   model = ConditionalMixtureEIM(config, train_samples=data.train_samples, seed=42 * 7, recorder=recorder, val_samples=data.val_samples)
-   model.train_emm()
+    """Recording"""
+    recorder_dict = {
+        RecorderKeys.TRAIN_ITER: TrainIterationRecMod(),
+        RecorderKeys.INITIAL: ConfigInitialRecMod(),
+        #RecorderKeys.MODEL: ObstacleModelRecMod(data,
+        #                                    train_samples=data.train_samples,
+        #                                    test_samples=data.test_samples,
+        #                                    test_log_iters=1,
+        #                                    eval_fn=eval_fn,
+        #                                    save_log_iters=50),
+        RecorderKeys.DRE: DRERecMod(torch.from_numpy(np.asarray(data.train_samples))),
+        RecorderKeys.COMPONENT_UPDATE: ComponentUpdateRecMod(plot=True, summarize=False)}
+    if num_components > 1:
+        recorder_dict[RecorderKeys.WEIGHTS_UPDATE] = WeightUpdateRecMod(plot=True)
+
+
+    recorder = Recorder(recorder_dict, plot_realtime=plot_realtime, save=plot_save, save_path="rec")
+
+
+    """Configure EIM"""
+
+    config = ConditionalMixtureEIM.get_default_config()
+    config.train_epochs = 5000
+    config.num_components = num_components
+
+    config.components_net_hidden_layers = [64, 64]
+    config.components_batch_size = 1000
+    config.components_num_epochs = 20
+    config.components_net_reg_loss_fact = 0.0
+    config.components_net_drop_prob = 0.0
+
+    config.gating_net_hidden_layers = [64, 64]
+    config.gating_batch_size = 1000
+    config.gating_num_epochs = 20
+    config.gating_net_reg_loss_fact = 0.0
+    config.gating_net_drop_prob = 0.0
+
+    config.dre_reg_loss_fact = 0.0005
+    config.dre_early_stopping = True
+    config.dre_drop_prob = 0.0
+    config.dre_num_iters =  50
+    config.dre_batch_size = 1000
+    config.dre_hidden_layers = [128, 128, 128]
+
+    model = ConditionalMixtureEIM(config, train_samples=data.train_samples, seed=42 * 7, recorder=recorder, val_samples=data.val_samples)
+    model.train_emm()

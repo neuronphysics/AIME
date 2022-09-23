@@ -266,6 +266,7 @@ def Train_offline_D2E(args):
 if __name__ == "__main__":
 
   repo_dir = "/home/memole/TEST/AIME/start-with-brac/start-with-brac"
+  # repo_dir = "/home/p23shi/D2E/AIME-comb/AIME"
   ##############################
   if not os.path.exists(os.path.join(os.getenv('HOME', '/'), repo_dir, 'offlinerl/learn')):
     os.makedirs(os.path.join(os.getenv('HOME', '/'), repo_dir, 'offlinerl/learn'))

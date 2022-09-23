@@ -528,6 +528,7 @@ class Agent(object):
        self._weight_decays = tuple([self._weight_decays[0]] * 4)
     self._build_fns()
     train_batch = self._get_train_batch()
+    self._build_backbones(train_batch)
     self._global_step = torch.tensor(0.0, requires_grad=False)
     self._init_vars(train_batch)
     self._build_optimizers()
@@ -537,7 +538,9 @@ class Agent(object):
     self._test_policies = collections.OrderedDict()
     self._build_test_policies()
     self._online_policy = self._build_online_policy()
-    
+  
+  def _build_backbones(self, train_batch):
+    pass
 
   def _build_fns(self):
     self._agent_module = AgentModule(modules_list=self._modules_list)
@@ -783,6 +786,18 @@ class D2EAgent(Agent):
     self._ensemble_q_lambda = ensemble_q_lambda
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     super(D2EAgent, self).__init__(**kwargs)
+  
+  def _build_backbones(self, train_batch):
+    s1  = train_batch['s1']
+    s2  = train_batch['s2']
+    train_samples = MujocoData(s1, s2).train_samples
+    self._eim_context_dim = train_samples[0].shape[-1]
+    self._eim_sample_dim = train_samples[1].shape[-1]
+    self._EIM_model = ConditionalMixtureEIM(self._EIM_config, 
+                                            context_dim=self._eim_context_dim,
+                                            sample_dim=self._eim_sample_dim,
+                                            seed=torch.initial_seed(),
+                                            recorder=self._recorder_EIM())
 
   def _build_fns(self):
     self._agent_module = AgentModule(modules_list=self._modules_list)
@@ -960,7 +975,7 @@ class D2EAgent(Agent):
 
     return loss, info
   
-  def _recorder_EIM(self,data):
+  def _recorder_EIM(self):
       """configure experiment"""
       plot_realtime = True
       plot_save = False    
@@ -973,7 +988,7 @@ class D2EAgent(Agent):
          #                                      self._env_name,
          #                                      train_samples=data.train_samples,
          #                                      test_samples=data.test_samples),
-         RecorderKeys.DRE: DRERecMod(data.train_samples),
+         RecorderKeys.DRE: DRERecMod(),
          RecorderKeys.COMPONENT_UPDATE: ComponentUpdateRecMod(plot=True, summarize=False)}
       if self._EIM_config.num_components > 1:
          recorder_dict[RecorderKeys.WEIGHTS_UPDATE] = WeightUpdateRecMod(plot=True)
@@ -998,13 +1013,12 @@ class D2EAgent(Agent):
     #########################
     #input_data next_state (s2) and state (s1) 
     data = MujocoData(s1,s2)
-    self._EIM_model = ConditionalMixtureEIM(self._EIM_config, train_samples=data.train_samples, seed=torch.initial_seed(), recorder=self._recorder_EIM(data), val_samples=data.val_samples)
     EIM_gate_KL=0
     if self._EIM_model._model.num_components > 1:
-       EIM_gate_res =self._EIM_model.update_gating()
+       EIM_gate_res =self._EIM_model.update_gating(data.train_samples)
        print(f"EIM gate residual {EIM_gate_res[1]}")
        EIM_gate_KL=EIM_gate_res[1]
-    EIM_res = self._EIM_model.update_components()
+    EIM_res = self._EIM_model.update_components(data.train_samples)
     EIM_KL=0 
     for i in range(len(EIM_res)):
         EIM_KL+=EIM_res[i][1]
@@ -1122,7 +1136,11 @@ class D2EAgent(Agent):
     self._c_optimizer.step()
     self._extra_c_step( batch)
     #train expected information maximization to compute transition ratio
-    self._EIM_model.train_emm()
+
+    s1  = batch['s1']
+    s2  = batch['s2']
+    data = MujocoData(s1, s2)
+    self._EIM_model.train_emm(data.train_samples, data.val_samples)
     
     if self._train_alpha:
        self._a_optimizer.zero_grad()
