@@ -57,7 +57,6 @@ def train_eval_online(
     update_freq=1,
     update_rate=0.005,
     discount=0.99,
-    device=None,
     ):
   """Training a policy with online interaction."""
   # Create env to get specs.
@@ -90,6 +89,7 @@ def train_eval_online(
   steps_collected = 0
   log_freq = 5000
   logging.info('Collecting data ...')
+  time_step = env.reset()
   collector = DataCollector(env, explore_policy, train_data)
   while steps_collected < initial_explore_steps:
     count = collector.collect_transition()
@@ -105,6 +105,7 @@ def train_eval_online(
 
   # Construct agent.
   agent_flags = utils.Flags(
+      observation_spec=observation_spec,
       action_spec=action_spec,
       model_params=model_params,
       optimizers=optimizers,
@@ -113,6 +114,7 @@ def train_eval_online(
       update_freq=update_freq,
       update_rate=update_rate,
       discount=discount,
+      env_name=env,
       train_data=train_data)
   agent_args = Config(agent_flags).agent_args
   agent = D2EAgent(**vars(agent_args))
@@ -183,6 +185,10 @@ def train_eval_online(
   time_cost = time.time() - time_st_total
   logging.info('Training finished, time cost %.4gs.', time_cost)
   return np.array(eval_results)
+
+if not os.path.exists( os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/policies')):
+  os.makedirs( os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/policies'))
+  
 parser = argparse.ArgumentParser(description='DreamToExplore', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
 parser.add_argument('--root_dir',type=dir_path, default= os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/policies'),
@@ -200,11 +206,13 @@ parser.add_argument('--n_eval_episodes', type=int, default=int(20), help='')
 parser.add_argument('--gin_file', type=str, default=[], nargs='*', help = 'Paths to the gin-config files.')
 parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help = 'Gin binding parameters.')
 args = parser.parse_args()
+config.update(vars(parser.parse_args()))
+logging.info("Parsed %i arguments.", len(config))
 
 
 def main(args):
   logging.set_verbosity(logging.INFO)
-  gin.parse_config_files_and_bindings(args.gin_file, args.gin_bindings)
+  #gin.parse_config_files_and_bindings(args.gin_file, args.gin_bindings)
   if args.sub_dir == 'auto':
     sub_dir = get_datetime()
   else:
