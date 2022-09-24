@@ -1369,22 +1369,6 @@ class TrainIterationRecMod(RecorderModule):
     def logger_name(self):
         return "Iteration"
 
-"""Runs the obstacles experiments described in section 5.4 of the paper"""
-#########################################
-########################################
-"""configure experiment"""
-plot_realtime = True
-plot_save = False
-record_dual_opt = True
-record_discriminator = True
-num_components = 3
-
-"""generate data"""
-
-data = ObstacleData(10000, 5000, 5000, num_obstacles=3, samples_per_context=10, seed=0)
-context_dim, sample_dim = data.dim
-print("context_dim, sample_dim ", context_dim, sample_dim )
-
 class Colors:
     """Provides colors for plotting """
     def __init__(self, pyplot_color_cycle=True):
@@ -1895,6 +1879,22 @@ class DRERecMod(RecorderModule):
 """Build and Run EIM"""
 if __name__ == "__main__":
     """Recording"""
+    """Runs the obstacles experiments described in section 5.4 of the paper"""
+    #########################################
+    ########################################
+    """configure experiment"""
+    plot_realtime = True
+    plot_save = False
+    record_dual_opt = True
+    record_discriminator = True
+    num_components = 3
+
+    """generate data"""
+
+    data = ObstacleData(10000, 5000, 5000, num_obstacles=3, samples_per_context=10, seed=0)
+    context_dim, sample_dim = data.dim
+    print("context_dim, sample_dim ", context_dim, sample_dim )
+
     recorder_dict = {
         RecorderKeys.TRAIN_ITER: TrainIterationRecMod(),
         RecorderKeys.INITIAL: ConfigInitialRecMod(),
@@ -1904,7 +1904,7 @@ if __name__ == "__main__":
         #                                    test_log_iters=1,
         #                                    eval_fn=eval_fn,
         #                                    save_log_iters=50),
-        RecorderKeys.DRE: DRERecMod(torch.from_numpy(np.asarray(data.train_samples))),
+        RecorderKeys.DRE: DRERecMod(),
         RecorderKeys.COMPONENT_UPDATE: ComponentUpdateRecMod(plot=True, summarize=False)}
     if num_components > 1:
         recorder_dict[RecorderKeys.WEIGHTS_UPDATE] = WeightUpdateRecMod(plot=True)
@@ -1938,5 +1938,15 @@ if __name__ == "__main__":
     config.dre_batch_size = 1000
     config.dre_hidden_layers = [128, 128, 128]
 
-    model = ConditionalMixtureEIM(config, train_samples=data.train_samples, seed=42 * 7, recorder=recorder, val_samples=data.val_samples)
-    model.train_emm()
+    context_dim = data.train_samples[0].shape[-1]
+    sample_dim = data.train_samples[1].shape[-1]
+
+    model = ConditionalMixtureEIM(
+        config,
+        context_dim=context_dim,
+        sample_dim=sample_dim,
+        seed=42 * 7,
+        recorder=recorder
+    )
+
+    model.train_emm(data.train_samples, data.val_samples)
