@@ -5,7 +5,7 @@
 #SBATCH --tasks-per-node=2
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=30G
-#SBATCH --time=00-01:59
+#SBATCH --time=00-13:59
 #SBATCH --account=def-jhoey
 #SBATCH --output=/home/memole/TEST/HalfCheetah-run-seed-1_%N-%j.out
 #SBATCH --error=/home/memole/TEST/HalfCheetah-run-seed-1_%N-%j.err
@@ -19,6 +19,6 @@ pip install --upgrade pip
 pip install dill --no-index
 
 #python DataCollectionD2E.py --env_name=HalfCheetah-v2
-python train_eval_offline_D2E.py --env_name=HalfCheetah-v2
-
+#python train_eval_offline_D2E.py --env_name=HalfCheetah-v2
+python train_D2E_eval_online.py --env_name=HalfCheetah-v2 
 #python main.py --id cheetah-run-seed-1 --seed 1 --env cheetah-run --use-regular-vae
