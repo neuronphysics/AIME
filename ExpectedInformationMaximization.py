@@ -6,7 +6,6 @@ from collections import OrderedDict
 from torch.distributions import normal
 import numpy as np
 import os
-from planner_regularizer_EIM import Split
 from tqdm import tqdm
 import warnings
 import logging
@@ -19,7 +18,9 @@ from itertools import chain
 from torchsample.callbacks import EarlyStopping, ReduceLROnPlateau
 from torchsample.modules import ModuleTrainer
 from torchsample.metrics import Metric
-from torchsample.regularizers import L2Regularizer
+from torchsample.constraints import Constraint
+from torchsample import constraints as cons
+from torchsample.regularizers import L2Regularizer, L1Regularizer
 from torchsample.initializers import XavierUniform
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
@@ -29,6 +30,190 @@ import re
 import os
 if not os.path.exists("EIM_out_imgs"):
     os.makedirs("EIM_out_imgs")
+from torch.optim import Optimizer
+
+def clip(x, min_value, max_value, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
+    """Element-wise value clipping.
+    Args:
+        x: Tensor or variable.
+        min_value: Python float, integer, or tensor.
+        max_value: Python float, integer, or tensor.
+    Returns:
+        A tensor.
+    """
+    if isinstance(min_value, (int, float)) and isinstance(
+        max_value, (int, float)
+    ):
+        if max_value < min_value:
+            max_value = min_value
+    if min_value is None:
+        min_value = torch.tensor(float('-inf'), dtype=torch.float32, device=device, requires_grad=False)
+    if max_value is None:
+        max_value = torch.tensor(float('inf'), dtype=torch.float32, device=device, requires_grad=False)
+    return torch.clamp(x, min_value, max_value)
+
+def fixprob(att):
+    att = att + 1e-9
+    _sum = sum(att,dim=1, keep_dims=True)
+    att = att / _sum
+    att = clip(att, 1e-9, 1.0)
+    return att
+
+class MinMaxNorm(Constraint):
+
+    def __init__(self, min_value=0.0, max_value=1.0, rate=1.0, axis=0, frequency=1,  unit='batch', module_filter='*'):
+        self.min_value = min_value
+        self.max_value = max_value
+        self.rate = rate
+        self.axis = axis
+        self.frequency = frequency
+        self.unit = unit
+        self.module_filter = module_filter
+        self.device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        self.epsilon= torch.tensor(1e-7, dtype=torch.float32, device=self.device, requires_grad=False)
+    
+    def __call__(self, module):
+        w = module.weight.data
+        norms = torch.sqrt(
+            torch.sum(torch.square(w), dim=self.axis, keepdims=True)
+        )
+        desired = (
+            self.rate * clip(norms, self.min_value, self.max_value)
+            + (1 - self.rate) * norms
+        )
+        module.weight.data= w * (desired / (self.epsilon + norms))
+
+
+class AdaBound(Optimizer):
+    """Implements AdaBound algorithm.
+    It has been proposed in `Adaptive Gradient Methods with Dynamic Bound of Learning Rate`_.
+    Arguments:
+        params (iterable): iterable of parameters to optimize or dicts defining
+            parameter groups
+        lr (float, optional): Adam learning rate (default: 1e-3)
+        betas (Tuple[float, float], optional): coefficients used for computing
+            running averages of gradient and its square (default: (0.9, 0.999))
+        final_lr (float, optional): final (SGD) learning rate (default: 0.1)
+        gamma (float, optional): convergence speed of the bound functions (default: 1e-3)
+        eps (float, optional): term added to the denominator to improve
+            numerical stability (default: 1e-8)
+        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
+        amsbound (boolean, optional): whether to use the AMSBound variant of this algorithm
+    .. Adaptive Gradient Methods with Dynamic Bound of Learning Rate:
+        https://openreview.net/forum?id=Bkg3g2R9FX
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), final_lr=0.1, gamma=1e-3,
+                 eps=1e-8, weight_decay=0, amsbound=False):
+        if not 0.0 <= lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if not 0.0 <= eps:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        if not 0.0 <= final_lr:
+            raise ValueError("Invalid final learning rate: {}".format(final_lr))
+        if not 0.0 <= gamma < 1.0:
+            raise ValueError("Invalid gamma parameter: {}".format(gamma))
+        defaults = dict(lr=lr, betas=betas, final_lr=final_lr, gamma=gamma, eps=eps,
+                        weight_decay=weight_decay, amsbound=amsbound)
+        super(AdaBound, self).__init__(params, defaults)
+
+        self.base_lrs = list(map(lambda group: group['lr'], self.param_groups))
+
+    def __setstate__(self, state):
+        super(AdaBound, self).__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault('amsbound', False)
+
+    def step(self, closure=None):
+        """Performs a single optimization step.
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group, base_lr in zip(self.param_groups, self.base_lrs):
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError(
+                        'Adam does not support sparse gradients, please consider SparseAdam instead')
+                amsbound = group['amsbound']
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    # Exponential moving average of gradient values
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    # Exponential moving average of squared gradient values
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    if amsbound:
+                        # Maintains max of all exp. moving avg. of sq. grad. values
+                        state['max_exp_avg_sq'] = torch.zeros_like(p.data)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                if amsbound:
+                    max_exp_avg_sq = state['max_exp_avg_sq']
+                beta1, beta2 = group['betas']
+
+                state['step'] += 1
+
+                if group['weight_decay'] != 0:
+                    grad = grad.add(group['weight_decay'], p.data)
+
+                # Decay the first and second moment running average coefficient
+                exp_avg.mul_(beta1).add_(1 - beta1, grad)
+                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                if amsbound:
+                    # Maintains the maximum of all 2nd moment running avg. till now
+                    torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+                    # Use the max. for normalizing running avg. of gradient
+                    denom = max_exp_avg_sq.sqrt().add_(group['eps'])
+                else:
+                    denom = exp_avg_sq.sqrt().add_(group['eps'])
+
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
+
+                # Applies bounds on actual learning rate
+                # lr_scheduler cannot affect final_lr, this is a workaround to apply lr decay
+                final_lr = group['final_lr'] * group['lr'] / base_lr
+                lower_bound = final_lr * (1 - 1 / (group['gamma'] * state['step'] + 1))
+                upper_bound = final_lr * (1 + 1 / (group['gamma'] * state['step']))
+                step_size = torch.full_like(denom, step_size)
+                step_size.div_(denom).clamp_(lower_bound, upper_bound).mul_(exp_avg)
+
+                p.data.add_(-step_size)
+
+        return loss
+
+
+class Split(torch.nn.Module):
+    """
+    models a split in the network. works with convolutional models (not FC).
+    specify out channels for the model to divide by n_parts.
+    """
+    def __init__(self, module, n_parts: int, dim=1):
+        super().__init__()
+        self._n_parts = n_parts
+        self._dim = dim
+        self._module = module
+
+    def forward(self, inputs):
+        output = self._module(inputs)
+        chunk_size = output.shape[self._dim] // self._n_parts
+        return torch.split(output, chunk_size, dim=self._dim)
 
 class _CWFormatter(logging.Formatter):
     def __init__(self):
@@ -226,8 +411,6 @@ def l2_penalty(model, l2_lambda=0.001):
 
 def build_dense_network(input_dim, output_dim, output_activation, params, with_output_layer=True):
 
-
-
     activation = params.get(NetworkKeys.ACTIVATION, "relu")
     l2_reg_fact = params.get(NetworkKeys.L2_REG_FACT, 0.0)
     drop_prob = params.get(NetworkKeys.DROP_PROB, 0.0)
@@ -295,7 +478,7 @@ class Gaussian:
         return 0.5 * kl
 
     def covar_logdet(self):
-        return 2 * torch.sum(torch.log(torch.diag(self._chol_covar) + 1e-25))
+        return 2 * torch.sum(torch.log(torch.diag(self._chol_covar) + 1e-15))
 
     def update_parameters(self, mean, covar):
         try:
@@ -343,6 +526,7 @@ class Categorical:
     def __init__(self, probabilities):
         self._p = probabilities
         self.to(device=device)
+        
     def sample(self, num_samples):
         thresholds = torch.unsqueeze(torch.cumsum(self._p, dim=0), dim=0)
         thresholds[0, -1] = 1.0
@@ -361,13 +545,13 @@ class Categorical:
 
     @property
     def log_probabilities(self):
-        return torch.log(self._p + 1e-25)
+        return torch.log(self._p + 1e-9)
 
     def entropy(self):
-        return - torch.sum(self._p * torch.log(self._p + 1e-25))
+        return - torch.sum(self._p * torch.log(self._p + 1e-15))
 
     def kl(self, other):
-        return torch.sum(self._p * (torch.log(self._p + 1e-25) - other.log_probabilities))
+        return torch.sum(self._p * (torch.log(self._p + 1e-9) - other.log_probabilities))
 
 class GMM:
 
@@ -381,7 +565,7 @@ class GMM:
         return torch.sum(w * densities, dim=0)
 
     def log_density(self, samples):
-        return torch.log(self.density(samples) + 1e-25)
+        return torch.log(self.density(samples) + 1e-15)
 
     def log_likelihood(self, samples):
         return torch.mean(self.log_density(samples))
@@ -410,7 +594,7 @@ class GMM:
 
 
 class DensityRatioAccuracy(Metric):
-
+    #https://github.com/pbecker93/ExpectedInformationMaximization/blob/53c6e097cb7f4f1f6338aeb69bc923dc86ca9712/EIM/eim/DensityRatioEstimator.py#L7
     def __init__(self):
         super(DensityRatioAccuracy, self).__init__()
         self.p_prob = 0
@@ -440,7 +624,7 @@ def gaussian_log_density(samples, means, chol_covars):
         exp_term = torch.sum(torch.square(torch.linalg.solve_triangular(chol_covars, diff, upper=False)), (-2, -1))
     except AttributeError:
         exp_term = torch.sum(torch.square(torch.triangular_solve(diff, chol_covars, upper=False)[0]), (-2, -1))
-    return - 0.5 * (samples.size()[-1] * torch.log(2 * torch.tensor(np.pi, requires_grad=False)) + covar_logdet + exp_term)
+    return - 0.5 * (samples.size()[-1].to(dtype= exp_term.dtype) * torch.log(2 * torch.tensor(np.pi, requires_grad=False)) + covar_logdet + exp_term)
 
 def gaussian_density(samples, means, chol_covars):
     return torch.exp(ConditionalGaussian.gaussian_log_density(samples, means, chol_covars))
@@ -482,9 +666,12 @@ class ConditionalGaussian(nn.Module):
 
         self._model = self._hidden_net
         idx = list(self._model._modules.keys())[-1] #get the index of last component in Sequential
-        hidden_dim = self._hidden_net._modules[list(self._hidden_net._modules)[-2]].out_features
+        if isinstance(self._hidden_net._modules[list(self._hidden_net._modules)[-2]], nn.Linear):
+           hidden_dim = self._hidden_net._modules[list(self._hidden_net._modules)[-2]].out_features
+        elif isinstance(self._hidden_net._modules[list(self._hidden_net._modules)[-3]], nn.Linear) and isinstance(self._hidden_net._modules[list(self._hidden_net._modules)[-2]], nn.BatchNorm1d):
+           hidden_dim = self._hidden_net._modules[list(self._hidden_net._modules)[-3]].out_features
         #add a linear layer for a combination of mean and covariance
-        self._model._modules[str(int(idx)+1)] = torch.nn.ReLU()
+        self._model._modules[str(int(idx)+1)] = torch.nn.LeakyReLU(0.3)
         self._model._modules[str(int(idx)+2)] = nn.Linear(hidden_dim, self._sample_dim+self._sample_dim ** 2)
 
 
@@ -527,6 +714,7 @@ class ConditionalGaussian(nn.Module):
         samples = torch.tril(torch.reshape(chol_raw, [-1, self._sample_dim, self._sample_dim]), diagonal=0)
 
         samples[:, range(self._sample_dim), range(self._sample_dim)] = torch.exp(torch.diagonal(samples, dim1=-2, dim2=-1))+ 1e-12
+
         return samples
 
 
@@ -556,7 +744,7 @@ class ConditionalGaussian(nn.Module):
 
     ##@staticmethod
     def _covar_logdets(self, chol_covars):
-        return 2 * torch.sum(torch.log(torch.diagonal(chol_covars, dim1=-2, dim2=-1) + 1e-12), dim=-1)
+        return 2 * torch.sum(torch.log(torch.diagonal(chol_covars, dim1=-2, dim2=-1) + 1e-15), dim=-1)
 
     ##@staticmethod
     def kls(self, contexts, other_means, other_chol_covars):
@@ -651,15 +839,15 @@ class Softmax(nn.Module):
         return nn.Softmax(dim=1)(self.logits(contexts))
 
     def log_probabilities(self, contexts):
-        return torch.log(self.probabilities(contexts) + 1e-12)
+        return torch.log(self.probabilities(contexts) + 1e-15)
 
     def expected_entropy(self, contexts):
         p = self.probabilities(contexts)
-        return - torch.mean(torch.sum(p * torch.log(p + 1e-12), -1))
+        return - torch.mean(torch.sum(p * torch.log(p + 1e-15), -1))
 
     def expected_kl(self, contexts, other_probabilities):
         p = self.probabilities(contexts)
-        return p, torch.mean(torch.sum(p * (torch.log(p + 1e-12) - torch.log(other_probabilities + 1e-12)), -1))
+        return p, torch.mean(torch.sum(p * (torch.log(p + 1e-9) - torch.log(other_probabilities + 1e-15)), -1))
 
     def sample(self, contexts):
         p = self.probabilities(contexts)
@@ -693,7 +881,7 @@ class GaussianEMM(nn.Module):
     """gated mixture of experts """
     def __init__(self, context_dim, sample_dim, number_of_components, gating_num_epochs, dre, component_hidden_dict, gating_hidden_dict,
                  seed=0, trainable=True, weight_path=None):
-        super().__init__()
+        super(GaussianEMM, self).__init__()
         self._context_dim = context_dim
         self._sample_dim = sample_dim
         self._number_of_components = number_of_components
@@ -721,7 +909,7 @@ class GaussianEMM(nn.Module):
             self._components.append(c)
         #iput features: 6
         self._component_input_size  = list(self._components[-1]._modules.values())[0][0].in_features
-        print(f"component input size: {self._component_input_size}")
+        #print(f"component input size: {self._component_input_size}")
         #number_of_components: 3
         self.trainable_variables = self._gating_distribution.trainable_variables
         # self._net, self._regularizer = build_dense_network(input_dim=input_dim, output_dim=1,
@@ -744,7 +932,7 @@ class GaussianEMM(nn.Module):
         return density
 
     def log_density(self, contexts, samples):
-        return torch.log(self.density(contexts, samples) + 1e-12)
+        return torch.log(self.density(contexts, samples) + 1e-15)
 
     def log_likelihood(self, contexts, samples):
         return torch.mean(self.log_density(contexts, samples))
@@ -779,14 +967,34 @@ class GaussianEMM(nn.Module):
             chol_covars.append(cc)
         return torch.stack(means, 1), torch.stack(chol_covars, 1)
 
-
+    def save_model_params(self, filepath):
+        stats_dict = {}
+        stats_dict['model_gating_state_dict']= self._gating_distribution.state_dict()
+        stats_dict['n_hidden_gating']= self._gating_distribution.n_hidden
+        stats_dict['n_layers_gating']= self._gating_distribution.n_layers
+        for i in range(self._number_of_components):
+            key_i = 'model_component_{}_state_dict'.format(i)
+            stats_dict[key_i] = self._components[i].state_dict()
+            h_i = 'n_hidden_component_{}'.format(i)
+            stats_dict[h_i] = self._components[i].n_hidden
+            l_i = 'n_layers_component_{}'.format(i)
+            stats_dict[l_i] = self._components[i].n_layers
+        torch.save(stats_dict, filepath )
+        
+    def load_model_params(self, filepath):
+        checkpoint = torch.load(filepath)
+        self.gating_distribution.load_state_dict(checkpoint['model_gating_state_dict'])
+        for i, c in enumerate(self.components):
+            key_i = 'model_component_{}_state_dict'.format(i)
+            c.load_state_dict(checkpoint[key_i])
+            
 ###################################################
 ############# Main Class of the Model #############
 ###################################################
 
 def LogisticRegressionLoss(pq_outputs):
     p_outputs, q_outputs = pq_outputs
-    loss = - torch.mean(torch.log(torch.sigmoid(p_outputs) +1e-12))- torch.mean(torch.log(1 - torch.sigmoid(q_outputs) + 1e-12))
+    loss = - torch.mean(torch.log(torch.sigmoid(p_outputs) +1e-15))- torch.mean(torch.log(1 - torch.sigmoid(q_outputs) + 1e-15))
     return  loss
 
 class DensityRatioEstimator(nn.Module):
@@ -817,7 +1025,7 @@ class DensityRatioEstimator(nn.Module):
         self.hidden_params=hidden_params
 
         #input_dim = self._target_train_samples.shape[-1]
-        print("DensityRatioEstimator input_dim", input_dim)
+        print(f"DensityRatioEstimator input_dim for the NN: {input_dim}")
 
         self._ldre_net, self._ldre_regularizer = build_dense_network(input_dim=input_dim, output_dim=1,
                                              output_activation="linear", params=self.hidden_params)
@@ -829,31 +1037,28 @@ class DensityRatioEstimator(nn.Module):
             n_parts=2,
             dim = 0
         )
-
-        self.trainer   = ModuleTrainer(self) # model
         self.metrics   = [self.acc_fn]
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0001)
+        #self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0001)
+        self.optimizer =AdaBound([ 
+                         { 'params': self._ldre_net.parameters() },
+                         { 'params': self._p_samples.parameters() }, 
+                         { 'params': self._q_samples.parameters() }, 
+                         ],  lr=1e-3, betas=(0.9, 0.999))
         self.initializers = [XavierUniform(bias=False, module_filter='*')]
-        self.regularizers   = [L2Regularizer(scale=1e-4)]
-
+        self.regularizers   = [L2Regularizer(scale=1e-4, module_filter='*')]
+        self.constraints = [cons.UnitNorm(3, 'batch', '*'), MinMaxNorm(min_value=0.0001, max_value=0.99, frequency=3,  unit='batch', module_filter='*')]
         if self._early_stopping:
 
             self.callbacks = [EarlyStopping(monitor='val_loss', patience=10),
-                        ReduceLROnPlateau(factor=0.5, patience=5)]
+                        ReduceLROnPlateau(factor=0.2, patience=5)]
         else:
             self.callbacks  = []
-
-        self.trainer.compile(loss=LogisticRegressionLoss,
-                             optimizer=self.optimizer,
-                             regularizers=self.regularizers,
-                             initializers=self.initializers,
-                             metrics=self.metrics,
-                             callbacks=self.callbacks)
-
-
+        
         self.to(device)
 
+
     def process_data(self, target_train_samples, target_val_samples=None):
+        
         if self._conditional_model:
             self._train_contexts = to_tensor(target_train_samples[0], device)
             print("DensityRatioEstimator _train_contexts", self._train_contexts.shape)
@@ -872,27 +1077,40 @@ class DensityRatioEstimator(nn.Module):
             else:
                 self._target_val_samples = to_tensor(target_val_samples, device)
 
+
     def forward(self, x, inTrain=True):
         if inTrain:
-          p = self._p_samples(x)
-          q = self._q_samples(x)
+          #p = self._p_samples(x)
+          #q = self._q_samples(x)
           p = x[:, 0, :]
           q = x[:, 1, :]
           combined = torch.cat((p.view(p.size(0), -1),
                                 q.view(q.size(0), -1)), dim=0)
-
           p_output, q_output =self._split_layers(combined)
           return p_output, q_output
         else:
           return self._ldre_net(x)
 
-    # def __call__(self, samples):
+    def set_trainer(self):
+        self.trainer   = ModuleTrainer(self) # model
+        
+
+        self.trainer.compile(loss=LogisticRegressionLoss,
+                             optimizer=self.optimizer,
+                             regularizers=self.regularizers,
+                             constraints=self.constraints,
+                             initializers=self.initializers,
+                             metrics=self.metrics,
+                             callbacks=self.callbacks)
+#    def __call__(self, samples):
     #     print("__call__ x", samples.shape)
-    #     return self._ldre_net(samples)
+#        return self._ldre_net(samples)
 
 
 
     def train_dre(self, model, batch_size, num_iters):
+        
+
         #self.process_data(target_train_samples, target_val_samples)
         #compile the model
         #https://github.com/ncullen93/torchsample
@@ -936,6 +1154,7 @@ class DensityRatioEstimator(nn.Module):
                            targets=None,
                            val_data=val_data,
                            num_epoch=num_iters,
+                           #batch_size=self.batch_size,
                            verbose=1)
         #eval_loss = self.trainer.evaluate(train_data)
         #print(f"eval_loss:{eval_loss}")
@@ -1129,19 +1348,19 @@ class ConditionalMixtureEIM:
         self._sample_dim = sample_dim
 
         c_net_hidden_dict = {NetworkKeys.NUM_UNITS: self.c.components_net_hidden_layers,
-                             NetworkKeys.ACTIVATION: "relu",
+                             NetworkKeys.ACTIVATION: "LeakyRelu",
                              NetworkKeys.BATCH_NORM: False,
                              NetworkKeys.DROP_PROB: self.c.components_net_drop_prob,
                              NetworkKeys.L2_REG_FACT: self.c.components_net_reg_loss_fact}
 
         g_net_hidden_dict = {NetworkKeys.NUM_UNITS: self.c.gating_net_hidden_layers,
-                             NetworkKeys.ACTIVATION: "relu",
+                             NetworkKeys.ACTIVATION: "LeakyRelu",
                              NetworkKeys.BATCH_NORM: False,
                              NetworkKeys.DROP_PROB: self.c.gating_net_drop_prob,
                              NetworkKeys.L2_REG_FACT: self.c.gating_net_reg_loss_fact}
 
         dre_params = {NetworkKeys.NUM_UNITS: self.c.dre_hidden_layers,
-                      NetworkKeys.ACTIVATION: "relu",
+                      NetworkKeys.ACTIVATION: "LeakyRelu",
                       NetworkKeys.DROP_PROB: self.c.dre_drop_prob,
                       NetworkKeys.L2_REG_FACT: self.c.dre_reg_loss_fact}
 
@@ -1160,6 +1379,8 @@ class ConditionalMixtureEIM:
         self._recorder.initialize_module(RecorderKeys.WEIGHTS_UPDATE, self.c.train_epochs)
         self._recorder.initialize_module(RecorderKeys.COMPONENT_UPDATE, self.c.train_epochs, self.c.num_components)
         self._recorder.initialize_module(RecorderKeys.DRE, self.c.train_epochs)
+        #initialise trainer inside DensityRatioEstimator class
+        self._dre.set_trainer()
 
     def _set_train_contexts(self, train_samples):
         self._train_samples = train_samples
@@ -1218,11 +1439,12 @@ class ConditionalMixtureEIM:
             self._components_train_step(importance_weights, old_means, old_chol_inv)
 
         res_list = []
-        for i, c in enumerate(self._model.components):
-            expected_entropy = torch.sum(importance_weights[:, i] * c.entropies(self._train_contexts))
-            kls = c.kls_other_chol_inv(self._train_contexts, old_means[:, i], old_chol_inv[:, i])
-            expected_kl = torch.sum(importance_weights[:, i] * kls)
-            res_list.append((self.c.components_num_epochs, expected_kl, expected_entropy, ""))
+        with torch.no_grad():
+             for i, c in enumerate(self._model.components):
+                 expected_entropy = torch.sum(importance_weights[:, i] * c.entropies(self._train_contexts))
+                 kls = c.kls_other_chol_inv(self._train_contexts, old_means[:, i], old_chol_inv[:, i])
+                 expected_kl = torch.sum(importance_weights[:, i] * kls)
+                 res_list.append((self.c.components_num_epochs, expected_kl, expected_entropy, ""))
         return res_list
 
 
@@ -1368,22 +1590,6 @@ class TrainIterationRecMod(RecorderModule):
     @property
     def logger_name(self):
         return "Iteration"
-
-"""Runs the obstacles experiments described in section 5.4 of the paper"""
-#########################################
-########################################
-"""configure experiment"""
-plot_realtime = True
-plot_save = False
-record_dual_opt = True
-record_discriminator = True
-num_components = 3
-
-"""generate data"""
-
-data = ObstacleData(10000, 5000, 5000, num_obstacles=3, samples_per_context=10, seed=0)
-context_dim, sample_dim = data.dim
-print("context_dim, sample_dim ", context_dim, sample_dim )
 
 class Colors:
     """Provides colors for plotting """
@@ -1895,6 +2101,22 @@ class DRERecMod(RecorderModule):
 """Build and Run EIM"""
 if __name__ == "__main__":
     """Recording"""
+    """Runs the obstacles experiments described in section 5.4 of the paper"""
+    #########################################
+    ########################################
+    """configure experiment"""
+    plot_realtime = True
+    plot_save = False
+    record_dual_opt = True
+    record_discriminator = True
+    num_components = 3
+
+    """generate data"""
+
+    data = ObstacleData(10000, 5000, 5000, num_obstacles=3, samples_per_context=10, seed=0)
+    context_dim, sample_dim = data.dim
+    print("context_dim, sample_dim ", context_dim, sample_dim )
+
     recorder_dict = {
         RecorderKeys.TRAIN_ITER: TrainIterationRecMod(),
         RecorderKeys.INITIAL: ConfigInitialRecMod(),
@@ -1904,7 +2126,7 @@ if __name__ == "__main__":
         #                                    test_log_iters=1,
         #                                    eval_fn=eval_fn,
         #                                    save_log_iters=50),
-        RecorderKeys.DRE: DRERecMod(torch.from_numpy(np.asarray(data.train_samples))),
+        RecorderKeys.DRE: DRERecMod(),
         RecorderKeys.COMPONENT_UPDATE: ComponentUpdateRecMod(plot=True, summarize=False)}
     if num_components > 1:
         recorder_dict[RecorderKeys.WEIGHTS_UPDATE] = WeightUpdateRecMod(plot=True)
@@ -1938,5 +2160,15 @@ if __name__ == "__main__":
     config.dre_batch_size = 1000
     config.dre_hidden_layers = [128, 128, 128]
 
-    model = ConditionalMixtureEIM(config, train_samples=data.train_samples, seed=42 * 7, recorder=recorder, val_samples=data.val_samples)
-    model.train_emm()
+    context_dim = data.train_samples[0].shape[-1]
+    sample_dim = data.train_samples[1].shape[-1]
+
+    model = ConditionalMixtureEIM(
+        config,
+        context_dim=context_dim,
+        sample_dim=sample_dim,
+        seed=42 * 7,
+        recorder=recorder
+    )
+
+    model.train_emm(data.train_samples, data.val_samples)
