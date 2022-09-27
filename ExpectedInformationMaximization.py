@@ -2171,4 +2171,8 @@ if __name__ == "__main__":
         recorder=recorder
     )
 
+<<<<<<< HEAD
     model.train_emm(data.train_samples, data.val_samples)
+=======
+    model.train_emm(data.train_samples, data.val_samples)
+>>>>>>> b3968e0dd35b29a6b2aaccdc8612afd89da99a21
