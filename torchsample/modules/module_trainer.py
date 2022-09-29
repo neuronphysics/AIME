@@ -137,17 +137,27 @@ class ModuleTrainer(object):
 
         self._has_transforms = True
         self._transforms = transforms
+    
+    def set_lr_scheduler(self, lr_scheduler):
+        self._lr_scheduler = lr_scheduler
+    
+    def set_gradient_clipping(self, gradient_clipping):
+        self._gradient_clipping = gradient_clipping
 
     def compile(self,
                 optimizer,
                 loss,
+                lr_scheduler=None,
                 callbacks=None,
                 regularizers=None,
                 initializers=None,
                 constraints=None,
                 metrics=None,
-                transforms=None):
+                transforms=None,
+                gradient_clipping=None):
         self.set_optimizer(optimizer)
+        self.set_lr_scheduler(lr_scheduler)
+        self.set_gradient_clipping(gradient_clipping)
         self.set_loss(loss)
 
         if regularizers is not None:
@@ -268,6 +278,9 @@ class ModuleTrainer(object):
                     output_batch = fit_forward_fn(input_batch)
                     loss = fit_loss_fn(output_batch, target_batch)
                     loss.backward()
+                    if self._gradient_clipping and self._gradient_clipping > 0:
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self._gradient_clipping)
+
                     self._optimizer.step()
                     # ---------------------------------------------
 
@@ -279,6 +292,9 @@ class ModuleTrainer(object):
 
                     batch_logs['loss'] = loss.item()
                     callback_container.on_batch_end(batch_idx, batch_logs)
+                
+                if self._lr_scheduler:
+                    self._lr_scheduler.step()
 
                 if has_val_data:
                     val_epoch_logs = self.evaluate(val_inputs,
