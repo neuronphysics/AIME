@@ -999,12 +999,13 @@ def LogisticRegressionLoss(pq_outputs):
 
 class DensityRatioEstimator(nn.Module):
 
-    def __init__(self, hidden_params, input_dim, early_stopping=False, conditional_model=False):
+    def __init__(self, hidden_params, input_dim, early_stopping=False, conditional_model=False, gradient_clipping=None):
         
         self.acc_fn = DensityRatioAccuracy()
         super(DensityRatioEstimator,self).__init__()
         self._early_stopping = early_stopping
         self._conditional_model = conditional_model
+        self.gradient_clipping=gradient_clipping
 
         # if self._conditional_model:
         #     self._train_contexts = to_tensor(target_train_samples[0], device)
@@ -1044,6 +1045,7 @@ class DensityRatioEstimator(nn.Module):
                          { 'params': self._p_samples.parameters() }, 
                          { 'params': self._q_samples.parameters() }, 
                          ],  lr=1e-3, betas=(0.9, 0.999))
+        self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99)
         self.initializers = [XavierUniform(bias=False, module_filter='*')]
         self.regularizers   = [L2Regularizer(scale=1e-4, module_filter='*')]
         self.constraints = [cons.UnitNorm(3, 'batch', '*'), MinMaxNorm(min_value=0.0001, max_value=0.99, frequency=3,  unit='batch', module_filter='*')]
@@ -1097,11 +1099,13 @@ class DensityRatioEstimator(nn.Module):
 
         self.trainer.compile(loss=LogisticRegressionLoss,
                              optimizer=self.optimizer,
+                             lr_scheduler=self.lr_scheduler,
                              regularizers=self.regularizers,
                              constraints=self.constraints,
                              initializers=self.initializers,
                              metrics=self.metrics,
-                             callbacks=self.callbacks)
+                             callbacks=self.callbacks,
+                             gradient_clipping=self.gradient_clipping)
 #    def __call__(self, samples):
     #     print("__call__ x", samples.shape)
 #        return self._ldre_net(samples)
@@ -1317,6 +1321,7 @@ class ConditionalMixtureEIM:
             components_net_reg_loss_fact=0.,
             components_net_drop_prob=0.0,
             components_net_hidden_layers=[50, 50],
+            components_grad_clipping=10,
             # Gating
             gating_learning_rate=1e-3,
             gating_batch_size=1000,
@@ -1324,13 +1329,15 @@ class ConditionalMixtureEIM:
             gating_net_reg_loss_fact=0.,
             gating_net_drop_prob=0.0,
             gating_net_hidden_layers=[50, 50],
+            gating_grad_clipping=10,
             # Density Ratio Estimation
             dre_reg_loss_fact=0.0,  # Scaling Factor for L2 regularization of density ratio estimator
             dre_early_stopping=True,  # Use early stopping for density ratio estimator training
             dre_drop_prob=0.0,  # If smaller than 1 dropout with keep prob = 'keep_prob' is used
             dre_num_iters=1000,  # Number of density ratio estimator steps each iteration (i.e. max number if early stopping)
             dre_batch_size=1000,  # Batch size for density ratio estimator training
-            dre_hidden_layers=[30, 30]  # width of density ratio estimator  hidden layers
+            dre_hidden_layers=[30, 30],  # width of density ratio estimator  hidden layers
+            dre_grad_clipping=10
         )
         c.finalize_adding()
         return c
@@ -1368,7 +1375,8 @@ class ConditionalMixtureEIM:
         self._dre = DensityRatioEstimator(hidden_params=dre_params,
                                           input_dim=self._context_dim + self._sample_dim,
                                           early_stopping=self.c.dre_early_stopping,
-                                          conditional_model=True)
+                                          conditional_model=True,
+                                          gradient_clipping=self.c.dre_grad_clipping)
 
         self._model = GaussianEMM(self._context_dim, self._sample_dim, self.c.num_components, self.c.gating_num_epochs, self._dre,
                                   c_net_hidden_dict, g_net_hidden_dict, seed=seed)
@@ -1381,6 +1389,11 @@ class ConditionalMixtureEIM:
         self._recorder.initialize_module(RecorderKeys.DRE, self.c.train_epochs)
         #initialise trainer inside DensityRatioEstimator class
         self._dre.set_trainer()
+        self._c_opts = [ torch.optim.Adam(self._model.components[i].trainable_variables, lr=self.c.components_learning_rate, betas=(0.5, 0.999)) for i in range(len(self._model.components))]
+        self._g_opt = torch.optim.Adam(self._model.gating_distribution.trainable_variables, lr=self.c.gating_learning_rate, betas=(0.5, 0.999))
+
+        self._c_lrs = [torch.optim.lr_scheduler.ExponentialLR(c_opt, gamma=0.99) for c_opt in self._c_opts]
+        self._g_lr = torch.optim.lr_scheduler.ExponentialLR(self._g_opt, gamma=0.99)
 
     def _set_train_contexts(self, train_samples):
         self._train_samples = train_samples
@@ -1449,7 +1462,6 @@ class ConditionalMixtureEIM:
 
 
     def _components_train_step(self, importance_weights, old_means, old_chol_precisions):
-        self._c_opts = [ torch.optim.Adam(self._model.components[i].trainable_variables, lr=self.c.components_learning_rate, betas=(0.5, 0.999)) for i in range(len(self._model.components))]
 
         for i in range(self._model.num_components):
             dataset = torch.utils.data.TensorDataset(self._train_contexts, importance_weights[:, i], old_means, old_chol_precisions)
@@ -1471,8 +1483,11 @@ class ConditionalMixtureEIM:
                 # print("kls", kls)
                 loss = torch.mean(iw_batch * (losses + kls))
                 #loss = torch.mean(iw_batch*kls)
+                if self.c.components_grad_clipping and self.c.components_grad_clipping > 0:
+                    torch.nn.utils.clip_grad_norm_(self._model.components[i].parameters(), self.c.components_grad_clipping)
                 loss.backward()
                 self._c_opts[i].step()
+            self._c_lrs[i].step()
             self._c_opts[i].zero_grad()
 
     """gating update"""
@@ -1492,7 +1507,6 @@ class ConditionalMixtureEIM:
         return i + 1, expected_kl, expected_entropy, ""
 
     def _gating_train_step(self, old_probs):
-        self._g_opt = torch.optim.Adam(self._model.gating_distribution.trainable_variables, lr=self.c.gating_learning_rate, betas=(0.5, 0.999))
         losses = []
         for i in range(self.c.num_components):
             samples = self._model.components[i].sample(self._train_contexts)
@@ -1511,7 +1525,10 @@ class ConditionalMixtureEIM:
             probabilities, kl = self._model.gating_distribution.expected_kl(context_batch, old_probs_batch)
             loss = torch.sum(torch.mean(probabilities * losses_batch, 0)) + kl
             loss.backward()
+            if self.c.gating_grad_clipping and self.c.gating_grad_clipping > 0:
+                torch.nn.utils.clip_grad_norm_(self._model.gating_distribution.parameters(), self.c.gating_grad_clipping)
             self._g_opt.step()
+        self._g_lr.step()
         self._g_opt.zero_grad()
 
     @property
