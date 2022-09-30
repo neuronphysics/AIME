@@ -1392,8 +1392,8 @@ class ConditionalMixtureEIM:
         self._c_opts = [ torch.optim.Adam(self._model.components[i].trainable_variables, lr=self.c.components_learning_rate, betas=(0.5, 0.999)) for i in range(len(self._model.components))]
         self._g_opt = torch.optim.Adam(self._model.gating_distribution.trainable_variables, lr=self.c.gating_learning_rate, betas=(0.5, 0.999))
 
-        self._c_lrs = [torch.optim.lr_scheduler.ExponentialLR(c_opt, gamma=0.998) for c_opt in self._c_opts]
-        self._g_lr = torch.optim.lr_scheduler.ExponentialLR(self._g_opt, gamma=0.998)
+        #self._c_lrs = [torch.optim.lr_scheduler.ExponentialLR(c_opt, gamma=0.998) for c_opt in self._c_opts]
+        #self._g_lr = torch.optim.lr_scheduler.ExponentialLR(self._g_opt, gamma=0.998)
 
     def _set_train_contexts(self, train_samples):
         self._train_samples = train_samples
@@ -1487,8 +1487,8 @@ class ConditionalMixtureEIM:
                     torch.nn.utils.clip_grad_norm_(self._model.components[i].parameters(), self.c.components_grad_clipping)
                 loss.backward()
                 self._c_opts[i].step()
-            if self._c_lrs:
-                self._c_lrs[i].step()
+            #if self._c_lrs:
+            #    self._c_lrs[i].step()
             self._c_opts[i].zero_grad()
 
     """gating update"""
@@ -1529,8 +1529,8 @@ class ConditionalMixtureEIM:
             if self.c.gating_grad_clipping and self.c.gating_grad_clipping > 0:
                 torch.nn.utils.clip_grad_norm_(self._model.gating_distribution.parameters(), self.c.gating_grad_clipping)
             self._g_opt.step()
-        if self._g_lr:
-            self._g_lr.step()
+        #if self._g_lr:
+        #    self._g_lr.step()
         self._g_opt.zero_grad()
 
     @property

@@ -230,11 +230,11 @@ class MujocoDataset(data.Dataset):
         obs2=self.dataset2[index]
         return obs1, obs2
 
-def shufflerow(tensor1, tensor2, axis):
+def shufflerow(tensor1, tensor2, axis, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
     row_perm = torch.rand(tensor1.shape[:axis+1]).argsort(axis)  # get permutation indices
     for _ in range(tensor1.ndim-axis-1): row_perm.unsqueeze_(-1)
     row_perm = row_perm.repeat(*[1 for _ in range(axis+1)], *(tensor1.shape[axis+1:]))  # reformat this for the gather operation
-    return tensor1.gather(axis, row_perm),tensor2.gather(axis, row_perm)
+    return tensor1.gather(axis, row_perm.to(device)),tensor2.gather(axis, row_perm.to(device))
 
 def split_data(data,valid_portion,dim):
     indices=torch.randperm(data[0].shape[dim])
