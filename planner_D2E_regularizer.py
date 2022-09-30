@@ -784,13 +784,14 @@ class D2EAgent(Agent):
     self._warm_start = warm_start
     self._c_iter = c_iter
     self._ensemble_q_lambda = ensemble_q_lambda
+    self.vf_criterion = nn.MSELoss()
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     super(D2EAgent, self).__init__(**kwargs)
   
   def _build_backbones(self, train_batch):
     s1  = train_batch['s1']
     s2  = train_batch['s2']
-    train_samples = MujocoData(s1, s2).train_samples
+    train_samples = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1).train_samples
     self._eim_context_dim = train_samples[0].shape[-1]
     self._eim_sample_dim = train_samples[1].shape[-1]
     self._EIM_model = ConditionalMixtureEIM(self._EIM_config, 
@@ -812,25 +813,25 @@ class D2EAgent(Agent):
     #################################################################################################################################
     ############ Setting Up Configuration parameters of the EIM model to compute desity ratio of the transition function ############
     #################################################################################################################################
-    self._EIM_config.train_epochs = 25
+    self._EIM_config.train_epochs = 4
     self._EIM_config.num_components = self._latent_spec.shape[0] #number of dimension of latent space
 
     self._EIM_config.components_net_hidden_layers = [30, 30]
     self._EIM_config.components_batch_size = self._batch_size #is it a correct batch size???
-    self._EIM_config.components_num_epochs = 10
+    self._EIM_config.components_num_epochs = 4
     self._EIM_config.components_net_reg_loss_fact = 0.0
     self._EIM_config.components_net_drop_prob = 0.0
 
     self._EIM_config.gating_net_hidden_layers = [30, 30]
     self._EIM_config.gating_batch_size = self._batch_size #???
-    self._EIM_config.gating_num_epochs = 10
+    self._EIM_config.gating_num_epochs = 4
     self._EIM_config.gating_net_reg_loss_fact = 0.0
     self._EIM_config.gating_net_drop_prob = 0.0
 
     self._EIM_config.dre_reg_loss_fact = 0.0005
     self._EIM_config.dre_early_stopping = True
     self._EIM_config.dre_drop_prob = 0.0
-    self._EIM_config.dre_num_iters =  25
+    self._EIM_config.dre_num_iters =  4
     self._EIM_config.dre_batch_size = self._batch_size ###???
     self._EIM_config.dre_hidden_layers = [30, 30]
     ########################################################################################################################
@@ -1000,33 +1001,29 @@ class D2EAgent(Agent):
     s1  = batch['s1']
     a_b = batch['a1']
     s2  = batch['s2']
-    _, a_p, _ = self._p_fn(s1.to(device=self.device))
-    v_target = self._v_fn(s2.to(device=self.device))
+    _, a_p, log_a_pi = self._p_fn(s1.to(device=self.device))
+
+    v_pred = self._v_fn(s1.to(device=self.device))
+
     q1_target = []
     for q_fn, q_fn_target in self._q_fns:
-      q1_ = q_fn_target(s1.to(device=self.device), a_b.to(device=self.device))
+      q1_ = q_fn_target(s1.to(device=self.device), a_p)
       q1_target.append(q1_)
-    q1_target = torch.stack(q1_target, dim=-1)
-    q1_target_ensemble = self.ensemble_q(q1_target)
+    #q1_target = torch.stack(q1_target, dim=-1)
+    #q1_target_ensemble = self.ensemble_q(q1_target)
+    min_q_target=torch.min(q1_target[0], q1_target[1])
     div_estimate = self._divergence.dual_estimate(
         s1.to(device=self.device), a_p, a_b.to(device=self.device))
     #########################
     #input_data next_state (s2) and state (s1) 
-    data = MujocoData(s1,s2)
-    EIM_gate_KL=0
-    if self._EIM_model._model.num_components > 1:
-       EIM_gate_res =self._EIM_model.update_gating(data.train_samples)
-       print(f"EIM gate residual {EIM_gate_res[1]}")
-       EIM_gate_KL=EIM_gate_res[1]
-    EIM_res = self._EIM_model.update_components(data.train_samples)
-    EIM_KL=0 
-    for i in range(len(EIM_res)):
-        EIM_KL+=EIM_res[i][1]
-
+    data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
+    
+    _, Iprojection, _, _, _ = self._EIM_model._dre.eval(data.train_samples, self._EIM_model._model)
+    #https://github.com/haarnoja/sac/blob/8258e33633c7e37833cc39315891e77adfbe14b2/sac/algos/sac.py#L295
+    #https://github.com/rail-berkeley/rlkit/blob/60bdfcd09f48f73a450da139b2ba7910b8cede53/rlkit/torch/smac/pearl.py#L247
     #Equation 20 in Dream to Explore paper
-    v_loss = torch.mean(q1_target_ensemble - v_target
-        - self._get_alpha()[0] * (div_estimate 
-        + EIM_KL + EIM_gate_KL))
+    v_target= min_q_target - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (div_estimate + Iprojection)
+    v_loss= self.vf_criterion(v_pred, v_target.detach()) 
     v_w_norm = self._get_v_weight_norm()
     norm_loss = self._weight_decays[3] * v_w_norm
     loss = v_loss + norm_loss
@@ -1139,7 +1136,7 @@ class D2EAgent(Agent):
 
     s1  = batch['s1']
     s2  = batch['s2']
-    data = MujocoData(s1, s2)
+    data = MujocoData(s1.to(device=self.device), s2.to(device=self.device), train_valid_split_portion=1/16)
     self._EIM_model.train_emm(data.train_samples, data.val_samples)
     
     if self._train_alpha:
