@@ -1039,12 +1039,12 @@ class DensityRatioEstimator(nn.Module):
             dim = 0
         )
         self.metrics   = [self.acc_fn]
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
-        # self.optimizer =AdaBound([ 
-        #                  { 'params': self._ldre_net.parameters() },
-        #                  { 'params': self._p_samples.parameters() }, 
-        #                  { 'params': self._q_samples.parameters() }, 
-        #                  ],  lr=1e-3, betas=(0.9, 0.999))
+        # self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        self.optimizer =AdaBound([ 
+                         { 'params': self._ldre_net.parameters() },
+                         { 'params': self._p_samples.parameters() }, 
+                         { 'params': self._q_samples.parameters() }, 
+                         ],  lr=1e-3, betas=(0.9, 0.999))
         self.lr_scheduler = None # torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99999)
         self.initializers = [XavierUniform(bias=False, module_filter='*')]
         self.regularizers   = [L2Regularizer(scale=1e-4, module_filter='*')]
@@ -1337,7 +1337,7 @@ class ConditionalMixtureEIM:
             dre_num_iters=1000,  # Number of density ratio estimator steps each iteration (i.e. max number if early stopping)
             dre_batch_size=1000,  # Batch size for density ratio estimator training
             dre_hidden_layers=[30, 30],  # width of density ratio estimator  hidden layers
-            dre_grad_clipping=10
+            dre_grad_clipping=1
         )
         c.finalize_adding()
         return c
