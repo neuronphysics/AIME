@@ -1017,7 +1017,6 @@ class D2EAgent(Agent):
     #########################
     #input_data next_state (s2) and state (s1) 
     data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
-    
     _, Iprojection, _, _, _ = self._EIM_model._dre.eval(data.train_samples, self._EIM_model._model)
     #https://github.com/haarnoja/sac/blob/8258e33633c7e37833cc39315891e77adfbe14b2/sac/algos/sac.py#L295
     #https://github.com/rail-berkeley/rlkit/blob/60bdfcd09f48f73a450da139b2ba7910b8cede53/rlkit/torch/smac/pearl.py#L247
@@ -1136,7 +1135,7 @@ class D2EAgent(Agent):
 
     s1  = batch['s1']
     s2  = batch['s2']
-    data = MujocoData(s1.to(device=self.device), s2.to(device=self.device), train_valid_split_portion=1/16)
+    data = MujocoData(s1.to(device=self.device), s2.to(device=self.device), train_valid_split_portion=1-1/16)
     self._EIM_model.train_emm(data.train_samples, data.val_samples)
     
     if self._train_alpha:
