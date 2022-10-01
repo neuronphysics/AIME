@@ -259,8 +259,7 @@ class MujocoData:
           self._samples_per_context = observation.shape[0]//2
         #mujoco_dataset=MujocoDataset(observation, next_observation)
         #self.train_samples =data.DataLoader(mujoco_dataset, batch_size=1, shuffle=True)
-        training_samples, validation_samples=split_data((observation,next_observation),train_valid_split_portion,0)
-
+        training_samples, validation_samples=split_data((observation,next_observation),1-train_valid_split_portion,0)
         self.train_samples = training_samples
         #self.test_samples = data.DataLoader(mujoco_dataset, batch_size=1, shuffle=True)
         self.test_samples = shufflerow(training_samples[0], training_samples[1], 0)
