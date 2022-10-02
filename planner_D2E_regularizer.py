@@ -962,10 +962,10 @@ class D2EAgent(Agent):
     div_estimate = self._divergence.dual_estimate(
         s.to(device=self.device), a_p, a_b.to(device=self.device))
     q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
-    p_loss = torch.mean(
+    p_loss = -torch.mean(
         self._get_alpha_entropy()[0] * log_pi_a_p
-        + self._get_alpha()[0] * div_estimate - v1 #new term based on Equation 10 in dream to explore paper
-        - q1 * q_start)
+        + self._get_alpha()[0] * div_estimate - (v1 #new term based on Equation 10 in dream to explore paper
+        - q1 )* q_start)
     p_w_norm = self._get_p_weight_norm()
     norm_loss = self._weight_decays[1] * p_w_norm
     loss = p_loss + norm_loss
@@ -1009,9 +1009,9 @@ class D2EAgent(Agent):
     for q_fn, q_fn_target in self._q_fns:
       q1_ = q_fn_target(s1.to(device=self.device), a_p)
       q1_target.append(q1_)
-    #q1_target = torch.stack(q1_target, dim=-1)
-    #q1_target_ensemble = self.ensemble_q(q1_target)
-    min_q_target=torch.min(q1_target[0], q1_target[1])
+    q1_target = torch.stack(q1_target, dim=-1)
+    q1_target_ensemble = self.ensemble_q(q1_target)
+    
     div_estimate = self._divergence.dual_estimate(
         s1.to(device=self.device), a_p, a_b.to(device=self.device))
     #########################
@@ -1021,7 +1021,7 @@ class D2EAgent(Agent):
     #https://github.com/haarnoja/sac/blob/8258e33633c7e37833cc39315891e77adfbe14b2/sac/algos/sac.py#L295
     #https://github.com/rail-berkeley/rlkit/blob/60bdfcd09f48f73a450da139b2ba7910b8cede53/rlkit/torch/smac/pearl.py#L247
     #Equation 20 in Dream to Explore paper
-    v_target= min_q_target - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (div_estimate + Iprojection)
+    v_target= q1_target_ensemble - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (div_estimate + Iprojection)
     v_loss= self.vf_criterion(v_pred, v_target.detach()) 
     v_w_norm = self._get_v_weight_norm()
     norm_loss = self._weight_decays[3] * v_w_norm
