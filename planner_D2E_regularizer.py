@@ -553,7 +553,7 @@ class Agent(object):
      self._optimizer = torch.optim.Adam(
             self._agent_module.parameters(),
             lr= opt[0],
-            betas=(opt[1], opt[2]),
+            betas=(opt[1], opt[2])
         )
     
 
@@ -732,7 +732,7 @@ class MaxQSoftPolicy(nn.Module):
   def __call__(self, latent_state):
 
     actions = self._a_network.sample_n(latent_state.to(device=self.device), self._n)[1]
-    #logging.info("latent states shape:{}, n: {}, actions: {}......".format(latent_state.shape, self._n, actions.shape))
+    
     batch_size = actions.shape[-1]
     actions_ = torch.reshape(actions, [self._n * batch_size, -1])
     states_  = torch.tile(latent_state[None].to(device=self.device), (self._n, 1, 1))
@@ -748,9 +748,15 @@ class MaxQSoftPolicy(nn.Module):
 ################ D2E Agent ################## 
 #############################################
 
+def where(cond, x_1, x_2, device=torch.device( 'cuda' if torch.cuda.is_available() else 'cpu')):
+    cond =cond.type(torch.FloatTensor).to(device)
+    return (cond * x_1) + ((1-cond) * x_2)
+  
+def WeightedLoss(diff, expectile=0.8):
+    weight = where(diff > 0, expectile, (1 - expectile))
+    out = weight * (diff**2)
+    return out.mean() 
 
-gin.clear_config()
-gin.config._REGISTRY.clear()
 @gin.configurable
 class D2EAgent(Agent):
   """dual agent class."""
@@ -770,6 +776,8 @@ class D2EAgent(Agent):
       warm_start=2000,
       c_iter=3,
       ensemble_q_lambda=1.0,
+      grad_value_clipping=1.0,
+      grad_norm_clipping=5.0,
       **kwargs):
     self._alpha = alpha
     self._alpha_max = alpha_max
@@ -784,6 +792,8 @@ class D2EAgent(Agent):
     self._warm_start = warm_start
     self._c_iter = c_iter
     self._ensemble_q_lambda = ensemble_q_lambda
+    self._grad_value_clipping = grad_value_clipping
+    self._grad_norm_clipping = grad_norm_clipping
     self.vf_criterion = nn.MSELoss()
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     super(D2EAgent, self).__init__(**kwargs)
@@ -813,16 +823,16 @@ class D2EAgent(Agent):
     #################################################################################################################################
     ############ Setting Up Configuration parameters of the EIM model to compute desity ratio of the transition function ############
     #################################################################################################################################
-    self._EIM_config.train_epochs = 4
+    self._EIM_config.train_epochs = 5
     self._EIM_config.num_components = self._latent_spec.shape[0] #number of dimension of latent space
 
-    self._EIM_config.components_net_hidden_layers = [30, 30]
+    self._EIM_config.components_net_hidden_layers = [20, 20]
     self._EIM_config.components_batch_size = self._batch_size #is it a correct batch size???
     self._EIM_config.components_num_epochs = 4
     self._EIM_config.components_net_reg_loss_fact = 0.0
     self._EIM_config.components_net_drop_prob = 0.0
 
-    self._EIM_config.gating_net_hidden_layers = [30, 30]
+    self._EIM_config.gating_net_hidden_layers = [20, 20]
     self._EIM_config.gating_batch_size = self._batch_size #???
     self._EIM_config.gating_num_epochs = 4
     self._EIM_config.gating_net_reg_loss_fact = 0.0
@@ -922,15 +932,18 @@ class D2EAgent(Agent):
     q2_target = self._ensemble_q2_target(q2_targets)
     div_estimate = self._divergence.dual_estimate(
         s2.to(device=self.device), a2_p, a2_b.to(device=self.device))
-    
-    v2_target = q2_target - self._v_fn(s2.to(device=self.device))- self._get_alpha_entropy()[0] * log_pi_a2_p# Equation 21 in Dream to Explore
+    data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
+    with torch.no_grad():
+         s_p = self._EIM_model._model.sample(data.train_samples[0])
+    v2_target = q2_target - self._v_fn(s_p)- self._get_alpha_entropy()[0] * log_pi_a2_p
+    #v2_target = q2_target - self._v_fn(s2.to(device=self.device))- self._get_alpha_entropy()[0] * log_pi_a2_p# Equation 21 in Dream to Explore
     if self._value_penalty:
        v2_target = v2_target - self._get_alpha()[0] * div_estimate
     with torch.no_grad():
          q1_target = r.to(device=self.device) + dsc.to(device=self.device) * self._discount * v2_target #Q(s,a)=R(s,a)+discount*v(s')
     q_losses = []
     for q1_pred in q1_preds:
-      q_loss_ = torch.mean(torch.square(q1_pred - q1_target))
+      q_loss_ = torch.mean(torch.square(q1_pred - q1_target.detach()))
       q_losses.append(q_loss_)
     q_loss = torch.sum(torch.FloatTensor(q_losses))
     q_w_norm = self._get_q_weight_norm()
@@ -964,7 +977,7 @@ class D2EAgent(Agent):
     q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
     p_loss = -torch.mean(
         self._get_alpha_entropy()[0] * log_pi_a_p
-        + self._get_alpha()[0] * div_estimate - (v1 #new term based on Equation 10 in dream to explore paper
+        + self._get_alpha()[0] * div_estimate + log_pi_a_p * (v1 #new term based on Equation 10 in dream to explore paper
         - q1 )* q_start)
     p_w_norm = self._get_p_weight_norm()
     norm_loss = self._weight_decays[1] * p_w_norm
@@ -1002,9 +1015,13 @@ class D2EAgent(Agent):
     a_b = batch['a1']
     s2  = batch['s2']
     _, a_p, log_a_pi = self._p_fn(s1.to(device=self.device))
-
-    v_pred = self._v_fn(s1.to(device=self.device))
-
+    #########################
+    #input_data next_state (s2) and state (s1) 
+    data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
+    _, Iprojection, _, _, _ = self._EIM_model._dre.eval(data.train_samples, self._EIM_model._model)
+    with torch.no_grad():
+         s_p = self._EIM_model._model.sample(data.train_samples[0])
+    v_pred = self._v_fn(s_p)
     q1_target = []
     for q_fn, q_fn_target in self._q_fns:
       q1_ = q_fn_target(s1.to(device=self.device), a_p)
@@ -1014,15 +1031,14 @@ class D2EAgent(Agent):
     
     div_estimate = self._divergence.dual_estimate(
         s1.to(device=self.device), a_p, a_b.to(device=self.device))
-    #########################
-    #input_data next_state (s2) and state (s1) 
-    data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
-    _, Iprojection, _, _, _ = self._EIM_model._dre.eval(data.train_samples, self._EIM_model._model)
+    
+    #https://github.com/AnujMahajanOxf/VIREL/blob/master/VIREL_code/beta.py
     #https://github.com/haarnoja/sac/blob/8258e33633c7e37833cc39315891e77adfbe14b2/sac/algos/sac.py#L295
     #https://github.com/rail-berkeley/rlkit/blob/60bdfcd09f48f73a450da139b2ba7910b8cede53/rlkit/torch/smac/pearl.py#L247
     #Equation 20 in Dream to Explore paper
     v_target= q1_target_ensemble - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (div_estimate + Iprojection)
-    v_loss= self.vf_criterion(v_pred, v_target.detach()) 
+    #v_loss= self.vf_criterion(v_pred, v_target.detach()) 
+    v_loss = WeightedLoss(v_pred - v_target.detach()) 
     v_w_norm = self._get_v_weight_norm()
     norm_loss = self._weight_decays[3] * v_w_norm
     loss = v_loss + norm_loss
@@ -1108,13 +1124,21 @@ class D2EAgent(Agent):
     self._agent_module.p_net.train()
     self._p_optimizer.zero_grad()
     policy_loss,_=self._build_p_loss(batch)
-    policy_loss.backward(retain_graph=True)
+    policy_loss.backward()
+    if self._grad_norm_clipping > 0.:
+       torch.nn.utils.clip_grad_norm_(self._agent_module.p_net.parameters(), self._grad_norm_clipping)
+    if self._grad_value_clipping > 0.0:
+       torch.nn.utils.clip_grad_value_(self._agent_module.p_net.parameters(), self._grad_value_clipping)
     self._p_optimizer.step()
     # Update value network
     self._agent_module.v_net.train()
     self._v_optimizer.zero_grad()
     value_loss,_=self._build_v_loss(batch)
     value_loss.backward(retain_graph=True)
+    if self._grad_norm_clipping > 0.:
+       torch.nn.utils.clip_grad_norm_(self._agent_module.v_net.parameters(), self._grad_norm_clipping)
+    if self._grad_value_clipping > 0.0:
+       torch.nn.utils.clip_grad_value_(self._agent_module.v_net.parameters(), self._grad_value_clipping)
     self._v_optimizer.step()
     # Update q networks parameter
     for q_fn, q_fn_target in self._q_fns:
@@ -1123,6 +1147,12 @@ class D2EAgent(Agent):
     self._q_optimizer.zero_grad()
     q_losses,q_info= self._build_q_loss(batch)
     q_losses.backward()
+    if self._grad_norm_clipping > 0.:
+       torch.nn.utils.clip_grad_norm_(q_fn.parameters(), self._grad_norm_clipping)
+       torch.nn.utils.clip_grad_norm_(q_fn_target.parameters(), self._grad_norm_clipping)
+    if self._grad_value_clipping > 0.0:
+       torch.nn.utils.clip_grad_value_(q_fn.parameters(), self._grad_value_clipping)
+       torch.nn.utils.clip_grad_value_( q_fn_target.parameters(), self._grad_value_clipping)
     self._q_optimizer.step()
     #Update critic network parameter
     self._agent_module.c_net.train()
@@ -1168,6 +1198,8 @@ class D2EAgent(Agent):
     if self._train_alpha_entropy:
        info["alpha_entropy_loss"]=ae_loss.cpu().item()
        self._agent_module.assign_alpha_entropy(ae_info["alpha_entropy"])
+    if self._global_step%10 == 0:
+       logging.info("Policy Loss:{}, Value Loss:{}, Q Loss: {}, Reward: {}, q1_target:{}, q2_target:{} ".format(info["policy_loss"],info["value_loss"], info["Q_loss"],info["reward_mean"],info["q1_target_mean"],info["q2_target_mean"]))
     return info
   
   def _extra_c_step(self, batch):
