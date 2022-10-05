@@ -6,7 +6,7 @@ from __future__ import print_function
 import collections
 import os
 import time
-
+import torch
 from absl import logging
 
 import gin
@@ -41,6 +41,7 @@ def train_eval_online(
     total_train_steps=int(1e6),
     summary_freq=100,
     print_freq=1000,
+    plot_train_freq=500,
     save_freq=int(1e8),
     eval_freq=5000,
     n_eval_episodes=20,
@@ -140,6 +141,7 @@ def train_eval_online(
   collector = DataCollector(
       env, agent.online_policy, train_data)
   for _ in range(total_train_steps):
+    
     collector.collect_transition()
     agent.train_step()
     step = agent.global_step
@@ -147,6 +149,8 @@ def train_eval_online(
       agent.write_train_summary(train_summary_writer)
     if step % print_freq == 0 or step == total_train_steps:
       agent.print_train_info()
+    if step % plot_train_freq == 0 or step == total_train_steps:
+      agent.plot_train_info(os.path.join(log_dir, "train"))
 
     if step % eval_freq == 0 or step == total_train_steps:
       time_ed = time.time()
@@ -156,7 +160,7 @@ def train_eval_online(
       eval_result, eval_infos = eval_policies(
           env_test, agent.test_policies, n_eval_episodes)
       eval_results.append([step] + eval_result)
-      # Cecide whether to save a partially trained policy based on current model
+      # Decide whether to save a partially trained policy based on current model
       # performance.
       if (eval_target is not None and len(eval_results) >= eval_target_n
           and not target_partial_policy_saved):
@@ -243,7 +247,7 @@ class TrainOnlineD2E(args):
     args.env_name = 'HalfCheetah-v2'
     args.eval_target = 4000
     args.agent_name = 'sac'
-    args.total_train_steps = 100  # Short training.
+    args.total_train_steps = 10000  # Short training.
     args.n_eval_episodes = 1
 
     main(args)  # Just test that it runs.

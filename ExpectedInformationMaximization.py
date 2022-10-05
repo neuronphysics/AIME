@@ -991,7 +991,18 @@ class GaussianEMM(nn.Module):
 ###################################################
 ############# Main Class of the Model #############
 ###################################################
-
+def OrthogonalRegularization(model, reg=1e-6, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
+    #https://github.com/kevinzakka/pytorch-goodies
+    with torch.enable_grad():
+        orth_loss = torch.zeros(1).to(device)
+        for name, param in model.named_parameters():
+            if 'bias' not in name:
+                param_flat = param.view(param.shape[0], -1)
+                sym = torch.mm(param_flat, torch.t(param_flat))
+                sym -= torch.eye(param_flat.shape[0]).to(device)
+                orth_loss +=  reg * sym.abs().sum()
+    return orth_loss
+            
 def LogisticRegressionLoss(pq_outputs):
     p_outputs, q_outputs = pq_outputs
     loss = - torch.mean(torch.log(torch.sigmoid(p_outputs) +1e-15))- torch.mean(torch.log(1 - torch.sigmoid(q_outputs) + 1e-15))
@@ -1042,9 +1053,7 @@ class DensityRatioEstimator(nn.Module):
         # self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
         self.optimizer =AdaBound([ 
                          { 'params': self._ldre_net.parameters() },
-                         { 'params': self._p_samples.parameters() }, 
-                         { 'params': self._q_samples.parameters() }, 
-                         ],  lr=1e-3, betas=(0.9, 0.999))
+                         ],  lr=3e-4, betas=(0.5, 0.999))
         self.lr_scheduler = None # torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99999)
         self.initializers = [XavierUniform(bias=False, module_filter='*')]
         self.regularizers   = [L2Regularizer(scale=1e-4, module_filter='*')]
@@ -1052,7 +1061,7 @@ class DensityRatioEstimator(nn.Module):
         if self._early_stopping:
 
             self.callbacks = [EarlyStopping(monitor='val_loss', patience=10),
-                        ReduceLROnPlateau(factor=0.2, patience=5)]
+                        ReduceLROnPlateau(factor=0.2, patience=10)]
         else:
             self.callbacks  = []
         
@@ -1321,7 +1330,7 @@ class ConditionalMixtureEIM:
             components_net_reg_loss_fact=0.,
             components_net_drop_prob=0.0,
             components_net_hidden_layers=[50, 50],
-            components_grad_clipping=10,
+            components_grad_clipping=2.,
             # Gating
             gating_learning_rate=1e-3,
             gating_batch_size=1000,
@@ -1329,7 +1338,7 @@ class ConditionalMixtureEIM:
             gating_net_reg_loss_fact=0.,
             gating_net_drop_prob=0.0,
             gating_net_hidden_layers=[50, 50],
-            gating_grad_clipping=10,
+            gating_grad_clipping=2.,
             # Density Ratio Estimation
             dre_reg_loss_fact=0.0,  # Scaling Factor for L2 regularization of density ratio estimator
             dre_early_stopping=True,  # Use early stopping for density ratio estimator training
@@ -1337,7 +1346,7 @@ class ConditionalMixtureEIM:
             dre_num_iters=1000,  # Number of density ratio estimator steps each iteration (i.e. max number if early stopping)
             dre_batch_size=1000,  # Batch size for density ratio estimator training
             dre_hidden_layers=[30, 30],  # width of density ratio estimator  hidden layers
-            dre_grad_clipping=1
+            dre_grad_clipping=2.
         )
         c.finalize_adding()
         return c
@@ -1467,7 +1476,7 @@ class ConditionalMixtureEIM:
             dataset = torch.utils.data.TensorDataset(self._train_contexts, importance_weights[:, i], old_means, old_chol_precisions)
 
             loader = torch.utils.data.DataLoader( dataset, shuffle = True, batch_size=self.c.components_batch_size)
-
+            l1_lambda = 0.0001
             for batch_idx, (context_batch, iw_batch, old_means_batch, old_chol_precisions_batch) in enumerate(loader):
                 self._c_opts[i].zero_grad()
                 iw_batch = iw_batch / torch.sum(iw_batch)
@@ -1481,7 +1490,10 @@ class ConditionalMixtureEIM:
                 # print("iw_batch", iw_batch)
                 # print("losses", losses)
                 # print("kls", kls)
-                loss = torch.mean(iw_batch * (losses + kls))
+                #Adding  L1 regularization to prevent gradient explosion
+                l1_norm = sum(p.abs().sum() for p in self._model.components[i].parameters())
+                #orth_norm = OrthogonalRegularization(self._model.components[i])
+                loss = torch.mean(iw_batch * (losses + kls)) + l1_lambda * l1_norm 
                 #loss = torch.mean(iw_batch*kls)
                 if self.c.components_grad_clipping and self.c.components_grad_clipping > 0:
                     torch.nn.utils.clip_grad_norm_(self._model.components[i].parameters(), self.c.components_grad_clipping)
@@ -2060,8 +2072,8 @@ class DRERecMod(RecorderModule):
         self._acc.append(acc.item())
         self._true_mean.append(true_mean.item())
         self._fake_mean.append(fake_mean.item())
-        print("self._loss", self._loss)
-        print("self._acc", self._acc)
+        #print("self._loss", self._loss)
+        #print("self._acc", self._acc)
         if self._plot_realtime:
             self._recorder.handle_plot("Discriminator Evaluation", self._plot)
 
