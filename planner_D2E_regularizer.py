@@ -765,10 +765,10 @@ class D2EAgent(Agent):
       self,
       alpha=1.0,
       alpha_max=ALPHA_MAX,
-      train_alpha=False,
-      value_penalty=True,
-      target_divergence=0.0,
-      alpha_entropy=0.0,
+      train_alpha= False,
+      value_penalty= True,
+      target_divergence= 0.0,
+      alpha_entropy= 1e-5,
       train_alpha_entropy=False,
       target_entropy=None,
       EIM_config = ConditionalMixtureEIM.get_default_config(),
@@ -1069,7 +1069,7 @@ class D2EAgent(Agent):
     s = batch['s1']
     a_b = batch['a1']
     _, a_p, _ = self._p_fn(s.to(device=self.device))
-    alpha = self._get_alpha()
+    alpha = self._get_alpha()[0]
     div_estimate = self._divergence.dual_estimate(
         s.to(device=self.device), a_p, a_b.to(device=self.device))
     a_loss = - torch.mean(alpha * (div_estimate - self._target_divergence))
@@ -1085,7 +1085,7 @@ class D2EAgent(Agent):
   def _build_ae_loss(self, batch):
     s = batch['s1']
     _, _, log_pi_a = self._p_fn(s.to(device=self.device))
-    alpha = self._get_alpha_entropy()
+    alpha = self._get_alpha_entropy()[0]
     ae_loss = torch.mean(alpha * (- log_pi_a - self._target_entropy))
 
     info = collections.OrderedDict()
@@ -1123,7 +1123,7 @@ class D2EAgent(Agent):
     # policy network's update should be done before updating q network, or there will make some errors
     self._agent_module.p_net.train()
     self._p_optimizer.zero_grad()
-    policy_loss,_=self._build_p_loss(batch)
+    policy_loss, _ = self._build_p_loss(batch)
     policy_loss.backward()
     if self._grad_norm_clipping > 0.:
        torch.nn.utils.clip_grad_norm_(self._agent_module.p_net.parameters(), self._grad_norm_clipping)
@@ -1133,7 +1133,7 @@ class D2EAgent(Agent):
     # Update value network
     self._agent_module.v_net.train()
     self._v_optimizer.zero_grad()
-    value_loss,_=self._build_v_loss(batch)
+    value_loss, _ = self._build_v_loss(batch)
     value_loss.backward(retain_graph=True)
     if self._grad_norm_clipping > 0.:
        torch.nn.utils.clip_grad_norm_(self._agent_module.v_net.parameters(), self._grad_norm_clipping)
@@ -1266,10 +1266,10 @@ class D2EAgent(Agent):
           checkpoint["q_net"]        = q_fn.state_dict()
           checkpoint["q_net_target"] = q_fn_target.state_dict()
       if self._train_alpha:
-          checkpoint["alpha"] = self._alpha_var
+          checkpoint["alpha"] = self._agent_module._alpha_var
           checkpoint["alpha_optimizer"] = self._a_optimizer.state_dict()
       if self._train_alpha_entropy:
-          checkpoint["alpha_entropy"] = self._alpha_entropy_var
+          checkpoint["alpha_entropy"] = self._agent_module._alpha_entropy_var
           checkpoint["alpha_entropy_optimizer"] = self._ae_optimizer.state_dict()   
       torch.save(checkpoint, self.checkpoint_path)
     
@@ -1287,10 +1287,10 @@ class D2EAgent(Agent):
         self._v_optimizer.load_state_dict(checkpoint["value_optimizer"])
         self._global_step = checkpoint["train_step"]
         if self._train_alpha:
-            self._alpha_var = checkpoint["alpha"]
+            self._agent_module._alpha_var = checkpoint["alpha"]
             self._a_optimizer.load_state_dict(checkpoint["alpha_optimizer"])
         if self._train_alpha_entropy:
-            self._alpha_entropy_var=checkpoint["alpha_entropy"]
+            self._agent_module._alpha_entropy_var=checkpoint["alpha_entropy"]
             self._ae_optimizer.load_state_dict(checkpoint["alpha_entropy_optimizer"])
         print("load checkpoint from \"" + self.checkpoint_path +
               "\" at " + str(self._global_step) + " time step")
