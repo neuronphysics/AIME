@@ -768,7 +768,7 @@ class D2EAgent(Agent):
       train_alpha= False,
       value_penalty= True,
       target_divergence= 0.0,
-      alpha_entropy= 1e-5,
+      alpha_entropy= 0.0,
       train_alpha_entropy=False,
       target_entropy=None,
       EIM_config = ConditionalMixtureEIM.get_default_config(),

@@ -260,81 +260,86 @@ def to_tensor(x, device):
     minimizing Kullback-Leibler divergences by estimating density ratios
     Based on https://github.com/pbecker93/ExpectedInformationMaximization/
 """
-def weights_init(modules, type='xavier'):
+def weights_init(modules, type='xavier', gain=0.02):
     "Based on shorturl.at/jmqV3"
-    m = modules
-    if isinstance(m, nn.Conv2d):
-        if type == 'xavier':
-            torch.nn.init.xavier_normal_(m.weight)
-        elif type == 'kaiming':  # msra
-            torch.nn.init.kaiming_normal_(m.weight)
-        else:
-            n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-            m.weight.data.normal_(0, math.sqrt(2. / n))
+    with torch.no_grad():
+         m = modules
+         if isinstance(m, nn.Conv2d):
+             if type == 'xavier':
+                 torch.nn.init.xavier_normal_(m.weight.data, gain=gain)
+             elif type == 'kaiming':  # msra
+                 torch.nn.init.kaiming_normal_(m.weight.data)
+             elif type == 'orthogonal':
+                 torch.nn.init.orthogonal_(m.weight.data, gain=gain)
+             else:
+                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                 m.weight.data.normal_(0, math.sqrt(2. / n))
 
-        if m.bias is not None:
-            m.bias.data.zero_()
-    elif isinstance(m, nn.ConvTranspose2d):
-        if type == 'xavier':
-            torch.nn.init.xavier_normal_(m.weight)
-        elif type == 'kaiming':  # msra
-            torch.nn.init.kaiming_normal_(m.weight)
-        else:
-            n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-            m.weight.data.normal_(0, math.sqrt(2. / n))
+             if m.bias is not None:
+                 m.bias.data.zero_()
+         elif isinstance(m, nn.ConvTranspose2d):
+             if type == 'xavier':
+                 torch.nn.init.xavier_normal_(m.weight.data, gain=gain)
+             elif type == 'kaiming':  # msra
+                 torch.nn.init.kaiming_normal_(m.weight.data)
+             else:
+                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                 m.weight.data.normal_(0, math.sqrt(2. / n))
 
-        if m.bias is not None:
-            m.bias.data.zero_()
-    elif isinstance(m, nn.BatchNorm2d):
-        m.weight.data.fill_(1.0)
-        m.bias.data.zero_()
-    elif isinstance(m, nn.Linear):
-        if type == 'xavier':
-            torch.nn.init.xavier_normal_(m.weight)
-        elif type == 'kaiming':  # msra
-            torch.nn.init.kaiming_normal_(m.weight)
-        else:
-            m.weight.data.fill_(1.0)
+             if m.bias is not None:
+                 m.bias.data.zero_()
+         elif isinstance(m, nn.BatchNorm2d):
+             m.weight.data.fill_(1.0)
+             m.bias.data.zero_()
+         elif isinstance(m, nn.Linear):
+             if type == 'xavier':
+                 torch.nn.init.xavier_normal_(m.weight.data, gain=gain)
+             elif type == 'kaiming':  # msra
+                 torch.nn.init.kaiming_normal_(m.weight.data)
+             elif type == 'orthogonal':
+                   torch.nn.init.orthogonal_(m.weight.data, gain=gain)
+             else:           
+                 m.weight.data.fill_(1.0)
 
-        if m.bias is not None:
-            m.bias.data.zero_()
-    elif isinstance(m, nn.Sequential):
-        for k, v in m._modules.items():
-            if isinstance(v, nn.Conv2d):
-                if type == 'xavier':
-                    torch.nn.init.xavier_normal_(v.weight)
-                elif type == 'kaiming':  # msra
-                    torch.nn.init.kaiming_normal_(v.weight)
-                else:
-                    n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
-                    v.weight.data.normal_(0, np.sqrt(2. / n))
+             if m.bias is not None:
+                 m.bias.data.zero_()
+         elif isinstance(m, nn.Sequential):
+             for k, v in m._modules.items():
+                 if isinstance(v, nn.Conv2d):
+                     if type == 'xavier':
+                         torch.nn.init.xavier_normal_(v.weight.data)
+                     elif type == 'kaiming':  # msra
+                         torch.nn.init.kaiming_normal_(v.weight.data)
+                     else:
+                         n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
+                         v.weight.data.normal_(0, np.sqrt(2. / n))
 
-                if v.bias is not None:
-                    v.bias.data.zero_()
-            elif isinstance(v, nn.ConvTranspose2d):
-                if type == 'xavier':
-                    torch.nn.init.xavier_normal_(v.weight)
-                elif type == 'kaiming':  # msra
-                    torch.nn.init.kaiming_normal_(v.weight)
-                else:
-                    n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
-                    v.weight.data.normal_(0, np.sqrt(2. / n))
+                     if v.bias is not None:
+                         v.bias.data.zero_()
+                 elif isinstance(v, nn.ConvTranspose2d):
+                     if type == 'xavier':
+                         torch.nn.init.xavier_normal_(v.weight)
+                     elif type == 'kaiming':  # msra
+                         torch.nn.init.kaiming_normal_(v.weight)
+                     else:
+                         n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
+                         v.weight.data.normal_(0, np.sqrt(2. / n))
 
-                if v.bias is not None:
-                    v.bias.data.zero_()
-            elif isinstance(v, nn.BatchNorm2d):
-                v.weight.data.fill_(1.0)
-                v.bias.data.zero_()
-            elif isinstance(v, nn.Linear):
-                if type == 'xavier':
-                    torch.nn.init.xavier_normal_(v.weight)
-                elif type == 'kaiming':  # msra
-                    torch.nn.init.kaiming_normal_(v.weight)
-                else:
-                    v.weight.data.fill_(1.0)
+                     if v.bias is not None:
+                         v.bias.data.zero_()
+                 elif isinstance(v, nn.BatchNorm2d):
+                     v.weight.data.fill_(1.0)
+                     v.bias.data.zero_()
+                 elif isinstance(v, nn.Linear):
+                     if type == 'xavier':
+                         torch.nn.init.xavier_normal_(v.weight)
+                     elif type == 'kaiming':  # msra
+                         torch.nn.init.kaiming_normal_(v.weight)
+                     else:
+                         v.weight.data.fill_(1.0)
 
-                if v.bias is not None:
-                    v.bias.data.zero_()
+                     if v.bias is not None:
+                         v.bias.data.zero_()
 
 class RecorderKeys:
     TRAIN_ITER = "train_iteration_module"
@@ -426,6 +431,8 @@ def build_dense_network(input_dim, output_dim, output_activation, params, with_o
             layers.append(nn.ReLU())
         elif activation=="LeakyRelu":
             layers.append(nn.LeakyReLU(0.1,inplace=True))
+        elif activation=="elu":
+            layers.append(torch.nn.ELU())
         else:
             pass
 
@@ -671,7 +678,7 @@ class ConditionalGaussian(nn.Module):
         elif isinstance(self._hidden_net._modules[list(self._hidden_net._modules)[-3]], nn.Linear) and isinstance(self._hidden_net._modules[list(self._hidden_net._modules)[-2]], nn.BatchNorm1d):
            hidden_dim = self._hidden_net._modules[list(self._hidden_net._modules)[-3]].out_features
         #add a linear layer for a combination of mean and covariance
-        self._model._modules[str(int(idx)+1)] = torch.nn.LeakyReLU(0.3)
+        self._model._modules[str(int(idx)+1)] = torch.nn.ELU()
         self._model._modules[str(int(idx)+2)] = nn.Linear(hidden_dim, self._sample_dim+self._sample_dim ** 2)
 
 
@@ -1002,10 +1009,14 @@ def OrthogonalRegularization(model, reg=1e-6, device=torch.device('cuda') if tor
                 sym -= torch.eye(param_flat.shape[0]).to(device)
                 orth_loss +=  reg * sym.abs().sum()
     return orth_loss
+
+
+def log_clip(x):
+    return torch.log(torch.clamp(x, 1e-10, None))
             
 def LogisticRegressionLoss(pq_outputs):
     p_outputs, q_outputs = pq_outputs
-    loss = - torch.mean(torch.log(torch.sigmoid(p_outputs) +1e-15))- torch.mean(torch.log(1 - torch.sigmoid(q_outputs) + 1e-15))
+    loss = - torch.mean(log_clip(torch.sigmoid(p_outputs)))- torch.mean(log_clip(1 - torch.sigmoid(q_outputs) ))
     return  loss
 
 class DensityRatioEstimator(nn.Module):
@@ -1338,7 +1349,7 @@ class ConditionalMixtureEIM:
             gating_net_reg_loss_fact=0.,
             gating_net_drop_prob=0.0,
             gating_net_hidden_layers=[50, 50],
-            gating_grad_clipping=2.,
+            gating_grad_clipping=2.0,
             # Density Ratio Estimation
             dre_reg_loss_fact=0.0,  # Scaling Factor for L2 regularization of density ratio estimator
             dre_early_stopping=True,  # Use early stopping for density ratio estimator training
@@ -1346,7 +1357,7 @@ class ConditionalMixtureEIM:
             dre_num_iters=1000,  # Number of density ratio estimator steps each iteration (i.e. max number if early stopping)
             dre_batch_size=1000,  # Batch size for density ratio estimator training
             dre_hidden_layers=[30, 30],  # width of density ratio estimator  hidden layers
-            dre_grad_clipping=2.
+            dre_grad_clipping=2.0
         )
         c.finalize_adding()
         return c
@@ -1364,19 +1375,19 @@ class ConditionalMixtureEIM:
         self._sample_dim = sample_dim
 
         c_net_hidden_dict = {NetworkKeys.NUM_UNITS: self.c.components_net_hidden_layers,
-                             NetworkKeys.ACTIVATION: "LeakyRelu",
+                             NetworkKeys.ACTIVATION: "elu",
                              NetworkKeys.BATCH_NORM: False,
                              NetworkKeys.DROP_PROB: self.c.components_net_drop_prob,
                              NetworkKeys.L2_REG_FACT: self.c.components_net_reg_loss_fact}
 
         g_net_hidden_dict = {NetworkKeys.NUM_UNITS: self.c.gating_net_hidden_layers,
-                             NetworkKeys.ACTIVATION: "LeakyRelu",
+                             NetworkKeys.ACTIVATION: "elu",
                              NetworkKeys.BATCH_NORM: False,
                              NetworkKeys.DROP_PROB: self.c.gating_net_drop_prob,
                              NetworkKeys.L2_REG_FACT: self.c.gating_net_reg_loss_fact}
 
         dre_params = {NetworkKeys.NUM_UNITS: self.c.dre_hidden_layers,
-                      NetworkKeys.ACTIVATION: "LeakyRelu",
+                      NetworkKeys.ACTIVATION: "elu",
                       NetworkKeys.DROP_PROB: self.c.dre_drop_prob,
                       NetworkKeys.L2_REG_FACT: self.c.dre_reg_loss_fact}
 
@@ -1400,7 +1411,9 @@ class ConditionalMixtureEIM:
         self._dre.set_trainer()
         self._c_opts = [ torch.optim.Adam(self._model.components[i].trainable_variables, lr=self.c.components_learning_rate, betas=(0.5, 0.999)) for i in range(len(self._model.components))]
         self._g_opt = torch.optim.Adam(self._model.gating_distribution.trainable_variables, lr=self.c.gating_learning_rate, betas=(0.5, 0.999))
-
+        
+        self._c_lrs = [torch.optim.lr_scheduler.ReduceLROnPlateau(c_opt, 'min', factor=0.2, patience=10, verbose=True)for c_opt in self._c_opts]
+        self._g_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(self._g_opt, 'min', factor=0.2, patience=10, verbose=True)
         #self._c_lrs = [torch.optim.lr_scheduler.ExponentialLR(c_opt, gamma=0.998) for c_opt in self._c_opts]
         #self._g_lr = torch.optim.lr_scheduler.ExponentialLR(self._g_opt, gamma=0.998)
 
@@ -1496,11 +1509,11 @@ class ConditionalMixtureEIM:
                 loss = torch.mean(iw_batch * (losses + kls)) + l1_lambda * l1_norm 
                 #loss = torch.mean(iw_batch*kls)
                 if self.c.components_grad_clipping and self.c.components_grad_clipping > 0:
-                    torch.nn.utils.clip_grad_norm_(self._model.components[i].parameters(), self.c.components_grad_clipping)
+                    torch.nn.utils.clip_grad_norm_(self._model.components[i].parameters(), max_norm = self.c.components_grad_clipping, norm_type=2)
                 loss.backward()
                 self._c_opts[i].step()
-            #if self._c_lrs:
-            #    self._c_lrs[i].step()
+            if self._c_lrs:
+                self._c_lrs[i].step(loss)
             self._c_opts[i].zero_grad()
 
     """gating update"""
@@ -1539,10 +1552,10 @@ class ConditionalMixtureEIM:
             loss = torch.sum(torch.mean(probabilities * losses_batch, 0)) + kl
             loss.backward()
             if self.c.gating_grad_clipping and self.c.gating_grad_clipping > 0:
-                torch.nn.utils.clip_grad_norm_(self._model.gating_distribution.parameters(), self.c.gating_grad_clipping)
+                torch.nn.utils.clip_grad_norm_(self._model.gating_distribution.parameters(), max_norm= self.c.gating_grad_clipping, norm_type=2)
             self._g_opt.step()
-        #if self._g_lr:
-        #    self._g_lr.step()
+        if self._g_lr:
+            self._g_lr.step(loss)
         self._g_opt.zero_grad()
 
     @property
