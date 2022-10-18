@@ -51,7 +51,7 @@ def train_eval_online(
     # Agent train args.
     initial_explore_steps=10000,
     replay_buffer_size=int(1e6),
-    model_params=(((200, 200),), 2),
+    model_params=(((200, 200),), 2, 1),
     optimizers=(( 0.0001, 0.5, 0.99),),
     batch_size=256,
     weight_decays=(0.0,),

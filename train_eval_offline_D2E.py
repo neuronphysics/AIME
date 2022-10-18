@@ -68,7 +68,7 @@ def train_eval_offline(
     eval_freq=5000,
     n_eval_episodes=20,
     # Agent args.
-    model_params=(((200, 200),), 2),
+    model_params=(((200, 200),), 2,  1),
     optimizers=(( 0.0001, 0.5, 0.99),),
     batch_size=256,
     weight_decays=(0.0,),

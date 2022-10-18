@@ -26,11 +26,13 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torchsample.datasets import TensorDataset
 import re
-
+import torch_optimizer as optim
 import os
 if not os.path.exists("EIM_out_imgs"):
     os.makedirs("EIM_out_imgs")
 from torch.optim import Optimizer
+from ObstacleData import ObstacleData
+import json
 
 def clip(x, min_value, max_value, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
     """Element-wise value clipping.
@@ -82,121 +84,6 @@ class MinMaxNorm(Constraint):
             + (1 - self.rate) * norms
         )
         module.weight.data= w * (desired / (self.epsilon + norms))
-
-
-class AdaBound(Optimizer):
-    """Implements AdaBound algorithm.
-    It has been proposed in `Adaptive Gradient Methods with Dynamic Bound of Learning Rate`_.
-    Arguments:
-        params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
-        lr (float, optional): Adam learning rate (default: 1e-3)
-        betas (Tuple[float, float], optional): coefficients used for computing
-            running averages of gradient and its square (default: (0.9, 0.999))
-        final_lr (float, optional): final (SGD) learning rate (default: 0.1)
-        gamma (float, optional): convergence speed of the bound functions (default: 1e-3)
-        eps (float, optional): term added to the denominator to improve
-            numerical stability (default: 1e-8)
-        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
-        amsbound (boolean, optional): whether to use the AMSBound variant of this algorithm
-    .. Adaptive Gradient Methods with Dynamic Bound of Learning Rate:
-        https://openreview.net/forum?id=Bkg3g2R9FX
-    """
-
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), final_lr=0.1, gamma=1e-3,
-                 eps=1e-8, weight_decay=0, amsbound=False):
-        if not 0.0 <= lr:
-            raise ValueError("Invalid learning rate: {}".format(lr))
-        if not 0.0 <= eps:
-            raise ValueError("Invalid epsilon value: {}".format(eps))
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
-        if not 0.0 <= final_lr:
-            raise ValueError("Invalid final learning rate: {}".format(final_lr))
-        if not 0.0 <= gamma < 1.0:
-            raise ValueError("Invalid gamma parameter: {}".format(gamma))
-        defaults = dict(lr=lr, betas=betas, final_lr=final_lr, gamma=gamma, eps=eps,
-                        weight_decay=weight_decay, amsbound=amsbound)
-        super(AdaBound, self).__init__(params, defaults)
-
-        self.base_lrs = list(map(lambda group: group['lr'], self.param_groups))
-
-    def __setstate__(self, state):
-        super(AdaBound, self).__setstate__(state)
-        for group in self.param_groups:
-            group.setdefault('amsbound', False)
-
-    def step(self, closure=None):
-        """Performs a single optimization step.
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        for group, base_lr in zip(self.param_groups, self.base_lrs):
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data
-                if grad.is_sparse:
-                    raise RuntimeError(
-                        'Adam does not support sparse gradients, please consider SparseAdam instead')
-                amsbound = group['amsbound']
-
-                state = self.state[p]
-
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    # Exponential moving average of gradient values
-                    state['exp_avg'] = torch.zeros_like(p.data)
-                    # Exponential moving average of squared gradient values
-                    state['exp_avg_sq'] = torch.zeros_like(p.data)
-                    if amsbound:
-                        # Maintains max of all exp. moving avg. of sq. grad. values
-                        state['max_exp_avg_sq'] = torch.zeros_like(p.data)
-
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                if amsbound:
-                    max_exp_avg_sq = state['max_exp_avg_sq']
-                beta1, beta2 = group['betas']
-
-                state['step'] += 1
-
-                if group['weight_decay'] != 0:
-                    grad = grad.add(group['weight_decay'], p.data)
-
-                # Decay the first and second moment running average coefficient
-                exp_avg.mul_(beta1).add_(1 - beta1, grad)
-                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
-                if amsbound:
-                    # Maintains the maximum of all 2nd moment running avg. till now
-                    torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
-                    # Use the max. for normalizing running avg. of gradient
-                    denom = max_exp_avg_sq.sqrt().add_(group['eps'])
-                else:
-                    denom = exp_avg_sq.sqrt().add_(group['eps'])
-
-                bias_correction1 = 1 - beta1 ** state['step']
-                bias_correction2 = 1 - beta2 ** state['step']
-                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
-
-                # Applies bounds on actual learning rate
-                # lr_scheduler cannot affect final_lr, this is a workaround to apply lr decay
-                final_lr = group['final_lr'] * group['lr'] / base_lr
-                lower_bound = final_lr * (1 - 1 / (group['gamma'] * state['step'] + 1))
-                upper_bound = final_lr * (1 + 1 / (group['gamma'] * state['step']))
-                step_size = torch.full_like(denom, step_size)
-                step_size.div_(denom).clamp_(lower_bound, upper_bound).mul_(exp_avg)
-
-                p.data.add_(-step_size)
-
-        return loss
 
 
 class Split(torch.nn.Module):
@@ -260,15 +147,15 @@ def to_tensor(x, device):
     minimizing Kullback-Leibler divergences by estimating density ratios
     Based on https://github.com/pbecker93/ExpectedInformationMaximization/
 """
-def weights_init(modules, type='xavier', gain=0.02):
-    "Based on shorturl.at/jmqV3"
+def weights_init(modules, type='xavier', gain=1./(8.*math.sqrt(2))):
+    "Based on https://github.com/SerCharles/LayoutEstimationSingle/blob/6b75711549daa33f750dd0a648402852d67f52d2/pretrain/models/dorn.py"
     with torch.no_grad():
          m = modules
-         if isinstance(m, nn.Conv2d):
+         if isinstance(m, nn.Conv2d) and hasattr(m, 'weight'):
              if type == 'xavier':
                  torch.nn.init.xavier_normal_(m.weight.data, gain=gain)
              elif type == 'kaiming':  # msra
-                 torch.nn.init.kaiming_normal_(m.weight.data)
+                 torch.nn.init.kaiming_normal_(m.weight.data,  mode= "fan_in", nonlinearity='relu')
              elif type == 'orthogonal':
                  torch.nn.init.orthogonal_(m.weight.data, gain=gain)
              else:
@@ -281,7 +168,7 @@ def weights_init(modules, type='xavier', gain=0.02):
              if type == 'xavier':
                  torch.nn.init.xavier_normal_(m.weight.data, gain=gain)
              elif type == 'kaiming':  # msra
-                 torch.nn.init.kaiming_normal_(m.weight.data)
+                 torch.nn.init.kaiming_normal_(m.weight.data, mode= "fan_in", nonlinearity='relu')
              else:
                  n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
                  m.weight.data.normal_(0, math.sqrt(2. / n))
@@ -291,11 +178,11 @@ def weights_init(modules, type='xavier', gain=0.02):
          elif isinstance(m, nn.BatchNorm2d):
              m.weight.data.fill_(1.0)
              m.bias.data.zero_()
-         elif isinstance(m, nn.Linear):
+         elif isinstance(m, nn.Linear) and hasattr(m, 'weight'):
              if type == 'xavier':
                  torch.nn.init.xavier_normal_(m.weight.data, gain=gain)
              elif type == 'kaiming':  # msra
-                 torch.nn.init.kaiming_normal_(m.weight.data)
+                 torch.nn.init.kaiming_normal_(m.weight.data, mode= "fan_in", nonlinearity='relu')
              elif type == 'orthogonal':
                    torch.nn.init.orthogonal_(m.weight.data, gain=gain)
              else:           
@@ -309,7 +196,7 @@ def weights_init(modules, type='xavier', gain=0.02):
                      if type == 'xavier':
                          torch.nn.init.xavier_normal_(v.weight.data)
                      elif type == 'kaiming':  # msra
-                         torch.nn.init.kaiming_normal_(v.weight.data)
+                         torch.nn.init.kaiming_normal_(v.weight.data, mode= "fan_in", nonlinearity='relu')
                      else:
                          n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
                          v.weight.data.normal_(0, np.sqrt(2. / n))
@@ -320,7 +207,18 @@ def weights_init(modules, type='xavier', gain=0.02):
                      if type == 'xavier':
                          torch.nn.init.xavier_normal_(v.weight)
                      elif type == 'kaiming':  # msra
-                         torch.nn.init.kaiming_normal_(v.weight)
+                         torch.nn.init.kaiming_normal_(v.weight.data, mode= "fan_in", nonlinearity='relu')
+                     else:
+                         n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
+                         v.weight.data.normal_(0, np.sqrt(2. / n))
+
+                     if v.bias is not None:
+                         v.bias.data.zero_()
+                 elif isinstance(v, nn.Linear) and hasattr(v, 'weight'):
+                     if type == 'xavier':
+                         torch.nn.init.xavier_normal_(v.weight.data)
+                     elif type == 'kaiming':  # msra
+                         torch.nn.init.kaiming_normal_(v.weight.data, mode= "fan_in", nonlinearity='relu')
                      else:
                          n = v.kernel_size[0] * v.kernel_size[1] * v.out_channels
                          v.weight.data.normal_(0, np.sqrt(2. / n))
@@ -334,6 +232,7 @@ def weights_init(modules, type='xavier', gain=0.02):
                      if type == 'xavier':
                          torch.nn.init.xavier_normal_(v.weight)
                      elif type == 'kaiming':  # msra
+                         
                          torch.nn.init.kaiming_normal_(v.weight)
                      else:
                          v.weight.data.fill_(1.0)
@@ -410,8 +309,21 @@ class NetworkKeys:
 
 def l2_penalty(model, l2_lambda=0.001):
     """Returns the L2 penalty of the params."""
-    l2_norm = sum(p.pow(2).sum() for p in model.parameters())
-    return l2_lambda*l2_norm
+    
+    L2_reg = torch.tensor(0., requires_grad=True).to(device)
+    if isinstance(model, nn.Sequential):
+        for k, v in model._modules.items():
+            if isinstance(v, nn.Linear):
+               for name, param in v.named_parameters():
+                   if 'weight' in name:
+                      L2_reg =L2_reg+ param.pow(2).sum()
+    elif isinstance(model, nn.Linear):
+         for name, param in model.named_parameters():
+             if 'weight' in name:
+                L2_reg = L2_reg+ param.pow(2).sum()
+        
+    return l2_lambda *L2_reg
+
 
 
 def build_dense_network(input_dim, output_dim, output_activation, params, with_output_layer=True):
@@ -445,7 +357,7 @@ def build_dense_network(input_dim, output_dim, output_activation, params, with_o
 
         layers.append(nn.Linear(params[NetworkKeys.NUM_UNITS][-1],output_dim))
     model = nn.Sequential(*layers)
-    regularizer = l2_penalty(model, l2_lambda=0.001) if l2_reg_fact > 0 else None
+    regularizer = l2_penalty(model, l2_lambda=0.00001) if l2_reg_fact > 0 else None
     return model, regularizer
 ###########################################
 #############  Distributions  #############
@@ -668,7 +580,7 @@ class ConditionalGaussian(nn.Module):
         self.trainable = trainable
 
 
-        self._hidden_net, self.regularizer = build_dense_network(self._context_dim, output_dim=-1, output_activation=None,
+        self._hidden_net, _ = build_dense_network(self._context_dim, output_dim=-1, output_activation=None,
                                                   params=self._hidden_dict, with_output_layer=False)
 
         self._model = self._hidden_net
@@ -678,11 +590,13 @@ class ConditionalGaussian(nn.Module):
         elif isinstance(self._hidden_net._modules[list(self._hidden_net._modules)[-3]], nn.Linear) and isinstance(self._hidden_net._modules[list(self._hidden_net._modules)[-2]], nn.BatchNorm1d):
            hidden_dim = self._hidden_net._modules[list(self._hidden_net._modules)[-3]].out_features
         #add a linear layer for a combination of mean and covariance
-        self._model._modules[str(int(idx)+1)] = torch.nn.ELU()
-        self._model._modules[str(int(idx)+2)] = nn.Linear(hidden_dim, self._sample_dim+self._sample_dim ** 2)
+        self._model._modules[str(int(idx)+1)] = torch.nn.ReLU()
+        last_layer = nn.Linear(hidden_dim, self._sample_dim+self._sample_dim ** 2)
+        self._model._modules[str(int(idx)+2)]= last_layer
+        self._model.to(device)
+        self._regularizer = l2_penalty(self._model, l2_lambda=0.0001).to(device)
 
-
-        weights_init(self._model, 'xavier')
+        weights_init(self._model,  'xavier')
         #based on this  shorturl.at/pTVZ3
         self._chol_covar =  Lambda(self._create_chol)
 
@@ -695,7 +609,9 @@ class ConditionalGaussian(nn.Module):
 
         output      = self._model(contexts.to(device))
         mean, covar = SplitLayer(output,self._sample_dim,self._sample_dim ** 2)
-
+        #new line
+        covar = torch.nn.Softplus()(covar)
+        
         chol_covar  = self._chol_covar(covar)
         covariance  = torch.matmul(chol_covar, torch.transpose(chol_covar, -2, -1))
         return mean, covariance, chol_covar
@@ -1050,7 +966,7 @@ class DensityRatioEstimator(nn.Module):
         #input_dim = self._target_train_samples.shape[-1]
         print(f"DensityRatioEstimator input_dim for the NN: {input_dim}")
 
-        self._ldre_net, self._ldre_regularizer = build_dense_network(input_dim=input_dim, output_dim=1,
+        self._ldre_net, _ = build_dense_network(input_dim=input_dim, output_dim=1,
                                              output_activation="linear", params=self.hidden_params)
 
         self._p_samples = nn.Linear(input_dim,input_dim)
@@ -1062,9 +978,9 @@ class DensityRatioEstimator(nn.Module):
         )
         self.metrics   = [self.acc_fn]
         # self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
-        self.optimizer =AdaBound([ 
+        self.optimizer = optim.QHAdam([ 
                          { 'params': self._ldre_net.parameters() },
-                         ],  lr=3e-4, betas=(0.5, 0.999))
+                         ],  lr=3e-4, betas=(0.5, 0.999), eps=1e-7)
         self.lr_scheduler = None # torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99999)
         self.initializers = [XavierUniform(bias=False, module_filter='*')]
         self.regularizers   = [L2Regularizer(scale=1e-4, module_filter='*')]
@@ -1341,7 +1257,7 @@ class ConditionalMixtureEIM:
             components_net_reg_loss_fact=0.,
             components_net_drop_prob=0.0,
             components_net_hidden_layers=[50, 50],
-            components_grad_clipping=2.,
+            components_grad_clipping=5.0,
             # Gating
             gating_learning_rate=1e-3,
             gating_batch_size=1000,
@@ -1400,7 +1316,7 @@ class ConditionalMixtureEIM:
 
         self._model = GaussianEMM(self._context_dim, self._sample_dim, self.c.num_components, self.c.gating_num_epochs, self._dre,
                                   c_net_hidden_dict, g_net_hidden_dict, seed=seed)
-
+        self._model.to(device)
         self._recorder.initialize_module(RecorderKeys.INITIAL)
         self._recorder(RecorderKeys.INITIAL, "Nonlinear Conditional EIM - Reparametrization", config)
         #self._recorder.initialize_module(RecorderKeys.MODEL, self.c.train_epochs)
@@ -1409,11 +1325,11 @@ class ConditionalMixtureEIM:
         self._recorder.initialize_module(RecorderKeys.DRE, self.c.train_epochs)
         #initialise trainer inside DensityRatioEstimator class
         self._dre.set_trainer()
-        self._c_opts = [ torch.optim.Adam(self._model.components[i].trainable_variables, lr=self.c.components_learning_rate, betas=(0.5, 0.999)) for i in range(len(self._model.components))]
+        self._c_opts = [ optim.Yogi(self._model.components[i].trainable_variables, lr=self.c.components_learning_rate, betas=(0.5, 0.999)) for i in range(len(self._model.components))]
         self._g_opt = torch.optim.Adam(self._model.gating_distribution.trainable_variables, lr=self.c.gating_learning_rate, betas=(0.5, 0.999))
         
-        self._c_lrs = [torch.optim.lr_scheduler.ReduceLROnPlateau(c_opt, 'min', factor=0.2, patience=10, verbose=True)for c_opt in self._c_opts]
-        self._g_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(self._g_opt, 'min', factor=0.2, patience=10, verbose=True)
+        #self._c_lrs = [torch.optim.lr_scheduler.ReduceLROnPlateau(c_opt, 'min', factor=0.2, patience=10, verbose=True)for c_opt in self._c_opts]
+        #self._g_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(self._g_opt, 'min', factor=0.2, patience=10, verbose=True)
         #self._c_lrs = [torch.optim.lr_scheduler.ExponentialLR(c_opt, gamma=0.998) for c_opt in self._c_opts]
         #self._g_lr = torch.optim.lr_scheduler.ExponentialLR(self._g_opt, gamma=0.998)
 
@@ -1490,13 +1406,14 @@ class ConditionalMixtureEIM:
 
             loader = torch.utils.data.DataLoader( dataset, shuffle = True, batch_size=self.c.components_batch_size)
             l1_lambda = 0.0001
+            
             for batch_idx, (context_batch, iw_batch, old_means_batch, old_chol_precisions_batch) in enumerate(loader):
-                self._c_opts[i].zero_grad()
+                
                 iw_batch = iw_batch / torch.sum(iw_batch)
-                samples = self._model.components[i].sample(context_batch)
+                samples = self._model.components[i].sample(context_batch.to(device))
                 #with torch.no_grad():
-                losses = - torch.squeeze(self._dre(torch.cat([context_batch, samples], dim=-1), inTrain=False))
-                kls = self._model.components[i].kls_other_chol_inv(context_batch, old_means_batch[:, i], old_chol_precisions_batch[:, i])
+                losses = - torch.squeeze(self._dre(torch.cat([context_batch.to(device), samples], dim=-1), inTrain=False))
+                kls = self._model.components[i].kls_other_chol_inv(context_batch.to(device), old_means_batch[:, i].to(device), old_chol_precisions_batch[:, i].to(device))
                 # print("context_batch", context_batch, context_batch.shape)
                 # print("old_means_batch", old_means_batch, old_means_batch.shape)
                 # print("old_chol_precisions_batch", old_chol_precisions_batch, old_chol_precisions_batch.shape)
@@ -1504,16 +1421,20 @@ class ConditionalMixtureEIM:
                 # print("losses", losses)
                 # print("kls", kls)
                 #Adding  L1 regularization to prevent gradient explosion
-                l1_norm = sum(p.abs().sum() for p in self._model.components[i].parameters())
+                l1_norm = torch.mul(l1_lambda , sum(p.abs().sum() for p in self._model.components[i].parameters())).to(device)
+                
                 #orth_norm = OrthogonalRegularization(self._model.components[i])
-                loss = torch.mean(iw_batch * (losses + kls)) + l1_lambda * l1_norm 
+                loss = torch.mean(iw_batch * (losses + kls)).to(device) +  l1_norm + self._model.components[i]._regularizer
                 #loss = torch.mean(iw_batch*kls)
+                # Backprop:
+                self._c_opts[i].zero_grad()
+                loss.backward(retain_graph=True)
+                
                 if self.c.components_grad_clipping and self.c.components_grad_clipping > 0:
                     torch.nn.utils.clip_grad_norm_(self._model.components[i].parameters(), max_norm = self.c.components_grad_clipping, norm_type=2)
-                loss.backward()
                 self._c_opts[i].step()
-            if self._c_lrs:
-                self._c_lrs[i].step(loss)
+            #if self._c_lrs:
+            #    self._c_lrs[i].step(loss)
             self._c_opts[i].zero_grad()
 
     """gating update"""
@@ -1554,8 +1475,8 @@ class ConditionalMixtureEIM:
             if self.c.gating_grad_clipping and self.c.gating_grad_clipping > 0:
                 torch.nn.utils.clip_grad_norm_(self._model.gating_distribution.parameters(), max_norm= self.c.gating_grad_clipping, norm_type=2)
             self._g_opt.step()
-        if self._g_lr:
-            self._g_lr.step(loss)
+        #if self._g_lr:
+        #    self._g_lr.step(loss)
         self._g_opt.zero_grad()
 
     @property
@@ -1564,8 +1485,6 @@ class ConditionalMixtureEIM:
 ################################################################################
 #################  Running an experiment to test the model #####################
 ################################################################################
-from ObstacleData import ObstacleData
-import json
 
 class RecorderModule:
     """RecorderModule Superclass"""

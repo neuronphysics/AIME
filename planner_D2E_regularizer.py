@@ -103,6 +103,18 @@ class TanhTransform(pyd.transforms.Transform):
 ###############################################
 ##################  Networks  #################
 ###############################################
+def weights_init_(modules, init_type='xavier', gain=1):
+    m = modules
+    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+       if init_type == 'kaiming':
+          torch.nn.init.uniform_(m.weight, a = -0.05, b = 0.05 )
+       elif init_type == 'xavier':
+            torch.nn.init.xavier_uniform_(m.weight, gain=gain)
+       if m.bias is not None:
+            torch.nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.Module):
+        for _, m in modules.named_children():
+           weights_init_(m, init_type, gain=gain)
 
 class ActorNetwork(nn.Module):
   """Actor network."""
@@ -238,9 +250,14 @@ class CriticNetwork(nn.Module):
           self._layers.append(nn.ReLU())
       output_layer = nn.Linear(hidden_size, 1)
       self._layers.append(output_layer)
-      self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-      self.to(device=self.device)
-
+      
+      
+      with torch.no_grad():
+          weights_init_(self._layers, init_type='xavier', gain=0.01)
+          
+      self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')    
+      self.to(device=self.device) 
+        
     def forward(self, state,action):
         hidden = torch.cat([state.to(device=self.device), action.to(device=self.device)], dim=-1)
         for l in self._layers:
@@ -266,6 +283,9 @@ class ValueNetwork(nn.Module):
           self._layers.append(nn.ReLU())
       output_layer = nn.Linear(hidden_size,1)
       self._layers.append(output_layer)
+      #initialize the network weights and biases
+      with torch.no_grad():
+           weights_init_(self._layers, init_type = 'kaiming')
       self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
       self.to(device=self.device)
 
@@ -278,7 +298,7 @@ class ValueNetwork(nn.Module):
 
 def get_modules(model_params, observation_spec, action_spec):
   """Gets pytorch modules for Q-function, policy, and discriminator."""
-  model_params, n_q_fns = model_params
+  model_params, n_q_fns, n_v_fns = model_params
   
   if len(model_params) == 1:
     model_params = tuple([model_params[0]] * 4)
@@ -309,6 +329,7 @@ def get_modules(model_params, observation_spec, action_spec):
       c_net_factory=c_net_factory,
       v_net_factory=v_net_factory,
       n_q_fns=n_q_fns,
+      n_v_fns=n_v_fns,
       )
   return modules_list
 #######################################
@@ -347,7 +368,13 @@ class AgentModule(GeneralAgent):
           )
     self._p_net = self._modules_list.p_net_factory()
     self._c_net = self._modules_list.c_net_factory()
-    self._v_net = self._modules_list.v_net_factory() #value network
+    self._v_nets = list()  
+    n_v_fns = self._modules_list.n_v_fns
+    for _ in range(n_v_fns):
+      self._v_nets.append(
+          [self._modules_list.v_net_factory(),  # Learned Value-value.
+           self._modules_list.v_net_factory(),]  # Target Value-value.
+          )
     self._alpha_var = torch.tensor(1.0, requires_grad=True)
     self._alpha_entropy_var = torch.tensor(1.0, requires_grad=True)
 
@@ -380,18 +407,18 @@ class AgentModule(GeneralAgent):
   def q_source_weights(self):
     q_weights = []
     for q_net, _ in self._q_nets:
-      for name, param in q_net._layers.named_parameters():
-          if 'weight' in name:
-             q_weights += list(param)
+        for name, param in q_net._layers.named_parameters():
+            if 'weight' in name:
+                q_weights += list(param)
     return q_weights
 
   @property
   def q_target_weights(self):
     q_weights = []
     for _, q_net in self._q_nets:
-      for name, param in q_net._layers.named_parameters():
-          if 'weight' in name:
-             q_weights += list(param)
+        for name, param in q_net._layers.named_parameters():
+            if 'weight' in name:
+                q_weights += list(param)
     return q_weights
 
   @property
@@ -413,25 +440,45 @@ class AgentModule(GeneralAgent):
     return vars_
   
   @property
-  def v_net(self):
-    return self._v_net
+  def v_nets(self):
+    return self._v_nets
 
   @property
-  def v_variables(self):
-    vars_ = []
-    for param in self._v_net._layers:
-        if not isinstance(param, nn.ReLU):
-               vars_+=list(param.parameters())
-    return vars_
-
-  @property
-  def v_weights(self):
+  def v_source_weights(self):
     v_weights = []
-    for name, param in self._v_net._layers.named_parameters():
-        if 'weight' in name:
-            v_weights += list(param)
+    for v_net, _ in self._v_nets:
+        for name, param in v_net._layers.named_parameters():
+            if 'weight' in name:
+                v_weights += list(param)
     return v_weights
 
+  @property
+  def v_target_weights(self):
+    v_weights = []
+    for _ , v_net in self._v_nets:
+        for name, param in v_net._layers.named_parameters():
+            if 'weight' in name:
+                v_weights += list(param)
+    return v_weights
+
+  @property
+  def v_source_variables(self):
+    vars_ = []
+    for v_net, _ in self._v_nets:
+        for param in v_net._layers:
+            if not isinstance(param, nn.ReLU):
+               vars_+=list(param.parameters())
+    return vars_
+ 
+  @property
+  def v_target_variables(self):
+    vars_ = []
+    for _, v_net in self._v_nets:
+        for param in v_net._layers:
+            if not isinstance(param, nn.ReLU):
+               vars_+=list(param.parameters())
+    return vars_
+  
   @property
   def p_net(self):
     return self._p_net
@@ -625,6 +672,9 @@ class Agent(object):
         source_vars,
         target_vars,
         tau=self._update_rate)
+    
+  def _update_network_parameters(self, tau=None):
+      pass
 
   def print_train_info(self):
       summary_str = utils.get_summary_str(
@@ -653,7 +703,9 @@ class Agent(object):
   def global_step(self):
     return self._global_step.numpy()
   
+############################################
 ################# Policies #################
+############################################
 class ContinuousRandomPolicy(nn.Module):
   """Samples actions uniformly at random."""
 
@@ -744,6 +796,7 @@ class MaxQSoftPolicy(nn.Module):
         [a_indices, torch.arange(batch_size, dtype=torch.int64).to(device=self.device)], dim=-1)
     action = utils.gather_nd(actions, gather_indices)
     return action
+
 #############################################
 ################ D2E Agent ################## 
 #############################################
@@ -765,7 +818,7 @@ class D2EAgent(Agent):
       self,
       alpha=1.0,
       alpha_max=ALPHA_MAX,
-      train_alpha= False,
+      train_alpha= True,
       value_penalty= True,
       target_divergence= 0.0,
       alpha_entropy= 0.0,
@@ -778,6 +831,7 @@ class D2EAgent(Agent):
       ensemble_q_lambda=1.0,
       grad_value_clipping=1.0,
       grad_norm_clipping=5.0,
+      tau=0.005,
       **kwargs):
     self._alpha = alpha
     self._alpha_max = alpha_max
@@ -794,7 +848,9 @@ class D2EAgent(Agent):
     self._ensemble_q_lambda = ensemble_q_lambda
     self._grad_value_clipping = grad_value_clipping
     self._grad_norm_clipping = grad_norm_clipping
+    self.qf_criterion = nn.MSELoss()
     self.vf_criterion = nn.MSELoss()
+    self._tau= tau
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     super(D2EAgent, self).__init__(**kwargs)
   
@@ -815,7 +871,7 @@ class D2EAgent(Agent):
     self._q_fns = self._agent_module.q_nets
     self._p_fn = self._agent_module.p_fn
     self._c_fn = self._agent_module.c_net
-    self._v_fn = self._agent_module.v_net #adding value network
+    self._v_fns = self._agent_module.v_nets #adding value network
     self._divergence = utils.get_divergence(
         name=self._divergence_name, 
         c=self._c_fn,
@@ -857,8 +913,11 @@ class D2EAgent(Agent):
     return self._agent_module.get_alpha(
         alpha_max=self._alpha_max)
 
-  def _get_q_vars(self):
+  def _get_q_source_vars(self):
     return self._agent_module.q_source_variables
+  
+  def _get_q_target_vars(self):
+    return self._agent_module.q_target_variables
 
   def _get_p_vars(self):
     return self._agent_module.p_variables
@@ -866,13 +925,20 @@ class D2EAgent(Agent):
   def _get_c_vars(self):
     return self._agent_module.c_variables
   
-  def _get_v_vars(self):
-    return self._agent_module.v_variables
+  def _get_v_source_vars(self):
+    return self._agent_module.v_source_variables
+  
+  def _get_v_target_vars(self):
+    return self._agent_module.v_target_variables
 
   def _get_q_weight_norm(self):
-    weights = self._agent_module.q_source_weights
+    source_weights = self._agent_module.q_source_weights
     norms = []
-    for w in weights:
+    for w in source_weights:
+      norm = torch.sum(torch.square(w))
+      norms.append(norm)
+    target_weights = self._agent_module.q_target_weights
+    for w in target_weights:
       norm = torch.sum(torch.square(w))
       norms.append(norm)
     return torch.stack(norms).sum(dim=0)
@@ -894,9 +960,13 @@ class D2EAgent(Agent):
     return torch.stack(norms).sum(dim=0)
   
   def _get_v_weight_norm(self):
-    weights = self._agent_module.v_weights
+    source_weights = self._agent_module.v_source_weights
     norms = []
-    for w in weights:
+    for w in source_weights:
+      norm = torch.sum(torch.square(w))
+      norms.append(norm)
+    target_weights = self._agent_module.v_target_weights
+    for w in target_weights:
       norm = torch.sum(torch.square(w))
       norms.append(norm)
     return torch.stack(norms).sum(dim=0)
@@ -921,6 +991,7 @@ class D2EAgent(Agent):
     r = batch['r']
     dsc = batch['dsc']
     _, a2_p, log_pi_a2_p = self._p_fn(s2.to(device=self.device))
+
     q2_targets = []
     q1_preds = []
     for q_fn, q_fn_target in self._q_fns:
@@ -928,22 +999,26 @@ class D2EAgent(Agent):
       q1_pred = q_fn(s1.to(device=self.device), a1.to(device=self.device))
       q1_preds.append(q1_pred)
       q2_targets.append(q2_target_)
+    
     q2_targets = torch.stack(q2_targets, dim=-1)
     q2_target = self._ensemble_q2_target(q2_targets)
     div_estimate = self._divergence.dual_estimate(
         s2.to(device=self.device), a2_p, a2_b.to(device=self.device))
-    data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
+    #using new states generated by EIM
+    
     with torch.no_grad():
-         s_p = self._EIM_model._model.sample(data.train_samples[0])
-    v2_target = q2_target - self._v_fn(s_p)- self._get_alpha_entropy()[0] * log_pi_a2_p
+        data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
+        s_p = self._EIM_model._model.sample(data.train_samples[0])
+        for _, v_fn_target in self._v_fns:
+            target_v_next =   q2_target - v_fn_target(s_p)- self._get_alpha_entropy()[0] * log_pi_a2_p
+
     #v2_target = q2_target - self._v_fn(s2.to(device=self.device))- self._get_alpha_entropy()[0] * log_pi_a2_p# Equation 21 in Dream to Explore
     if self._value_penalty:
-       v2_target = v2_target - self._get_alpha()[0] * div_estimate
-    with torch.no_grad():
-         q1_target = r.to(device=self.device) + dsc.to(device=self.device) * self._discount * v2_target #Q(s,a)=R(s,a)+discount*v(s')
+       target_v_next = target_v_next - self._get_alpha()[0] * div_estimate
+    q1_target = r.to(device=self.device) + dsc.to(device=self.device) * self._discount *  target_v_next #Q(s,a)=R(s,a)+discount*v(s')
     q_losses = []
     for q1_pred in q1_preds:
-      q_loss_ = torch.mean(torch.square(q1_pred - q1_target.detach()))
+      q_loss_ = self.qf_criterion(q1_pred.view(-1) , q1_target.detach())
       q_losses.append(q_loss_)
     q_loss = torch.sum(torch.FloatTensor(q_losses))
     q_w_norm = self._get_q_weight_norm()
@@ -957,7 +1032,7 @@ class D2EAgent(Agent):
     info['dsc_mean'] = torch.mean(dsc)
     info['q2_target_mean'] = torch.mean(q2_target)
     info['q1_target_mean'] = torch.mean(q1_target)
-    info['v2_target_mean'] = torch.mean(v2_target) #added in D2E
+    info['v2_target_mean'] = torch.mean(target_v_next) #added in D2E
 
     return loss, info
 
@@ -965,11 +1040,13 @@ class D2EAgent(Agent):
     s = batch['s1']
     a_b = batch['a1']
     _, a_p, log_pi_a_p = self._p_fn(s.to(device=self.device))
-    v1  = self._v_fn(s.to(device=self.device))
+    for v_fn, v_fn_target in self._v_fns:
+        v1  = v_fn(s.to(device=self.device))
     q1s = []
     for q_fn, _ in self._q_fns:
         q1_ = q_fn(s.to(device=self.device), a_p)
         q1s.append(q1_)
+    
     q1s = torch.stack(q1s, dim=-1)
     q1 = self._ensemble_q1(q1s)
     div_estimate = self._divergence.dual_estimate(
@@ -1017,18 +1094,21 @@ class D2EAgent(Agent):
     _, a_p, log_a_pi = self._p_fn(s1.to(device=self.device))
     #########################
     #input_data next_state (s2) and state (s1) 
-    data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
-    _, Iprojection, _, _, _ = self._EIM_model._dre.eval(data.train_samples, self._EIM_model._model)
     with torch.no_grad():
-         s_p = self._EIM_model._model.sample(data.train_samples[0])
-    v_pred = self._v_fn(s_p)
-    q1_target = []
-    for q_fn, q_fn_target in self._q_fns:
-      q1_ = q_fn_target(s1.to(device=self.device), a_p)
-      q1_target.append(q1_)
-    q1_target = torch.stack(q1_target, dim=-1)
-    q1_target_ensemble = self.ensemble_q(q1_target)
-    
+          data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
+          for v_fn, v_fn_target in self._v_fns:
+              v_pred  = v_fn(s1)
+          q1_target = []
+          q1_pred=[]
+          for q_fn, q_fn_target in self._q_fns:
+              q1_ = q_fn_target(s1.to(device=self.device), a_p)
+              q1_target.append(q1_)
+              q2_ = q_fn(s1.to(device=self.device), a_p)
+              q1_pred.append(q2_)
+          q1_target = torch.stack(q1_target, dim=-1)
+          q1_target_ensemble = self.ensemble_q(q1_target)
+          q1_pred = torch.stack(q1_pred, dim=-1)
+          q1_pred_ensemble = self.ensemble_q(q1_pred)
     div_estimate = self._divergence.dual_estimate(
         s1.to(device=self.device), a_p, a_b.to(device=self.device))
     
@@ -1036,7 +1116,9 @@ class D2EAgent(Agent):
     #https://github.com/haarnoja/sac/blob/8258e33633c7e37833cc39315891e77adfbe14b2/sac/algos/sac.py#L295
     #https://github.com/rail-berkeley/rlkit/blob/60bdfcd09f48f73a450da139b2ba7910b8cede53/rlkit/torch/smac/pearl.py#L247
     #Equation 20 in Dream to Explore paper
-    v_target= q1_target_ensemble - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (div_estimate + Iprojection)
+    _, Iprojection, _, _, _ = self._EIM_model._dre.eval(data.train_samples, self._EIM_model._model)
+    with torch.no_grad():
+         v_target= torch.min(q1_target_ensemble,q1_pred_ensemble) - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (div_estimate + Iprojection)
     #v_loss= self.vf_criterion(v_pred, v_target.detach()) 
     v_loss = WeightedLoss(v_pred - v_target.detach()) 
     v_w_norm = self._get_v_weight_norm()
@@ -1093,7 +1175,22 @@ class D2EAgent(Agent):
     info['alpha_entropy'] = alpha
 
     return ae_loss, info
+  
+  def _update_network_parameters(self, tau=None):
+        if tau is None:
+            tau=self._tau
+        for v_fn, v_fn_target in self._v_fns:
+            
+            target_value_params=v_fn_target.named_parameters()
+            value_params=v_fn.named_parameters()
 
+        target_value_state_dict=dict(target_value_params)
+        value_state_dict=dict(value_params)
+        for name in value_state_dict:
+            value_state_dict[name]=tau*value_state_dict[name].clone()+(1-tau)*target_value_state_dict[name].clone()
+        
+        self._v_fns[0][1].load_state_dict(value_state_dict)
+      
   def _get_source_target_vars(self):
     return (self._agent_module.q_source_variables,
             self._agent_module.q_target_variables)
@@ -1106,10 +1203,12 @@ class D2EAgent(Agent):
     elif len(opts) < 5:
       raise ValueError('Bad optimizers %s.' % opts)
       
-    self._q_optimizer = torch.optim.Adam(self._get_q_vars(),lr=opts[0][0], betas=(opts[0][1],opts[0][2]), weight_decay=self._weight_decays[0])
+    self._q_source_optimizer = torch.optim.Adam(self._get_q_source_vars(),lr=opts[0][0], betas=(opts[0][1],opts[0][2]), weight_decay=self._weight_decays[0])
+    self._q_target_optimizer = torch.optim.Adam(self._get_q_target_vars(),lr=opts[0][0], betas=(opts[0][1],opts[0][2]), weight_decay=self._weight_decays[0])
     self._p_optimizer = torch.optim.Adam(self._get_p_vars(),lr=opts[1][0], betas=(opts[1][1],opts[1][2]), weight_decay=self._weight_decays[1])
     self._c_optimizer = torch.optim.Adam(self._get_c_vars(),lr=opts[2][0], betas=(opts[2][1],opts[2][2]), weight_decay=self._weight_decays[2])
-    self._v_optimizer = torch.optim.Adam(self._get_v_vars(),lr=opts[3][0], betas=(opts[3][1],opts[3][2]), weight_decay=self._weight_decays[3])
+    self._v_target_optimizer = torch.optim.Adam(self._get_v_target_vars(),lr=opts[3][0], betas=(opts[3][1],opts[3][2]), weight_decay=self._weight_decays[3])
+    self._v_source_optimizer = torch.optim.Adam(self._get_v_source_vars(),lr=opts[3][0], betas=(opts[3][1],opts[3][2]), weight_decay=self._weight_decays[3])
     self._a_optimizer = torch.optim.Adam(self._a_vars, lr=opts[4][0], betas=(opts[4][1],opts[4][2]))
     self._ae_optimizer = torch.optim.Adam(self._ae_vars, lr=opts[4][0], betas=(opts[4][1],opts[4][2]))
 
@@ -1124,36 +1223,44 @@ class D2EAgent(Agent):
     self._agent_module.p_net.train()
     self._p_optimizer.zero_grad()
     policy_loss, _ = self._build_p_loss(batch)
-    policy_loss.backward()
+    policy_loss.backward(retain_graph=True)
     if self._grad_norm_clipping > 0.:
        torch.nn.utils.clip_grad_norm_(self._agent_module.p_net.parameters(), self._grad_norm_clipping)
     if self._grad_value_clipping > 0.0:
        torch.nn.utils.clip_grad_value_(self._agent_module.p_net.parameters(), self._grad_value_clipping)
     self._p_optimizer.step()
     # Update value network
-    self._agent_module.v_net.train()
-    self._v_optimizer.zero_grad()
+    for v_fn, v_fn_target in self._v_fns:
+        v_fn.train()
+        v_fn_target.train()
+    self._v_target_optimizer.zero_grad()
+    self._v_source_optimizer.zero_grad()
     value_loss, _ = self._build_v_loss(batch)
     value_loss.backward(retain_graph=True)
     if self._grad_norm_clipping > 0.:
-       torch.nn.utils.clip_grad_norm_(self._agent_module.v_net.parameters(), self._grad_norm_clipping)
+       torch.nn.utils.clip_grad_norm_(v_fn.parameters(), self._grad_norm_clipping)
+       torch.nn.utils.clip_grad_norm_(v_fn_target.parameters(), self._grad_norm_clipping)
     if self._grad_value_clipping > 0.0:
-       torch.nn.utils.clip_grad_value_(self._agent_module.v_net.parameters(), self._grad_value_clipping)
-    self._v_optimizer.step()
+       torch.nn.utils.clip_grad_value_(v_fn.parameters(), self._grad_value_clipping)
+       torch.nn.utils.clip_grad_value_(v_fn_target.parameters(), self._grad_value_clipping)
+    self._v_target_optimizer.step()
+    self._v_source_optimizer.step()
     # Update q networks parameter
     for q_fn, q_fn_target in self._q_fns:
         q_fn.train()
         q_fn_target.train()
-    self._q_optimizer.zero_grad()
+    self._q_source_optimizer.zero_grad()
+    self._q_target_optimizer.zero_grad()
     q_losses,q_info= self._build_q_loss(batch)
-    q_losses.backward()
+    q_losses.backward(retain_graph=True)
     if self._grad_norm_clipping > 0.:
        torch.nn.utils.clip_grad_norm_(q_fn.parameters(), self._grad_norm_clipping)
        torch.nn.utils.clip_grad_norm_(q_fn_target.parameters(), self._grad_norm_clipping)
     if self._grad_value_clipping > 0.0:
        torch.nn.utils.clip_grad_value_(q_fn.parameters(), self._grad_value_clipping)
        torch.nn.utils.clip_grad_value_( q_fn_target.parameters(), self._grad_value_clipping)
-    self._q_optimizer.step()
+    self._q_source_optimizer.step()
+    self._q_target_optimizer.step()
     #Update critic network parameter
     self._agent_module.c_net.train()
     self._c_optimizer.zero_grad()
@@ -1161,11 +1268,14 @@ class D2EAgent(Agent):
     critic_loss.backward()
     self._c_optimizer.step()
     self._extra_c_step( batch)
+    
     #train expected information maximization to compute transition ratio
 
     s1  = batch['s1']
     s2  = batch['s2']
-    data = MujocoData(s1.to(device=self.device), s2.to(device=self.device), train_valid_split_portion=1-1/16)
+    with torch.no_grad():
+          data = MujocoData(s1.to(device=self.device), s2.to(device=self.device), train_valid_split_portion=1-1/16)
+    print(f"shape of training data {data.train_samples[0].shape} {data.train_samples[1].shape}{data.val_samples[0].shape}")
     self._EIM_model.train_emm(data.train_samples, data.val_samples)
     
     if self._train_alpha:
@@ -1178,6 +1288,7 @@ class D2EAgent(Agent):
        ae_loss,ae_info = self._build_ae_loss( batch)
        ae_loss.backward()
        self._ae_optimizer.step()
+    self._update_network_parameters()
     #1)policy loss
     info["policy_loss"]=policy_loss.cpu().item()
     #2)Q loss
@@ -1244,10 +1355,12 @@ class D2EAgent(Agent):
     self._build_p_loss(batch)
     self._build_c_loss(batch)
     self._build_v_loss(batch)
-    self._q_vars = self._get_q_vars()
+    self._q_source_vars = self._get_q_source_vars()
+    self._q_target_vars = self._get_q_target_vars()
     self._p_vars = self._get_p_vars()
     self._c_vars = self._get_c_vars()
-    self._v_vars = self._get_v_vars()
+    self._v_source_vars = self._get_v_source_vars()
+    self._v_target_vars = self._get_v_target_vars()
     self._a_vars = self._agent_module.a_variables
     self._ae_vars = self._agent_module.ae_variables
 
@@ -1255,16 +1368,20 @@ class D2EAgent(Agent):
       checkpoint = {
             "policy_net": self._agent_module.p_net.state_dict(),
             "critic_net": self._agent_module.c_net.state_dict(),
-            "value_net" : self._agent_module.v_net.state_dict(),
-            "q_optimizer": self._q_optimizer.state_dict(),
+            "q_source_optimizer": self._q_source_optimizer.state_dict(),
+            "q_target_optimizer": self._q_target_optimizer.state_dict(),
             "critic_optimizer": self._c_optimizer.state_dict(),
             "policy_optimizer": self._p_optimizer.state_dict(),
-            "value_optimizer": self._v_optimizer.state_dict(),
+            "value_source_optimizer": self._v_source_optimizer.state_dict(),
+            "value_target_optimizer": self._v_target_optimizer.state_dict(),
             "train_step": self._global_step
       }
       for q_fn, q_fn_target in self._q_fns:
           checkpoint["q_net"]        = q_fn.state_dict()
           checkpoint["q_net_target"] = q_fn_target.state_dict()
+      for v_fn, v_fn_target in self._v_fns:
+          checkpoint["v_net"]        = v_fn.state_dict()
+          checkpoint["v_net_target"] = v_fn_target.state_dict()
       if self._train_alpha:
           checkpoint["alpha"] = self._agent_module._alpha_var
           checkpoint["alpha_optimizer"] = self._a_optimizer.state_dict()
@@ -1278,13 +1395,17 @@ class D2EAgent(Agent):
         for q_fn, q_fn_target in self._q_fns:
             q_fn.load_state_dict(checkpoint["q_net"])
             q_fn_target.load_state_dict(checkpoint["q_net_target"])
+        for v_fn, v_fn_target in self._v_fns:
+            v_fn.load_state_dict(checkpoint["v_net"])
+            v_fn_target.load_state_dict(checkpoint["v_net_target"])
         self._agent_module.p_net.load_state_dict(checkpoint["policy_net"])
         self._agent_module.c_net.load_state_dict(checkpoint["critic_net"])
-        self._agent_module.v_net.load_state_dict(checkpoint["value_net"])
         self._p_optimizer.load_state_dict(checkpoint["policy_optimizer1"])
-        self._q_optimizer.load_state_dict(checkpoint["q_optimizer"])
+        self._q_source_optimizer.load_state_dict(checkpoint["q_source_optimizer"])
+        self._q_target_optimizer.load_state_dict(checkpoint["q_target_optimizer"])
         self._c_optimizer.load_state_dict(checkpoint["critic_optimizer"])
-        self._v_optimizer.load_state_dict(checkpoint["value_optimizer"])
+        self._v_source_optimizer.load_state_dict(checkpoint["v_source_optimizer"])
+        self._v_target_optimizer.load_state_dict(checkpoint["v_target_optimizer"])
         self._global_step = checkpoint["train_step"]
         if self._train_alpha:
             self._agent_module._alpha_var = checkpoint["alpha"]
@@ -1295,8 +1416,8 @@ class D2EAgent(Agent):
         print("load checkpoint from \"" + self.checkpoint_path +
               "\" at " + str(self._global_step) + " time step")
 
-
-
+##########################################################
+####################configuration ########################
 PolicyConfig = collections.namedtuple(
     'PolicyConfig', 'ptype, ckpt, wrapper, model_params')
 
