@@ -3,7 +3,7 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-from planner_behavior_regularizer_actor_critic import eval_policies
+from planner_D2E_regularizer import eval_policies
 import collections
 import os
 import time
@@ -75,6 +75,7 @@ def train_eval_offline(
     update_freq=1,
     update_rate=0.005,
     discount=0.99,
+    done=False,
     device=None
     ):
   ###Training a policy with a fixed dataset.###
@@ -84,6 +85,8 @@ def train_eval_offline(
   env = TimeLimit(env, MUJOCO_ENVS_LENNGTH[env_name])
   observation_spec = env.observation_spec()
   action_spec = env.action_spec()
+  if device is None:
+     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
   
   # Prepare data.
   logging.info('Loading data from %s ...', data_file)
@@ -134,6 +137,7 @@ def train_eval_offline(
       update_freq=update_freq,
       update_rate=update_rate,
       discount=discount,
+      done=done,
       env_name=env_name,
       train_data=train_data)
   
@@ -254,10 +258,11 @@ def Train_offline_D2E(args):
     #args.env_name = 'Pendulum-v0'
     args.data_name = 'example'
     args.agent_name = 'DreamToExplore'
+    #size of neural networks for actor critic and value networks, number of Q networks and number of value nnetwork
     args.gin_bindings = [
-        'train_eval_offline.model_params=((200, 200),)',
+        'train_eval_offline.model_params=((200, 200), 2, 1)',
         'train_eval_offline.optimizers=((5e-4, 0.5, 0.99),)']
-    args.n_train = 10000
+    args.n_train = 20000
     args.n_eval_episodes = 50
     args.total_train_steps = 100000  # Short training.
 

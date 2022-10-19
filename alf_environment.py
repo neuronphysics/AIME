@@ -128,6 +128,15 @@ class AlfEnvironment(object):
         """
         return alf.TensorSpec(())
 
+    def done_spec(self):
+        """Defines the done provided by the environment.
+        The done of the most environments is a boolean scalar. So we provide a default
+        implementation which returns a scalar spec.
+        Returns:
+            alf.TensorSpec
+        """
+        return alf.TensorSpec(())
+
     def time_step_spec(self):
         """Describes the ``TimeStep`` fields returned by ``step()``.
         Override this method to define an environment that uses non-standard values
@@ -138,7 +147,7 @@ class AlfEnvironment(object):
             the step_type, reward, discount, observation, prev_action, and end_id.
         """
         return time_step_spec(self.observation_spec(), self.action_spec(),
-                              self.reward_spec())
+                              self.reward_spec(), self.done_spec())
 
     def current_time_step(self):
         """Returns the current timestep."""
@@ -250,8 +259,8 @@ class AlfEnvironment(object):
         """Starts a new sequence, returns the first ``TimeStep`` of this sequence.
         See ``reset(self)`` docstring for more details
         """
-        
-        
+
+
 class AlfEnvironmentBaseWrapper(AlfEnvironment):
     """AlfEnvironment wrapper forwards calls to the given environment."""
 
@@ -311,6 +320,9 @@ class AlfEnvironmentBaseWrapper(AlfEnvironment):
 
     def reward_spec(self):
         return self._env.reward_spec()
+
+    def done_spec(self):
+        return self._env.done_spec()
 
     def close(self):
         return self._env.close()
