@@ -538,6 +538,7 @@ class Agent(object):
       update_freq=1,
       update_rate=0.005,
       discount=0.99,
+      done=False,
       env_name='HalfCheetah-v2',      
       train_data=None,
       resume=False, 
@@ -554,6 +555,7 @@ class Agent(object):
     self._update_freq = update_freq
     self._update_rate = update_rate
     self._discount = discount
+    self._done = done
     self._env_name = env_name    
     self._resume = resume 
     if device is None:
@@ -646,6 +648,7 @@ class Agent(object):
         dsc=transition_batch.discount,
         a1=transition_batch.a1,
         a2=transition_batch.a2,
+        done=transition_batch.done,
         )
     return batch
 
@@ -990,6 +993,7 @@ class D2EAgent(Agent):
     a2_b = batch['a2']
     r = batch['r']
     dsc = batch['dsc']
+    done=batch['done']
     _, a2_p, log_pi_a2_p = self._p_fn(s2.to(device=self.device))
 
     q2_targets = []
@@ -1015,7 +1019,7 @@ class D2EAgent(Agent):
     #v2_target = q2_target - self._v_fn(s2.to(device=self.device))- self._get_alpha_entropy()[0] * log_pi_a2_p# Equation 21 in Dream to Explore
     if self._value_penalty:
        target_v_next = target_v_next - self._get_alpha()[0] * div_estimate
-    q1_target = r.to(device=self.device) + dsc.to(device=self.device) * self._discount *  target_v_next #Q(s,a)=R(s,a)+discount*v(s')
+    q1_target = r.to(device=self.device) + (1.0 - done.float().to(device=self.device)) * self._discount *  target_v_next #Q(s,a)=R(s,a)+discount*v(s')
     q_losses = []
     for q1_pred in q1_preds:
       q_loss_ = self.qf_criterion(q1_pred.view(-1) , q1_target.detach())
@@ -1476,7 +1480,7 @@ def maybe_makedirs(log_dir):
 #from train_eval_utils
 from typing import Callable
 Transition = collections.namedtuple(
-    'Transition', 's1, s2, a1, a2, discount, reward')
+    'Transition', 's1, s2, a1, a2, discount, reward, done')
 
 def eval_policy_episodes(env, policy, n_episodes):
   """Evaluates policy performance."""
@@ -1541,6 +1545,7 @@ class AgentConfig(object):
         update_rate=agent_flags.update_rate,
         update_freq=agent_flags.update_freq,
         discount=agent_flags.discount,
+        done=agent_flags.done,
         env_name=agent_flags.env_name,
         train_data=agent_flags.train_data,
         )

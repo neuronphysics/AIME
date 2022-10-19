@@ -82,7 +82,7 @@ class TimeStep(
         namedtuple(
             'TimeStep', [
                 'step_type', 'reward', 'discount', 'observation',
-                'prev_action', 'env_id', 'untransformed', "env_info"
+                'prev_action', 'env_id', 'done', 'untransformed', "env_info"
             ],
             default_value=())):
     """A ``TimeStep`` contains the data emitted by an environment at each step of
@@ -99,6 +99,7 @@ class TimeStep(
     - observation: A (nested) ``Tensor`` for observation.
     - prev_action: A (nested) ``Tensor`` for action from previous time step.
     - env_id: A scalar ``Tensor`` of the environment ID of the time step.
+    - done: A tensor of boolean to express the last step
     - untransformed: a nest that represents the entire time step itself *before*
       any transformation (e.g., observation or reward transformation); used for
       experience replay observing by subalgorithms.
@@ -144,6 +145,7 @@ class Experience(
                 'observation',
                 'prev_action',
                 'env_id',
+                'done',
                 'action',
                 'rollout_info',  # AlgStep.info from rollout()
                 'state',  # state passed to rollout() to generate `action`
@@ -216,6 +218,7 @@ def _generate_time_step(batched,
                         reward=None,
                         reward_spec=ts.TensorSpec(()),
                         env_id=None,
+                        done=None,
                         env_info={}):
 
     flat_observation = nest.flatten(observation)
@@ -224,6 +227,8 @@ def _generate_time_step(batched,
         md = np
         if reward is not None:
             reward = np.float32(reward)
+        if done is not None:
+            done = np.array(done).astype(np.bool_)
         discount = np.float32(discount)
     else:
         assert all(
@@ -232,6 +237,8 @@ def _generate_time_step(batched,
         md = torch
         if reward is not None:
             reward = to_tensor(reward, dtype=torch.float32)
+        if done is not None:
+            done = to_tensor(done, dtype=torch.bool)
         discount = to_tensor(discount, dtype=torch.float32)
 
     if batched:
@@ -241,6 +248,8 @@ def _generate_time_step(batched,
             env_id = md.arange(batch_size, dtype=md.int32)
         if reward is not None:
             assert reward.shape[:1] == outer_dims
+        if done is None:
+            env_id = md.arange(batch_size, dtype=md.bool)
         if prev_action is not None:
             flat_action = nest.flatten(prev_action)
             assert flat_action[0].shape[:1] == outer_dims
@@ -248,11 +257,14 @@ def _generate_time_step(batched,
         outer_dims = ()
         if env_id is None:
             env_id = md.zeros((), dtype=md.int32)
+        if done is None:
+            done = md.zeros((), dtype=md.bool)
 
     step_type = md.full(outer_dims, step_type, dtype=md.int32)
     if reward is None:
         reward = md.zeros(outer_dims + reward_spec.shape, dtype=md.float32)
     discount = md.ones(outer_dims, dtype=md.float32) * discount
+    done = md.ones(outer_dims, dtype=md.bool_) * done
     if prev_action is None:
         prev_action = nest.map_structure(
             lambda spec: md.zeros(
@@ -267,11 +279,13 @@ def _generate_time_step(batched,
         observation,
         prev_action,
         env_id,
+        done,
         env_info=env_info)
 
 
 def restart(observation,
             action_spec,
+            done,
             reward_spec=ts.TensorSpec(()),
             env_id=None,
             env_info={},
@@ -296,12 +310,14 @@ def restart(observation,
         action_spec=action_spec,
         reward_spec=reward_spec,
         env_id=env_id,
+        done=done,
         env_info=env_info)
 
 
 def transition(observation,
                prev_action,
                reward,
+               done,
                reward_spec=ts.TensorSpec(()),
                discount=1.0,
                env_id=None,
@@ -336,12 +352,14 @@ def transition(observation,
         reward=reward,
         reward_spec=reward_spec,
         env_id=env_id,
+        done=done,
         env_info=env_info)
 
 
 def termination(observation,
                 prev_action,
                 reward,
+                done,
                 reward_spec=ts.TensorSpec(()),
                 env_id=None,
                 env_info={}):
@@ -372,10 +390,11 @@ def termination(observation,
         reward=reward,
         reward_spec=reward_spec,
         env_id=env_id,
+        done=done,
         env_info=env_info)
 
 
-def time_step_spec(observation_spec, action_spec, reward_spec):
+def time_step_spec(observation_spec, action_spec, reward_spec, done):
     """Returns a ``TimeStep`` spec given the ``observation_spec`` and the
     ``action_spec``.
     """
@@ -394,7 +413,8 @@ def time_step_spec(observation_spec, action_spec, reward_spec):
                                       maximum=1.0),
         observation=observation_spec,
         prev_action=action_spec,
-        env_id=ts.TensorSpec([], torch.int32))
+        env_id=ts.TensorSpec([], torch.int32),
+        done=ts.TensorSpec([], torch.bool))
 
 
 def make_experience(time_step: TimeStep, alg_step: AlgStep, state):
@@ -414,6 +434,7 @@ def make_experience(time_step: TimeStep, alg_step: AlgStep, state):
         observation=time_step.observation,
         prev_action=time_step.prev_action,
         env_id=time_step.env_id,
+        done=time_step.done,
         action=alg_step.output,
         rollout_info=alg_step.info,
         state=state)
@@ -427,7 +448,8 @@ def experience_to_time_step(exp: Experience):
         discount=exp.discount,
         observation=exp.observation,
         prev_action=exp.prev_action,
-        env_id=exp.env_id)
+        env_id=exp.env_id,
+        done=exp.done)
 
 
 LossInfo = namedtuple(

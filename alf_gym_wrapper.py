@@ -148,10 +148,12 @@ class AlfGymWrapper(AlfEnvironment):
                 self._gym_env.reward_space, simplify_box_bounds)
         else:
             self._reward_spec = TensorSpec(())
+        self._done=True
+
         self._time_step_spec = ds.time_step_spec(
-            self._observation_spec, self._action_spec, self._reward_spec)
+            self._observation_spec, self._action_spec, self._reward_spec, self._done)
         self._info = None
-        self._done = True
+
         self._zero_info = self._obtain_zero_info()
 
         self._env_info_spec = nest.map_structure(TensorSpec.from_array,
@@ -193,6 +195,7 @@ class AlfGymWrapper(AlfEnvironment):
         return ds.restart(
             observation=observation,
             action_spec=self._action_spec,
+            done= self._done,
             reward_spec=self._reward_spec,
             env_id=self._env_id,
             env_info=self._zero_info)
@@ -216,6 +219,7 @@ class AlfGymWrapper(AlfEnvironment):
                 observation,
                 action,
                 reward,
+                self._done,
                 self._reward_spec,
                 self._env_id,
                 env_info=self._info)
@@ -224,6 +228,7 @@ class AlfGymWrapper(AlfEnvironment):
                 observation,
                 action,
                 reward,
+                self._done,
                 self._reward_spec,
                 self._discount,
                 self._env_id,
@@ -261,6 +266,13 @@ class AlfGymWrapper(AlfEnvironment):
 
     def reward_spec(self):
         return self._reward_spec
+
+    def done_spec(self):
+        done_spec = TensorSpec((1,), dtype=torch.bool)
+        if self._done:
+           return done_spec.ones()
+        else:
+           return done_spec.zeros()
 
     def close(self):
         return self._gym_env.close()

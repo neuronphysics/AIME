@@ -54,12 +54,13 @@ MUJOCO_ENVS_LENNGTH={"Ant-v2":1000,
 
 def get_transition(time_step, next_time_step, action, next_action):
   return Transition(
-      s1=time_step.observation,
-      s2=next_time_step.observation,
-      a1=action,
-      a2=next_action,
-      reward=next_time_step.reward,
-      discount=next_time_step.discount)
+      s1  = time_step.observation,
+      s2  = next_time_step.observation,
+      a1  = action,
+      a2  = next_action,
+      reward  = next_time_step.reward,
+      discount= next_time_step.discount,
+      done    = next_time_step.done)
   
 class DataCollector(object):
   """Class for collecting sequence of environment experience."""
@@ -166,9 +167,15 @@ class Dataset(nn.Module):
     self._a2 = self._zeros([size] + action_shape, action_type)
     self._discount = self._zeros([size], torch.float32)
     self._reward = self._zeros([size], torch.float32)
+    self._done= self._zeros([size], torch.bool)
     self._data = Transition(
-        s1=self._s1, s2=self._s2, a1=self._a1, a2=self._a2,
-        discount=self._discount, reward=self._reward)
+                            s1=self._s1, 
+                            s2=self._s2, 
+                            a1=self._a1, 
+                            a2=self._a2,
+                            discount=self._discount, 
+                            reward=self._reward,
+                            done=self._done)
     self._current_size = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
     self._current_idx = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
     self._capacity = torch.autograd.Variable(torch.tensor(self._size))
