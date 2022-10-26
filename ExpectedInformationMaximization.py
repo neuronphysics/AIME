@@ -33,6 +33,9 @@ if not os.path.exists("EIM_out_imgs"):
 from torch.optim import Optimizer
 from ObstacleData import ObstacleData
 import json
+import cooper
+
+logging.basicConfig(format='%(asctime)s: %(filename)s:%(lineno)d: %(message)s', level=logging.INFO)
 
 def clip(x, min_value, max_value, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
     """Element-wise value clipping.
@@ -464,13 +467,13 @@ class Categorical:
 
     @property
     def log_probabilities(self):
-        return torch.log(self._p + 1e-9)
+        return torch.log(self._p + 1e-15)
 
     def entropy(self):
         return - torch.sum(self._p * torch.log(self._p + 1e-15))
 
     def kl(self, other):
-        return torch.sum(self._p * (torch.log(self._p + 1e-9) - other.log_probabilities))
+        return torch.sum(self._p * (torch.log(self._p + 1e-15) - other.log_probabilities))
 
 class GMM:
 
@@ -610,7 +613,7 @@ class ConditionalGaussian(nn.Module):
         output      = self._model(contexts.to(device))
         mean, covar = SplitLayer(output,self._sample_dim,self._sample_dim ** 2)
         #new line
-        covar = torch.nn.Softplus()(covar)
+        #covar = torch.nn.Softplus()(covar)
         
         chol_covar  = self._chol_covar(covar)
         covariance  = torch.matmul(chol_covar, torch.transpose(chol_covar, -2, -1))
@@ -802,7 +805,7 @@ class Softmax(nn.Module):
 #############################
 class GaussianEMM(nn.Module):
     """gated mixture of experts """
-    def __init__(self, context_dim, sample_dim, number_of_components, gating_num_epochs, dre, component_hidden_dict, gating_hidden_dict,
+    def __init__(self, context_dim, sample_dim, number_of_components, gating_num_epochs, component_hidden_dict, gating_hidden_dict,
                  seed=0, trainable=True, weight_path=None):
         super(GaussianEMM, self).__init__()
         self._context_dim = context_dim
@@ -837,7 +840,7 @@ class GaussianEMM(nn.Module):
         self.trainable_variables = self._gating_distribution.trainable_variables
         # self._net, self._regularizer = build_dense_network(input_dim=input_dim, output_dim=1,
         #                                      output_activation="linear", params=self.hidden_params)
-        self._net = dre
+        
         for c in self._components:
             self.trainable_variables += c.trainable_variables
         self.to(device)
@@ -928,7 +931,7 @@ def OrthogonalRegularization(model, reg=1e-6, device=torch.device('cuda') if tor
 
 
 def log_clip(x):
-    return torch.log(torch.clamp(x, 1e-10, None))
+    return torch.log(torch.clamp(x, 1e-12, None))
             
 def LogisticRegressionLoss(pq_outputs):
     p_outputs, q_outputs = pq_outputs
@@ -978,17 +981,18 @@ class DensityRatioEstimator(nn.Module):
         )
         self.metrics   = [self.acc_fn]
         # self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
-        self.optimizer = optim.QHAdam([ 
+        self.optimizer = torch.optim.Adam([ 
                          { 'params': self._ldre_net.parameters() },
-                         ],  lr=3e-4, betas=(0.5, 0.999), eps=1e-7)
+                         ],  lr=1e-3, betas=(0.9, 0.999))
         self.lr_scheduler = None # torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99999)
         self.initializers = [XavierUniform(bias=False, module_filter='*')]
         self.regularizers   = [L2Regularizer(scale=1e-4, module_filter='*')]
-        self.constraints = [cons.UnitNorm(3, 'batch', '*'), MinMaxNorm(min_value=0.0001, max_value=0.99, frequency=3,  unit='batch', module_filter='*')]
+        #self.constraints = [cons.UnitNorm(3, 'batch', '*'), MinMaxNorm(min_value=0.0001, max_value=0.99, frequency=3,  unit='batch', module_filter='*')]
+        self.constraints = [cons.UnitNorm(3, 'batch', '*')]
         if self._early_stopping:
 
             self.callbacks = [EarlyStopping(monitor='val_loss', patience=10),
-                        ReduceLROnPlateau(factor=0.2, patience=10)]
+                        ReduceLROnPlateau(factor=0.5, patience=5)]
         else:
             self.callbacks  = []
         
@@ -1110,7 +1114,8 @@ class DensityRatioEstimator(nn.Module):
         if self._conditional_model:
             #print(f"target_samples:{target_samples}")
             model_samples = torch.cat([target_samples[0], model.sample(target_samples[0])], dim=-1)
-            target_samples = torch.cat([target_samples[0], target_samples[1]], dim=-1)
+            #target_samples = torch.cat([target_samples[0], target_samples[1]], dim=-1)
+            target_samples= torch.cat([x.to( device) for x in target_samples], -1)
         else:
             model_samples = model.sample(self._target_train_samples.shape[0])
         target_ldre = self(target_samples.to(device), inTrain=False)
@@ -1243,6 +1248,78 @@ class Recorder:
             last_rec = {**last_rec, **self._modules_dict[key].get_last_rec()}
         return last_rec
 
+
+
+
+class PenalizedKLConstraint(cooper.ConstrainedMinimizationProblem):
+    """
+    Class for KL-penalized constrains.
+    """
+    def __init__(self, module: nn.Module, l1_lambda: float= 0.0001, mean_constraint:float = 2.5, model_regularizer: bool= False, use_proxy: bool= True, device: torch.types.Device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
+        self.mean_constraint = mean_constraint
+        self._module = module
+        self.l1_lambda = l1_lambda
+        self._model_regularizer= model_regularizer
+        self.use_proxy = use_proxy
+        self.device = device
+        self._module.to(self.device)
+        super(PenalizedKLConstraint, self).__init__(is_constrained=True)
+
+    def compute_losses(
+        self, 
+        model: nn.Module,
+        context: torch.Tensor, 
+        another_context:torch.Tensor,
+        precision: torch.Tensor,
+        weights: torch.Tensor,
+    ): 
+        model.to(self.device)
+        with torch.no_grad():
+             samples = model.sample(context.to(self.device))
+        losses = - torch.squeeze(self._module(torch.cat([context.to(self.device), samples], dim=-1), inTrain=False))
+        kls = model.kls_other_chol_inv(context.to(self.device),  another_context.to(self.device), precision.to(self.device))
+        #Adding  L1 regularization to prevent gradient explosion
+        l1_norm = torch.mul(self.l1_lambda , sum(p.abs().sum() for p in model.parameters())).to(self.device)
+        
+        if self._model_regularizer:
+                
+           loss = torch.mean(weights * (losses + kls)).to(self.device) +  l1_norm + model._regularizer.detach()
+        else:
+           loss = torch.mean(weights * (losses + kls)).to(self.device) +  l1_norm 
+        return loss, kls, l1_norm
+
+    def closure(
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        p:torch.Tensor,
+        w:torch.Tensor,
+        model: nn.Module,
+    ) -> cooper.CMPState:
+        """
+        Computes CMP state for the given model and inputs.
+        """
+        # Compute loss and regularization statistics
+        loss, kls, l1_norm = self.compute_losses(model, inputs, targets, p, w)
+        misc = {"l1_norm_vlue": l1_norm, "kl_value": kls}
+
+        if not self.use_proxy:
+           # Entries of kls >= 0 (equiv. -kls <= 0)
+           ineq_defect = -kls  
+           proxy_ineq_defect = None
+        else:
+           #kls - costraint <= 0
+           ineq_defect= kls - self.mean_constraint
+           proxy_ineq_defect = -kls  
+        # Store model output and other 'miscellaneous' objects in misc dict
+        state = cooper.CMPState(loss=loss, 
+                                ineq_defect=ineq_defect,
+                                proxy_ineq_defect=proxy_ineq_defect,
+                                misc=misc,
+                                )
+
+        return state
+    
 class ConditionalMixtureEIM:
 
     @staticmethod
@@ -1265,7 +1342,7 @@ class ConditionalMixtureEIM:
             gating_net_reg_loss_fact=0.,
             gating_net_drop_prob=0.0,
             gating_net_hidden_layers=[50, 50],
-            gating_grad_clipping=2.0,
+            gating_grad_clipping=5.0,
             # Density Ratio Estimation
             dre_reg_loss_fact=0.0,  # Scaling Factor for L2 regularization of density ratio estimator
             dre_early_stopping=True,  # Use early stopping for density ratio estimator training
@@ -1273,7 +1350,9 @@ class ConditionalMixtureEIM:
             dre_num_iters=1000,  # Number of density ratio estimator steps each iteration (i.e. max number if early stopping)
             dre_batch_size=1000,  # Batch size for density ratio estimator training
             dre_hidden_layers=[30, 30],  # width of density ratio estimator  hidden layers
-            dre_grad_clipping=2.0
+            dre_grad_clipping=5.0,
+            mean_constraint=20,
+            checkpoint_dir=os. getcwd()+ "/EIM_out_imgs/"
         )
         c.finalize_adding()
         return c
@@ -1284,26 +1363,27 @@ class ConditionalMixtureEIM:
 
         self.c = config
         self.c.finalize_modifying()
-
+        self.checkpoint_dir= self.c.checkpoint_dir
+        self._mean_constraint= self.c.mean_constraint
         self._recorder = recorder
 
         self._context_dim = context_dim
         self._sample_dim = sample_dim
 
         c_net_hidden_dict = {NetworkKeys.NUM_UNITS: self.c.components_net_hidden_layers,
-                             NetworkKeys.ACTIVATION: "elu",
+                             NetworkKeys.ACTIVATION: "relu",
                              NetworkKeys.BATCH_NORM: False,
                              NetworkKeys.DROP_PROB: self.c.components_net_drop_prob,
                              NetworkKeys.L2_REG_FACT: self.c.components_net_reg_loss_fact}
 
         g_net_hidden_dict = {NetworkKeys.NUM_UNITS: self.c.gating_net_hidden_layers,
-                             NetworkKeys.ACTIVATION: "elu",
+                             NetworkKeys.ACTIVATION: "relu",
                              NetworkKeys.BATCH_NORM: False,
                              NetworkKeys.DROP_PROB: self.c.gating_net_drop_prob,
                              NetworkKeys.L2_REG_FACT: self.c.gating_net_reg_loss_fact}
 
         dre_params = {NetworkKeys.NUM_UNITS: self.c.dre_hidden_layers,
-                      NetworkKeys.ACTIVATION: "elu",
+                      NetworkKeys.ACTIVATION: "relu",
                       NetworkKeys.DROP_PROB: self.c.dre_drop_prob,
                       NetworkKeys.L2_REG_FACT: self.c.dre_reg_loss_fact}
 
@@ -1314,8 +1394,17 @@ class ConditionalMixtureEIM:
                                           conditional_model=True,
                                           gradient_clipping=self.c.dre_grad_clipping)
 
-        self._model = GaussianEMM(self._context_dim, self._sample_dim, self.c.num_components, self.c.gating_num_epochs, self._dre,
+        self._model = GaussianEMM(self._context_dim, self._sample_dim, self.c.num_components, self.c.gating_num_epochs, 
                                   c_net_hidden_dict, g_net_hidden_dict, seed=seed)
+        #https://github.com/cooper-org/cooper/blob/de1c6fec6aef68ca024c017e06812c3dd453e5c4/tutorials/scripts/plot_gaussian_mixture.py
+        #https://github.com/gallego-posada/constrained_sparsity
+        #Adding costraint over KL divergence of mixture of experts component to avoid getting negative KLs or very huge KL values
+        self._cmp = [PenalizedKLConstraint(self._dre, l1_lambda = 0.0001, mean_constraint=self._mean_constraint, device=device) for i in range(len(self._model.components))]
+        self._formulation= [cooper.LagrangianFormulation(self._cmp[i]) for i in range(len(self._model.components))]
+        self._primal_optimizer = [cooper.optim.ExtraSGD(self._model.components[i].trainable_variables, lr=self.c.components_learning_rate, momentum=0.7) for i in range(len(self._model.components))]
+        self._dual_optimizer = [cooper.optim.partial_optimizer(cooper.optim.ExtraSGD, lr=1e-3, momentum=0.7) for i in range(len(self._model.components))]
+        # Wrap the formulation and both optimizers inside a ConstrainedOptimizer
+        self._coop = [cooper.ConstrainedOptimizer(formulation=self._formulation[i], primal_optimizer=self._primal_optimizer[i], dual_optimizer=self._dual_optimizer[i]) for i in range(len(self._model.components))]
         self._model.to(device)
         self._recorder.initialize_module(RecorderKeys.INITIAL)
         self._recorder(RecorderKeys.INITIAL, "Nonlinear Conditional EIM - Reparametrization", config)
@@ -1325,8 +1414,8 @@ class ConditionalMixtureEIM:
         self._recorder.initialize_module(RecorderKeys.DRE, self.c.train_epochs)
         #initialise trainer inside DensityRatioEstimator class
         self._dre.set_trainer()
-        self._c_opts = [ optim.Yogi(self._model.components[i].trainable_variables, lr=self.c.components_learning_rate, betas=(0.5, 0.999)) for i in range(len(self._model.components))]
         self._g_opt = torch.optim.Adam(self._model.gating_distribution.trainable_variables, lr=self.c.gating_learning_rate, betas=(0.5, 0.999))
+        #self._c_opts = [ optim.Yogi(self._model.components[i].trainable_variables, lr=self.c.components_learning_rate, betas=(0.5, 0.999)) for i in range(len(self._model.components))]
         
         #self._c_lrs = [torch.optim.lr_scheduler.ReduceLROnPlateau(c_opt, 'min', factor=0.2, patience=10, verbose=True)for c_opt in self._c_opts]
         #self._g_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(self._g_opt, 'min', factor=0.2, patience=10, verbose=True)
@@ -1335,14 +1424,48 @@ class ConditionalMixtureEIM:
 
     def _set_train_contexts(self, train_samples):
         self._train_samples = train_samples
+        #https://github.com/pbecker93/ExpectedInformationMaximization/blob/53c6e097cb7f4f1f6338aeb69bc923dc86ca9712/EIM/eim/ConditionalMixtureEIM.py#L56
         self._train_contexts = torch.tensor(train_samples[0], dtype=torch.float32).to(device)
 
     def train_emm(self, train_samples, val_samples):
         self._dre.process_data(train_samples, val_samples)
         self._set_train_contexts(train_samples)
+        self.state_history = [cooper.StateLogger(save_metrics=["loss", "ineq_defect", "ineq_multipliers"]) for i in range(len(self._model.components))]
         for i in range(self.c.train_epochs):
-            self._recorder(RecorderKeys.TRAIN_ITER, i)
+            with torch.no_grad():
+                 self._recorder(RecorderKeys.TRAIN_ITER, i)
             self.train_iter(i)
+        
+        fig, axs = plt.subplots(nrows=len(self._model.components), ncols=3, figsize=(7, 25))
+        for i in range(len(self._model.components)):
+            
+            all_metrics = self.state_history[i].unpack_stored_metrics()
+            lagrangian_multipliers=np.stack([x.cpu() for x in all_metrics["ineq_multipliers"]])
+            constraints=np.stack([x.cpu() for x in all_metrics["ineq_defect"]]) 
+            losses=np.stack([x for x in all_metrics["loss"]])
+            #print(lagrangian_multipliers.shape, constraints.shape, losses.shape)
+            axs[i,0].plot(all_metrics["iters"], lagrangian_multipliers)
+            axs[i,0].set_title("KL Multipliers")
+            asp = np.diff(axs[i,0].get_xlim())[0] / np.diff(axs[i,0].get_ylim())[0]
+            axs[i,0].set_aspect(asp)
+            #second plot
+            
+            axs[i,1].plot(all_metrics["iters"], constraints, alpha=0.6)
+            # Show that defect remains below/at zero
+            axs[i,1].axhline(0.0, c="gray", alpha=0.35)
+            axs[i,1].set_title("Defects Positive KL")
+            asp = np.diff(axs[i,1].get_xlim())[0] / np.diff(axs[i,1].get_ylim())[0]
+            axs[i,1].set_aspect(asp)
+            ###########
+            #third plot
+            axs[i,2].plot(all_metrics["iters"],losses)
+            # Show optimal entropy is achieved
+            axs[i,2].set_title("Objective")
+            asp = np.diff(axs[i,2].get_xlim())[0] / np.diff(axs[i,2].get_ylim())[0]
+            axs[i,2].set_aspect(asp)
+        fig.tight_layout()
+        plt.savefig("EIM_out_imgs/train_constrain.png")
+        plt.close()
 
     #   extra function to allow running from cluster work
     def train_iter(self, i, train_samples=None, val_samples=None):
@@ -1361,7 +1484,7 @@ class ConditionalMixtureEIM:
             with torch.no_grad():
               self._recorder(RecorderKeys.WEIGHTS_UPDATE, w_res)
 
-        c_res = self.update_components()
+        c_res = self.update_components(i)
         with torch.no_grad():
           self._recorder(RecorderKeys.COMPONENT_UPDATE, c_res)
         return w_res, c_res
@@ -1369,7 +1492,7 @@ class ConditionalMixtureEIM:
           #self._recorder(RecorderKeys.MODEL, self._model, i)
 
     """component update"""
-    def update_components(self, train_samples=None):
+    def update_components(self, iter_num, train_samples=None):
         # if pass train_samples, overwrite the exsiting cache
         if train_samples is not None:
             self._set_train_contexts(train_samples)
@@ -1386,8 +1509,11 @@ class ConditionalMixtureEIM:
             old_chol_inv = torch.linalg.solve_triangular(old_chol_covars + stab_fact * rhs, rhs, upper=False)
         except AttributeError:
             old_chol_inv = torch.triangular_solve(rhs, old_chol_covars + stab_fact * rhs, upper=False)[0]
+        
+        
+
         for i in range(self.c.components_num_epochs):
-            self._components_train_step(importance_weights, old_means, old_chol_inv)
+            self._components_train_step(importance_weights, old_means, old_chol_inv, iter_num)
 
         res_list = []
         with torch.no_grad():
@@ -1399,17 +1525,24 @@ class ConditionalMixtureEIM:
         return res_list
 
 
-    def _components_train_step(self, importance_weights, old_means, old_chol_precisions):
+    def _components_train_step(self, importance_weights, old_means, old_chol_precisions, iter_num, save_model=False):
 
         for i in range(self._model.num_components):
             dataset = torch.utils.data.TensorDataset(self._train_contexts, importance_weights[:, i], old_means, old_chol_precisions)
 
             loader = torch.utils.data.DataLoader( dataset, shuffle = True, batch_size=self.c.components_batch_size)
-            l1_lambda = 0.0001
+            
             
             for batch_idx, (context_batch, iw_batch, old_means_batch, old_chol_precisions_batch) in enumerate(loader):
                 
                 iw_batch = iw_batch / torch.sum(iw_batch)
+
+                if save_model:
+                    #needs to be debugged 
+                    torch.save(self._coop[i].formulation.state_dict(), os.path.join(self.checkpoint_dir, "formulation_component_{}.pt".format(i)),)
+                    torch.save(self._coop[i].state_dict(),os.path.join(self.checkpoint_dir, "constrained_optimizer_component_{i}.pt".format(i)),)
+
+                """
                 samples = self._model.components[i].sample(context_batch.to(device))
                 #with torch.no_grad():
                 losses = - torch.squeeze(self._dre(torch.cat([context_batch.to(device), samples], dim=-1), inTrain=False))
@@ -1425,17 +1558,27 @@ class ConditionalMixtureEIM:
                 
                 #orth_norm = OrthogonalRegularization(self._model.components[i])
                 loss = torch.mean(iw_batch * (losses + kls)).to(device) +  l1_norm + self._model.components[i]._regularizer
+                """
+                self._coop[i].zero_grad()
+                lagrangian = self._formulation[i].composite_objective(self._cmp[i].closure, context_batch, old_means_batch[:, i], old_chol_precisions_batch[:, i], iw_batch, self._model.components[i])
+                self._formulation[i].custom_backward(lagrangian)
+                self._coop[i].step(self._cmp[i].closure, context_batch, old_means_batch[:, i], old_chol_precisions_batch[:, i], iw_batch, self._model.components[i])
+                loss = self._cmp[i].closure( context_batch, old_means_batch[:, i], old_chol_precisions_batch[:, i], iw_batch, self._model.components[i]).loss
+                if iter_num % 100 == 0:
+                   logging.info("Iteration: %d component  %d of mixture annd its loss value using constraint optimization: %.4f", iter_num, i, loss.item())
+
+                self.state_history[i].store_metrics(self._formulation[i], iter_num)
                 #loss = torch.mean(iw_batch*kls)
                 # Backprop:
-                self._c_opts[i].zero_grad()
-                loss.backward(retain_graph=True)
+                #self._c_opts[i].zero_grad()
+                #loss.backward(retain_graph=True)
                 
                 if self.c.components_grad_clipping and self.c.components_grad_clipping > 0:
                     torch.nn.utils.clip_grad_norm_(self._model.components[i].parameters(), max_norm = self.c.components_grad_clipping, norm_type=2)
-                self._c_opts[i].step()
+                #self._c_opts[i].step()
             #if self._c_lrs:
             #    self._c_lrs[i].step(loss)
-            self._c_opts[i].zero_grad()
+            #self._c_opts[i].zero_grad()
 
     """gating update"""
     def update_gating(self, train_samples=None):
@@ -1477,7 +1620,7 @@ class ConditionalMixtureEIM:
             self._g_opt.step()
         #if self._g_lr:
         #    self._g_lr.step(loss)
-        self._g_opt.zero_grad()
+        #self._g_opt.zero_grad()
 
     @property
     def model(self):
@@ -2101,7 +2244,7 @@ if __name__ == "__main__":
     """Configure EIM"""
 
     config = ConditionalMixtureEIM.get_default_config()
-    config.train_epochs = 5000
+    config.train_epochs = 2000
     config.num_components = num_components
 
     config.components_net_hidden_layers = [64, 64]
