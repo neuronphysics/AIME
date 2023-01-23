@@ -1,0 +1,621 @@
+from torch.distributions.normal import Normal
+from torch.distributions import MultivariateNormal, OneHotCategorical
+from torch.utils.data import Dataset
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+import torch_optimizer
+import os
+import sys
+
+from MaskedNorm import MaskedNorm
+from CustomLSTM import LSTMCore
+from attention import LatentEncoder
+
+
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
+        #nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("linear"))
+        m.bias.data.zero_()
+    elif isinstance(m, nn.Conv2d):
+        nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("relu"))
+        m.bias.data.zero_()
+    elif isinstance(m, nn.BatchNorm1d):
+        nn.init.normal_(m.weight, 1.0, 0.02)
+        m.bias.data.zero_()
+    elif isinstance(m, nn.LayerNorm):
+        m.bias.data.zero_()
+        nn.init.ones_(m.weight)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.normal_(m.weight, 1.0, 0.02)
+        m.bias.data.zero_()
+    elif isinstance(m,nn.GRU) or isinstance(m,nn.LSTM):
+        for ind in range(0, m.num_layers):
+            weight = eval('m.weight_ih_l'+str(ind))
+            bias = np.sqrt(6.0 / (weight.size(0)/4 + weight.size(1)))
+            nn.init.uniform_(weight, -bias, bias)
+            weight = eval('m.weight_hh_l'+str(ind))
+            bias = np.sqrt(6.0 / (weight.size(0)/4 + weight.size(1)))
+            nn.init.uniform_(weight, -bias, bias)
+        if m.bias:
+            for ind in range(0, m.num_layers):
+                weight = eval('m.bias_ih_l'+str(ind))
+                weight.data.zero_()
+                weight.data[m.hidden_size: 2 *m.hidden_size] = 1
+                weight = eval('m.bias_hh_l'+str(ind))
+                weight.data.zero_()
+                weight.data[m.hidden_size: 2 * m.hidden_size] = 1
+    elif isinstance(m, list):
+        for layer in m:
+            if isinstance(layer, nn.BatchNorm1d):
+                nn.init.normal_(layer.weight, 1.0, 0.02)
+                layer.bias.data.zero_()
+            elif isinstance(layer, nn.Linear):
+                torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
+                #nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain("linear"))
+                layer.bias.data.zero_()
+
+#based on https://github.com/JasonZHM/magic-microlensing/blob/bb9dd7df3144f55eeffcf497ae9f4b9b968a2a79/model/mdn_full.py
+class NormalNetwork(nn.Module):
+    def __init__(self, in_dim, out_dim, n_components, full_cov=True):
+        super().__init__()
+        self.n_components = n_components
+        self.out_dim = out_dim
+        self.full_cov = full_cov
+        self.tril_indices = torch.tril_indices(row=out_dim, col=out_dim, offset=0)
+        self.elu = nn.ELU()
+        self.mean_net = nn.Sequential(
+                nn.Linear(in_dim, out_dim * n_components),
+            )
+        ##initialize
+        #init_weights(self.mean_net[0])
+        if full_cov:
+            # Cholesky decomposition of the covariance matrix
+            self.tril_net = nn.Sequential(
+                nn.Linear(in_dim, int(out_dim * (out_dim + 1) / 2 * n_components)),
+            )
+        else:
+            self.tril_net = nn.Sequential(
+                nn.Linear(in_dim, out_dim * n_components),
+            )
+        ##initialize
+        #init_weights(self.tril_net[0])
+
+    def forward(self, x):
+        mean = self.mean_net(x).reshape(-1, self.n_components, self.out_dim)
+        if self.full_cov:
+            tril_values = self.tril_net(x).reshape(mean.shape[0], self.n_components, -1)
+            tril = torch.zeros(mean.shape[0], mean.shape[1], mean.shape[2], mean.shape[2]).to(x.device)
+            tril[:, :, self.tril_indices[0], self.tril_indices[1]] = tril_values
+            # diagonal element must be strictly positive
+            # use diag = elu(diag) + 1 to ensure positivity
+            tril = tril - torch.diag_embed(torch.diagonal(tril, dim1=-2, dim2=-1)) + torch.diag_embed(self.elu(torch.diagonal(tril, dim1=-2, dim2=-1)) + 1 + 1e-8)
+        else:
+            tril = self.tril_net(x).reshape(mean.shape[0], self.n_components, -1)
+            tril = torch.diag_embed(self.elu(tril) + 1 + 1e-8)
+        return MultivariateNormal(mean, scale_tril=tril)
+
+class CategoricalNetwork(nn.Module):
+
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+        )
+
+        ##initialize
+        #init_weights(self.network[0])
+
+    def forward(self, x):
+        params = self.network(x)
+        return OneHotCategorical(logits=params)
+
+
+class VRNN_GMM(nn.Module):
+    #The main part of the algorithm
+    #A Recurrent Latent Variable Model for Sequential Data (Junyoung Chung et al 2016)
+    def __init__(self,
+                 u_dim,
+                 y_dim,
+                 h_dim,
+                 z_dim,
+                 n_layers,
+                 n_mixtures,
+                 device,
+                 output_clamp=(-10,10),
+                 batch_norm=False,
+                 masked_norm=True,
+                 bias=False):
+        super(VRNN_GMM, self).__init__()
+
+        self.y_dim = y_dim
+        self.u_dim = u_dim
+        self.h_dim = h_dim
+        self.z_dim = z_dim
+        self.n_layers = n_layers
+        self.n_mixtures = n_mixtures
+        self.device = device
+        self.batch_norm = batch_norm
+        self._MaskedNorm = masked_norm
+        ##====(new)====##
+        if self._MaskedNorm:
+            self.norm_u = MaskedNorm(u_dim)
+            self.norm_y = MaskedNorm(y_dim)
+
+        self._latent_encoder = LatentEncoder(
+            u_dim + y_dim,
+            hidden_dim=h_dim,
+            latent_dim=h_dim,
+            self_attention_type="ptmultihead",
+            n_encoder_layers=n_layers,
+            batchnorm=False,
+            dropout=0,
+            attention_dropout=0,
+            attention_layers=2,
+            use_lstm=True
+            )
+        self.output_clamp = output_clamp
+        self._eps = 1e-5
+        self._max_deviation = 2.0
+
+        ###=============###
+        # feature-extracting transformations (phi_y, phi_u and phi_z)
+
+        layers_phi_y = [nn.Linear(self.y_dim, self.h_dim)]
+        if self.batch_norm:  # Add batch normalization when requested
+            layers_phi_y.append(torch.nn.BatchNorm1d(self.h_dim))
+        layers_phi_y = layers_phi_y + [
+            nn.ReLU(),
+            nn.Linear(self.h_dim, self.h_dim),
+        ]
+
+        self.phi_y = torch.nn.Sequential(*layers_phi_y)
+
+        ##initialize
+        #init_weights(self.phi_y[0])
+        #init_weights(self.phi_y[-1])
+        ###=============###
+        layers_phi_u = [nn.Linear(self.u_dim, self.h_dim)]
+        if self.batch_norm:
+            layers_phi_u.append(torch.nn.BatchNorm1d(self.h_dim))
+        layers_phi_u = layers_phi_u + [
+            nn.ReLU(),
+            nn.Linear(self.h_dim, self.h_dim),
+        ]
+
+
+        self.phi_u = torch.nn.Sequential(*layers_phi_u)
+
+        ##initialize
+        #init_weights(self.phi_u[0])
+        #init_weights(self.phi_u[-1])
+        ######
+        layers_phi_z = [nn.Linear(self.z_dim, self.h_dim)]
+        if self.batch_norm:
+            layers_phi_z.append(torch.nn.BatchNorm1d(self.h_dim))
+        layers_phi_z = layers_phi_z + [
+            nn.ReLU(),
+            nn.Linear(self.h_dim, self.h_dim),
+        ]
+
+        self.phi_z = torch.nn.Sequential(*layers_phi_z)
+
+        ##initialize
+        #init_weights(self.phi_z[0])
+        #init_weights(self.phi_z[-1])
+        #-----------------------------------------
+        # encoder function (phi_enc) -> Inference
+
+        encoder_layers=[nn.Linear(self.h_dim + self.h_dim, self.h_dim)]
+        if self.batch_norm:
+            encoder_layers.append(torch.nn.BatchNorm1d(self.h_dim))
+        encoder_layers=encoder_layers+[
+            nn.ReLU(),
+            nn.Linear(self.h_dim, self.h_dim),
+        ]
+        if self.batch_norm:
+            encoder_layers= encoder_layers+[nn.BatchNorm1d(self.h_dim)]
+
+        encoder_layers  = encoder_layers+[nn.ReLU()]
+
+
+        self.enc        = torch.nn.Sequential(*encoder_layers)
+
+        ##initialize
+        #init_weights(self.enc[0])
+        #if not self.batch_norm:
+        #    init_weights(self.enc[2])
+        #else:
+        #    init_weights(self.enc[3])
+        #-----------------------------------------
+        ###  encoder mean
+        self.enc_mean   = nn.Linear(self.h_dim, self.z_dim)
+        #init_weights(self.enc_mean)
+
+        ###  encoder log_var
+        self.enc_logvar = nn.Linear(self.h_dim, self.z_dim)
+        #init_weights(self.enc_logvar)
+
+        #-----------------------------------------
+        # prior function (phi_prior) -> Prior
+        layers_prior = [nn.Linear(self.h_dim, self.h_dim)]
+        if self.batch_norm:
+            layers_prior.append(torch.nn.BatchNorm1d(self.h_dim))
+        layers_prior = layers_prior + [
+            nn.ReLU(),
+        ]
+
+        self.prior = torch.nn.Sequential(*layers_prior)
+        ##initialize
+        #init_weights(self.prior[0])
+
+        # prior mean
+        self.prior_mean = nn.Linear(self.h_dim, self.z_dim)
+        #init_weights(self.prior_mean)
+
+        # prior logvar
+        self.prior_logvar = nn.Linear(self.h_dim, self.z_dim)
+        #init_weights(self.prior_logvar)
+
+        #-----------------------------------------
+        # decoder function (phi_dec) -> Generation
+        layers_decoder = [
+            nn.Linear(self.h_dim + self.h_dim + self.h_dim, self.h_dim) #modified
+        ]
+        if self.batch_norm:
+            layers_decoder.append(torch.nn.BatchNorm1d(self.h_dim))
+        layers_decoder = layers_decoder+[
+            nn.ReLU(),
+            nn.Linear(self.h_dim, self.h_dim)
+        ]
+        if self.batch_norm:
+            layers_decoder.append(torch.nn.BatchNorm1d(self.h_dim))
+        layers_decoder = layers_decoder+[
+            nn.ReLU(),
+        ]
+
+        self.dec      = nn.Sequential(*layers_decoder)
+        #init_weights(self.dec[0])
+        #if self.batch_norm:
+        #    init_weights(self.dec[3])
+        #else:
+        #    init_weights(self.dec[2])
+        ## initialize
+
+
+        ## (decoder) Normal distribution
+        self.decoder_normal = NormalNetwork(self.h_dim, self.y_dim , self.n_mixtures)
+
+        ##
+        #(decoder) Categorical distribution
+        self.dec_pi = CategoricalNetwork(self.h_dim, self.n_mixtures)
+
+
+        # recurrence function (f_theta) -> Recurrence
+        #self._rnn =  nn.LSTM(self.h_dim + self.h_dim + self.h_dim, self.h_dim, self.n_layers, bias, batch_first= True)#modified
+        self._rnn =  LSTMCore(input_size=self.h_dim + self.h_dim + self.h_dim, hidden_size = self.h_dim, num_layers = self.n_layers,  batch_first=True, train_truncate= 25, train_burn_in = 15)
+        #self.apply(self.weight_init)
+
+    def forward(self, u, y):
+
+        batch_size = y.size(0)
+        #input is (Batch, seq_len, D)
+        #seq_len = y.shape[-1]
+        seq_len = torch.LongTensor([torch.max((u[i,0,:]!=0).nonzero()).item()+1 for i in range(u.shape[0])])
+        ##=============##
+        mask = ~u.eq(0.0)
+
+        sqn  = torch.unique(mask.sum(dim=-1), sorted=False, dim=1).squeeze(-1)
+        sqn  = sqn.cpu()
+        #print(seq_len,sqn, u.shape)
+        assert torch.all(torch.eq(seq_len, sqn))
+        ##====(new)====##
+        reshaped_u  = u.permute(0,2,1)
+        reshaped_y  = y.permute(0,2,1)
+
+        assert not torch.isnan(reshaped_u).any()
+        assert not torch.isnan(reshaped_y).any()
+        assert torch.isfinite(reshaped_u).any()
+
+        #mistmach between input???
+        if self._MaskedNorm:
+            normed_u = self.norm_u(reshaped_u)
+            normed_y = self.norm_y(reshaped_y)
+            assert not torch.isnan(normed_u).any()
+            assert not torch.isnan(normed_y).any()
+            context_u = normed_u
+            context_y = normed_y
+        else:
+            context_u = reshaped_u
+            context_y = reshaped_y
+
+        mean_attn, logvar_attn = self._latent_encoder(context_u, context_y)
+        #mean_attn [B, :seq_len, D_h])
+        ##=============##
+        # allocation
+        total_loss = 0
+        # initialization
+        h = torch.autograd.Variable(torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device), requires_grad=True)
+        c = torch.autograd.Variable(torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device), requires_grad=True)
+        # for all time steps
+        for i in range(len(seq_len)):
+            for t in range(seq_len[i]):
+                # feature extraction: y_t
+                phi_y_t = self.phi_y(y[:, :, t])
+                # feature extraction: u_t
+                phi_u_t = self.phi_u(u[:, :, t])
+
+                # encoder: y_t, h_t -> z_t posterior
+                encoder_input = torch.cat([phi_y_t, h[-1]], dim=1)
+                encoder_input = self.enc(encoder_input)
+
+                enc_mean_t   = torch.clamp(self.enc_mean(encoder_input), *self.output_clamp)
+                enc_logvar_t = self.enc_logvar(encoder_input)
+                enc_logvar_t = torch.clamp(nn.Softplus()(enc_logvar_t), *self.output_clamp)
+
+                # prior: h_t -> z_t (for KLD loss)
+                prior_input  = h[-1]
+                prior_input  = self.prior(prior_input)
+
+                prior_mean_t   = self.prior_mean(prior_input)
+                prior_logvar_t = self.prior_logvar(prior_input)
+                prior_logvar_t = nn.Softplus()(prior_logvar_t)
+
+                # sampling and reparameterization: get a new z_t
+                #temp = tdist.Normal(enc_mean_t, enc_logvar_t.exp().sqrt())
+                #z_t = tdist.Normal.rsample(temp)
+                z_t     = self.reparametrization(enc_mean_t, enc_logvar_t)
+                # feature extraction: z_t
+                phi_z_t = self.phi_z(z_t)
+                #####=====(new)======######
+
+                #mean attention size :torch.Size([B, time, D_hid])
+                c_t_mu     = mean_attn[:, t, :]
+                c_t_logvar = logvar_attn[:, t, :]
+                #phi_z_t:torch.Size([B, D_hid])
+                #c_final :torch.Size([B, D_hid])
+                c_final  =  self.reparametrization(c_t_mu, c_t_logvar)
+
+
+                #####================######
+                # decoder: h_t, z_t -> y_t
+                decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)##(modified)
+                decoder_out   = self.dec(decoder_input)
+
+                dec_normal_t = self.decoder_normal(decoder_out)
+                dec_pi_t     = self.dec_pi(decoder_out)
+
+                RNN_inputs    = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
+                #input of RNN module torch.Size([B, 3*H]) ==>[B,T,3*H]
+
+                # recurrence: u_t+1, z_t -> h_t+1
+                _, (h, c) = self._rnn( torch.unsqueeze(RNN_inputs, 1), (h,c)) ##(modified)Size [2, B, H]
+
+                # computing the loss
+                KLD = self.kld_gauss(enc_mean_t, enc_logvar_t, prior_mean_t, prior_logvar_t)
+                assert not torch.isnan(KLD)
+                KLD_ATTN = self.kld_attention(c_t_mu, c_t_logvar) ##(new)
+                assert not torch.isnan(KLD_ATTN)
+                loss_pred = self.loglikelihood_gmm(y[:, :, t], dec_normal_t, dec_pi_t)
+                assert not torch.isnan(loss_pred)
+                assert torch.isfinite(loss_pred)
+                total_loss += - loss_pred + KLD + KLD_ATTN
+
+        return total_loss
+
+    def reparametrization(self, mu, log_var):
+
+        # Reparametrization trick
+        var = torch.exp(log_var* 0.5)
+        eps = torch.randn_like(var)
+
+        return eps.mul(var).add_(mu)
+
+    def generate(self, u):
+        # get the batch size
+        batch_size = u.shape[0]
+        # length of the sequence to generate
+        #seq_len = u.shape[-1]
+        seq_len = torch.LongTensor([torch.max((u[i,0,:]!=0).nonzero()).item()+1 for i in range(u.shape[0])])
+        # allocation
+        sample = torch.zeros(batch_size, self.y_dim, seq_len, device=self.device)
+        sample_mu = torch.zeros(batch_size, self.y_dim, seq_len, device=self.device)
+        sample_sigma = torch.zeros(batch_size, self.y_dim, seq_len, device=self.device)
+
+        h = torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device)
+        c = torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device)
+        # for all time steps
+        for i in range(len(seq_len)):
+            for t in range(seq_len[i]):
+                # feature extraction: u_t+1
+                phi_u_t = self.phi_u(u[:, :, t])
+
+                # prior: h_t -> z_t
+                prior_input  = h[-1]
+                prior_input  = self.prior(prior_input)
+
+                prior_mean_t   = self.prior_mean(prior_input)
+                prior_logvar_t = self.prior_logvar(prior_input)
+                prior_logvar_t = nn.Softplus()(prior_logvar_t)
+
+                # sampling and reparameterization: get new z_t
+                #temp = tdist.Normal(prior_mean_t, prior_logvar_t.exp().sqrt())
+                #z_t = tdist.Normal.rsample(temp)
+                z_t = self.reparametrization(prior_mean_t, prior_logvar_t)
+                # feature extraction: z_t
+                phi_z_t = self.phi_z(z_t)
+                ##=================(new)============##
+
+                c_final = torch.distributions.Normal(torch.zeros_like(phi_z_t), torch.ones_like(phi_z_t)).rsample()
+
+                ##==================================##
+                # decoder: z_t, h_t -> y_t
+
+                decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)##(modified)
+                decoder_out   = self.dec(decoder_input)
+
+                dec_normal_t          = self.decoder_normal(decoder_out)
+
+                # store the samples
+                sample_mu[:, :, t]    = dec_normal_t.mean
+                sample_sigma[:, :, t] = dec_normal_t.variance**0.5
+
+                dec_pi_t        = self.dec_pi(decoder_out)
+                sample[:, :, t] = torch.sum(pi.sample().unsqueeze(2) * normal.sample(), dim=1)
+
+                # recurrence: u_t+1, z_t -> h_t+1
+                RNN_inputs = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
+                #input(B,T,H )
+
+                _, (h, c) = self._rnn(torch.unsqueeze(RNN_inputs, 1), (h,c))##(modified)
+
+        return sample, sample_mu, sample_sigma
+
+
+    def loglikelihood_gmm(self, y, normal, pi):
+        loglik = normal.log_prob(y.unsqueeze(1).expand_as(normal.loc))
+        loss = -torch.logsumexp(torch.log(pi.probs) + loglik, dim=1)
+        assert not torch.isnan(loss).any()
+        return loss.mean()
+
+
+    @staticmethod
+    def kld_gauss(mu_q, logvar_q, mu_p, logvar_p):
+        # Goal: Minimize KL divergence between q_pi(z|xi) || p(z|xi)
+        # This is equivalent to maximizing the ELBO: - D_KL(q_phi(z|xi) || p(z)) + Reconstruction term
+        # This is equivalent to minimizing D_KL(q_phi(z|xi) || p(z))
+        term1 = logvar_p - logvar_q - 1
+        term2 = (torch.exp(logvar_q) + (mu_q - mu_p) ** 2) / torch.exp(logvar_p)
+        kld = 0.5 * torch.sum(term1 + term2)
+
+
+        return kld
+    @staticmethod
+    def kld_attention(mu_attn, logvar_attn):
+        kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar_attn - mu_attn ** 2 - logvar_attn.exp(), dim = 1), dim = 0)
+        return kld_loss
+
+class DynamicModel(nn.Module):
+    def __init__(self, num_inputs, num_outputs, h_dim=96, z_dim=48, n_layers=2, n_mixtures=10, device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'), normalizer_input=None, normalizer_output=None,
+                 *args, **kwargs):
+        super(DynamicModel, self).__init__()
+        # Save parameters
+        self.num_inputs = num_inputs
+        self.num_outputs = num_outputs
+        self.args = args
+        self.kwargs = kwargs
+        self.normalizer_input = normalizer_input
+        self.normalizer_output = normalizer_output
+        self.zero_initial_state = False
+
+        # initialize the model
+        self.m = VRNN_GMM(num_inputs, num_outputs, h_dim, z_dim, n_layers, n_mixtures, device)
+        self.to(device)
+
+    @property
+    def num_model_inputs(self):
+        return self.num_inputs + self.num_outputs if self.ar else self.num_inputs
+
+    def forward(self, u, y=None):
+        if self.normalizer_input is not None:
+            u = self.normalizer_input.normalize(u)
+        if y is not None and self.normalizer_output is not None:
+            y = self.normalizer_output.normalize(y)
+
+        loss = self.m(u, y)
+
+        return loss
+
+    def generate(self, u, y=None):
+        if self.normalizer_input is not None:
+            u = self.normalizer_input.normalize(u)
+
+        y_sample, y_sample_mu, y_sample_sigma = self.m.generate(u)
+
+        if self.normalizer_output is not None:
+            y_sample = self.normalizer_output.unnormalize(y_sample)
+        if self.normalizer_output is not None:
+            y_sample_mu = self.normalizer_output.unnormalize_mean(y_sample_mu)
+        if self.normalizer_output is not None:
+            y_sample_sigma = self.normalizer_output.unnormalize_sigma(y_sample_sigma)
+
+        return y_sample, y_sample_mu, y_sample_sigma
+
+class ModelState:
+    """
+    Container for all model related parameters and optimizer
+    model
+    optimizer
+    """
+
+    def __init__(self,
+                 seed,
+                 nu,
+                 ny,
+                 h_dim=56,
+                 z_dim=48,
+                 n_layers=2,
+                 n_mixtures=8,
+                 device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+                 optimizer_type= "Yogi",
+                 **kwargs):
+
+        torch.manual_seed(seed)
+
+        self.h_dim=h_dim
+        self.z_dim=z_dim
+        self.n_layers=n_layers
+        self.n_mixtures= n_mixtures
+
+        self.model = DynamicModel( num_inputs=nu, num_outputs=ny, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers, n_mixtures=n_mixtures, device=device, **kwargs)
+        if optimizer_type == "AdaBelief":
+            self.optimizer = torch_optimizer.AdaBelief(self.model.m.parameters(),
+                                                       lr= 1e-4,
+                                                      betas=(0.9, 0.999),
+                                                      eps=1e-6,
+                                                      weight_decay=0
+                                                      )
+        elif optimizer_type=="AdamW":
+            self.optimizer = torch.optim.AdamW(self.model.m.parameters(),
+                                               lr= 1e-4,
+                                               betas=(0.9, 0.999)
+                                              )
+        elif optimizer_type=="SGD":
+            self.optimizer  = torch_optimizer.SGDW(self.model.m.parameters(),
+                                                   lr= 1e-4,
+                                                   momentum=0,
+                                                   dampening=0,
+                                                   weight_decay=1e-2,
+                                                   nesterov=False,
+                                                   )
+        else:
+            # Optimization parameters
+            yogi = torch_optimizer.Yogi(self.model.m.parameters(), lr= 0.5e-4, betas=(0.95, 0.999), eps=1e-3, initial_accumulator=1e-6, weight_decay=0,)
+
+            self.optimizer = torch_optimizer.Lookahead(yogi, k=5, alpha=0.5)
+
+
+    def load_model(self, path, name='VRNN_model.pt'):
+        file = path if os.path.isfile(path) else os.path.join(path, name)
+        try:
+            ckpt = torch.load(file, map_location=lambda storage, loc: storage)
+        except NotADirectoryError:
+            raise Exception("Could not find model: " + file)
+        self.model.load_state_dict(ckpt["model"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        epoch = ckpt['epoch']
+        return epoch
+
+    def save_model(self, epoch, vloss, elapsed_time,  path, name='VRNN_model.pt'):
+        # check if path exists and create otherwise
+        if not os.path.exists(path):
+            os.makedirs(path)
+        torch.save({
+                'epoch': epoch,
+                'model': self.model.state_dict(),
+                'optimizer': self.optimizer.state_dict(),
+                'vloss': vloss,
+                'elapsed_time': elapsed_time,
+            },
+            os.path.join(path, name))
