@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from vrnn import init_weights
 
 class MCDropout2d(nn.Dropout2d):
     def forward(self, input: torch.Tensor) -> torch.Tensor:

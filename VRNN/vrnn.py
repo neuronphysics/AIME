@@ -10,7 +10,7 @@ import sys
 
 from MaskedNorm import MaskedNorm
 from CustomLSTM import LSTMCore
-from attention import LatentEncoder
+from attention_encoder import LatentEncoder
 
 
 def init_weights(m):

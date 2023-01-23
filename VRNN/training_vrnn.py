@@ -23,7 +23,7 @@ from collections import defaultdict
 from functools import partial
 from Normalization import *
 from vrnn import *
-from utilities import *
+from vrnn_utilities import *
 
 torch.cuda.empty_cache()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
