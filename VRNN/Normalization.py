@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import os, sys
+import numpy as np 
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class Normalizer1D(nn.Module):

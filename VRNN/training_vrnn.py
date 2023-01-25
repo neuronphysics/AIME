@@ -4,7 +4,7 @@ import numpy as np
 import math
 import time
 import logging
-import os
+import os, sys
 import torch
 import torch.nn as nn
 import torch.utils
@@ -15,15 +15,18 @@ import torch.optim as optim
 from torch.nn import functional as F
 import torch.distributions as tdist
 from torch.distributions import MultivariateNormal, OneHotCategorical
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, TensorDataset
+from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 import torch.nn.init as init
-
+from tqdm import tqdm
 from collections import defaultdict
 from functools import partial
-from Normalization import *
-from vrnn import *
+from Normalization import Normalizer1D, compute_normalizer
+from main import ModelState, DynamicModel, VRNN_GMM
 from vrnn_utilities import *
+from sklearn.model_selection import train_test_split
+from tensorboardX import SummaryWriter
 
 torch.cuda.empty_cache()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -31,8 +34,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_general, file_name_general):
     train_options={'clip':2,
-                   'lr_scheduler_nstart':10,
-                   'print_every':1,
+                   'print_every':2,
                    'test_every':50,
                    'batch_size':30,
                    'n_epochs':400,
@@ -42,6 +44,10 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                    'min_lr':1e-6,#minimal learning rate
                    'init_lr':5e-4,#initial learning rate
                    }
+    path = os.getcwd()
+    parentfolder = os.path.dirname(path)
+    
+    writer = SummaryWriter(log_dir=os.path.join(parentfolder, "writer"))
     def validate(loader):
         modelstate.model.eval()
         total_vloss = 0
@@ -51,7 +57,9 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
             for i, (u, y) in enumerate(loader):
                 u = u.to(device)
                 y = y.to(device)
-                vloss_ = modelstate.model(u, y)
+                # forward pass over model
+                with torch.no_grad():
+                     vloss_ = modelstate.model(u, y)
 
                 total_batches += u.size()[0]
                 total_points += np.prod(u.shape)
@@ -71,6 +79,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
             scaler = torch.cuda.amp.GradScaler()
 
         for i, (u, y) in enumerate(loader_train):
+            batch_size=u.shape[0]
             u = u.to(device)#torch.Size([B, D_in, T])
             y = y.to(device)
 
@@ -149,7 +158,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                     'Train Epoch: [{:5d}/{:5d}], Batch [{:6d}/{:6d} ({:3.0f}%)]\tLearning rate: {:.2e}\tLoss: {:.3f}'.format(
                         epoch, train_options['n_epochs'], (i + 1), len(loader_train),
                         100. * (i + 1) / len(loader_train), lr, total_loss / total_points))  # total_batches
-
+                writer.add_scalar('data/total_loss', total_loss / total_points, i + epoch*len(loader_train))
         return total_loss / total_points
 
     try:
@@ -169,7 +178,10 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
 
         # output parameter
         best_epoch = 0
-
+        process_desc = "Train-loss: {:2.3e}; Valid-loss: {:2.3e}; LR: {:2.3e}"
+        progress_bar = tqdm(initial=0, leave=True, total=train_options['n_epochs'], desc=process_desc.format(0, 0, 0), position=0)
+        
+        
         for epoch in range(0, train_options['n_epochs'] + 1):
             # Train and validate
             train(epoch)  # model, train_options, loader_train, optimizer, epoch, lr)
@@ -204,17 +216,23 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                         # adapt new learning rate in the optimizer
                         for param_group in modelstate.optimizer.param_groups:
                             param_group['lr'] = lr
-                        print('\nLearning rate adapted! New learning rate {:.3e}\n'.format(lr))
-                # Early stoping condition
-                if lr < train_options['min_lr']:
-                    break
-
+                        #print('\nLearning rate adapted! New learning rate {:.3e}\n'.format(lr))
+                        message = 'Learning rate adapted in epoch {} with valid loss {:2.6e}. New learning rate {:.3e}.'
+                        tqdm.write(message.format(epoch, vloss, lr))
+                
+            progress_bar.desc = process_desc.format(loss, vloss, lr)
+            progress_bar.update(1)
+            # Early stoping condition
+            if lr < train_options['min_lr']:
+                break
+        progress_bar.close()
+        
     except KeyboardInterrupt:
-        print('\n')
-        print('-' * 89)
-        print('Exiting from training early')
+        tqdm.write('\n')
+        tqdm.write('-' * 89)
+        tqdm.write('Exiting from training early.......')
         # modelstate.save_model(epoch, vloss, time.clock() - start_time, logdir, 'interrupted_model.pt')
-        print('-' * 89)
+        tqdm.writet('-' * 89)
 
     # print best saved epoch model
     # print('\nBest model from epoch {} saved.'.format(best_epoch))
@@ -361,25 +379,23 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
 if __name__ == "__main__":
     # get saving path
 
-    input_filename = "gym_transition_inputs.pt"
-    target_filename = "gym_transition_outputs.pt"
-    filepath ="/home/zsheikhb/Work/AIME/sac/tmp/data/"
-    variable_episodes = torch.load(os.path.join(filepath, input_filename))
-    final_next_state  = torch.load(os.path.join(filepath, target_filename))
+    input_filename = "transit_data/gym_transition_inputs.pt"
+    target_filename = "transit_data/gym_transition_outputs.pt"
+    filepath = os.getcwd()
+    parentfolder = os.path.dirname(filepath)
+    variable_episodes = torch.load(os.path.join( parentfolder, input_filename))
+    final_next_state  = torch.load(os.path.join( parentfolder, target_filename))
 
-    print(f" shape of input: {variable_episodes.shape}")
-    print(f" shape of output: {final_next_state.shape}")
-    path_general = os.getcwd() + '/sac/log/'
+    print(f" shape of input data (s_t, a_t): {variable_episodes.shape}")
+    print(f" shape of output data (s_t+1, r_t): {final_next_state.shape}")
+    path_general = parentfolder + '/sac/log/'
     if not os.path.exists(path_general):
         os.makedirs(path_general)
     else:
         pass
     file_name_general='Mujoco'
-    if not os.path.exists('/home/zsheikhb/Work/AIME/sac/tmp/logs'):
-       os.makedirs('/home/zsheikhb/Work/AIME/sac/tmp/logs')
-    else:
-       pass
-    IMG_FOLDER='/home/zsheikhb/Work/AIME/sac/tmp/sac'
+
+    IMG_FOLDER=parentfolder +'/sac/plots'
     #LOG_FILENAME = '/content/gdrive/My Drive/sac/tmp/logs/vrnn_{}.log'.format(time.strftime("%Y%m%d-%H%M%S"))
     #logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO)
     logger = logging.getLogger('my_logger')
@@ -392,11 +408,11 @@ if __name__ == "__main__":
     logger.info('module initialized')
 
     # get saving file names
-    #file_name_general = os.getcwd() + '/sac/data/'
-    #if not os.path.exists(file_name_general):
-    #   os.makedirs(file_name_general)
-    #else:
-    #   pass
+    file_name_general = parentfolder + '/sac/data/'
+    if not os.path.exists(file_name_general):
+       os.makedirs(file_name_general)
+    else:
+       pass
     #https://github.com/Abishekpras/vrnn/blob/104b532e862620f9043421e73b98d38653f6b73b/train.py#L71
     seed = 1234
 
@@ -419,7 +435,8 @@ if __name__ == "__main__":
 
 
 
-    print(f" size of training input {x_train.shape}, test input {x_test.shape}, validation data size {x_val.shape}")
+    print(f" size of training input {x_train.shape}")
+    print(f" size of test input {x_test.shape}, validation data size {x_val.shape}")
     print(f" training output {y_train.shape}, test output {y_test.shape}")
     if torch.cuda.is_available():
         train_x, train_y, test_x, test_y, validation_x, validation_y = x_train.cuda(), y_train.cuda(), x_test.cuda(), y_test.cuda(), x_val.cuda(), y_val.cuda()
@@ -440,24 +457,7 @@ if __name__ == "__main__":
 
     valid_dataset = TensorDataset(validation_x, validation_y)
     valid_loader = DataLoader(valid_dataset, batch_size=1 , shuffle=True)
-    """
-    #check the data with plotting
-    inputs, outputs=next(iter(train_loader))
-
-
-    inputs=inputs.permute(0,2,1).to("cuda")
-
-    norm=MaskedNorm(inputs.shape[-1]).to("cuda")
-    input_norm= norm(inputs)
-    fig, axs = plt.subplots(2)
-    fig.suptitle('original vs. norm')
-    colors=['olive','r','k','b','g','c','m','y','violet','deepskyblue','hotpink','sienna','goldenrod','turquoise']
-    for i in range(inputs.shape[-1]):
-        axs[0].plot(inputs[0,:,i].cpu().numpy(),colors[i])
-        axs[1].plot(input_norm[0,:,i].detach().cpu().numpy(),colors[i])
-
-    plt.show()
-    """
+    
 
     normalizer_input, normalizer_output = compute_normalizer(train_loader)
 
