@@ -8,7 +8,7 @@ import math
 import time
 import logging
 import torch.nn as nn
-###Required for debugging nan values
+###Required for debugging to detect nan values in layers
 def nan_hook(self, inp, out):
     """
     Check for NaN inputs or outputs at each layer in the model

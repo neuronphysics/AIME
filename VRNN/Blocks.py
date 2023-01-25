@@ -1,7 +1,48 @@
 import torch
 import torch.nn as nn
-from vrnn import init_weights
 
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
+        #nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("linear"))
+        m.bias.data.zero_()
+    elif isinstance(m, nn.Conv2d):
+        nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("relu"))
+        m.bias.data.zero_()
+    elif isinstance(m, nn.BatchNorm1d):
+        nn.init.normal_(m.weight, 1.0, 0.02)
+        m.bias.data.zero_()
+    elif isinstance(m, nn.LayerNorm):
+        m.bias.data.zero_()
+        nn.init.ones_(m.weight)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.normal_(m.weight, 1.0, 0.02)
+        m.bias.data.zero_()
+    elif isinstance(m,nn.GRU) or isinstance(m,nn.LSTM):
+        for ind in range(0, m.num_layers):
+            weight = eval('m.weight_ih_l'+str(ind))
+            bias = np.sqrt(6.0 / (weight.size(0)/4 + weight.size(1)))
+            nn.init.uniform_(weight, -bias, bias)
+            weight = eval('m.weight_hh_l'+str(ind))
+            bias = np.sqrt(6.0 / (weight.size(0)/4 + weight.size(1)))
+            nn.init.uniform_(weight, -bias, bias)
+        if m.bias:
+            for ind in range(0, m.num_layers):
+                weight = eval('m.bias_ih_l'+str(ind))
+                weight.data.zero_()
+                weight.data[m.hidden_size: 2 *m.hidden_size] = 1
+                weight = eval('m.bias_hh_l'+str(ind))
+                weight.data.zero_()
+                weight.data[m.hidden_size: 2 * m.hidden_size] = 1
+    elif isinstance(m, list):
+        for layer in m:
+            if isinstance(layer, nn.BatchNorm1d):
+                nn.init.normal_(layer.weight, 1.0, 0.02)
+                layer.bias.data.zero_()
+            elif isinstance(layer, nn.Linear):
+                torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
+                #nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain("linear"))
+                layer.bias.data.zero_()
 class MCDropout2d(nn.Dropout2d):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.dropout2d(input, self.p, True, self.inplace)

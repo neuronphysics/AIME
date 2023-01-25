@@ -11,50 +11,9 @@ import sys
 from MaskedNorm import MaskedNorm
 from CustomLSTM import LSTMCore
 from attention_encoder import LatentEncoder
+from Blocks import init_weights
 
 
-def init_weights(m):
-    if isinstance(m, nn.Linear):
-        torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
-        #nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("linear"))
-        m.bias.data.zero_()
-    elif isinstance(m, nn.Conv2d):
-        nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("relu"))
-        m.bias.data.zero_()
-    elif isinstance(m, nn.BatchNorm1d):
-        nn.init.normal_(m.weight, 1.0, 0.02)
-        m.bias.data.zero_()
-    elif isinstance(m, nn.LayerNorm):
-        m.bias.data.zero_()
-        nn.init.ones_(m.weight)
-    elif isinstance(m, nn.BatchNorm2d):
-        nn.init.normal_(m.weight, 1.0, 0.02)
-        m.bias.data.zero_()
-    elif isinstance(m,nn.GRU) or isinstance(m,nn.LSTM):
-        for ind in range(0, m.num_layers):
-            weight = eval('m.weight_ih_l'+str(ind))
-            bias = np.sqrt(6.0 / (weight.size(0)/4 + weight.size(1)))
-            nn.init.uniform_(weight, -bias, bias)
-            weight = eval('m.weight_hh_l'+str(ind))
-            bias = np.sqrt(6.0 / (weight.size(0)/4 + weight.size(1)))
-            nn.init.uniform_(weight, -bias, bias)
-        if m.bias:
-            for ind in range(0, m.num_layers):
-                weight = eval('m.bias_ih_l'+str(ind))
-                weight.data.zero_()
-                weight.data[m.hidden_size: 2 *m.hidden_size] = 1
-                weight = eval('m.bias_hh_l'+str(ind))
-                weight.data.zero_()
-                weight.data[m.hidden_size: 2 * m.hidden_size] = 1
-    elif isinstance(m, list):
-        for layer in m:
-            if isinstance(layer, nn.BatchNorm1d):
-                nn.init.normal_(layer.weight, 1.0, 0.02)
-                layer.bias.data.zero_()
-            elif isinstance(layer, nn.Linear):
-                torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
-                #nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain("linear"))
-                layer.bias.data.zero_()
 
 #based on https://github.com/JasonZHM/magic-microlensing/blob/bb9dd7df3144f55eeffcf497ae9f4b9b968a2a79/model/mdn_full.py
 class NormalNetwork(nn.Module):
@@ -113,8 +72,10 @@ class CategoricalNetwork(nn.Module):
 
 
 class VRNN_GMM(nn.Module):
-    #The main part of the algorithm
+    #################################################################################
+    #The main part of the algorithm for learing the dynamics (world model)
     #A Recurrent Latent Variable Model for Sequential Data (Junyoung Chung et al 2016)
+    ##################################################################################
     def __init__(self,
                  u_dim,
                  y_dim,
@@ -207,7 +168,7 @@ class VRNN_GMM(nn.Module):
         #-----------------------------------------
         # encoder function (phi_enc) -> Inference
 
-        encoder_layers=[nn.Linear(self.h_dim + self.h_dim, self.h_dim)]
+        encoder_layers=[nn.Linear(self.h_dim + self.h_dim + self.h_dim, self.h_dim)]
         if self.batch_norm:
             encoder_layers.append(torch.nn.BatchNorm1d(self.h_dim))
         encoder_layers=encoder_layers+[
@@ -294,7 +255,12 @@ class VRNN_GMM(nn.Module):
 
         # recurrence function (f_theta) -> Recurrence
         #self._rnn =  nn.LSTM(self.h_dim + self.h_dim + self.h_dim, self.h_dim, self.n_layers, bias, batch_first= True)#modified
-        self._rnn =  LSTMCore(input_size=self.h_dim + self.h_dim + self.h_dim, hidden_size = self.h_dim, num_layers = self.n_layers,  batch_first=True, train_truncate= 25, train_burn_in = 15)
+        self._rnn =  LSTMCore(input_size=self.h_dim + self.h_dim + self.h_dim, 
+                              hidden_size = self.h_dim, 
+                              num_layers = self.n_layers,  
+                              batch_first=True, 
+                              train_truncate= 25, 
+                              train_burn_in = 15)
         #self.apply(self.weight_init)
 
     def forward(self, u, y):
@@ -346,8 +312,8 @@ class VRNN_GMM(nn.Module):
                 # feature extraction: u_t
                 phi_u_t = self.phi_u(u[:, :, t])
 
-                # encoder: y_t, h_t -> z_t posterior
-                encoder_input = torch.cat([phi_y_t, h[-1]], dim=1)
+                # encoder: u_t, y_t, h_t -> z_t posterior
+                encoder_input = torch.cat([phi_u_t, phi_y_t, h[-1]], dim=1)
                 encoder_input = self.enc(encoder_input)
 
                 enc_mean_t   = torch.clamp(self.enc_mean(encoder_input), *self.output_clamp)
@@ -412,12 +378,17 @@ class VRNN_GMM(nn.Module):
 
         return eps.mul(var).add_(mu)
 
-    def generate(self, u):
+    def generate(self, u, seq_len=None):
         # get the batch size
-        batch_size = u.shape[0]
+        batch_size, D, T = u.shape
+        
         # length of the sequence to generate
         #seq_len = u.shape[-1]
-        seq_len = torch.LongTensor([torch.max((u[i,0,:]!=0).nonzero()).item()+1 for i in range(u.shape[0])])
+        if seq_len is None:
+           seq_len = torch.LongTensor([torch.max((u[i,0,:]!=0).nonzero()).item()+1 for i in range(u.shape[0])])
+        elif isinstance(seq_len, int):
+           seq_len=[seq_len]*batch_size
+        
         # allocation
         sample = torch.zeros(batch_size, self.y_dim, seq_len, device=self.device)
         sample_mu = torch.zeros(batch_size, self.y_dim, seq_len, device=self.device)
@@ -471,7 +442,7 @@ class VRNN_GMM(nn.Module):
                 _, (h, c) = self._rnn(torch.unsqueeze(RNN_inputs, 1), (h,c))##(modified)
 
         return sample, sample_mu, sample_sigma
-
+    
 
     def loglikelihood_gmm(self, y, normal, pi):
         loglik = normal.log_prob(y.unsqueeze(1).expand_as(normal.loc))

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from Blocks import BatchMLP, LSTMBlock
-
+from typing import Optional
 class AttnLinear(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
