@@ -108,7 +108,7 @@ class VRNN_GMM(nn.Module):
             u_dim + y_dim,
             hidden_dim=h_dim,
             latent_dim=h_dim,
-            self_attention_type="ptmultihead",
+            self_attention_type="multihead",
             n_encoder_layers=n_layers,
             batchnorm=False,
             dropout=0,
