@@ -87,7 +87,8 @@ class VRNN_GMM(nn.Module):
                  output_clamp=(-10,10),
                  batch_norm=False,
                  masked_norm=True,
-                 bias=False):
+                 bias=False,
+                 self_attention_type="multihead"):
         super(VRNN_GMM, self).__init__()
 
         self.y_dim = y_dim
@@ -106,20 +107,20 @@ class VRNN_GMM(nn.Module):
 
         self._latent_encoder = LatentEncoder(
             u_dim + y_dim,
-            hidden_dim=h_dim,
-            latent_dim=h_dim,
-            self_attention_type="multihead",
-            n_encoder_layers=n_layers,
-            batchnorm=False,
-            dropout=0,
-            attention_dropout=0,
-            attention_layers=2,
-            use_lstm=True
+            hidden_dim = h_dim,
+            latent_dim = h_dim,
+            self_attention_type = self_attention_type,
+            n_encoder_layers = n_layers,
+            batchnorm = False,
+            dropout  = 0,
+            attention_dropout = 0,
+            attention_layers  = 2,
+            use_lstm = True
             )
         self.output_clamp = output_clamp
         self._eps = 1e-5
         self._max_deviation = 2.0
-
+        self.self_attention_type= self_attention_type
         ###=============###
         # feature-extracting transformations (phi_y, phi_u and phi_z)
 
@@ -179,7 +180,6 @@ class VRNN_GMM(nn.Module):
             encoder_layers= encoder_layers+[nn.BatchNorm1d(self.h_dim)]
 
         encoder_layers  = encoder_layers+[nn.ReLU()]
-
 
         self.enc        = torch.nn.Sequential(*encoder_layers)
 
@@ -252,15 +252,16 @@ class VRNN_GMM(nn.Module):
         #(decoder) Categorical distribution
         self.dec_pi = CategoricalNetwork(self.h_dim, self.n_mixtures)
 
-
         # recurrence function (f_theta) -> Recurrence
         #self._rnn =  nn.LSTM(self.h_dim + self.h_dim + self.h_dim, self.h_dim, self.n_layers, bias, batch_first= True)#modified
+        
         self._rnn =  LSTMCore(input_size=self.h_dim + self.h_dim + self.h_dim, 
                               hidden_size = self.h_dim, 
                               num_layers = self.n_layers,  
                               batch_first=True, 
                               train_truncate= 25, 
                               train_burn_in = 15)
+        
         #self.apply(self.weight_init)
 
     def forward(self, u, y):
@@ -295,9 +296,11 @@ class VRNN_GMM(nn.Module):
         else:
             context_u = reshaped_u
             context_y = reshaped_y
-
-        mean_attn, logvar_attn = self._latent_encoder(context_u, context_y)
-        #mean_attn [B, :seq_len, D_h])
+        if self.self_attention_type is not "multihead":
+           mean_attn, logvar_attn = self._latent_encoder(context_u, context_y)
+        else:
+           mean_attn, logvar_attn, attn_loss  = self._latent_encoder(context_u, context_y)
+       #mean_attn [B, :seq_len, D_h])
         ##=============##
         # allocation
         total_loss = 0
@@ -367,8 +370,10 @@ class VRNN_GMM(nn.Module):
                 assert not torch.isnan(loss_pred)
                 assert torch.isfinite(loss_pred)
                 total_loss += - loss_pred + KLD + KLD_ATTN
-
-        return total_loss
+        if self.self_attention_type is not "multihead":
+           return total_loss
+        else:
+           return total_loss + attn_loss
 
     def reparametrization(self, mu, log_var):
 
@@ -467,10 +472,10 @@ class VRNN_GMM(nn.Module):
         kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar_attn - mu_attn ** 2 - logvar_attn.exp(), dim = 1), dim = 0)
         return kld_loss
 
-class DynamicModel(nn.Module):
+class DynamicModel(VRNN_GMM):
     def __init__(self, num_inputs, num_outputs, h_dim=96, z_dim=48, n_layers=2, n_mixtures=10, device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'), normalizer_input=None, normalizer_output=None,
                  *args, **kwargs):
-        super(DynamicModel, self).__init__()
+        super(DynamicModel, self).__init__(u_dim=num_inputs,y_dim= num_outputs, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers, n_mixtures=n_mixtures, device=device)
         # Save parameters
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
@@ -478,10 +483,7 @@ class DynamicModel(nn.Module):
         self.kwargs = kwargs
         self.normalizer_input = normalizer_input
         self.normalizer_output = normalizer_output
-        self.zero_initial_state = False
-
-        # initialize the model
-        self.m = VRNN_GMM(num_inputs, num_outputs, h_dim, z_dim, n_layers, n_mixtures, device)
+       
         self.to(device)
 
     @property
@@ -494,15 +496,14 @@ class DynamicModel(nn.Module):
         if y is not None and self.normalizer_output is not None:
             y = self.normalizer_output.normalize(y)
 
-        loss = self.m(u, y)
-
+        loss =super(DynamicModel, self).forward(u, y)
         return loss
 
     def generate(self, u, y=None):
         if self.normalizer_input is not None:
             u = self.normalizer_input.normalize(u)
 
-        y_sample, y_sample_mu, y_sample_sigma = self.m.generate(u)
+        y_sample, y_sample_mu, y_sample_sigma = super(DynamicModel, self).generate(u)
 
         if self.normalizer_output is not None:
             y_sample = self.normalizer_output.unnormalize(y_sample)
@@ -529,7 +530,7 @@ class ModelState:
                  n_layers=2,
                  n_mixtures=8,
                  device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-                 optimizer_type= "Yogi",
+                 optimizer_type= "AdamW",
                  **kwargs):
 
         torch.manual_seed(seed)
@@ -541,19 +542,19 @@ class ModelState:
 
         self.model = DynamicModel( num_inputs=nu, num_outputs=ny, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers, n_mixtures=n_mixtures, device=device, **kwargs)
         if optimizer_type == "AdaBelief":
-            self.optimizer = torch_optimizer.AdaBelief(self.model.m.parameters(),
+            self.optimizer = torch_optimizer.AdaBelief(self.model.parameters(),
                                                        lr= 1e-4,
                                                       betas=(0.9, 0.999),
                                                       eps=1e-6,
                                                       weight_decay=0
                                                       )
         elif optimizer_type=="AdamW":
-            self.optimizer = torch.optim.AdamW(self.model.m.parameters(),
+            self.optimizer = torch.optim.AdamW(self.model.parameters(),
                                                lr= 1e-4,
                                                betas=(0.9, 0.999)
                                               )
         elif optimizer_type=="SGD":
-            self.optimizer  = torch_optimizer.SGDW(self.model.m.parameters(),
+            self.optimizer  = torch_optimizer.SGDW(self.model.parameters(),
                                                    lr= 1e-4,
                                                    momentum=0,
                                                    dampening=0,
@@ -562,15 +563,18 @@ class ModelState:
                                                    )
         else:
             # Optimization parameters
-            yogi = torch_optimizer.Yogi(self.model.m.parameters(), lr= 0.5e-4, betas=(0.95, 0.999), eps=1e-3, initial_accumulator=1e-6, weight_decay=0,)
+            yogi = torch_optimizer.Yogi(self.model.parameters(), lr= 0.5e-4, betas=(0.95, 0.999), eps=1e-3, initial_accumulator=1e-6, weight_decay=0,)
 
             self.optimizer = torch_optimizer.Lookahead(yogi, k=5, alpha=0.5)
 
 
-    def load_model(self, path, name='VRNN_model.pt'):
+    def load_model(self, path, name='VRNN_model.pt', map_location=None):
         file = path if os.path.isfile(path) else os.path.join(path, name)
         try:
-            ckpt = torch.load(file, map_location=lambda storage, loc: storage)
+            if map_location is None:
+               ckpt = torch.load(file, map_location=lambda storage, loc: storage)
+            else:
+               ckpt = torch.load(file, map_location=map_location)
         except NotADirectoryError:
             raise Exception("Could not find model: " + file)
         self.model.load_state_dict(ckpt["model"])

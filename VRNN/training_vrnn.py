@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-
+import datetime 
 import math
 import time
 import logging
@@ -27,22 +27,41 @@ from main import ModelState, DynamicModel, VRNN_GMM
 from vrnn_utilities import *
 from sklearn.model_selection import train_test_split
 from tensorboardX import SummaryWriter
+import torch.backends.cudnn as cudnn
+import torch.utils.data.distributed
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+import argparse
+
+parser = argparse.ArgumentParser(description='the vrnn transition model (Chung et al. 2016), distributed data parallel ')
+parser.add_argument('--lr', default=0.001, help='')
+parser.add_argument('--batch_size', type=int, default=768, help='')
+parser.add_argument('--max_epochs', type=int, default=4, help='')
+parser.add_argument('--num_workers', type=int, default=0, help='')
+
+parser.add_argument('--init_method', default='tcp://127.0.0.1:3456', type=str, help='')
+parser.add_argument('--dist-backend', choices=['gloo', 'nccl'], default='gloo', type=str, help='')
+parser.add_argument('--world_size', default=1, type=int, help='')
+parser.add_argument('--distributed', action='store_true', help='')
 
 torch.cuda.empty_cache()
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+os.environ['PYTORCH_CUDA_ALLOC_CONF']="max_split_size_mb:9000"
 
+def cleanup():
+    dist.destroy_process_group()
 
-def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_general, file_name_general):
+def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_general, file_name_general, lr, max_epochs, train_rank, train_sampler, batch_size):
     train_options={'clip':2,
                    'print_every':2,
                    'test_every':50,
-                   'batch_size':30,
-                   'n_epochs':400,
+                   'batch_size':batch_size,
+                   'n_epochs':max_epochs,
                    'lr_scheduler_nstart':10,#earning rate scheduler start epoch
                    'lr_scheduler_nepochs':5,#check learning rater after
                    'lr_scheduler_factor':10,#adapt learning rate by
                    'min_lr':1e-6,#minimal learning rate
-                   'init_lr':5e-4,#initial learning rate
+                   'init_lr':lr,#initial learning rate
                    }
     path = os.getcwd()
     parentfolder = os.path.dirname(path)
@@ -70,6 +89,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
     def train(epoch):
         # model in training mode
         modelstate.model.train()
+        
         # initialization
         total_loss = 0
         total_batches = 0
@@ -77,11 +97,13 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
         if torch.cuda.is_available():
             #https://pytorch.org/docs/stable/notes/amp_examples.html
             scaler = torch.cuda.amp.GradScaler()
-
+            
+        epoch_start = time.time()
         for i, (u, y) in enumerate(loader_train):
             batch_size=u.shape[0]
-            u = u.to(device)#torch.Size([B, D_in, T])
-            y = y.to(device)
+            start = time.time()
+            u = u.cuda()#torch.Size([B, D_in, T])
+            y = y.cuda()
 
             # set the optimizer
                         # set the optimizer
@@ -89,7 +111,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
             if torch.cuda.is_available():
                 with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
                     loss_ = modelstate.model(u, y)
-                diff_params = [p for p in modelstate.model.m.parameters() if p.requires_grad]
+                diff_params = [p for p in modelstate.model.parameters() if p.requires_grad]
                 scaled_grad_params = torch.autograd.grad(outputs=scaler.scale(loss_),
                                                         inputs=diff_params,
                                                         create_graph=True,
@@ -99,7 +121,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
 
                 """
                 #Cut NaN value
-                for submodule in modelstate.model.m.modules():
+                for submodule in modelstate.model.modules():
                     submodule.register_forward_hook(nan_hook)
                 """
                 inv_scale = 1./scaler.get_scale()
@@ -119,9 +141,9 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 # Scales the loss, and calls backward()
                 # to create scaled gradients
                 assert not torch.isnan(loss_)
-                scaler.scale(loss_).backward(retain_graph=True, inputs=list(modelstate.model.m.parameters()))
+                scaler.scale(loss_).backward(retain_graph=True, inputs=list(modelstate.model.parameters()))
 
-                torch.nn.utils.clip_grad_norm_(modelstate.model.m.parameters(),  max_norm=train_options['clip'], error_if_nonfinite =False)
+                torch.nn.utils.clip_grad_norm_(modelstate.model.parameters(),  max_norm=train_options['clip'], error_if_nonfinite =False)
                 # Unscales gradients and calls
                 # or skips optimizer.step()
 
@@ -130,9 +152,15 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
 
                 # Updates the scale for next iteration
                 scaler.update()
+                batch_time = time.time() - start
+
+                elapse_time = time.time() - epoch_start
+                elapse_time = datetime.timedelta(seconds=elapse_time)
+                print("From Rank: {}, Epoch: {}, Training time {}".format(train_rank, epoch, elapse_time))
+
                 """
                 #test for invalid/NaN values in different layers
-                for name, param in modelstate.model.m.named_parameters():
+                for name, param in modelstate.model.named_parameters():
                     if torch.is_tensor(param.grad):
                         print(name, torch.isfinite(param.grad).all())
                 """
@@ -143,7 +171,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 loss_.backward()
                 ### GRADIENT CLIPPING
                 #
-                torch.nn.utils.clip_grad_norm_(modelstate.model.m.parameters(), train_options['clip'])
+                torch.nn.utils.clip_grad_norm_(modelstate.model.parameters(), train_options['clip'])
 
                 modelstate.optimizer.step()
 
@@ -179,10 +207,12 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
         # output parameter
         best_epoch = 0
         process_desc = "Train-loss: {:2.3e}; Valid-loss: {:2.3e}; LR: {:2.3e}"
-        progress_bar = tqdm(initial=0, leave=True, total=train_options['n_epochs'], desc=process_desc.format(0, 0, 0), position=0)
+        progress_bar = tqdm(initial=0, leave=True, total=train_options['n_epochs'], desc=process_desc.format(0, 0, 0), position=0, disable=dist.get_rank()!=0)
         
         
         for epoch in range(0, train_options['n_epochs'] + 1):
+            print('\n[%d]Epoch: %d' % (train_rank, epoch))
+            train_sampler.set_epoch(epoch)
             # Train and validate
             train(epoch)  # model, train_options, loader_train, optimizer, epoch, lr)
             # validate every n epochs
@@ -198,7 +228,11 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                     # save model
                     path = path_general + 'model/'
                     file_name = file_name_general + '_bestModel.ckpt'
-                    modelstate.save_model(epoch, vloss, time.process_time() - start_time, path, file_name)
+                    if train_rank==0:
+                       # All processes should see same parameters as they all start from same
+                       # random parameters and gradients are synchronized in backward passes.
+                       # Therefore, saving it in one process is sufficient.
+                       modelstate.save_model(epoch, vloss, time.process_time() - start_time, path, file_name)
                     # torch.save(model.state_dict(), path + file_name)
                     best_epoch = epoch
 
@@ -252,7 +286,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
 
     return dataframe
 
-def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general, **kwargs):
+def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general, batch_size, test_rank, **kwargs):
     # switch to cpu computations for testing
     # options['device'] = 'cpu'
 
@@ -274,7 +308,8 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
     # load model
     path = path_general + 'model/'
     file_name = file_name_general + '_bestModel.ckpt'
-    modelstate.load_model(path, file_name)
+    map_location = {'cuda:%d' % 0: 'cuda:%d' % test_rank}
+    modelstate.load_model(path, file_name, map_location=map_location)
     modelstate.model.to(device)
     options={'h_dim':modelstate.h_dim,
              'z_dim':modelstate.z_dim,
@@ -285,7 +320,7 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
              'showfig':'True',
              'savefig':'True',
              'seq_len_train':loaders.dataset[0][-1].shape[-1],
-             'batch_size':30,
+             'batch_size':batch_size,
              'lr_scheduler_nepochs':5,
              'lr_scheduler_factor':10}
     # %% plot and save the loss curve
@@ -376,18 +411,63 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
 
     return df
 
-if __name__ == "__main__":
-    # get saving path
 
+def main():
+    print("Starting...")
+
+    args = parser.parse_args()
+
+    ngpus_per_node = torch.cuda.device_count()
+
+    """ This next line is the key to getting DistributedDataParallel working on SLURM:
+		SLURM_NODEID is 0 or 1 in this example, SLURM_LOCALID is the id of the 
+ 		current process inside a node and is also 0 or 1 in this example."""
+
+    print("echo GPUs per node: {}".format(torch.cuda.device_count()))
+    print("local ID: ",os.environ.get("SLURM_LOCALID")," node ID: ", os.environ.get("SLURM_NODEID"), "number of tasks: ", os.environ.get("SLURM_NTASKS"))
+    local_rank = int(os.environ.get("SLURM_LOCALID")) 
+    
+    rank = int(os.environ.get("SLURM_NODEID"))*ngpus_per_node + local_rank
+    print('cuda visible: ',os.environ.get('CUDA_VISIBLE_DEVICES'))
+    proc_id = int(os.environ.get("SLURM_PROCID"))
+    job_id = int(os.environ.get("SLURM_JOBID"))
+    n_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES"))
+    available_gpus = list(os.environ.get('CUDA_VISIBLE_DEVICES').replace(',',""))
+    current_device = local_rank
+
+    torch.cuda.set_device(current_device)
+    device = torch.device('cuda', local_rank if torch.cuda.is_available() else 'cpu')
+    print('Using device:{}'.format(device))
+    
+    """ this block initializes a process group and initiate communications
+		between all processes running on all nodes """
+
+    print('From Rank: {}, ==> Initializing Process Group...'.format(rank))
+    print(f"init_method = {args.init_method}")
+    #init the process group
+    dist.init_process_group(backend=args.dist_backend, 
+                            init_method=args.init_method, 
+                            world_size=args.world_size, 
+                            rank=rank,
+                            timeout=datetime.timedelta(0, 30) # 20s connection timeout
+                            )
+    print("process group ready!")
+
+    print('From Rank: {}, ==> Making model..'.format(rank))
+    print("echo final check; ngpus_per_node={},local_rank={},rank={},available_gpus={},current_device={}"
+              .format(ngpus_per_node,local_rank,rank,available_gpus,current_device))
+
+    # get saving path
     input_filename = "transit_data/gym_transition_inputs.pt"
     target_filename = "transit_data/gym_transition_outputs.pt"
     filepath = os.getcwd()
     parentfolder = os.path.dirname(filepath)
+    #read input data
     variable_episodes = torch.load(os.path.join( parentfolder, input_filename))
     final_next_state  = torch.load(os.path.join( parentfolder, target_filename))
 
-    print(f" shape of input data (s_t, a_t): {variable_episodes.shape}")
-    print(f" shape of output data (s_t+1, r_t): {final_next_state.shape}")
+    print(f" shape of input data state and action: {variable_episodes.shape}")
+    print(f" shape of output data next state and reward: {final_next_state.shape}")
     path_general = parentfolder + '/sac/log/'
     if not os.path.exists(path_general):
         os.makedirs(path_general)
@@ -396,17 +476,6 @@ if __name__ == "__main__":
     file_name_general='Mujoco'
 
     IMG_FOLDER=parentfolder +'/sac/plots'
-    #LOG_FILENAME = '/content/gdrive/My Drive/sac/tmp/logs/vrnn_{}.log'.format(time.strftime("%Y%m%d-%H%M%S"))
-    #logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO)
-    logger = logging.getLogger('my_logger')
-    logging.basicConfig(
-      level=logging.DEBUG # allow DEBUG level messages to pass through the logger
-    )
-
-
-    logging.getLogger(__name__).addHandler(logging.StreamHandler(sys.stdout))
-    logger.info('module initialized')
-
     # get saving file names
     file_name_general = parentfolder + '/sac/data/'
     if not os.path.exists(file_name_general):
@@ -433,7 +502,13 @@ if __name__ == "__main__":
     x_val, x_test, y_val, y_test = train_test_split(x_test, y_test, test_size=test_ratio/(test_ratio + validation_ratio))
     #scale the dataset
 
+    def seed_worker(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        numpy.random.seed(worker_seed)
+        random.seed(worker_seed)
 
+    g = torch.Generator()
+    g.manual_seed(0)
 
     print(f" size of training input {x_train.shape}")
     print(f" size of test input {x_test.shape}, validation data size {x_val.shape}")
@@ -446,10 +521,21 @@ if __name__ == "__main__":
     y_dim = final_next_state.shape[-1]
 
 
-    batch_size = 30
+    batch_size = args.batch_size
     train_dataset = TensorDataset(train_x, train_y)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,
+                                                                    num_replicas=args.world_size,
+                                                                    rank=rank,
+                                                                    shuffle=True,
+                                                                    )
     #we don't shuffle because it is a time series data
-    train_loader = DataLoader(train_dataset, batch_size=batch_size , shuffle=True)
+    train_loader = DataLoader(train_dataset, 
+                              batch_size=batch_size , 
+                              shuffle=False, 
+                              num_workers=args.num_workers, 
+                              sampler=train_sampler,
+                              worker_init_fn=seed_worker,
+                              generator=g,)
 
     test_dataset = TensorDataset(test_x, test_y)
     test_loader = DataLoader(test_dataset, batch_size=batch_size , shuffle=True)
@@ -468,23 +554,44 @@ if __name__ == "__main__":
                             #normalizer_input=normalizer_input,
                             #normalizer_output=normalizer_output
                             )
-    modelstate.model.to(device)
+    modelstate.model.cuda()
+    #for DDP used this instruction: https://docs.alliancecan.ca/wiki/PyTorch 
+    modelstate.model = torch.nn.parallel.DistributedDataParallel(modelstate.model, find_unused_parameters=True, device_ids=[current_device])
+    print('passed distributed data parallel call')
     df={}# allocation
     # train the model
     file_name_general= file_name_general+'VRNN_h{}_z{}_n{}'.format(modelstate.h_dim, modelstate.z_dim, modelstate.n_layers)
-
+         
     df = run_train(modelstate=modelstate,
                    loader_train=train_loader,
                    loader_valid=valid_loader,
                    device=device,
                    dataframe=df,
                    path_general=path_general,
-                   file_name_general=file_name_general, )
-
-    df = run_test(seed, u_dim, y_dim, test_loader, df,torch.device('cuda' if torch.cuda.is_available() else 'cpu'), path_general, file_name_general)
+                   file_name_general=file_name_general, 
+                   lr=args.lr,
+                   max_epochs=args.max_epochs,
+                   train_rank=rank,
+                   train_sampler=train_sampler,
+                   batch_size=args.batch_size
+                   )
+    
+    df = run_test(seed=seed,
+                  nu=u_dim, 
+                  ny=y_dim,
+                  loaders=test_loader, 
+                  df = df,
+                  device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
+                  path_general= path_general, 
+                  file_name_general=file_name_general, 
+                  batch_size=args.batch_size,
+                  test_rank=rank)
+    
     df = pd.DataFrame(df)
-
     # save data
     file_name = file_name_general + 'VRNN_GMM_GYM_TEST.csv'
 
     df.to_csv(file_name)
+    
+if __name__ == "__main__":
+   main()

@@ -11,6 +11,8 @@ import torch.nn as nn
 import numpy as np
 from tempfile import TemporaryDirectory
 from typing import Any, Optional, Tuple, Union
+REQUIRED_RATE = 48_000
+__version__ = "0.4.0"
 def np_to_wav(
     x: np.ndarray,
     filename: Union[str, Path],
