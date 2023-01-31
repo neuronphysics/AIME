@@ -1,4 +1,3 @@
-
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, Optional, Tuple, Union
@@ -8,6 +7,7 @@ import math
 import time
 import logging
 import torch.nn as nn
+from collections import OrderedDict
 ###Required for debugging to detect nan values in layers
 def nan_hook(self, inp, out):
     """
@@ -247,3 +247,12 @@ def plot_losscurve(df, options, path_general, file_name_general, removedata=True
         #3D tensor of shape (n_samples, timesteps, n_features) use the following:
         (timeseries-timeseries.min(dim=2))/(timeseries.max(dim=2)-timeseries.min(dim=2))
         return timeseries
+    
+def _strip_prefix_if_present(state_dict, prefix):
+    keys = sorted(state_dict.keys())
+    if not all(key.startswith(prefix) for key in keys):
+        return state_dict
+    stripped_state_dict = OrderedDict()
+    for key, value in state_dict.items():
+        stripped_state_dict[key.replace(prefix, "")] = value
+    return stripped_state_dict

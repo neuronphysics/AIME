@@ -12,7 +12,7 @@ from MaskedNorm import MaskedNorm
 from CustomLSTM import LSTMCore
 from attention_encoder import LatentEncoder
 from Blocks import init_weights
-
+from vrnn_utilities import _strip_prefix_if_present
 
 
 #based on https://github.com/JasonZHM/magic-microlensing/blob/bb9dd7df3144f55eeffcf497ae9f4b9b968a2a79/model/mdn_full.py
@@ -453,7 +453,7 @@ class VRNN_GMM(nn.Module):
         loglik = normal.log_prob(y.unsqueeze(1).expand_as(normal.loc))
         loss = -torch.logsumexp(torch.log(pi.probs) + loglik, dim=1)
         assert not torch.isnan(loss).any()
-        return loss.mean()
+        return loss.sum()
 
 
     @staticmethod
@@ -471,6 +471,7 @@ class VRNN_GMM(nn.Module):
     def kld_attention(mu_attn, logvar_attn):
         kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar_attn - mu_attn ** 2 - logvar_attn.exp(), dim = 1), dim = 0)
         return kld_loss
+
 
 class DynamicModel(VRNN_GMM):
     def __init__(self, num_inputs, num_outputs, h_dim=96, z_dim=48, n_layers=2, n_mixtures=10, device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'), normalizer_input=None, normalizer_output=None,
@@ -577,10 +578,12 @@ class ModelState:
                ckpt = torch.load(file, map_location=map_location)
         except NotADirectoryError:
             raise Exception("Could not find model: " + file)
-        self.model.load_state_dict(ckpt["model"])
+        loaded_state_dict = _strip_prefix_if_present(ckpt.pop("model"), prefix="module.")
+        self.model.load_state_dict(loaded_state_dict, strict=False)
         self.optimizer.load_state_dict(ckpt["optimizer"])
         epoch = ckpt['epoch']
-        return epoch
+        vloss = ckpt['vloss']
+        return epoch, vloss
 
     def save_model(self, epoch, vloss, elapsed_time,  path, name='VRNN_model.pt'):
         # check if path exists and create otherwise
@@ -588,7 +591,7 @@ class ModelState:
             os.makedirs(path)
         torch.save({
                 'epoch': epoch,
-                'model': self.model.state_dict(),
+                'model': _strip_prefix_if_present(self.model.state_dict(), 'module.'),
                 'optimizer': self.optimizer.state_dict(),
                 'vloss': vloss,
                 'elapsed_time': elapsed_time,
