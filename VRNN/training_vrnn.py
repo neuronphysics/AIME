@@ -75,10 +75,9 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                    'min_lr':1e-6,#minimal learning rate
                    'init_lr':lr,#initial learning rate
                    }
-    path = os.getcwd()
-    parentfolder = os.path.dirname(path)
     
-    writer = SummaryWriter(log_dir=os.path.join(parentfolder, "writer"))
+    
+    writer = SummaryWriter(log_dir=os.path.join(path_general, "writer"))
     def validate(loader):
         modelstate.model.eval()
         total_vloss = 0
@@ -239,8 +238,8 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 if vloss < best_vloss:  # epoch == train_options.n_epochs:  #
                     best_vloss = vloss
                     # save model
-                    path = path_general + 'model/'
-                    file_name = file_name_general + '_bestModel.ckpt'
+                    path = path_general + 'saved_model/'
+                    file_name = file_ + '_bestModel.ckpt'
                     if train_rank==0:
                        # All processes should see same parameters as they all start from same
                        # random parameters and gradients are synchronized in backward passes.
@@ -429,7 +428,8 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
 
 def main():
     print("Starting...")
-
+    path = os.getcwd()
+    parentfolder = os.path.dirname(path)
     args = parser.parse_args()
 
     ngpus_per_node = torch.cuda.device_count()
@@ -464,7 +464,7 @@ def main():
                             init_method=args.init_method, 
                             world_size=args.world_size, 
                             rank=rank,
-                            timeout=datetime.timedelta(0, 180) # 20s connection timeout
+                            timeout=datetime.timedelta(0, 240) # 20s connection timeout
                             )
     print("process group ready!")
 
@@ -490,11 +490,11 @@ def main():
         pass
     file_name_general='Mujoco'
 
-    IMG_FOLDER=parentfolder +'/sac/plots'
+    
     # get saving file names
-    file_name_general = parentfolder + '/sac/data/'
-    if not os.path.exists(file_name_general):
-       os.makedirs(file_name_general)
+    file_general_path = parentfolder + '/sac/data/'
+    if not os.path.exists(file_general_path):
+       os.makedirs(file_general_path)
     else:
        pass
     #https://github.com/Abishekpras/vrnn/blob/104b532e862620f9043421e73b98d38653f6b73b/train.py#L71
@@ -604,7 +604,7 @@ def main():
     
     df = pd.DataFrame(df)
     # save data
-    file_name = file_name_general + 'VRNN_GMM_GYM_TEST.csv'
+    file_name = file_general_path + 'VRNN_GMM_GYM_TEST.csv'
 
     df.to_csv(file_name)
     
