@@ -34,7 +34,7 @@ import torch.multiprocessing as mp
 
 import argparse
 
-parser = argparse.ArgumentParser(description='the vrnn transition model (Chung et al. 2016), distributed data parallel ')
+parser = argparse.ArgumentParser(description='the vrnn transition model (Chung et al. 2016) conditioned on the context, distributed data parallel ')
 parser.add_argument('--lr', default=0.001, help='')
 parser.add_argument('--batch_size', type=int, default=768, help='')
 parser.add_argument('--max_epochs', type=int, default=4, help='')
@@ -44,12 +44,24 @@ parser.add_argument('--init_method', default='tcp://127.0.0.1:3456', type=str, h
 parser.add_argument('--dist-backend', choices=['gloo', 'nccl'], default='gloo', type=str, help='')
 parser.add_argument('--world_size', default=1, type=int, help='')
 parser.add_argument('--distributed', action='store_true', help='')
-
+parser.add_argument('--seed', type=int, default=1234,  help='seed of the experiment')
 torch.cuda.empty_cache()
 os.environ['PYTORCH_CUDA_ALLOC_CONF']="max_split_size_mb:9000"
 
-def cleanup():
-    dist.destroy_process_group()
+
+""" Gradient averaging. """
+def average_gradients(model):
+    size = float(dist.get_world_size())
+    for param in model.parameters():
+        if param.requires_grad and param.grad is not None:
+           dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+           param.grad.data /= size
+    for m in model.modules():
+        if isinstance(m, torch.nn.BatchNorm1d):
+            dist.all_reduce(m.running_mean.data, op=dist.reduce_op.SUM)
+            m.running_mean.data /= size
+            dist.all_reduce(m.running_var.data, op=dist.reduce_op.SUM)
+            m.running_var.data /= size
 
 def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_general, file_name_general, lr, max_epochs, train_rank, train_sampler, batch_size):
     train_options={'clip':2,
@@ -147,7 +159,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 # Unscales gradients and calls
                 # or skips optimizer.step()
 
-
+                average_gradients(modelstate.model)
                 scaler.step(modelstate.optimizer)
 
                 # Updates the scale for next iteration
@@ -156,7 +168,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
 
                 elapse_time = time.time() - epoch_start
                 elapse_time = datetime.timedelta(seconds=elapse_time)
-                print("From Rank: {}, Epoch: {}, Training time {}".format(train_rank, epoch, elapse_time))
+                print("From Rank: {}, Epoch: {}, Training time {}".format(dist.get_rank(), epoch, elapse_time))
 
                 """
                 #test for invalid/NaN values in different layers
@@ -187,6 +199,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                         epoch, train_options['n_epochs'], (i + 1), len(loader_train),
                         100. * (i + 1) / len(loader_train), lr, total_loss / total_points))  # total_batches
                 writer.add_scalar('data/total_loss', total_loss / total_points, i + epoch*len(loader_train))
+        
         return total_loss / total_points
 
     try:
@@ -260,6 +273,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
             if lr < train_options['min_lr']:
                 break
         progress_bar.close()
+        dist.destroy_process_group()
         
     except KeyboardInterrupt:
         tqdm.write('\n')
@@ -309,7 +323,8 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
     path = path_general + 'model/'
     file_name = file_name_general + '_bestModel.ckpt'
     map_location = {'cuda:%d' % 0: 'cuda:%d' % test_rank}
-    modelstate.load_model(path, file_name, map_location=map_location)
+    epoch, vloss = modelstate.load_model(path, file_name, map_location='cuda:0')
+    print('Best Loaded Train Epoch: {:5d} \tVal Loss: {:.3f}'.format(epoch,  vloss))
     modelstate.model.to(device)
     options={'h_dim':modelstate.h_dim,
              'z_dim':modelstate.z_dim,
@@ -418,7 +433,7 @@ def main():
     args = parser.parse_args()
 
     ngpus_per_node = torch.cuda.device_count()
-
+    os.environ["NCCL_DEBUG"] = "INFO"
     """ This next line is the key to getting DistributedDataParallel working on SLURM:
 		SLURM_NODEID is 0 or 1 in this example, SLURM_LOCALID is the id of the 
  		current process inside a node and is also 0 or 1 in this example."""
@@ -449,7 +464,7 @@ def main():
                             init_method=args.init_method, 
                             world_size=args.world_size, 
                             rank=rank,
-                            timeout=datetime.timedelta(0, 30) # 20s connection timeout
+                            timeout=datetime.timedelta(0, 180) # 20s connection timeout
                             )
     print("process group ready!")
 
@@ -483,7 +498,7 @@ def main():
     else:
        pass
     #https://github.com/Abishekpras/vrnn/blob/104b532e862620f9043421e73b98d38653f6b73b/train.py#L71
-    seed = 1234
+    seed = args.seed
 
     plt.ion()
     train_ratio = 0.34
