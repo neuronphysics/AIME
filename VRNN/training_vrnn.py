@@ -239,7 +239,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                     best_vloss = vloss
                     # save model
                     path = path_general + 'saved_model/'
-                    file_name = file_ + '_bestModel.ckpt'
+                    file_name = file_name_general + '_bestModel.ckpt'
                     if train_rank==0:
                        # All processes should see same parameters as they all start from same
                        # random parameters and gradients are synchronized in backward passes.
@@ -319,10 +319,14 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
     modelstate.model.to(device)
 
     # load model
-    path = path_general + 'model/'
+    model_path = path_general + 'saved_model/'
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
+    else:
+        pass
     file_name = file_name_general + '_bestModel.ckpt'
     map_location = {'cuda:%d' % 0: 'cuda:%d' % test_rank}
-    epoch, vloss = modelstate.load_model(path, file_name, map_location='cuda:0')
+    epoch, vloss = modelstate.load_model(model_path, file_name, map_location='cuda:0')
     print('Best Loaded Train Epoch: {:5d} \tVal Loss: {:.3f}'.format(epoch,  vloss))
     modelstate.model.to(device)
     options={'h_dim':modelstate.h_dim,
@@ -489,7 +493,8 @@ def main():
     else:
         pass
     file_name_general='Mujoco'
-
+    
+    
     
     # get saving file names
     file_general_path = parentfolder + '/sac/data/'
@@ -575,7 +580,7 @@ def main():
     print('passed distributed data parallel call')
     df={}# allocation
     # train the model
-    file_name_general= file_name_general+'VRNN_h{}_z{}_n{}'.format(modelstate.h_dim, modelstate.z_dim, modelstate.n_layers)
+    file_name_general= file_name_general+'_VRNN_h{}_z{}_n{}'.format(modelstate.h_dim, modelstate.z_dim, modelstate.n_layers)
          
     df = run_train(modelstate=modelstate,
                    loader_train=train_loader,
@@ -604,7 +609,7 @@ def main():
     
     df = pd.DataFrame(df)
     # save data
-    file_name = file_general_path + 'VRNN_GMM_GYM_TEST.csv'
+    file_name = file_general_path + '_VRNN_GMM_GYM_TEST.csv'
 
     df.to_csv(file_name)
     

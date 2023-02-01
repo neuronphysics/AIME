@@ -1,5 +1,6 @@
 from torch.distributions.normal import Normal
-from torch.distributions import MultivariateNormal, OneHotCategorical
+from torch.distributions import MultivariateNormal, OneHotCategorical, MixtureSameFamily
+from torch.distributions.independent import Independent
 from torch.utils.data import Dataset
 import torch
 import torch.nn as nn
@@ -395,9 +396,9 @@ class VRNN_GMM(nn.Module):
            seq_len=[seq_len]*batch_size
         
         # allocation
-        sample = torch.zeros(batch_size, self.y_dim, seq_len, device=self.device)
-        sample_mu = torch.zeros(batch_size, self.y_dim, seq_len, device=self.device)
-        sample_sigma = torch.zeros(batch_size, self.y_dim, seq_len, device=self.device)
+        sample = torch.zeros(batch_size, self.y_dim, T, device=self.device)
+        sample_mu = torch.zeros(batch_size, self.y_dim, T, device=self.device)
+        sample_sigma = torch.zeros(batch_size, self.y_dim, T, device=self.device)
 
         h = torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device)
         c = torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device)
@@ -432,13 +433,15 @@ class VRNN_GMM(nn.Module):
                 decoder_out   = self.dec(decoder_input)
 
                 dec_normal_t          = self.decoder_normal(decoder_out)
-
+                
                 # store the samples
-                sample_mu[:, :, t]    = dec_normal_t.mean
-                sample_sigma[:, :, t] = dec_normal_t.variance**0.5
 
                 dec_pi_t        = self.dec_pi(decoder_out)
-                sample[:, :, t] = torch.sum(pi.sample().unsqueeze(2) * normal.sample(), dim=1)
+                gmm = MixtureSameFamily(dec_pi_t._categorical, dec_normal_t )
+                sample_mu[:, :, t]    = gmm.mean
+                sample_sigma[:, :, t] = gmm.variance**0.5
+                n_samples = 1
+                sample[:, :, t] = gmm.sample(sample_shape=(n_samples,))
 
                 # recurrence: u_t+1, z_t -> h_t+1
                 RNN_inputs = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
@@ -453,7 +456,7 @@ class VRNN_GMM(nn.Module):
         loglik = normal.log_prob(y.unsqueeze(1).expand_as(normal.loc))
         loss = -torch.logsumexp(torch.log(pi.probs) + loglik, dim=1)
         assert not torch.isnan(loss).any()
-        return loss.sum()
+        return loss.mean()
 
 
     @staticmethod

@@ -6,8 +6,10 @@ import torch
 import math
 import time
 import logging
+import os, sys
 import torch.nn as nn
 from collections import OrderedDict
+import torch.distributions as tdist
 ###Required for debugging to detect nan values in layers
 def nan_hook(self, inp, out):
     """
@@ -90,7 +92,7 @@ def compute_rmse(y, yhat, doprint=False):
 
 
 # computes the marginal likelihood of all outputs
-def compute_marginalLikelihood(y, yhat_mu, yhat_sigma, doprint=False):
+def compute_marginalLikelihood(y, yhat_mu, yhat_sigma, doprint=True):
     # to torch
     y = torch.tensor(y, dtype=torch.double)
     yhat_mu = torch.tensor(yhat_mu, dtype=torch.double)
