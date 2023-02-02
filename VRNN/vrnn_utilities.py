@@ -9,7 +9,7 @@ import logging
 import os, sys
 import torch.nn as nn
 from collections import OrderedDict
-import torch.distributions as tdist
+from torch.distributions import normal
 ###Required for debugging to detect nan values in layers
 def nan_hook(self, inp, out):
     """
@@ -101,12 +101,12 @@ def compute_marginalLikelihood(y, yhat_mu, yhat_sigma, doprint=True):
     # number of batches
     num_batches = y.shape[0]
     num_points = np.prod(y.shape)
-
+    T = torch.max((yhat_mu[0,0,:]!=0).nonzero()).item()+1
     # get predictive distribution
-    pred_dist = tdist.Normal(yhat_mu, yhat_sigma)
+    pred_dist = normal.Normal(yhat_mu[:,:,:T], yhat_sigma[:,:,:T])
 
     # get marginal likelihood
-    marg_likelihood = torch.mean(pred_dist.log_prob(y))
+    marg_likelihood = pred_dist.log_prob(y[:,:,:T]).sum()
     # to numpy
     marg_likelihood = marg_likelihood.numpy()
 
@@ -226,7 +226,7 @@ def plot_losscurve(df, options, path_general, file_name_general, removedata=True
                                                          options['z_dim'],
                                                          options['n_layers']))
         plt.legend()
-        plt.yscale('log')
+        plt.yscale('symlog')
         # save model
         if options['savefig']:
             # check if path exists and create otherwise
