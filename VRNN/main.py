@@ -8,7 +8,6 @@ import torch.nn.init as init
 import torch_optimizer
 import os
 import sys
-
 from MaskedNorm import MaskedNorm
 from CustomLSTM import LSTMCore
 from attention_encoder import LatentEncoder
@@ -260,8 +259,8 @@ class VRNN_GMM(nn.Module):
                               hidden_size = self.h_dim, 
                               num_layers = self.n_layers,  
                               batch_first=True, 
-                              train_truncate= 25, 
-                              train_burn_in = 15)
+                              train_truncate= 35, 
+                              train_burn_in = 25)
         
         #self.apply(self.weight_init)
 
@@ -380,9 +379,10 @@ class VRNN_GMM(nn.Module):
 
         # Reparametrization trick
         var = torch.exp(log_var* 0.5)
-        eps = torch.randn_like(var)
+        eps = torch.FloatTensor(var.size()).normal_(mean=0, std=1).to(self.device)
+        eps = torch.autograd.Variable(eps)
 
-        return eps.mul(var).add_(mu)
+        return eps.mul(var).add_(mu).add_(1e-7)
 
     def generate(self, u, seq_len=None):
         # get the batch size
