@@ -1,5 +1,6 @@
 from torch.distributions.normal import Normal
-from torch.distributions import MultivariateNormal, OneHotCategorical, MixtureSameFamily
+from torch.distributions import MultivariateNormal, OneHotCategorical, MixtureSameFamily, Categorical
+from torch.distributions.normal import Normal
 from torch.distributions.independent import Independent
 from torch.utils.data import Dataset
 import torch
@@ -236,21 +237,13 @@ class VRNN_GMM(nn.Module):
             nn.ReLU(),
         ]
 
-        self.dec      = nn.Sequential(*layers_decoder)
-        #init_weights(self.dec[0])
-        #if self.batch_norm:
-        #    init_weights(self.dec[3])
-        #else:
-        #    init_weights(self.dec[2])
-        ## initialize
+        layers_decoder.append(
+          nn.Linear(self.h_dim, self.n_mixtures + self.n_mixtures * 2 * self.y_dim )
+        )
 
 
         ## (decoder) Normal distribution
-        self.decoder_normal = NormalNetwork(self.h_dim, self.y_dim , self.n_mixtures)
-
-        ##
-        #(decoder) Categorical distribution
-        self.dec_pi = CategoricalNetwork(self.h_dim, self.n_mixtures)
+        self.decoder = torch.nn.Sequential(*layers_decoder)
 
         # recurrence function (f_theta) -> Recurrence
         #self._rnn =  nn.LSTM(self.h_dim + self.h_dim + self.h_dim, self.h_dim, self.n_layers, bias, batch_first= True)#modified
@@ -350,11 +343,28 @@ class VRNN_GMM(nn.Module):
                 #####================######
                 # decoder: h_t, z_t -> y_t
                 decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)##(modified)
-                decoder_out   = self.dec(decoder_input)
+                x_decoder     = self.decoder(decoder_input)
+                # Get the mixing probabilities from the decoder
+                mix_probs    = x_decoder[:, : self.n_mixtures]
+                # Return all (for every component) means and standard deviations from the decoder
+                mu, sigma = x_decoder[:, self.n_mixtures :].chunk(2, dim=-1)
+                
+                sigma = nn.Softplus()(sigma )
+                batch_n = mu.shape[0]
+                mu = mu.view(batch_n, self.n_mixtures, self.y_dim)
+                sigma = sigma.view(batch_n, self.n_mixtures, self.y_dim)
 
-                dec_normal_t = self.decoder_normal(decoder_out)
-                dec_pi_t     = self.dec_pi(decoder_out)
+                # Ensure that the mixing probabilities are between zero and one and sum to one
+                mix_probs = torch.nn.functional.softmax(mix_probs, dim=1)
 
+                # Construct a batch of Gaussian Mixture Modles in input_shape-D consisting of
+                # GMM_components equally weighted input_shape-D Gaussian distributions
+                mix = Categorical(mix_probs)
+                comp = Independent(Normal(mu, sigma), 1)
+                gmm = MixtureSameFamily(mix, comp)
+                # Return a distribution p(y_t|z_t,h_t)
+                dist = gmm
+                
                 RNN_inputs    = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
                 #input of RNN module torch.Size([B, 3*H]) ==>[B,T,3*H]
 
@@ -366,7 +376,10 @@ class VRNN_GMM(nn.Module):
                 assert not torch.isnan(KLD)
                 KLD_ATTN = self.kld_attention(c_t_mu, c_t_logvar) ##(new)
                 assert not torch.isnan(KLD_ATTN)
-                loss_pred = self.loglikelihood_gmm(y[:, :, t], dec_normal_t, dec_pi_t)
+                # Create the observation model (generating distribution) p(y_t|z_t,h_t, c_t)
+                
+                log_p = dist.log_prob(y[:, :, t])
+                loss_pred = log_p.mean()
                 assert not torch.isnan(loss_pred)
                 assert torch.isfinite(loss_pred)
                 total_loss += - loss_pred + KLD + KLD_ATTN
@@ -430,18 +443,30 @@ class VRNN_GMM(nn.Module):
                 # decoder: z_t, h_t -> y_t
 
                 decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)##(modified)
-                decoder_out   = self.dec(decoder_input)
-
-                dec_normal_t          = self.decoder_normal(decoder_out)
+                x_decoder     = self.decoder(decoder_input)
+                # Get the mixing probabilities from the decoder
+                mix_probs    = x_decoder[:, : self.n_mixtures]
+                # Return all (for every component) means and standard deviations from the decoder
+                mu, sigma = x_decoder[:, self.n_mixtures :].chunk(2, dim=-1)
                 
-                # store the samples
+                sigma = nn.Softplus()(sigma )
+                batch_n = mu.shape[0]
+                mu = mu.view(batch_n, self.n_mixtures, self.y_dim)
+                sigma = sigma.view(batch_n, self.n_mixtures, self.y_dim)
 
-                dec_pi_t        = self.dec_pi(decoder_out)
-                gmm = MixtureSameFamily(dec_pi_t._categorical, dec_normal_t )
+                # Ensure that the mixing probabilities are between zero and one and sum to one
+                mix_probs = torch.nn.functional.softmax(mix_probs, dim=1)
+
+                # Construct a batch of Gaussian Mixture Modles in input_shape-D consisting of
+                # GMM_components equally weighted input_shape-D Gaussian distributions
+                mix = Categorical(mix_probs)
+                comp = Independent(Normal(mu, sigma), 1)
+                gmm = MixtureSameFamily(mix, comp)
+                
                 sample_mu[:, :, t]    = gmm.mean
                 sample_sigma[:, :, t] = gmm.variance**0.5
-                n_samples = 1
-                sample[:, :, t] = gmm.sample(sample_shape=(n_samples,))
+
+                sample[:, :, t] = gmm.sample()
 
                 # recurrence: u_t+1, z_t -> h_t+1
                 RNN_inputs = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
@@ -452,11 +477,6 @@ class VRNN_GMM(nn.Module):
         return sample, sample_mu, sample_sigma
     
 
-    def loglikelihood_gmm(self, y, normal, pi):
-        loglik = normal.log_prob(y.unsqueeze(1).expand_as(normal.loc))
-        loss = -torch.logsumexp(torch.log(pi.probs) + loglik, dim=1)
-        assert not torch.isnan(loss).any()
-        return loss.mean()
 
 
     @staticmethod
