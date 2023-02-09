@@ -32,14 +32,12 @@ from torch.distributions import Distribution, Independent, MultivariateNormal
 from collections import Counter
 import torch.distributions as pyd
 import math
-from ExpectedInformationMaximization import ConditionalMixtureEIM, RecorderKeys, TrainIterationRecMod, ConfigInitialRecMod, DRERecMod, ComponentUpdateRecMod, WeightUpdateRecMod, Recorder, to_tensor
-from MUJOCORecorder import MujocoData, MujocoModelRecMod 
-import ExpectedInformationMaximization as EIM
+from f_divergence import Discriminator, preprocess_loader
 from dm_control import suite
 import dm_control
 local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-LOG_STD_MIN = torch.tensor(-5, dtype=torch.float32, device=local_device,requires_grad=False)
+LOG_STD_MIN = torch.tensor(-20, dtype=torch.float32, device=local_device,requires_grad=False)
 
 LOG_STD_MAX = torch.tensor(2 , dtype=torch.float32, device=local_device,requires_grad=False)
 
@@ -103,13 +101,15 @@ class TanhTransform(pyd.transforms.Transform):
 ###############################################
 ##################  Networks  #################
 ###############################################
-def weights_init_(modules, init_type='xavier', gain=1):
+def weights_init_(modules, init_type='orthogonal', gain=1):
     m = modules
     if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
        if init_type == 'kaiming':
           torch.nn.init.uniform_(m.weight, a = -0.05, b = 0.05 )
        elif init_type == 'xavier':
             torch.nn.init.xavier_uniform_(m.weight, gain=gain)
+       elif init_type == 'orthogonal':
+            torch.nn.init.orthogonal_(m.weight.data, gain=gain)
        if m.bias is not None:
             torch.nn.init.constant_(m.bias, 0)
     elif isinstance(m, nn.Module):
@@ -142,6 +142,7 @@ class ActorNetwork(nn.Module):
     self._action_means, self._action_mags = get_spec_means_mags(
         self._action_spec, self.device)
     
+    self.apply(weights_init_)
     self.to(device=self.device)
 
   def to(self, *args, **kwargs):
@@ -574,22 +575,19 @@ class Agent(object):
   def _build_agent(self):
     """Builds agent components."""
     if len(self._weight_decays) == 1:
-       self._weight_decays = tuple([self._weight_decays[0]] * 4)
+       self._weight_decays = tuple([self._weight_decays[0]] * 5)
     self._build_fns()
-    train_batch = self._get_train_batch()
-    self._build_backbones(train_batch)
-    self._global_step = torch.tensor(0.0, requires_grad=False)
-    self._init_vars(train_batch)
     self._build_optimizers()
+    self._global_step = torch.tensor(0.0, requires_grad=False)
     self._train_info = collections.OrderedDict()
     self._all_train_info = collections.OrderedDict()
     self._checkpointer = self._build_checkpointer()
     self._test_policies = collections.OrderedDict()
     self._build_test_policies()
     self._online_policy = self._build_online_policy()
-  
-  def _build_backbones(self, train_batch):
-    pass
+    train_batch = self._get_train_batch()
+    self._init_vars(train_batch)
+    
 
   def _build_fns(self):
     self._agent_module = AgentModule(modules_list=self._modules_list)
@@ -822,19 +820,20 @@ class D2EAgent(Agent):
       alpha=1.0,
       alpha_max=ALPHA_MAX,
       train_alpha= True,
-      value_penalty= True,
+      divergence_name='kl',
       target_divergence= 0.0,
       alpha_entropy= 0.0,
       train_alpha_entropy=False,
       target_entropy=None,
-      EIM_config = ConditionalMixtureEIM.get_default_config(),
-      divergence_name='kl',
+      value_penalty= True,
       warm_start=2000,
       c_iter=3,
       ensemble_q_lambda=1.0,
       grad_value_clipping=1.0,
       grad_norm_clipping=5.0,
-      tau=0.005,
+      transition_disc_hidden_size =128,
+      transition_disc_latent_size =128,
+      tau=0.005, ###
       **kwargs):
     self._alpha = alpha
     self._alpha_max = alpha_max
@@ -845,29 +844,19 @@ class D2EAgent(Agent):
     self._train_alpha_entropy = train_alpha_entropy
     self._alpha_entropy = alpha_entropy
     self._target_entropy = target_entropy
-    self._EIM_config = EIM_config
     self._warm_start = warm_start
     self._c_iter = c_iter
     self._ensemble_q_lambda = ensemble_q_lambda
-    self._grad_value_clipping = grad_value_clipping
-    self._grad_norm_clipping = grad_norm_clipping
+    self._grad_value_clipping = grad_value_clipping ##
+    self._grad_norm_clipping = grad_norm_clipping ###
+    self._transition_disc_hidden_size = transition_disc_hidden_size ###
+    self._transition_disc_latent_size = transition_disc_latent_size ####
     self.qf_criterion = nn.MSELoss()
     self.vf_criterion = nn.MSELoss()
-    self._tau= tau
+    self._tau= tau ###
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     super(D2EAgent, self).__init__(**kwargs)
   
-  def _build_backbones(self, train_batch):
-    s1  = train_batch['s1']
-    s2  = train_batch['s2']
-    train_samples = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1).train_samples
-    self._eim_context_dim = train_samples[0].shape[-1]
-    self._eim_sample_dim = train_samples[1].shape[-1]
-    self._EIM_model = ConditionalMixtureEIM(self._EIM_config, 
-                                            context_dim=self._eim_context_dim,
-                                            sample_dim=self._eim_sample_dim,
-                                            seed=torch.initial_seed(),
-                                            recorder=self._recorder_EIM())
 
   def _build_fns(self):
     self._agent_module = AgentModule(modules_list=self._modules_list)
@@ -879,42 +868,27 @@ class D2EAgent(Agent):
         name=self._divergence_name, 
         c=self._c_fn,
         device=self.device)
-    #################################################################################################################################
-    ############ Setting Up Configuration parameters of the EIM model to compute desity ratio of the transition function ############
-    #################################################################################################################################
-    self._EIM_config.train_epochs = 5
-    self._EIM_config.num_components = self._latent_spec.shape[0] #number of dimension of latent space
-
-    self._EIM_config.components_net_hidden_layers = [20, 20]
-    self._EIM_config.components_batch_size = self._batch_size #is it a correct batch size???
-    self._EIM_config.components_num_epochs = 4
-    self._EIM_config.components_net_reg_loss_fact = 0.0
-    self._EIM_config.components_net_drop_prob = 0.0
-
-    self._EIM_config.gating_net_hidden_layers = [20, 20]
-    self._EIM_config.gating_batch_size = self._batch_size #???
-    self._EIM_config.gating_num_epochs = 4
-    self._EIM_config.gating_net_reg_loss_fact = 0.0
-    self._EIM_config.gating_net_drop_prob = 0.0
-
-    self._EIM_config.dre_reg_loss_fact = 0.0005
-    self._EIM_config.dre_early_stopping = True
-    self._EIM_config.dre_drop_prob = 0.0
-    self._EIM_config.dre_num_iters =  4
-    self._EIM_config.dre_batch_size = self._batch_size ###???
-    self._EIM_config.dre_hidden_layers = [30, 30]
-    ########################################################################################################################
-    ##########################################   END of EIM cofiguration SETUP    ##########################################
-    ########################################################################################################################
+    #########################################################################################################################
+    ########################################   START of DISC cofiguration SETUP    ##########################################
+    #########################################################################################################################   
+    self._transit_discriminator = Discriminator(input_dim = self._latent_spec.shape[0]+ self._action_spec.shape[0], #number of dimension of observation plus action space
+                                                output_dim = self._latent_spec.shape[0],
+                                                hidden_dim = self._transition_disc_hidden_size,
+                                                latent_dim = self._transition_disc_latent_size,
+                                                device = self.device
+                                                )
+    #########################################################################################################################
+    ##########################################   END of DISC cofiguration SETUP    ##########################################
+    #########################################################################################################################
     self._agent_module.assign_alpha(self._alpha)
+    # entropy regularization
     if self._target_entropy is None:
-      self._target_entropy = - self._action_spec.shape[0]
+       self._target_entropy = - self._action_spec.shape[0]
     self._get_alpha_entropy = self._agent_module.get_alpha_entropy
     self._agent_module.assign_alpha_entropy(self._alpha_entropy)
 
   def _get_alpha(self):
-    return self._agent_module.get_alpha(
-        alpha_max=self._alpha_max)
+    return self._agent_module.get_alpha(alpha_max = self._alpha_max)
 
   def _get_q_source_vars(self):
     return self._agent_module.q_source_variables
@@ -938,12 +912,12 @@ class D2EAgent(Agent):
     source_weights = self._agent_module.q_source_weights
     norms = []
     for w in source_weights:
-      norm = torch.sum(torch.square(w))
-      norms.append(norm)
-    target_weights = self._agent_module.q_target_weights
-    for w in target_weights:
-      norm = torch.sum(torch.square(w))
-      norms.append(norm)
+        norm = torch.sum(torch.square(w))
+        norms.append(norm)
+    #target_weights = self._agent_module.q_target_weights##???
+    #for w in target_weights:##
+    #    norm = torch.sum(torch.square(w))##
+    #    norms.append(norm)##
     return torch.stack(norms).sum(dim=0)
 
   def _get_p_weight_norm(self):
@@ -968,13 +942,25 @@ class D2EAgent(Agent):
     for w in source_weights:
       norm = torch.sum(torch.square(w))
       norms.append(norm)
-    target_weights = self._agent_module.v_target_weights
-    for w in target_weights:
-      norm = torch.sum(torch.square(w))
-      norms.append(norm)
+    #target_weights = self._agent_module.v_target_weights
+    #for w in target_weights:
+    #    norm = torch.sum(torch.square(w))
+    #    norms.append(norm)
     return torch.stack(norms).sum(dim=0)
 
-
+  def _get_disc_weight_norm(self):
+    disc_weights = []
+    child_disc = [self._transit_discriminator.input_condition_disc, self._transit_discriminator.output_condition_disc, self._transit_discriminator.trunk, self._transit_discriminator.fake_state_action.output_emb, self._transit_discriminator.fake_state_action.model]
+    for i rage(len(child_disc)):
+        for name, param in child_disc[i]._layers.named_parameters():
+            if 'weight' in name:
+                disc_weights += list(param)
+    norms = []
+    for w in disc_weights:
+        norm = torch.sum(torch.square(w))
+        norms.append(norm)
+    return torch.stack(norms).sum(dim=0)
+    
   def ensemble_q(self, qs):
     lambda_ = self._ensemble_q_lambda
     return (lambda_ *torch.min(qs, dim=-1).values
@@ -993,28 +979,26 @@ class D2EAgent(Agent):
     a2_b = batch['a2']
     r = batch['r']
     dsc = batch['dsc']
-    done=batch['done']
+    done = batch['done']
     _, a2_p, log_pi_a2_p = self._p_fn(s2.to(device=self.device))
-
     q2_targets = []
     q1_preds = []
     for q_fn, q_fn_target in self._q_fns:
-      q2_target_ = q_fn_target(s2.to(device=self.device), a2_p)
-      q1_pred = q_fn(s1.to(device=self.device), a1.to(device=self.device))
-      q1_preds.append(q1_pred)
-      q2_targets.append(q2_target_)
+        q2_target_ = q_fn_target(s2.to(device=self.device), a2_p)
+        q1_pred = q_fn(s1.to(device=self.device), a1.to(device=self.device))
+        q1_preds.append(q1_pred)
+        q2_targets.append(q2_target_)
     
     q2_targets = torch.stack(q2_targets, dim=-1)
     q2_target = self._ensemble_q2_target(q2_targets)
-    div_estimate = self._divergence.dual_estimate(
-        s2.to(device=self.device), a2_p, a2_b.to(device=self.device))
+    if self._value_penalty:
+       div_estimate = self._divergence.dual_estimate(
+             s2.to(device=self.device), a2_p, a2_b.to(device=self.device))
     #using new states generated by EIM
     
     with torch.no_grad():
-        data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
-        s_p = self._EIM_model._model.sample(data.train_samples[0])
         for _, v_fn_target in self._v_fns:
-            target_v_next =   q2_target - v_fn_target(s_p)- self._get_alpha_entropy()[0] * log_pi_a2_p
+            target_v_next = q2_target - v_fn_target( s2.to(device=self.device)) - self._get_alpha_entropy()[0] * log_pi_a2_p
 
     #v2_target = q2_target - self._v_fn(s2.to(device=self.device))- self._get_alpha_entropy()[0] * log_pi_a2_p# Equation 21 in Dream to Explore
     if self._value_penalty:
@@ -1022,8 +1006,8 @@ class D2EAgent(Agent):
     q1_target = r.to(device=self.device) + (1.0 - done.float().to(device=self.device)) * self._discount *  target_v_next #Q(s,a)=R(s,a)+discount*v(s')
     q_losses = []
     for q1_pred in q1_preds:
-      q_loss_ = self.qf_criterion(q1_pred.view(-1) , q1_target.detach())
-      q_losses.append(q_loss_)
+        q_loss_ = self.qf_criterion(q1_pred.view(-1) , q1_target.detach())
+        q_losses.append(q_loss_)
     q_loss = torch.sum(torch.FloatTensor(q_losses))
     q_w_norm = self._get_q_weight_norm()
     norm_loss = self._weight_decays[0] * q_w_norm
@@ -1045,7 +1029,7 @@ class D2EAgent(Agent):
     a_b = batch['a1']
     _, a_p, log_pi_a_p = self._p_fn(s.to(device=self.device))
     for v_fn, v_fn_target in self._v_fns:
-        v1  = v_fn(s.to(device=self.device))
+        v1_source  = v_fn(s.to(device=self.device))
     q1s = []
     for q_fn, _ in self._q_fns:
         q1_ = q_fn(s.to(device=self.device), a_p)
@@ -1058,7 +1042,7 @@ class D2EAgent(Agent):
     q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
     p_loss = -torch.mean(
         self._get_alpha_entropy()[0] * log_pi_a_p
-        + self._get_alpha()[0] * div_estimate + log_pi_a_p * (v1 #new term based on Equation 10 in dream to explore paper
+        + self._get_alpha()[0] * div_estimate + (v1_source #new term based on Equation 10 in dream to explore paper
         - q1 )* q_start)
     p_w_norm = self._get_p_weight_norm()
     norm_loss = self._weight_decays[1] * p_w_norm
@@ -1067,71 +1051,50 @@ class D2EAgent(Agent):
     info = collections.OrderedDict()
     info['p_loss'] = p_loss
     info['p_norm'] = p_w_norm
-
+    info['v1_source_mean'] = torch.mean(v1_source)
     return loss, info
   
-  def _recorder_EIM(self):
-      """configure experiment"""
-      plot_realtime = True
-      plot_save = False    
-      print(f"env: {self._env_name}")
-      """Recording"""
-      recorder_dict = {
-         RecorderKeys.TRAIN_ITER: TrainIterationRecMod(),
-         RecorderKeys.INITIAL: ConfigInitialRecMod(),
-         #RecorderKeys.MODEL: MujocoModelRecMod(data,
-         #                                      self._env_name,
-         #                                      train_samples=data.train_samples,
-         #                                      test_samples=data.test_samples),
-         RecorderKeys.DRE: DRERecMod(),
-         RecorderKeys.COMPONENT_UPDATE: ComponentUpdateRecMod(plot=True, summarize=False)}
-      if self._EIM_config.num_components > 1:
-         recorder_dict[RecorderKeys.WEIGHTS_UPDATE] = WeightUpdateRecMod(plot=True)
-
-
-      return Recorder(recorder_dict, plot_realtime=plot_realtime, save=plot_save, save_path="rec")
-
   def _build_v_loss(self, batch):
     s1  = batch['s1']
     a_b = batch['a1']
     s2  = batch['s2']
+    loader = preprocess_loader(s1, a_b, s2, self.device)
     _, a_p, log_a_pi = self._p_fn(s1.to(device=self.device))
     #########################
     #input_data next_state (s2) and state (s1) 
-    with torch.no_grad():
-          data = MujocoData(s1.to(device=self.device), s2.to(device=self.device),train_valid_split_portion=1)
-          for v_fn, v_fn_target in self._v_fns:
-              v_pred  = v_fn(s1)
-          q1_target = []
-          q1_pred=[]
-          for q_fn, q_fn_target in self._q_fns:
-              q1_ = q_fn_target(s1.to(device=self.device), a_p)
-              q1_target.append(q1_)
-              q2_ = q_fn(s1.to(device=self.device), a_p)
-              q1_pred.append(q2_)
-          q1_target = torch.stack(q1_target, dim=-1)
-          q1_target_ensemble = self.ensemble_q(q1_target)
-          q1_pred = torch.stack(q1_pred, dim=-1)
-          q1_pred_ensemble = self.ensemble_q(q1_pred)
+    for v_fn, v_fn_target in self._v_fns:
+              v_target  = v_fn_target(s2.to(device=self.device))
+    q1_pred=[]
+    for q_fn, q_fn_target in self._q_fns:
+        q1_ = q_fn(s1.to(device=self.device), a_p)
+        q1_pred.append(q1_)
+
+        q1_pred = torch.stack(q1_pred, dim=-1)
+        q1_pred_ensemble = self.ensemble_q(q1_pred)
     div_estimate = self._divergence.dual_estimate(
         s1.to(device=self.device), a_p, a_b.to(device=self.device))
-    
+    disc_estimate_loss, disc_grad_penalty = self._transit_discriminator.update(loader)
     #https://github.com/AnujMahajanOxf/VIREL/blob/master/VIREL_code/beta.py
     #https://github.com/haarnoja/sac/blob/8258e33633c7e37833cc39315891e77adfbe14b2/sac/algos/sac.py#L295
     #https://github.com/rail-berkeley/rlkit/blob/60bdfcd09f48f73a450da139b2ba7910b8cede53/rlkit/torch/smac/pearl.py#L247
     #Equation 20 in Dream to Explore paper
-    _, Iprojection, _, _, _ = self._EIM_model._dre.eval(data.train_samples, self._EIM_model._model)
-    with torch.no_grad():
-         v_target= torch.min(q1_target_ensemble,q1_pred_ensemble) - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (div_estimate + Iprojection)
+    
+    v_pred = q1_pred_ensemble - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (div_estimate + disc_estimate_loss)
     #v_loss= self.vf_criterion(v_pred, v_target.detach()) 
     v_loss = WeightedLoss(v_pred - v_target.detach()) 
     v_w_norm = self._get_v_weight_norm()
-    norm_loss = self._weight_decays[3] * v_w_norm
-    loss = v_loss + norm_loss
-
+    v_norm_loss = self._weight_decays[3] * v_w_norm
+    
+    
+    disc_w_norm = self._get_disc_weight_norm()  
+    disc_norm_loss = self._weight_decays[4] * disc_w_norm
+    
+    loss = v_loss + v_norm_loss + disc_norm_loss + disc_grad_penalty     
     info = collections.OrderedDict()
     info['value_loss'] = v_loss
-    info['vale_norm'] = v_w_norm
+    info['vale_norm']  = v_w_norm
+    info['transition_fgan']    = disc_estimate_loss
+    info['transition_penalty'] = disc_grad_penalty
     return loss, info
 
 
@@ -1239,7 +1202,10 @@ class D2EAgent(Agent):
         v_fn_target.train()
     self._v_target_optimizer.zero_grad()
     self._v_source_optimizer.zero_grad()
-    value_loss, _ = self._build_v_loss(batch)
+    ###fGAN
+    self._transit_discriminator.optimizer.zero_grad()
+    self._transit_discriminator.fake_state_action.optimizer.zero_grad()
+    value_loss, info_value = self._build_v_loss(batch)
     value_loss.backward(retain_graph=True)
     if self._grad_norm_clipping > 0.:
        torch.nn.utils.clip_grad_norm_(v_fn.parameters(), self._grad_norm_clipping)
@@ -1249,6 +1215,9 @@ class D2EAgent(Agent):
        torch.nn.utils.clip_grad_value_(v_fn_target.parameters(), self._grad_value_clipping)
     self._v_target_optimizer.step()
     self._v_source_optimizer.step()
+    ###fGAN
+    self._transit_discriminator.optimizer.step()
+    self._transit_discriminator.fake_state_action.optimizer.step()
     # Update q networks parameter
     for q_fn, q_fn_target in self._q_fns:
         q_fn.train()
@@ -1274,13 +1243,6 @@ class D2EAgent(Agent):
     self._extra_c_step( batch)
     
     #train expected information maximization to compute transition ratio
-
-    s1  = batch['s1']
-    s2  = batch['s2']
-    with torch.no_grad():
-          data = MujocoData(s1.to(device=self.device), s2.to(device=self.device), train_valid_split_portion=1-1/16)
-    print(f"shape of training data {data.train_samples[0].shape} {data.train_samples[1].shape}{data.val_samples[0].shape}")
-    self._EIM_model.train_emm(data.train_samples, data.val_samples)
     
     if self._train_alpha:
        self._a_optimizer.zero_grad()
@@ -1303,6 +1265,8 @@ class D2EAgent(Agent):
     info["q2_target_mean"]=q_info["q2_target_mean"].cpu().item()
     #) value loss
     info["value_loss"]= value_loss.cpu().item()
+    info["transition_fgan"]=info_value["transition_fgan"].cpu().item()
+    info["transition_penalty"]=info_value["transition_penalty"].cpu().item()
     #7) critic loss
     info["critic_loss"] = self.critic_loss.cpu().item()
     #8)alpha loss
@@ -1372,12 +1336,16 @@ class D2EAgent(Agent):
       checkpoint = {
             "policy_net": self._agent_module.p_net.state_dict(),
             "critic_net": self._agent_module.c_net.state_dict(),
+            "discriminator_transition_net":self._transit_discriminator.state_dict(),
+            "generator_transition_net":self._transit_discriminator.fake_state_action.state_dict(),
             "q_source_optimizer": self._q_source_optimizer.state_dict(),
             "q_target_optimizer": self._q_target_optimizer.state_dict(),
             "critic_optimizer": self._c_optimizer.state_dict(),
             "policy_optimizer": self._p_optimizer.state_dict(),
             "value_source_optimizer": self._v_source_optimizer.state_dict(),
             "value_target_optimizer": self._v_target_optimizer.state_dict(),
+            "discriminator_transition_optimizer":self._transit_discriminator.optimizer.state_dict(),
+            "generator_transition_optimizer":self._transit_discriminator.fake_state_action.optimizer.state_dict(),
             "train_step": self._global_step
       }
       for q_fn, q_fn_target in self._q_fns:
@@ -1404,9 +1372,13 @@ class D2EAgent(Agent):
             v_fn_target.load_state_dict(checkpoint["v_net_target"])
         self._agent_module.p_net.load_state_dict(checkpoint["policy_net"])
         self._agent_module.c_net.load_state_dict(checkpoint["critic_net"])
+        self._transit_discriminator.load_state_dict(checkpoint["discriminator_transition_net"])###
+        self._transit_discriminator.fake_state_action.load_state_dict(checkpoint["generator_transition_net"])###
         self._p_optimizer.load_state_dict(checkpoint["policy_optimizer1"])
         self._q_source_optimizer.load_state_dict(checkpoint["q_source_optimizer"])
         self._q_target_optimizer.load_state_dict(checkpoint["q_target_optimizer"])
+        self._transit_discriminator.optimizer.load_state_dict(["discriminator_transition_optimizer"])
+        self._transit_discriminator.fake_state_action.optimizer.load_state_dict(["generator_transition_optimizer"])
         self._c_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self._v_source_optimizer.load_state_dict(checkpoint["v_source_optimizer"])
         self._v_target_optimizer.load_state_dict(checkpoint["v_target_optimizer"])
