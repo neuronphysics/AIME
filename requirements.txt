@@ -7,3 +7,4 @@ matplotlib
 plotly
 dm-control
 git+https://github.com/denisyarats/dmc2gym.git
+git+https://github.com/HorizonRobotics/cnest.git
