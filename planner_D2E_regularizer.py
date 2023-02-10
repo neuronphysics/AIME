@@ -577,16 +577,17 @@ class Agent(object):
     if len(self._weight_decays) == 1:
        self._weight_decays = tuple([self._weight_decays[0]] * 5)
     self._build_fns()
-    self._build_optimizers()
+    train_batch = self._get_train_batch()
     self._global_step = torch.tensor(0.0, requires_grad=False)
+    self._init_vars(train_batch)
+    self._build_optimizers()
     self._train_info = collections.OrderedDict()
     self._all_train_info = collections.OrderedDict()
     self._checkpointer = self._build_checkpointer()
     self._test_policies = collections.OrderedDict()
     self._build_test_policies()
     self._online_policy = self._build_online_policy()
-    train_batch = self._get_train_batch()
-    self._init_vars(train_batch)
+   
     
 
   def _build_fns(self):
@@ -942,13 +943,13 @@ class D2EAgent(Agent):
 
   def _get_disc_weight_norm(self):
     disc_weights = []
-    child_disc = [self._transit_discriminator.input_condition_disc, self._transit_discriminator.output_condition_disc, \
-                  self._transit_discriminator.trunk, self._transit_discriminator.fake_state_action.output_emb,\
+    child_disc = [self._transit_discriminator._condition_disc ,self._transit_discriminator.trunk, \
+                  self._transit_discriminator.fake_state_action.output_emb, \
                   self._transit_discriminator.fake_state_action.model]
-    for i rage(len(child_disc)):
-        for name, param in child_disc[i]._layers.named_parameters():
-            if 'weight' in name:
-                disc_weights += list(param)
+    for i in range(len(child_disc)):
+        for layer in child_disc[i].children():
+            if isinstance(layer, nn.Linear):
+                disc_weights += layer.weight
     norms = []
     for w in disc_weights:
         norm = torch.sum(torch.square(w))

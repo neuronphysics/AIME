@@ -58,6 +58,8 @@ def train_eval_online(
     update_freq=1,
     update_rate=0.005,
     discount=0.99,
+    done=False,
+    device=None,
     ):
   """Training a policy with online interaction."""
   # Create env to get specs.
@@ -68,7 +70,8 @@ def train_eval_online(
   action_spec = env.action_spec()
   env_test = alf_gym_wrapper.AlfGymWrapper(dm_env,discount=discount)
   env_test = TimeLimit(env_test, MUJOCO_ENVS_LENNGTH[env_name])
- 
+  if device is None:
+     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
   # Initialize dataset.
   train_data = Dataset(
@@ -115,6 +118,7 @@ def train_eval_online(
       update_freq=update_freq,
       update_rate=update_rate,
       discount=discount,
+      done=done,
       env_name=env,
       train_data=train_data)
   agent_args = Config(agent_flags).agent_args

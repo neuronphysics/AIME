@@ -193,7 +193,7 @@ class Dataset(nn.Module):
     return DatasetView(self, indices)
 
   def get_batch(self, indices):
-    indices = torch.tensor(indices, dtype=torch.int64, requires_grad=False, device=self.device)
+    indices = torch.tensor(indices, dtype=torch.int64, requires_grad=False)
     def get_batch_(data_):
       return gather(data_, indices)
     transition_batch = nest.map_structure(get_batch_, self._data)

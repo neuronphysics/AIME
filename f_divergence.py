@@ -119,7 +119,7 @@ def generate_noise(bs, nz, device):
     normal = Normal(loc, scale)
     diagn = Independent(normal, 1)
     noise = diagn.sample()
-	return noise
+    return noise
 
 class Discriminator(nn.Module):
     def __init__(self,
@@ -137,14 +137,12 @@ class Discriminator(nn.Module):
         self.latent_dim = latent_dim
         self.lr     = lr
         self.device = device
-        self.input_condition_disc = nn.Sequential( nn.Linear(input_dim, hidden_dim),
+        self._condition_disc = nn.Sequential( nn.Linear(input_dim, hidden_dim),
                                                   nn.Tanh()
                                                   ).to(device)
-        self.output_condition_disc = nn.Sequential( nn.Linear(output_dim, hidden_dim),
-                                                    nn.Tanh()
-                                                  ).to(device)
+        
         self.trunk = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(output_dim + hidden_dim, hidden_dim), nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
             nn.Linear(hidden_dim, 1)).to(device)
@@ -157,21 +155,22 @@ class Discriminator(nn.Module):
         self.ret_rms = RunningMeanStd(shape=())
 
     def compute_grad_pen(self,
-                         next_state,
+                         next_state_fake,
+                         next_state_real,
                          current_state,
                          current_action,
                          lambda_=10):
         """Calculates the gradient penalty loss for WGAN GP"""
 
-        future_data  = self.output_condition_disc(next_state)
-        current_data = self.input_condition_disc(torch.cat([current_state, current_action.float()], dim=1))
-        alpha = torch.rand(current_data.size(0), 1)
-        alpha = alpha.expand_as(current_data).to(current_data.device)
+        conditional_data = self._condition_disc(torch.cat([current_state, current_action.float()], dim=1))
+        #mixing coefficient
+        alpha = torch.rand(next_state_real.size(0), 1)
+        alpha = alpha.expand_as(next_state_real).to(next_state_real.device)
         #interpolates = (alpha * real_images + ((1 - alpha) * fake_images)).requires_grad_(True).float()
-        mixup_data = (alpha  * current_data + (1 - alpha)* future_data).requires_grad_(True).float()
+        mixup_data = (alpha  * next_state_real + (1 - alpha)* next_state_fake).requires_grad_(True).float()
 
 
-        disc = self.trunk(mixup_data)
+        disc = self.trunk(torch.cat([mixup_data, conditional_data], dim=1))
         ones =  torch.autograd.Variable(torch.ones(disc.size()), requires_grad=False).to(disc.device)
         grad = autograd.grad(
             outputs=disc,
@@ -193,25 +192,24 @@ class Discriminator(nn.Module):
         for item in loader:
             policy_state = torch.FloatTensor(item["obs"]).to(self.device)
             policy_action = torch.FloatTensor(item["action"]).to(self.device)
-            current_state_o = self.input_condition_disc( torch.cat([policy_state, policy_action], dim=1) )
+            #conditional
+            current_state_o = self._condition_disc( torch.cat([policy_state, policy_action], dim=1) )
 
-            next_state = torch.FloatTensor(item["next_obs"]).to(self.device)
+            next_state_o = torch.FloatTensor(item["next_obs"]).to(self.device)
 
-            next_state_o = self.output_condition_disc(next_state)
             #min Es∼d^o [logc(s,a)]+Es∼d^f [log(1−c(s,a))]
             observation_d = self.trunk(
                 torch.cat([next_state_o, current_state_o], dim=1))
 
 
             real_loss = F.binary_cross_entropy_with_logits(
-                observation_d,
-                torch.autograd.Variable(torch.ones_like(observation_d), requires_grad=False).to(self.device))
+                                                           observation_d,
+                                                           torch.autograd.Variable(torch.ones_like(observation_d), requires_grad=False).to(self.device))
 
-
+            #generate fake next states
             noise_            = generate_noise(bs=policy_state.shape[0], nz=self.latent_dim, device=self.device)
             next_state_f      = self.fake_state_action(noise_, torch.cat([policy_state, policy_action.float()], dim=1))
 
-            next_state_f      = self.output_condition_disc(next_state_f)
             observation_f     = self.trunk(torch.cat([next_state_f, current_state_o], dim=1))
 
             fake_loss = F.binary_cross_entropy_with_logits(
@@ -219,10 +217,11 @@ class Discriminator(nn.Module):
                                                            torch.autograd.Variable(torch.zeros_like(observation_f), requires_grad=False).to(self.device))
             gail_loss = real_loss + fake_loss
             grad_pen = self.compute_grad_pen(next_state_f,
+                                             next_state_o,
                                              policy_state, policy_action)
 
-            div_loss += gail_loss.item()
-            penalty  += grad_pen.item()
+            div_loss += gail_loss
+            penalty  += grad_pen
             n += 1
 
         return div_loss / n, penalty/ n
@@ -254,7 +253,7 @@ class TransitDataset(torch.utils.data.Dataset):
     def __getitem__(self, item):
         states  = self.states[item]
         actions = self.actions[item]
-        targets = self.targets[item]
+        targets = self.next_states[item]
         return {"next_obs":targets , "obs": states, "action": actions}
 
 def preprocess_loader(states, actions, next_states, device):
@@ -262,7 +261,7 @@ def preprocess_loader(states, actions, next_states, device):
     pin_memory = device == 'cuda'
     dloader = torch.utils.data.DataLoader(
                 dataset,
-                batch_size=states.shape[0]
+                batch_size=states.shape[0],
                 shuffle=False,
                 drop_last=False,
                 pin_memory=pin_memory
