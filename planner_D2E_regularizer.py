@@ -700,6 +700,9 @@ class Agent(object):
   def _load_checkpoint(self):
       #?restore
       pass
+    
+  def save(self, ckpt_name):
+     torch.save(self._checkpointer, ckpt_name)
 
   @property
   def global_step(self):
@@ -786,11 +789,17 @@ class MaxQSoftPolicy(nn.Module):
   def __call__(self, latent_state):
 
     actions = self._a_network.sample_n(latent_state.to(device=self.device), self._n)[1]
+    if latent_state.ndim>1:
+       batch_size = latent_state.shape[0]
+    else:
+       batch_size = 1
     
-    batch_size = actions.shape[-1]
-    actions_ = torch.reshape(actions, [self._n * batch_size, -1])
+    actions_ = torch.reshape(actions, [self._n , batch_size, -1])
     states_  = torch.tile(latent_state[None].to(device=self.device), (self._n, 1, 1))
     states_  = torch.reshape(states_, [self._n * batch_size, -1])
+    if batch_size==1:
+       actions_ = actions_.squeeze(1)
+       
     qvals = self._q_network(states_, actions_)
     qvals = torch.reshape(qvals, [self._n, batch_size]).to(device=self.device)
     a_indices = torch.argmax(qvals, dim=0).to(device=self.device)
@@ -1348,7 +1357,7 @@ class D2EAgent(Agent):
       if self._train_alpha_entropy:
           checkpoint["alpha_entropy"] = self._agent_module._alpha_entropy_var
           checkpoint["alpha_entropy_optimizer"] = self._ae_optimizer.state_dict()   
-      torch.save(checkpoint, self.checkpoint_path)
+      return checkpoint
     
   def _load_checkpoint(self):
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device)  # can load gpu's data on cpu machine
