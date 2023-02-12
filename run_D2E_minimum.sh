@@ -20,5 +20,5 @@ pip install dill --no-index
 
 #python DataCollectionD2E.py --env_name=HalfCheetah-v2
 #python train_eval_offline_D2E.py --env_name=HalfCheetah-v2
-python train_D2E_eval_online.py --env_name=HalfCheetah-v2 
+python train_D2E_eval_online.py --env_name=HalfCheetah-v2 --n_eval_episodes 25 --eval_target 10000 --total_train_steps 100000
 #python main.py --id cheetah-run-seed-1 --seed 1 --env cheetah-run --use-regular-vae

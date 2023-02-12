@@ -223,7 +223,7 @@ class Dataset(nn.Module):
            attr=attr.detach().cpu()
         transitions=transitions._replace(**{i:np.expand_dims(attr,axis=0)})
     batch_size = transitions.s1.shape[0]
-    effective_batch_size = torch.minimum( torch.tensor(batch_size), torch.tensor(self._size - self._current_idx))
+    effective_batch_size = torch.minimum( torch.tensor(batch_size), torch.tensor(self._size) - self._current_idx)
     indices = self._current_idx + torch.arange(effective_batch_size)
     for key in transitions._asdict().keys():
         data = getattr(self._data, key)

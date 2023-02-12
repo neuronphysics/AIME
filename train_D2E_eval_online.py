@@ -178,10 +178,11 @@ def train_eval_online(
                        ' with episodic return %.4g.', step, evals_[-1])
           target_partial_policy_saved = True
       logging.info('Testing at step %d:', step)
+      ##
       for policy_key, policy_info in eval_infos.items():
         logging.info(utils.get_summary_str(
             step=None, info=policy_info, prefix=policy_key + ': '))
-        utils.write_summary(eval_summary_writers[policy_key], step, policy_info)
+        utils.write_summary(eval_summary_writers[policy_key], policy_info, step)
       time_st = time.time()
       timed_at_step = step
     if step % save_freq == 0:
@@ -245,18 +246,9 @@ def main(args):
       eval_target=args.eval_target,
       )
 
-class TrainOnlineD2E(args):
 
-    args.sub_dir = '0'
-    args.env_name = 'HalfCheetah-v2'
-    args.eval_target = 4000
-    args.agent_name = 'sac'
-    args.total_train_steps = 10000  # Short training.
-    args.n_eval_episodes = 1
-
-    main(args)  # Just test that it runs.
 if __name__ == '__main__':
   args = parser.parse_args(sys.argv[1:])
   #print(' '.join(f'{k}={v}' for k, v in vars(args).items()))
   #gin.parse_config_files_and_bindings(args.gin_file, args.gin_bindings)
-  TrainOnlineD2E(args)
+  main(args)
