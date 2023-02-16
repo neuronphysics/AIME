@@ -1,6 +1,5 @@
 from torch.distributions.normal import Normal
 from torch.distributions import MultivariateNormal, OneHotCategorical, MixtureSameFamily, Categorical
-from torch.distributions.normal import Normal
 from torch.distributions.independent import Independent
 from torch.utils.data import Dataset
 import torch

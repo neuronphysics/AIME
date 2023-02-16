@@ -122,9 +122,9 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
             if torch.cuda.is_available():
                 with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
                     loss_ = modelstate.model(u, y)
-                diff_params = [p for p in modelstate.model.parameters() if p.requires_grad]
+                
                 scaled_grad_params = torch.autograd.grad(outputs=scaler.scale(loss_),
-                                                        inputs=diff_params,
+                                                        inputs=modelstate.model.parameters(),
                                                         create_graph=True,
                                                         retain_graph=True,
                                                         allow_unused=True #Whether to allow differentiation of unused parameters.
@@ -137,8 +137,8 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 """
                 inv_scale = 1./scaler.get_scale()
 
-                grad_params = [ p * inv_scale if p is not None and not torch.isnan(p).any() else torch.tensor(0, device=device, dtype=torch.float32) for p in scaled_grad_params ]
-                #grad_params = [p * inv_scale for p in scaled_grad_params]
+                #grad_params = [ p * inv_scale if p is not None and not torch.isnan(p).any() else torch.tensor(0, device=device, dtype=torch.float32) for p in scaled_grad_params ]
+                grad_params = [p * inv_scale for p in scaled_grad_params]
                 with torch.autocast(device_type='cuda', dtype=torch.float32):
                     #grad_norm = torch.tensor(0, device=grad_params[0].device, dtype=grad_params[0].dtype)
                     grad_norm = 0
@@ -571,8 +571,8 @@ def main():
     modelstate = ModelState(seed=seed,
                             nu=u_dim,
                             ny=y_dim,
-                            #normalizer_input=normalizer_input,
-                            #normalizer_output=normalizer_output
+                            normalizer_input=normalizer_input,
+                            normalizer_output=normalizer_output
                             )
     modelstate.model.cuda()
     #for DDP used this instruction: https://docs.alliancecan.ca/wiki/PyTorch 
