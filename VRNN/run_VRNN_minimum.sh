@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=4 # Request 1 process per GPU. You will get 1 CPU per process by default. Request more CPUs with the "cpus-per-task" parameter to enable multiple data-loader workers to load data in parallel.
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --time=02-23:59
+#SBATCH --time=01-23:59
 #SBATCH --account=def-jhoey
 #SBATCH --output=/home/memole/TEST/AIME/Hopper-transit-run-seed-1_%N-%j.out
 #SBATCH --error=/home/memole/TEST/AIME/Hopper-transit-run-seed-1_%N-%j.err

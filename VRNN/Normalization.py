@@ -73,7 +73,8 @@ class Normalizer1D(nn.Module):
         n_x=[]
         for i in range(x.shape[1]):
             n_x.append(self._norm[str(i)].transform(nd[:,i,:]))
-        x =np.stack(n_x, axis=1)
+        y = np.stack(n_x, axis=1)
+        x = np.where(np.isnan(y), 0, y)
         return torch.from_numpy(x).to(device)
         
     def unnormalize(self, x):
@@ -85,7 +86,8 @@ class Normalizer1D(nn.Module):
         for i in range(x.shape[1]):
             n_x.append(self._norm[str(i)].inverse_transform(nd[:,i,:]))
              
-        x =np.stack(n_x, axis=1)
+        y =np.stack(n_x, axis=1)
+        x = np.where(np.isnan(y), 0, y)
         return torch.from_numpy(x).to(device)
 
 
