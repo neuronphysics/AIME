@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=4 # Request 1 process per GPU. You will get 1 CPU per process by default. Request more CPUs with the "cpus-per-task" parameter to enable multiple data-loader workers to load data in parallel.
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --time=01-23:59
+#SBATCH --time=01-15:59
 #SBATCH --account=def-jhoey
 #SBATCH --output=/home/memole/TEST/AIME/Hopper-transit-run-seed-1_%N-%j.out
 #SBATCH --error=/home/memole/TEST/AIME/Hopper-transit-run-seed-1_%N-%j.err
@@ -38,6 +38,6 @@ export MASTER_ADDR=$(hostname) #Store the master node’s IP address in the MAST
 echo "r$SLURM_NODEID master: $MASTER_ADDR"
 echo "r$SLURM_NODEID Launching python script"
 
-srun python training_vrnn.py  --init_method tcp://$MASTER_ADDR:3456 --world_size $SLURM_NTASKS  --batch_size 35 --max_epochs 600
+srun python training_vrnn.py  --init_method tcp://$MASTER_ADDR:3456 --world_size $SLURM_NTASKS  --batch_size 40 --max_epochs 700
 
 #python main.py --id cheetah-run-seed-1 --seed 1 --env cheetah-run --use-regular-vae
