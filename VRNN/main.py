@@ -251,7 +251,7 @@ class VRNN_GMM(nn.Module):
                               hidden_size = self.h_dim, 
                               num_layers = self.n_layers,  
                               batch_first=True, 
-                              train_truncate= 35, 
+                              train_truncate= 75, 
                               train_burn_in = 25)
         
         #self.apply(self.weight_init)
@@ -262,14 +262,14 @@ class VRNN_GMM(nn.Module):
         #input is (Batch, seq_len, D)
         #seq_len = y.shape[-1]
         seq_len = torch.LongTensor([torch.max((u[i,0,:]!=0).nonzero()).item()+1 for i in range(u.shape[0])])
-        ##=============##
-        mask = ~u.eq(0.0)
+        ##======fiding sequece length of each episode =======##
+        #mask = ~u.eq(0.0)
 
-        sqn  = torch.unique(mask.sum(dim=-1), sorted=False, dim=1).squeeze(-1)
-        sqn  = sqn.cpu()
+        #sqn  = torch.unique(mask.sum(dim=-1), sorted=False, dim=1).squeeze(-1)
+        #sqn  = sqn.cpu()
         #print(seq_len,sqn, u.shape)
-        assert torch.all(torch.eq(seq_len, sqn))
-        ##====(new)====##
+        #assert torch.all(torch.eq(seq_len, sqn))
+        ##==================== (new) =====================##
         reshaped_u  = u.permute(0,2,1)
         reshaped_y  = y.permute(0,2,1)
 
@@ -548,12 +548,12 @@ class ModelState:
                  seed,
                  nu,
                  ny,
-                 h_dim=56,
-                 z_dim=48,
+                 h_dim=64,
+                 z_dim=64,
                  n_layers=2,
                  n_mixtures=8,
                  device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-                 optimizer_type= "AdamW",
+                 optimizer_type= "MADGRAD",
                  **kwargs):
 
         torch.manual_seed(seed)
@@ -584,6 +584,13 @@ class ModelState:
                                                    weight_decay=1e-2,
                                                    nesterov=False,
                                                    )
+        elif optimizer_type=="MADGRAD":
+            self.optimizer = torch_optimizer.MADGRAD(self.model.parameters(),
+                                                     lr=3e-4,
+                                                     momentum=0.0,
+                                                     weight_decay=0,
+                                                     eps=1e-6,
+                                                    )
         else:
             # Optimization parameters
             yogi = torch_optimizer.Yogi(self.model.parameters(), lr= 0.5e-4, betas=(0.95, 0.999), eps=1e-3, initial_accumulator=1e-6, weight_decay=0,)

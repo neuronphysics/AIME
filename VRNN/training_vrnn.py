@@ -137,8 +137,8 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 """
                 inv_scale = 1./scaler.get_scale()
 
-                #grad_params = [ p * inv_scale if p is not None and not torch.isnan(p).any() else torch.tensor(0, device=device, dtype=torch.float32) for p in scaled_grad_params ]
-                grad_params = [p * inv_scale for p in scaled_grad_params]
+                grad_params = [ p * inv_scale if p is not None and not torch.isnan(p).any() else torch.tensor(0, device=device, dtype=torch.float32) for p in scaled_grad_params ]
+                #grad_params = [p * inv_scale for p in scaled_grad_params]
                 with torch.autocast(device_type='cuda', dtype=torch.float32):
                     #grad_norm = torch.tensor(0, device=grad_params[0].device, dtype=grad_params[0].dtype)
                     grad_norm = 0
@@ -313,8 +313,8 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
     modelstate = ModelState(seed=seed,
                             nu=nu,
                             ny=ny,
-                            #normalizer_input=normalizer_input,
-                            #normalizer_output=normalizer_output #
+                            normalizer_input=normalizer_input,
+                            normalizer_output=normalizer_output #
                            )
     modelstate.model.to(device)
 
@@ -364,7 +364,7 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
     for i, (u_test, y_test) in enumerate(loaders):
         # getting output distribution parameter only implemented for selected models
         u_test = u_test.to(device)
-
+        u_test[u_test != u_test] = 0 #change nan values to zero
         y_sample, y_sample_mu, y_sample_sigma = modelstate.model.generate(u_test)
 
         # convert to cpu and to numpy for evaluation
@@ -377,6 +377,7 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
 
     # get noisy test data for narendra_li
     yshape = y_test.shape
+    y_test = np.where(np.isnan(y_test), 0, y_test) #change nan values to zero
     y_test_noisy = y_test + np.sqrt(0.1) * np.random.randn(yshape[0], yshape[1], yshape[2])
 
 

@@ -94,27 +94,35 @@ def compute_rmse(y, yhat, doprint=False):
 # computes the marginal likelihood of all outputs
 def compute_marginalLikelihood(y, yhat_mu, yhat_sigma, doprint=True):
     # to torch
+    
     y = torch.tensor(y, dtype=torch.double)
+    
     yhat_mu = torch.tensor(yhat_mu, dtype=torch.double)
+    
     yhat_sigma = torch.tensor(yhat_sigma, dtype=torch.double)
 
     # number of batches
     num_batches = y.shape[0]
     num_points = np.prod(y.shape)
-    T = torch.max((yhat_mu[0,0,:]!=0).nonzero()).item()+1
-    # get predictive distribution
-    pred_dist = normal.Normal(yhat_mu[:,:,:T], yhat_sigma[:,:,:T])
+    #replace the nan values in the tensor to zero
+    yhat_mu[yhat_mu != yhat_mu] = 0
+    #find the end of episode
+    T = [torch.max((yhat_mu[i,0,:]!=0).nonzero()).item()+1 for i in range(yhat_mu.shape[0])]
+    marginalLikelihood = 0
+    for i in range(yhat_mu.shape[0]):
+        # get predictive distribution
+        pred_dist = normal.Normal(yhat_mu[:,:,:T[i]], yhat_sigma[:,:,:T[i]])
 
-    # get marginal likelihood
-    marg_likelihood = pred_dist.log_prob(y[:,:,:T]).sum()
-    # to numpy
-    marg_likelihood = marg_likelihood.numpy()
-
+        # get marginal likelihood
+        marg_likelihood = pred_dist.log_prob(y[:,:,:T[i]]).sum()
+        # to numpy
+        marg_likelihood = marg_likelihood.numpy()
+        marginalLikelihood += marg_likelihood
     # print output
     if doprint:
-        print('Marginal Likelihood / point = {:.3f}'.format(marg_likelihood))
+        print('Marginal Likelihood / point = {:.3f}'.format(marginalLikelihood))
 
-    return marg_likelihood
+    return marginalLikelihood
 
 # %% plots the resulting time sequence
 def plot_time_sequence_uncertainty(data_y_true, data_y_sample, label_y, options, path_general, file_name_general,
