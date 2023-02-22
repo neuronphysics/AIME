@@ -383,9 +383,9 @@ class VRNN_GMM(nn.Module):
                 assert torch.isfinite(loss_pred)
                 total_loss += - loss_pred + KLD + KLD_ATTN
         if self.self_attention_type is not "multihead":
-           return total_loss
+           return total_loss, h[-1]
         else:
-           return total_loss + attn_loss
+           return total_loss + attn_loss, h[-1]
 
     def reparametrization(self, mu, log_var):
 
@@ -473,7 +473,7 @@ class VRNN_GMM(nn.Module):
 
                 _, (h, c) = self._rnn(torch.unsqueeze(RNN_inputs, 1), (h,c))##(modified)
 
-        return sample, sample_mu, sample_sigma
+        return sample, sample_mu, sample_sigma, h[-1]
     
 
 
@@ -519,14 +519,14 @@ class DynamicModel(VRNN_GMM):
         if y is not None and self.normalizer_output is not None:
             y = self.normalizer_output.normalize(y)
 
-        loss =super(DynamicModel, self).forward(u, y)
-        return loss
+        loss, hidden = super(DynamicModel, self).forward(u, y)
+        return loss, hidden
 
     def generate(self, u, y=None):
         if self.normalizer_input is not None:
             u = self.normalizer_input.normalize(u)
 
-        y_sample, y_sample_mu, y_sample_sigma = super(DynamicModel, self).generate(u)
+        y_sample, y_sample_mu, y_sample_sigma, hidden = super(DynamicModel, self).generate(u)
 
         if self.normalizer_output is not None:
             y_sample = self.normalizer_output.unnormalize(y_sample)
@@ -535,7 +535,7 @@ class DynamicModel(VRNN_GMM):
         if self.normalizer_output is not None:
             y_sample_sigma = self.normalizer_output.unnormalize_sigma(y_sample_sigma)
 
-        return y_sample, y_sample_mu, y_sample_sigma
+        return y_sample, y_sample_mu, y_sample_sigma, hidden
 
 class ModelState:
     """

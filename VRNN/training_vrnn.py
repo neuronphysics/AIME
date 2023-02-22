@@ -89,7 +89,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 y = y.to(device)
                 # forward pass over model
                 with torch.no_grad():
-                     vloss_ = modelstate.model(u, y)
+                     vloss_, h = modelstate.model(u, y)
 
                 total_batches += u.size()[0]
                 total_points += np.prod(u.shape)
@@ -121,7 +121,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
             modelstate.optimizer.zero_grad()
             if torch.cuda.is_available():
                 with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
-                    loss_ = modelstate.model(u, y)
+                    loss_, h = modelstate.model(u, y)
                 
                 scaled_grad_params = torch.autograd.grad(outputs=scaler.scale(loss_),
                                                         inputs=modelstate.model.parameters(),
@@ -177,7 +177,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 """
             else:
                 # forward pass over model
-                loss_ = modelstate.model(u, y)
+                loss_, h = modelstate.model(u, y)
                 # NN optimization
                 loss_.backward()
                 ### GRADIENT CLIPPING
@@ -365,7 +365,7 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
         # getting output distribution parameter only implemented for selected models
         u_test = u_test.to(device)
         u_test[u_test != u_test] = 0 #change nan values to zero
-        y_sample, y_sample_mu, y_sample_sigma = modelstate.model.generate(u_test)
+        y_sample, y_sample_mu, y_sample_sigma, hidden = modelstate.model.generate(u_test)
 
         # convert to cpu and to numpy for evaluation
         # samples data
