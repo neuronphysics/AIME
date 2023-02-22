@@ -1288,7 +1288,7 @@ def train(epoch):
             loss_critic = (
                 -(torch.mean(critic_real) - torch.mean(critic_fake)) + hyperParams["LAMBDA_GP"] * gp
             )
-            discriminator.zero_grad()
+            dis_optim.zero_grad()
             loss_critic.backward(retain_graph=True)
             dis_optim.step()
         gen_fake = discriminator(z_fake).reshape(-1)
@@ -1296,8 +1296,8 @@ def train(epoch):
 
         loss_dict = net.get_ELBO(X)
         loss_dict["wasserstein_loss"] =  -torch.mean(gen_fake)
-        vae_encoder.zero_grad()
-        vae_decoder.zero_grad()
+        enc_optim.zero_grad()
+        dec_optim.zero_grad()
         
         loss_dict["WAE-GP"]=loss_dict["loss"]+loss_dict["wasserstein_loss"]
 
