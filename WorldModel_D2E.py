@@ -108,8 +108,8 @@ class WorldModel(nn.Module):
         self.criterion       = nn.MSELoss(reduction='sum')
         self.Max_Grad_Norm   = hyperParams["MAX_GRAD_NORM"]
         self._gamma          = hyperParams["GAMMA"]
-        self.reward_model    = RewardNetwork(self.state_dim + self.action_dim).to(device)
-        self.discount_model  = DiscountNetwork.create(self.state_dim + self.action_dim, hyperParams["PREDICT_DONE"], self._gamma).to(device)
+        self.reward_model    = RewardNetwork(self.state_dim ).to(device)
+        self.discount_model  = DiscountNetwork.create(self.state_dim , hyperParams["PREDICT_DONE"], self._gamma).to(device)
         modelstate =  ModelState(seed  = hyperParams["seed"],
                                  nu    = self.state_dim + self.action_dim,
                                  ny    = self.state_dim,
