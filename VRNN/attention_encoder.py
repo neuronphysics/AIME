@@ -1458,6 +1458,8 @@ class Attention(nn.Module):
         o = self._W(q, k, v, attention_mask )[0]
         return o.permute(1, 0, 2)
 
+
+    
 class LatentEncoder(nn.Module):
     def __init__(
         self,
@@ -1506,7 +1508,8 @@ class LatentEncoder(nn.Module):
             encoded, _ = self._encoder(encoder_input)
         else:
             encoded = self._encoder(encoder_input) 
-
+        #residual
+        residual = encoded.clone() ###???
         # Aggregator: take the mean over all points
         if self._self_attention_type is not "multihead":
            attention_output = self._self_attention(encoded, encoded, encoded)
@@ -1521,10 +1524,10 @@ class LatentEncoder(nn.Module):
         
         # Have further MLP layers that map to the parameters of the Gaussian latent
         mean_repr = torch.relu(self._penultimate_layer(mean_attention))
-
+        mean_representation =  mean_repr + residual ###????
         # Then apply further linear layers to output latent mu and log sigma
-        mean    =  self._mean(mean_repr)
-        logvar  =  nn.Softplus()(self._log_var(mean_repr))
+        mean    =  self._mean(mean_representation)
+        logvar  =  nn.Softplus()(self._log_var(mean_representation))
 
         if self._self_attention_type is not "multihead":
            return mean, logvar

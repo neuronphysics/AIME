@@ -253,7 +253,7 @@ def plot_losscurve(df, options, path_general, file_name_general, removedata=True
 
     return df
 
-    def normalize_timeseries(timeseries):
+def normalize_timeseries(timeseries):
         #3D tensor of shape (n_samples, timesteps, n_features) use the following:
         (timeseries-timeseries.min(dim=2))/(timeseries.max(dim=2)-timeseries.min(dim=2))
         return timeseries
