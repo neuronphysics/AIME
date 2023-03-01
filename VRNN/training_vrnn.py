@@ -31,11 +31,11 @@ import torch.backends.cudnn as cudnn
 import torch.utils.data.distributed
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
+import random
 import argparse
 
 parser = argparse.ArgumentParser(description='the vrnn transition model (Chung et al. 2016) conditioned on the context, distributed data parallel ')
-parser.add_argument('--lr', default=0.001, help='')
+parser.add_argument('--lr', default=0.0002, help='')
 parser.add_argument('--batch_size', type=int, default=768, help='')
 parser.add_argument('--max_epochs', type=int, default=4, help='')
 parser.add_argument('--num_workers', type=int, default=0, help='')
@@ -88,8 +88,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 u = u.to(device)
                 y = y.to(device)
                 # forward pass over model
-                with torch.no_grad():
-                     vloss_, h = modelstate.model(u, y)
+                vloss_, d_loss, hidden, real_feature, fake_feature = modelstate.model(u, y)
 
                 total_batches += u.size()[0]
                 total_points += np.prod(u.shape)
@@ -113,18 +112,19 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
         for i, (u, y) in enumerate(loader_train):
             batch_size=u.shape[0]
             start = time.time()
-            u = u.cuda()#torch.Size([B, D_in, T])
-            y = y.cuda()
+            u = u.to(device)#torch.Size([B, D_in, T])
+            y = y.to(device)
 
             # set the optimizer
                         # set the optimizer
             modelstate.optimizer.zero_grad()
+            modelstate.model.optimizer_discriminator.zero_grad()
             if torch.cuda.is_available():
                 with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
-                    loss_, h = modelstate.model(u, y)
-                
-                scaled_grad_params = torch.autograd.grad(outputs=scaler.scale(loss_),
-                                                        inputs=modelstate.model.parameters(),
+                     loss_, disc_loss, hidden, real, fake = modelstate.model(u, y)
+
+                scaled_grad_params = torch.autograd.grad(outputs = scaler.scale(loss_),
+                                                        inputs   = modelstate.model._params,
                                                         create_graph=True,
                                                         retain_graph=True,
                                                         allow_unused=True #Whether to allow differentiation of unused parameters.
@@ -148,11 +148,10 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                     # Compute the L2 Norm as penalty and add that to loss
                     loss_ = loss_ + grad_norm
 
-
                 # Scales the loss, and calls backward()
                 # to create scaled gradients
-                assert not torch.isnan(loss_)
-                scaler.scale(loss_).backward(retain_graph=True, inputs=list(modelstate.model.parameters()))
+                assert not torch.isnan(loss_)                
+                scaler.scale(loss_).backward(retain_graph=True, inputs=list( modelstate.model._params))
 
                 torch.nn.utils.clip_grad_norm_(modelstate.model.parameters(),  max_norm=train_options['clip'], error_if_nonfinite =False)
                 # Unscales gradients and calls
@@ -160,13 +159,18 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
 
                 average_gradients(modelstate.model)
                 scaler.step(modelstate.optimizer)
-
                 # Updates the scale for next iteration
                 scaler.update()
                 batch_time = time.time() - start
 
                 elapse_time = time.time() - epoch_start
                 elapse_time = datetime.timedelta(seconds=elapse_time)
+
+                with torch.backends.cudnn.flags(enabled=False):
+                     gradient_penalty = modelstate.model.wgan_gp_reg(real, fake)
+                discriminator_loss = disc_loss + gradient_penalty
+                discriminator_loss.backward()
+                modelstate.model.optimizer_discriminator.step()
                 print("From Rank: {}, Epoch: {}, Training time {}".format(dist.get_rank(), epoch, elapse_time))
 
                 """
@@ -177,27 +181,29 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 """
             else:
                 # forward pass over model
-                loss_, h = modelstate.model(u, y)
+                loss_, disc_loss, hidden, real, fake = modelstate.model(u, y)
                 # NN optimization
                 loss_.backward()
+                gradient_penalty = modelstate.model.wgan_gp_reg(real, fake)
+                discriminator_loss = disc_loss+ gradient_penalty
+                discriminator_loss.backward()
+
                 ### GRADIENT CLIPPING
                 #
                 torch.nn.utils.clip_grad_norm_(modelstate.model.parameters(), train_options['clip'])
-
+                modelstate.model.optimizer_discriminator.step()
                 modelstate.optimizer.step()
-
 
             total_batches += u.size()[0]
             total_points += np.prod(u.shape)
-            total_loss += loss_.item()
+            total_loss += loss_.item() + discriminator_loss.item()
 
             # output to console
             if i % train_options['print_every'] == 0:
                 print(
-                    'Train Epoch: [{:5d}/{:5d}], Batch [{:6d}/{:6d} ({:3.0f}%)]\tLearning rate: {:.2e}\tLoss: {:.3f}'.format(
+                    'Train Epoch: [{:5d}/{:5d}], Batch [{:6d}/{:6d} ({:3.0f}%)]\tLearning rate: {:.2e}\tTotal Loss: {:.3f}\t Discriminator Loss: {:.4f}'.format(
                         epoch, train_options['n_epochs'], (i + 1), len(loader_train),
-                        100. * (i + 1) / len(loader_train), lr, total_loss / total_points))  # total_batches
-                writer.add_scalar('data/total_loss', total_loss / total_points, i + epoch*len(loader_train))
+                        100. * (i + 1) / len(loader_train), lr, total_loss / total_points, discriminator_loss.item()))  # total_batches
         
         return total_loss / total_points
 
@@ -220,8 +226,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
         best_epoch = 0
         process_desc = "Train-loss: {:2.3e}; Valid-loss: {:2.3e}; LR: {:2.3e}"
         progress_bar = tqdm(initial=0, leave=True, total=train_options['n_epochs'], desc=process_desc.format(0, 0, 0), position=0, disable=dist.get_rank()!=0)
-        
-        
+                
         for epoch in range(0, train_options['n_epochs'] + 1):
             print('\n[%d]Epoch: %d' % (train_rank, epoch))
             train_sampler.set_epoch(epoch)
@@ -299,7 +304,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
 
     return dataframe
 
-def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general, batch_size, test_rank, **kwargs):
+def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name_general, batch_size, test_rank, **kwargs):
     # switch to cpu computations for testing
     # options['device'] = 'cpu'
 
@@ -310,9 +315,11 @@ def run_test(seed, nu, ny, loaders, df, device, path_general, file_name_general,
 
 
     # Define model
+
     modelstate = ModelState(seed=seed,
                             nu=nu,
                             ny=ny,
+                            sequence_length=seq_len,
                             normalizer_input=normalizer_input,
                             normalizer_output=normalizer_output #
                            )
@@ -525,7 +532,7 @@ def main():
 
     def seed_worker(worker_id):
         worker_seed = torch.initial_seed() % 2**32
-        numpy.random.seed(worker_seed)
+        np.random.seed(worker_seed)
         random.seed(worker_seed)
 
     g = torch.Generator()
@@ -540,6 +547,7 @@ def main():
 
     u_dim = variable_episodes.shape[-1]
     y_dim = final_next_state.shape[-1]
+    seq_len = variable_episodes.shape[1]
 
 
     batch_size = args.batch_size
@@ -569,9 +577,11 @@ def main():
     normalizer_input, normalizer_output = compute_normalizer(train_loader)
 
     # Define model
+    
     modelstate = ModelState(seed=seed,
                             nu=u_dim,
                             ny=y_dim,
+                            sequence_length = seq_len,
                             normalizer_input=normalizer_input,
                             normalizer_output=normalizer_output
                             )
@@ -597,16 +607,17 @@ def main():
                    batch_size=args.batch_size
                    )
     
-    df = run_test(seed=seed,
-                  nu=u_dim, 
-                  ny=y_dim,
-                  loaders=test_loader, 
+    df = run_test(seed = seed,
+                  nu   = u_dim, 
+                  ny   = y_dim,
+                  seq_len = seq_len, 
+                  loaders = test_loader, 
                   df = df,
-                  device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
-                  path_general= path_general, 
-                  file_name_general=file_name_general, 
-                  batch_size=args.batch_size,
-                  test_rank=rank)
+                  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
+                  path_general = path_general, 
+                  file_name_general = file_name_general, 
+                  batch_size = args.batch_size,
+                  test_rank = rank)
     
     df = pd.DataFrame(df)
     # save data

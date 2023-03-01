@@ -23,6 +23,7 @@ pip install --upgrade pip
 pip install dill --no-index
 pip install einops --no-index
 pip install torch-optimizer --no-index
+#pip install git+https://github.com/torchgan/torchgan.git
 #pip install git+https://github.com/WarrenWeckesser/wavio.git
 pip install git+https://github.com/cooper-org/cooper.git
 #pip install git+https://github.com/facebookresearch/fairseq.git
@@ -38,6 +39,6 @@ export MASTER_ADDR=$(hostname) #Store the master node’s IP address in the MAST
 echo "r$SLURM_NODEID master: $MASTER_ADDR"
 echo "r$SLURM_NODEID Launching python script"
 
-srun python training_vrnn.py  --init_method tcp://$MASTER_ADDR:3456 --world_size $SLURM_NTASKS  --batch_size 40 --max_epochs 700
+srun python training_vrnn.py  --init_method tcp://$MASTER_ADDR:3456 --world_size $SLURM_NTASKS  --batch_size 40 --max_epochs 750
 
 #python main.py --id cheetah-run-seed-1 --seed 1 --env cheetah-run --use-regular-vae
