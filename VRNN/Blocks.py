@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import numpy as np
 def init_weights(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')

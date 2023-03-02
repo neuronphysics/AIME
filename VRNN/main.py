@@ -17,7 +17,7 @@ from vrnn_utilities import _strip_prefix_if_present
 parent_dir=os.path.abspath(os.path.join(os.getcwd(), '..'))
 # passing the file name and path as argument
 sys.path.append(parent_dir)
-import RCGAN.RGANDiscriminator as RGANDiscriminator
+from RCGAN import RGANDiscriminator 
 
 #based on https://github.com/JasonZHM/magic-microlensing/blob/bb9dd7df3144f55eeffcf497ae9f4b9b968a2a79/model/mdn_full.py
 class NormalNetwork(nn.Module):
@@ -97,6 +97,7 @@ class VRNN_GMM(nn.Module):
                  num_layer_discriminator=3,
                  disc_lr=0.0005,
                  beta1=0.5,
+                 weight_decay =0.01
                  ):
         super(VRNN_GMM, self).__init__()
         
@@ -269,7 +270,7 @@ class VRNN_GMM(nn.Module):
                                                hidden_size = self.h_dim,
                                                num_layers = num_layer_discriminator
                                                )
-        self.optimizer_discriminator = optim.AdamW(self.discriminator.parameters(), lr=disc_lr, betas=(beta1, 0.999))
+        self.optimizer_discriminator = torch.optim.AdamW(self.discriminator.parameters(), lr=disc_lr, betas=(beta1, 0.999), weight_decay= weight_decay)
         if self._MaskedNorm:
             self._params = list(itertools.chain(*[self.norm_u.parameters(),
                                                  self.norm_y.parameters(),
