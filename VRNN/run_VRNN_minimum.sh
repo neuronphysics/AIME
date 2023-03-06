@@ -1,11 +1,11 @@
 #!/bin/bash
 #
-#SBATCH --nodes=6
+#SBATCH --nodes=7
 #SBATCH --gres=gpu:v100:4 # Request 4 GPU "generic resources”.
 #SBATCH --ntasks-per-node=4 # Request 1 process per GPU. You will get 1 CPU per process by default. Request more CPUs with the "cpus-per-task" parameter to enable multiple data-loader workers to load data in parallel.
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --time=01-15:59
+#SBATCH --time=01-19:59
 #SBATCH --account=def-jhoey
 #SBATCH --output=/home/memole/TEST/AIME/Hopper-transit-run-seed-1_%N-%j.out
 #SBATCH --error=/home/memole/TEST/AIME/Hopper-transit-run-seed-1_%N-%j.err
@@ -26,6 +26,7 @@ pip install torch-optimizer --no-index
 #pip install git+https://github.com/torchgan/torchgan.git
 #pip install git+https://github.com/WarrenWeckesser/wavio.git
 pip install git+https://github.com/cooper-org/cooper.git
+#pip install git+https://github.com/AdamCobb/hamiltorch.git
 #pip install git+https://github.com/facebookresearch/fairseq.git
 pip install --no-index wandb
 #pip install torch-geometric

@@ -8,18 +8,56 @@ import torch.nn.init as init
 import torch_optimizer
 import os
 import sys
+import itertools
 from MaskedNorm import MaskedNorm
 from CustomLSTM import LSTMCore
 from attention_encoder import LatentEncoder
 from Blocks import init_weights
 from vrnn_utilities import _strip_prefix_if_present
-      
+import hamiltorch
+
 parent_dir=os.path.abspath(os.path.join(os.getcwd(), '..'))
 # passing the file name and path as argument
 sys.path.append(parent_dir)
 from RCGAN import RGANDiscriminator 
+#https://github.com/alafage/deep-traffic-generation/blob/9585e86dfd7644dc194dcd1fe304486aa02d4381/deep_traffic_generation/core/lsr.py
+class CustomMSF(MixtureSameFamily):
+    """MixtureSameFamily with `rsample()` method for reparametrization.
+    Args:
+        mixture_distribution (Categorical): Manages the probability of
+            selecting component. The number of categories must match the
+            rightmost batch dimension of the component_distribution.
+        component_distribution (Distribution): Define the distribution law
+            followed by the components. Right-most batch dimension indexes
+            component.
+    """
 
-#based on https://github.com/JasonZHM/magic-microlensing/blob/bb9dd7df3144f55eeffcf497ae9f4b9b968a2a79/model/mdn_full.py
+    def rsample(self, sample_shape=torch.Size()):
+        """Generates a sample_shape shaped reparameterized sample or
+        sample_shape shaped batch of reparameterized samples if the
+        distribution parameters are batched.
+        Method:
+            - Apply `Gumbel Sotmax
+              <https://pytorch.org/docs/stable/generated/torch.nn.functional.gumbel_softmax.html>`_
+              on component weights to get a one-hot tensor;
+            - Sample using rsample() from the component distribution;
+            - Use the one-hot tensor to select samples.
+        .. note::
+            The component distribution of the mixture should implements a
+            rsample() method.
+        .. warning::
+            Further studies should be made on this method. It is highly
+            possible that this method is not correct.
+        """
+        assert (
+            self.component_distribution.has_rsample
+        ), "component_distribution attribute should implement rsample() method"
+
+        weights = self.mixture_distribution._param
+        comp = nn.functional.gumbel_softmax(weights, hard=True).unsqueeze(-1)
+        samples = self.component_distribution.rsample(sample_shape)
+        return (comp * samples).sum(dim=1)
+
 class NormalNetwork(nn.Module):
     def __init__(self, in_dim, out_dim, n_components, full_cov=True):
         super().__init__()
@@ -95,9 +133,6 @@ class VRNN_GMM(nn.Module):
                  bias=False,
                  self_attention_type="multihead",
                  num_layer_discriminator=3,
-                 disc_lr=0.0005,
-                 beta1=0.5,
-                 weight_decay =0.01
                  ):
         super(VRNN_GMM, self).__init__()
         
@@ -212,6 +247,7 @@ class VRNN_GMM(nn.Module):
 
         #-----------------------------------------
         # prior function (phi_prior) -> Prior
+
         layers_prior = [nn.Linear(self.h_dim, self.h_dim)]
         if self.batch_norm:
             layers_prior.append(torch.nn.BatchNorm1d(self.h_dim))
@@ -224,11 +260,14 @@ class VRNN_GMM(nn.Module):
         #init_weights(self.prior[0])
 
         # prior mean
+
         self.prior_mean = nn.Linear(self.h_dim, self.z_dim)
         #init_weights(self.prior_mean)
 
         # prior logvar
         self.prior_logvar = nn.Linear(self.h_dim, self.z_dim)
+        #init_weights(self.prior_logvar)
+
         #init_weights(self.prior_logvar)
 
         #-----------------------------------------
@@ -270,38 +309,9 @@ class VRNN_GMM(nn.Module):
                                                hidden_size = self.h_dim,
                                                num_layers = num_layer_discriminator
                                                )
-        self.optimizer_discriminator = torch.optim.AdamW(self.discriminator.parameters(), lr=disc_lr, betas=(beta1, 0.999), weight_decay= weight_decay)
-        if self._MaskedNorm:
-            self._params = list(itertools.chain(*[self.norm_u.parameters(),
-                                                 self.norm_y.parameters(),
-                                                 self._latent_encoder.parameters(),
-                                                 self.phi_y.parameters(),
-                                                 self.phi_u.parameters(),
-                                                 self.phi_z.parameters(),
-                                                 self.enc.parameters(),
-                                                 self.enc_logvar.parameters(),
-                                                 self.enc_mean.parameters(),
-                                                 self.prior.parameters(),
-                                                 self.prior_mean.parameters(),
-                                                 self.prior_logvar.parameters(),
-                                                 self.decoder.parameters(),
-                                                 self._rnn.parameters()]))
-       
-        else:
-
-            self._params = list(itertools.chain(*[self._latent_encoder.parameters(),
-                                                 self.phi_y.parameters(),
-                                                 self.phi_u.parameters(),
-                                                 self.phi_z.parameters(),
-                                                 self.enc.parameters(),
-                                                 self.enc_logvar.parameters(),
-                                                 self.enc_mean.parameters(),
-                                                 self.prior.parameters(),
-                                                 self.prior_mean.parameters(),
-                                                 self.prior_logvar.parameters(),
-                                                 self.decoder.parameters(),
-                                                 self._rnn.parameters()]))
+        
         #self.apply(self.weight_init)
+
     def wgan_gp_reg(self, x_real, x_fake, center=1., lambda_gp=10.0):
 
         batch_size, T, D = x_real.shape
@@ -388,10 +398,10 @@ class VRNN_GMM(nn.Module):
                 encoder_input = torch.cat([phi_u_t, phi_y_t, h[-1]], dim=1)
                 encoder_input = self.enc(encoder_input)
 
-                enc_mean_t   = torch.clamp(self.enc_mean(encoder_input), *self.output_clamp)
-                enc_logvar_t = self.enc_logvar(encoder_input)
-                enc_logvar_t = torch.clamp(nn.Softplus()(enc_logvar_t), *self.output_clamp)
-
+                enc_mean_t     = torch.clamp(self.enc_mean(encoder_input), *self.output_clamp)
+                enc_logvar_t   = self.enc_logvar(encoder_input)
+                enc_logvar_t   = torch.clamp(nn.Softplus()(enc_logvar_t), *self.output_clamp)
+                posterior_dist = Independent(Normal(enc_mean_t, enc_logvar_t.exp().sqrt()), 1)
                 # prior: h_t -> z_t (for KLD loss)
                 prior_input  = h[-1]
                 prior_input  = self.prior(prior_input)
@@ -399,7 +409,7 @@ class VRNN_GMM(nn.Module):
                 prior_mean_t   = self.prior_mean(prior_input)
                 prior_logvar_t = self.prior_logvar(prior_input)
                 prior_logvar_t = nn.Softplus()(prior_logvar_t)
-
+                
                 # sampling and reparameterization: get a new z_t
                 #temp = tdist.Normal(enc_mean_t, enc_logvar_t.exp().sqrt())
                 #z_t = tdist.Normal.rsample(temp)
@@ -436,6 +446,7 @@ class VRNN_GMM(nn.Module):
 
                 # computing the loss
                 KLD = self.kld_gauss(enc_mean_t, enc_logvar_t, prior_mean_t, prior_logvar_t)
+                
                 assert not torch.isnan(KLD)
                 KLD_ATTN = self.kld_attention(c_t_mu, c_t_logvar) ##(new)
                 assert not torch.isnan(KLD_ATTN)
@@ -445,6 +456,7 @@ class VRNN_GMM(nn.Module):
                 loss_pred = log_p.mean()
                 assert not torch.isnan(loss_pred)
                 assert torch.isfinite(loss_pred)
+                
                 total_loss += - loss_pred + KLD + KLD_ATTN
                 deterministic_hidden_state.append(h[-1])
 
@@ -538,6 +550,7 @@ class VRNN_GMM(nn.Module):
                 # sampling and reparameterization: get new z_t
                 #temp = tdist.Normal(prior_mean_t, prior_logvar_t.exp().sqrt())
                 #z_t = tdist.Normal.rsample(temp)
+                
                 z_t = self.reparametrization(prior_mean_t, prior_logvar_t)
                 # feature extraction: z_t
                 phi_z_t = self.phi_z(z_t)
@@ -550,7 +563,7 @@ class VRNN_GMM(nn.Module):
 
                 decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)##(modified)
 
-                gmm, sample[:, :, t] = self._decode(decoder_input)
+                 sample[:, :, t], gmm = self._decode(decoder_input)
 
                 sample_mu[:, :, t]    = gmm.mean
                 sample_sigma[:, :, t] = gmm.variance**0.5
@@ -577,9 +590,16 @@ class VRNN_GMM(nn.Module):
         term1 = logvar_p - logvar_q - 1
         term2 = (torch.exp(logvar_q) + (mu_q - mu_p) ** 2) / torch.exp(logvar_p)
         kld = 0.5 * torch.sum(term1 + term2)
-
-
         return kld
+
+    @staticmethod
+    def kl_Normal_MixtureSameFamily(p: MixtureSameFamily, q: Normal):
+        NUM_of_MC_SAMPLES = 10
+        samples = q.sample(sample_shape=(NUM_of_MC_SAMPLES,))
+        px = p.log_prob(samples)
+        qx = q.log_prob(samples)
+        return torch.mean(qx-px)  
+
     @staticmethod
     def kld_attention(mu_attn, logvar_attn):
         kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar_attn - mu_attn ** 2 - logvar_attn.exp(), dim = 1), dim = 0)
@@ -657,19 +677,20 @@ class ModelState:
 
         self.model = DynamicModel( num_inputs=nu, num_outputs=ny, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers, n_mixtures=n_mixtures, sequence_length=sequence_length, device=device, **kwargs)
         if optimizer_type == "AdaBelief":
-            self.optimizer = torch_optimizer.AdaBelief(self.model._params,
+            self.optimizer = torch_optimizer.AdaBelief(self.model.parameters(),
                                                        lr= 1e-4,
                                                       betas=(0.9, 0.999),
                                                       eps=1e-6,
                                                       weight_decay=0
                                                       )
         elif optimizer_type=="AdamW":
-            self.optimizer = torch.optim.AdamW(self.model._params,
+            self.optimizer = torch.optim.AdamW(self.model.parameters(),
                                                lr= 1e-4,
-                                               betas=(0.9, 0.999)
+                                               betas=(0.9, 0.999),
+                                               weight_decay=0.001
                                               )
         elif optimizer_type=="SGD":
-            self.optimizer  = torch_optimizer.SGDW(self.model._params,
+            self.optimizer  = torch_optimizer.SGDW(self.model.parameters(),
                                                    lr= 1e-4,
                                                    momentum=0,
                                                    dampening=0,
@@ -677,7 +698,7 @@ class ModelState:
                                                    nesterov=False,
                                                    )
         elif optimizer_type=="MADGRAD":
-            self.optimizer = torch_optimizer.MADGRAD(self.model._params,
+            self.optimizer = torch_optimizer.MADGRAD(self.model.parameters(),
                                                      lr=3e-4,
                                                      momentum=0.0,
                                                      weight_decay=0,
@@ -685,7 +706,7 @@ class ModelState:
                                                     )
         else:
             # Optimization parameters
-            yogi = torch_optimizer.Yogi(self.model._params, 
+            yogi = torch_optimizer.Yogi(self.model.parameters(), 
                                         lr= 0.5e-4,
                                         betas=(0.5, 0.999), 
                                         eps=1e-3, 
