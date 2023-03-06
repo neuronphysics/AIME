@@ -118,13 +118,17 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
             # set the optimizer
                         # set the optimizer
             modelstate.optimizer.zero_grad()
-            modelstate.model.optimizer_discriminator.zero_grad()
+            
             if torch.cuda.is_available():
                 with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
                      loss_, disc_loss, hidden, real, fake = modelstate.model(u, y)
-
+                
+                with torch.backends.cudnn.flags(enabled=False):
+                     gradient_penalty = modelstate.model.module.wgan_gp_reg(real, fake)
+                discriminator_loss = disc_loss + gradient_penalty
+                loss_ += discriminator_loss
                 scaled_grad_params = torch.autograd.grad(outputs = scaler.scale(loss_),
-                                                        inputs   = modelstate.model._params,
+                                                        inputs   = modelstate.model.parameters(),
                                                         create_graph=True,
                                                         retain_graph=True,
                                                         allow_unused=True #Whether to allow differentiation of unused parameters.
@@ -151,7 +155,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 # Scales the loss, and calls backward()
                 # to create scaled gradients
                 assert not torch.isnan(loss_)                
-                scaler.scale(loss_).backward(retain_graph=True, inputs=list( modelstate.model._params))
+                scaler.scale(loss_).backward(retain_graph=True, inputs=list( modelstate.model.parameters()))
 
                 torch.nn.utils.clip_grad_norm_(modelstate.model.parameters(),  max_norm=train_options['clip'], error_if_nonfinite =False)
                 # Unscales gradients and calls
@@ -166,11 +170,8 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 elapse_time = time.time() - epoch_start
                 elapse_time = datetime.timedelta(seconds=elapse_time)
 
-                with torch.backends.cudnn.flags(enabled=False):
-                     gradient_penalty = modelstate.model.wgan_gp_reg(real, fake)
-                discriminator_loss = disc_loss + gradient_penalty
-                discriminator_loss.backward()
-                modelstate.model.optimizer_discriminator.step()
+                
+
                 print("From Rank: {}, Epoch: {}, Training time {}".format(dist.get_rank(), epoch, elapse_time))
 
                 """
@@ -182,21 +183,24 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
             else:
                 # forward pass over model
                 loss_, disc_loss, hidden, real, fake = modelstate.model(u, y)
+                
+                with torch.backends.cudnn.flags(enabled=False):
+                     gradient_penalty = modelstate.model.module.wgan_gp_reg(real, fake)
+                discriminator_loss = disc_loss+ gradient_penalty
+                loss_ += discriminator_loss
                 # NN optimization
                 loss_.backward()
-                gradient_penalty = modelstate.model.wgan_gp_reg(real, fake)
-                discriminator_loss = disc_loss+ gradient_penalty
-                discriminator_loss.backward()
+                
 
                 ### GRADIENT CLIPPING
                 #
                 torch.nn.utils.clip_grad_norm_(modelstate.model.parameters(), train_options['clip'])
-                modelstate.model.optimizer_discriminator.step()
+                
                 modelstate.optimizer.step()
 
             total_batches += u.size()[0]
             total_points += np.prod(u.shape)
-            total_loss += loss_.item() + discriminator_loss.item()
+            total_loss += loss_.item() 
 
             # output to console
             if i % train_options['print_every'] == 0:
