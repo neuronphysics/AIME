@@ -111,8 +111,8 @@ def compute_marginalLikelihood(y, yhat_mu, yhat_sigma, doprint=True):
     marginalLikelihood = 0
     for i in range(yhat_mu.shape[0]):
         # get predictive distribution
-        pred_dist = normal.Normal(yhat_mu[:,:,:T[i]], yhat_sigma[:,:,:T[i]])
-
+        pred_dist = normal.Normal(yhat_mu[:,:,:T[i]], toorch.abs(yhat_sigma[:,:,:T[i]]))
+        
         # get marginal likelihood
         marg_likelihood = pred_dist.log_prob(y[:,:,:T[i]]).sum()
         # to numpy
