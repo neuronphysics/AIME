@@ -301,8 +301,8 @@ class VRNN_GMM(nn.Module):
                               hidden_size = self.h_dim, 
                               num_layers = self.n_layers,  
                               batch_first = True, 
-                              train_truncate= 75, 
-                              train_burn_in = 50)
+                              train_truncate = 100, 
+                              train_burn_in  = 80)
         
         self.discriminator = RGANDiscriminator(sequence_length = self.sequence_length,
                                                input_size =  2 * self.h_dim + self.u_dim + self.y_dim,
@@ -563,7 +563,7 @@ class VRNN_GMM(nn.Module):
 
                 decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)##(modified)
 
-                 sample[:, :, t], gmm = self._decode(decoder_input)
+                sample[:, :, t], gmm = self._decode(decoder_input)
 
                 sample_mu[:, :, t]    = gmm.mean
                 sample_sigma[:, :, t] = gmm.variance**0.5
@@ -660,8 +660,8 @@ class ModelState:
                  nu,
                  ny,
                  sequence_length,
-                 h_dim=80,
-                 z_dim=80,
+                 h_dim=75,
+                 z_dim=100,
                  n_layers=2,
                  n_mixtures=8,
                  device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
