@@ -62,7 +62,7 @@ class LSTMBlock(jit.ScriptModule):
         layers.append(nn.Linear(hidden_dims[-1], out_dim))
         self.model = nn.Sequential(*layers)
 
-     @jit.script_method
+    @jit.script_method
     def forward(self, x):
         # (Batch, D, seq_len)
         length =  [torch.max((x[i,0,:]!=0).nonzero()).item()+1 for i in range(x.shape[0])]
@@ -102,7 +102,7 @@ class DiscountNetwork(LSTMBlock):
             return StubDiscountNetwork(gamma)
 
 
-class StubDiscountNetwork(nn.Module):
+class StubDiscountNetwork(jit.ScriptModule):
     def __init__(self, gamma):
         super(StubDiscountNetwork, self).__init__()
         self.gamma = gamma
@@ -112,7 +112,8 @@ class StubDiscountNetwork(nn.Module):
     def to(self, device):
         self.device = device
         return super().to(device)
-     @jit.script_method
+        
+    @jit.script_method
     def predict_logit(self, x: torch.Tensor)-> torch.Tensor:
         return torch.ones(x.shape[:-1], device=self.device) * self.scale
 
@@ -203,6 +204,7 @@ class WorldModel(jit.ScriptModule):
                                                     lr    = 0.5 * self._params.LEARNING_RATE,
                                                     betas = (0.5, 0.9))
         self.disc_scheduler = torch.optim.lr_scheduler.StepLR(self.discriminator_optim, step_size = 30, gamma = 0.5)
+    
     @torch.jit.script_method
     def optimize(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, reward: torch.Tensor, discount: torch.Tensor) -> torch.Tensor:
         self.discriminator.train()
