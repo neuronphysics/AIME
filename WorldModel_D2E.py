@@ -6,8 +6,11 @@ from torch import nn, optim, jit
 from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
 import torchvision.transforms as T
 from VRNN.main import ModelState
+from VRNN.Normalization import compute_normalizer
 from collections import namedtuple
 import gym
+from torch.utils.data import Dataset, TensorDataset
+from torch.utils.data import DataLoader
 import mujoco_py
 from tensorboardX import SummaryWriter
 import torch.backends.cudnn as cudnn
@@ -18,7 +21,7 @@ from planner_D2E_regularizer import D2EAgent as agent
 from tqdm import tqdm
 import logging
 import cv2
-
+#https://github.com/google-research/planet/blob/master/planet/scripts/create_video.py
 def write_video(frames, title, path=''):
     frames = np.multiply(np.stack(frames, axis=0).transpose(0, 2, 3, 1), 255).clip(0, 255).astype(np.uint8)[:, :, :,
              ::-1]  # VideoWrite expects H x W x C in BGR
@@ -112,7 +115,7 @@ class StubDiscountNetwork(jit.ScriptModule):
     def to(self, device):
         self.device = device
         return super().to(device)
-        
+
     @jit.script_method
     def predict_logit(self, x: torch.Tensor)-> torch.Tensor:
         return torch.ones(x.shape[:-1], device=self.device) * self.scale
@@ -145,6 +148,12 @@ class WorldModel(jit.ScriptModule):
     def __init__(self, hyperParams, sequence_length, env_name='Hopper-v2', device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), log_dir="logs"):
         super(WorldModel, self).__init__()
         env = gym.make(env_name)
+        self.model_path = os.path.abspath(os.getcwd()) + '/model'
+        try:
+           os.makedirs(self.model_path, exist_ok=True) 
+           print("Directory '%s' created successfully" %self.model_path)
+        except OSError as error:
+           print("Directory '%s' can not be created")
         self._params = namedtuple('x', hyperParams.keys())(*hyperParams.values())
         self.n_discriminator_iter = self._params.CRITIC_ITERATIONS
 
@@ -177,9 +186,9 @@ class WorldModel(jit.ScriptModule):
                                                      nchannel   = self._params.n_channel,
                                                      z_dim      = self.state_dim,
                                                      w_dim      = self._params.latent_w,
-                                                     hidden_dim =self._params.hidden_d,
+                                                     hidden_dim = self._params.hidden_d,
                                                      device     = self.device,
-                                                     img_width  =self._params.image_width,
+                                                     img_width  = self._params.image_width,
                                                      batch_size = self._params.batch_size,
                                                      num_layers = 4,
                                                      include_elbo2=True)
@@ -209,6 +218,7 @@ class WorldModel(jit.ScriptModule):
     def optimize(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, reward: torch.Tensor, discount: torch.Tensor) -> torch.Tensor:
         self.discriminator.train()
         pbar = tqdm(range(self.n_discriminator_iter))
+        BS = obs.size(0) #batch size
         for _ in pbar:
             z_real, z_x_mean, z_x_sigma, c_posterior, w_x_mean, w_x_sigma, gmm_dist, z_wc_mean_prior, z_wc_logvar_prior, x_reconstructed = self.variational_autoencoder(obs)
             z_fake = gmm_dist.sample()
@@ -221,7 +231,7 @@ class WorldModel(jit.ScriptModule):
             )
             self.discriminator_optim.zero_grad()
             loss_critic.backward(retain_graph=True)
-            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self._params.MAX_GRAD_NORM)
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self._params.MAX_GRAD_NORM, norm_type=2)
             self.discriminator_optim.step()
             
         gen_fake  = self.discriminator(z_fake).reshape(-1)
@@ -230,39 +240,46 @@ class WorldModel(jit.ScriptModule):
         self.optimizer.zero_grad()
         w_x, w_x_mean, w_x_sigma, z_next, z_next_mean, z_next_sigma, c_posterior = self.variational_autoencoder.GMM_encoder(next_obs)
         inputs = torch.cat([z_real, action], dim=1)
-
-        transition_loss, transition_disc_loss, hidden, real , fake = self.transition_model(inputs, z_next)
+        #Prepare & normalize the input/output data for the transition model
+        train_dataset = TensorDataset(inputs, z_next)
+        data_loader = DataLoader(train_dataset, batch_size=BS , shuffle=False)
+        normalizer_input, normalizer_output = compute_normalizer(data_loader)
+        self.transition_model.normalizer_input  = normalizer_input
+        self.transition_model.normalizer_output = normalizer_output
+        u, y = next(iter(data_loader))
+        transition_loss, transition_disc_loss, hidden, real , fake = self.transition_model(u, y)
         transition_gradient_penalty = self.transition_model.wgan_gp_reg(real, fake)
         
         predicted_reward = self.reward_model(inputs) #reward
-        loss_dict, z_posterior, z_posterior_mean, z_posterior_sigma, c_posterior, w_posterior_mean, w_posterior_sigma, dist, z_prior_mean, z_prior_logvar, X_reconst = self.variational_autoencoder.get_ELBO(X)
-        loss_dict["wasserstein_gp_loss"] = -torch.mean(gen_fake)
-        loss_dict["total_observe_loss"] = loss_dict["loss"]+loss_dict["wasserstein_gp_loss"]
-        loss_dict["transition_total_loss"] = transition_loss+ transition_disc_loss + transition_gradient_penalty
-        loss_dict["reward_loss"] = self.criterion(reward, predicted_reward)
+        self.metrics, z_posterior, z_posterior_mean, z_posterior_sigma, c_posterior, w_posterior_mean, w_posterior_sigma, dist, z_prior_mean, z_prior_logvar, X_reconst = self.variational_autoencoder.get_ELBO(X)
+        self.metrics["wasserstein_gp_loss"] = -torch.mean(gen_fake)
+        self.metrics["total_observe_loss"] = self.metrics["loss"] + self.metrics["wasserstein_gp_loss"]
+        self.metrics["transition_total_loss"] = transition_loss+ transition_disc_loss + transition_gradient_penalty
+        self.metrics["reward_loss"] = self.criterion(reward, predicted_reward)
         discount_loss = torch.tensor(0.)
         #computing discount factor
         if self.PREDICT_DONE:
             predicted_discount_logit = self.discount_model.predict_logit(inputs)
             discount_loss = F.binary_cross_entropy_with_logits(predicted_discount_logit, discount * self._gamma)
-        loss_dict["discount_loss"] = discount_loss
-        loss_dict["total_model_loss"] = loss_dict["total_observe_loss"]+loss_dict["transition_total_loss"]+loss_dict["reward_loss"]+loss_dict["discount_loss"]
-        loss_dict["total_model_loss"].backward(retain_graph=True)
-        nn.utils.clip_grad_norm_(self.parameters,self._params.MAX_GRAD_NORM)
+        self.metrics["discount_loss"] = discount_loss
+        self.metrics["total_model_loss"] = self.metrics["total_observe_loss"]+self.metrics["transition_total_loss"]+self.metrics["reward_loss"]+self.metrics["discount_loss"]
+        self.metrics["total_model_loss"].backward(retain_graph=True)
+        nn.utils.clip_grad_norm_(self.parameters, self._params.MAX_GRAD_NORM, norm_type=2)
         self.optimizer.step()
         
-        self.writer.add_scalar('model_loss', {'observation loss': loss_dict["total_observe_loss"].item(),
-                                         'transition loss': loss_dict["transition_total_loss"].item(),
-                                         'reward loss': loss_dict["reward_loss"].item(),
-                                         'discount loss': loss_dict["discount_loss"].item(),
-                                         'total loss': loss_dict["total_model_loss"].item()})
+        self.writer.add_scalar('model_loss', {'observation loss': self.metrics["total_observe_loss"].item(),
+                                         'transition loss': self.metrics["transition_total_loss"].item(),
+                                         'reward loss': self.metrics["reward_loss"].item(),
+                                         'discount loss': self.metrics["discount_loss"].item(),
+                                         'total loss': self.metrics["total_model_loss"].item()})
 
         return hidden
 
 
     def imagine(self, agent, state, horizon):
+        tqdm.write("Collect data from imagination:")
         state_list, reward_list, discount_list, action_list = [state], [], [], []
-        for _ in range(horizon):
+        for _ in tqdm(range(horizon)):
             _, action, _ = agent._p_fn(state.to(device=self.device))
             features = torch.cat([torch.stack(state_list)[:-1], torch.stack(action_list)], dim=1)
             sample, sample_mu, sample_sigma, state = self.transition_model.generate(features)
@@ -278,3 +295,24 @@ class WorldModel(jit.ScriptModule):
         reward = torch.stack(reward_list)
         discount = torch.stack(discount_list)
         return state, action, reward, discount
+
+    def load_checkpoints(self):
+        self.metrics = torch.load(self.model_path+'/metrics.pth')
+        model_path = self.model_path+'/best_model'
+        os.makedirs(model_path, exist_ok=True) 
+        files = os.listdir(model_path)
+        if files:
+            checkpoint = [f for f in files if os.path.isfile(os.path.join(model_path, f))]
+            model_dicts = torch.load(os.path.join(model_path, checkpoint[0]),map_location=self.device)
+            self.transition_model.load_state_dict(model_dicts['transition_model'])
+            self.variational_autoencoder.load_state_dict(model_dicts['observation_model'])
+            self.discriminator.load_state_dict(model_dicts['observation_discriminator_model'])
+            self.reward_model.load_state_dict(model_dicts['reward_model'])
+            self.discount_model.load_state_dict(model_dicts['discount_model'])
+            self.encoder.load_state_dict(model_dicts['encoder'])
+            self.decoder.load_state_dict(model_dicts['decoder'])
+            self.optimizer.load_state_dict(model_dicts['optimizer'])  
+            self.discriminator_optim.load_state_dict(model_dicts['discriminator_optimizer'])
+            print("Loading models checkpoints!")
+        else:
+            print("Checkpoints not found!")
