@@ -7,6 +7,7 @@ from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient
 import torchvision.transforms as T
 from VRNN.main import ModelState
 from VRNN.Normalization import compute_normalizer
+from VRNN.Blocks import init_weights
 from collections import namedtuple
 import gym
 from torch.utils.data import Dataset, TensorDataset
@@ -52,6 +53,129 @@ class Logger(logging.Logger):
         self.addHandler(handler)
 
 #inspired by https://github.com/mahkons/Dreamer/blob/003c3cc7a9430e9fa0d8af9cead88d8f4b06e0f4/dreamer/WorldModel.py
+class StandardScaler(object):
+
+    def __init__(self, device):
+        self.input_mu = torch.zeros(1).to(device)
+        self.input_std = torch.ones(1).to(device)
+        self.target_mu = torch.zeros(1).to(device)
+        self.target_std = torch.ones(1).to(device)
+        self.device = device
+
+    def fit(self, inputs, targets, scale_dim=0):
+        """
+        Runs two ops, one for assigning the mean of the data to the internal mean, and
+        another for assigning the standard deviation of the data to the internal standard deviation.
+        This function must be called within a 'with <session>.as_default()' block.
+        Parameters
+        ----------
+        inputs : torch.Tensor
+            A torch Tensor containing the input
+        targets : torch.Tensor
+            A torch Tensor containing the input
+        """
+        self.input_mu = torch.mean(inputs, dim=scale_dim, keepdims=True).to(self.device)
+        self.input_std = torch.std(inputs, dim=scale_dim, keepdims=True).to(self.device)
+        self.input_std[self.input_std < 1e-8] = 1.0
+        self.target_mu = torch.mean(targets, dim=scale_dim, keepdims=True).to(self.device)
+        self.target_std = torch.std(targets, dim=scale_dim, keepdims=True).to(self.device)
+        self.target_std[self.target_std < 1e-8] = 1.0
+
+    def transform(self, inputs, targets=None):
+        """
+        Transforms the input matrix data using the parameters of this scaler.
+        Parameters
+        ----------
+        inputs : torch.Tensor
+            A torch Tensor containing the points to be transformed.
+        targets : torch.Tensor
+            A torch Tensor containing the points to be transformed.
+        Returns
+        -------
+        norm_inputs : torch.Tensor
+            Normalized inputs
+        norm_targets : torch.Tensor
+            Normalized targets
+        """
+        norm_inputs = (inputs - self.input_mu) / self.input_std
+        norm_targets = None
+        if targets is not None:
+            norm_targets = (targets - self.target_mu) / self.target_std
+        return norm_inputs, norm_targets
+
+    def inverse_transform(self, targets):
+        """
+        Undoes the transformation performed by this scaler.
+        Parameters
+        ----------
+        targets : torch.Tensor
+            A torch Tensor containing the points to be transformed.
+        Returns
+        -------
+        output : torch.Tensor
+            The transformed dataset.
+        """
+        output = self.target_std * targets + self.target_mu
+        return output
+
+class Scale(nn.Module):
+    """
+    Maps inputs from [space.low, space.high] range to [-1, 1] range.
+    Parameters
+    ----------
+    space : gym.Space
+        Space to map from.
+    Attributes
+    ----------
+    low : torch.tensor
+        Lower bound for unscaled Space.
+    high : torch.tensor
+        Upper bound for unscaled Space.
+    """
+    def __init__(self, space):
+        super(Scale, self).__init__()
+        self.register_buffer("low", torch.from_numpy(space.low))
+        self.register_buffer("high", torch.from_numpy(space.high))
+
+    def forward(self, x):
+        """
+        Maps x from [space.low, space.high] to [-1, 1].
+        Parameters
+        ----------
+        x : torch.tensor
+            Input to be scaled
+        """
+        return 2.0 * ((x - self.low) / (self.high - self.low)) - 1.0
+
+
+class Unscale(nn.Module):
+    """
+    Maps inputs from [-1, 1] range to [space.low, space.high] range.
+    Parameters
+    ----------
+    space : gym.Space
+        Space to map from.
+    Attributes
+    ----------
+    low : torch.tensor
+        Lower bound for unscaled Space.
+    high : torch.tensor
+        Upper bound for unscaled Space.
+    """
+    def __init__(self, space):
+        super(Unscale, self).__init__()
+        self.register_buffer("low", torch.from_numpy(space.low))
+        self.register_buffer("high", torch.from_numpy(space.high))
+
+    def forward(self, x):
+        """
+        Maps x from [-1, 1] to [space.low, space.high].
+        Parameters
+        ----------
+        x : torch.tensor
+            Input to be unscaled
+        """
+        return self.low + (0.5 * (x + 1.0) * (self.high - self.low))
 
 
 class LSTMBlock(jit.ScriptModule):
@@ -64,9 +188,12 @@ class LSTMBlock(jit.ScriptModule):
             for ind, outd in zip(hidden_dims, hidden_dims[1:])], [])
         layers.append(nn.Linear(hidden_dims[-1], out_dim))
         self.model = nn.Sequential(*layers)
+        self.model.apply(init_weights)
 
     @jit.script_method
     def forward(self, x):
+
+
         # (Batch, D, seq_len)
         length =  [torch.max((x[i,0,:]!=0).nonzero()).item()+1 for i in range(x.shape[0])]
         packed = nn.utils.rnn.pack_padded_sequence(
@@ -179,7 +306,7 @@ class WorldModel(jit.ScriptModule):
                                  device          = device,
                                  optimizer_type  = self._params.VRNN_Optimizer_Type,
                                 )
-
+        self.standard_scaler = StandardScaler(self.device)
         self.transition_model = modelstate.model
         self.variational_autoencoder = InfGaussMMVAE(hyperParams,
                                                      K          = self._params.K,
@@ -239,6 +366,7 @@ class WorldModel(jit.ScriptModule):
         self.transition_model.train()
         self.optimizer.zero_grad()
         w_x, w_x_mean, w_x_sigma, z_next, z_next_mean, z_next_sigma, c_posterior = self.variational_autoencoder.GMM_encoder(next_obs)
+        ###
         inputs = torch.cat([z_real, action], dim=1)
         #Prepare & normalize the input/output data for the transition model
         train_dataset = TensorDataset(inputs, z_next)
@@ -249,8 +377,12 @@ class WorldModel(jit.ScriptModule):
         u, y = next(iter(data_loader))
         transition_loss, transition_disc_loss, hidden, real , fake = self.transition_model(u, y)
         transition_gradient_penalty = self.transition_model.wgan_gp_reg(real, fake)
-        
-        predicted_reward = self.reward_model(inputs) #reward
+        #reward prediction normalize --> predict -->unnormalize
+        self.standard_scaler.fit(inputs, reward, scale_dim=1) #what is the dimension of data? (Batch, D, seq_len)
+        norm_inputs, _ = self.standard_scaler.transform(inputs)
+        norm_predictions = self.reward_model(norm_inputs)
+        predicted_reward = self.standard_scaler.inverse_transform(norm_predictions)
+
         self.metrics, z_posterior, z_posterior_mean, z_posterior_sigma, c_posterior, w_posterior_mean, w_posterior_sigma, dist, z_prior_mean, z_prior_logvar, X_reconst = self.variational_autoencoder.get_ELBO(X)
         self.metrics["wasserstein_gp_loss"] = -torch.mean(gen_fake)
         self.metrics["total_observe_loss"] = self.metrics["loss"] + self.metrics["wasserstein_gp_loss"]
