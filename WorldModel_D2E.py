@@ -22,6 +22,55 @@ from planner_D2E_regularizer import D2EAgent as agent
 from tqdm import tqdm
 import logging
 import cv2
+###############################################################################
+########### prepare data for transition model by padding episodes #############
+def make_episodes(states, actions, next_states, dones):
+    pairs, inputs, score, targets =[], [], [], []
+    for i in range(len(dones)):
+        if dones[i]==False:            
+           pairs.append(torch.cat([states[i], actions[i]]))
+           score.append(next_states[i])
+        else:
+           pairs.append(torch.cat([states[i], actions[i]]))
+           score.append(next_states[i])
+           inputs.append(pairs)
+           pairs=[]
+           targets.append(score)
+           score=[]
+    return inputs, targets
+
+def pad(episodes, repeat=True):
+    """Pads episodes to all be the same length by repeating the last exp.
+    Args:
+        episodes (list[list[Experience]]): episodes to pad.
+    Returns:
+        padded_episodes (list[list[Experience]]): now of shape
+            (batch_size, max_len)
+        mask (torch.BoolTensor): of shape (batch_size, max_len) with value 0 for
+            padded experiences.
+    """
+    max_len = max(len(episode) for episode in episodes)
+    
+    mask = torch.zeros((len(episodes), max_len), dtype=torch.bool)
+    padded_episodes = []
+    for i, episode in enumerate(episodes):
+        if repeat:
+           padded = episode + [episode[-1]] * (max_len - len(episode))
+        else:
+           padded = episode + [torch.zeros_like(episode[-1])] * (max_len - len(episode))
+        padded_episodes.append(padded)
+        mask[i, :len(episode)] = True
+    return padded_episodes, mask
+
+def preprocess_transition_data(s1, a1, s2, done):
+    inputs, outputs = make_episodes(s1, a1, s2, done)
+    padded_trajectories_inputs, mask_input = pad(inputs, repeat=False)
+    padded_trajectories_outputs, mask_output = pad(outputs, repeat=False)
+    final_inputs  = torch.stack([ torch.stack([padded_trajectories_inputs[i][j] for j in range(mask_input.shape[1])], dim=0) for i in range(mask_input.shape[0])], dim=0)#(batch_size , max_len, state_dim)
+    final_outputs = torch.stack([ torch.stack([padded_trajectories_outputs[i][j] for j in range(mask_output.shape[1])], dim=0) for i in range(mask_output.shape[0])], dim=0)#(batch_size , max_len, state_dim)
+    #shape of outputs: (B , max_seq_len, D)
+    return final_inputs, final_outputs
+###############################################################################
 #https://github.com/google-research/planet/blob/master/planet/scripts/create_video.py
 def write_video(frames, title, path=''):
     frames = np.multiply(np.stack(frames, axis=0).transpose(0, 2, 3, 1), 255).clip(0, 255).astype(np.uint8)[:, :, :,
@@ -342,7 +391,7 @@ class WorldModel(jit.ScriptModule):
         self.disc_scheduler = torch.optim.lr_scheduler.StepLR(self.discriminator_optim, step_size = 30, gamma = 0.5)
     
     @torch.jit.script_method
-    def optimize(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, reward: torch.Tensor, discount: torch.Tensor) -> torch.Tensor:
+    def optimize(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, reward: torch.Tensor, discount: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
         self.discriminator.train()
         pbar = tqdm(range(self.n_discriminator_iter))
         BS = obs.size(0) #batch size
@@ -367,9 +416,9 @@ class WorldModel(jit.ScriptModule):
         self.optimizer.zero_grad()
         w_x, w_x_mean, w_x_sigma, z_next, z_next_mean, z_next_sigma, c_posterior = self.variational_autoencoder.GMM_encoder(next_obs)
         ###
-        inputs = torch.cat([z_real, action], dim=1)
         #Prepare & normalize the input/output data for the transition model
-        train_dataset = TensorDataset(inputs, z_next)
+        inputs, outputs = preprocess_transition_data(z_real, action, z_next, done)
+        train_dataset = TensorDataset(inputs,outputs)
         data_loader = DataLoader(train_dataset, batch_size=BS , shuffle=False)
         normalizer_input, normalizer_output = compute_normalizer(data_loader)
         self.transition_model.normalizer_input  = normalizer_input
