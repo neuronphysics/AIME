@@ -9,6 +9,7 @@ from VRNN.main import ModelState
 from VRNN.Normalization import compute_normalizer
 from VRNN.Blocks import init_weights
 from collections import namedtuple
+from typing import Iterables
 import gym
 from torch.utils.data import Dataset, TensorDataset
 from torch.utils.data import DataLoader
@@ -22,6 +23,28 @@ from planner_D2E_regularizer import D2EAgent as agent
 from tqdm import tqdm
 import logging
 import cv2
+class FreezeParameters:
+    def __init__(self, modules: Iterable[nn.Module]):
+        """
+        Context manager to locally freeze gradients.
+        In some cases with can speed up computation because gradients aren't calculated for these listed modules.
+        example:
+        ```
+        with FreezeParameters([module]):
+            output_tensor = module(input_tensor)
+        ```
+        :param modules: iterable of modules. used to call .parameters() to freeze gradients.
+        """
+        self.modules = modules
+        self.param_states = [p.requires_grad for p in get_parameters(self.modules)]
+
+    def __enter__(self):
+        for param in get_parameters(self.modules):
+            param.requires_grad = False
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for i, param in enumerate(get_parameters(self.modules)):
+            param.requires_grad = self.param_states[i]
 ###############################################################################
 ########### prepare data for transition model by padding episodes #############
 def make_episodes(states, actions, next_states, dones):
@@ -321,7 +344,7 @@ hyperParams = {"batch_size": 40,
                 }
 
 class WorldModel(jit.ScriptModule):
-    def __init__(self, hyperParams, sequence_length, env_name='Hopper-v2', device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), log_dir="logs"):
+    def __init__(self, hyperParams, sequence_length, env_name='Hopper-v2', device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), log_dir="logs", restore=False):
         super(WorldModel, self).__init__()
         env = gym.make(env_name)
         self.model_path = os.path.abspath(os.getcwd()) + '/model'
@@ -337,11 +360,13 @@ class WorldModel(jit.ScriptModule):
         self.action_dim      = env.action_space.shape[0]
 
         self.device          = device
- 
+        
         self.criterion       = nn.MSELoss(reduction='sum')
 
         self.reward_model    = RewardNetwork( self.state_dim + self.action_dim).to(self.device)
         self.discount_model  = DiscountNetwork.create(self.state_dim + self.action_dim, self._params.PREDICT_DONE, self._params.GAMMA).to(device)
+        self.ckpt_path       = self.model_path+'/best_model'
+        os.makedirs(self.ckpt_path, exist_ok=True) 
         self.logger = Logger(self.__class__.__name__)
 
         modelstate =  ModelState(seed            = self._params.seed,
@@ -389,7 +414,9 @@ class WorldModel(jit.ScriptModule):
                                                     lr    = 0.5 * self._params.LEARNING_RATE,
                                                     betas = (0.5, 0.9))
         self.disc_scheduler = torch.optim.lr_scheduler.StepLR(self.discriminator_optim, step_size = 30, gamma = 0.5)
-    
+        if restore:
+            self.load_checkpoints()
+            
     @torch.jit.script_method
     def optimize(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, reward: torch.Tensor, discount: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
         self.discriminator.train()
@@ -477,22 +504,33 @@ class WorldModel(jit.ScriptModule):
         discount = torch.stack(discount_list)
         return state, action, reward, discount
 
+    def save(self):
+        self.save_path=os.path.join(self.ckpt_path, 'WorldModel.pth')
+        torch.save(
+            {'transition_model' : self.transition_model.state_dict(),
+             'reward_model': self.reward_model.state_dict(),
+             'observation_model': self.variational_autoencoder.state_dict(),
+             'observation_discriminator_model': self.discriminator.state_dict(),
+             'discount_model': self.discount_model.state_dict(),
+             'encoder_model': self.encoder.state_dict(),
+             'decoder_model': self.decoder.state_dict(),
+             'discriminator_optimizer': self.discriminator_optim.state_dict(),
+             'world_model_optimizer': self.optimizer.state_dict(),}, self.save_path)
+
     def load_checkpoints(self):
         self.metrics = torch.load(self.model_path+'/metrics.pth')
-        model_path = self.model_path+'/best_model'
-        os.makedirs(model_path, exist_ok=True) 
-        files = os.listdir(model_path)
-        if files:
-            checkpoint = [f for f in files if os.path.isfile(os.path.join(model_path, f))]
-            model_dicts = torch.load(os.path.join(model_path, checkpoint[0]),map_location=self.device)
+
+        if os.path.isfile(self.save_path):
+            
+            model_dicts = torch.load(self.save_path, map_location=self.device)
             self.transition_model.load_state_dict(model_dicts['transition_model'])
             self.variational_autoencoder.load_state_dict(model_dicts['observation_model'])
             self.discriminator.load_state_dict(model_dicts['observation_discriminator_model'])
             self.reward_model.load_state_dict(model_dicts['reward_model'])
             self.discount_model.load_state_dict(model_dicts['discount_model'])
-            self.encoder.load_state_dict(model_dicts['encoder'])
-            self.decoder.load_state_dict(model_dicts['decoder'])
-            self.optimizer.load_state_dict(model_dicts['optimizer'])  
+            self.encoder.load_state_dict(model_dicts['encoder_model'])
+            self.decoder.load_state_dict(model_dicts['decoder_model'])
+            self.optimizer.load_state_dict(model_dicts['world_model_optimizer'])  
             self.discriminator_optim.load_state_dict(model_dicts['discriminator_optimizer'])
             print("Loading models checkpoints!")
         else:
