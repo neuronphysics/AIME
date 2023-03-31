@@ -863,13 +863,12 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
         BetaSample.__init__(self)
 
         self.priors          = {"alpha": hyperParams['prior_alpha'], "beta": hyperParams['prior_beta']}
-        self.K               = hyperParams['K']
-        self.z_dim           = hyperParams['latent_d']
-        self.hidden_dim      = hyperParams['hidden_d']
+        self.K               = K
+        self.z_dim           = z_dim
+        self.hidden_dim      = hidden_dim
         self.img_size        = img_width
         self.include_elbo2   = include_elbo2
         self.to(device=self.device)
-        self.dummy_param = nn.Parameter(torch.empty(0))
         self.use_mse_loss = use_mse_loss
 
     # def __len__(self):
@@ -878,12 +877,10 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
 
     def forward(self, X):
         # init variational params
-        # device = self.dummy_param.device
-        # print(f"device in the InfGaussMMVAE class is {device}")
 
         w_x, w_x_mean, w_x_sigma, z_x, z_x_mean, z_x_sigma, c_posterior = self.GMM_encoder(X)
         gmm, z_wc_mean_prior, z_wc_logvar_prior = self.GMM_prior(w_x, c_posterior)
-        prior_z = gmm.sample()
+        #prior_z = gmm.sample()
         x_reconstructed = self.GMM_decoder(z_x)
         self.prior_nu = self.gamma_sample(self.gamma_alpha, self.gamma_beta)
         #print(f"size of alpha (variable of beta distribution): {self.prior_nu.size()}")
@@ -929,8 +926,6 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
         #print(f'size of pi {self.pi_samples.size()}')
 
         return  self.pi_samples
-
-
 
     def DiscreteKL(self, P,Q, epsilon=1e-8):
 
@@ -1093,8 +1088,6 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
         log_w_post      = log_normal_pdf(w_x, w_post_mean, w_post_sigma)
         return ll + log_beta_prior + log_gauss_prior +log_w_prior +log_gamma_prior - log_kumar_post - log_gauss_post - log_w_post- log_gamma_post
 
-
-    #TODO??
     @torch.no_grad()
     def get_component_samples(self, batchSize, z_prior_mean, z_prior_logvar):
         # get the components of the latent space
@@ -1119,8 +1112,6 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
         #p(c^{(i)}=j)=w_j
         #p(z^{(i)}|theta)=sum_{j=1}^{k} p(c^{(i)}=j) p(z^{(i)}|c^{(i)}=j;theta)
         # sample a component index
-
-
         component = torch.argmax( self.pi_samples  , 1).to(device=self.device, dtype=torch.int64)
         #print(f'size of each latent component: {self.z_sample_list[0].size()}')
 
@@ -1149,9 +1140,6 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
         #self.concatenated_latent_space = rearrange(self.concatenated_latent_space, 'd0 d1 d2 -> d1 (d0 d2)')
         #out = self.concatenated_latent_space.permute(1,0)
         return torch.squeeze(torch.mean(self.concatenated_latent_space, 2, True))
-
-
-
 
 
 ### Marginal Likelihood Calculation
