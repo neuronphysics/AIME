@@ -134,7 +134,8 @@ class VRNN_GMM(nn.Module):
                  self_attention_type="multihead",
                  num_layer_discriminator=3,
                  learn_init_state=True,
-                 bidirectional=False
+                 bidirectional=False,
+                 dropout=0.1,
                  ):
         super(VRNN_GMM, self).__init__()
         
@@ -164,7 +165,7 @@ class VRNN_GMM(nn.Module):
                                              self_attention_type = self_attention_type,
                                              n_encoder_layers = n_layers,
                                              batchnorm = False,
-                                             dropout  = 0.1,
+                                             dropout  = dropout,
                                              attention_dropout = 0,
                                              attention_layers  = 2,
                                              use_lstm = True
