@@ -133,6 +133,8 @@ class VRNN_GMM(nn.Module):
                  bias=False,
                  self_attention_type="multihead",
                  num_layer_discriminator=3,
+                 learn_init_state=True,
+                 bidirectional=False
                  ):
         super(VRNN_GMM, self).__init__()
         
@@ -147,7 +149,9 @@ class VRNN_GMM(nn.Module):
         self._MaskedNorm = masked_norm
         self.sequence_length = sequence_length
         self.num_layer_dis   = num_layer_discriminator
-        
+        self._learn_init_state = learn_init_state
+        self.is_bidirectional = bidirectional
+        self.num_directions = 2 if self.is_bidirectional else 1
         ##====(new)====##
         if self._MaskedNorm:
             self.norm_u = MaskedNorm(u_dim)
@@ -160,7 +164,7 @@ class VRNN_GMM(nn.Module):
                                              self_attention_type = self_attention_type,
                                              n_encoder_layers = n_layers,
                                              batchnorm = False,
-                                             dropout  = 0,
+                                             dropout  = 0.1,
                                              attention_dropout = 0,
                                              attention_layers  = 2,
                                              use_lstm = True
@@ -169,6 +173,10 @@ class VRNN_GMM(nn.Module):
         self._eps = 1e-5
         self._max_deviation = 2.0
         self.self_attention_type= self_attention_type
+        if dropout > 0.0:
+            self.input_drop = nn.Dropout(p=dropout)
+        else:
+            self.input_drop = nn.Identity()
         ###=============###
         # feature-extracting transformations (phi_y, phi_u and phi_z)
 
@@ -309,7 +317,10 @@ class VRNN_GMM(nn.Module):
                                                hidden_size = self.h_dim,
                                                num_layers = num_layer_discriminator
                                                )
-        
+        if self._learn_init_state:
+            self.to_init_state_h = nn.Linear(u_dim, self.h_dim * self.n_layers * self.num_directions)
+            self.to_init_state_c = nn.Linear(u_dim, self.h_dim * self.n_layers * self.num_directions)
+        self.to(self.device)
         #self.apply(self.weight_init)
 
     def wgan_gp_reg(self, x_real, x_fake, center=1., lambda_gp=10.0):
@@ -338,7 +349,27 @@ class VRNN_GMM(nn.Module):
         gradient_penalty = (((gradients + 1e-16).norm(2, dim=1) - center) ** 2).mean() * lambda_gp
 
         return gradient_penalty
+
+    def initialize_state_vectors(self, batch_size, first_obs=None):
+        """
+        incorporating tips from here to improve the performance of the model
+        https://danijar.com/tips-for-training-recurrent-neural-networks/
+        """
+
+        if self.learn_init_state:
+            c0 = self.to_init_state_c(first_obs[:, 0:1]).squeeze()
+            c0 = c0.reshape(-1, self.n_layers, self.h_dim).transpose(0, 1)
+            h0 = self.to_init_state_h(first_obs[:, 0:1]).squeeze()
+            h0 = h0.reshape(-1, self.n_layers, self.h_dim).transpose(0, 1)
+        elif self.zero_init:
+            h_0 = torch.nn.Parameter(torch.zeros(self.n_layers, batch_size, self.h_dim).to(self.device), requires_grad=True)
+            c_0 = torch.nn.Parameter(torch.zeros(self.n_layers, batch_size, self.h_dim).to(self.device), requires_grad=True)
+        else:
+            h_0 = torch.nn.Parameter(torch.rand(self.n_layers, batch_size, self.h_dim).to(self.device), requires_grad=True)
+            c_0 = torch.nn.Parameter(torch.rand(self.n_layers, batch_size, self.h_dim).to(self.device), requires_grad=True)
         
+        return (h_0, c_0)
+
     def forward(self, u, y):
         deterministic_hidden_state=[]
         batch_size = y.size(0)
@@ -384,8 +415,9 @@ class VRNN_GMM(nn.Module):
         # allocation
         total_loss = 0
         # initialization
-        h = torch.autograd.Variable(torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device), requires_grad=True)
-        c = torch.autograd.Variable(torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device), requires_grad=True)
+        input_ = self.input_drop(u[:, :, 0])
+        h, c   = self.initialize_state_vectors(batch_size, first_obs=input_)
+        
         # for all time steps
         for i in range(len(seq_len)):
             for t in range(seq_len[i]):
@@ -531,8 +563,9 @@ class VRNN_GMM(nn.Module):
         sample_mu = torch.zeros(batch_size, self.y_dim, T, device=self.device)
         sample_sigma = torch.zeros(batch_size, self.y_dim, T, device=self.device)
 
-        h = torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device)
-        c = torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device)
+        ## use the learned initial state based on the first frame.
+        input_ = self.input_drop(u[:, :, 0])
+        h, c   = self.initialize_state_vectors(batch_size, first_obs=input_)
         # for all time steps
         for i in range(len(seq_len)):
             for t in range(seq_len[i]):
@@ -660,7 +693,7 @@ class ModelState:
                  nu,
                  ny,
                  sequence_length,
-                 h_dim=75,
+                 h_dim=80,
                  z_dim=100,
                  n_layers=2,
                  n_mixtures=8,

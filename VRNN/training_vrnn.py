@@ -398,7 +398,7 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
     data_y_sample = [y_sample_mu, y_sample_sigma]
     label_y = ['true, $\mu\pm3\sigma$', 'sample, $\mu\pm3\sigma$']
 
-    temp = 200
+    temp = 250
 
     plot_time_sequence_uncertainty(data_y_true,
                                    data_y_sample,
