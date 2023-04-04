@@ -153,6 +153,7 @@ class VRNN_GMM(nn.Module):
         self._learn_init_state = learn_init_state
         self.is_bidirectional = bidirectional
         self.num_directions = 2 if self.is_bidirectional else 1
+        self.zero_init = False if self._learn_init_state else True
         ##====(new)====##
         if self._MaskedNorm:
             self.norm_u = MaskedNorm(u_dim)
