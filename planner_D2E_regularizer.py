@@ -808,6 +808,35 @@ class MaxQSoftPolicy(nn.Module):
     action = utils.gather_nd(actions, gather_indices)
     return action
 
+class GaussianEpsilonGreedySoftPolicy(nn.Module):
+  """Switches between Gaussian-perturbed and uniform random action."""
+
+  def __init__(self, a_network, std=0.1, clip_eps=1e-3, eps=0.1):
+    super(GaussianEpsilonGreedySoftPolicy, self).__init__()
+    self._a_network = a_network
+    self._std = std
+    self._clip_eps = clip_eps
+    self._eps = eps
+    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    self.to(device)
+
+  def __call__(self, state):
+    action = self._a_network(state.to(device=self.device))[1]
+    noise = torch.normal(mean=0, std=self._std, size=action.shape).to(device=self.device)
+    action = action + noise
+    spec = self._a_network.action_spec
+    action = torch.clamp(action, spec.minimum + self._clip_eps,
+                              spec.maximum - self._clip_eps)
+
+    rand_action = tensor_spec.sample_bounded_spec(
+        self._a_network.action_spec, outer_dims=[state.shape[0]])
+    low, high = 0,1 #range of uniform distribution
+
+    seed = torch.distributions.uniform.Uniform(low,high).sample([state.shape[0]]) 
+    is_random = seed < self._eps
+    action = torch.where(is_random, rand_action, action)
+    return action, state
+    
 #############################################
 ################ D2E Agent ################## 
 #############################################
