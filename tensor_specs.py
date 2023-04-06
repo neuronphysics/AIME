@@ -185,7 +185,10 @@ class TensorSpec(object):
         if outer_dims is not None:
             shape = tuple(outer_dims) + shape
         return torch.randn(*shape, dtype=self._dtype)
-    
+
+def where(cond, x_1, x_2):
+    return (cond * x_1) + ((1-cond) * x_2)
+
 def _random_uniform_int(shape, outer_dims, minval, maxval, dtype, seed=None):
   """Iterates over n-d tensor minval, maxval limits to sample uniformly."""
   # maxval in BoundedTensorSpec is bound inclusive.
@@ -196,6 +199,8 @@ def _random_uniform_int(shape, outer_dims, minval, maxval, dtype, seed=None):
   minval = torch.broadcast_to(minval, maxval.shape).to(dtype)
 
   sampling_maxval = maxval
+  if dtype in (torch.int8, torch.int32, torch.int16, torch.int64):
+     sampling_maxval = where(maxval< torch.iinfo(dtype).max, maxval + 1, maxval)
 
   if not torch.all(shape[-len(minval.shape):] == minval.shape):
     raise ValueError(
@@ -221,7 +226,7 @@ def _random_uniform_int(shape, outer_dims, minval, maxval, dtype, seed=None):
       torch.manual_seed(seed) 
   for (single_min, single_max) in zip(minval.flat, sampling_maxval.flat):
     samples.append(torch.tensor(sample_shape,dtype=dtype).uniform_(single_min, single_max))
-  samples = torch.stack(samples, axis=-1)
+  samples = torch.stack(samples, dim=-1)
   samples = torch.reshape(samples, full_shape)
   return samples
 
@@ -248,7 +253,12 @@ def sample_bounded_spec(spec, seed=None, outer_dims=None):
 #   print(dtype)
   is_uint8 = dtype == torch.uint8
   sampling_dtype = torch.int32 if is_uint8 else dtype
-
+  
+  if dtype in [torch.float64, torch.float32]:
+    # Avoid under/over-flow as random_uniform can't sample over the full range
+    # for these types.
+    minval = torch.maximum(torch.tensor(torch.finfo(dtype).min / 8), torch.tensor(minval))
+    maxval = torch.minimum(torch.tensor(torch.finfo(dtype).max / 8), torch.tensor(maxval))
 
   if outer_dims is None:
     outer_dims = torch.tensor([], dtype=torch.int32)
@@ -279,28 +289,18 @@ def sample_bounded_spec(spec, seed=None, outer_dims=None):
     # tf.random_uniform is upper bound exclusive, +1 to fix the sampling
     # behavior.
     # However +1 will cause overflow, in such cases we use the original maxval.
-    """
-    shape = torch.as_tensor(spec.shape, dtype=torch.int32)
-    full_shape = torch.cat((outer_dims, shape), dim=1)
-    g = torch.Generator()
-    if not seed is None:
-      g.manual_seed(seed)
-    else:
-      g.manual_seed(0) 
     
-    res=torch.tensor(full_shape,dtype=sampling_dtype).uniform_(float(minval), float(maxval))
-    """
+    if sampling_dtype in (torch.int8, torch.int32, torch.int16, torch.int64):
+       if maxval < torch.iinfo(sampling_dtype).max:
+          maxval = maxval + 1
     shape = torch.as_tensor(spec.shape, dtype=torch.int32)
-    g = torch.Generator()
-    if not seed is None:
-      g.manual_seed(seed)
+    full_shape = torch.cat((outer_dims, shape), dim=0)
+    if seed==None:
+      torch.manual_seed(0)
     else:
-      g.manual_seed(0) 
-    
-    dist = torch.distributions.uniform.Uniform(float(minval), float(maxval))
-    res=dist.sample(shape).to(dtype=sampling_dtype)
-
-    if is_uint8:
+      torch.manual_seed(seed) 
+    res = torch.empty(torch.Size(full_shape.tolist())).uniform_(minval,maxval).type(sampling_dtype)
+  if is_uint8:
      res =torch.tensor(res, dtype=dtype)
 
   return res
