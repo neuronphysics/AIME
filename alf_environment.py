@@ -21,7 +21,7 @@ import abc
 import six
 import torch
 from data_structures import time_step_spec, StepType, _is_numpy_array
-from tensor_specs import TensorSpec
+from tensor_specs import TensorSpec, BoundedTensorSpec
 
 ###
 @six.add_metaclass(abc.ABCMeta)
@@ -336,6 +336,65 @@ class AlfEnvironmentBaseWrapper(AlfEnvironment):
     def wrapped_env(self):
         return self._env
 
+class FrameStackWrapper(AlfEnvironmentBaseWrapper):
+    #https://github.com/medric49/imitation-from-observation/blob/faae84a0bbc527eb428ac3c2be9aabb210e56367/dmc.py
+    def __init__(self, env, num_frames, pixels_key='pixels'):
+        self._env = env
+        self._num_frames = num_frames
+        self._frames = deque([], maxlen=num_frames)
+        self._pixels_key = pixels_key
+
+        wrapped_obs_spec = env.observation_spec()
+        assert pixels_key in wrapped_obs_spec
+
+        pixels_shape = wrapped_obs_spec[pixels_key].shape
+        # remove batch dim
+        if len(pixels_shape) == 4:
+            pixels_shape = pixels_shape[1:]
+
+        self._obs_spec = BoundedTensorSpec(shape=np.concatenate(
+            [[pixels_shape[2] * num_frames], pixels_shape[:2]], axis=0),
+            dtype=np.uint8,
+            minimum=0,
+            maximum=255,
+            name='observation')
+
+    def _transform_observation(self, time_step):
+        assert len(self._frames) == self._num_frames
+        obs = np.concatenate(list(self._frames), axis=0)
+        return time_step._replace(observation=obs)
+
+    def _extract_pixels(self, time_step):
+        pixels = time_step.observation[self._pixels_key]
+        # remove batch dim
+        if len(pixels.shape) == 4:
+            pixels = pixels[0]
+        return pixels.transpose(2, 0, 1).copy()
+
+    def reset(self):
+        time_step = self._env.reset()
+        pixels = self._extract_pixels(time_step)
+        for _ in range(self._num_frames):
+            self._frames.append(pixels)
+        return self._transform_observation(time_step)
+
+    def step(self, action):
+        time_step = self._env.step(action)
+        pixels = self._extract_pixels(time_step)
+        self._frames.append(pixels)
+        return self._transform_observation(time_step)
+
+    def observation_spec(self):
+        return self._obs_spec
+
+    def action_spec(self):
+        return self._env.action_spec()
+    
+    def done_spec(self):
+        return self._env.done_spec()    
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
 
 # Used in ALF
 #@alf.configurable
