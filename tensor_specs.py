@@ -17,9 +17,9 @@ class TensorSpec(object):
     construction and configuration.
     """
 
-    __slots__ = ["_shape", "_dtype"]
+    __slots__ = ["_shape", "_dtype", , "_name"]
 
-    def __init__(self, shape, dtype=torch.float32):
+    def __init__(self, shape, dtype=torch.float32, name: Optional[str] = None):
         """
         Args:
             shape (tuple[int]): The shape of the tensor.
@@ -32,6 +32,7 @@ class TensorSpec(object):
         else:
             assert isinstance(dtype, torch.dtype)
             self._dtype = dtype
+        self._name = name
 
     @classmethod
     def from_spec(cls, spec):
@@ -88,6 +89,11 @@ class TensorSpec(object):
         return self._dtype
 
     @property
+    def name(self):
+        """Returns the name of the Array."""
+        return self._name
+
+    @property
     def is_discrete(self):
         """Whether spec is discrete."""
         return not self.dtype.is_floating_point
@@ -98,8 +104,9 @@ class TensorSpec(object):
         return self.dtype.is_floating_point
 
     def __repr__(self):
-        return "TensorSpec(shape={}, dtype={})".format(self.shape,
-                                                       repr(self.dtype))
+        return "TensorSpec(shape={}, dtype={}, name={})".format(self.shape,
+                                                               repr(self.dtype),
+                                                               repr(self.name))
 
     def __eq__(self, other):
         if type(self) != type(other):
@@ -323,7 +330,7 @@ class BoundedTensorSpec(TensorSpec):
 
     __slots__ = ("_minimum", "_maximum")
 
-    def __init__(self, shape, dtype=torch.float32, minimum=0, maximum=1):
+    def __init__(self, shape, dtype=torch.float32, minimum=0, maximum=1, name=None):
         """
         Args:
             shape (tuple[int]): The shape of the tensor.
@@ -334,7 +341,7 @@ class BoundedTensorSpec(TensorSpec):
             maximum: numpy number or sequence specifying the maximum element
                 bounds (inclusive). Must be broadcastable to `shape`.
         """
-        super(BoundedTensorSpec, self).__init__(shape, dtype)
+        super(BoundedTensorSpec, self).__init__(shape, dtype, name)
 
         try:
             min_max = np.broadcast(minimum, maximum, np.zeros(self.shape))
@@ -376,8 +383,8 @@ class BoundedTensorSpec(TensorSpec):
         return self._maximum
 
     def __repr__(self):
-        s = "BoundedTensorSpec(shape={}, dtype={}, minimum={}, maximum={})"
-        return s.format(self.shape, repr(self.dtype), repr(self.minimum),
+        s = "BoundedTensorSpec(shape={}, dtype={}, name={}, minimum={}, maximum={})"
+        return s.format(self.shape, repr(self.dtype), repr(self.name), repr(self.minimum),
                         repr(self.maximum))
 
     def __eq__(self, other):
@@ -387,7 +394,7 @@ class BoundedTensorSpec(TensorSpec):
 
     def __reduce__(self):
         return BoundedTensorSpec, (self._shape, self._dtype, self._minimum,
-                                   self._maximum)
+                                   self._maximum, self._name)
 
     def sample(self, outer_dims=None):
         """Sample uniformly given the min/max bounds.
