@@ -14,8 +14,8 @@ from CustomLSTM import LSTMCore
 from attention_encoder import LatentEncoder
 from Blocks import init_weights
 from vrnn_utilities import _strip_prefix_if_present
-import hamiltorch
-
+import random
+import numpy as np
 parent_dir=os.path.abspath(os.path.join(os.getcwd(), '..'))
 # passing the file name and path as argument
 sys.path.append(parent_dir)
@@ -358,11 +358,12 @@ class VRNN_GMM(nn.Module):
         https://danijar.com/tips-for-training-recurrent-neural-networks/
         """
 
-        if self.learn_init_state:
-            c0 = self.to_init_state_c(first_obs[:, 0:1]).squeeze()
-            c0 = c0.reshape(-1, self.n_layers, self.h_dim).transpose(0, 1)
-            h0 = self.to_init_state_h(first_obs[:, 0:1]).squeeze()
-            h0 = h0.reshape(-1, self.n_layers, self.h_dim).transpose(0, 1)
+        if self._learn_init_state:
+            c_0 = self.to_init_state_c(torch.squeeze(first_obs[:, :, 0:1], dim=-1))
+            c_0 = c_0.reshape(-1, self.n_layers, self.h_dim).transpose(0, 1).contiguous()
+            h_0 = self.to_init_state_h(torch.squeeze(first_obs[:, :, 0:1],  dim=-1))
+            h_0 = h_0.reshape(-1, self.n_layers, self.h_dim).transpose(0, 1).contiguous()
+
         elif self.zero_init:
             h_0 = torch.nn.Parameter(torch.zeros(self.n_layers, batch_size, self.h_dim).to(self.device), requires_grad=True)
             c_0 = torch.nn.Parameter(torch.zeros(self.n_layers, batch_size, self.h_dim).to(self.device), requires_grad=True)
@@ -417,7 +418,7 @@ class VRNN_GMM(nn.Module):
         # allocation
         total_loss = 0
         # initialization
-        input_ = self.input_drop(u[:, :, 0])
+        input_ = self.input_drop(u)
         h, c   = self.initialize_state_vectors(batch_size, first_obs=input_)
         
         # for all time steps
@@ -643,9 +644,21 @@ class VRNN_GMM(nn.Module):
 
 class DynamicModel(VRNN_GMM):
 
-    def __init__(self, num_inputs, num_outputs, h_dim=96, z_dim=48, n_layers=2, n_mixtures=10, sequence_length=200, device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'), normalizer_input=None, normalizer_output=None,
+    def __init__(self, 
+                 num_inputs, 
+                 num_outputs, 
+                 h_dim=96, 
+                 z_dim=48, 
+                 n_layers=2, 
+                 n_mixtures=10, 
+                 sequence_length=200,
+                 device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
+                 learn_init_state=True,
+                 bidirectional=False, 
+                 normalizer_input=None, 
+                 normalizer_output=None,
                  *args, **kwargs):
-        super(DynamicModel, self).__init__(u_dim=num_inputs,y_dim= num_outputs, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers, n_mixtures=n_mixtures, sequence_length=sequence_length, device=device)
+        super(DynamicModel, self).__init__(u_dim=num_inputs, y_dim= num_outputs, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers, n_mixtures=n_mixtures, sequence_length=sequence_length, device=device, learn_init_state=learn_init_state, bidirectional=bidirectional)
         # Save parameters
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
@@ -703,7 +716,10 @@ class ModelState:
                  optimizer_type= "MADGRAD",
                  **kwargs):
 
+        random.seed(seed)
+        np.random.seed(seed)
         torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
 
         self.h_dim=h_dim
         self.z_dim=z_dim
