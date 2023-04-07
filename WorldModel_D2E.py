@@ -1,28 +1,68 @@
 import os
 import numpy as np
-import torch
 import itertools
-from torch import nn, optim, jit
-from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
-import torchvision.transforms as T
-from VRNN.main import ModelState
-from VRNN.Normalization import compute_normalizer
-from VRNN.Blocks import init_weights
+from tqdm import tqdm
+import logging
+import cv2
+import imageio
+import re
+import functools
+import math
+from numbers import Number
 from collections import namedtuple
-from typing import Iterables
+from typing import Iterables, Tuple, Dict, List
 import gym
+import mujoco_py
+import torch
+from torch import nn, optim, jit
+import torchvision.transforms as T
+import torch.nn.functional as F
 from torch.utils.data import Dataset, TensorDataset
 from torch.utils.data import DataLoader
-import mujoco_py
-from tensorboardX import SummaryWriter
+from torch.distributions import Distribution, constraints
+from torch.distributions.utils import broadcast_all
 import torch.backends.cudnn as cudnn
 import torch.utils.data.distributed
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from planner_D2E_regularizer import D2EAgent as agent
-from tqdm import tqdm
-import logging
-import cv2
+from tensorboardX import SummaryWriter
+from planner_D2E_regularizer import D2EAgent, Config, parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
+import utils_planner as utils
+from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
+from VRNN.main import ModelState
+from VRNN.Normalization import compute_normalizer
+from VRNN.Blocks import init_weights
+import DataCollectionD2E_WM  as DC
+import alf_gym_wrapper
+import argparse
+from alf_environment import TimeLimit
+#####################################
+hyperParams = { "batch_size": 40,
+                "input_d": 1,
+                "prior_alpha": 7., #gamma_alpha
+                "prior_beta": 1., #gamma_beta
+                "K": 25,
+                "image_width": 96,
+                "hidden_d": 300,
+                "latent_d": 100,
+                "latent_w": 200,
+                "hidden_transit": 100,
+                "LAMBDA_GP": 10, #hyperparameter for WAE with gradient penalty
+                "LEARNING_RATE": 2e-4,
+                "CRITIC_ITERATIONS" : 5,
+                "GAMMA": 0.99,
+                "PREDICT_DONE": False,
+                "seed": 1234,
+                "number_of_mixtures": 8,
+                "weight_decay": 1e-5,
+                "n_channel": 3,
+                "VRNN_Optimizer_Type":"MADGRAD",
+                "MAX_GRAD_NORM": 100.,
+                "expl_behavior": greedy,
+                "expl_noise": 0.0,
+                "eval_noise": 0.0,
+                }
+#####################################
 class FreezeParameters:
     def __init__(self, modules: Iterable[nn.Module]):
         """
@@ -45,6 +85,398 @@ class FreezeParameters:
     def __exit__(self, exc_type, exc_val, exc_tb):
         for i, param in enumerate(get_parameters(self.modules)):
             param.requires_grad = self.param_states[i]
+
+#partially based on https://github.com/sai-prasanna/mpc_and_rl/blob/1fedaec5eec7a2a5844935d17b4fd0ad385d9d6c/dreamerv2_torch/dreamerv2_torch/common/other.py
+#inspired by https://github.com/mahkons/Dreamer/blob/003c3cc7a9430e9fa0d8af9cead88d8f4b06e0f4/dreamer/WorldModel.py
+
+@functools.total_ordering
+class Counter:
+    def __init__(self, initial=0):
+        self.value = initial
+
+    def __int__(self):
+        return int(self.value)
+
+    def __eq__(self, other):
+        return int(self) == other
+
+    def __ne__(self, other):
+        return int(self) != other
+
+    def __lt__(self, other):
+        return int(self) < other
+
+    def __add__(self, other):
+        return int(self) + other
+
+    def increment(self, amount=1):
+        self.value += amount
+
+def schedule(string, step):
+    try:
+        return float(string)
+    except ValueError:
+        step = step.to(torch.float32)
+        match = re.match(r"linear\((.+),(.+),(.+)\)", string)
+        if match:
+            initial, final, duration = [float(group) for group in match.groups()]
+            mix = torch.clip(step / duration, 0, 1)
+            return (1 - mix) * initial + mix * final
+        match = re.match(r"warmup\((.+),(.+)\)", string)
+        if match:
+            warmup, value = [float(group) for group in match.groups()]
+            scale = torch.clip(step / warmup, 0, 1)
+            return scale * value
+        match = re.match(r"exp\((.+),(.+),(.+)\)", string)
+        if match:
+            initial, final, halflife = [float(group) for group in match.groups()]
+            return (initial - final) * 0.5 ** (step / halflife) + final
+        match = re.match(r"horizon\((.+),(.+),(.+)\)", string)
+        if match:
+            initial, final, duration = [float(group) for group in match.groups()]
+            mix = torch.clip(step / duration, 0, 1)
+            horizon = (1 - mix) * initial + mix * final
+            return 1 - 1 / horizon
+        raise NotImplementedError(string)
+
+def static_scan_for_lambda_return(fn, inputs, start):
+    last = start
+    indices = range(inputs[0].shape[0])
+    indices = reversed(indices)
+    flag = True
+    for index in indices:
+        inp = lambda x: (_input[x] for _input in inputs)
+        last = fn(last, *inp(index))
+        if flag:
+            outputs = last
+            flag = False
+        else:
+            outputs = torch.cat([outputs, last], dim=-1)
+    outputs = torch.reshape(outputs, [outputs.shape[0], outputs.shape[1], 1])
+    outputs = torch.unbind(outputs, dim=0)
+    outputs = torch.stack(outputs, dim=1)
+    return outputs
+
+def lambda_return(reward, value, pcont, bootstrap, lambda_, axis):
+    # Setting lambda=1 gives a discounted Monte Carlo return.
+    # Setting lambda=0 gives a fixed 1-step return.
+    assert len(reward.shape) == len(value.shape), (reward.shape, value.shape)
+    if isinstance(pcont, (int, float)):
+        pcont = pcont * torch.ones_like(reward)
+    dims = list(range(len(reward.shape)))
+    dims = [axis] + dims[1:axis] + [0] + dims[axis + 1 :]
+    if axis != 0:
+        reward = reward.permute(dims)
+        value = value.permute(dims)
+        pcont = pcont.permute(dims)
+    if bootstrap is None:
+        bootstrap = torch.zeros_like(value[-1])
+    next_values = torch.cat([value[1:], bootstrap[None]], 0)
+    inputs = reward + pcont * next_values * (1 - lambda_)
+    # returns = static_scan(
+    #    lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg,
+    #    (inputs, pcont), bootstrap, reverse=True)
+    # reimplement to optimize performance
+    returns = static_scan_for_lambda_return(
+        lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg, (inputs, pcont), bootstrap
+    )
+    if axis != 0:
+        returns = returns.permute(dims)
+    return returns
+
+#####################################################
+
+CONST_SQRT_2 = math.sqrt(2)
+CONST_INV_SQRT_2PI = 1 / math.sqrt(2 * math.pi)
+CONST_INV_SQRT_2 = 1 / math.sqrt(2)
+CONST_LOG_INV_SQRT_2PI = math.log(CONST_INV_SQRT_2PI)
+CONST_LOG_SQRT_2PI_E = 0.5 * math.log(2 * math.pi * math.e)
+
+
+class TruncatedStandardNormal(Distribution):
+    """
+    Truncated Standard Normal distribution
+    https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
+    """
+
+    arg_constraints = {
+        "a": constraints.real,
+        "b": constraints.real,
+    }
+    has_rsample = True
+
+    def __init__(self, a, b, validate_args=None):
+        self.a, self.b = broadcast_all(a, b)
+        if isinstance(a, Number) and isinstance(b, Number):
+            batch_shape = torch.Size()
+        else:
+            batch_shape = self.a.size()
+        super(TruncatedStandardNormal, self).__init__(
+            batch_shape, validate_args=validate_args
+        )
+        if self.a.dtype != self.b.dtype:
+            raise ValueError("Truncation bounds types are different")
+        if any(
+            (self.a >= self.b)
+            .view(
+                -1,
+            )
+            .tolist()
+        ):
+            raise ValueError("Incorrect truncation range")
+        eps = torch.finfo(self.a.dtype).eps
+        self._dtype_min_gt_0 = eps
+        self._dtype_max_lt_1 = 1 - eps
+        self._little_phi_a = self._little_phi(self.a)
+        self._little_phi_b = self._little_phi(self.b)
+        self._big_phi_a = self._big_phi(self.a)
+        self._big_phi_b = self._big_phi(self.b)
+        self._Z = (self._big_phi_b - self._big_phi_a).clamp_min(eps)
+        self._log_Z = self._Z.log()
+        little_phi_coeff_a = torch.nan_to_num(self.a, nan=math.nan)
+        little_phi_coeff_b = torch.nan_to_num(self.b, nan=math.nan)
+        self._lpbb_m_lpaa_d_Z = (
+            self._little_phi_b * little_phi_coeff_b
+            - self._little_phi_a * little_phi_coeff_a
+        ) / self._Z
+        self._mean = -(self._little_phi_b - self._little_phi_a) / self._Z
+        self._variance = (
+            1
+            - self._lpbb_m_lpaa_d_Z
+            - ((self._little_phi_b - self._little_phi_a) / self._Z) ** 2
+        )
+        self._entropy = CONST_LOG_SQRT_2PI_E + self._log_Z - 0.5 * self._lpbb_m_lpaa_d_Z
+
+    @constraints.dependent_property
+    def support(self):
+        return constraints.interval(self.a, self.b)
+
+    @property
+    def mean(self):
+        return self._mean
+
+    @property
+    def variance(self):
+        return self._variance
+
+    def entropy(self):
+        return self._entropy
+
+    @property
+    def auc(self):
+        return self._Z
+
+    @staticmethod
+    def _little_phi(x):
+        return (-(x**2) * 0.5).exp() * CONST_INV_SQRT_2PI
+
+    @staticmethod
+    def _big_phi(x):
+        return 0.5 * (1 + (x * CONST_INV_SQRT_2).erf())
+
+    @staticmethod
+    def _inv_big_phi(x):
+        return CONST_SQRT_2 * (2 * x - 1).erfinv()
+
+    def cdf(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        return ((self._big_phi(value) - self._big_phi_a) / self._Z).clamp(0, 1)
+
+    def icdf(self, value):
+        return self._inv_big_phi(self._big_phi_a + value * self._Z)
+
+    def log_prob(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        return CONST_LOG_INV_SQRT_2PI - self._log_Z - (value**2) * 0.5
+
+    def rsample(self, sample_shape=torch.Size()):
+        shape = self._extended_shape(sample_shape)
+        p = torch.empty(shape, device=self.a.device).uniform_(
+            self._dtype_min_gt_0, self._dtype_max_lt_1
+        )
+        return self.icdf(p)
+
+
+class TruncatedNormal(TruncatedStandardNormal):
+    """
+    Truncated Normal distribution
+    https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
+    """
+
+    has_rsample = True
+
+    def __init__(self, loc, scale, a, b, validate_args=None):
+        self.loc, self.scale, a, b = broadcast_all(loc, scale, a, b)
+        a = (a - self.loc) / self.scale
+        b = (b - self.loc) / self.scale
+        super(TruncatedNormal, self).__init__(a, b, validate_args=validate_args)
+        self._log_scale = self.scale.log()
+        self._mean = self._mean * self.scale + self.loc
+        self._variance = self._variance * self.scale**2
+        self._entropy += self._log_scale
+
+    def _to_std_rv(self, value):
+        return (value - self.loc) / self.scale
+
+    def _from_std_rv(self, value):
+        return value * self.scale + self.loc
+
+    def cdf(self, value):
+        return super(TruncatedNormal, self).cdf(self._to_std_rv(value))
+
+    def icdf(self, value):
+        return self._from_std_rv(super(TruncatedNormal, self).icdf(value))
+
+    def log_prob(self, value):
+        return (
+            super(TruncatedNormal, self).log_prob(self._to_std_rv(value))
+            - self._log_scale
+        )
+class SampleDist:
+    def __init__(self, dist, samples=100):
+        self._dist = dist
+        self._samples = (samples,)
+
+    @property
+    def name(self):
+        return "SampleDist"
+
+    def __getattr__(self, name):
+        return getattr(self._dist, name)
+
+    def mean(self):
+        samples = self._dist.sample(self._samples)
+        return torch.mean(samples, 0)
+
+    def mode(self):
+        sample = self._dist.sample(self._samples)
+        logprob = self._dist.log_prob(sample)
+        return sample[torch.argmax(logprob)][0]
+
+    def entropy(self):
+        sample = self._dist.sample(self._samples)
+        logprob = self.log_prob(sample)
+        return -torch.mean(logprob, 0)
+
+class OneHotDist(torch.distributions.OneHotCategorical):
+    def __init__(self, logits=None, probs=None):
+        super().__init__(logits=logits, probs=probs)
+
+    def mode(self):
+        _mode = F.one_hot(
+            torch.argmax(super().logits, axis=-1), super().logits.shape[-1]
+        )
+        return _mode.detach() + super().logits - super().logits.detach()
+
+    def sample(self, sample_shape=(), seed=None):
+        if seed is not None:
+            raise ValueError("need to check")
+        sample = super().sample(sample_shape)
+        probs = super().probs
+        while len(probs.shape) < len(sample.shape):
+            probs = probs[None]
+        sample = sample + (probs - probs.detach())
+        return sample
+
+class ContDist:
+    def __init__(self, dist=None):
+        super().__init__()
+        self._dist = dist
+        self.mean = dist.mean
+
+    def __getattr__(self, name):
+        return getattr(self._dist, name)
+
+    def entropy(self):
+        return self._dist.entropy()
+
+    def mode(self):
+        return self._dist.mean
+
+    def sample(self, sample_shape=()):
+        return self._dist.rsample(sample_shape)
+
+    def log_prob(self, x):
+        return self._dist.log_prob(x)
+
+
+class Bernoulli:
+    def __init__(self, dist=None):
+        super().__init__()
+        self._dist = dist
+        self.mean = dist.mean
+
+    def __getattr__(self, name):
+        return getattr(self._dist, name)
+
+    def entropy(self):
+        return self._dist.entropy()
+
+    def mode(self):
+        _mode = torch.round(self._dist.mean)
+        return _mode.detach() + self._dist.mean - self._dist.mean.detach()
+
+    def sample(self, sample_shape=()):
+        return self._dist.rsample(sample_shape)
+
+    def log_prob(self, x):
+        _logits = self._dist.base_dist.logits
+        log_probs0 = -F.softplus(_logits)
+        log_probs1 = -F.softplus(-_logits)
+
+        return log_probs0 * (1 - x) + log_probs1 * x
+
+def action_noise(action, amount, act_space):
+    if amount == 0:
+        return action
+    amount = amount.to(action.dtype)
+    if hasattr(act_space, "n"):
+        probs = amount / action.shape[-1] + (1 - amount) * action
+        return OneHotDist(probs=probs).sample()
+    else:
+        return torch.clip(torch.distributions.Normal(action, amount).sample(), -1, 1)
+
+
+class StreamNorm(nn.Module):
+    def __init__(self, shape=(), momentum=0.99, scale=1.0, eps=1e-8):
+        # Momentum of 0 normalizes only based on the current batch.
+        # Momentum of 1 disables normalization.
+        super().__init__()
+        self._shape = tuple(shape)
+        self._momentum = momentum
+        self._scale = scale
+        self._eps = eps
+        self.mag = nn.Parameter(
+            torch.ones(shape, dtype=torch.float64), requires_grad=False
+        )
+
+    def forward(self, inputs):
+        metrics = {}
+        self.update(inputs)
+        metrics["mean"] = inputs.mean().detach().cpu()
+        metrics["std"] = inputs.std().detach().cpu()
+        outputs = self.transform(inputs)
+        metrics["normed_mean"] = outputs.mean().detach().cpu()
+        metrics["normed_std"] = outputs.std().detach().cpu()
+        return outputs, metrics
+
+    def reset(self):
+        self.mag.data = torch.ones_like(self.mag)
+
+    def update(self, inputs):
+        batch = inputs.reshape((-1,) + self._shape)
+        mag = torch.abs(batch).mean(0).type(torch.float64)
+        self.mag.data = self._momentum * self.mag + (1 - self._momentum) * mag
+
+    def transform(self, inputs):
+        values = inputs.reshape((-1,) + self._shape)
+        values /= self.mag.data.type(inputs.dtype)[None] + self._eps
+        values *= self._scale
+        return values.reshape(inputs.shape)
+
+
 ###############################################################################
 ########### prepare data for transition model by padding episodes #############
 def make_episodes(states, actions, next_states, dones):
@@ -94,15 +526,39 @@ def preprocess_transition_data(s1, a1, s2, done):
     #shape of outputs: (B , max_seq_len, D)
     return final_inputs, final_outputs
 ###############################################################################
-#https://github.com/google-research/planet/blob/master/planet/scripts/create_video.py
-def write_video(frames, title, path=''):
-    frames = np.multiply(np.stack(frames, axis=0).transpose(0, 2, 3, 1), 255).clip(0, 255).astype(np.uint8)[:, :, :,
-             ::-1]  # VideoWrite expects H x W x C in BGR
-    _, H, W, _ = frames.shape
-    writer = cv2.VideoWriter(os.path.join(path, '%s.mp4' % title), cv2.VideoWriter_fourcc(*'mp4v'), 30., (W, H), True)
-    for frame in frames:
-        writer.write(frame)
-    writer.release()
+class VideoRecorder:
+    def __init__(self, root_dir, render_size=64, fps=20):
+        if root_dir is not None:
+            self.save_dir = root_dir / 'eval_video'
+            self.save_dir.mkdir(exist_ok=True)
+        else:
+            self.save_dir = None
+
+        self.render_size = render_size
+        self.fps = fps
+        self.frames = []
+
+    def init(self, env, enabled=True):
+        self.frames = []
+        self.enabled = self.save_dir is not None and enabled
+        self.record(env)
+
+    def record(self, env):
+        if self.enabled:
+            if hasattr(env, 'physics'):
+                frame = env.physics.render(height=self.render_size,
+                                           width=self.render_size,
+                                           camera_id=0)
+            else:
+                frame = env.render()
+            self.frames.append(frame)
+
+    def save(self, file_name):
+        if self.enabled:
+            path = self.save_dir / file_name
+            imageio.mimsave(str(path), self.frames, fps=self.fps)
+
+
 
 class logger:
       def __init__ (self):
@@ -124,7 +580,72 @@ class Logger(logging.Logger):
         handler.setLevel(logger.level)
         self.addHandler(handler)
 
-#inspired by https://github.com/mahkons/Dreamer/blob/003c3cc7a9430e9fa0d8af9cead88d8f4b06e0f4/dreamer/WorldModel.py
+class Optimizer(nn.Module):
+    def __init__(
+        self,
+        name,
+        parameters,
+        lr,
+        eps=1e-4,
+        clip=None,
+        wd=None,
+        wd_pattern=r".*",
+        opt="adam",
+        use_amp=False,
+    ):
+        super().__init__()
+        assert 0 <= wd < 1
+        assert not clip or 1 <= clip
+        self._name = name
+        self._params = list(parameters)
+        self._clip = clip
+        self._wd = wd
+        self._wd_pattern = wd_pattern
+        self._opt = {
+            "adam": lambda: torch.optim.Adam(self._params, lr=lr, eps=eps),
+            "adamw": lambda: torch.optim.AdamW(self._params, lr= lr, betas = (0.9, 0.999), amsgrad = True),
+            "adamax": lambda: torch.optim.Adamax(self._params, lr=lr, eps=eps),
+            "sgd": lambda: torch.optim.SGD(self._params, lr=lr),
+            "momentum": lambda: torch.optim.SGD(self._params, lr=lr, momentum=0.9),
+        }[opt]()
+        self._scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    def __call__(self, loss, retain_graph=False):
+        assert len(loss.shape) == 0, loss.shape
+        metrics = {}
+        metrics[f"{self._name}_loss"] = loss.detach().cpu().numpy()
+        self._scaler.scale(loss).backward()
+        self._scaler.unscale_(self._opt)
+        # loss.backward(retain_graph=retain_graph)
+        norm = torch.nn.utils.clip_grad_norm_(self._params, self._clip)
+        if self._wd:
+            self._apply_weight_decay(self._params)
+        self._scaler.step(self._opt)
+        self._scaler.update()
+        # self._opt.step()
+        self._opt.zero_grad()
+        metrics[f"{self._name}_grad_norm"] = norm.item()
+        return metrics
+
+    def _apply_weight_decay(self, varibs):
+        nontrivial = self._wd_pattern != r".*"
+        if nontrivial:
+            raise NotImplementedError
+        for var in varibs:
+            var.data = (1 - self._wd) * var.data
+
+
+class RequiresGrad:
+    def __init__(self, model):
+        self._model = model
+
+    def __enter__(self):
+        self._model.requires_grad_(requires_grad=True)
+
+    def __exit__(self, *args):
+        self._model.requires_grad_(requires_grad=False)
+#################################
+
 class StandardScaler(object):
 
     def __init__(self, device):
@@ -250,103 +771,101 @@ class Unscale(nn.Module):
         return self.low + (0.5 * (x + 1.0) * (self.high - self.low))
 
 
-class LSTMBlock(jit.ScriptModule):
-    def __init__(self, in_dim, out_dim, hidden_dims, activation_func_module):
-        super(LSTMBlock, self).__init__()
-        self.rnn = nn.LSTM( in_dim, hidden_dims[0], bidirectional=False, batch_first=True)
+def get_act(name):
+    if name == "none":
+        return lambda x: x
+    if name == "mish":
+        return lambda x: x * torch.tanh(nn.Softplus()(x))
+    elif hasattr(torch.nn, name):
+        return getattr(torch.nn, name)()
+    else:
+        raise NotImplementedError(name)
 
-        layers = [nn.Linear(hidden_dims[0], hidden_dims[0]), activation_func_module()]
-        layers += sum([[nn.Linear(ind, outd), activation_func_module()]
-            for ind, outd in zip(hidden_dims, hidden_dims[1:])], [])
-        layers.append(nn.Linear(hidden_dims[-1], out_dim))
-        self.model = nn.Sequential(*layers)
-        self.model.apply(init_weights)
+class Module(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self._lazy_modules = nn.ModuleDict({})
 
-    @jit.script_method
-    def forward(self, x):
+    def get(self, name, ctor, *args, **kwargs):
+        # Create or get layer by name to avoid mentioning it in the constructor.
+        if name not in self._lazy_modules:
+            self._lazy_modules[name] = ctor(*args, **kwargs)
+        return self._lazy_modules[name]
 
+class DistLayer(Module):
+    def __init__(self, shape, dist="mse", min_std=0.1, init_std=0.0):
+        super().__init__()
+        self._shape = shape
+        self._dist = dist
+        self._min_std = min_std
+        self._init_std = init_std
 
-        # (Batch, D, seq_len)
-        length =  [torch.max((x[i,0,:]!=0).nonzero()).item()+1 for i in range(x.shape[0])]
-        packed = nn.utils.rnn.pack_padded_sequence(
-            x, length, batch_first=True, enforce_sorted=False
+    def forward(self, inputs):
+        out = self.get("out", nn.Linear, inputs.shape[-1], int(np.prod(self._shape)))(
+            inputs
         )
-        out_packed, (_, _) = self.rnn(packed)
-        out, _ = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True)
-        return self.model(out)
+        out = torch.reshape(out, inputs.shape[:-1] + self._shape)
+        if self._dist in ("normal", "tanh_normal", "trunc_normal"):
+            std = self.get("std", nn.Linear, inputs.shape[-1], np.prod(self._shape))(
+                inputs
+            )
+            std = torch.reshape(std, inputs.shape[:-1] + self._shape)
+        if self._dist == "mse":
+            dist = torch.distributions.Normal(out, 1.0)
+            return ContDist(torch.distributions.Independent(dist, len(self._shape)))
+        if self._dist == "normal":
+            dist = torch.distributions.Normal(out, std)
+            return ContDist(torch.distributions.Independent(dist, len(self._shape)))
+        if self._dist == "binary":
+            dist = Bernoulli(torch.distributions.Independent(torch.distributions.Bernoulli(logits=out), len(self._shape)))
+            return dist
+        if self._dist == "tanh_normal":
+            mean = 5 * torch.tanh(out / 5)
+            std = nn.Softplus()(std + self._init_std) + self._min_std
+            dist = torch.distributions.Normal(mean, std)
+            dist = torch.distributions.TransformedDistribution(dist, TanhBijector())
+            dist = torch.distributions.Independent(dist, len(self._shape))
+            return SampleDist(dist)
+        if self._dist == "trunc_normal":
+            std = 2 * torch.sigmoid((std + self._init_std) / 2) + self._min_std
+            dist = TruncatedNormal(torch.tanh(out), std, -1, 1)
+            return ContDist(torch.distributions.Independent(dist, 1))
+        if self._dist == "onehot":
+            return OneHotDist(out)
+        raise NotImplementedError(self._dist)
 
+class MLP(Module):
+    def __init__(self, shape, layers, units, act="elu", norm="none", **out):
+        super().__init__()
+        self._shape = (shape,) if isinstance(shape, int) else shape
+        self._layers = layers
+        self._units = units
+        self._norm = norm
+        self._act = get_act(act)
+        self._out = out
 
-class RewardNetwork(LSTMBlock):
-    def __init__(self, state_dim):
-        super(RewardNetwork, self).__init__(state_dim, 1, [300, 300], nn.GELU)
+    def forward(self, features):
+        x = features
+        x = x.reshape([-1, x.shape[-1]])
+        for index in range(self._layers):
+            x = self.get(f"dense{index}", nn.Linear, x.shape[-1], self._units)(x)
+            x = self.get(f"norm{index}", NormLayer, x.shape[-1], self._norm)(x)
+            x = self._act(x)
+        x = x.reshape(features.shape[:-1] + (x.shape[-1],))
+        return self.get("out", DistLayer, self._shape, **self._out)(x)
 
-    def forward(self, x):
-        x = super().forward(x)
-        return x.squeeze(len(x.shape) - 1)
-
-
-class DiscountNetwork(LSTMBlock):
-    def __init__(self, state_dim):
-        super(DiscountNetwork, self).__init__(in_dim=state_dim, out_dim=1, hidden_dims=[300, 300], activation_func_module=nn.GELU)
-
-    def forward(self, x):
-        assert(False)
-
-    def predict_logit(self, x):
-        x = super().forward(x)
-        return x.squeeze(len(x.shape) - 1)
-
-    @staticmethod # TODO move to config factory method?
-    def create(state_dim, predict_done, gamma):
-        if predict_done:
-            return DiscountNetwork(state_dim)
-        else:
-            return StubDiscountNetwork(gamma)
-
-
-class StubDiscountNetwork(jit.ScriptModule):
-    def __init__(self, gamma):
-        super(StubDiscountNetwork, self).__init__()
-        self.gamma = gamma
-        self.scale = math.log(gamma) - math.log(1 - gamma)
-        self.device = torch.device("cpu")
-
-    def to(self, device):
-        self.device = device
-        return super().to(device)
-
-    @jit.script_method
-    def predict_logit(self, x: torch.Tensor)-> torch.Tensor:
-        return torch.ones(x.shape[:-1], device=self.device) * self.scale
-
-
-hyperParams = {"batch_size": 40,
-                "input_d": 1,
-                "prior_alpha": 7., #gamma_alpha
-                "prior_beta": 1., #gamma_beta
-                "K": 25,
-                "image_width": 96,
-                "hidden_d": 300,
-                "latent_d": 100,
-                "latent_w": 200,
-                "hidden_transit": 100,
-                "LAMBDA_GP": 10, #hyperparameter for WAE with gradient penalty
-                "LEARNING_RATE": 2e-4,
-                "CRITIC_ITERATIONS" : 5,
-                "GAMMA": 0.99,
-                "PREDICT_DONE": False,
-                "seed": 1234,
-                "number_of_mixtures": 8,
-                "weight_decay": 1e-5,
-                "n_channel": 3,
-                "VRNN_Optimizer_Type":"MADGRAD",
-                "MAX_GRAD_NORM": 100.
-                }
 
 class WorldModel(jit.ScriptModule):
-    def __init__(self, hyperParams, sequence_length, env_name='Hopper-v2', device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), log_dir="logs", restore=False):
+    def __init__(self, 
+                 hyperParams, 
+                 sequence_length, 
+                 env_name='Hopper-v2', 
+                 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
+                 log_dir="logs", 
+                 restore=False):
         super(WorldModel, self).__init__()
-        env = gym.make(env_name)
+        
+        
         self.model_path = os.path.abspath(os.getcwd()) + '/model'
         try:
            os.makedirs(self.model_path, exist_ok=True) 
@@ -354,21 +873,31 @@ class WorldModel(jit.ScriptModule):
         except OSError as error:
            print("Directory '%s' can not be created")
         self._params = namedtuple('x', hyperParams.keys())(*hyperParams.values())
+        self._discount       = self._params.GAMMA
+        #set the environment 
+        self._env_name = env_name
+        env_gym =  gym.spec(env_name).make()
+        env = alf_gym_wrapper.AlfGymWrapper(env_gym,discount=self._discount)
+        env = TimeLimit(env, DC.MUJOCO_ENVS_LENGTH[env_name])
+        self._env            = env
         self.n_discriminator_iter = self._params.CRITIC_ITERATIONS
-
+        self._use_amp        = False
+        self._saved_action   = None
+        #set the sizes
         self.state_dim       = self._params.latent_d
-        self.action_dim      = env.action_space.shape[0]
+        self.action_dim      = env.action_spec()
+        self. observation_dim= env.observation_spec()
 
         self.device          = device
-        
-        self.criterion       = nn.MSELoss(reduction='sum')
-
-        self.reward_model    = RewardNetwork( self.state_dim + self.action_dim).to(self.device)
-        self.discount_model  = DiscountNetwork.create(self.state_dim + self.action_dim, self._params.PREDICT_DONE, self._params.GAMMA).to(device)
+        self._clip_rewards   = "tanh"
+        self.heads = nn.ModuleDict()
+        self.heads["reward"]    = MLP(shape=1, layers= 4, units= 400, act= "ELU", norm= "none", dist= "mse").to(self.device)
+        self.heads["discount"]  = MLP(shape=1, layers= 4, units= 400, act= "ELU", norm= "none", dist= "binary").to(self.device)
+        DiscountNetwork.create(self.state_dim + self.action_dim, self._params.PREDICT_DONE, self._discount).to(self.device)
         self.ckpt_path       = self.model_path+'/best_model'
         os.makedirs(self.ckpt_path, exist_ok=True) 
         self.logger = Logger(self.__class__.__name__)
-
+        self.mse_loss = nn.MSELoss()
         modelstate =  ModelState(seed            = self._params.seed,
                                  nu              = self.state_dim + self.action_dim,
                                  ny              = self.state_dim,
@@ -392,45 +921,74 @@ class WorldModel(jit.ScriptModule):
                                                      img_width  = self._params.image_width,
                                                      batch_size = self._params.batch_size,
                                                      num_layers = 4,
-                                                     include_elbo2=True)
-        self.encoder = self.variational_autoencoder.encoder
-        self.decoder = self.variational_autoencoder.decoder
+                                                     include_elbo2=True,
+                                                     use_mse_loss=True)
+        self.encoder = self.variational_autoencoder.GMM_encoder
+        self.decoder = self.variational_autoencoder.GMM_decoder
         self.discriminator = VAECritic(self.state_dim)
+        self.grad_heads = [ "reward", "discount"]
+        self.loss_scales: { reward: 1.0, discount: 1.0}
+        for name in self.grad_heads:
+            assert name in self.heads, name
+
         self.parameters = itertools.chain(
-            self.reward_model.parameters(),
-            self.discount_model.parameters(),
+            self.transition_model.parameters(),
+            self.heads.parameters(),
             self.encoder.parameters(),
             self.decoder.parameters(),
         )
-        self.writer = SummaryWriter(log_dir)
-        self.optimizer = torch.optim.AdamW(self.parameters,
-                                           lr      = self._params.LEARNING_RATE,
-                                           betas   = (0.9, 0.999),
-                                           weight_decay = self._params.weight_decay,
-                                           amsgrad = True)
-
-        self._scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size = 20, gamma = 0.5)
-        self.discriminator_optim = torch.optim.Adam(self.discriminator.parameters(),
-                                                    lr    = 0.5 * self._params.LEARNING_RATE,
-                                                    betas = (0.5, 0.9))
-        self.disc_scheduler = torch.optim.lr_scheduler.StepLR(self.discriminator_optim, step_size = 30, gamma = 0.5)
         if restore:
-            self.load_checkpoints()
-            
+           self.load_checkpoints()
+
+        self.writer = SummaryWriter(log_dir)
+    
+    def initialize_optimizer(self):
+        self.optimizer = Optimizer("world_model",
+                                   self.parameters,
+                                   lr = self._params.LEARNING_RATE,
+                                   wd = self._params.weight_decay,
+                                   opt= "adamw",
+                                   use_amp=self._use_amp)
+        
+        self.discriminator_optim = Optimizer("discriminator_model",
+                                             self.discriminator.parameters(),
+                                             lr = 0.5 * self._params.LEARNING_RATE,
+                                             opt= "adam",
+                                             use_amp=self._use_amp)
+        
+    def preprocess(self, 
+                   observation, 
+                   next_observation, 
+                   reward, 
+                   done):
+        data["reward"]    = {
+                            "identity": lambda x: x,
+                            "sign": torch.sign,
+                            "tanh": torch.tanh,
+                            }[self._clip_rewards](reward).unsqueeze(-1)
+        data["discount"]  = 1.0 - done.float().unsqueeze(-1)  # .to(dtype)
+        data["discount"] *= self._discount
+        dtype = torch.float32
+        data["observation"], data["next_observation"] = (i.to(dtype) if i.dtype==torch.int32 else i.to(dtype)/255.0-0.5 if i.dtype == torch.uint8 else i.to(i.dtype) for i in [observation, next_observation])
+        data["done"] = done
+        return data
+    
     @torch.jit.script_method
-    def optimize(self, obs: torch.Tensor, action: torch.Tensor, next_obs: torch.Tensor, reward: torch.Tensor, discount: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
+    def _train(self, 
+               data: Dict[str, torch.Tensor]
+               ):
+        
         self.discriminator.train()
         pbar = tqdm(range(self.n_discriminator_iter))
-        BS = obs.size(0) #batch size
+        BS = data["observation"].size(0) #batch size
         for _ in pbar:
-            z_real, z_x_mean, z_x_sigma, c_posterior, w_x_mean, w_x_sigma, gmm_dist, z_wc_mean_prior, z_wc_logvar_prior, x_reconstructed = self.variational_autoencoder(obs)
+            z_real, z_x_mean, z_x_sigma, c_posterior, w_x_mean, w_x_sigma, gmm_dist, z_wc_mean_prior, z_wc_logvar_prior, x_reconstructed = self.variational_autoencoder(data["observation"])
             z_fake = gmm_dist.sample()
-
             critic_real = self.discriminator(z_real).reshape(-1)
             critic_fake = self.discriminator(z_fake).reshape(-1)
             gp = gradient_penalty(self.discriminator, z_real, z_fake, device=device)
             loss_critic = (
-                -(torch.mean(critic_real) - torch.mean(critic_fake)) +self._params.LAMBDA_GP * gp
+                -(torch.mean(critic_real) - torch.mean(critic_fake)) + self._params.LAMBDA_GP * gp
             )
             self.discriminator_optim.zero_grad()
             loss_critic.backward(retain_graph=True)
@@ -441,68 +999,114 @@ class WorldModel(jit.ScriptModule):
 
         self.transition_model.train()
         self.optimizer.zero_grad()
-        w_x, w_x_mean, w_x_sigma, z_next, z_next_mean, z_next_sigma, c_posterior = self.variational_autoencoder.GMM_encoder(next_obs)
+        w_x, w_x_mean, w_x_sigma, z_next, z_next_mean, z_next_sigma, c_posterior = self.encoder(data["next_observation"])
         ###
         #Prepare & normalize the input/output data for the transition model
-        inputs, outputs = preprocess_transition_data(z_real, action, z_next, done)
-        train_dataset = TensorDataset(inputs,outputs)
-        data_loader = DataLoader(train_dataset, batch_size=BS , shuffle=False)
+        inputs, outputs = preprocess_transition_data(z_real, action, z_next, data["done"])
+        train_dataset   = TensorDataset(inputs, outputs)
+        data_loader     = DataLoader(train_dataset, batch_size=BS , shuffle=False)
         normalizer_input, normalizer_output = compute_normalizer(data_loader)
         self.transition_model.normalizer_input  = normalizer_input
         self.transition_model.normalizer_output = normalizer_output
         u, y = next(iter(data_loader))
-        transition_loss, transition_disc_loss, hidden, real , fake = self.transition_model(u, y)
-        transition_gradient_penalty = self.transition_model.wgan_gp_reg(real, fake)
-        #reward prediction normalize --> predict -->unnormalize
-        self.standard_scaler.fit(inputs, reward, scale_dim=1) #what is the dimension of data? (Batch, D, seq_len)
-        norm_inputs, _ = self.standard_scaler.transform(inputs)
-        norm_predictions = self.reward_model(norm_inputs)
-        predicted_reward = self.standard_scaler.inverse_transform(norm_predictions)
+        transition_loss, transition_disc_loss, hidden, real_embed, fake_embed = self.transition_model(u, y)
+        
+        transition_gradient_penalty = self.transition_model.wgan_gp_reg(real_embed, fake_embed)
+        #reward prediction and computing discount factor 
+        likes, losses = {}, {}
+        for name, head in self.heads.items():
+            grad_head = name in self.grad_heads
+            inp = inputs if grad_head else inputs.detach()
+            out = head(inp)
+            dists = out if isinstance(out, dict) else {name: out}
+            for key, dist in dists.items():
+                like = dist.log_prob(data[key])
+                likes[key] = like
+                losses[key] = -like.mean()
+        model_loss = sum(
+            self.loss_scales.get(k, 1.0) * v for k, v in losses.items()
+        )
+        print(f"sum of reward and discount losses: {model_loss}")
+       
+        metrics, z_posterior, z_posterior_mean, z_posterior_sigma, c_posterior, w_posterior_mean, w_posterior_sigma, dist, z_prior_mean, z_prior_logvar, X_reconst = self.variational_autoencoder.get_ELBO(data["observation"])
+        metrics["wasserstein_gp_loss"]   = -torch.mean(gen_fake)
+        metrics["total_observe_loss"]    = metrics["loss"] + metrics["wasserstein_gp_loss"]
+        ###??? extra loss
+        #reward and discount losses
+        for k, v in losses.items():
+            metrics.update(k + "_loss" : v.detach().cpu())
 
-        self.metrics, z_posterior, z_posterior_mean, z_posterior_sigma, c_posterior, w_posterior_mean, w_posterior_sigma, dist, z_prior_mean, z_prior_logvar, X_reconst = self.variational_autoencoder.get_ELBO(X)
-        self.metrics["wasserstein_gp_loss"] = -torch.mean(gen_fake)
-        self.metrics["total_observe_loss"] = self.metrics["loss"] + self.metrics["wasserstein_gp_loss"]
-        self.metrics["transition_total_loss"] = transition_loss+ transition_disc_loss + transition_gradient_penalty
-        self.metrics["reward_loss"] = self.criterion(reward, predicted_reward)
-        discount_loss = torch.tensor(0.)
-        #computing discount factor
-        if self.PREDICT_DONE:
-            predicted_discount_logit = self.discount_model.predict_logit(inputs)
-            discount_loss = F.binary_cross_entropy_with_logits(predicted_discount_logit, discount * self._gamma)
-        self.metrics["discount_loss"] = discount_loss
-        self.metrics["total_model_loss"] = self.metrics["total_observe_loss"]+self.metrics["transition_total_loss"]+self.metrics["reward_loss"]+self.metrics["discount_loss"]
-        self.metrics["total_model_loss"].backward(retain_graph=True)
+        metrics["transition_total_loss"] = transition_loss + transition_disc_loss + transition_gradient_penalty
+
+        metrics["total_model_loss"] = metrics["total_observe_loss"]+ metrics["transition_total_loss"]+ model_loss
+        metrics["total_model_loss"].backward(retain_graph=True)
         nn.utils.clip_grad_norm_(self.parameters, self._params.MAX_GRAD_NORM, norm_type=2)
         self.optimizer.step()
         
-        self.writer.add_scalar('model_loss', {'observation loss': self.metrics["total_observe_loss"].item(),
-                                         'transition loss': self.metrics["transition_total_loss"].item(),
-                                         'reward loss': self.metrics["reward_loss"].item(),
-                                         'discount loss': self.metrics["discount_loss"].item(),
-                                         'total loss': self.metrics["total_model_loss"].item()})
+        self.writer.add_scalar('model_loss', {'observation loss': metrics["total_observe_loss"].item(),
+                                              'transition loss': metrics["transition_total_loss"].item(),
+                                              'reward loss': metrics["reward_loss"].item(),
+                                              'discount loss': metrics["discount_loss"].item(),
+                                              'total loss': metrics["total_model_loss"].item(),
+                                              })
 
-        return hidden
-
-
-    def imagine(self, agent, state, horizon):
+        return hidden, real_embed, z_real, z_next, metrics
+    
+    @torch.jit.script_method
+    def imagine(self, 
+                agent: nn.Module, 
+                state: torch.Tensor, 
+                horizon: int,
+                done: torch.Tensor = None, 
+                ) -> Tuple(torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor):
         tqdm.write("Collect data from imagination:")
-        state_list, reward_list, discount_list, action_list = [state], [], [], []
-        for _ in tqdm(range(horizon)):
-            _, action, _ = agent._p_fn(state.to(device=self.device))
-            features = torch.cat([torch.stack(state_list)[:-1], torch.stack(action_list)], dim=1)
-            sample, sample_mu, sample_sigma, state = self.transition_model.generate(features)
-
-            reward, _, _ = self.reward_model.sample_from(features)
-            discount = torch.sigmoid(self.discount_model.predict_logit(features))
-            state_list.append(state)
+        #inspired https://github.com/sai-prasanna/mpc_and_rl/blob/1fedaec5eec7a2a5844935d17b4fd0ad385d9d6c/dreamerv2_torch/dreamerv2_torch/world_model.py#L86
+        state_list, action_list = [state], []
+        flatten = lambda x: x.reshape([-1] + list(x.shape[2:])) #torch.Size([b,c,h,w])->torch.Size([b*c,h,w])
+        time_step = self._env.current_time_step()
+        time_step._replace(observation=state)
+        for i in tqdm(range(horizon)):
+            self._saved_action = agent._p_fn(state.to(device=self.device))
+            action = self._saved_action
+            next_time_step = self._env.step(action.detach().cpu())
             action_list.append(action)
-            reward_list.append(reward)
-            discount_list.append(discount)
-        state = torch.stack(state_list)
-        action = torch.stack(action_list)
-        reward = torch.stack(reward_list)
-        discount = torch.stack(discount_list)
-        return state, action, reward, discount
+            features = torch.cat([torch.stack(state_list), torch.stack(action_list)], dim=1)
+            next_state, sample_mu, sample_sigma, state = self.transition_model.generate(features, seq_len = features.shape[-1])
+            next_time_step._replace(observation=next_state)
+            state_list.append(next_state)
+            state = next_state
+        states   = torch.stack(state_list)
+        actions  = torch.stack(action_list)
+        seq_feat = torch.cat([states[:-1], actions], dim=1)
+        
+        disc = self.heads["discount"](seq_feat).mean()
+        if done is not None:
+            # Override discount prediction for the first step with the true
+            # discount factor from the replay buffer.
+            true_first = 1.0 - flatten(done).to(disc.dtype)
+            true_first *= self._discount
+            disc = torch.concat([true_first[None], disc[1:]], 0)
+        else:
+            done = torch.zeros_like(disc, dtype=torch.bool)
+            done[disc <= self._discount**DC.MUJOCO_ENVS_LENNGTH[self._env_name]] = True
+        discount = disc.unsqueeze(-1)   
+        weight   = torch.cumprod( torch.cat([torch.ones_like(disc[:1]), disc[:-1]], 0), 0).unsqueeze(-1)
+
+        return states, actions, discount, weight, done
+    
+    def video_pred(self, observation, action):
+        
+        truth = observation[:6] + 0.5
+        inputs = observation[:5]
+        embed, embed_mean, embed_sigma, _, _, _, _, _, _, recon = self.variational_autoencoder(inputs)
+
+        next_state, sample_mu, sample_sigma, state = self.transition_model.generate(torch.cat([embed, action], dim=1))
+        openl = self.decoder(next_state)
+        model = torch.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
+        error = (model - truth + 1) / 2
+        video = torch.concat([truth, model, error], 2)
+        B, T, H, W, C = video.shape
+        return video.permute(1, 2, 0, 3, 4).reshape(T, H, B * W, C).cpu()
 
     def save(self):
         self.save_path=os.path.join(self.ckpt_path, 'WorldModel.pth')
@@ -518,7 +1122,6 @@ class WorldModel(jit.ScriptModule):
              'world_model_optimizer': self.optimizer.state_dict(),}, self.save_path)
 
     def load_checkpoints(self):
-        self.metrics = torch.load(self.model_path+'/metrics.pth')
 
         if os.path.isfile(self.save_path):
             
@@ -535,3 +1138,155 @@ class WorldModel(jit.ScriptModule):
             print("Loading models checkpoints!")
         else:
             print("Checkpoints not found!")
+
+class D2EAlgorithm(nn.Module):
+    def __init__(self, 
+                 hyperParams, 
+                 sequence_length, 
+                 env_name = 'Hopper-v2', 
+                 device   = torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
+                 obs_space, 
+                 act_space, 
+                 step: Counter, *,
+                 model_params=(((200, 200),), 2, 1),
+                 optimizers=(( 0.0001, 0.5, 0.99),),
+                 batch_size=50,
+                 update_freq=1,
+                 update_rate=0.005,
+                 discount=0.99,
+                 replay_buffer_size=int(1e6),
+                 eval_state_mean=False,
+                 imag_horizon= 16,
+                 precision=32,
+                 **kwarg):
+        super().__init__()
+        self.parameter = namedtuple('x', hyperParams.keys())(*hyperParams.values())
+        self._env      = env_name
+        self.obs_space = obs_space
+        self.act_space = act_space
+        self._discount = discount
+        self.step      = step
+        self.device    = device
+        self.precision = precision
+        self.eval_state_mean  = eval_state_mean
+        self._sequence_length = sequence_length
+        self.register_buffer("tfstep", torch.ones(()) * int(self.step))
+        self.wm = WorldModel(hyperParams, sequence_length= self._sequence_length, env_name= self._env, device=self.device, **kwarg)
+        self.RewardNorm = StreamNorm(momentum=0.99, scale=1.0, eps=1e-8)
+        self.imag_horizon = imag_horizon
+        self._use_amp = True if  self.precision==16 else False
+        # Construct agent.
+        # Initialize dataset.
+        self._train_data = DC.Dataset(
+                                      self.obs_space,
+                                      self.act_space,
+                                      replay_buffer_size,
+                                      circular=True,
+                                     )
+        agent_flags = utils.Flags(
+                                  observation_spec= obs_space,
+                                  action_spec     = act_space,
+                                  model_params    = model_params,
+                                  optimizers      = optimizers,
+                                  batch_size      = batch_size,
+                                  weight_decays   = (self.parameter.weight_decay,),
+                                  update_freq     = update_freq,
+                                  update_rate     = update_rate,
+                                  discount        = discount,
+                                  done            = self.parameter.PREDICT_DONE,
+                                  env_name        = env_name,
+                                  train_data      = self._train_data
+                                  )
+        agent_args = Config(agent_flags).agent_args
+        self._task_behavior = D2EAgent(**vars(agent_args))
+        self._task_behavior_params = itertools.chain(
+            self._task_behavior._get_q_source_vars(),
+            self._task_behavior._get_p_vars(),
+            self._task_behavior._get_c_vars(),
+            self._task_behavior._get_v_source_vars(),
+            self._task_behavior._a_vars,
+            self._task_behavior._ae_vars,
+            self._task_behavior._transit_discriminator.parameters()
+        )
+
+    def policy(self, observation, next_observation, reward, done, state=None, mode="train"):
+        obs = self.wm.preprocess(observation, next_observation, reward, done)
+        self.tfstep.copy_(torch.tensor([int(self.step)])[0])
+
+        embed      = self.wm.encoder(obs["observation"])
+        next_embed = self.wm.encoder(obs["next_observation"])
+        sample = (mode == "train") or not self.eval_state_mean
+        
+        latent, _, _, _ = self.wm.transition_model.generate(
+                                                           torch.cat([embed, action], dim=1), 
+                                                           seq_len = embed.shape[-1]
+                                                           )
+        policy_state = latent.copy()
+        if mode == "eval":
+            a_tanh_mode, action, log_pi_a = self._task_behavior._p_fn(policy_state)
+            noise = self.parameter.eval_noise
+        elif mode in ["explore", "train"]:
+            action = self._expl_behavior._p_fn(policy_state)[1]
+            noise  = self.parameter.expl_noise
+        action = action_noise(action, noise, self.act_space)
+        outputs = {"action": action}
+        state = (latent, next_embed)
+        return outputs, state
+
+    def _train(self, data, state=None):
+        """
+        1)train the world model
+        2)imagine state, action, and discount from the world model
+        3)compute reward
+        4)put them as an appropriate format to train D2E agent
+        5) train agent
+        """
+        metrics = {}
+        _, _, z_real, z_next, mets = self.wm._train(data, state)
+
+        metrics.update(mets)
+        dm_env = gym.spec(self._env).make()
+        env = alf_gym_wrapper.AlfGymWrapper(dm_env, discount=self._discount)
+        env = TimeLimit(env, MUJOCO_ENVS_LENNGTH[self._env])
+        with RequiresGrad(self._task_behavior_params):
+            with torch.cuda.amp.autocast(self._use_amp):
+                states, actions, discount, weight, done = self.wm.imagine( 
+                                                                          self._task_behavior, 
+                                                                          z_real, 
+                                                                          self.imag_horizon,
+                                                                          data["done"], 
+                                                                         )
+                seq_feat = torch.cat([states[:-1], actions], dim=1)
+                reward_  = lambda seq: self.wm.heads["reward"](seq_feat).mode()
+                rewards, mets1 = self.RewardNorm(reward_)
+                mets1 = {f"reward_{k}": v for k, v in mets1.items()}
+                self._task_behavior.train_step()
+        if isinstance(self._task_behavior, TrainablePolicy):
+            metrics.update(
+                self._task_behavior.train_batch(self.wm, start, data["is_terminal"], reward)
+            )
+        if self.config.expl_behavior != "greedy":
+            mets = self._expl_behavior.train_batch(start, outputs, data)[-1]
+            metrics.update({"expl_" + key: value for key, value in mets.items()})
+        return state, metrics
+
+    def report(self, data):
+        report = {}
+        data = self.wm.preprocess(data)
+        for key in self.wm.heads["decoder"].cnn_keys:
+            name = key.replace("/", "_")
+            report[f"openl_{name}"] = self.wm.video_pred(data, key)
+        return report
+
+    def initialize_lazy_modules(self, data):
+        _, _, outputs, _ = self.wm.loss(data, None)
+        start = outputs["post"]
+        reward = lambda seq: self.wm.heads["reward"](seq["feat"]).mode()
+        
+        if self.config.expl_behavior != "greedy":
+            self._expl_behavior.lazy_initialize(start, outputs, data)
+        self.zero_grad()
+        self.wm.initialize_optimizer()
+        if isinstance(self._task_behavior, TrainablePolicy):
+            self._task_behavior.loss(self.wm, start, data["is_terminal"], reward)
+            self._task_behavior.initialize_optimizer()
