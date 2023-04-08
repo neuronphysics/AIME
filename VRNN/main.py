@@ -567,7 +567,7 @@ class VRNN_GMM(nn.Module):
         sample_sigma = torch.zeros(batch_size, self.y_dim, T, device=self.device)
 
         ## use the learned initial state based on the first frame.
-        input_ = self.input_drop(u[:, :, 0])
+        input_ = self.input_drop(u)
         h, c   = self.initialize_state_vectors(batch_size, first_obs=input_)
         # for all time steps
         for i in range(len(seq_len)):
