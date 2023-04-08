@@ -1,6 +1,6 @@
 import gin
 import numpy as np
-
+from typing import Optional
 import torch
 
 
@@ -17,7 +17,7 @@ class TensorSpec(object):
     construction and configuration.
     """
 
-    __slots__ = ["_shape", "_dtype", , "_name"]
+    __slots__ = ["_shape", "_dtype", "_name"]
 
     def __init__(self, shape, dtype=torch.float32, name: Optional[str] = None):
         """
