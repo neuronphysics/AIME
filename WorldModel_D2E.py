@@ -9,10 +9,11 @@ import re
 import functools
 import math
 from numbers import Number
-from collections import namedtuple
+from collections import namedtuple, deque
 from typing import Iterables, Tuple, Dict, List
 import gym
 import mujoco_py
+from tensorboardX import SummaryWriter
 import torch
 from torch import nn, optim, jit
 import torchvision.transforms as T
@@ -26,7 +27,7 @@ import torch.utils.data.distributed
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tensorboardX import SummaryWriter
-from planner_D2E_regularizer import D2EAgent, Config, parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
+from planner_D2E_regularizer import D2EAgent, Config, Agent, parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
 import utils_planner as utils
 from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
 from VRNN.main import ModelState
@@ -61,6 +62,7 @@ hyperParams = { "batch_size": 40,
                 "expl_behavior": greedy,
                 "expl_noise": 0.0,
                 "eval_noise": 0.0,
+                "replay_buffer_size":int(1e4),
                 }
 #####################################
 class FreezeParameters:
@@ -834,6 +836,7 @@ class DistLayer(Module):
             return OneHotDist(out)
         raise NotImplementedError(self._dist)
 
+
 class MLP(Module):
     def __init__(self, shape, layers, units, act="elu", norm="none", **out):
         super().__init__()
@@ -854,15 +857,30 @@ class MLP(Module):
         x = x.reshape(features.shape[:-1] + (x.shape[-1],))
         return self.get("out", DistLayer, self._shape, **self._out)(x)
 
+class D2EDataset(Dataset):
+    def __init__(self, REPLAY_SIZE):
+        self.buffer = deque(maxlen=REPLAY_SIZE)
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def __getitem__(self, indx):
+        item = self.buffer[indx]
+        return item.s1, item.s2, item.reward, item.discount, item.a1, item.a2, item.done
+
+    def append(self, Transition):
+        self.buffer.append(Transition)
+
 
 class WorldModel(jit.ScriptModule):
     def __init__(self, 
                  hyperParams, 
                  sequence_length, 
+                 dataset,
                  env_name='Hopper-v2', 
-                 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
-                 log_dir="logs", 
-                 restore=False):
+                 device  = torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
+                 log_dir = "logs", 
+                 restore = False):
         super(WorldModel, self).__init__()
         
         
@@ -882,12 +900,18 @@ class WorldModel(jit.ScriptModule):
         self._env            = env
         self.n_discriminator_iter = self._params.CRITIC_ITERATIONS
         self._use_amp        = False
-        self._saved_action   = None
+        
         #set the sizes
         self.state_dim       = self._params.latent_d
         self.action_dim      = env.action_spec()
         self. observation_dim= env.observation_spec()
-
+        #question: do I need to define this here???
+        self._data =   Dataset(env.observation_spec,
+                               env.action_spec,
+                               self._params.replay_buffer_size,
+                               circular=True,
+                               )
+        self.dataset = dataset
         self.device          = device
         self._clip_rewards   = "tanh"
         self.heads = nn.ModuleDict()
@@ -1054,32 +1078,53 @@ class WorldModel(jit.ScriptModule):
     
     @torch.jit.script_method
     def imagine(self, 
-                agent: nn.Module, 
-                state: torch.Tensor, 
+                agent: Agent, 
+                start_state: Dict[str, Tensor], #a combination of previous states & actions 
                 horizon: int,
                 done: torch.Tensor = None, 
                 ) -> Tuple(torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor):
         tqdm.write("Collect data from imagination:")
         #inspired https://github.com/sai-prasanna/mpc_and_rl/blob/1fedaec5eec7a2a5844935d17b4fd0ad385d9d6c/dreamerv2_torch/dreamerv2_torch/world_model.py#L86
-        state_list, action_list = [state], []
+        
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:])) #torch.Size([b,c,h,w])->torch.Size([b*c,h,w])
+        start = {k: flatten(v) for k, v in start_state.items()}
+        start["action"] = torch.zeros_like(agent._p_fn(start["feat"])[1])
+        seq = {k: [v] for k, v in start.items()}
         time_step = self._env.current_time_step()
-        time_step._replace(observation=state)
+        seq["observation"] = self.decoder(start["feat"])
+        time_step._replace(observation=seq["observation"])
         for i in tqdm(range(horizon)):
-            self._saved_action = agent._p_fn(state.to(device=self.device))
-            action = self._saved_action
-            next_time_step = self._env.step(action.detach().cpu())
-            action_list.append(action)
-            features = torch.cat([torch.stack(state_list), torch.stack(action_list)], dim=1)
-            next_state, sample_mu, sample_sigma, state = self.transition_model.generate(features, seq_len = features.shape[-1])
-            next_time_step._replace(observation=next_state)
-            state_list.append(next_state)
-            state = next_state
-        states   = torch.stack(state_list)
-        actions  = torch.stack(action_list)
-        seq_feat = torch.cat([states[:-1], actions], dim=1)
+            s1=seq["feat"]
+            if i==0:
+                action = agent._p_fn(seq["feat"])[1]
+                seq["action"] = action
+            features = torch.cat([seq["feat"], seq["action"]], dim=1)
+            state, sample_mu, sample_sigma, hidden = self.transition_model.generate(features, seq_len = features.shape[-1])
+            s2= state[:,:,-1]
+            seq["feat"] = torch.cat([seq["feature"], state[:,:,-1]], dim=-1)
+            #generate observation by decoder
+            seq["observation"] = torch.cat([ seq["observation"], self.decoder(state[:,:,-1])], dim=-1)
+            next_time_step = self._env.step(action.unsqueeze(0).detach().cpu())
+            next_action = self._policy(seq["feat"][:,:,-1])[1]
+            #s1, s2, reward, discount, a1, a2, done
+            #inspired by https://github.com/Arseni1919/PL_TEMPLATE_PROJECT/blob/dd5d5fa2284c9ea1da35e316a14299fc89272669/alg_datamodule.py
+            experience = Transition(s1, s2, torch.zeros(1, dtype=torch.float32), torch.zeros(1, dtype=torch.float32), action, next_action, torch.zeros(1, dtype=torch.bool))
+            self.dataset.append(experience)
+            if not time_step.is_last():
+     
+                transition = get_transition(time_step, next_time_step,
+                                               action, next_action)
+                self._data.add_transitions(transition)
+            else:
+                break
+            time_step = next_time_step
+            action = next_action
+            seq["action"] = torch.cat([seq["action"], action], dim=-1) 
+
+        seq_feat = torch.cat([seq["feat"], seq["action"]], dim=1)
         
         disc = self.heads["discount"](seq_feat).mean()
+        seq["reward"] = self.heads["reward"](seq_feat).mode()
         if done is not None:
             # Override discount prediction for the first step with the true
             # discount factor from the replay buffer.
@@ -1089,10 +1134,13 @@ class WorldModel(jit.ScriptModule):
         else:
             done = torch.zeros_like(disc, dtype=torch.bool)
             done[disc <= self._discount**DC.MUJOCO_ENVS_LENNGTH[self._env_name]] = True
-        discount = disc.unsqueeze(-1)   
-        weight   = torch.cumprod( torch.cat([torch.ones_like(disc[:1]), disc[:-1]], 0), 0).unsqueeze(-1)
-
-        return states, actions, discount, weight, done
+        seq["discount"] = disc.unsqueeze(-1)   
+        seq["weight"]   = torch.cumprod( torch.cat([torch.ones_like(disc[:1]), disc[:-1]], 0), 0).unsqueeze(-1)
+        seq["done"]     = done
+        for i in range(len(self.dataset)):
+            self.dataset[i] = self.dataset[i]._replace(discount = seq["discount"][i])
+            self.dataset[i] = self.dataset[i]._replace(done = seq["done"][i])
+        return seq
     
     def video_pred(self, observation, action):
         
@@ -1140,6 +1188,7 @@ class WorldModel(jit.ScriptModule):
             print("Checkpoints not found!")
 
 class D2EAlgorithm(nn.Module):
+    #https://github.com/sai-prasanna/dreamerv2_torch/tree/main/dreamerv2_torch/agent.py
     def __init__(self, 
                  hyperParams, 
                  sequence_length, 
@@ -1148,6 +1197,7 @@ class D2EAlgorithm(nn.Module):
                  obs_space, 
                  act_space, 
                  step: Counter, *,
+                 log_dir,
                  model_params=(((200, 200),), 2, 1),
                  optimizers=(( 0.0001, 0.5, 0.99),),
                  batch_size=50,
@@ -1162,9 +1212,11 @@ class D2EAlgorithm(nn.Module):
         super().__init__()
         self.parameter = namedtuple('x', hyperParams.keys())(*hyperParams.values())
         self._env      = env_name
+        self._discount = discount
+
         self.obs_space = obs_space
         self.act_space = act_space
-        self._discount = discount
+        
         self.step      = step
         self.device    = device
         self.precision = precision
@@ -1175,14 +1227,12 @@ class D2EAlgorithm(nn.Module):
         self.RewardNorm = StreamNorm(momentum=0.99, scale=1.0, eps=1e-8)
         self.imag_horizon = imag_horizon
         self._use_amp = True if  self.precision==16 else False
+
+        train_summary_dir = os.path.join(log_dir, 'train')
+        self.train_summary_writer = SummaryWriter( train_summary_dir)
         # Construct agent.
         # Initialize dataset.
-        self._train_data = DC.Dataset(
-                                      self.obs_space,
-                                      self.act_space,
-                                      replay_buffer_size,
-                                      circular=True,
-                                     )
+        
         agent_flags = utils.Flags(
                                   observation_spec= obs_space,
                                   action_spec     = act_space,
@@ -1195,7 +1245,7 @@ class D2EAlgorithm(nn.Module):
                                   discount        = discount,
                                   done            = self.parameter.PREDICT_DONE,
                                   env_name        = env_name,
-                                  train_data      = self._train_data
+                                  train_data      = self.wm.dataset
                                   )
         agent_args = Config(agent_flags).agent_args
         self._task_behavior = D2EAgent(**vars(agent_args))
@@ -1235,39 +1285,52 @@ class D2EAlgorithm(nn.Module):
 
     def _train(self, data, state=None):
         """
+        List of operations happen here in this module 
         1)train the world model
-        2)imagine state, action, and discount from the world model
-        3)compute reward
-        4)put them as an appropriate format to train D2E agent
-        5) train agent
+        2)imagine state, action, reward, and discount from the world model
+        3)normaize reward
+        4)update reward and put them as an appropriate format to train D2E agent
+        5) train the policy
+        6) we should minimize the difference between the reward and discount (maybe observation) here too???
         """
+        
         metrics = {}
         _, _, z_real, z_next, mets = self.wm._train(data, state)
 
         metrics.update(mets)
-        dm_env = gym.spec(self._env).make()
-        env = alf_gym_wrapper.AlfGymWrapper(dm_env, discount=self._discount)
-        env = TimeLimit(env, MUJOCO_ENVS_LENNGTH[self._env])
+        start["feat"] = z_real
         with RequiresGrad(self._task_behavior_params):
             with torch.cuda.amp.autocast(self._use_amp):
-                states, actions, discount, weight, done = self.wm.imagine( 
-                                                                          self._task_behavior, 
-                                                                          z_real, 
-                                                                          self.imag_horizon,
-                                                                          data["done"], 
-                                                                         )
-                seq_feat = torch.cat([states[:-1], actions], dim=1)
-                reward_  = lambda seq: self.wm.heads["reward"](seq_feat).mode()
-                rewards, mets1 = self.RewardNorm(reward_)
+                seq = self.wm.imagine( 
+                                      self._task_behavior, 
+                                      start, 
+                                      self.imag_horizon,
+                                      data["done"], 
+                                      )
+                
+                rewards, mets1 = self.RewardNorm(seq["reward"])
+                #update reward in the dataset before training the agent 
+                for i in range(len(self.wm.dataset)):
+                    self.wm.dataset[i] = self.wm.dataset[i]._replace(reward = rewards[i])
                 mets1 = {f"reward_{k}": v for k, v in mets1.items()}
+                #train the policy 
                 self._task_behavior.train_step()
-        if isinstance(self._task_behavior, TrainablePolicy):
-            metrics.update(
-                self._task_behavior.train_batch(self.wm, start, data["is_terminal"], reward)
-            )
-        if self.config.expl_behavior != "greedy":
-            mets = self._expl_behavior.train_batch(start, outputs, data)[-1]
-            metrics.update({"expl_" + key: value for key, value in mets.items()})
+                step = self._task_behavior.global_step
+                #get all the loss values from policy network 
+                #here: https://github.com/neuronphysics/AIME/blob/1077b972d2ce85882cf54558370b21d83f687ce5/planner_D2E_regularizer.py#L1329
+                mets2 = self._task_behavior._all_train_info
+                metrics.update({"expl_" + key: value for key, value in mets2.items()})
+                #Number (6) task
+                losses = {}
+                for name, head in self.wm.heads.items():
+                     out = head(seq[name])
+                     dists = out if isinstance(out, dict) else {name: out}
+                     for key, dist in dists.items():
+                         like = dist.log_prob(getattr(self.wm._data, key))
+                         likes[key] = like
+                         losses[key] = -like.mean()
+                metrics.update(**mets1)
+                metrics.update(f"{name}_loss": value.detach().cpu() for name, value in losses.items())
         return state, metrics
 
     def report(self, data):
@@ -1277,16 +1340,3 @@ class D2EAlgorithm(nn.Module):
             name = key.replace("/", "_")
             report[f"openl_{name}"] = self.wm.video_pred(data, key)
         return report
-
-    def initialize_lazy_modules(self, data):
-        _, _, outputs, _ = self.wm.loss(data, None)
-        start = outputs["post"]
-        reward = lambda seq: self.wm.heads["reward"](seq["feat"]).mode()
-        
-        if self.config.expl_behavior != "greedy":
-            self._expl_behavior.lazy_initialize(start, outputs, data)
-        self.zero_grad()
-        self.wm.initialize_optimizer()
-        if isinstance(self._task_behavior, TrainablePolicy):
-            self._task_behavior.loss(self.wm, start, data["is_terminal"], reward)
-            self._task_behavior.initialize_optimizer()
