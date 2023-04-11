@@ -922,6 +922,7 @@ class WorldModel(jit.ScriptModule):
         os.makedirs(self.ckpt_path, exist_ok=True) 
         self.logger = Logger(self.__class__.__name__)
         self.mse_loss = nn.MSELoss()
+        #vrrn folder main.py script :traisition model
         modelstate =  ModelState(seed            = self._params.seed,
                                  nu              = self.state_dim + self.action_dim,
                                  ny              = self.state_dim,
@@ -935,6 +936,7 @@ class WorldModel(jit.ScriptModule):
                                 )
         self.standard_scaler = StandardScaler(self.device)
         self.transition_model = modelstate.model
+        #getting sensory information ad building latent state 
         self.variational_autoencoder = InfGaussMMVAE(hyperParams,
                                                      K          = self._params.K,
                                                      nchannel   = self._params.n_channel,
@@ -1085,7 +1087,8 @@ class WorldModel(jit.ScriptModule):
                 ) -> Tuple(torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor):
         tqdm.write("Collect data from imagination:")
         #inspired https://github.com/sai-prasanna/mpc_and_rl/blob/1fedaec5eec7a2a5844935d17b4fd0ad385d9d6c/dreamerv2_torch/dreamerv2_torch/world_model.py#L86
-        
+        #Main challenge : get frames from Mujoco and build a right type data structure with latent representations which are suitable for D2EAgent class (the planner)
+        # 
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:])) #torch.Size([b,c,h,w])->torch.Size([b*c,h,w])
         start = {k: flatten(v) for k, v in start_state.items()}
         start["action"] = torch.zeros_like(agent._p_fn(start["feat"])[1])
@@ -1288,8 +1291,8 @@ class D2EAlgorithm(nn.Module):
         List of operations happen here in this module 
         1)train the world model
         2)imagine state, action, reward, and discount from the world model
-        3)normaize reward
-        4)update reward and put them as an appropriate format to train D2E agent
+        3) normaize reward
+        4) update reward and put them as an appropriate format to train D2E agent
         5) train the policy
         6) we should minimize the difference between the reward and discount (maybe observation) here too???
         """
