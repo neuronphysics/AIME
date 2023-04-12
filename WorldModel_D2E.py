@@ -922,7 +922,7 @@ class WorldModel(jit.ScriptModule):
         os.makedirs(self.ckpt_path, exist_ok=True) 
         self.logger = Logger(self.__class__.__name__)
         self.mse_loss = nn.MSELoss()
-        #vrrn folder main.py script :traisition model
+        #inside VRNN folder we have main.py script : the traisition model
         modelstate =  ModelState(seed            = self._params.seed,
                                  nu              = self.state_dim + self.action_dim,
                                  ny              = self.state_dim,
@@ -936,7 +936,7 @@ class WorldModel(jit.ScriptModule):
                                 )
         self.standard_scaler = StandardScaler(self.device)
         self.transition_model = modelstate.model
-        #getting sensory information ad building latent state 
+        #getting sensory information and building latent state 
         self.variational_autoencoder = InfGaussMMVAE(hyperParams,
                                                      K          = self._params.K,
                                                      nchannel   = self._params.n_channel,
