@@ -1,25 +1,28 @@
-import os
+import os #
 import numpy as np
 import itertools
 from tqdm import tqdm
-import logging
+import logging #
 import cv2
 import imageio
-import re
-import functools
+import re #
+import pathlib #
+import random #
+import warnings #
+import functools #
 import math
 from numbers import Number
-from collections import namedtuple, deque
+from collections import namedtuple, deque, defaultdict #
 from typing import Iterables, Tuple, Dict, List
 import gym
 import mujoco_py
 from tensorboardX import SummaryWriter
-import torch
+import torch #
 from torch import nn, optim, jit
 import torchvision.transforms as T
 import torch.nn.functional as F
 from torch.utils.data import Dataset, TensorDataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from torch.distributions import Distribution, constraints
 from torch.distributions.utils import broadcast_all
 import torch.backends.cudnn as cudnn
@@ -33,11 +36,238 @@ from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient
 from VRNN.main import ModelState
 from VRNN.Normalization import compute_normalizer
 from VRNN.Blocks import init_weights
-import DataCollectionD2E_WM  as DC
+import DataCollectionD2E as DC
 import alf_gym_wrapper
 import argparse
 from alf_environment import TimeLimit
+import json
+import time
+from dmc_gym_wrapper import DMCGYMWrapper
+from gym_wrappers import wrap_env
+
+try:
+    import rich.traceback ##
+    rich.traceback.install() ##
+except ImportError:
+    pass
+
+import io
+import uuid
+import datetime
 #####################################
+def get_datetime():
+  now = datetime.datetime.now().isoformat()
+  now = re.sub(r'\D', '', now)[:-6]
+  return now
+#####################################
+#https://github.com/danijar/dreamerv2/blob/main/dreamerv2/common/replay.py
+
+class IterableWrapper(IterableDataset):
+    def __init__(self, iterator):
+        super().__init__()
+        self.iterator = iterator
+
+    def __iter__(self):
+        return self.iterator
+
+def isnamedtupleinstance(x):
+    t = type(x)
+    b = t.__bases__
+    if len(b) != 1 or b[0] != tuple: return False
+    f = getattr(t, '_fields', None)
+    if not isinstance(f, tuple): return False
+    return all(type(n)==str for n in f)
+
+class Replay:
+    def __init__(
+        self,
+        directory,
+        capacity=0,
+        ongoing=False,
+        minlen=1,
+        maxlen=0,
+        prioritize_ends=False,
+    ):
+        self._directory = pathlib.Path(directory).expanduser()
+        self._directory.mkdir(parents=True, exist_ok=True)
+        self._capacity = capacity
+        self._ongoing = ongoing
+        self._minlen = minlen
+        self._maxlen = maxlen
+        self._prioritize_ends = prioritize_ends
+        self._random = np.random.RandomState()
+        # filename -> key -> value_sequence
+        self._complete_eps = load_episodes(self._directory, capacity, minlen)
+        # worker -> key -> value_sequence
+        self._ongoing_eps = collections.defaultdict(
+            lambda: collections.defaultdict(list)
+        )
+        self._total_episodes, self._total_steps = count_episodes(directory)
+        self._loaded_episodes = len(self._complete_eps)
+        self._loaded_steps = sum(eplen(x) for x in self._complete_eps.values())
+
+    @property
+    def stats(self):
+        return {
+            "total_steps": self._total_steps,
+            "total_episodes": self._total_episodes,
+            "loaded_steps": self._loaded_steps,
+            "loaded_episodes": self._loaded_episodes,
+        }
+
+    def add_step(self, transition, worker=0):
+        episode = self._ongoing_eps[worker]
+        if isnamedtupleinstance(transition):
+           for key, value in transition._asdict().items():
+               episode[key].append(value)
+           if transition.done:
+              self.add_episode(episode)
+        elif isinstance(transition, dict):
+            for key, value in transition.items():
+                episode[key].append(value)
+            if transition["is_last"]:
+                self.add_episode(episode)
+        episode.clear()
+
+    def add_episode(self, episode):
+        length = eplen(episode)
+        if length < self._minlen:
+            print(f"Skipping short episode of length {length}.")
+            return
+        self._total_steps += length
+        self._loaded_steps += length
+        self._total_episodes += 1
+        self._loaded_episodes += 1
+        episode = {key: convert(value) for key, value in episode.items()}
+        filename = save_episode(self._directory, episode)
+        self._complete_eps[str(filename)] = episode
+        self._enforce_limit()
+
+    def dataset(self, batch, length):
+        # example = next(iter(self._generate_chunks(length)))
+        dataset = IterableWrapper(iter(self._generate_chunks(length)))
+        dataloader = DataLoader(dataset, batch_size=batch)
+        return dataloader
+
+    def _generate_chunks(self, length):
+        sequence = self._sample_sequence()
+        while True:
+            chunk = collections.defaultdict(list)
+            added = 0
+            while added < length:
+                needed = length - added
+                adding = {k: v[:needed] for k, v in sequence.items()}
+                sequence = {k: v[needed:] for k, v in sequence.items()}
+                for key, value in adding.items():
+                    chunk[key].append(value)
+                added += len(adding["action"])
+                if len(sequence["action"]) < 1:
+                    sequence = self._sample_sequence()
+            chunk = {k: np.concatenate(v) for k, v in chunk.items()}
+            yield chunk
+
+    def _sample_sequence(self):
+        episodes = list(self._complete_eps.values())
+        if self._ongoing:
+            episodes += [
+                x for x in self._ongoing_eps.values() if eplen(x) >= self._minlen
+            ]
+        episode = self._random.choice(episodes)
+        total = len(episode["action"])
+        length = total
+        if self._maxlen:
+            length = min(length, self._maxlen)
+        # Randomize length to avoid all chunks ending at the same time in case the
+        # episodes are all of the same length.
+        length -= np.random.randint(self._minlen)
+        length = max(self._minlen, length)
+        upper = total - length + 1
+        if self._prioritize_ends:
+            upper += self._minlen
+        index = min(self._random.randint(upper), total - length)
+        sequence = {
+            k: convert(v[index : index + length])
+            for k, v in episode.items()
+            if not k.startswith("log_")
+        }
+        sequence["is_first"] = np.zeros(len(sequence["action"]), bool)
+        sequence["is_first"][0] = True
+        if self._maxlen:
+            assert self._minlen <= len(sequence["action"]) <= self._maxlen
+        return sequence
+
+    def _enforce_limit(self):
+        if not self._capacity:
+            return
+        while self._loaded_episodes > 1 and self._loaded_steps > self._capacity:
+            # Relying on Python preserving the insertion order of dicts.
+            oldest, episode = next(iter(self._complete_eps.items()))
+            self._loaded_steps -= eplen(episode)
+            self._loaded_episodes -= 1
+            del self._complete_eps[oldest]
+
+
+def count_episodes(directory):
+    filenames = list(directory.glob("*.npz"))
+    num_episodes = len(filenames)
+    num_steps = sum(int(str(n).split("-")[-1][:-4]) - 1 for n in filenames)
+    return num_episodes, num_steps
+
+
+def save_episode(directory, episode):
+    timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    identifier = str(uuid.uuid4().hex)
+    length = eplen(episode)
+    filename = directory / f"{timestamp}-{identifier}-{length}.npz"
+    with io.BytesIO() as f1:
+        np.savez_compressed(f1, **episode)
+        f1.seek(0)
+        with filename.open("wb") as f2:
+            f2.write(f1.read())
+    return filename
+
+
+def load_episodes(directory, capacity=None, minlen=1):
+    # The returned directory from filenames to episodes is guaranteed to be in
+    # temporally sorted order.
+    filenames = sorted(directory.glob("*.npz"))
+    if capacity:
+        num_steps = 0
+        num_episodes = 0
+        for filename in reversed(filenames):
+            length = int(str(filename).split("-")[-1][:-4])
+            num_steps += length
+            num_episodes += 1
+            if num_steps >= capacity:
+                break
+        filenames = filenames[-num_episodes:]
+    episodes = {}
+    for filename in filenames:
+        try:
+            with filename.open("rb") as f:
+                episode = np.load(f)
+                episode = {k: episode[k] for k in episode.keys()}
+        except Exception as e:
+            print(f"Could not load episode {str(filename)}: {e}")
+            continue
+        episodes[str(filename)] = episode
+    return episodes
+
+
+def convert(value):
+    value = np.array(value)
+    if np.issubdtype(value.dtype, np.floating):
+        return value.astype(np.float32)
+    elif np.issubdtype(value.dtype, np.signedinteger):
+        return value.astype(np.int32)
+    elif np.issubdtype(value.dtype, np.uint8):
+        return value.astype(np.uint8)
+    return value
+
+
+def eplen(episode):
+    return len(episode["action"]) - 1
+############################################
 hyperParams = { "batch_size": 40,
                 "input_d": 1,
                 "prior_alpha": 7., #gamma_alpha
@@ -114,6 +344,229 @@ class Counter:
     def increment(self, amount=1):
         self.value += amount
 
+##################
+class Driver:
+    def __init__(self, envs, **kwargs):
+        self._envs = envs
+        self._kwargs = kwargs
+        self._on_steps = []
+        self._on_resets = []
+        self._on_episodes = []
+        self._act_spaces = [env.act_space for env in envs]
+        self.reset()
+
+    def on_step(self, callback):
+        self._on_steps.append(callback)
+
+    def on_reset(self, callback):
+        self._on_resets.append(callback)
+
+    def on_episode(self, callback):
+        self._on_episodes.append(callback)
+
+    def reset(self):
+        self._obs = [None] * len(self._envs)
+        self._eps = [None] * len(self._envs)
+        self._state = None
+
+    def __call__(self, policy, steps=0, episodes=0):
+        step, episode = 0, 0
+        while step < steps or episode < episodes:
+            obs = {
+                i: self._envs[i].reset()
+                for i, ob in enumerate(self._obs)
+                if ob is None or ob["is_last"]
+            }
+            for i, ob in obs.items():
+                self._obs[i] = ob() if callable(ob) else ob
+                act = {k: np.zeros(v.shape) for k, v in self._act_spaces[i].items()}
+                tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
+                [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
+                self._eps[i] = [tran]
+            obs = {k: np.stack([o[k] for o in self._obs]) for k in self._obs[0]}
+            actions, self._state = policy(obs, self._state, **self._kwargs)
+            actions = [
+                {k: np.array(actions[k][i].cpu()) for k in actions}
+                for i in range(len(self._envs))
+            ]
+            assert len(actions) == len(self._envs)
+            obs = [e.step(a) for e, a in zip(self._envs, actions)]
+            obs = [ob() if callable(ob) else ob for ob in obs]
+            for i, (act, ob) in enumerate(zip(actions, obs)):
+                tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
+                [fn(tran, worker=i, **self._kwargs) for fn in self._on_steps]
+                self._eps[i].append(tran)
+                step += 1
+                if ob["is_last"]:
+                    ep = self._eps[i]
+                    ep = {k: self._convert([t[k] for t in ep]) for k in ep[0]}
+                    [fn(ep, **self._kwargs) for fn in self._on_episodes]
+                    episode += 1
+            self._obs = obs
+
+    def _convert(self, value):
+        value = np.array(value)
+        if np.issubdtype(value.dtype, np.floating):
+            return value.astype(np.float32)
+        elif np.issubdtype(value.dtype, np.signedinteger):
+            return value.astype(np.int32)
+        elif np.issubdtype(value.dtype, np.uint8):
+            return value.astype(np.uint8)
+        return value
+###########################
+class Logger:
+    def __init__(self, step, outputs, multiplier=1):
+        self._step = step
+        self._outputs = outputs
+        self._multiplier = multiplier
+        self._last_step = None
+        self._last_time = None
+        self._metrics = []
+
+    def add(self, mapping, prefix=None):
+        step = int(self._step) * self._multiplier
+        for name, value in dict(mapping).items():
+            name = f"{prefix}_{name}" if prefix else name
+            value = np.array(value)
+            if len(value.shape) not in (0, 2, 3, 4):
+                raise ValueError(
+                    f"Shape {value.shape} for name '{name}' cannot be "
+                    "interpreted as scalar, image, or video."
+                )
+            self._metrics.append((step, name, value))
+
+    def scalar(self, name, value):
+        self.add({name: value})
+
+    def image(self, name, value):
+        self.add({name: value})
+
+    def video(self, name, value):
+        self.add({name: value})
+
+    def write(self, fps=False):
+        fps and self.scalar("fps", self._compute_fps())
+        if not self._metrics:
+            return
+        for output in self._outputs:
+            output(self._metrics)
+        self._metrics.clear()
+
+    def _compute_fps(self):
+        step = int(self._step) * self._multiplier
+        if self._last_step is None:
+            self._last_time = time.time()
+            self._last_step = step
+            return 0
+        steps = step - self._last_step
+        duration = time.time() - self._last_time
+        self._last_time += duration
+        self._last_step = step
+        return steps / duration
+
+
+class TerminalOutput:
+    def __call__(self, summaries):
+        step = max(s for s, _, _, in summaries)
+        scalars = {k: float(v) for _, k, v in summaries if len(v.shape) == 0}
+        formatted = {k: self._format_value(v) for k, v in scalars.items()}
+        print(f"[{step}]", " / ".join(f"{k} {v}" for k, v in formatted.items()))
+
+    def _format_value(self, value):
+        if value == 0:
+            return "0"
+        elif 0.01 < abs(value) < 10000:
+            value = f"{value:.2f}"
+            value = value.rstrip("0")
+            value = value.rstrip("0")
+            value = value.rstrip(".")
+            return value
+        else:
+            value = f"{value:.1e}"
+            value = value.replace(".0e", "e")
+            value = value.replace("+0", "")
+            value = value.replace("+", "")
+            value = value.replace("-0", "-")
+        return value
+
+
+class JSONLOutput:
+    def __init__(self, logdir):
+        self._logdir = pathlib.Path(logdir).expanduser()
+
+    def __call__(self, summaries):
+        scalars = {k: float(v) for _, k, v in summaries if len(v.shape) == 0}
+        step = max(s for s, _, _, in summaries)
+        with (self._logdir / "metrics.jsonl").open("a") as f:
+            f.write(json.dumps({"step": step, **scalars}) + "\n")
+
+
+class TensorBoardOutput:
+    def __init__(self, logdir, fps=20):
+        # The TensorFlow summary writer supports file protocols like gs://. We use
+        # os.path over pathlib here to preserve those prefixes.
+        self._logdir = os.path.expanduser(logdir)
+        self._writer = None
+        self._fps = fps
+
+    def __call__(self, summaries):
+
+        self._ensure_writer()
+        for step, name, value in summaries:
+            if len(value.shape) == 0:
+                self._writer.add_scalar("scalars/" + name, value, step)
+            elif len(value.shape) == 2:
+                self._writer.add_image(name, value, step)
+            elif len(value.shape) == 3:
+                self._writer.add_image(name, value, step)
+            elif len(value.shape) == 4:
+                self._video_summary(name, value, step)
+        self._writer.flush()
+
+    def _ensure_writer(self):
+        if not self._writer:
+            self._writer = SummaryWriter(self._logdir, max_queue=1000)
+
+    def _video_summary(self, name, video, step):
+        name = name if isinstance(name, str) else name.decode("utf-8")
+        if np.issubdtype(video.dtype, np.floating):
+            video = np.clip(255 * video, 0, 255).astype(np.uint8)
+        T, H, W, C = video.shape
+        video = video.transpose(0, 3, 1, 2).reshape((1, T, C, H, W))
+
+        # T, H, W, C = video.shape
+        # image = tf1.Summary.Image(height=H, width=W, colorspace=C)
+        # image.encoded_image_string = encode_gif(video, self._fps)
+        # summary.value.add(tag=name, image=image)
+        self._writer.add_video(name, video, step, 16)
+        # tf.summary.experimental.write_raw_pb(summary.SerializeToString(), step)
+        # except (IOError, OSError) as e:
+        #     print("GIF summaries require ffmpeg in $PATH.", e)
+        #    # tf.summary.image(name, video, step)
+
+
+def encode_gif(frames, fps):
+    from subprocess import Popen, PIPE
+
+    h, w, c = frames[0].shape
+    pxfmt = {1: "gray", 3: "rgb24"}[c]
+    cmd = " ".join(
+        [
+            "ffmpeg -y -f rawvideo -vcodec rawvideo",
+            f"-r {fps:.02f} -s {w}x{h} -pix_fmt {pxfmt} -i - -filter_complex",
+            "[0:v]split[x][z];[z]palettegen[y];[x]fifo[x];[x][y]paletteuse",
+            f"-r {fps:.02f} -f gif -",
+        ]
+    )
+    proc = Popen(cmd.split(" "), stdin=PIPE, stdout=PIPE, stderr=PIPE)
+    for image in frames:
+        proc.stdin.write(image.tobytes())
+    out, err = proc.communicate()
+    if proc.returncode:
+        raise IOError("\n".join([" ".join(cmd), err.decode("utf8")]))
+    del proc
+    return out
+#########################################
 def schedule(string, step):
     try:
         return float(string)
@@ -1136,7 +1589,7 @@ class WorldModel(jit.ScriptModule):
             disc = torch.concat([true_first[None], disc[1:]], 0)
         else:
             done = torch.zeros_like(disc, dtype=torch.bool)
-            done[disc <= self._discount**DC.MUJOCO_ENVS_LENNGTH[self._env_name]] = True
+            done[disc <= self._discount**DC.MUJOCO_ENVS_LENGTH[self._env_name]] = True
         seq["discount"] = disc.unsqueeze(-1)   
         seq["weight"]   = torch.cumprod( torch.cat([torch.ones_like(disc[:1]), disc[:-1]], 0), 0).unsqueeze(-1)
         seq["done"]     = done
@@ -1195,12 +1648,12 @@ class D2EAlgorithm(nn.Module):
     def __init__(self, 
                  hyperParams, 
                  sequence_length, 
-                 env_name = 'Hopper-v2', 
-                 device   = torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
                  obs_space, 
                  act_space, 
-                 step: Counter, *,
-                 log_dir,
+                 step: Counter,
+                 env_name:str 'Hopper-v2', 
+                 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
+                 log_dir=os.path.join(os.getcwd(), "\log"),
                  model_params=(((200, 200),), 2, 1),
                  optimizers=(( 0.0001, 0.5, 0.99),),
                  batch_size=50,
@@ -1343,3 +1796,495 @@ class D2EAlgorithm(nn.Module):
             name = key.replace("/", "_")
             report[f"openl_{name}"] = self.wm.video_pred(data, key)
         return report
+
+##############
+class NormalizeAction:
+    def __init__(self, env, key="action"):
+        self._env = env
+        self._key = key
+        space = env.act_space[key]
+        self._mask = np.isfinite(space.low) & np.isfinite(space.high)
+        self._low = np.where(self._mask, space.low, -1)
+        self._high = np.where(self._mask, space.high, 1)
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        try:
+            return getattr(self._env, name)
+        except AttributeError:
+            raise ValueError(name)
+
+    @property
+    def act_space(self):
+        low = np.where(self._mask, -np.ones_like(self._low), self._low)
+        high = np.where(self._mask, np.ones_like(self._low), self._high)
+        space = gym.spaces.Box(low, high, dtype=np.float32)
+        return {**self._env.act_space, self._key: space}
+
+    def step(self, action):
+        orig = (action[self._key] + 1) / 2 * (self._high - self._low) + self._low
+        orig = np.where(self._mask, orig, action[self._key])
+        return self._env.step({**action, self._key: orig})
+
+######################
+
+class Every:
+    def __init__(self, every):
+        self._every = every
+        self._last = None
+
+    def __call__(self, step):
+        step = int(step)
+        if not self._every:
+            return False
+        if self._last is None:
+            self._last = step
+            return True
+        if step >= self._last + self._every:
+            self._last += self._every
+            return True
+        return False
+
+
+class Once:
+    def __init__(self):
+        self._once = True
+
+    def __call__(self):
+        if self._once:
+            self._once = False
+            return True
+        return False
+
+
+class Until:
+    def __init__(self, until):
+        self._until = until
+
+    def __call__(self, step):
+        step = int(step)
+        if not self._until:
+            return True
+        return step < self._until
+##############
+class VideoRenderWrapper(gym.Wrapper):
+    """A wrapper to enable 'rgb_array' rendering for the gym wrapper of
+    ``dm_control``. To do this, the ``metadata`` field needs to be updated.
+    """
+    _metadata = {'render.modes': ["rgb_array"]}
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.metadata.update(self._metadata)
+#########################
+
+class Driver:
+    def __init__(self, envs, **kwargs):
+        self._envs = envs
+        self._kwargs = kwargs
+        self._on_steps = []
+        self._on_resets = []
+        self._on_episodes = []
+        self._act_spaces = [env.act_space for env in envs]
+        self.reset()
+
+    def on_step(self, callback):
+        self._on_steps.append(callback)
+
+    def on_reset(self, callback):
+        self._on_resets.append(callback)
+
+    def on_episode(self, callback):
+        self._on_episodes.append(callback)
+
+    def reset(self):
+        self._obs = [None] * len(self._envs)
+        self._eps = [None] * len(self._envs)
+        self._state = None
+
+    def __call__(self, policy, steps=0, episodes=0):
+        step, episode = 0, 0
+        while step < steps or episode < episodes:
+            obs = {
+                i: self._envs[i].reset()
+                for i, ob in enumerate(self._obs)
+                if ob is None or ob["is_last"]
+            }
+            for i, ob in obs.items():
+                self._obs[i] = ob() if callable(ob) else ob
+                act = {k: np.zeros(v.shape) for k, v in self._act_spaces[i].items()}
+                tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
+                [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
+                self._eps[i] = [tran]
+            obs = {k: np.stack([o[k] for o in self._obs]) for k in self._obs[0]}
+            actions, self._state = policy(obs, self._state, **self._kwargs)
+            actions = [
+                {k: np.array(actions[k][i].cpu()) for k in actions}
+                for i in range(len(self._envs))
+            ]
+            assert len(actions) == len(self._envs)
+            obs = [e.step(a) for e, a in zip(self._envs, actions)]
+            obs = [ob() if callable(ob) else ob for ob in obs]
+            for i, (act, ob) in enumerate(zip(actions, obs)):
+                tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
+                [fn(tran, worker=i, **self._kwargs) for fn in self._on_steps]
+                self._eps[i].append(tran)
+                step += 1
+                if ob["is_last"]:
+                    ep = self._eps[i]
+                    ep = {k: self._convert([t[k] for t in ep]) for k in ep[0]}
+                    [fn(ep, **self._kwargs) for fn in self._on_episodes]
+                    episode += 1
+            self._obs = obs
+
+    def _convert(self, value):
+        value = np.array(value)
+        if np.issubdtype(value.dtype, np.floating):
+            return value.astype(np.float32)
+        elif np.issubdtype(value.dtype, np.signedinteger):
+            return value.astype(np.int32)
+        elif np.issubdtype(value.dtype, np.uint8):
+            return value.astype(np.uint8)
+        return value
+
+class Async:
+
+    # Message types for communication via the pipe.
+    _ACCESS = 1
+    _CALL = 2
+    _RESULT = 3
+    _CLOSE = 4
+    _EXCEPTION = 5
+
+    def __init__(self, constructor, strategy="thread"):
+        self._pickled_ctor = cloudpickle.dumps(constructor)
+        if strategy == "process":
+            import multiprocessing as mp
+
+            context = mp.get_context("spawn")
+        elif strategy == "thread":
+            import multiprocessing.dummy as context
+        else:
+            raise NotImplementedError(strategy)
+        self._strategy = strategy
+        self._conn, conn = context.Pipe()
+        self._process = context.Process(target=self._worker, args=(conn,))
+        atexit.register(self.close)
+        self._process.start()
+        self._receive()  # Ready.
+        self._obs_space = None
+        self._act_space = None
+
+    def access(self, name):
+        self._conn.send((self._ACCESS, name))
+        return self._receive
+
+    def call(self, name, *args, **kwargs):
+        payload = name, args, kwargs
+        self._conn.send((self._CALL, payload))
+        return self._receive
+
+    def close(self):
+        try:
+            self._conn.send((self._CLOSE, None))
+            self._conn.close()
+        except IOError:
+            pass  # The connection was already closed.
+        self._process.join(5)
+
+    @property
+    def obs_space(self):
+        if not self._obs_space:
+            self._obs_space = self.access("obs_space")()
+        return self._obs_space
+
+    @property
+    def act_space(self):
+        if not self._act_space:
+            self._act_space = self.access("act_space")()
+        return self._act_space
+
+    def step(self, action, blocking=False):
+        promise = self.call("step", action)
+        if blocking:
+            return promise()
+        else:
+            return promise
+
+    def reset(self, blocking=False):
+        promise = self.call("reset")
+        if blocking:
+            return promise()
+        else:
+            return promise
+
+    def _receive(self):
+        try:
+            message, payload = self._conn.recv()
+        except (OSError, EOFError):
+            raise RuntimeError("Lost connection to environment worker.")
+        # Re-raise exceptions in the main process.
+        if message == self._EXCEPTION:
+            stacktrace = payload
+            raise Exception(stacktrace)
+        if message == self._RESULT:
+            return payload
+        raise KeyError("Received message of unexpected type {}".format(message))
+
+    def _worker(self, conn):
+        try:
+            ctor = cloudpickle.loads(self._pickled_ctor)
+            env = ctor()
+            conn.send((self._RESULT, None))  # Ready.
+            while True:
+                try:
+                    # Only block for short times to have keyboard exceptions be raised.
+                    if not conn.poll(0.1):
+                        continue
+                    message, payload = conn.recv()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if message == self._ACCESS:
+                    name = payload
+                    result = getattr(env, name)
+                    conn.send((self._RESULT, result))
+                    continue
+                if message == self._CALL:
+                    name, args, kwargs = payload
+                    result = getattr(env, name)(*args, **kwargs)
+                    conn.send((self._RESULT, result))
+                    continue
+                if message == self._CLOSE:
+                    break
+                raise KeyError("Received message of unknown type {}".format(message))
+        except Exception:
+            stacktrace = "".join(traceback.format_exception(*sys.exc_info()))
+            print("Error in environment process: {}".format(stacktrace))
+            conn.send((self._EXCEPTION, stacktrace))
+        finally:
+            try:
+                conn.close()
+            except IOError:
+                pass  # The connection was already closed.
+
+class CarryOverState:
+    def __init__(self, fn):
+        self._fn = fn
+        self._state = None
+
+    def __call__(self, *args):
+        self._state, out = self._fn(*args, self._state)
+        return out
+
+def main(args):
+    dataset = dict({'batch':args.batch,'length': args.length})
+    train_replay_param = dict({'capacity': 2e6, 'ongoing': False, 'minlen': 50, 'maxlen': 50, 'prioritize_ends': True})
+    if args.seed >= 0:
+       torch.manual_seed(args.seed)
+       np.random.seed(args.seed)
+       random.seed(args.seed)
+       torch.cuda.manual_seed(args.seed)
+    logdir = pathlib.Path(args.logdir).expanduser()
+    logdir.mkdir(parents=True, exist_ok=True)
+
+
+    train_replay = Replay( logdir / "train_episodes",**train_replay_param,)
+    eval_replay = Replay(
+                         logdir / "eval_episodes",
+        **dict(
+            capacity=train_replay_param["capacity"] // 10,
+            minlen=train_replay_param['minlen'],
+            maxlen=train_replay_param['maxlen'],
+        ),
+    )
+    step = Counter(train_replay.stats["total_steps"])
+    outputs = [
+               TerminalOutput(),
+               JSONLOutput(logdir),
+               TensorBoardOutput(logdir),
+    ]
+    logger = Logger(step, outputs, multiplier=args.action_repeat)
+    metrics = collections.defaultdict(list)
+
+    should_train = Every(args.train_every)
+    should_log = Every(args.log_every)
+    should_video_train = Every(args.eval_every)
+    should_video_eval = Every(args.eval_every)
+    should_expl = Until(args.expl_until // args.action_repeat)
+
+    def make_env(mode):
+        suite, task = config.task.split("_", 1)###??
+        if suite == "dmc":
+            domain_name, task_name = args.environment_name.split(":")
+            env = DMCGYMWrapper(
+                               domain_name= domain_name,
+                               task_name=task_name,
+                               visualize_reward=False,
+                               from_pixels= True,
+                               height= 100,
+                               width = 100,
+                               camera_id = 0,
+                               control_timestep = None)
+            gym_env = VideoRenderWrapper(env)
+            env = wrap_env(gym_env,
+                          env_id=None,,
+                          discount=args.discount,
+                          max_episode_steps=args.max_episode_steps,
+                          image_channel_first=False,
+                          )
+            env = NormalizeAction(env)
+        else:
+            raise NotImplementedError(suite)
+        gym_env = gym.spec(args.environment_name).make()
+        env = alf_gym_wrapper.AlfGymWrapper(gym_env,discount=args.discount)
+        env = TimeLimit(env, DC.MUJOCO_ENVS_LENGTH[args.environment_name])
+        return env
+
+    def per_episode(ep, mode):
+        length = len(ep["reward"]) - 1
+        score = float(ep["reward"].astype(np.float64).sum())
+        print(f"{mode.title()} episode has {length} steps and return {score:.1f}.")
+        logger.scalar(f"{mode}_return", score)
+        logger.scalar(f"{mode}_length", length)
+        for key, value in ep.items():
+            if re.match(config.log_keys_sum, key):
+                logger.scalar(f"sum_{mode}_{key}", ep[key].sum())
+            if re.match(config.log_keys_mean, key):
+                logger.scalar(f"mean_{mode}_{key}", ep[key].mean())
+            if re.match(config.log_keys_max, key):
+                logger.scalar(f"max_{mode}_{key}", ep[key].max(0).mean())
+        should = {"train": should_video_train, "eval": should_video_eval}[mode]
+        if should(step):
+            for key in config.log_keys_video:
+                logger.video(f"{mode}_policy_{key}", ep[key])
+        replay = dict(train=train_replay, eval=eval_replay)[mode]
+        logger.add(replay.stats, prefix=mode)
+        logger.write()
+
+    print("Create envs.")
+    num_eval_envs = min(args.envs, args.eval_eps)
+    if args.envs_parallel == "none":
+        train_envs = [make_env("train") for _ in range(args.envs)]
+        eval_envs = [make_env("eval") for _ in range(num_eval_envs)]
+    else:
+        make_async_env = lambda mode: Async(
+            functools.partial(make_env, mode), args.envs_parallel
+        )
+        train_envs = [make_async_env("train") for _ in range(args.envs)]
+        eval_envs = [make_async_env("eval") for _ in range(eval_envs)]
+    act_space = train_envs[0].act_space
+    obs_space = train_envs[0].obs_space
+    train_driver = Driver(train_envs)
+    train_driver.on_episode(lambda ep: per_episode(ep, mode="train"))
+    train_driver.on_step(lambda tran, worker: step.increment())
+    train_driver.on_step(train_replay.add_step)
+    train_driver.on_reset(train_replay.add_step)
+    eval_driver = Driver(eval_envs)
+    eval_driver.on_episode(lambda ep: per_episode(ep, mode="eval"))
+    eval_driver.on_episode(eval_replay.add_episode)
+
+    prefill = max(0, args.prefill - train_replay.stats["total_steps"])
+    if prefill:
+        print(f"Prefill dataset ({prefill} steps).")
+        a_net = ActorNetwork(
+                             obs_space,
+                             act_space,
+                             fc_layer_params=args.model_params
+                             )
+        random_agent = RandomSoftPolicy(a_net)
+        train_driver(random_agent, steps=prefill, episodes=1)
+        eval_driver(random_agent, episodes=1)
+        train_driver.reset()
+        eval_driver.reset()
+
+    print("Create agent.")
+    train_dataset = iter(train_replay.dataset(**dataset))
+    report_dataset = iter(train_replay.dataset(**dataset))
+    eval_dataset = iter(eval_replay.dataset(**dataset))
+
+    agnt = D2EAlgorithm(hyperParams, 
+                        sequence_length,###???? 
+                        obs_space, 
+                        act_space, 
+                        step,
+                        args.environment_name)
+    agnt.initialize_lazy_modules(next(train_dataset))##fix this
+    print(
+        f"Number of parameters in WorldModel {sum(p.numel() for p in agnt.wm.parameters())}"
+    )
+    print(
+        f"Number of parameters in Actor {sum(p.numel() for p in agnt._task_behavior._get_p_vars())}"
+    )
+    print(
+        f"Number of parameters in Value network {sum(p.numel() for p in agnt._task_behavior._get_v_source_vars())}"
+    )
+     print(
+        f"Number of parameters in Q network {sum(p.numel() for p in agnt._task_behavior._get_q_source_vars())}"
+    )
+    agnt.requires_grad_(False)
+    
+    train_agent = CarryOverState(agnt._train)
+    if (logdir / "model.pt").exists():
+        agnt.load_state_dict(torch.load(logdir / "model.pt"))
+    else:
+        print("Pretrain agent.")
+        for _ in range(args.pretrain):
+            train_agent(next(train_dataset))
+    train_policy = lambda *args: agnt.policy(
+        *args, mode="explore" if should_expl(step) else "train"
+    )
+    eval_policy = lambda *args: agnt.policy(*args, mode="eval")
+
+    def train_step(tran, worker):
+        if should_train(step):
+            for _ in range(args.train_steps):
+                mets = train_agent(next(train_dataset))
+                [metrics[key].append(value) for key, value in mets.items()]
+        if should_log(step):
+            for name, values in metrics.items():
+                logger.scalar(name, np.array(values, np.float64).mean())
+                metrics[name].clear()
+            logger.add(agnt.report(next(report_dataset)), prefix="train")
+            logger.write(fps=True)
+
+    train_driver.on_step(train_step)
+
+    while step < args.steps:
+        logger.write()
+        print("Start evaluation.")
+        logger.add(agnt.report(next(eval_dataset)), prefix="eval")
+        eval_driver(eval_policy, episodes=args.eval_eps)
+        print("Start training.")
+        train_driver(train_policy, steps=args.eval_every)
+        torch.save(agnt.state_dict(), logdir / "model.pt")
+    for env in train_envs + eval_envs:
+        try:
+            env.close()
+        except Exception:
+            pass
+
+def parse_args(args):
+    parser = argparse.ArgumentParser(description="Evaluate your search algorithms.")
+    arser.add_argument("--environment_name", type=str, default="tiny", choices=["tiny", "dfs", "bfs"])
+    parser.add_argument("--action_repeat", type=int, default=2, choices=[1, 2, 3])
+    parser.add_argument("--eval_every", type=int, default=1e5)
+    parser.add_argument("--log_every", type=int, default=1e4, help= 'print train info frequency')
+    parser.add_argument('--train_every', type=int, default=5, help='frequency of training' )
+    parser.add_argument('--train_steps', type=int, default=1, help='frequency of training' )
+    parser.add_argument("--prefill", type=int, default=1000)
+    parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
+    parser.add_argument('--batch', type=int, default=40,help= 'Batch size')
+    parser.add_argument('--length', type=int, default=50,help= 'length of ...')
+    parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....' )
+    parser.add_argument("--eval_every", type=int, default=1e5)
+    parser.add_argument("--max_episode_steps", type=int, default=1e3, help='an episode corresponds to 1000 steps')
+    parser.add_argument("--envs", type=int, default=1, help='should be updated??')
+    parser.add_argument("--eval_eps", type=int, default=1, help='??')
+    parser.add_argument("--envs_parallel", type=int, default=None, help='??')
+    parser.add_argument("--log_keys_video", type=list, default=['image'], help='??')
+    parser.add_argument("--log_keys_sum", type=str, default='^$', help='??')
+    parser.add_argument("--discount", type=int, default= 0.99, help="??")
+    return parser.parse_args(args)
+if __name__ == "__main__":
+    main(sys.argv[1:])
