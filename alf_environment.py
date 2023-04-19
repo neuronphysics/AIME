@@ -23,6 +23,7 @@ import torch
 from data_structures import time_step_spec, StepType, _is_numpy_array
 from tensor_specs import TensorSpec, BoundedTensorSpec
 from collections import deque
+import numpy as np
 ###
 @six.add_metaclass(abc.ABCMeta)
 class AlfEnvironment(object):
@@ -337,7 +338,7 @@ class AlfEnvironmentBaseWrapper(AlfEnvironment):
         return self._env
 
 class FrameStackWrapper(AlfEnvironmentBaseWrapper):
-    #https://github.com/medric49/imitation-from-observation/blob/faae84a0bbc527eb428ac3c2be9aabb210e56367/dmc.py
+    #changed https://github.com/medric49/imitation-from-observation/blob/faae84a0bbc527eb428ac3c2be9aabb210e56367/dmc.py
     def __init__(self, env, num_frames, pixels_key='pixels'):
         self._env = env
         self._num_frames = num_frames
@@ -396,6 +397,38 @@ class FrameStackWrapper(AlfEnvironmentBaseWrapper):
     def __getattr__(self, name):
         return getattr(self._env, name)
 
+class ActionRepeatWrapper(AlfEnvironmentBaseWrapper):
+    def __init__(self, env, num_repeats, discount = 1.0):
+        self._env = env
+        self._num_repeats = num_repeats
+        self._discount = discount
+
+    def step(self, action):
+        reward = 0.0
+        discount = self._discount
+        for i in range(self._num_repeats):
+            time_step = self._env.step(action)
+            reward += (time_step.reward or 0.0) * discount
+            discount *= time_step.discount
+            if time_step.last():
+                break
+
+        return time_step._replace(reward=reward, discount=discount)
+
+    def observation_spec(self):
+        return self._env.observation_spec()
+
+    def action_spec(self):
+        return self._env.action_spec()
+    
+    def done_spec(self):
+        return self._env.done_spec()   
+
+    def reset(self):
+        return self._env.reset()
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
 # Used in ALF
 #@alf.configurable
 class TimeLimit(AlfEnvironmentBaseWrapper):
