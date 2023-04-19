@@ -11,9 +11,10 @@ import random #
 import warnings #
 import functools #
 import math
+import collections
 from numbers import Number
-from collections import namedtuple, deque, defaultdict #
-from typing import Iterables, Tuple, Dict, List
+from collections import namedtuple, deque, defaultdict, Iterable
+from typing import Tuple, Dict, List
 import gym
 import mujoco_py
 from tensorboardX import SummaryWriter
@@ -30,12 +31,12 @@ import torch.utils.data.distributed
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tensorboardX import SummaryWriter
-from planner_D2E_regularizer import D2EAgent, Config, Agent, parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
+from planner_D2E_regularizer import D2EAgent, Config, Agent, parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes, ActorNetwork, RandomSoftPolicy
 import utils_planner as utils
 from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
-from VRNN.main import ModelState
-from VRNN.Normalization import compute_normalizer
-from VRNN.Blocks import init_weights
+from main import ModelState
+from Normalization import compute_normalizer
+from Blocks import init_weights
 import DataCollectionD2E as DC
 import alf_gym_wrapper
 import argparse
@@ -44,6 +45,9 @@ import json
 import time
 from dmc_gym_wrapper import DMCGYMWrapper
 from gym_wrappers import wrap_env
+import cloudpickle
+import atexit
+import traceback
 
 try:
     import rich.traceback ##
@@ -289,7 +293,7 @@ hyperParams = { "batch_size": 40,
                 "n_channel": 3,
                 "VRNN_Optimizer_Type":"MADGRAD",
                 "MAX_GRAD_NORM": 100.,
-                "expl_behavior": greedy,
+                "expl_behavior": "greedy",
                 "expl_noise": 0.0,
                 "eval_noise": 0.0,
                 "replay_buffer_size":int(1e4),
@@ -1015,25 +1019,55 @@ class VideoRecorder:
 
 
 
-class logger:
-      def __init__ (self):
-          self.fmt = '%(asctime)s [%(name)s] %(levelname)s: %(message)s'
-          self.level = logging.INFO
-          self.datefmt = '%Y-%m-%d %H:%M:%S'
+class Logger:
+    def __init__(self, step, outputs, multiplier=1):
+        self._step = step
+        self._outputs = outputs
+        self._multiplier = multiplier
+        self._last_step = None
+        self._last_time = None
+        self._metrics = []
 
-class Logger(logging.Logger):
-    def __init__(self, name: str, level=None) -> None:
-        if level is None:
-            level = logger.level
-        super().__init__(name, level=level)
-        formatter = logging.Formatter(
-            fmt=logger.fmt,
-            datefmt=logger.datefmt,
-        )
-        handler = logging.StreamHandler()
-        handler.setFormatter(formatter)
-        handler.setLevel(logger.level)
-        self.addHandler(handler)
+    def add(self, mapping, prefix=None):
+        step = int(self._step) * self._multiplier
+        for name, value in dict(mapping).items():
+            name = f"{prefix}_{name}" if prefix else name
+            value = np.array(value)
+            if len(value.shape) not in (0, 2, 3, 4):
+                raise ValueError(
+                    f"Shape {value.shape} for name '{name}' cannot be "
+                    "interpreted as scalar, image, or video."
+                )
+            self._metrics.append((step, name, value))
+
+    def scalar(self, name, value):
+        self.add({name: value})
+
+    def image(self, name, value):
+        self.add({name: value})
+
+    def video(self, name, value):
+        self.add({name: value})
+
+    def write(self, fps=False):
+        fps and self.scalar("fps", self._compute_fps())
+        if not self._metrics:
+            return
+        for output in self._outputs:
+            output(self._metrics)
+        self._metrics.clear()
+
+    def _compute_fps(self):
+        step = int(self._step) * self._multiplier
+        if self._last_step is None:
+            self._last_time = time.time()
+            self._last_step = step
+            return 0
+        steps = step - self._last_step
+        duration = time.time() - self._last_time
+        self._last_time += duration
+        self._last_step = step
+        return steps / duration
 
 class Optimizer(nn.Module):
     def __init__(
@@ -1373,7 +1407,7 @@ class WorldModel(jit.ScriptModule):
         DiscountNetwork.create(self.state_dim + self.action_dim, self._params.PREDICT_DONE, self._discount).to(self.device)
         self.ckpt_path       = self.model_path+'/best_model'
         os.makedirs(self.ckpt_path, exist_ok=True) 
-        self.logger = Logger(self.__class__.__name__)
+        
         self.mse_loss = nn.MSELoss()
         #inside VRNN folder we have main.py script : the traisition model
         modelstate =  ModelState(seed            = self._params.seed,
@@ -1513,7 +1547,8 @@ class WorldModel(jit.ScriptModule):
         ###??? extra loss
         #reward and discount losses
         for k, v in losses.items():
-            metrics.update(k + "_loss" : v.detach().cpu())
+            print(k,type(k))
+            metrics.update({k + "_loss" : v.detach().cpu()})
 
         metrics["transition_total_loss"] = transition_loss + transition_disc_loss + transition_gradient_penalty
 
@@ -1531,13 +1566,12 @@ class WorldModel(jit.ScriptModule):
 
         return hidden, real_embed, z_real, z_next, metrics
     
-    @torch.jit.script_method
     def imagine(self, 
                 agent: Agent, 
-                start_state: Dict[str, Tensor], #a combination of previous states & actions 
+                start_state: Dict[str, torch.Tensor], #a combination of previous states & actions 
                 horizon: int,
                 done: torch.Tensor = None, 
-                ) -> Tuple(torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor):
+                ):
         tqdm.write("Collect data from imagination:")
         #inspired https://github.com/sai-prasanna/mpc_and_rl/blob/1fedaec5eec7a2a5844935d17b4fd0ad385d9d6c/dreamerv2_torch/dreamerv2_torch/world_model.py#L86
         #Main challenge : get frames from Mujoco and build a right type data structure with latent representations which are suitable for D2EAgent class (the planner)
@@ -1651,7 +1685,7 @@ class D2EAlgorithm(nn.Module):
                  obs_space, 
                  act_space, 
                  step: Counter,
-                 env_name:str 'Hopper-v2', 
+                 env_name:str ='Hopper-v2', 
                  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
                  log_dir=os.path.join(os.getcwd(), "\log"),
                  model_params=(((200, 200),), 2, 1),
@@ -1786,7 +1820,7 @@ class D2EAlgorithm(nn.Module):
                          likes[key] = like
                          losses[key] = -like.mean()
                 metrics.update(**mets1)
-                metrics.update(f"{name}_loss": value.detach().cpu() for name, value in losses.items())
+                metrics.update({f"{name}_loss": value.detach().cpu() for name, value in losses.items()})
         return state, metrics
 
     def report(self, data):
@@ -2086,6 +2120,7 @@ def main(args):
        random.seed(args.seed)
        torch.cuda.manual_seed(args.seed)
     logdir = pathlib.Path(args.logdir).expanduser()
+    print(f'current path {logdir}')
     logdir.mkdir(parents=True, exist_ok=True)
 
 
@@ -2128,7 +2163,7 @@ def main(args):
                                control_timestep = None)
             gym_env = VideoRenderWrapper(env)
             env = wrap_env(gym_env,
-                          env_id=None,,
+                          env_id=None,
                           discount=args.discount,
                           max_episode_steps=args.max_episode_steps,
                           image_channel_first=False,
@@ -2148,15 +2183,15 @@ def main(args):
         logger.scalar(f"{mode}_return", score)
         logger.scalar(f"{mode}_length", length)
         for key, value in ep.items():
-            if re.match(config.log_keys_sum, key):
+            if re.match(args.log_keys_sum, key):
                 logger.scalar(f"sum_{mode}_{key}", ep[key].sum())
-            if re.match(config.log_keys_mean, key):
+            if re.match(args.log_keys_mean, key):
                 logger.scalar(f"mean_{mode}_{key}", ep[key].mean())
-            if re.match(config.log_keys_max, key):
+            if re.match(args.log_keys_max, key):
                 logger.scalar(f"max_{mode}_{key}", ep[key].max(0).mean())
         should = {"train": should_video_train, "eval": should_video_eval}[mode]
         if should(step):
-            for key in config.log_keys_video:
+            for key in args.log_keys_video:
                 logger.video(f"{mode}_policy_{key}", ep[key])
         replay = dict(train=train_replay, eval=eval_replay)[mode]
         logger.add(replay.stats, prefix=mode)
@@ -2219,7 +2254,7 @@ def main(args):
     print(
         f"Number of parameters in Value network {sum(p.numel() for p in agnt._task_behavior._get_v_source_vars())}"
     )
-     print(
+    print(
         f"Number of parameters in Q network {sum(p.numel() for p in agnt._task_behavior._get_q_source_vars())}"
     )
     agnt.requires_grad_(False)
@@ -2264,12 +2299,13 @@ def main(args):
         except Exception:
             pass
 
-def parse_args(args):
+def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate your search algorithms.")
-    arser.add_argument("--environment_name", type=str, default="tiny", choices=["tiny", "dfs", "bfs"])
+    parser.add_argument('--logdir', type=str, default=os.path.join('/content/gdrive/My\ Drive/AIME-vrnn/','/logs'), help= 'a path to the log directory')
+    parser.add_argument("--environment_name", type=str, default="tiny", choices=["tiny", "dfs", "bfs"])
     parser.add_argument("--action_repeat", type=int, default=2, choices=[1, 2, 3])
-    parser.add_argument("--eval_every", type=int, default=1e5)
-    parser.add_argument("--log_every", type=int, default=1e4, help= 'print train info frequency')
+    parser.add_argument('--eval_every', type=int, default=1e5)
+    parser.add_argument('--log_every', type=int, default=1e4, help= 'print train info frequency')
     parser.add_argument('--train_every', type=int, default=5, help='frequency of training' )
     parser.add_argument('--train_steps', type=int, default=1, help='frequency of training' )
     parser.add_argument("--prefill", type=int, default=1000)
@@ -2277,14 +2313,17 @@ def parse_args(args):
     parser.add_argument('--batch', type=int, default=40,help= 'Batch size')
     parser.add_argument('--length', type=int, default=50,help= 'length of ...')
     parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....' )
-    parser.add_argument("--eval_every", type=int, default=1e5)
-    parser.add_argument("--max_episode_steps", type=int, default=1e3, help='an episode corresponds to 1000 steps')
-    parser.add_argument("--envs", type=int, default=1, help='should be updated??')
-    parser.add_argument("--eval_eps", type=int, default=1, help='??')
-    parser.add_argument("--envs_parallel", type=int, default=None, help='??')
-    parser.add_argument("--log_keys_video", type=list, default=['image'], help='??')
-    parser.add_argument("--log_keys_sum", type=str, default='^$', help='??')
-    parser.add_argument("--discount", type=int, default= 0.99, help="??")
-    return parser.parse_args(args)
+    parser.add_argument('--max_episode_steps', type=int, default=1e3, help='an episode corresponds to 1000 steps')
+    parser.add_argument('--envs', type=int, default=1, help='should be updated??')
+    parser.add_argument('--eval_eps', type=int, default=1, help='??')
+    parser.add_argument('--envs_parallel', type=int, default=None, help='??')
+    parser.add_argument('--log_keys_video', type=list, default=['image'], help='??')
+    parser.add_argument('--log_keys_sum', type=str, default='^$', help='??')
+    parser.add_argument('--log_keys_mean', type=str, default='^$', help='??')
+    parser.add_argument('--log_keys_max', type=str, default='^$', help='??')
+    parser.add_argument('--discount', type=int, default= 0.99, help="??")
+    args, unknown = parser.parse_known_args()
+    return args
 if __name__ == "__main__":
-    main(sys.argv[1:])
+   args = parse_args()
+   main(args)
