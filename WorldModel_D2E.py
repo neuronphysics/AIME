@@ -34,9 +34,9 @@ from tensorboardX import SummaryWriter
 from planner_D2E_regularizer import D2EAgent, Config, Agent, parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes, ActorNetwork, RandomSoftPolicy
 import utils_planner as utils
 from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
-from main import ModelState
-from Normalization import compute_normalizer
-from Blocks import init_weights
+from VRNN.main import ModelState
+from VRNN.Normalization import compute_normalizer
+from VRNN.Blocks import init_weights
 import DataCollectionD2E as DC
 import alf_gym_wrapper
 import argparse
