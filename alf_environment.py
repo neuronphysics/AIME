@@ -22,7 +22,7 @@ import six
 import torch
 from data_structures import time_step_spec, StepType, _is_numpy_array
 from tensor_specs import TensorSpec, BoundedTensorSpec
-
+from collections import deque
 ###
 @six.add_metaclass(abc.ABCMeta)
 class AlfEnvironment(object):
