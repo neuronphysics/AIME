@@ -60,7 +60,7 @@ import io
 import uuid
 import datetime
 """
-The purpose of this script is to integrate three key components of dream exploration algorithm:
+The purpose of this script is to integrate three key components of our dream to explore algorithm:
 (1) latent representation learning, 
 (2) environment dynamics learning (prediction), 
 (3) planning. 
