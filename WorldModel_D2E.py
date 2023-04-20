@@ -11,6 +11,7 @@ import random #
 import warnings #
 import functools #
 import math
+from matplotlib import pyplot as plt
 import collections
 from numbers import Number
 from collections import namedtuple, deque, defaultdict
@@ -44,7 +45,7 @@ from alf_environment import TimeLimit
 import json
 import time
 from dmc_gym_wrapper import DMCGYMWrapper
-from gym_wrappers import wrap_env
+from gym_wrappers import wrap_env, FrameSkip
 import cloudpickle
 import atexit
 import traceback
@@ -59,7 +60,7 @@ import io
 import uuid
 import datetime
 """
-The purpose of this script is to integrate three key components of dream to explore model:
+The purpose of this script is to integrate three key components of dream exploration algorithm:
 (1) latent representation learning, 
 (2) environment dynamics learning (prediction), 
 (3) planning. 
@@ -1041,6 +1042,7 @@ def preprocess_transition_data(s1, a1, s2, done):
     final_outputs = torch.stack([ torch.stack([padded_trajectories_outputs[i][j] for j in range(mask_output.shape[1])], dim=0) for i in range(mask_output.shape[0])], dim=0)#(batch_size , max_len, state_dim)
     #shape of outputs: (B , max_seq_len, D)
     return final_inputs, final_outputs
+    
 ###############################################################################
 class VideoRecorder:
     def __init__(self, root_dir, render_size=64, fps=20):
@@ -2207,6 +2209,7 @@ def main(args):
     should_expl = Until(args.expl_until // args.action_repeat)
 
     def make_env(mode):
+        #check this too: https://github.com/jsikyoon/dreamer-torch/blob/main/dreamer.py
         suite, task = args.task.split("_", 1)###??
         #print(suite, task)
         if suite == "dmc":
@@ -2222,8 +2225,8 @@ def main(args):
                                width = 100,
                                camera_id = 0,
                                 )
-            print(env.__dict__)
-            #gym_env = VideoRenderWrapper(env)
+            print(f"deepmind control suite {env.__dict__}")
+            env = FrameSkip(env, args.action_repeat)
             env = wrap_env(env,
                           env_id=None,
                           discount=args.discount,
@@ -2232,8 +2235,22 @@ def main(args):
                           alf_env_wrappers=(),
                           image_channel_first=False,
                           )
-            print(env.__dict__)
-            env = NormalizeAction(env)
+            env.seed(args.seed)
+            env.action_space.np_random.seed(args.seed)
+            """
+            #plotting to test that everything works here
+            time_step = env.reset()
+            time_step = env.current_time_step()
+            time_step = env.step(env.action_space.sample())
+            img=time_step.observation
+
+            img = img.swapaxes(0,1)
+            img = img.swapaxes(1,2)
+            plt.figure(figsize=(6, 8))
+            plt.imshow(img)
+            plt.axis('off')
+            plt.show()
+            """
         else:
             raise NotImplementedError(suite)
         
@@ -2274,9 +2291,9 @@ def main(args):
         )
         
         train_envs = [make_async_env("train") for _ in range(args.envs)]
-        eval_envs = [make_async_env("eval") for _ in range(eval_envs)]
-    act_space = train_envs[0].act_space
-    obs_space = train_envs[0].obs_space
+        eval_envs = [make_async_env("eval") for _ in range(num_eval_envs)]
+    act_space = train_envs[0].action_space
+    obs_space = train_envs[0].observation_space
     train_driver = Driver(train_envs)
     train_driver.on_episode(lambda ep: per_episode(ep, mode="train"))
     train_driver.on_step(lambda tran, worker: step.increment())
