@@ -373,13 +373,13 @@ class EpisodicRandomFrameCrop(BaseObservationWrapper):
         assert channel_order in ['channels_last', 'channels_first']
         super().__init__(env, fields=fields)
         self._observation_space = _dict_space(self.observation_space)
-        self._syx = alf.nest.map_structure(lambda _: None,
+        self._syx = nest.map_structure(lambda _: None,
                                            self._observation_space)
 
     def observation(self, observation):
         for field in self._fields:
-            syx = alf.nest.get_field(self._syx, field)
-            space = alf.nest.get_field(self._observation_space, field)
+            syx = nest.get_field(self._syx, field)
+            space = nest.get_field(self._observation_space, field)
             observation = transform_nest(
                 nested=observation,
                 field=field,
@@ -403,13 +403,13 @@ class EpisodicRandomFrameCrop(BaseObservationWrapper):
         sy, sx = None, None
         for field in self._fields:
             if not self._share_cropping or sy is None:
-                ori_space = alf.nest.get_field(
+                ori_space = nest.get_field(
                     self._original_observation_space, field)
-                space = alf.nest.get_field(self._observation_space, field)
+                space = nest.get_field(self._observation_space, field)
                 H, W, _ = self._get_hwc(ori_space)
                 h, w, _ = self._get_hwc(space)
                 sy, sx = np.random.randint(H - h), np.random.randint(W - w)
-            self._syx = alf.nest.set_field(
+            self._syx = nest.set_field(
                 nested=self._syx, field=field, new_value=(sy, sx))
         return super().reset(**kwargs)
 
@@ -648,7 +648,7 @@ class ContinuousActionClip(gym.ActionWrapper):
 
         self._nested_action_space = _gym_space_to_nested_space(
             self.action_space)
-        self.bounds = alf.nest.map_structure(_space_bounds,
+        self.bounds = nest.map_structure(_space_bounds,
                                              self._nested_action_space)
 
     def action(self, action):
@@ -661,7 +661,7 @@ class ContinuousActionClip(gym.ActionWrapper):
                 action = np.clip(action, bounds[0], bounds[1])
             return action
 
-        action = alf.nest.map_structure_up_to(action, _clip_action,
+        action = nest.map_structure_up_to(action, _clip_action,
                                               self._nested_action_space,
                                               action, self.bounds)
         return action
@@ -688,9 +688,9 @@ class ContinuousActionMapping(gym.ActionWrapper):
                 return (space.low, space.high)
 
         nested_action_space = _gym_space_to_nested_space(self.action_space)
-        self._bounds = alf.nest.map_structure(_space_bounds,
+        self._bounds = nest.map_structure(_space_bounds,
                                               nested_action_space)
-        self._nested_action_space = alf.nest.map_structure(
+        self._nested_action_space = nest.map_structure(
             lambda space: (gym.spaces.Box(
                 low=low, high=high, shape=space.shape, dtype=space.dtype)
                            if isinstance(space, gym.spaces.Box) else space),
@@ -708,7 +708,7 @@ class ContinuousActionMapping(gym.ActionWrapper):
             return a
 
         # map action back to its original space
-        action = alf.nest.map_structure_up_to(action, _scale_back, action,
+        action = nest.map_structure_up_to(action, _scale_back, action,
                                               self._bounds,
                                               self._nested_action_space)
         return action
