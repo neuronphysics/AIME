@@ -13,8 +13,8 @@ import functools #
 import math
 import collections
 from numbers import Number
-from collections import namedtuple, deque, defaultdict, Iterable
-from typing import Tuple, Dict, List
+from collections import namedtuple, deque, defaultdict
+from typing import Tuple, Dict, List, Iterable
 import gym
 import mujoco_py
 from tensorboardX import SummaryWriter
@@ -58,6 +58,23 @@ except ImportError:
 import io
 import uuid
 import datetime
+"""
+The purpose of this script is to integrate three key components of dream to explore model:
+(1) latent representation learning, 
+(2) environment dynamics learning (prediction), 
+(3) planning. 
+The first component involves the use of an infinite Gaussian mixture variational autoencoder to learn latent representations (implemented in Hierarchical_StickBreaking_GMMVAE.py). 
+The second component focuses on learning the dynamics of the environment through a variational sequential neural process (VSNP) architecture, which can be found in the VRNN directory and main.py file. 
+The third component involves building a variational model-based actor critic algorithm using planner_D2E_regularizer.py.
+
+We create a world model that combines the first two components and adds two extra heads to compute reward and discount. 
+Next, we develop the D2E algorithm that brings together the world model and the planning algorithm. 
+The goal is to learn the latent dynamics of the environment through the world model and then simulate imaginative trajectories from the model. 
+Finally, we use the planning algorithm to determine the best policy that maximizes the expected reward from the simulated trajectories.
+
+Overall, this script aims to provide a comprehensive framework for dream to explore algorithm that incorporates various key components and techniques to enable effective learning of the world model and planning.
+
+"""
 #####################################
 def get_datetime():
   now = datetime.datetime.now().isoformat()
@@ -299,6 +316,17 @@ hyperParams = { "batch_size": 40,
                 "replay_buffer_size":int(1e4),
                 }
 #####################################
+def get_parameters(modules: Iterable[nn.Module]):
+    """
+    Given a list of torch modules, returns a list of their parameters.
+    :param modules: iterable of modules
+    :returns: a list of parameters
+    """
+    model_parameters = []
+    for module in modules:
+        model_parameters += list(module.parameters())
+    return model_parameters
+
 class FreezeParameters:
     def __init__(self, modules: Iterable[nn.Module]):
         """
@@ -651,6 +679,34 @@ CONST_INV_SQRT_2 = 1 / math.sqrt(2)
 CONST_LOG_INV_SQRT_2PI = math.log(CONST_INV_SQRT_2PI)
 CONST_LOG_SQRT_2PI_E = 0.5 * math.log(2 * math.pi * math.e)
 
+class TanhBijector(torch.distributions.Transform):
+    def __init__(self):
+        super().__init__()
+
+        self.bijective = True
+        self.domain = torch.distributions.constraints.real
+        self.codomain = torch.distributions.constraints.interval(-1.0, 1.0)
+
+    def atanh(self, x):
+        return 0.5 * torch.log((1 + x) / (1 - x))
+
+    def sign(self):
+        return 1.0
+
+    def _call(self, x):
+        return torch.tanh(x)
+
+    def _inverse(self, y):
+        y = torch.where(
+            (torch.abs(y) <= 1.0), torch.clamp(y, -0.99999997, 0.99999997), y
+        )
+        y = self.atanh(y)
+        return y
+
+    def log_abs_det_jacobian(self, x, y):
+        return 2.0 * (np.log(2) - x - nn.functional.softplus(-2.0 * x))
+
+
 
 class TruncatedStandardNormal(Distribution):
     """
@@ -793,6 +849,7 @@ class TruncatedNormal(TruncatedStandardNormal):
             super(TruncatedNormal, self).log_prob(self._to_std_rv(value))
             - self._log_scale
         )
+
 class SampleDist:
     def __init__(self, dist, samples=100):
         self._dist = dist
@@ -1404,7 +1461,7 @@ class WorldModel(jit.ScriptModule):
         self.heads = nn.ModuleDict()
         self.heads["reward"]    = MLP(shape=1, layers= 4, units= 400, act= "ELU", norm= "none", dist= "mse").to(self.device)
         self.heads["discount"]  = MLP(shape=1, layers= 4, units= 400, act= "ELU", norm= "none", dist= "binary").to(self.device)
-        DiscountNetwork.create(self.state_dim + self.action_dim, self._params.PREDICT_DONE, self._discount).to(self.device)
+        
         self.ckpt_path       = self.model_path+'/best_model'
         os.makedirs(self.ckpt_path, exist_ok=True) 
         
@@ -1440,7 +1497,7 @@ class WorldModel(jit.ScriptModule):
         self.decoder = self.variational_autoencoder.GMM_decoder
         self.discriminator = VAECritic(self.state_dim)
         self.grad_heads = [ "reward", "discount"]
-        self.loss_scales: { reward: 1.0, discount: 1.0}
+        self.loss_scales= { "reward": 1.0, "discount": 1.0}
         for name in self.grad_heads:
             assert name in self.heads, name
 
@@ -1499,7 +1556,7 @@ class WorldModel(jit.ScriptModule):
             z_fake = gmm_dist.sample()
             critic_real = self.discriminator(z_real).reshape(-1)
             critic_fake = self.discriminator(z_fake).reshape(-1)
-            gp = gradient_penalty(self.discriminator, z_real, z_fake, device=device)
+            gp = gradient_penalty(self.discriminator, z_real, z_fake, device= self.device)
             loss_critic = (
                 -(torch.mean(critic_real) - torch.mean(critic_fake)) + self._params.LAMBDA_GP * gp
             )
@@ -1515,7 +1572,7 @@ class WorldModel(jit.ScriptModule):
         w_x, w_x_mean, w_x_sigma, z_next, z_next_mean, z_next_sigma, c_posterior = self.encoder(data["next_observation"])
         ###
         #Prepare & normalize the input/output data for the transition model
-        inputs, outputs = preprocess_transition_data(z_real, action, z_next, data["done"])
+        inputs, outputs = preprocess_transition_data(z_real, data["action"], z_next, data["done"])
         train_dataset   = TensorDataset(inputs, outputs)
         data_loader     = DataLoader(train_dataset, batch_size=BS , shuffle=False)
         normalizer_input, normalizer_output = compute_normalizer(data_loader)
@@ -1602,7 +1659,7 @@ class WorldModel(jit.ScriptModule):
             self.dataset.append(experience)
             if not time_step.is_last():
      
-                transition = get_transition(time_step, next_time_step,
+                transition = DC.get_transition(time_step, next_time_step,
                                                action, next_action)
                 self._data.add_transitions(transition)
             else:
@@ -1685,7 +1742,7 @@ class D2EAlgorithm(nn.Module):
                  obs_space, 
                  act_space, 
                  step: Counter,
-                 env_name:str ='Hopper-v2', 
+                 env_name: str, 
                  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
                  log_dir=os.path.join(os.getcwd(), "\log"),
                  model_params=(((200, 200),), 2, 1),
@@ -1788,7 +1845,7 @@ class D2EAlgorithm(nn.Module):
         _, _, z_real, z_next, mets = self.wm._train(data, state)
 
         metrics.update(mets)
-        start["feat"] = z_real
+        start = {"feat":z_real,"action":data["action"]}
         with RequiresGrad(self._task_behavior_params):
             with torch.cuda.amp.autocast(self._use_amp):
                 seq = self.wm.imagine( 
@@ -1811,6 +1868,7 @@ class D2EAlgorithm(nn.Module):
                 mets2 = self._task_behavior._all_train_info
                 metrics.update({"expl_" + key: value for key, value in mets2.items()})
                 #Number (6) task
+                likes = {}
                 losses = {}
                 for name, head in self.wm.heads.items():
                      out = head(seq[name])
@@ -2120,7 +2178,7 @@ def main(args):
        random.seed(args.seed)
        torch.cuda.manual_seed(args.seed)
     logdir = pathlib.Path(args.logdir).expanduser()
-    print(f'current path {logdir}')
+    print(f'current path to the log file => {logdir}')
     logdir.mkdir(parents=True, exist_ok=True)
 
 
@@ -2149,9 +2207,12 @@ def main(args):
     should_expl = Until(args.expl_until // args.action_repeat)
 
     def make_env(mode):
-        suite, task = config.task.split("_", 1)###??
+        suite, task = args.task.split("_", 1)###??
+        #print(suite, task)
         if suite == "dmc":
-            domain_name, task_name = args.environment_name.split(":")
+            
+            domain_name, task_name = task.split("_")
+            print(domain_name, task_name)
             env = DMCGYMWrapper(
                                domain_name= domain_name,
                                task_name=task_name,
@@ -2160,20 +2221,23 @@ def main(args):
                                height= 100,
                                width = 100,
                                camera_id = 0,
-                               control_timestep = None)
-            gym_env = VideoRenderWrapper(env)
-            env = wrap_env(gym_env,
+                                )
+            print(env.__dict__)
+            #gym_env = VideoRenderWrapper(env)
+            env = wrap_env(env,
                           env_id=None,
                           discount=args.discount,
                           max_episode_steps=args.max_episode_steps,
+                          gym_env_wrappers=(),
+                          alf_env_wrappers=(),
                           image_channel_first=False,
                           )
+            print(env.__dict__)
             env = NormalizeAction(env)
         else:
             raise NotImplementedError(suite)
-        gym_env = gym.spec(args.environment_name).make()
-        env = alf_gym_wrapper.AlfGymWrapper(gym_env,discount=args.discount)
-        env = TimeLimit(env, DC.MUJOCO_ENVS_LENGTH[args.environment_name])
+        
+        
         return env
 
     def per_episode(ep, mode):
@@ -2197,15 +2261,18 @@ def main(args):
         logger.add(replay.stats, prefix=mode)
         logger.write()
 
-    print("Create envs.")
+    print("Create envs.") #debug: stuck here
     num_eval_envs = min(args.envs, args.eval_eps)
     if args.envs_parallel == "none":
+        
         train_envs = [make_env("train") for _ in range(args.envs)]
         eval_envs = [make_env("eval") for _ in range(num_eval_envs)]
     else:
+        
         make_async_env = lambda mode: Async(
             functools.partial(make_env, mode), args.envs_parallel
         )
+        
         train_envs = [make_async_env("train") for _ in range(args.envs)]
         eval_envs = [make_async_env("eval") for _ in range(eval_envs)]
     act_space = train_envs[0].act_space
@@ -2218,7 +2285,7 @@ def main(args):
     eval_driver = Driver(eval_envs)
     eval_driver.on_episode(lambda ep: per_episode(ep, mode="eval"))
     eval_driver.on_episode(eval_replay.add_episode)
-
+  
     prefill = max(0, args.prefill - train_replay.stats["total_steps"])
     if prefill:
         print(f"Prefill dataset ({prefill} steps).")
@@ -2237,9 +2304,9 @@ def main(args):
     train_dataset = iter(train_replay.dataset(**dataset))
     report_dataset = iter(train_replay.dataset(**dataset))
     eval_dataset = iter(eval_replay.dataset(**dataset))
-
+    #extract sequence length which is the maximum size of sequence length in an all episodes and replace it down for "sequence_length"??? TODO
     agnt = D2EAlgorithm(hyperParams, 
-                        sequence_length,###???? 
+                        args.sequence_length,###???? 
                         obs_space, 
                         act_space, 
                         step,
@@ -2302,7 +2369,6 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate your search algorithms.")
     parser.add_argument('--logdir', type=str, default=os.path.join('/content/gdrive/My\ Drive/AIME-vrnn/','/logs'), help= 'a path to the log directory')
-    parser.add_argument("--environment_name", type=str, default="tiny", choices=["tiny", "dfs", "bfs"])
     parser.add_argument("--action_repeat", type=int, default=2, choices=[1, 2, 3])
     parser.add_argument('--eval_every', type=int, default=1e5)
     parser.add_argument('--log_every', type=int, default=1e4, help= 'print train info frequency')
@@ -2313,15 +2379,17 @@ def parse_args():
     parser.add_argument('--batch', type=int, default=40,help= 'Batch size')
     parser.add_argument('--length', type=int, default=50,help= 'length of ...')
     parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....' )
-    parser.add_argument('--max_episode_steps', type=int, default=1e3, help='an episode corresponds to 1000 steps')
-    parser.add_argument('--envs', type=int, default=1, help='should be updated??')
-    parser.add_argument('--eval_eps', type=int, default=1, help='??')
-    parser.add_argument('--envs_parallel', type=int, default=None, help='??')
-    parser.add_argument('--log_keys_video', type=list, default=['image'], help='??')
+    parser.add_argument("--max_episode_steps", type=int, default=1e3, help='an episode corresponds to 1000 steps')
+    parser.add_argument("--envs", type=int, default=1, help='should be updated??')
+    parser.add_argument("--eval_eps", type=int, default=1, help='??')
+    parser.add_argument("--envs_parallel", type=str, default="none", help='??')
+    parser.add_argument("--log_keys_video", type=list, default=['image'], help='??')
     parser.add_argument('--log_keys_sum', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_mean', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_max', type=str, default='^$', help='??')
     parser.add_argument('--discount', type=int, default= 0.99, help="??")
+    parser.add_argument('--task', type=str, default="dmc_cheetah_run", help="name of the environment")
+    parser.add_argument('--sequence_length', type=int , default=100, help="the length of an episode")
     args, unknown = parser.parse_known_args()
     return args
 if __name__ == "__main__":
