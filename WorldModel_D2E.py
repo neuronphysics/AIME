@@ -447,55 +447,6 @@ class Driver:
             return value.astype(np.uint8)
         return value
 ###########################
-class Logger:
-    def __init__(self, step, outputs, multiplier=1):
-        self._step = step
-        self._outputs = outputs
-        self._multiplier = multiplier
-        self._last_step = None
-        self._last_time = None
-        self._metrics = []
-
-    def add(self, mapping, prefix=None):
-        step = int(self._step) * self._multiplier
-        for name, value in dict(mapping).items():
-            name = f"{prefix}_{name}" if prefix else name
-            value = np.array(value)
-            if len(value.shape) not in (0, 2, 3, 4):
-                raise ValueError(
-                    f"Shape {value.shape} for name '{name}' cannot be "
-                    "interpreted as scalar, image, or video."
-                )
-            self._metrics.append((step, name, value))
-
-    def scalar(self, name, value):
-        self.add({name: value})
-
-    def image(self, name, value):
-        self.add({name: value})
-
-    def video(self, name, value):
-        self.add({name: value})
-
-    def write(self, fps=False):
-        fps and self.scalar("fps", self._compute_fps())
-        if not self._metrics:
-            return
-        for output in self._outputs:
-            output(self._metrics)
-        self._metrics.clear()
-
-    def _compute_fps(self):
-        step = int(self._step) * self._multiplier
-        if self._last_step is None:
-            self._last_time = time.time()
-            self._last_step = step
-            return 0
-        steps = step - self._last_step
-        duration = time.time() - self._last_time
-        self._last_time += duration
-        self._last_step = step
-        return steps / duration
 
 
 class TerminalOutput:
@@ -1980,7 +1931,7 @@ class Driver:
         self._on_steps = []
         self._on_resets = []
         self._on_episodes = []
-        self._act_spaces = [env.act_space for env in envs]
+        self._act_spaces = [env.action_space for env in envs]
         self.reset()
 
     def on_step(self, callback):
@@ -2000,14 +1951,18 @@ class Driver:
     def __call__(self, policy, steps=0, episodes=0):
         step, episode = 0, 0
         while step < steps or episode < episodes:
+            
             obs = {
                 i: self._envs[i].reset()
                 for i, ob in enumerate(self._obs)
-                if ob is None or ob["is_last"]
+                if ob is None or ob.done
             }
+            
             for i, ob in obs.items():
                 self._obs[i] = ob() if callable(ob) else ob
-                act = {k: np.zeros(v.shape) for k, v in self._act_spaces[i].items()}
+                
+                act = {k: np.zeros_like(v.shape) for k,v in dict({"action":self._act_spaces[i]}).items()}
+                
                 tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
                 self._eps[i] = [tran]
@@ -2025,7 +1980,7 @@ class Driver:
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_steps]
                 self._eps[i].append(tran)
                 step += 1
-                if ob["is_last"]:
+                if ob.done:
                     ep = self._eps[i]
                     ep = {k: self._convert([t[k] for t in ep]) for k in ep[0]}
                     [fn(ep, **self._kwargs) for fn in self._on_episodes]
@@ -2237,6 +2192,9 @@ def main(args):
                           )
             env.seed(args.seed)
             env.action_space.np_random.seed(args.seed)
+            #print(env.action_space)
+            #spec = alf_gym_wrapper.tensor_spec_from_gym_space(env.action_space)
+            #print(spec)
             """
             #plotting to test that everything works here
             time_step = env.reset()
@@ -2293,7 +2251,10 @@ def main(args):
         train_envs = [make_async_env("train") for _ in range(args.envs)]
         eval_envs = [make_async_env("eval") for _ in range(num_eval_envs)]
     act_space = train_envs[0].action_space
+    print(f"action space {alf_gym_wrapper.tensor_spec_from_gym_space(train_envs[0].action_space)}")
     obs_space = train_envs[0].observation_space
+    print(f"obervational space {obs_space}") #why didn't we build the latent features here???
+    print(torch.as_tensor(obs_space.sample()[None]).float().shape)
     train_driver = Driver(train_envs)
     train_driver.on_episode(lambda ep: per_episode(ep, mode="train"))
     train_driver.on_step(lambda tran, worker: step.increment())
@@ -2306,12 +2267,14 @@ def main(args):
     prefill = max(0, args.prefill - train_replay.stats["total_steps"])
     if prefill:
         print(f"Prefill dataset ({prefill} steps).")
-        a_net = ActorNetwork(
-                             obs_space,
-                             act_space,
-                             fc_layer_params=args.model_params
-                             )
-        random_agent = RandomSoftPolicy(a_net)
+        
+        random_actor = torch.distributions.independent.Independent(
+          torch.distributions.uniform.Uniform(torch.Tensor(act_space.low)[None],
+                                 torch.Tensor(act_space.high)[None]), 1)
+        def random_agent(o, s):
+            action = random_actor.sample()
+            logprob = random_actor.log_prob(action)
+            return {'action': action, 'logprob': logprob}, None
         train_driver(random_agent, steps=prefill, episodes=1)
         eval_driver(random_agent, episodes=1)
         train_driver.reset()
@@ -2407,6 +2370,7 @@ def parse_args():
     parser.add_argument('--discount', type=int, default= 0.99, help="??")
     parser.add_argument('--task', type=str, default="dmc_cheetah_run", help="name of the environment")
     parser.add_argument('--sequence_length', type=int , default=100, help="the length of an episode")
+    parser.add_argument('--model_params', type=tuple , default=(200, 200), help='number of layers in the actor network')
     args, unknown = parser.parse_known_args()
     return args
 if __name__ == "__main__":
