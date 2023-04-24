@@ -1923,6 +1923,15 @@ class VideoRenderWrapper(gym.Wrapper):
         super().__init__(env)
         self.metadata.update(self._metadata)
 #########################
+def build_dict_from_namedtuple(x):
+    res=dict()
+    for name in x[0]._fields:
+        if isinstance(getattr(x[0], name), np.ndarray):
+           res.update({name : np.stack([getattr(o, name) for o in x])})
+        elif isinstance(getattr(x[0],name), np.bool_):
+           res.update({name : np.stack([np.array(getattr(o, name),dtype=bool) for o in x])})
+
+    return res
 
 class Driver:
     def __init__(self, envs, **kwargs):
@@ -1961,17 +1970,19 @@ class Driver:
             for i, ob in obs.items():
                 self._obs[i] = ob() if callable(ob) else ob
                 
-                act = {k: np.zeros_like(v.shape) for k,v in dict({"action":self._act_spaces[i]}).items()}
-                
-                tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
+                #act = {k: np.zeros_like(v.shape) for k,v in dict({"action":self._act_spaces[i]}).items()}
+                tran = {"observation": ob.observation, "reward":ob.reward, "is_last":ob.done, 'action':ob.prev_action}
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
                 self._eps[i] = [tran]
-            obs = {k: np.stack([o[k] for o in self._obs]) for k in self._obs[0]}
+            
+            obs = build_dict_from_namedtuple(self._obs)
             actions, self._state = policy(obs, self._state, **self._kwargs)
             actions = [
                 {k: np.array(actions[k][i].cpu()) for k in actions}
                 for i in range(len(self._envs))
             ]
+            removed_actions = [ actions[i].pop('logprob') for i in range(len(actions))]
+            
             assert len(actions) == len(self._envs)
             obs = [e.step(a) for e, a in zip(self._envs, actions)]
             obs = [ob() if callable(ob) else ob for ob in obs]
@@ -2251,9 +2262,9 @@ def main(args):
         train_envs = [make_async_env("train") for _ in range(args.envs)]
         eval_envs = [make_async_env("eval") for _ in range(num_eval_envs)]
     act_space = train_envs[0].action_space
-    print(f"action space {alf_gym_wrapper.tensor_spec_from_gym_space(train_envs[0].action_space)}")
+    #print(f"action space {alf_gym_wrapper.tensor_spec_from_gym_space(train_envs[0].action_space)}")
     obs_space = train_envs[0].observation_space
-    print(f"obervational space {obs_space}") #why didn't we build the latent features here???
+    #print(f"obervational space {obs_space}") #why didn't we build the latent features here???
     print(torch.as_tensor(obs_space.sample()[None]).float().shape)
     train_driver = Driver(train_envs)
     train_driver.on_episode(lambda ep: per_episode(ep, mode="train"))
