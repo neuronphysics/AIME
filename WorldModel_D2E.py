@@ -1984,10 +1984,12 @@ class Driver:
             removed_actions = [ actions[i].pop('logprob') for i in range(len(actions))]
             
             assert len(actions) == len(self._envs)
-            obs = [e.step(a) for e, a in zip(self._envs, actions)]
+            obs = [e.step(a['action']) for e, a in zip(self._envs, actions)]
             obs = [ob() if callable(ob) else ob for ob in obs]
             for i, (act, ob) in enumerate(zip(actions, obs)):
-                tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
+                
+                tran = {"observation": ob.observation, "reward":ob.reward, "is_last":ob.done, 'action':ob.prev_action}
+                #tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_steps]
                 self._eps[i].append(tran)
                 step += 1
@@ -2146,7 +2148,7 @@ def main(args):
        random.seed(args.seed)
        torch.cuda.manual_seed(args.seed)
     logdir = pathlib.Path(args.logdir).expanduser()
-    print(f'current path to the log file => {logdir}')
+    
     logdir.mkdir(parents=True, exist_ok=True)
 
 
@@ -2264,8 +2266,7 @@ def main(args):
     act_space = train_envs[0].action_space
     #print(f"action space {alf_gym_wrapper.tensor_spec_from_gym_space(train_envs[0].action_space)}")
     obs_space = train_envs[0].observation_space
-    #print(f"obervational space {obs_space}") #why didn't we build the latent features here???
-    print(torch.as_tensor(obs_space.sample()[None]).float().shape)
+    #print(torch.as_tensor(obs_space.sample()[None]).float().shape)
     train_driver = Driver(train_envs)
     train_driver.on_episode(lambda ep: per_episode(ep, mode="train"))
     train_driver.on_step(lambda tran, worker: step.increment())
