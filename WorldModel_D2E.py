@@ -2288,6 +2288,7 @@ def main(args):
             logprob = random_actor.log_prob(action)
             return {'action': action, 'logprob': logprob}, None
         train_driver(random_agent, steps=prefill, episodes=1)
+        print(f"Collect a dataset for evaluation.")
         eval_driver(random_agent, episodes=1)
         train_driver.reset()
         eval_driver.reset()
@@ -2360,7 +2361,7 @@ def main(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate your search algorithms.")
-    parser.add_argument('--logdir', type=str, default=os.path.join('/content/gdrive/My\ Drive/AIME-vrnn/','/logs'), help= 'a path to the log directory')
+    parser.add_argument('--logdir', type=str, default=os.path.join(os.getcwd(),'/logs'), help= 'a path to the log directory')
     parser.add_argument("--action_repeat", type=int, default=2, choices=[1, 2, 3])
     parser.add_argument('--eval_every', type=int, default=1e5)
     parser.add_argument('--log_every', type=int, default=1e4, help= 'print train info frequency')
