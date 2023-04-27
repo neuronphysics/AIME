@@ -22,9 +22,9 @@ import torch.nn.init as init
 from tqdm import tqdm
 from collections import defaultdict
 from functools import partial
-from Normalization import Normalizer1D, compute_normalizer
-from main import ModelState, DynamicModel, VRNN_GMM
-from vrnn_utilities import *
+from .Normalization import Normalizer1D, compute_normalizer
+from .main import ModelState, DynamicModel, VRNN_GMM
+from .vrnn_utilities import *
 from sklearn.model_selection import train_test_split
 from tensorboardX import SummaryWriter
 import torch.backends.cudnn as cudnn

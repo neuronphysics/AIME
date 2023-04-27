@@ -9,11 +9,11 @@ import torch_optimizer
 import os
 import sys
 import itertools
-from MaskedNorm import MaskedNorm
-from CustomLSTM import LSTMCore
-from attention_encoder import LatentEncoder
-from Blocks import init_weights
-from vrnn_utilities import _strip_prefix_if_present
+from .MaskedNorm import MaskedNorm
+from .CustomLSTM import LSTMCore
+from .attention_encoder import LatentEncoder
+from .Blocks import init_weights
+from .vrnn_utilities import _strip_prefix_if_present
 import random
 import numpy as np
 parent_dir=os.path.abspath(os.path.join(os.getcwd(), '..'))
