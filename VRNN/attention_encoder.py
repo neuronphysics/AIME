@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from Blocks import BatchMLP, LSTMBlock
+from .Blocks import BatchMLP, LSTMBlock
 from typing import Optional
 import torch.nn.functional as F
 import numpy as np
