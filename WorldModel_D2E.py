@@ -49,6 +49,12 @@ from gym_wrappers import wrap_env, FrameSkip
 import cloudpickle
 import atexit
 import traceback
+import sys
+from pathlib import Path
+sys.path.append(os.path.join(os.getcwd(),'VRNN'))
+
+path = str(Path(Path(__file__).parent.absolute()).parent.absolute())
+sys.path.insert(0, os.getcwd())
 
 try:
     import rich.traceback ##
@@ -2361,7 +2367,7 @@ def main(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate your search algorithms.")
-    parser.add_argument('--logdir', type=str, default=os.path.join(os.getcwd(),'/logs'), help= 'a path to the log directory')
+    parser.add_argument('--logdir', type=str, default=os.path.join(os.getcwd(),'logs'), help= 'a path to the log directory')
     parser.add_argument("--action_repeat", type=int, default=2, choices=[1, 2, 3])
     parser.add_argument('--eval_every', type=int, default=1e5)
     parser.add_argument('--log_every', type=int, default=1e4, help= 'print train info frequency')
