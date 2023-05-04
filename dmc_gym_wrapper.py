@@ -79,7 +79,7 @@ class DMCGYMWrapper(gym.core.Env):
                  height: int = 84,
                  width: int = 84,
                  camera_id: int = 0,
-                 control_timestep: Optional[float] = None):
+                 environment_kwargs: Optional[Dict[str, Any]] = None):
         """A Gym env that wraps a ``dm_control`` environment.
 
         Args:
@@ -106,18 +106,13 @@ class DMCGYMWrapper(gym.core.Env):
         self._height = height
         self._width = width
         self._camera_id = camera_id
-
-        if control_timestep is not None:
-            environment_kwargs = {"control_timestep": control_timestep}
-        else:
-            environment_kwargs = None
+        
 
         # create task
         self._env_fn = partial(
             suite.load,
             domain_name=domain_name,
             task_name=task_name,
-            task_kwargs={"time_limit": float('inf')},
             environment_kwargs=environment_kwargs,
             visualize_reward=visualize_reward)
         self._env = self._env_fn()
@@ -164,15 +159,15 @@ class DMCGYMWrapper(gym.core.Env):
         # an env again.
         self._env = self._env_fn(task_kwargs={
             'random': seed,
-            "time_limit": float('inf')
         })
 
     def step(self, action):
         assert self._action_space.contains(action)
         time_step = self._env.step(action)
         reward = time_step.reward or 0
+        done = time_step.last() 
         obs = self._get_obs(time_step)
-        return obs, reward, False, {}
+        return obs, reward, done, {}
 
     def reset(self):
         time_step = self._env.reset()
