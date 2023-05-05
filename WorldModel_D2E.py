@@ -1379,7 +1379,6 @@ class WorldModel(jit.ScriptModule):
     def __init__(self, 
                  hyperParams, 
                  sequence_length, 
-                 dataset,
                  env_name='Hopper-v2', 
                  device  = torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
                  log_dir = "logs", 
@@ -1397,24 +1396,35 @@ class WorldModel(jit.ScriptModule):
         self._discount       = self._params.GAMMA
         #set the environment 
         self._env_name = env_name
-        env_gym =  gym.spec(env_name).make()
-        env = alf_gym_wrapper.AlfGymWrapper(env_gym,discount=self._discount)
-        env = TimeLimit(env, DC.MUJOCO_ENVS_LENGTH[env_name])
+        domain_name, task_name = env_name.split("_")
+        print(domain_name, task_name)
+        env = DMCGYMWrapper(
+                            domain_name= domain_name,
+                            task_name=task_name,
+                            visualize_reward=False,
+                            from_pixels= True,
+                            height= 100,
+                            width = 100,
+                            camera_id = 0,
+                            )
+        
         self._env            = env
         self.n_discriminator_iter = self._params.CRITIC_ITERATIONS
         self._use_amp        = False
         
         #set the sizes
         self.state_dim       = self._params.latent_d
-        self.action_dim      = env.action_spec()
-        self. observation_dim= env.observation_spec()
-        #question: do I need to define this here???
-        self._data =   Dataset(env.observation_spec,
-                               env.action_spec,
-                               self._params.replay_buffer_size,
-                               circular=True,
-                               )
-        self.dataset = dataset
+        self.action_dim      = env.action_spec().shape[0]
+        
+        i=0
+        for key, value in env.observation_spec().items():
+            attr_name = f"observation_{key}_dim"
+            setattr(self, attr_name, value.shape)
+            if i==0:
+              self.observation_dim = tuple(0 for i in range(len(getattr(self,attr_name))))
+            self.observation_dim = tuple(map(operator.add, self.observation_dim, getattr(self,attr_name)))
+            i+=1
+        print(f"total size of action and observation spaces in {env_name} are {self.action_dim} {self.observation_dim}")    
         self.device          = device
         self._clip_rewards   = "tanh"
         self.heads = nn.ModuleDict()
@@ -1425,6 +1435,7 @@ class WorldModel(jit.ScriptModule):
         os.makedirs(self.ckpt_path, exist_ok=True) 
         
         self.mse_loss = nn.MSELoss()
+        print("setting initial values of the dynamic model...")
         #inside VRNN folder we have main.py script : the traisition model
         modelstate =  ModelState(seed            = self._params.seed,
                                  nu              = self.state_dim + self.action_dim,
@@ -1440,6 +1451,7 @@ class WorldModel(jit.ScriptModule):
         self.standard_scaler = StandardScaler(self.device)
         self.transition_model = modelstate.model
         #getting sensory information and building latent state 
+        print("setting initial values of the variational autoencoder model...")
         self.variational_autoencoder = InfGaussMMVAE(hyperParams,
                                                      K          = self._params.K,
                                                      nchannel   = self._params.n_channel,
@@ -1455,20 +1467,24 @@ class WorldModel(jit.ScriptModule):
         self.encoder = self.variational_autoencoder.GMM_encoder
         self.decoder = self.variational_autoencoder.GMM_decoder
         self.discriminator = VAECritic(self.state_dim)
+        print("setting initial values of reward and discount models...")
         self.grad_heads = [ "reward", "discount"]
         self.loss_scales= { "reward": 1.0, "discount": 1.0}
         for name in self.grad_heads:
             assert name in self.heads, name
-
+        print("parameters of the model ....")
+        
+        
         self.parameters = itertools.chain(
             self.transition_model.parameters(),
-            self.heads.parameters(),
-            self.encoder.parameters(),
-            self.decoder.parameters(),
+            self.heads["reward"].parameters(),
+            self.heads["discount"].parameters(),
+            self.variational_autoencoder.get_trainable_parameters()
         )
+        print("if the model restored before")
         if restore:
            self.load_checkpoints()
-
+        print("start tensorboard ....")
         self.writer = SummaryWriter(log_dir)
     
     def initialize_optimizer(self):
@@ -1729,7 +1745,11 @@ class D2EAlgorithm(nn.Module):
         self.eval_state_mean  = eval_state_mean
         self._sequence_length = sequence_length
         self.register_buffer("tfstep", torch.ones(()) * int(self.step))
-        self.wm = WorldModel(hyperParams, sequence_length= self._sequence_length, env_name= self._env, device=self.device, **kwarg)
+        self.wm = WorldModel(hyperParams, 
+                             sequence_length= self._sequence_length,
+                             env_name= self._env, 
+                             device=self.device, 
+                             **kwarg)
         self.RewardNorm = StreamNorm(momentum=0.99, scale=1.0, eps=1e-8)
         self.imag_horizon = imag_horizon
         self._use_amp = True if  self.precision==16 else False
@@ -1995,15 +2015,19 @@ class Driver:
             for i, (act, ob) in enumerate(zip(actions, obs)):
                 
                 tran = {"observation": ob.observation, "reward":ob.reward, "is_last":ob.done, 'action':ob.prev_action}
-                #tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
+                               
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_steps]
                 self._eps[i].append(tran)
                 step += 1
                 if ob.done:
                     ep = self._eps[i]
                     ep = {k: self._convert([t[k] for t in ep]) for k in ep[0]}
+                    #change a key in the ep dictionary 
+                    ep['image'] = ep.pop('observation')
+                    
                     [fn(ep, **self._kwargs) for fn in self._on_episodes]
                     episode += 1
+                
             self._obs = obs
 
     def _convert(self, value):
@@ -2294,7 +2318,6 @@ def main(args):
             logprob = random_actor.log_prob(action)
             return {'action': action, 'logprob': logprob}, None
         train_driver(random_agent, steps=prefill, episodes=1)
-        print(f"Collect a dataset for evaluation.")
         eval_driver(random_agent, episodes=1)
         train_driver.reset()
         eval_driver.reset()
@@ -2304,12 +2327,14 @@ def main(args):
     report_dataset = iter(train_replay.dataset(**dataset))
     eval_dataset = iter(eval_replay.dataset(**dataset))
     #extract sequence length which is the maximum size of sequence length in an all episodes and replace it down for "sequence_length"??? TODO
+    environment_name=args.task.partition('_')[2]
+    print(f"name of the environment {environment_name}")
     agnt = D2EAlgorithm(hyperParams, 
                         args.sequence_length,###???? 
                         obs_space, 
                         act_space, 
                         step,
-                        args.environment_name)
+                        environment_name)
     agnt.initialize_lazy_modules(next(train_dataset))##fix this
     print(
         f"Number of parameters in WorldModel {sum(p.numel() for p in agnt.wm.parameters())}"
