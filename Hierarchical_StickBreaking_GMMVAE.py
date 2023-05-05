@@ -22,6 +22,7 @@ Tensor = TypeVar('torch.tensor')
 from numpy.testing import assert_almost_equal
 from einops import rearrange
 import os
+import itertools
 from sklearn.manifold import TSNE
 #mypdb=pdb.Pdb(stdin=open('fifo_stdin','r'), stdout=open('fifo_stdout','w'))
 try:
@@ -548,6 +549,19 @@ def initialize_weights(model):
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.BatchNorm2d)):
             nn.init.normal_(m.weight.data, 0.0, 0.02)
 
+class LinearBN(nn.Module):
+    def __init__(self, in_features, out_features, bias=False, activation=nn.ReLU()):
+        super(LinearBN, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.bn = nn.BatchNorm1d(out_features)
+        self.activation = activation
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.bn(x)
+        x = self.activation(x)  # or any other activation function
+        return x
+    
 class GMMVAE(nn.Module):
     #Used this repository as a base
     # https://github.com/bhavikngala/gaussian_mixture_vae
@@ -613,11 +627,10 @@ class GMMVAE(nn.Module):
                                               nn.BatchNorm1d(hidden_dim),
                                               nn.Tanh()
                                               )
-        self.pz_wc_fc_mean = nn.ModuleList([nn.Linear(self.hidden_dim, self.z_dim, bias=False) for i in range(self.K)])
-        self.pz_wc_bn_mean = nn.ModuleList([nn.BatchNorm1d(self.z_dim) for i in range(self.K)])
-        self.pz_wc_fc_var  = nn.ModuleList([nn.Linear(self.hidden_dim, self.z_dim, bias=False) for i in range(self.K)])
-        self.pz_wc_bn_var  = nn.ModuleList([nn.BatchNorm1d(self.z_dim) for i in range(self.K)])
-
+        
+        self.pz_wc_mean   =  nn.ModuleList([LinearBN(self.hidden_dim, self.z_dim, bias=False) for i in range(self.K)])
+        self.pz_wc_logvar =  nn.ModuleList([LinearBN(self.hidden_dim, self.z_dim, bias=False, activation=nn.Softplus()) for i in range(self.K)])
+        
         self.encoder_kumar_a = init_mlp([hidden_dim,self.K-1], 1e-7) #Q(pi|x)
         self.encoder_kumar_b = init_mlp([hidden_dim,self.K-1], 1e-7) #Q(pi|x)
         ########## Gamma #########
@@ -626,7 +639,7 @@ class GMMVAE(nn.Module):
         self.encoder_gamma_a = init_mlp([hidden_dim,self.K-1], 1e-8) #Q(pi|x)
         self.encoder_gamma_b = init_mlp([hidden_dim,self.K-1], 1e-8) #Q(pi|x)
 
-
+        ###############################
         ########## Device #############
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.to(device=self.device)
@@ -666,7 +679,7 @@ class GMMVAE(nn.Module):
         #3) posterior P(c|w,z)=Q(c|X)
         #posterior distribution of P(c|w,z^{i})=Q(c|x) where z^{i}~q(z|x)
         #combine hidden layers after convolutional layers for Z latent space and feed forward layers of W latent space
-        hc               = torch.cat([self.encoder.hlayer,hw],1)
+        hc               = torch.cat([self.encoder.hlayer, hw],1)
         c_posterior      = self.encoder_c(hc).to(device=self.device)
 
         #4) posterior of Kumaraswamy given input images
@@ -692,14 +705,13 @@ class GMMVAE(nn.Module):
         #P(z_i|w,c_i)
         h = self.encoder_z_given_w(w_x)
         z_wc_mean_list = list()
-        for i in range(self.K):
-            Pz_given_wc_mean = nn.ReLU()(self.pz_wc_bn_mean[i](self.pz_wc_fc_mean[i](h)))
-            z_wc_mean_list.append(Pz_given_wc_mean)
+        for module in self.pz_wc_mean:
+            z_wc_mean_list.append(module(h))
 
         z_wc_logvar_list, z_wc_sigma_list = list(), list()
 
-        for i in range(self.K):
-            Pz_given_wc_logvar  = nn.Softplus()(self.pz_wc_bn_var[i](self.pz_wc_fc_var[i](h)))
+        for module in self.pz_wc_logvar:
+            Pz_given_wc_logvar  = module(h)
             z_wc_logvar_list.append(Pz_given_wc_logvar)
             Pz_given_wc_sigma = torch.exp(Pz_given_wc_logvar / 2) + epsilon()
             z_wc_sigma_list.append(Pz_given_wc_sigma)
@@ -714,7 +726,16 @@ class GMMVAE(nn.Module):
         gmm              = MixtureSameFamily(self.q_c_given_z, comp)
         #pdb.set_trace()
         return gmm, z_wc_mean.permute(1,0,2), z_wc_logvar.permute(1,0,2) #[k, batch_size, z_dim]
-
+    
+    def get_trainable_parameters(self):
+        params = []
+        for module in self.modules():
+            if isinstance(module, (nn.Sequential, nn.ModuleList)):
+                for sub_module in module:
+                    params += [p for p in sub_module.parameters() if p.requires_grad]
+            else:
+                params += [p for p in module.parameters() if p.requires_grad]
+        return params
 
 
 
@@ -1220,8 +1241,6 @@ def train(epoch):
     data_time  = AverageMeter()
     train_loss_avg = []
     net.train()
-    vae_encoder.train()
-    vae_decoder.train()
     discriminator.train()
 
     train_loss = 0
@@ -1256,8 +1275,7 @@ def train(epoch):
 
         loss_dict, z_posterior, z_posterior_mean, z_posterior_sigma, c_posterior, w_posterior_mean, w_posterior_sigma, dist, z_prior_mean, z_prior_logvar, X_reconst = net.get_ELBO(X)
         loss_dict["wasserstein_loss"] =  -torch.mean(gen_fake)
-        enc_optim.zero_grad()
-        dec_optim.zero_grad()
+        vae_optim.zero_grad()
 
         loss_dict["WAE-GP"]=loss_dict["loss"]+loss_dict["wasserstein_loss"]
 
@@ -1278,8 +1296,7 @@ def train(epoch):
 
         torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
         #optimizer.step()
-        enc_optim.step()
-        dec_optim.step()
+        vae_optim.step()
 
         train_loss_avg[-1] += loss_dict["WAE-GP"].item()
         num_batches += 1
@@ -1521,14 +1538,12 @@ if __name__ == "__main__":
     ###*********************************************************###
 
     #net.cuda()
-    vae_encoder, vae_decoder, discriminator = net.encoder, net.decoder, VAECritic(net.z_dim)
-
-    enc_optim = torch.optim.Adam(vae_encoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
-    dec_optim = torch.optim.Adam(vae_decoder.parameters(), lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
+    discriminator = VAECritic(net.z_dim)
+    trainable_params = net.get_trainable_parameters()
+    vae_optim = torch.optim.Adam(trainable_params, lr = hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
     dis_optim = torch.optim.Adam(discriminator.parameters(), lr = 0.5 * hyperParams["LEARNING_RATE"], betas=(0.5, 0.9))
 
-    enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
-    dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
+    vae_scheduler = torch.optim.lr_scheduler.StepLR(vae_optim, step_size = 30, gamma = 0.5)
     dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
     #optimizer = optim.Adam(net.parameters(), lr=hyperParams["LEARNING_RATE"])
     cwd = os.getcwd()
@@ -1558,11 +1573,8 @@ if __name__ == "__main__":
             print(latest_file)
             checkpoint = torch.load(latest_file)
             net.load_state_dict(checkpoint['model_state_dict'])
-            #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            enc_optim.load_state_dict(checkpoint['encoder_optimizer_state_dict'])
-            dec_optim.load_state_dict(checkpoint['decoder_optimizer_state_dict'])
-            vae_encoder.load_state_dict(checkpoint['encoder_state_dict'])
-            vae_decoder.load_state_dict(checkpoint['decoder_state_dict'])
+            vae_optim.load_state_dict(checkpoint['vae_optimizer_state_dict'])
+            dis_optim.load_state_dict(checkpoint['disc_optimizer_state_dict'])
             discriminator.load_state_dict(checkpoint['citic_state_dict'])
             best_loss   = checkpoint['best_loss']
             start_epoch = int(regex.findall(latest_file)[-1])
@@ -1596,17 +1608,14 @@ if __name__ == "__main__":
             #print(average_epoch_loss)
             #print(epoch)
             #plotter.plot('Total loss', 'train', 'Class Loss', epoch, average_epoch_loss[0])
-            vae_encoder.eval()
-            vae_decoder.eval()
+            net.eval()
             discriminator.eval()
             if (epoch % 500 == 0) and (epoch//500> 0):
                 torch.save({
                         'best_epoch': epoch,
                         'model_state_dict': copy.deepcopy(net.state_dict()),
-                        'encoder_optimizer_state_dict':copy.deepcopy(enc_optim.state_dict()),
-                        'decoder_optimizer_state_dict':copy.deepcopy(dec_optim.state_dict()),
-                        'encoder_state_dict':copy.deepcopy(vae_encoder.state_dict()),
-                        'decoder_state_dict':copy.deepcopy(vae_decoder.state_dict()),
+                        'vae_optimizer_state_dict':copy.deepcopy(vae_optim.state_dict()),
+                        'disc_optimizer_state_dict':copy.deepcopy(dis_optim.state_dict()),
                         'citic_state_dict':copy.deepcopy(discriminator.state_dict()),
                         #'optimizer_state_dict': copy.deepcopy(optimizer.state_dict()),
                         'best_loss': average_epoch_loss[-1],
