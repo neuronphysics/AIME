@@ -1375,7 +1375,7 @@ class D2EDataset(Dataset):
         self.buffer.append(Transition)
 
 
-class WorldModel(jit.ScriptModule):
+class WorldModel(nn.Module):
     def __init__(self, 
                  hyperParams, 
                  sequence_length, 
@@ -1518,7 +1518,6 @@ class WorldModel(jit.ScriptModule):
         data["done"] = done
         return data
     
-    @torch.jit.script_method
     def _train(self, 
                data: Dict[str, torch.Tensor]
                ):
