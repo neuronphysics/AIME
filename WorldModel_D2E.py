@@ -51,6 +51,8 @@ import atexit
 import traceback
 import sys
 from pathlib import Path
+import types
+import operator
 sys.path.append(os.path.join(os.getcwd(),'VRNN'))
 
 path = str(Path(Path(__file__).parent.absolute()).parent.absolute())
@@ -82,12 +84,13 @@ Finally, we use the planning algorithm to determine the best policy that maximiz
 Overall, this script aims to provide a comprehensive framework for dream to explore algorithm that incorporates various key components and techniques to enable effective learning of the world model and planning.
 
 """
-#####################################
+#####################################################################
+
 def get_datetime():
   now = datetime.datetime.now().isoformat()
   now = re.sub(r'\D', '', now)[:-6]
   return now
-#####################################
+#####################################################################
 #https://github.com/danijar/dreamerv2/blob/main/dreamerv2/common/replay.py
 
 class IterableWrapper(IterableDataset):
@@ -188,8 +191,8 @@ class Replay:
                 sequence = {k: v[needed:] for k, v in sequence.items()}
                 for key, value in adding.items():
                     chunk[key].append(value)
-                added += len(adding["action"])
-                if len(sequence["action"]) < 1:
+                added += len(adding["done"])
+                if len(sequence["done"]) < 1:
                     sequence = self._sample_sequence()
             chunk = {k: np.concatenate(v) for k, v in chunk.items()}
             yield chunk
@@ -201,7 +204,7 @@ class Replay:
                 x for x in self._ongoing_eps.values() if eplen(x) >= self._minlen
             ]
         episode = self._random.choice(episodes)
-        total = len(episode["action"])
+        total = len(episode["done"])
         length = total
         if self._maxlen:
             length = min(length, self._maxlen)
@@ -218,10 +221,10 @@ class Replay:
             for k, v in episode.items()
             if not k.startswith("log_")
         }
-        sequence["is_first"] = np.zeros(len(sequence["action"]), bool)
+        sequence["is_first"] = np.zeros(len(sequence["done"]), bool)
         sequence["is_first"][0] = True
         if self._maxlen:
-            assert self._minlen <= len(sequence["action"]) <= self._maxlen
+            assert self._minlen <= len(sequence["done"]) <= self._maxlen
         return sequence
 
     def _enforce_limit(self):
@@ -294,14 +297,14 @@ def convert(value):
 
 
 def eplen(episode):
-    return len(episode["action"]) - 1
+    return len(episode["done"]) -1
 ############################################
 hyperParams = { "batch_size": 40,
                 "input_d": 1,
                 "prior_alpha": 7., #gamma_alpha
                 "prior_beta": 1., #gamma_beta
                 "K": 25,
-                "image_width": 96,
+                "image_width": 100,
                 "hidden_d": 300,
                 "latent_d": 100,
                 "latent_w": 200,
@@ -383,78 +386,8 @@ class Counter:
     def increment(self, amount=1):
         self.value += amount
 
-##################
-class Driver:
-    def __init__(self, envs, **kwargs):
-        self._envs = envs
-        self._kwargs = kwargs
-        self._on_steps = []
-        self._on_resets = []
-        self._on_episodes = []
-        self._act_spaces = [env.act_space for env in envs]
-        self.reset()
-
-    def on_step(self, callback):
-        self._on_steps.append(callback)
-
-    def on_reset(self, callback):
-        self._on_resets.append(callback)
-
-    def on_episode(self, callback):
-        self._on_episodes.append(callback)
-
-    def reset(self):
-        self._obs = [None] * len(self._envs)
-        self._eps = [None] * len(self._envs)
-        self._state = None
-
-    def __call__(self, policy, steps=0, episodes=0):
-        step, episode = 0, 0
-        while step < steps or episode < episodes:
-            obs = {
-                i: self._envs[i].reset()
-                for i, ob in enumerate(self._obs)
-                if ob is None or ob["is_last"]
-            }
-            for i, ob in obs.items():
-                self._obs[i] = ob() if callable(ob) else ob
-                act = {k: np.zeros(v.shape) for k, v in self._act_spaces[i].items()}
-                tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
-                [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
-                self._eps[i] = [tran]
-            obs = {k: np.stack([o[k] for o in self._obs]) for k in self._obs[0]}
-            actions, self._state = policy(obs, self._state, **self._kwargs)
-            actions = [
-                {k: np.array(actions[k][i].cpu()) for k in actions}
-                for i in range(len(self._envs))
-            ]
-            assert len(actions) == len(self._envs)
-            obs = [e.step(a) for e, a in zip(self._envs, actions)]
-            obs = [ob() if callable(ob) else ob for ob in obs]
-            for i, (act, ob) in enumerate(zip(actions, obs)):
-                tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
-                [fn(tran, worker=i, **self._kwargs) for fn in self._on_steps]
-                self._eps[i].append(tran)
-                step += 1
-                if ob["is_last"]:
-                    ep = self._eps[i]
-                    ep = {k: self._convert([t[k] for t in ep]) for k in ep[0]}
-                    [fn(ep, **self._kwargs) for fn in self._on_episodes]
-                    episode += 1
-            self._obs = obs
-
-    def _convert(self, value):
-        value = np.array(value)
-        if np.issubdtype(value.dtype, np.floating):
-            return value.astype(np.float32)
-        elif np.issubdtype(value.dtype, np.signedinteger):
-            return value.astype(np.int32)
-        elif np.issubdtype(value.dtype, np.uint8):
-            return value.astype(np.uint8)
-        return value
+############################
 ###########################
-
-
 class TerminalOutput:
     def __call__(self, summaries):
         step = max(s for s, _, _, in summaries)
@@ -663,7 +596,6 @@ class TanhBijector(torch.distributions.Transform):
 
     def log_abs_det_jacobian(self, x, y):
         return 2.0 * (np.log(2) - x - nn.functional.softplus(-2.0 * x))
-
 
 
 class TruncatedStandardNormal(Distribution):
@@ -953,6 +885,8 @@ class StreamNorm(nn.Module):
 
 ###############################################################################
 ########### prepare data for transition model by padding episodes #############
+###############################################################################
+
 def make_episodes(states, actions, next_states, dones):
     pairs, inputs, score, targets =[], [], [], []
     for i in range(len(dones)):
@@ -1032,7 +966,6 @@ class VideoRecorder:
         if self.enabled:
             path = self.save_dir / file_name
             imageio.mimsave(str(path), self.frames, fps=self.fps)
-
 
 
 class Logger:
@@ -1474,7 +1407,6 @@ class WorldModel(nn.Module):
             assert name in self.heads, name
         print("parameters of the model ....")
         
-        
         self.parameters = itertools.chain(
             self.transition_model.parameters(),
             self.heads["reward"].parameters(),
@@ -1486,6 +1418,7 @@ class WorldModel(nn.Module):
            self.load_checkpoints()
         print("start tensorboard ....")
         self.writer = SummaryWriter(log_dir)
+        print("end of initializing the world model")
     
     def initialize_optimizer(self):
         self.optimizer = Optimizer("world_model",
@@ -1749,6 +1682,7 @@ class D2EAlgorithm(nn.Module):
                              env_name= self._env, 
                              device=self.device, 
                              **kwarg)
+        print("normalize the reward .....")
         self.RewardNorm = StreamNorm(momentum=0.99, scale=1.0, eps=1e-8)
         self.imag_horizon = imag_horizon
         self._use_amp = True if  self.precision==16 else False
@@ -1958,6 +1892,20 @@ def build_dict_from_namedtuple(x):
 
     return res
 
+def build_dict_from_namedtuple_list(x):
+    res = {}
+    for name in x[0]._fields:
+        if isinstance(getattr(x[0], name), np.ndarray):
+            res[name] = np.stack([getattr(o, name) for o in x])
+        elif isinstance(getattr(x[0], name), np.bool_):
+            res[name] = np.stack([np.array(getattr(o, name), dtype=bool) for o in x])
+        else:
+            res[name] = [getattr(o, name) for o in x]
+    return res
+
+Transition = collections.namedtuple(
+    'Transition', 's1, s2, a1, a2, discount, reward, done')
+
 class Driver:
     def __init__(self, envs, **kwargs):
         self._envs = envs
@@ -1981,11 +1929,11 @@ class Driver:
         self._obs = [None] * len(self._envs)
         self._eps = [None] * len(self._envs)
         self._state = None
+        
 
     def __call__(self, policy, steps=0, episodes=0):
         step, episode = 0, 0
         while step < steps or episode < episodes:
-            
             obs = {
                 i: self._envs[i].reset()
                 for i, ob in enumerate(self._obs)
@@ -1994,43 +1942,60 @@ class Driver:
             
             for i, ob in obs.items():
                 self._obs[i] = ob() if callable(ob) else ob
-                
-                #act = {k: np.zeros_like(v.shape) for k,v in dict({"action":self._act_spaces[i]}).items()}
-                tran = {"observation": ob.observation, "reward":ob.reward, "is_last":ob.done, 'action':ob.prev_action}
+                tran = Transition(
+                    s1=ob.observation,
+                    s2=None,
+                    a1=None,
+                    a2=None,
+                    discount=None,
+                    reward=None,
+                    done=None
+                )
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
                 self._eps[i] = [tran]
             
-            obs = build_dict_from_namedtuple(self._obs)
+            obs =build_dict_from_namedtuple(self._obs)
+            
             actions, self._state = policy(obs, self._state, **self._kwargs)
             actions = [
                 {k: np.array(actions[k][i].cpu()) for k in actions}
                 for i in range(len(self._envs))
             ]
+            
             removed_actions = [ actions[i].pop('logprob') for i in range(len(actions))]
             
             assert len(actions) == len(self._envs)
-            obs = [e.step(a['action']) for e, a in zip(self._envs, actions)]
-            obs = [ob() if callable(ob) else ob for ob in obs]
-            for i, (act, ob) in enumerate(zip(actions, obs)):
-                
-                tran = {"observation": ob.observation, "reward":ob.reward, "is_last":ob.done, 'action':ob.prev_action}
-                               
+            obs_next = [e.step(a['action']) for e, a in zip(self._envs, actions)]
+            
+            obs_next = [ob() if callable(ob) else ob for ob in obs_next]
+            for i, (act, ob, ob_next) in enumerate(zip(actions, self._obs, obs_next)):
+                tran = Transition(
+                    s1=ob.observation,
+                    s2=ob_next.observation,
+                    a1=ob.prev_action,
+                    a2=act['action'],
+                    discount=ob_next.discount,
+                    reward=ob_next.reward,
+                    done=ob_next.done
+                )       
+                  
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_steps]
                 self._eps[i].append(tran)
-                step += 1
-                if ob.done:
-                    ep = self._eps[i]
-                    ep = {k: self._convert([t[k] for t in ep]) for k in ep[0]}
-                    #change a key in the ep dictionary 
-                    ep['image'] = ep.pop('observation')
-                    
-                    [fn(ep, **self._kwargs) for fn in self._on_episodes]
-                    episode += 1
                 
-            self._obs = obs
+                step += 1
+                if ob_next.done:
+                    ep = self._eps[i]
+                    ep = [Transition(*[self._convert(getattr(t, field)) for field in t._fields]) for t in ep if not any(getattr(t, field) is None for field in t._fields)]
+                    ep_dict = build_dict_from_namedtuple_list(ep)
+                    [fn(ep_dict, **self._kwargs) for fn in self._on_episodes]
+                    episode += 1               
+            self._obs = obs_next
 
     def _convert(self, value):
-        value = np.array(value)
+        if isinstance(value, bool):
+           return np.array(value, dtype=np.bool_)
+        else:
+           value = np.array(value)
         if np.issubdtype(value.dtype, np.floating):
             return value.astype(np.float32)
         elif np.issubdtype(value.dtype, np.signedinteger):
@@ -2038,6 +2003,7 @@ class Driver:
         elif np.issubdtype(value.dtype, np.uint8):
             return value.astype(np.uint8)
         return value
+
 
 class Async:
 
@@ -2243,7 +2209,7 @@ def main(args):
             time_step = env.current_time_step()
             time_step = env.step(env.action_space.sample())
             img=time_step.observation
-
+            #size of image :(3, 100, 100)
             img = img.swapaxes(0,1)
             img = img.swapaxes(1,2)
             plt.figure(figsize=(6, 8))
@@ -2328,6 +2294,9 @@ def main(args):
     #extract sequence length which is the maximum size of sequence length in an all episodes and replace it down for "sequence_length"??? TODO
     environment_name=args.task.partition('_')[2]
     print(f"name of the environment {environment_name}")
+
+    print("start initializing the D2E algorithm class ....")
+    
     agnt = D2EAlgorithm(hyperParams, 
                         args.sequence_length,###???? 
                         obs_space, 
@@ -2389,6 +2358,8 @@ def main(args):
         except Exception:
             pass
 
+
+#####################################################################
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate your search algorithms.")
     parser.add_argument('--logdir', type=str, default=os.path.join(os.getcwd(),'logs'), help= 'a path to the log directory')
@@ -2406,7 +2377,7 @@ def parse_args():
     parser.add_argument("--envs", type=int, default=1, help='should be updated??')
     parser.add_argument("--eval_eps", type=int, default=1, help='??')
     parser.add_argument("--envs_parallel", type=str, default="none", help='??')
-    parser.add_argument("--log_keys_video", type=list, default=['image'], help='??')
+    parser.add_argument("--log_keys_video", type=list, default=['s2'], help='??')
     parser.add_argument('--log_keys_sum', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_mean', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_max', type=str, default='^$', help='??')
