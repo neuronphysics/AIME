@@ -23,6 +23,7 @@ from PIL import Image
 from planner_D2E_regularizer import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, eval_policy_episodes
 import dill
 import nest
+from torch.utils import data
 #####################################
 #from train_eval_utils
 
@@ -144,7 +145,7 @@ def save_copy(data, ckpt_name):
   with open( ckpt_name+'.pth', 'wb') as filehandler: 
     dill.dump(new_data, filehandler)
   
-class Dataset(nn.Module):
+class Dataset(data.Dataset):
   """Tensorflow module of dataset of transitions."""
 
   def __init__(
@@ -346,7 +347,8 @@ def collect_data(
   # Save final dataset.
   assert data.size == data.capacity
   data_ckpt_name = os.path.join(log_dir, 'data_{}.pt'.format(env_name))
-  torch.save([data.capacity, data.state_dict()], data_ckpt_name)
+  torch.save({"dataset": data, "capacity": data.capacity},  data_ckpt_name)
+  
   whole_data_ckpt_name = os.path.join(log_dir, 'data_{}.pth'.format(env_name))
   with open( whole_data_ckpt_name, 'wb') as filehandler: 
     pickle.dump(data, filehandler)

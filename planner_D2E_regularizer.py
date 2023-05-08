@@ -723,7 +723,7 @@ class ContinuousRandomPolicy(nn.Module):
   def __call__(self, observation, state=()):
     action = tensor_specs.sample_bounded_spec(
         self._action_spec, 
-        outer_dims=[observation.shape[0]]
+        #outer_dims=[observation.shape[0]]
         )
     return action, state
 
