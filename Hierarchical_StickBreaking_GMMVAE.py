@@ -543,7 +543,7 @@ class VAECritic(nn.Module):
     # define the descriminator/critic
     def __init__(self, input_dims, num_layers=4, norm_type='layer'):
         super(VAECritic,self).__init__()
-
+        self.norm_type = norm_type
         layers = []
         layers.append(nn.Linear(input_dims, input_dims * 2, bias=False))
 
