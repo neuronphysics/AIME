@@ -212,8 +212,8 @@ class LayerNorm2d(nn.LayerNorm):
     with shape (batch_size, channels, height, width).
     source :https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
     """
-    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_first"):
-        super().__init__()
+    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_first", **kwargs):
+        super().__init__(normalized_shape, **kwargs)
         self.weight = nn.Parameter(torch.ones(normalized_shape))
         self.bias = nn.Parameter(torch.zeros(normalized_shape))
         self.eps = eps
