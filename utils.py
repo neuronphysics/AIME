@@ -204,9 +204,39 @@ class AttentionBlock(nn.Module):
         score = torch.matmul(score, v)
         return score
 
+class LayerNorm2d(nn.LayerNorm):
+    
+    r""" LayerNorm that supports two data formats: channels_last (default) or channels_first. 
+    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
+    shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
+    with shape (batch_size, channels, height, width).
+    source :https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
+    """
+    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_first"):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.data_format = data_format
+        if self.data_format not in ["channels_last", "channels_first"]:
+            raise NotImplementedError 
+        self.normalized_shape = (normalized_shape, )
+    
+    def forward(self, x):
+        assert x.dim() == 4, 'LayerNorm2d only supports inputs with shape ' \
+            f'(B, C, H, W), but got tensor with shape {x.shape}'
+        if self.data_format == "channels_last":
+            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        elif self.data_format == "channels_first":
+            u = x.mean(1, keepdim=True)
+            s = (x - u).pow(2).mean(1, keepdim=True)
+            x = (x - u) / torch.sqrt(s + self.eps)
+            x = self.weight[:, None, None] * x + self.bias[:, None, None]
+            return x
+
 class ResidualBlock(nn.Module):
 
-    def __init__(self, in_channels, kernel_size, stride, padding, nonlinearity=None):
+    def __init__(self, in_channels, kernel_size, stride, padding, norm_type='layer', nonlinearity=None ):
         """
             1. in_channels is the number of input channels to the first conv layer, 
             2. out_channels is the number of output channels of the first conv layer 
@@ -225,7 +255,11 @@ class ResidualBlock(nn.Module):
                                 bias    = False)
                         
         )
-        layers.append(nn.BatchNorm2d( in_channels))
+        if norm_type == 'batch':
+            layers.append(nn.BatchNorm2d(in_channels))
+        elif norm_type == 'layer':
+            layers.append(LayerNorm2d(in_channels))
+
         layers.append(nl)
         layers.append(
                         nn.Conv2d(
@@ -237,7 +271,11 @@ class ResidualBlock(nn.Module):
                                 bias    = False)
                         
         )
-        layers.append(nn.BatchNorm2d( in_channels))
+        if norm_type == 'batch':
+            layers.append(nn.BatchNorm2d(in_channels))
+        elif norm_type == 'layer':
+            layers.append(LayerNorm2d(in_channels))
+
         layers.append(nl)
         self.layers = nn.Sequential(*layers)
 
@@ -249,44 +287,86 @@ class ResidualBlock(nn.Module):
         return out
 
 class ResidualBlock_deconv(nn.Module):
-    def __init__(self, channel, kernel_size, stride, padding, nonlinearity=None):
+    def __init__(self, channel, kernel_size, stride, padding, norm_type="layer", nonlinearity=None):
         super(ResidualBlock_deconv, self).__init__()
         nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
         self.conv1 = nn.ConvTranspose2d(channel, channel, kernel_size, stride, padding)
-        self.bn1 = nn.BatchNorm2d(channel)
+        if norm_type == "batch":
+           self.norm1 = nn.BatchNorm2d(channel)
+        elif norm_type == "layer":
+           self.norm1 = LayerNorm2d(channel)
         self.relu = nl
         self.conv2 = nn.ConvTranspose2d(channel, channel, kernel_size, stride, padding)
-        self.bn2 = nn.BatchNorm2d(channel)
+        if norm_type == "batch":
+           self.norm2 = nn.BatchNorm2d(channel)
+        elif norm_type == "layer":
+           self.norm2 = LayerNorm2d(channel)
 
     def forward(self, x):
         res = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.relu(self.norm1(self.conv1(x)))
+        out = self.relu(self.norm2(self.conv2(out)))
         out = out + res
         return out
 
 class LinearResidual(nn.Module):
-    def __init__(self, input_feature, nonlinearity=None):
+    def __init__(self, input_feature, nonlinearity=None, norm_type='layer'):
         super(LinearResidual, self).__init__()
         nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
-        fn=[]
-        fn.append(
-                nn.Linear(input_feature, input_feature)
-        )
-        fn.append(
-                nn.BatchNorm1d(input_feature, affine=True)
-        )
-        fn.append(nl) 
-        fn.append(
-                nn.Linear(input_feature, input_feature)
-        )
-        fn.append(
-                nn.BatchNorm1d(input_feature, affine=True)
-        )
-        fn.append(nl)                      
-        self.fn = nn.Sequential(*fn)
+        
+        layers = []
+        layers.append(nn.Linear(input_feature, input_feature))
+        
+        if norm_type == 'batch':
+            layers.append(nn.BatchNorm1d(input_feature, affine=True))
+        elif norm_type == 'layer':
+            layers.append(nn.LayerNorm(input_feature))
+        
+        layers.append(nl)
+        
+        layers.append(nn.Linear(input_feature, input_feature))
+        
+        if norm_type == 'batch':
+            layers.append(nn.BatchNorm1d(input_feature, affine=True))
+        elif norm_type == 'layer':
+            layers.append(nn.LayerNorm(input_feature))
+        
+        layers.append(nl)
+        
+        self.fn = nn.Sequential(*layers)
+    
     def forward(self, x):
         return self.fn(x) + x
+    
+
+class CustomLinear(nn.Module):
+    def __init__(self, hidden_dim, norm_type='layer', last_activation=None, flatten=False):
+        super(CustomLinear, self).__init__()
+        layers = []
+        if norm_type == 'batch':
+            norm_layer = nn.BatchNorm1d
+        elif norm_type == 'layer':
+            norm_layer = nn.LayerNorm
+        else:
+            raise ValueError("Invalid norm_type. Supported values: 'batch', 'layer'")
+        ###
+        if flatten:
+            layers.append(nn.Flatten())
+        ###
+        for i in range(len(hidden_dim)-1):
+            layers.append(nn.Linear(hidden_dim[i], hidden_dim[i+1], bias=False))
+            if norm_type != 'none':
+                layers.append(norm_layer(hidden_dim[i+1]))
+            if i== len(hidden_dim)-2:
+               layers.append( last_activation)
+            else:
+                layers.append(nn.ReLU())
+        ###
+        self.encoder = nn.Sequential(*layers)
+    def forward(self, x):
+        return self.encoder(x)
+
+
 #########################
 def build_grid(resolution, device):
     ranges = [np.linspace(0., 1., num=res) for res in resolution]

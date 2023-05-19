@@ -29,7 +29,7 @@ try:
     import PIL.Image as Image
 except ImportError:
     import Image
-from utils import AverageMeter, ResidualBlock, LinearResidual, ResidualBlock_deconv
+from utils import AverageMeter, ResidualBlock, LinearResidual, ResidualBlock_deconv, LayerNorm2d, CustomLinear
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 ##########################################
 #####  author: Zahra Sheikhbahaee   ######
@@ -289,8 +289,11 @@ def init_(m):
         if m.bias is not None:
             m.bias.data.fill_(0)
 
+
+
+
 class VAEEncoder(nn.Module):
-    def __init__(self,nchannel, z_dim, hidden_dim, img_width, max_filters=512, num_layers=4, small_conv=False):
+    def __init__(self,nchannel, z_dim, hidden_dim, img_width, max_filters=512, num_layers=4, small_conv=False, norm_type = 'layer'):
         super(VAEEncoder,self).__init__()
         self.nchannel    = nchannel
         self.z_dim       = z_dim
@@ -337,7 +340,11 @@ class VAEEncoder(nn.Module):
                     )
                 )
             # Batch Norm
-            encoder_layers.append(nn.BatchNorm2d(out_channels))
+            if norm_type == 'batch':
+                encoder_layers.append(nn.BatchNorm2d(out_channels))
+            elif norm_type == 'layer':
+                encoder_layers.append(LayerNorm2d(out_channels))
+            
             # ReLU
             encoder_layers.append(nn.ReLU())
             if (i==num_layers//2):
@@ -359,15 +366,23 @@ class VAEEncoder(nn.Module):
 
         # Calculate shape of the flattened image
         self.h_dim, self.h_image_dim = self.get_flattened_size(self.img_width)
+        #linear layers
+        layers = []
+        layers.append(nn.Linear(self.h_dim, hidden_dim, bias=False))
+        if norm_type == 'batch':
+            layers.append(nn.BatchNorm1d(hidden_dim))
+        elif norm_type == 'layer':
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.ReLU())
 
-        self.encoder = nn.Sequential(
-        self.encoder, nn.Linear(self.h_dim, hidden_dim, bias=False),
-        nn.BatchNorm1d(hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim, bias=False),
-        nn.BatchNorm1d(hidden_dim),
-        nn.ReLU()
-        ) # ReLU
+        layers.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
+        if norm_type == 'batch':
+            layers.append(nn.BatchNorm1d(hidden_dim))
+        elif norm_type == 'layer':
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.ReLU())
+
+        self.encoder = nn.Sequential( *layers)        
 
         #print(f"encode network:\n{self.encoder}")
         ########################
@@ -419,7 +434,7 @@ class VAEEncoder(nn.Module):
 
 class VAEDecoder(nn.Module):
     #https://github.com/akashsara/fusion-dance
-    def __init__(self,nchannel, z_dim, hidden_dim, extend_dim, h_image_dim, img_width, max_filters=512, num_layers=4, small_conv=False):
+    def __init__(self,nchannel, z_dim, hidden_dim, extend_dim, h_image_dim, img_width, max_filters=512, num_layers=4, small_conv=False, norm_type = 'layer'):
         super(VAEDecoder,self).__init__()
         self.nchannel   = nchannel
         self.z_dim      = z_dim
@@ -445,13 +460,25 @@ class VAEDecoder(nn.Module):
         decoder_layers = nn.ModuleList()
         # Feedforward/Dense Layer to expand our latent dimensions
         decoder_layers.append(nn.Linear(z_dim, hidden_dim))
-        decoder_layers.append(nn.BatchNorm1d(hidden_dim))
+        if norm_type == 'batch':
+            decoder_layers.append(nn.BatchNorm1d(hidden_dim))
+        elif norm_type == 'layer':
+            decoder_layers.append(nn.LayerNorm(hidden_dim))
+        
         decoder_layers.append(nn.ReLU())
         decoder_layers.append(nn.Linear(hidden_dim, hidden_dim))
-        decoder_layers.append(nn.BatchNorm1d(hidden_dim))
+        if norm_type == 'batch':
+            decoder_layers.append(nn.BatchNorm1d(hidden_dim))
+        elif norm_type == 'layer':
+            decoder_layers.append(nn.LayerNorm(hidden_dim))
+
         decoder_layers.append(nn.ReLU())
         decoder_layers.append(torch.nn.Linear(hidden_dim, extend_dim, bias=False))
-        decoder_layers.append(nn.BatchNorm1d(extend_dim))
+        if norm_type == 'batch':
+            decoder_layers.append(nn.BatchNorm1d(extend_dim))
+        elif norm_type == 'layer':
+            decoder_layers.append(nn.LayerNorm(extend_dim))
+
         decoder_layers.append(nn.ReLU())
         # Unflatten to a shape of (Channels, Height, Width)
         decoder_layers.append(nn.Unflatten(1, (int(extend_dim / (h_image_dim * h_image_dim)), h_image_dim, h_image_dim)))
@@ -481,7 +508,12 @@ class VAEDecoder(nn.Module):
                         bias=False,
                     )
                 )
-            decoder_layers.append(nn.BatchNorm2d(out_channels))
+            if norm_type == 'batch':
+                decoder_layers.append(nn.BatchNorm2d(out_channels))
+            elif norm_type == 'layer':
+                decoder_layers.append(LayerNorm2d(out_channels))
+ 
+
             # ReLU if not final layer
             if i != num_layers - 1:
                 decoder_layers.append(nn.ReLU())
@@ -509,13 +541,16 @@ class VAEDecoder(nn.Module):
 
 class VAECritic(nn.Module):
     # define the descriminator/critic
-    def __init__(self, input_dims, num_layers=4):
+    def __init__(self, input_dims, num_layers=4, norm_type='layer'):
         super(VAECritic,self).__init__()
 
         layers = []
         layers.append(nn.Linear(input_dims, input_dims * 2, bias=False))
 
-        layers.append(nn.BatchNorm1d(input_dims * 2))
+        if self.norm_type == 'batch':
+           layers.append(nn.BatchNorm1d(input_dims * 2))
+        elif self.norm_type == 'layer':
+            layers.append(nn.LayerNorm(input_dims * 2))   
         # Activation Function
         layers.append(nn.LeakyReLU(0.2))
         size = input_dims * 2
@@ -523,14 +558,24 @@ class VAECritic(nn.Module):
         for i in range(num_layers-2):
             # residual feedforward Layer
             layers.append( nn.Linear(size, size //2))
-            layers.append(nn.BatchNorm1d(size // 2))
+
+            if self.norm_type == 'batch':
+                layers.append(nn.BatchNorm1d(size // 2))
+            elif self.norm_type == 'layer':
+                layers.append(nn.LayerNorm(size // 2))
+
             layers.append(nn.LeakyReLU(0.2))
             if (i==(num_layers//2-1)):
                 #add a residual block
                 LinearResidual(size//2)
             size = size// 2
         layers.append(nn.Linear(size, size * 2, bias=False))
-        layers.append(nn.BatchNorm1d(size * 2))
+
+        if self.norm_type == 'batch':
+           layers.append(nn.BatchNorm1d(size * 2))
+        elif self.norm_type == 'layer':
+            layers.append(nn.LayerNorm(size * 2))   
+
         # Activation Function
         layers.append(nn.LeakyReLU(0.2))
         #add anther residual block
@@ -550,10 +595,14 @@ def initialize_weights(model):
             nn.init.normal_(m.weight.data, 0.0, 0.02)
 
 class LinearBN(nn.Module):
-    def __init__(self, in_features, out_features, bias=False, activation=nn.ReLU()):
+    def __init__(self, in_features, out_features, bias=False, activation=nn.ReLU(), norm_type='layer'):
         super(LinearBN, self).__init__()
         self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.bn = nn.BatchNorm1d(out_features)
+        if self.norm_type == 'batch':
+            self.bn = nn.BatchNorm1d(out_features)
+        elif self.norm_type == 'layer':
+            self.bn = nn.LayerNorm(out_features)
+        
         self.activation = activation
 
     def forward(self, x):
@@ -561,7 +610,8 @@ class LinearBN(nn.Module):
         x = self.bn(x)
         x = self.activation(x)  # or any other activation function
         return x
-    
+
+
 class GMMVAE(nn.Module):
     #Used this repository as a base
     # https://github.com/bhavikngala/gaussian_mixture_vae
@@ -588,45 +638,23 @@ class GMMVAE(nn.Module):
         ########################
         #ENCODER-JUST USING FULLY CONNECTED LAYERS
         #THE LATENT SPACE (W)
-        self.encoder_w   = nn.Sequential(
-                                         nn.Flatten(),
-                                         nn.Linear(img_width * img_width * nchannel, hidden_dim),
-                                         nn.BatchNorm1d(hidden_dim),
-                                         nn.ReLU(),
-                                         nn.Linear(hidden_dim, hidden_dim, bias=False),
-                                         nn.BatchNorm1d(hidden_dim),
-                                         nn.ReLU(),
-                                         )
+        self.encoder_w   = CustomLinear( hidden_dim = [img_width * img_width * nchannel, hidden_dim, hidden_dim], norm_type='layer', last_activation=nn.ReLU(), flatten=True)
+        
         # mean of w
-        self.encoder_w_mean = nn.Sequential(
-                                            nn.Linear(hidden_dim, w_dim, bias=False),
-                                            nn.BatchNorm1d(w_dim),
-                                            nn.ReLU(),
-                                            )
+        self.encoder_w_mean = CustomLinear( hidden_dim =[hidden_dim, w_dim], last_activation=nn.ReLU(), flatten=False)
+
         # logvar_w
-        self.encoder_w_logvar = nn.Sequential(
-                                           nn.Linear(hidden_dim, w_dim, bias=False),
-                                           nn.BatchNorm1d(w_dim),
-                                           nn.Softplus(),
-                                           )
+        self.encoder_w_logvar = CustomLinear( hidden_dim =[hidden_dim, w_dim], last_activation=nn.Softplus(), flatten=False)
+        
         ########################
         #number of mixtures (c parameter) gets the input from feedforward layers of w and convolutional layers of z
-        self.encoder_c   = nn.Sequential(
-                                         nn.Linear(2*hidden_dim, hidden_dim),
-                                         nn.BatchNorm1d(hidden_dim),
-                                         nn.ReLU(),
-                                         nn.Linear(hidden_dim, number_of_mixtures),
-                                         nn.BatchNorm1d(number_of_mixtures),
-                                         nn.Softmax( dim=-1)
-                                         )
+        self.encoder_c   = CustomLinear( hidden_dim =[2*hidden_dim, hidden_dim, number_of_mixtures], last_activation=nn.Softmax( dim=-1), flatten=False)
+        
         ########################
         #(GENERATOR)
         # CreatePriorGenerator_Given Z LAYERS P(z|w,c)
-        self.encoder_z_given_w = nn.Sequential(
-                                              nn.Linear(self.w_dim, self.hidden_dim, bias=False),
-                                              nn.BatchNorm1d(hidden_dim),
-                                              nn.Tanh()
-                                              )
+        self.encoder_z_given_w =  CustomLinear( hidden_dim =[ w_dim, hidden_dim], last_activation=nn.Tanh(), flatten=False)
+        
         
         self.pz_wc_mean   =  nn.ModuleList([LinearBN(self.hidden_dim, self.z_dim, bias=False) for i in range(self.K)])
         self.pz_wc_logvar =  nn.ModuleList([LinearBN(self.hidden_dim, self.z_dim, bias=False, activation=nn.Softplus()) for i in range(self.K)])
