@@ -597,6 +597,7 @@ def initialize_weights(model):
 class LinearBN(nn.Module):
     def __init__(self, in_features, out_features, bias=False, activation=nn.ReLU(), norm_type='layer'):
         super(LinearBN, self).__init__()
+        self.norm_type = norm_type
         self.linear = nn.Linear(in_features, out_features, bias=bias)
         if self.norm_type == 'batch':
             self.bn = nn.BatchNorm1d(out_features)
