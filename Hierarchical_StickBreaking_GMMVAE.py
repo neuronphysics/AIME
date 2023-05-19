@@ -312,33 +312,29 @@ class VAEEncoder(nn.Module):
         channel_sizes = calculate_channel_sizes(
             self.nchannel, max_filters, num_layers
         )
-        #print(f"channel size of encoder:{channel_sizes}")
+        
         # Encoder
         encoder_layers = nn.ModuleList()
         # Encoder Convolutions
         for i, (in_channels, out_channels) in enumerate(channel_sizes):
             if small_conv and i == 0:
                 # 1x1 Convolution
-                encoder_layers.append(
-                    nn.Conv2d(
+                encoder_layers.append(nn.Conv2d(
                         in_channels=in_channels,
                         out_channels=out_channels,
                         kernel_size=self.enc_kernel,
                         stride=self.enc_stride,
                         padding=self.enc_padding,
-                    )
-                )
+                ))
             else:
-                encoder_layers.append(
-                    nn.Conv2d(
+                encoder_layers.append( nn.Conv2d(
                         in_channels=in_channels,
                         out_channels=out_channels,
                         kernel_size=self.enc_kernel,
                         stride=self.enc_stride,
                         padding=self.enc_padding,
                         bias=False,
-                    )
-                )
+                    ))
             # Batch Norm
             if norm_type == 'batch':
                 encoder_layers.append(nn.BatchNorm2d(out_channels))
@@ -349,15 +345,13 @@ class VAEEncoder(nn.Module):
             encoder_layers.append(nn.ReLU())
             if (i==num_layers//2):
                 #add a residual Layer
-                encoder_layers.append(
-                    ResidualBlock(
+                encoder_layers.append(ResidualBlock(
                         out_channels,
                         self.res_kernel,
                         self.res_stride,
                         self.res_padding,
                         nonlinearity=nn.ReLU()
-                    )
-                )
+                    ))
 
         # Flatten Encoder Output
         encoder_layers.append(nn.Flatten())
@@ -382,7 +376,7 @@ class VAEEncoder(nn.Module):
             layers.append(nn.LayerNorm(hidden_dim))
         layers.append(nn.ReLU())
 
-        self.encoder = nn.Sequential( *layers)        
+        self.linear_layers = nn.Sequential( *layers)        
 
         #print(f"encode network:\n{self.encoder}")
         ########################
@@ -401,9 +395,9 @@ class VAEEncoder(nn.Module):
     def forward(self,X):
 
             # Encode
-            self.hlayer = self.encoder(X)
+            h = self.encoder(X)
             # Get latent variables
-
+            self.hlayer = self.linear_layers(h)
             #mean_z
             mu_z        = self.fc_mu(self.hlayer)
 
