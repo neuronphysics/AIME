@@ -1041,7 +1041,7 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
             criterion = nn.MSELoss(reduction='sum')
         else:
             criterion = nn.BCELoss(reduction='sum')
-        elbo5     = criterion(x_reconst.view(-1, self.nchannel*self.img_size*self.img_size),X.view(-1, self.nchannel*self.img_size*self.img_size))
+        elbo5     = criterion(x_reconst.reshape(-1, self.nchannel*self.img_size*self.img_size),X.reshape(-1, self.nchannel*self.img_size*self.img_size))
 
         assert torch.isfinite(elbo5)
         # 4)compute D_KL(Q(nu|x)||p(nu|alpha,beta)) --> gamma distribution
