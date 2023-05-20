@@ -2,7 +2,7 @@ import math
 import torch.nn.functional as F
 import torch
 from torch.optim import Optimizer
-import torch.nn as nn 
+import torch.nn as nn
 import numpy as np
 from torch.nn import init
 import cv2
@@ -10,7 +10,7 @@ import os
 import plotly
 from plotly.graph_objs import Scatter
 from plotly.graph_objs.scatter import Line
-
+from einops import rearrange
 
 # Plots min, max and mean + standard deviation bars of a population over time
 def lineplot(xs, ys_population, title, path='', xaxis='episode'):
@@ -37,14 +37,14 @@ def lineplot(xs, ys_population, title, path='', xaxis='episode'):
 
 
 def write_video(frames, title, path=''):
-  
+
   frames = np.multiply(np.stack(frames, axis=0).transpose(0, 2, 3, 1), 255).clip(0, 255).astype(np.uint8)[:, :, :, ::-1]  # VideoWrite expects H x W x C in BGR
   _, H, W, _ = frames.shape
   writer = cv2.VideoWriter(os.path.join(path, '%s.mp4' % title), cv2.VideoWriter_fourcc(*'mp4v'), 30., (W, H), True)
   for frame in frames:
     writer.write(frame)
   writer.release()
-  
+
   pass
 
 class AverageMeter(object):
@@ -197,31 +197,66 @@ def tile_raster_images(X, img_shape, tile_shape, tile_spacing=(0, 0),
 class AttentionBlock(nn.Module):
     def __init__(self):
         super(AttentionBlock, self).__init__()
-    
+
     def forward(self, q, k, v, d_k):
         score = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
         score = F.softmax(score, dim=-1)
         score = torch.matmul(score, v)
         return score
 
+class GRN(nn.Module):
+    """Global Response Normalization Module.
+
+    Come from `ConvNeXt V2: Co-designing and Scaling ConvNets with Masked
+    Autoencoders <http://arxiv.org/abs/2301.00808>`_
+
+    Args:
+        in_channels (int): The number of channels of the input tensor.
+        eps (float): a value added to the denominator for numerical stability.
+            Defaults to 1e-6.
+    """
+
+    def __init__(self, in_channels, eps=1e-6):
+        super().__init__()
+        self.in_channels = in_channels
+        self.gamma = nn.Parameter(torch.zeros(in_channels))
+        self.beta = nn.Parameter(torch.zeros(in_channels))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor, data_format='channel_first'):
+        """Forward method.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+            data_format (str): The format of the input tensor. If
+                ``"channel_first"``, the shape of the input tensor should be
+                (B, C, H, W). If ``"channel_last"``, the shape of the input
+                tensor should be (B, H, W, C). Defaults to "channel_first".
+        """
+        if data_format == 'channel_last':
+            gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)
+            nx = gx / (gx.mean(dim=-1, keepdim=True) + self.eps)
+            x = self.gamma * (x * nx) + self.beta + x
+        elif data_format == 'channel_first':
+            gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
+            nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
+            x = self.gamma.view(1, -1, 1, 1) * (x * nx) + self.beta.view(
+                1, -1, 1, 1) + x
+        return x
+
 class LayerNorm2d(nn.LayerNorm):
-    """LayerNorm for channels of '2D' spatial NCHW tensors"""
-
-    def __init__(self, num_channels, eps=1e-6, affine=True):
-        super().__init__(num_channels, eps=eps, elementwise_affine=affine)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.layer_norm(
-            x.permute(0, 2, 3, 1), self.normalized_shape, self.weight, self.bias, self.eps
-        ).permute(0, 3, 1, 2)
-            
+    def forward(self, x):
+        x = rearrange(x, "b c h w -> b h w c")
+        x = super().forward(x)
+        x = rearrange(x, "b h w c -> b c h w")
+        return x
 
 class ResidualBlock(nn.Module):
 
-    def __init__(self, in_channels, kernel_size, stride, padding, norm_type='layer', nonlinearity=None ):
+    def __init__(self, in_channels, kernel_size, stride, padding, norm_type='layer', num_groups=1, nonlinearity=None ):
         """
-            1. in_channels is the number of input channels to the first conv layer, 
-            2. out_channels is the number of output channels of the first conv layer 
+            1. in_channels is the number of input channels to the first conv layer,
+            2. out_channels is the number of output channels of the first conv layer
                 and the number of input channels to the second conv layer
         """
         super(ResidualBlock, self).__init__()
@@ -229,34 +264,34 @@ class ResidualBlock(nn.Module):
         layers=[]
         layers.append(
                         nn.Conv2d(
-                                in_channels, 
-                                in_channels, 
-                                kernel_size, 
-                                stride, 
-                                padding, 
+                                in_channels,
+                                in_channels,
+                                kernel_size,
+                                stride,
+                                padding,
                                 bias    = False)
-                        
+
         )
         if norm_type == 'batch':
             layers.append(nn.BatchNorm2d(in_channels))
         elif norm_type == 'layer':
-            layers.append(LayerNorm2d(in_channels))
+            layers.append(nn.GroupNorm(num_groups, in_channels))
 
         layers.append(nl)
         layers.append(
                         nn.Conv2d(
-                                in_channels, 
-                                in_channels, 
-                                kernel_size, 
-                                stride, 
-                                padding, 
+                                in_channels,
+                                in_channels,
+                                kernel_size,
+                                stride,
+                                padding,
                                 bias    = False)
-                        
+
         )
         if norm_type == 'batch':
             layers.append(nn.BatchNorm2d(in_channels))
         elif norm_type == 'layer':
-            layers.append(LayerNorm2d(in_channels))
+            layers.append(nn.GroupNorm(num_groups, in_channels))
 
         layers.append(nl)
         self.layers = nn.Sequential(*layers)
@@ -269,20 +304,20 @@ class ResidualBlock(nn.Module):
         return out
 
 class ResidualBlock_deconv(nn.Module):
-    def __init__(self, channel, kernel_size, stride, padding, norm_type="layer", nonlinearity=None):
+    def __init__(self, channel, kernel_size, stride, padding, norm_type="layer", num_groups=1, nonlinearity=None):
         super(ResidualBlock_deconv, self).__init__()
         nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
         self.conv1 = nn.ConvTranspose2d(channel, channel, kernel_size, stride, padding)
         if norm_type == "batch":
            self.norm1 = nn.BatchNorm2d(channel)
         elif norm_type == "layer":
-           self.norm1 = LayerNorm2d(channel)
+           self.norm1 = nn.GroupNorm(num_groups, channel)
         self.relu = nl
         self.conv2 = nn.ConvTranspose2d(channel, channel, kernel_size, stride, padding)
         if norm_type == "batch":
            self.norm2 = nn.BatchNorm2d(channel)
         elif norm_type == "layer":
-           self.norm2 = LayerNorm2d(channel)
+           self.norm2 = nn.GroupNorm(num_groups, channel)
 
     def forward(self, x):
         res = x
@@ -295,34 +330,34 @@ class LinearResidual(nn.Module):
     def __init__(self, input_feature, nonlinearity=None, norm_type='layer'):
         super(LinearResidual, self).__init__()
         nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
-        
+
         layers = []
         layers.append(nn.Linear(input_feature, input_feature))
-        
+
         if norm_type == 'batch':
             layers.append(nn.BatchNorm1d(input_feature, affine=True))
         elif norm_type == 'layer':
             layers.append(nn.LayerNorm(input_feature))
-        
+
         layers.append(nl)
-        
+
         layers.append(nn.Linear(input_feature, input_feature))
-        
+
         if norm_type == 'batch':
             layers.append(nn.BatchNorm1d(input_feature, affine=True))
         elif norm_type == 'layer':
             layers.append(nn.LayerNorm(input_feature))
-        
+
         layers.append(nl)
-        
+
         self.fn = nn.Sequential(*layers)
-    
+
     def forward(self, x):
         return self.fn(x) + x
-    
+
 
 class CustomLinear(nn.Module):
-    def __init__(self, hidden_dim, norm_type='layer', last_activation=None, flatten=False):
+    def __init__(self, hidden_dim, norm_type='batch', last_activation=None, flatten=False):
         super(CustomLinear, self).__init__()
         layers = []
         if norm_type == 'batch':
@@ -342,7 +377,7 @@ class CustomLinear(nn.Module):
             if i== len(hidden_dim)-2:
                layers.append( last_activation)
             else:
-                layers.append(nn.ReLU())
+                layers.append(nn.SiLU())
         ###
         self.encoder = nn.Sequential(*layers)
     def forward(self, x):
@@ -385,7 +420,7 @@ class SlotAttention(nn.Module):
         self.num_slots = num_slots
         self.iters = iters
         self.eps = eps
-        self.scale = dim ** -0.5 
+        self.scale = dim ** -0.5
 
         self.slots_mu = nn.Parameter(torch.randn(1, 1, dim))
 
@@ -413,13 +448,13 @@ class SlotAttention(nn.Module):
     def forward(self, inputs, num_slots = None):
         b, n, d, device = *inputs.shape, inputs.device
         n_s = num_slots if num_slots is not None else self.num_slots
-        
+
         mu = self.slots_mu.expand(b, n_s, -1)
         sigma = self.slots_logsigma.exp().expand(b, n_s, -1)
 
         slots = mu + sigma * torch.randn(mu.shape, device = device)
 
-        inputs = self.norm_input(inputs)        
+        inputs = self.norm_input(inputs)
         k, v = self.to_k(inputs), self.to_v(inputs)
 
         for _ in range(self.iters):
