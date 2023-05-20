@@ -293,7 +293,7 @@ def init_(m):
 
 
 class VAEEncoder(nn.Module):
-    def __init__(self,nchannel, z_dim, hidden_dim, img_width, max_filters=512, num_layers=4, small_conv=False, norm_type = 'layer'):
+    def __init__(self, nchannel, z_dim, hidden_dim, img_width, max_filters=512, num_layers=4, small_conv=False, norm_type = 'batch', num_groups=1, activation = nn.PReLU()):
         super(VAEEncoder,self).__init__()
         self.nchannel    = nchannel
         self.z_dim       = z_dim
@@ -305,6 +305,7 @@ class VAEEncoder(nn.Module):
         self.res_kernel  = 3
         self.res_stride  = 1
         self.res_padding = 1
+        self.activation  = activation
         ########################
         # ENCODER-CONVOLUTION LAYERS
         if small_conv:
@@ -312,7 +313,7 @@ class VAEEncoder(nn.Module):
         channel_sizes = calculate_channel_sizes(
             self.nchannel, max_filters, num_layers
         )
-        
+
         # Encoder
         encoder_layers = nn.ModuleList()
         # Encoder Convolutions
@@ -339,10 +340,12 @@ class VAEEncoder(nn.Module):
             if norm_type == 'batch':
                 encoder_layers.append(nn.BatchNorm2d(out_channels))
             elif norm_type == 'layer':
-                encoder_layers.append(LayerNorm2d(out_channels))
-            
+                encoder_layers.append(nn.GroupNorm(num_groups, out_channels ))
+
             # ReLU
-            encoder_layers.append(nn.ReLU())
+            encoder_layers.append(self.activation)
+
+
             if (i==num_layers//2):
                 #add a residual Layer
                 encoder_layers.append(ResidualBlock(
@@ -350,7 +353,7 @@ class VAEEncoder(nn.Module):
                         self.res_kernel,
                         self.res_stride,
                         self.res_padding,
-                        nonlinearity=nn.ReLU()
+                        nonlinearity=self.activation
                     ))
 
         # Flatten Encoder Output
@@ -366,17 +369,17 @@ class VAEEncoder(nn.Module):
         if norm_type == 'batch':
             layers.append(nn.BatchNorm1d(hidden_dim))
         elif norm_type == 'layer':
-            layers.append(nn.LayerNorm(hidden_dim))
-        layers.append(nn.ReLU())
+            layers.append(nn.LayerNorm(hidden_dim ))
+        layers.append(self.activation)
 
         layers.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
         if norm_type == 'batch':
             layers.append(nn.BatchNorm1d(hidden_dim))
         elif norm_type == 'layer':
-            layers.append(nn.LayerNorm(hidden_dim))
-        layers.append(nn.ReLU())
+            layers.append(nn.LayerNorm(hidden_dim ))
+        layers.append(self.activation)
 
-        self.linear_layers = nn.Sequential( *layers)        
+        self.linear_layers = nn.Sequential( *layers)
 
         #print(f"encode network:\n{self.encoder}")
         ########################
@@ -428,7 +431,7 @@ class VAEEncoder(nn.Module):
 
 class VAEDecoder(nn.Module):
     #https://github.com/akashsara/fusion-dance
-    def __init__(self,nchannel, z_dim, hidden_dim, extend_dim, h_image_dim, img_width, max_filters=512, num_layers=4, small_conv=False, norm_type = 'layer'):
+    def __init__(self, nchannel, z_dim, hidden_dim, extend_dim, h_image_dim, img_width, max_filters=512, num_layers=4, small_conv=False, norm_type = 'batch', num_groups=1, activation = nn.PReLU()):
         super(VAEDecoder,self).__init__()
         self.nchannel   = nchannel
         self.z_dim      = z_dim
@@ -440,6 +443,7 @@ class VAEDecoder(nn.Module):
         self.res_kernel  = 3
         self.res_stride  = 1
         self.res_padding = 1
+        self.activation  = activation
         ########################
         # DECODER: CreateXGenerator
         # Px_given_z LAYERS Decoder P(X|Z)
@@ -457,23 +461,24 @@ class VAEDecoder(nn.Module):
         if norm_type == 'batch':
             decoder_layers.append(nn.BatchNorm1d(hidden_dim))
         elif norm_type == 'layer':
-            decoder_layers.append(nn.LayerNorm(hidden_dim))
-        
-        decoder_layers.append(nn.ReLU())
+            decoder_layers.append(nn.LayerNorm(hidden_dim ))
+
+        decoder_layers.append(self.activation)
         decoder_layers.append(nn.Linear(hidden_dim, hidden_dim))
+
         if norm_type == 'batch':
             decoder_layers.append(nn.BatchNorm1d(hidden_dim))
         elif norm_type == 'layer':
-            decoder_layers.append(nn.LayerNorm(hidden_dim))
+            decoder_layers.append(nn.LayerNorm(hidden_dim ))
 
-        decoder_layers.append(nn.ReLU())
+        decoder_layers.append(self.activation)
         decoder_layers.append(torch.nn.Linear(hidden_dim, extend_dim, bias=False))
         if norm_type == 'batch':
             decoder_layers.append(nn.BatchNorm1d(extend_dim))
         elif norm_type == 'layer':
-            decoder_layers.append(nn.LayerNorm(extend_dim))
+            decoder_layers.append(nn.LayerNorm(extend_dim ))
 
-        decoder_layers.append(nn.ReLU())
+        decoder_layers.append(self.activation)
         # Unflatten to a shape of (Channels, Height, Width)
         decoder_layers.append(nn.Unflatten(1, (int(extend_dim / (h_image_dim * h_image_dim)), h_image_dim, h_image_dim)))
         # Decoder Convolutions
@@ -505,12 +510,12 @@ class VAEDecoder(nn.Module):
             if norm_type == 'batch':
                 decoder_layers.append(nn.BatchNorm2d(out_channels))
             elif norm_type == 'layer':
-                decoder_layers.append(LayerNorm2d(out_channels))
- 
+                decoder_layers.append(nn.GroupNorm(num_groups, out_channels ))
+
 
             # ReLU if not final layer
             if i != num_layers - 1:
-                decoder_layers.append(nn.ReLU())
+                decoder_layers.append(self.activation)
             # Sigmoid if final layer
             else:
                 decoder_layers.append(nn.Sigmoid())
@@ -522,7 +527,7 @@ class VAEDecoder(nn.Module):
                         self.res_kernel,
                         self.res_stride,
                         self.res_padding,
-                        nonlinearity=nn.ReLU()
+                        nonlinearity=self.activation
                     )
                 )
 
@@ -535,18 +540,19 @@ class VAEDecoder(nn.Module):
 
 class VAECritic(nn.Module):
     # define the descriminator/critic
-    def __init__(self, input_dims, num_layers=4, norm_type='layer'):
+    def __init__(self, input_dims, num_layers=4, norm_type='layer', activation = nn.LeakyReLU(0.1)):
         super(VAECritic,self).__init__()
         self.norm_type = norm_type
+        self.activation  = activation
         layers = []
         layers.append(nn.Linear(input_dims, input_dims * 2, bias=False))
 
         if self.norm_type == 'batch':
            layers.append(nn.BatchNorm1d(input_dims * 2))
         elif self.norm_type == 'layer':
-            layers.append(nn.LayerNorm(input_dims * 2))   
+            layers.append(nn.LayerNorm(input_dims * 2))
         # Activation Function
-        layers.append(nn.LeakyReLU(0.2))
+        layers.append(self.activation)
         size = input_dims * 2
         # Fully Connected Block
         for i in range(num_layers-2):
@@ -558,7 +564,7 @@ class VAECritic(nn.Module):
             elif self.norm_type == 'layer':
                 layers.append(nn.LayerNorm(size // 2))
 
-            layers.append(nn.LeakyReLU(0.2))
+            layers.append(self.activation)
             if (i==(num_layers//2-1)):
                 #add a residual block
                 LinearResidual(size//2)
@@ -568,10 +574,10 @@ class VAECritic(nn.Module):
         if self.norm_type == 'batch':
            layers.append(nn.BatchNorm1d(size * 2))
         elif self.norm_type == 'layer':
-            layers.append(nn.LayerNorm(size * 2))   
+            layers.append(nn.LayerNorm(size * 2))
 
         # Activation Function
-        layers.append(nn.LeakyReLU(0.2))
+        layers.append(self.activation)
         #add anther residual block
         LinearResidual(size*2)
         layers.append(nn.Linear(size*2, 1))
@@ -589,7 +595,7 @@ def initialize_weights(model):
             nn.init.normal_(m.weight.data, 0.0, 0.02)
 
 class LinearBN(nn.Module):
-    def __init__(self, in_features, out_features, bias=False, activation=nn.ReLU(), norm_type='layer'):
+    def __init__(self, in_features, out_features, bias=False, activation=nn.LeakyReLU(0.1), norm_type='layer'):
         super(LinearBN, self).__init__()
         self.norm_type = norm_type
         self.linear = nn.Linear(in_features, out_features, bias=bias)
@@ -597,7 +603,7 @@ class LinearBN(nn.Module):
             self.bn = nn.BatchNorm1d(out_features)
         elif self.norm_type == 'layer':
             self.bn = nn.LayerNorm(out_features)
-        
+
         self.activation = activation
 
     def forward(self, x):
@@ -612,7 +618,7 @@ class GMMVAE(nn.Module):
     # https://github.com/bhavikngala/gaussian_mixture_vae
     # https://github.com/Nat-D/GMVAE
     # https://github.com/psanch21/VAE-GMVAE
-    def __init__(self, number_of_mixtures, nchannel, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4, small_conv=False, use_mse_loss=False):
+    def __init__(self, number_of_mixtures, nchannel, z_dim, w_dim, hidden_dim,  device, img_width, batch_size, max_filters=512, num_layers=4,norm_type='layer', small_conv=False, use_mse_loss=False):
         super(GMMVAE, self).__init__()
         self.use_mse_loss = use_mse_loss
         self.K          = number_of_mixtures
@@ -627,33 +633,36 @@ class GMMVAE(nn.Module):
         self.enc_stride = 2
         self.enc_padding = 0
         self._to_linear = None
+        self.norm_type = norm_type
         ####################### Encoder & Decoder of Z #####################
-        self.encoder  = VAEEncoder(nchannel, z_dim, hidden_dim, img_width, max_filters, num_layers, small_conv)
-        self.decoder  = VAEDecoder(nchannel, z_dim, hidden_dim, self.encoder.h_dim, self.encoder.h_image_dim, img_width, max_filters, num_layers, small_conv)
+
+        self.encoder  = VAEEncoder(nchannel, z_dim, hidden_dim, img_width, max_filters, num_layers, small_conv, norm_type =self.norm_type)
+
+        self.decoder  = VAEDecoder(nchannel, z_dim, hidden_dim, self.encoder.h_dim, self.encoder.h_image_dim, img_width, max_filters, num_layers, small_conv, norm_type = self.norm_type)
         ########################
         #ENCODER-JUST USING FULLY CONNECTED LAYERS
         #THE LATENT SPACE (W)
-        self.encoder_w   = CustomLinear( hidden_dim = [img_width * img_width * nchannel, hidden_dim, hidden_dim], norm_type='layer', last_activation=nn.ReLU(), flatten=True)
-        
+        self.encoder_w   = CustomLinear( hidden_dim = [img_width * img_width * nchannel, hidden_dim, hidden_dim], norm_type=self.norm_type, last_activation=nn.LeakyReLU(0.1), flatten=True)
+
         # mean of w
-        self.encoder_w_mean = CustomLinear( hidden_dim =[hidden_dim, w_dim], last_activation=nn.ReLU(), flatten=False)
+        self.encoder_w_mean = CustomLinear( hidden_dim =[hidden_dim, w_dim], norm_type=self.norm_type, last_activation=nn.LeakyReLU(0.1), flatten=False)
 
         # logvar_w
-        self.encoder_w_logvar = CustomLinear( hidden_dim =[hidden_dim, w_dim], last_activation=nn.Softplus(), flatten=False)
-        
+        self.encoder_w_logvar = CustomLinear( hidden_dim =[hidden_dim, w_dim], norm_type=self.norm_type, last_activation=nn.Softplus(), flatten=False)
+
         ########################
         #number of mixtures (c parameter) gets the input from feedforward layers of w and convolutional layers of z
-        self.encoder_c   = CustomLinear( hidden_dim =[2*hidden_dim, hidden_dim, number_of_mixtures], last_activation=nn.Softmax( dim=-1), flatten=False)
-        
+        self.encoder_c   = CustomLinear( hidden_dim =[2*hidden_dim, hidden_dim, number_of_mixtures], norm_type=self.norm_type, last_activation=nn.Softmax( dim=-1), flatten=False)
+
         ########################
         #(GENERATOR)
         # CreatePriorGenerator_Given Z LAYERS P(z|w,c)
-        self.encoder_z_given_w =  CustomLinear( hidden_dim =[ w_dim, hidden_dim], last_activation=nn.Tanh(), flatten=False)
-        
-        
+        self.encoder_z_given_w =  CustomLinear( hidden_dim =[ w_dim, hidden_dim], norm_type=self.norm_type, last_activation=nn.Tanh(), flatten=False)
+
+
         self.pz_wc_mean   =  nn.ModuleList([LinearBN(self.hidden_dim, self.z_dim, bias=False) for i in range(self.K)])
         self.pz_wc_logvar =  nn.ModuleList([LinearBN(self.hidden_dim, self.z_dim, bias=False, activation=nn.Softplus()) for i in range(self.K)])
-        
+
         self.encoder_kumar_a = init_mlp([hidden_dim,self.K-1], 1e-7) #Q(pi|x)
         self.encoder_kumar_b = init_mlp([hidden_dim,self.K-1], 1e-7) #Q(pi|x)
         ########## Gamma #########
@@ -749,7 +758,7 @@ class GMMVAE(nn.Module):
         gmm              = MixtureSameFamily(self.q_c_given_z, comp)
         #pdb.set_trace()
         return gmm, z_wc_mean.permute(1,0,2), z_wc_logvar.permute(1,0,2) #[k, batch_size, z_dim]
-    
+
     def get_trainable_parameters(self):
         params = []
         for module in self.modules():
@@ -1041,6 +1050,7 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
             criterion = nn.MSELoss(reduction='sum')
         else:
             criterion = nn.BCELoss(reduction='sum')
+
         elbo5     = criterion(x_reconst.reshape(-1, self.nchannel*self.img_size*self.img_size),X.reshape(-1, self.nchannel*self.img_size*self.img_size))
 
         assert torch.isfinite(elbo5)
