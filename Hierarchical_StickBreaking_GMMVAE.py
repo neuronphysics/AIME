@@ -753,6 +753,7 @@ class GMMVAE(nn.Module):
         z_wc_sigma       = torch.stack(z_wc_sigma_list, dim=1)
         #categorical variable y from the Gumbel-Softmax distribution
         self.q_c_given_z = Categorical( logits= post_c)# [batch_size,  K]
+       
         #print(z_wc_mean.shape, post_c.shape)
         comp             = Independent(Normal(z_wc_mean, z_wc_sigma),1)
         gmm              = MixtureSameFamily(self.q_c_given_z, comp)
@@ -886,14 +887,30 @@ def log_gaussian(x, mu=0, logvar=0.):
 			  - 0.5 * torch.sum(logvar, dim=1) + torch.tensor(log_norm_constant, dtype=torch.float, device=local_device)
 
 
-def gumbel_softmax_sample(log_pi, temperature, eps=1e-20):
+def gumbel_softmax_sample(logits, temperature, eps=1e-20):
     global local_device
     # Sample from Gumbel
-    U = torch.rand(log_pi.shape).to(device=local_device)
+    U = torch.rand(logits.shape).to(device=local_device)
     g = -Variable(torch.log(-torch.log(U + eps) + eps))
     # Gumbel-Softmax sample
-    y = log_pi + g
-    return F.softmax(y / temperature, dim=-1).to(device=local_device)
+    y = logits + g
+    return nn.Softmax(dim=-1)(y / temperature).to(device=local_device)
+
+def gumbel_softmax(logits, temperature, latent_dim, categorical_dim):
+    """
+    https://github.com/dev4488/VAE_gumble_softmax
+    ST-gumple-softmax
+    input: [*, n_class]
+    return: flatten --> [*, n_class] an one-hot vector
+    """
+    y = gumbel_softmax_sample(logits, temperature)
+    shape = y.size()
+    _, ind = y.max(dim=-1)
+    y_hard = torch.zeros_like(y).view(-1, shape[-1])
+    y_hard.scatter_(1, ind.view(-1, 1), 1)
+    y_hard = y_hard.view(*shape)
+    y_hard = (y_hard - y).detach() + y
+    return y_hard.view(-1,latent_dim*categorical_dim)
 
 def free_params(module: nn.Module):
     for p in module.parameters():
