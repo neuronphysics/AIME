@@ -752,11 +752,11 @@ class GMMVAE(nn.Module):
         z_wc_logvar      = torch.stack(z_wc_logvar_list, dim=1) # [batch_size, K, z_dim]
         z_wc_sigma       = torch.stack(z_wc_sigma_list, dim=1)
         #categorical variable y from the Gumbel-Softmax distribution
-        self.q_c_given_z = Categorical( logits= post_c)# [batch_size,  K]
+        self.p_c_given_z = Categorical( logits= post_c)# [batch_size,  K]
        
         #print(z_wc_mean.shape, post_c.shape)
         comp             = Independent(Normal(z_wc_mean, z_wc_sigma),1)
-        gmm              = MixtureSameFamily(self.q_c_given_z, comp)
+        gmm              = MixtureSameFamily(self.p_c_given_z, comp)
         #pdb.set_trace()
         return gmm, z_wc_mean.permute(1,0,2), z_wc_logvar.permute(1,0,2) #[k, batch_size, z_dim]
 
@@ -1083,7 +1083,7 @@ class InfGaussMMVAE(GMMVAE,BetaSample):
         # 6.)  CV = H(C|Z, W) = E_q(z,w) [ E_p(c|z,w)[ - log P(c|z,w)] ]
                 # Conditional entropy loss
 
-        logits = self.q_c_given_z.logits
+        logits = self.p_c_given_z.logits
         probs = F.softmax(logits, dim=-1)
         loss_dict['CV_entropy'] = (- probs * torch.log(probs)).sum()
 
