@@ -21,6 +21,7 @@ import gym
 import gym.spaces
 import numbers
 import numpy as np
+import torch
 
 import data_structures as ds
 from alf_environment import AlfEnvironment
@@ -66,7 +67,7 @@ def tensor_spec_from_gym_space(space,
             minimum=0,
             maximum=maximum)
     elif isinstance(space, gym.spaces.MultiBinary):
-        shape = (space.n, )
+        shape = (space.n,)
         return BoundedTensorSpec(
             shape=shape, dtype=space.dtype.name, minimum=0, maximum=1)
     elif isinstance(space, gym.spaces.Box):
@@ -148,7 +149,7 @@ class AlfGymWrapper(AlfEnvironment):
                 self._gym_env.reward_space, simplify_box_bounds)
         else:
             self._reward_spec = TensorSpec(())
-        self._done=True
+        self._done = True
 
         self._time_step_spec = ds.time_step_spec(
             self._observation_spec, self._action_spec, self._reward_spec, self._done)
@@ -171,7 +172,7 @@ class AlfGymWrapper(AlfEnvironment):
         self._gym_env.reset()
         action = nest.map_structure(lambda spec: spec.numpy_zeros(),
                                     self._action_spec)
-        _, _, _, info = self._gym_env.step(action)
+        _, _, _, _, info = self._gym_env.step(action)
         self._gym_env.reset()
         info = _as_array(info)
         return nest.map_structure(lambda a: np.zeros_like(a), info)
@@ -187,15 +188,15 @@ class AlfGymWrapper(AlfEnvironment):
     def _reset(self):
         # TODO: Upcoming update on gym adds **kwargs on reset. Update this to
         # support that.
-        observation = self._gym_env.reset()
-        self._info = None
+        observation, info = self._gym_env.reset()
+        self._info = info
         self._done = False
 
         observation = self._to_spec_dtype_observation(observation)
         return ds.restart(
             observation=observation,
             action_spec=self._action_spec,
-            done= self._done,
+            done=self._done,
             reward_spec=self._reward_spec,
             env_id=self._env_id,
             env_info=self._zero_info)
@@ -209,7 +210,7 @@ class AlfGymWrapper(AlfEnvironment):
         if self._auto_reset and self._done:
             return self.reset()
 
-        observation, reward, self._done, self._info = self._gym_env.step(
+        observation, reward, self._done, truncated, self._info = self._gym_env.step(
             action)
         observation = self._to_spec_dtype_observation(observation)
         self._info = nest.map_structure(_as_array, self._info)
@@ -270,9 +271,9 @@ class AlfGymWrapper(AlfEnvironment):
     def done_spec(self):
         done_spec = TensorSpec((1,), dtype=torch.bool)
         if self._done:
-           return done_spec.ones()
+            return done_spec.ones()
         else:
-           return done_spec.zeros()
+            return done_spec.zeros()
 
     def close(self):
         return self._gym_env.close()

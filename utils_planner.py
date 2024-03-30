@@ -28,11 +28,13 @@ import datetime
 import re
 import os
 import matplotlib.pyplot as plt
+
 local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 # Epsilon for avoiding numerical issues.
-EPS = torch.tensor(1e-8, dtype=torch.float64, device=local_device,requires_grad=False)
+EPS = torch.tensor(1e-8, dtype=torch.float64, device=local_device, requires_grad=False)
 # Epsilon for clipping actions.
-CLIP_EPS = torch.tensor(1e-3 , dtype=torch.float64, device=local_device,requires_grad=False)
+CLIP_EPS = torch.tensor(1e-3, dtype=torch.float64, device=local_device, requires_grad=False)
+
 
 def gather_nd(params, indices):
     # this function has a limit that MAX_ADVINDEX_CALC_DIMS=5
@@ -46,139 +48,144 @@ def gather_nd(params, indices):
 
 @gin.configurable
 class gradient_penalty(object):
-  def __init__(self, c, device):
-    self.c = c
-    self.device = device
-    
-  def forward(self, s, a_p, a_b, gamma=5.0):
-    """Calculates interpolated gradient penalty."""
-    batch_size = s.shape[0]
-    alpha = torch.rand([batch_size], device=self.device)
-    a_intpl = a_p.to(device=self.device) + alpha[:, None] * (a_b.to(device=self.device) - a_p.to(device=self.device))
-    c_intpl = self.c(s.to(device=self.device), a_intpl)
-    slope = torch.sqrt(EPS + torch.sum(c_intpl ** 2, axis=-1))
-    grad_penalty = torch.mean(torch.max(slope - 1.0, torch.zeros_like(slope)) ** 2)
-    return grad_penalty * gamma
+    def __init__(self, c, device):
+        self.c = c
+        self.device = device
+
+    def forward(self, s, a_p, a_b, gamma=5.0):
+        """Calculates interpolated gradient penalty."""
+        batch_size = s.shape[0]
+        n_step = s.shape[1]
+        alpha = torch.rand([batch_size, n_step], device=self.device)
+        a_intpl = a_p.to(device=self.device) + alpha[:, :, None] * (
+                a_b.to(device=self.device) - a_p.to(device=self.device))
+        c_intpl = self.c(s.to(device=self.device), a_intpl)
+        slope = torch.sqrt(EPS + torch.sum(c_intpl ** 2, axis=-1))
+        grad_penalty = torch.mean(torch.max(slope - 1.0, torch.zeros_like(slope)) ** 2)
+        return grad_penalty * gamma
+
 
 class Divergence(object):
-  """Basic interface for divergence."""
-  def __init__(self, c, device):
-    self.c = c
-    self.gradient_penalty = gradient_penalty(self.c, device)
+    """Basic interface for divergence."""
 
-  def dual_estimate(self, s, a_p, a_b):
-    raise NotImplementedError
+    def __init__(self, c, device):
+        self.c = c
+        self.gradient_penalty = gradient_penalty(self.c, device)
 
-  def dual_critic_loss(self, s, a_p, a_b):
-    return (- torch.mean(self.dual_estimate(s, a_p, a_b))
-            + self.gradient_penalty.forward(s, a_p, a_b))
+    def dual_estimate(self, s, a_p, a_b):
+        raise NotImplementedError
 
-  def primal_estimate(self, s, p_fn, b_fn, n_samples, action_spec=None):
-    raise NotImplementedError
+    def dual_critic_loss(self, s, a_p, a_b):
+        return (- torch.mean(self.dual_estimate(s, a_p, a_b))
+                + self.gradient_penalty.forward(s, a_p, a_b))
+
+    def primal_estimate(self, s, p_fn, b_fn, n_samples, action_spec=None):
+        raise NotImplementedError
 
 
 class Flags(object):
 
-  def __init__(self, **kwargs):
-     self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu') 
-     for key, val in kwargs.items():
-        if kwargs.get(key) is not None:
-           setattr(self, key, val)
-        else:
-           pass
+    def __init__(self, **kwargs):
+        self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        for key, val in kwargs.items():
+            if kwargs.get(key) is not None:
+                setattr(self, key, val)
+            else:
+                pass
 
 
 class FDivergence(Divergence):
-  """Interface for f-divergence."""
+    """Interface for f-divergence."""
 
-  def dual_estimate(self, s, a_p, a_b):
-    logits_p = self.c.cuda()(s, a_p)
-    logits_b = self.c.cuda()(s, a_b)
-    return self._dual_estimate_with_logits(logits_p, logits_b)
+    def dual_estimate(self, s, a_p, a_b):
+        logits_p = self.c.cuda()(s, a_p)
+        logits_b = self.c.cuda()(s, a_b)
+        return self._dual_estimate_with_logits(logits_p, logits_b)
 
-  def _dual_estimate_with_logits(self, logits_p, logits_b):
-    raise NotImplementedError
+    def _dual_estimate_with_logits(self, logits_p, logits_b):
+        raise NotImplementedError
 
-  def primal_estimate(self, s, p_fn, b_fn, n_samples, action_spec=None):
-    _, apn, apn_logp = p_fn.sample_n(s, n_samples)
-    _, abn, abn_logb = b_fn.sample_n(s, n_samples)
-    # Clip actions here to avoid numerical issues.
-    apn_logb = b_fn.get_log_density(
-        s, clip_by_eps(apn, action_spec, CLIP_EPS))
-    abn_logp = p_fn.get_log_density(
-        s, clip_by_eps(abn, action_spec, CLIP_EPS))
-    return self._primal_estimate_with_densities(
-        apn_logp, apn_logb, abn_logp, abn_logb)
+    def primal_estimate(self, s, p_fn, b_fn, n_samples, action_spec=None):
+        _, apn, apn_logp = p_fn.sample_n(s, n_samples)
+        _, abn, abn_logb = b_fn.sample_n(s, n_samples)
+        # Clip actions here to avoid numerical issues.
+        apn_logb = b_fn.get_log_density(
+            s, clip_by_eps(apn, action_spec, CLIP_EPS))
+        abn_logp = p_fn.get_log_density(
+            s, clip_by_eps(abn, action_spec, CLIP_EPS))
+        return self._primal_estimate_with_densities(
+            apn_logp, apn_logb, abn_logp, abn_logb)
 
-  def _primal_estimate_with_densities(
-      self, apn_logp, apn_logb, abn_logp, abn_logb):
-    raise NotImplementedError
-
+    def _primal_estimate_with_densities(
+            self, apn_logp, apn_logb, abn_logp, abn_logb):
+        raise NotImplementedError
 
 
 class KL(FDivergence):
-  """KL divergence."""
+    """KL divergence."""
 
-  def _dual_estimate_with_logits(self, logits_p, logits_b):
-    return (- soft_relu(logits_b)
-            + torch.log(soft_relu(logits_p) + EPS) + 1.0)
+    def _dual_estimate_with_logits(self, logits_p, logits_b):
+        return (- soft_relu(logits_b)
+                + torch.log(soft_relu(logits_p) + EPS) + 1.0)
 
-  def _primal_estimate_with_densities(
-      self, apn_logp, apn_logb, abn_logp, abn_logb):
-    return torch.mean(apn_logp - apn_logb, dim=0)
+    def _primal_estimate_with_densities(
+            self, apn_logp, apn_logb, abn_logp, abn_logb):
+        return torch.mean(apn_logp - apn_logb, dim=0)
 
 
 class W(FDivergence):
-  """Wasserstein distance."""
+    """Wasserstein distance."""
 
-  def _dual_estimate_with_logits(self, logits_p, logits_b):
-    return logits_p - logits_b
+    def _dual_estimate_with_logits(self, logits_p, logits_b):
+        return logits_p - logits_b
 
 
 @gin.configurable
 def laplacian_kernel(x1, x2, sigma=20.0):
-  d12 = torch.sum(
-      torch.abs(x1[None] - x2[:, None]), dim=-1)
-  k12 = torch.exp(- d12 / sigma)
-  return k12
+    d12 = torch.sum(
+        torch.abs(x1[None] - x2[:, None]), dim=-1)
+    k12 = torch.exp(- d12 / sigma)
+    return k12
 
 
 @gin.configurable
 def mmd(x1, x2, kernel, use_sqrt=False):
-  k11 = torch.mean(kernel(x1, x1), dim=(0, 1))
-  k12 = torch.mean(kernel(x1, x2), dim=(0, 1))
-  k22 = torch.mean(kernel(x2, x2), dim=(0, 1))
-  if use_sqrt:
-    return torch.sqrt(k11 + k22 - 2 * k12 + EPS)
-  else:
-    return k11 + k22 - 2 * k12
+    k11 = torch.mean(kernel(x1, x1), dim=(0, 1))
+    k12 = torch.mean(kernel(x1, x2), dim=(0, 1))
+    k22 = torch.mean(kernel(x2, x2), dim=(0, 1))
+    if use_sqrt:
+        return torch.sqrt(k11 + k22 - 2 * k12 + EPS)
+    else:
+        return k11 + k22 - 2 * k12
 
 
 class MMD(Divergence):
-  """MMD."""
+    """MMD."""
 
-  def primal_estimate(
-      self, s, p_fn, b_fn, n_samples,
-      kernel=laplacian_kernel, action_spec=None):
-    apn = p_fn.sample_n(s, n_samples)[1]
-    abn = b_fn.sample_n(s, n_samples)[1]
-    return mmd(apn, abn, kernel)
+    def primal_estimate(
+            self, s, p_fn, b_fn, n_samples,
+            kernel=laplacian_kernel, action_spec=None):
+        apn = p_fn.sample_n(s, n_samples)[1]
+        abn = b_fn.sample_n(s, n_samples)[1]
+        return mmd(apn, abn, kernel)
 
 
 CLS_DICT = dict(
     kl=KL,
     w=W,
     mmd=MMD,
-    )
+)
 
 
 def get_divergence(name, c, device):
-  return CLS_DICT[name](c, device)
+    return CLS_DICT[name](c, device)
+
 
 def clear_plot():
     plt.cla()
     plt.clf()
     plt.close()
+
 
 def plot_train_info(vals, name, savepath):
     clear_plot()
@@ -191,11 +198,12 @@ def plot_train_info(vals, name, savepath):
     plt.savefig(savepath)
     clear_plot()
 
+
 def soft_variables_update(source_variables, target_variables, tau=1.0):
     for (v_s, v_t) in zip(source_variables, target_variables):
-
         v_t = (1 - tau) * v_t + tau * v_s
     return v_t
+
 
 def get_summary_str(step=None, info=None, prefix=''):
     summary_str = prefix
@@ -213,33 +221,41 @@ def write_summary(writer, info, step):
     """For pytorch. Write summary to tensorboard."""
     for key, val in info.items():
         if isinstance(val,
-                (int, float, np.int32, np.int64, np.float32, np.float64)):
+                      (int, float, np.int32, np.int64, np.float32, np.float64)):
             writer.add_scalar(key, val, step)
 
+
 def clip_by_eps(x, spec, eps=0.0):
-  return torch.clamp(
-      x, min=spec.minimum + eps, max=spec.maximum - eps)
+    return torch.clamp(
+        x, min=spec.minimum + eps, max=spec.maximum - eps)
+
 
 # TODO: add customized gradient
 def clip_v2(x, low, high):
     """Clipping with modified gradient behavior."""
     value = torch.min(torch.max(x, low * torch.ones_like((x))), high * torch.ones_like(x))
+
     def grad(dy):
-       if_y_pos = torch.gt(dy, 0.0).type(torch.float32)
-       if_x_g_low = torch.gt(x, low).type(torch.float32)
-       if_x_l_high = torch.le(x, high).type(torch.float32)
-       return (if_y_pos * if_x_g_low +
-             (1.0 - if_y_pos) * if_x_l_high) * dy
+        if_y_pos = torch.gt(dy, 0.0).type(torch.float32)
+        if_x_g_low = torch.gt(x, low).type(torch.float32)
+        if_x_l_high = torch.le(x, high).type(torch.float32)
+        return (if_y_pos * if_x_g_low +
+                (1.0 - if_y_pos) * if_x_l_high) * dy
+
     return value, grad
 
+
 def relu_v2(x):
-  """Relu with modified gradient behavior."""
-  value = torch.nn.ReLU()(x)
-  def grad(dy):
-     if_y_pos = torch.gt(dy, 0.0).type(torch.float32)
-     if_x_pos = torch.gt(x, 0.0).type(torch.float32)
-     return (if_y_pos * if_x_pos + (1.0 - if_y_pos)) * dy
-  return value, grad
+    """Relu with modified gradient behavior."""
+    value = torch.nn.ReLU()(x)
+
+    def grad(dy):
+        if_y_pos = torch.gt(dy, 0.0).type(torch.float32)
+        if_x_pos = torch.gt(x, 0.0).type(torch.float32)
+        return (if_y_pos * if_x_pos + (1.0 - if_y_pos)) * dy
+
+    return value, grad
+
 
 # class clip_v2(torch.autograd.Function):
 #   @staticmethod
@@ -256,38 +272,39 @@ def relu_v2(x):
 #     return (if_y_pos * if_x_g_low +
 #             (1.0 - if_y_pos) * if_x_l_high) * grad_cpy
 def soft_relu(x, device=local_device):
-  """Compute log(1 + exp(x))."""
-  # Note: log(sigmoid(x)) = x - soft_relu(x) = - soft_relu(-x).
-  #       log(1 - sigmoid(x)) = - soft_relu(x)
-  return torch.log(1.0 + torch.exp(-torch.abs(x))).to(device=device) + torch.max(x, torch.zeros_like(x)).to(device=device)
+    """Compute log(1 + exp(x))."""
+    # Note: log(sigmoid(x)) = x - soft_relu(x) = - soft_relu(-x).
+    #       log(1 - sigmoid(x)) = - soft_relu(x)
+    return torch.log(1.0 + torch.exp(-torch.abs(x))).to(device=device) + torch.max(x, torch.zeros_like(x)).to(
+        device=device)
 
 
 def local_global_loss(l_enc, g_enc, measure, mode):
-        '''
-        Args:
-            l: Local feature map.
-            g: Global features.
-            measure: Type of f-divergence. For use with mode `fd`
-            mode: Loss mode. Fenchel-dual `fd`, NCE `nce`, or Donsker-Vadadhan `dv`.
-        Returns:
-            torch.Tensor: Loss.
-        '''
-        N, local_units, dim_x, dim_y = l_enc.size()
-        l_enc = l_enc.view(N, local_units, -1)
+    '''
+    Args:
+        l: Local feature map.
+        g: Global features.
+        measure: Type of f-divergence. For use with mode `fd`
+        mode: Loss mode. Fenchel-dual `fd`, NCE `nce`, or Donsker-Vadadhan `dv`.
+    Returns:
+        torch.Tensor: Loss.
+    '''
+    N, local_units, dim_x, dim_y = l_enc.size()
+    l_enc = l_enc.view(N, local_units, -1)
 
-        if mode == 'fd':
-            loss = fenchel_dual_loss(l_enc, g_enc, measure=measure)
-        elif mode == 'nce':
-            loss = nce_loss(l_enc, g_enc)
-        elif mode == 'dv':
-            loss = donsker_varadhan_loss(l_enc, g_enc)
-        else:
-            raise NotImplementedError(mode)
+    if mode == 'fd':
+        loss = fenchel_dual_loss(l_enc, g_enc, measure=measure)
+    elif mode == 'nce':
+        loss = nce_loss(l_enc, g_enc)
+    elif mode == 'dv':
+        loss = donsker_varadhan_loss(l_enc, g_enc)
+    else:
+        raise NotImplementedError(mode)
 
-        return loss
+    return loss
+
 
 def get_negative_expectation(q_samples, measure, average=True):
-
     log_2 = math.log(2.)
 
     if measure == 'GAN':
@@ -295,13 +312,13 @@ def get_negative_expectation(q_samples, measure, average=True):
     elif measure == 'JSD':
         #
         Eq = F.softplus(-q_samples) + q_samples - log_2  # Note JSD will be shifted
-        #Eq = F.softplus(q_samples) #+ q_samples - log_2
+        # Eq = F.softplus(q_samples) #+ q_samples - log_2
     elif measure == 'X2':
         Eq = -0.5 * ((torch.sqrt(q_samples ** 2) + 1.) ** 2)
     elif measure == 'KL':
-        q_samples = torch.clamp(q_samples,-1e6,9.5)
+        q_samples = torch.clamp(q_samples, -1e6, 9.5)
 
-        #print("neg q samples ",q_samples.cpu().data.numpy())
+        # print("neg q samples ",q_samples.cpu().data.numpy())
         Eq = torch.exp(q_samples - 1.)
     elif measure == 'RKL':
         Eq = q_samples - 1.
@@ -310,22 +327,22 @@ def get_negative_expectation(q_samples, measure, average=True):
     elif measure == 'W1':
         Eq = q_samples
     else:
-        assert 1==2
+        assert 1 == 2
 
     if average:
         return Eq.mean()
     else:
         return Eq
 
-def get_positive_expectation(p_samples, measure, average=True):
 
+def get_positive_expectation(p_samples, measure, average=True):
     log_2 = math.log(2.)
 
     if measure == 'GAN':
         Ep = - F.softplus(-p_samples)
     elif measure == 'JSD':
         Ep = log_2 - F.softplus(-p_samples)  # Note JSD will be shifted
-        #Ep =  - F.softplus(-p_samples)
+        # Ep =  - F.softplus(-p_samples)
     elif measure == 'X2':
         Ep = p_samples ** 2
     elif measure == 'KL':
@@ -341,12 +358,13 @@ def get_positive_expectation(p_samples, measure, average=True):
     elif measure == 'W1':
         Ep = p_samples
     else:
-        assert 1==2
+        assert 1 == 2
 
     if average:
         return Ep.mean()
     else:
         return Ep
+
 
 def fenchel_dual_loss(l, g, measure=None):
     '''Computes the f-divergence distance between positive and negative joint distributions.
@@ -451,7 +469,7 @@ def multi_nce_loss(l, m):
         torch.Tensor: Loss.
     '''
     N, units, n_locals = l.size()
-    _, _ , n_multis = m.size()
+    _, _, n_multis = m.size()
 
     l = l.view(N, units, n_locals)
     m = m.view(N, units, n_multis)
@@ -538,6 +556,7 @@ def multi_donsker_varadhan_loss(l, m):
     loss = E_neg - E_pos
     return loss
 
+
 # Optimistic Mirror Adam - works GREAT
 
 
@@ -601,9 +620,9 @@ class OptMirrorAdam(Optimizer):
         loss = None
 
         # Do not allow training with out closure
-        if closure is  None:
-            raise ValueError("This algorithm requires a closure definition for the evaluation of the intermediate gradient")
-
+        if closure is None:
+            raise ValueError(
+                "This algorithm requires a closure definition for the evaluation of the intermediate gradient")
 
         # Create a copy of the initial parameters
         param_groups_copy = self.param_groups.copy()
@@ -636,20 +655,15 @@ class OptMirrorAdam(Optimizer):
                         state['max_exp_avg_sq_2'] = torch.zeros_like(p.data)
                 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 
-
-
-
                 exp_avg1, exp_avg_sq1 = state['exp_avg_1'], state['exp_avg_sq_1']
                 if amsgrad:
                     max_exp_avg_sq1 = state['max_exp_avg_sq_1']
                 beta1, beta2 = group['betas']
 
-
                 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
                 # Step will be updated once
                 state['step'] += 1
                 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-
 
                 if group['weight_decay'] != 0:
                     grad = grad.add(group['weight_decay'], p.data)
@@ -679,16 +693,14 @@ class OptMirrorAdam(Optimizer):
 
                 p.data.addcdiv_(-step_size1, exp_avg1, denom1)
 
-
-
         # Perform additional backward step to calculate stochastic gradient - WATING STATE
         loss = closure()
 
         # Re run the optimization with the second averaged moments
         # ############### Second evaluation of gradients ###########################################
         # ######################################################################################
-        for (group, group_copy) in zip(self.param_groups,param_groups_copy ):
-            for (p, p_copy) in zip(group['params'],group_copy['params']):
+        for (group, group_copy) in zip(self.param_groups, param_groups_copy):
+            for (p, p_copy) in zip(group['params'], group_copy['params']):
                 if p.grad is None:
                     continue
                 grad = p.grad.data
@@ -698,13 +710,10 @@ class OptMirrorAdam(Optimizer):
 
                 state = self.state[p]
 
-
-
                 exp_avg2, exp_avg_sq2 = state['exp_avg_2'], state['exp_avg_sq_2']
                 if amsgrad:
                     max_exp_avg_sq2 = state['max_exp_avg_sq_2']
                 beta1, beta2 = group['betas']
-
 
                 if group['weight_decay'] != 0:
                     grad = grad.add(group['weight_decay'], p.data)
@@ -732,10 +741,8 @@ class OptMirrorAdam(Optimizer):
                 p_copy.data.addcdiv_(-step_size2, exp_avg2, denom2)
                 p = p_copy
 
-
-
-
         return loss
+
 
 class AdaBoundW(Optimizer):
     """Implements AdaBound algorithm with Decoupled Weight Decay (arxiv.org/abs/1711.05101)
@@ -855,19 +862,19 @@ class AdaBoundW(Optimizer):
 
 
 def shuffle_indices_with_steps(n, steps=1, rand=None):
-  """Randomly shuffling indices while keeping segments."""
-  if steps == 0:
-    return np.arange(n)
-  if rand is None:
-    rand = np.random
-  n_segments = int(n // steps)
-  n_effective = n_segments * steps
-  batch_indices = rand.permutation(n_segments)
-  batches = np.arange(n_effective).reshape([n_segments, steps])
-  shuffled_batches = batches[batch_indices]
-  shuffled_indices = np.arange(n)
-  shuffled_indices[:n_effective] = shuffled_batches.reshape([-1])
-  return shuffled_indices
+    """Randomly shuffling indices while keeping segments."""
+    if steps == 0:
+        return np.arange(n)
+    if rand is None:
+        rand = np.random
+    n_segments = int(n // steps)
+    n_effective = n_segments * steps
+    batch_indices = rand.permutation(n_segments)
+    batches = np.arange(n_effective).reshape([n_segments, steps])
+    shuffled_batches = batches[batch_indices]
+    shuffled_indices = np.arange(n)
+    shuffled_indices[:n_effective] = shuffled_batches.reshape([-1])
+    return shuffled_indices
 
 
 def get_datetime():
@@ -875,15 +882,17 @@ def get_datetime():
     now = re.sub(r'\D', '', now)[:-6]
     return now
 
+
 def maybe_makedirs(log_dir):
-  import os.path
-  if not os.path.exists(log_dir):
-     os.mkdir(log_dir)
+    import os.path
+    if not os.path.exists(log_dir):
+        os.mkdir(log_dir)
+
 
 def make_base_dir(list_of_dir):
     first = list_of_dir[0]
     if not os.path.exists(first):
-      os.mkdir(first)
+        os.mkdir(first)
     for dir in list_of_dir[1:]:
         first = os.path.join(first, dir)
         if not os.path.exists(first):
@@ -891,9 +900,10 @@ def make_base_dir(list_of_dir):
 
     return first
 
+
 def check_for_nans_and_nones(arr):
     none_indices = []
-    checker_fn = lambda iterable : math.isnan(iterable)
+    checker_fn = lambda iterable: math.isnan(iterable)
     if isinstance(arr, np.ndarray):
         # checker_fn = lambda iterable : np.isnan(iterable)
         if np.isnan(arr).any():

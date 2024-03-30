@@ -8,8 +8,8 @@ import datetime
 import utils_planner as utils
 import gin.torch.external_configurables
 from typing import Dict, Any
-from DataCollectionD2E import *
-from planner_D2E_regularizer import eval_policies, D2EAgent, Config
+from DataCollectionD2E_n_step import *
+from planner_D2E_regularizer_n_step import eval_policies, D2EAgent, Config
 
 config: Dict[str, Any] = {}
 

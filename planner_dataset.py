@@ -479,14 +479,14 @@ class GaussianRandomSoftPolicy(nn.Module):
     self._std = std
     self._clip_eps = clip_eps
 
-  def __call__(self, observation, state=()):
+  def __call__(self, observation):
     action = self._a_network(observation)[1]
     noise = torch.normal(mean=torch.zeros(action.shape), std=self._std)
     action = action + noise
     spec = self._a_network.action_spec
     action = torch.clamp(action, spec.minimum + self._clip_eps,
                               spec.maximum - self._clip_eps)
-    return action, state
+    return action
   
 class DeterministicSoftPolicy(nn.Module):
   """Returns mode of policy distribution."""
