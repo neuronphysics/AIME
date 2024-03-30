@@ -1,9 +1,9 @@
 import collections
 import numpy as np
 import os
-import gin
+# import gin
 import gym
-import mujoco_py
+# import mujoco_py
 from absl import app
 from absl import flags
 from absl import logging
@@ -20,10 +20,13 @@ import argparse
 import pickle
 from typing import Callable
 from PIL import Image
-from planner_behavior_regularizer_actor_critic import parse_policy_cfg, Transition, map_structure, maybe_makedirs, \
-    load_policy, eval_policy_episodes
+from planner_D2E_regularizer import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, \
+    eval_policy_episodes
 import dill
 import nest
+from torch.utils import data
+
+from planner_D2E_regularizer_n_step import NStepTransitions
 
 #####################################
 # from train_eval_utils
@@ -60,7 +63,18 @@ def get_transition(time_step, next_time_step, action, next_action):
         a1=action,
         a2=next_action,
         reward=next_time_step.reward,
-        discount=next_time_step.discount)
+        discount=next_time_step.discount,
+        done=next_time_step.done)
+
+
+def strip_action(action):
+    if action.ndim < 1:
+        action = action.unsqueeze(0).detach().cpu()
+    elif action.ndim > 1:
+        action = action.detach().cpu()[0]
+    else:
+        action = action.detach().cpu()
+    return action
 
 
 class DataCollector(object):
@@ -72,27 +86,25 @@ class DataCollector(object):
         self._data = data
         self._saved_action = None
 
-    def collect_transition(self):
-        """Collect single transition from environment."""
+    def collect_transition(self, t):
         time_step = self._env.current_time_step()
         if self._saved_action is None:
-            self._saved_action = self._policy(torch.from_numpy(time_step.observation))[0]
-
+            self._saved_action = strip_action(self._policy(torch.from_numpy(time_step.observation)))
         action = self._saved_action
-        if action.ndim < 1:
-            next_time_step = self._env.step(action.unsqueeze(0).detach().cpu())
-        else:
-            next_time_step = self._env.step(action.detach().cpu())
 
-        next_action = self._policy(torch.from_numpy(next_time_step.observation))[0]
-        self._saved_action = next_action
-        if not time_step.is_last():
-            transition = get_transition(time_step, next_time_step,
-                                        action, next_action)
-            self._data.add_transitions(transition)
-            return 1
-        else:
-            return 0
+        n_step_tran = NStepTransitions(start_time_step=time_step, start_action=action)
+        for i in range(t):
+            next_time_step = self._env.step(action)
+            next_action = strip_action(self._policy(torch.from_numpy(next_time_step.observation)))
+            self._saved_action = next_action
+            action = next_action
+
+            if not time_step.is_last():
+                n_step_tran.add_step(next_time_step, next_action)
+            else:
+                return 0
+        self._data.add_transitions(n_step_tran.get_transition())
+        return 1
 
 
 #######################
@@ -150,7 +162,7 @@ def save_copy(data, ckpt_name):
         dill.dump(new_data, filehandler)
 
 
-class Dataset(nn.Module):
+class Dataset(data.Dataset):
     """Tensorflow module of dataset of transitions."""
 
     def __init__(
@@ -158,6 +170,7 @@ class Dataset(nn.Module):
             observation_spec,
             action_spec,
             size,
+            group_size,
             circular=True,
     ):
         super(Dataset, self).__init__()
@@ -167,15 +180,21 @@ class Dataset(nn.Module):
         obs_type = observation_spec.dtype
         action_shape = list(action_spec.shape)
         action_type = action_spec.dtype
-        self._s1 = self._zeros([size] + obs_shape, obs_type)
-        self._s2 = self._zeros([size] + obs_shape, obs_type)
-        self._a1 = self._zeros([size] + action_shape, action_type)
-        self._a2 = self._zeros([size] + action_shape, action_type)
-        self._discount = self._zeros([size], torch.float32)
-        self._reward = self._zeros([size], torch.float32)
+        self._s1 = self._zeros([size] + [group_size] + obs_shape, obs_type)
+        self._s2 = self._zeros([size] + [group_size] + obs_shape, obs_type)
+        self._a1 = self._zeros([size] + [group_size] + action_shape, action_type)
+        self._a2 = self._zeros([size] + [group_size] + action_shape, action_type)
+        self._discount = self._zeros([size] + [group_size], torch.float32)
+        self._reward = self._zeros([size] + [group_size], torch.float32)
+        self._done = self._zeros([size] + [group_size], torch.bool)
         self._data = Transition(
-            s1=self._s1, s2=self._s2, a1=self._a1, a2=self._a2,
-            discount=self._discount, reward=self._reward)
+            s1=self._s1,
+            s2=self._s2,
+            a1=self._a1,
+            a2=self._a2,
+            discount=self._discount,
+            reward=self._reward,
+            done=self._done)
         self._current_size = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
         self._current_idx = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
         self._capacity = torch.autograd.Variable(torch.tensor(self._size))
@@ -194,7 +213,7 @@ class Dataset(nn.Module):
         return DatasetView(self, indices)
 
     def get_batch(self, indices):
-        indices = torch.tensor(indices, dtype=torch.int64, requires_grad=False, device=self.device)
+        indices = torch.tensor(indices, dtype=torch.int64, requires_grad=False)
 
         def get_batch_(data_):
             return gather(data_, indices)
@@ -219,15 +238,14 @@ class Dataset(nn.Module):
         return torch.autograd.Variable(torch.zeros(shape, dtype=dtype))
 
     def add_transitions(self, transitions):
-        assert isinstance(transitions, Transition)
         for i in transitions._fields:
             attr = getattr(transitions, i)
             if torch.is_tensor(attr):
                 attr = attr.detach().cpu()
             transitions = transitions._replace(**{i: np.expand_dims(attr, axis=0)})
         batch_size = transitions.s1.shape[0]
-        effective_batch_size = torch.minimum(torch.tensor(batch_size), torch.tensor(self._size - self._current_idx))
-        indices = self._current_idx + torch.arange(effective_batch_size)
+        effective_batch_size = torch.minimum(torch.tensor(batch_size), torch.tensor(self._size) - self._current_idx)
+        indices = self._current_idx + torch.arange(effective_batch_size.item())
         for key in transitions._asdict().keys():
             data = getattr(self._data, key)
             batch = getattr(transitions, key)
@@ -269,27 +287,6 @@ def dir_path(path):
         raise argparse.ArgumentTypeError(f"readable_dir:{path} is not a valid path")
 
 
-parser = argparse.ArgumentParser(description='BRAC')
-parser.add_argument('--root_offlinerl_dir', type=dir_path, default='/home/memole/TEST/AIME/start-with-brac/offlinerl',
-                    help='Root directory for saving data')
-parser.add_argument('--sub_offlinerl_dir', type=str, default=None, help='sub directory for saving data.')
-parser.add_argument('--test_srcdir', type=str, default=None, help='directory for saving test data.')
-parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.')
-parser.add_argument('--data_name', type=str, default='random', help='data name.')
-parser.add_argument('--env_loader', type=str, default='mujoco', help='env loader, suite/gym.')
-parser.add_argument('--config_dir', type=str, default='configs', help='config file dir.')
-parser.add_argument('--config_file', type=str, default='d2e_pure', help='config file name.')
-parser.add_argument('--policy_root_dir', type=str, default=None, help='Directory in which to find the behavior policy.')
-parser.add_argument('--n_samples', type=int, default=int(1e3), help='number of transitions to collect.')
-parser.add_argument('--n_eval_episodes', type=int, default=20, help='number episodes to eval each policy.')
-parser.add_argument("--gin_file", type=str, default=[], nargs='*', help='Paths to the gin-config files.')
-
-parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help='Gin binding parameters.')
-args = parser.parse_args()
-if not os.path.exists("/home/memole/TEST/AIME/start-with-brac/offlinerl/HalfCheetah-v2/example/0"):
-    os.makedirs("/home/memole/TEST/AIME/start-with-brac/offlinerl/HalfCheetah-v2/example/0")
-
-
 def get_sample_counts(n, distr):
     """Provides size of each sub-dataset based on desired distribution."""
     distr = torch.tensor(distr)
@@ -304,14 +301,14 @@ def get_sample_counts(n, distr):
     return counts
 
 
-def collect_n_transitions(tf_env, policy, data, n, log_freq=1000):
+def collect_n_transitions(tf_env, policy, data, n, log_freq=1000, group_size=15):
     """Adds desired number of transitions to dataset."""
     collector = DataCollector(tf_env, policy, data)
     time_st = time.time()
     timed_at_step = 0
     steps_collected = 0
     while steps_collected < n:
-        count = collector.collect_transition()
+        count = collector.collect_transition(group_size)
         steps_collected += count
         if (steps_collected % log_freq == 0
             or steps_collected == n) and count > 0:
@@ -330,6 +327,7 @@ def collect_data(
         env_name='HalfCheetah-v2',
         log_freq=int(1e2),
         n_eval_episodes=20,
+        group_size=15
 ):
     """
                  **** Main function ****
@@ -352,6 +350,7 @@ def collect_data(
         observation_spec,
         action_spec,
         n_samples,
+        group_size=group_size,
         circular=False)
 
     # Collect data for each policy in data_config.
@@ -367,11 +366,12 @@ def collect_data(
         test_results[policy_name] = [eval_mean, eval_std]
         logging.info('Return mean %.4g, std %.4g.', eval_mean, eval_std)
         logging.info('Collecting data from policy %s...', policy_name)
-        collect_n_transitions(env, policy, data, n_transitions, log_freq)
+        collect_n_transitions(env, policy, data, n_transitions, log_freq, group_size)
     # Save final dataset.
     assert data.size == data.capacity
     data_ckpt_name = os.path.join(log_dir, 'data_{}.pt'.format(env_name))
-    torch.save([data.capacity, data.state_dict()], data_ckpt_name)
+    torch.save({"dataset": data, "capacity": data.capacity}, data_ckpt_name)
+
     whole_data_ckpt_name = os.path.join(log_dir, 'data_{}.pth'.format(env_name))
     with open(whole_data_ckpt_name, 'wb') as filehandler:
         pickle.dump(data, filehandler)
@@ -400,23 +400,50 @@ def main(args):
                                                   args.policy_root_dir),
         n_samples=args.n_samples,
         env_name=args.env_name,
-        n_eval_episodes=args.n_eval_episodes)
+        n_eval_episodes=args.n_eval_episodes,
+        group_size=args.group_size)
 
 
 def collect_gym_data(args):
     args.sub_offlinerl_dir = '0'
-    args.env_name = 'Pendulum-v0'
+    # args.env_name = 'HalfCheetah-v2'
     args.data_name = 'example'
     args.config_file = 'D2E_example'
     data_dir = 'testdata'
     args.test_srcdir = os.getcwd()
     args.policy_root_dir = os.path.join(args.test_srcdir,
                                         data_dir)
-    args.n_samples = 10000  # Short collection.
-    args.n_eval_episodes = 20
+    args.n_samples = 100000  # Short collection.
+    args.n_eval_episodes = 50
     main(args)
 
 
 if __name__ == "__main__":
-    args = parser.parse_args(sys.argv[1:])
+    repo_dir = "/mnt/e/pycharm_projects/AIME"
+
+    parser = argparse.ArgumentParser(description='DreamToExplore')
+    parser.add_argument('--root_offlinerl_dir', type=dir_path,
+                        default=os.path.join(os.getenv('HOME', '/'), repo_dir, 'offlinerl'),
+                        help='Root directory for saving data')
+    parser.add_argument('--sub_offlinerl_dir', type=str, default=None, help='sub directory for saving data.')
+    parser.add_argument('--test_srcdir', type=str, default=None, help='directory for saving test data.')
+    parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.')
+    parser.add_argument('--data_name', type=str, default='random', help='data name.')
+    parser.add_argument('--env_loader', type=str, default='mujoco', help='env loader, suite/gym.')
+    parser.add_argument('--config_dir', type=str, default='configs', help='config file dir.')
+    parser.add_argument('--config_file', type=str, default='d2e_pure', help='config file name.')
+    parser.add_argument('--policy_root_dir', type=str, default=None,
+                        help='Directory in which to find the behavior policy.')
+    parser.add_argument('--n_samples', type=int, default=int(1e3), help='number of transitions to collect.')
+    parser.add_argument('--n_eval_episodes', type=int, default=20, help='number episodes to eval each policy.')
+    parser.add_argument("--gin_file", type=str, default=[], nargs='*', help='Paths to the gin-config files.')
+
+    parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help='Gin binding parameters.')
+    parser.add_argument('--group_size', type=int, default=15, help='number of steps required for general advantage'
+                                                                   ' estimator')
+    args = parser.parse_args()
+    if not os.path.exists(os.path.join(args.root_offlinerl_dir, f"{args.env_name}/example/0")):
+        os.makedirs(os.path.join(args.root_offlinerl_dir, f"{args.env_name}/example/0"))
+
+    ##############################
     collect_gym_data(args)

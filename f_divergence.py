@@ -8,7 +8,9 @@ from torch import autograd
 from typing import Any, Callable, List, Optional, Tuple, Union
 import numpy as np
 from torch.distributions import MultivariateNormal, Normal, Independent, Uniform
-#https://github.com/JasonMa2016/SMODICE/blob/d6e58b0663fe636f313fe761b5473b6891f09f2b/discriminator_pytorch.py
+
+
+# https://github.com/JasonMa2016/SMODICE/blob/d6e58b0663fe636f313fe761b5473b6891f09f2b/discriminator_pytorch.py
 class RunningMeanStd:
     def __init__(self, epsilon: float = 1e-4, shape: Tuple[int, ...] = ()):
         """
@@ -44,7 +46,8 @@ class RunningMeanStd:
         batch_count = arr.shape[0]
         self.update_from_moments(batch_mean, batch_var, batch_count)
 
-    def update_from_moments(self, batch_mean: np.ndarray, batch_var: np.ndarray, batch_count: Union[int, float]) -> None:
+    def update_from_moments(self, batch_mean: np.ndarray, batch_var: np.ndarray,
+                            batch_count: Union[int, float]) -> None:
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
 
@@ -60,24 +63,24 @@ class RunningMeanStd:
         self.var = new_var
         self.count = new_count
 
+
 class Generator(nn.Module):
     def __init__(self,
-                input_dim: int,
-                output_dim: int,
-                hidden_dim: int,
-                latent_dim: int,
-                device: Any,
-                lr: float = 1e-4,
-                weight_decay : float = 1e-3,
-                opt_betas : tuple = (0.9, 0.999)
-                ):
+                 input_dim: int,
+                 output_dim: int,
+                 hidden_dim: int,
+                 latent_dim: int,
+                 device: Any,
+                 lr: float = 1e-4,
+                 weight_decay: float = 1e-3,
+                 opt_betas: tuple = (0.9, 0.999)
+                 ):
         super(Generator, self).__init__()
 
         self.output_emb = nn.Sequential(
-                                     nn.Linear(input_dim, hidden_dim),
-                                     nn.LeakyReLU(0.2, inplace=True)
-                                     )
-
+            nn.Linear(input_dim, hidden_dim),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
 
         def block(in_feat, out_feat, normalize=True):
             layers = [nn.Linear(in_feat, out_feat)]
@@ -94,7 +97,7 @@ class Generator(nn.Module):
             nn.Tanh()
         )
 
-        self.device=device
+        self.device = device
         # optimizer
         self.lr = lr
         self.weight_decay = weight_decay
@@ -113,6 +116,7 @@ class Generator(nn.Module):
         y = self.model(gen_input)
         return y
 
+
 def generate_noise(bs, nz, device):
     loc = torch.zeros(bs, nz).to(device)
     scale = torch.ones(bs, nz).to(device)
@@ -121,26 +125,27 @@ def generate_noise(bs, nz, device):
     noise = diagn.sample()
     return noise
 
+
 class Discriminator(nn.Module):
     def __init__(self,
-                 input_dim:int,
-                 output_dim:int,
-                 hidden_dim:int,
-                 latent_dim:int,
-                 device:Any,
+                 input_dim: int,
+                 output_dim: int,
+                 hidden_dim: int,
+                 latent_dim: int,
+                 device: Any,
                  lr: float = 1e-4,
                  ):
         super(Discriminator, self).__init__()
-        self.input_dim  = input_dim
+        self.input_dim = input_dim
         self.output_dim = output_dim
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
-        self.lr     = lr
+        self.lr = lr
         self.device = device
-        self._condition_disc = nn.Sequential( nn.Linear(input_dim, hidden_dim),
-                                                  nn.Tanh()
-                                                  ).to(device)
-        
+        self._condition_disc = nn.Sequential(nn.Linear(input_dim, hidden_dim),
+                                             nn.Tanh()
+                                             ).to(device)
+
         self.trunk = nn.Sequential(
             nn.Linear(output_dim + hidden_dim, hidden_dim), nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
@@ -150,7 +155,8 @@ class Discriminator(nn.Module):
         self.train()
 
         self.optimizer = torch.optim.Adam(self.parameters(), self.lr)
-        self.fake_state_action = Generator(self.input_dim, self.output_dim, self.hidden_dim, self.latent_dim, self.device)
+        self.fake_state_action = Generator(self.input_dim, self.output_dim, self.hidden_dim, self.latent_dim,
+                                           self.device)
         self.returns = None
         self.ret_rms = RunningMeanStd(shape=())
 
@@ -163,15 +169,14 @@ class Discriminator(nn.Module):
         """Calculates the gradient penalty loss for WGAN GP"""
 
         conditional_data = self._condition_disc(torch.cat([current_state, current_action.float()], dim=1))
-        #mixing coefficient
+        # mixing coefficient
         alpha = torch.rand(next_state_real.size(0), 1)
         alpha = alpha.expand_as(next_state_real).to(next_state_real.device)
-        #interpolates = (alpha * real_images + ((1 - alpha) * fake_images)).requires_grad_(True).float()
-        mixup_data = (alpha  * next_state_real + (1 - alpha)* next_state_fake).requires_grad_(True).float()
-
+        # interpolates = (alpha * real_images + ((1 - alpha) * fake_images)).requires_grad_(True).float()
+        mixup_data = (alpha * next_state_real + (1 - alpha) * next_state_fake).requires_grad_(True).float()
 
         disc = self.trunk(torch.cat([mixup_data, conditional_data], dim=1))
-        ones =  torch.autograd.Variable(torch.ones(disc.size()), requires_grad=False).to(disc.device)
+        ones = torch.autograd.Variable(torch.ones(disc.size()), requires_grad=False).to(disc.device)
         grad = autograd.grad(
             outputs=disc,
             inputs=mixup_data,
@@ -192,39 +197,43 @@ class Discriminator(nn.Module):
         for item in loader:
             policy_state = torch.FloatTensor(item["obs"]).to(self.device)
             policy_action = torch.FloatTensor(item["action"]).to(self.device)
-            #conditional
-            current_state_o = self._condition_disc( torch.cat([policy_state, policy_action], dim=1) )
+            if policy_state.ndim > 2:
+                policy_state = torch.reshape(policy_state, (policy_state.shape[0] * policy_state.shape[1], -1))
+                policy_action = torch.reshape(policy_action, (policy_action.shape[0] * policy_action.shape[1], -1))
 
+            # conditional
+            current_state_o = self._condition_disc(torch.cat([policy_state, policy_action], dim=-1))
             next_state_o = torch.FloatTensor(item["next_obs"]).to(self.device)
+            if next_state_o.ndim > 2:
+                next_state_o = torch.reshape(next_state_o, (next_state_o.shape[0] * next_state_o.shape[1], -1))
 
-            #min Es∼d^o [logc(s,a)]+Es∼d^f [log(1−c(s,a))]
+            # min Es∼d^o [logc(s,a)]+Es∼d^f [log(1−c(s,a))]
             observation_d = self.trunk(
-                torch.cat([next_state_o, current_state_o], dim=1))
-
+                torch.cat([next_state_o, current_state_o], dim=-1))
 
             real_loss = F.binary_cross_entropy_with_logits(
-                                                           observation_d,
-                                                           torch.autograd.Variable(torch.ones_like(observation_d), requires_grad=False).to(self.device))
+                observation_d,
+                torch.autograd.Variable(torch.ones_like(observation_d), requires_grad=False).to(self.device))
 
-            #generate fake next states
-            noise_            = generate_noise(bs=policy_state.shape[0], nz=self.latent_dim, device=self.device)
-            next_state_f      = self.fake_state_action(noise_, torch.cat([policy_state, policy_action.float()], dim=1))
+            # generate fake next states
+            noise_ = generate_noise(bs=policy_state.shape[0], nz=self.latent_dim, device=self.device)
+            next_state_f = self.fake_state_action(noise_, torch.cat([policy_state, policy_action.float()], dim=-1))
 
-            observation_f     = self.trunk(torch.cat([next_state_f, current_state_o], dim=1))
+            observation_f = self.trunk(torch.cat([next_state_f, current_state_o], dim=-1))
 
             fake_loss = F.binary_cross_entropy_with_logits(
-                                                           observation_f,
-                                                           torch.autograd.Variable(torch.zeros_like(observation_f), requires_grad=False).to(self.device))
+                observation_f,
+                torch.autograd.Variable(torch.zeros_like(observation_f), requires_grad=False).to(self.device))
             gail_loss = real_loss + fake_loss
             grad_pen = self.compute_grad_pen(next_state_f,
                                              next_state_o,
                                              policy_state, policy_action)
 
             div_loss += gail_loss
-            penalty  += grad_pen
+            penalty += grad_pen
             n += 1
 
-        return div_loss / n, penalty/ n
+        return div_loss / n, penalty / n
 
     def predict(self, state, action):
         with torch.no_grad():
@@ -232,6 +241,7 @@ class Discriminator(nn.Module):
             noise = generate_noise(bs=state.shape[0], nz=self.latent_dim, device=self.device)
             fake_future_state = self.fake_state_action(noise, torch.cat([state, action.float()], dim=1))
         return fake_future_state
+
 
 class TransitDataset(torch.utils.data.Dataset):
 
@@ -243,27 +253,27 @@ class TransitDataset(torch.utils.data.Dataset):
         super(TransitDataset, self).__init__()
 
         self.next_states = next_states
-        self.states      = states
-        self.actions     = actions
-
+        self.states = states
+        self.actions = actions
 
     def __len__(self):
         return len(self.next_states)
 
     def __getitem__(self, item):
-        states  = self.states[item]
+        states = self.states[item]
         actions = self.actions[item]
         targets = self.next_states[item]
-        return {"next_obs":targets , "obs": states, "action": actions}
+        return {"next_obs": targets, "obs": states, "action": actions}
+
 
 def preprocess_loader(states, actions, next_states, device):
-    dataset =  TransitDataset(states, actions, next_states)
+    dataset = TransitDataset(states, actions, next_states)
     pin_memory = device == 'cuda'
     dloader = torch.utils.data.DataLoader(
-                dataset,
-                batch_size=states.shape[0],
-                shuffle=False,
-                drop_last=False,
-                pin_memory=pin_memory
-            )
+        dataset,
+        batch_size=states.shape[0],
+        shuffle=False,
+        drop_last=False,
+        pin_memory=pin_memory
+    )
     return dloader

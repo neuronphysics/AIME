@@ -2,28 +2,14 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-
-import collections
-import os
-import time
-import torch
-from absl import logging
-
 import gin
-import numpy as np
-
-import gym
-import alf_gym_wrapper
-import argparse
-from alf_environment import TimeLimit
-from DataCollectionD2E import *
 import utils_planner as utils
-from planner_D2E_regularizer import D2EAgent, Config, eval_policies, ContinuousRandomPolicy
-
 from torch.utils.tensorboard import SummaryWriter
 import datetime
 import re
 from typing import Dict, Any
+from DataCollectionD2E_n_step import *
+from planner_D2E_regularizer_n_step import D2EAgent, Config, eval_policies, ContinuousRandomPolicy
 
 config: Dict[str, Any] = {}
 
@@ -63,6 +49,7 @@ def train_eval_online(
         discount=0.99,
         done=False,
         device=None,
+        group_size=15
 ):
     """Training a policy with online interaction."""
     # Create env to get specs.
@@ -82,6 +69,7 @@ def train_eval_online(
         action_spec,
         replay_buffer_size,
         circular=True,
+        group_size=group_size
     )
 
     data_ckpt_name = os.path.join(log_dir, 'replay_{}'.format(env_name))
@@ -98,7 +86,7 @@ def train_eval_online(
     time_step = env.reset()
     collector = DataCollector(env, explore_policy, train_data)
     while steps_collected < initial_explore_steps:
-        count = collector.collect_transition()
+        count = collector.collect_transition(group_size)
         steps_collected += count
         if (steps_collected % log_freq == 0
             or steps_collected == initial_explore_steps) and count > 0:
@@ -148,7 +136,7 @@ def train_eval_online(
         env, agent.online_policy, train_data)
     for _ in range(total_train_steps):
 
-        collector.collect_transition()
+        collector.collect_transition(group_size)
         agent.train_step()
         step = agent.global_step
         if step % summary_freq == 0 or step == total_train_steps:
@@ -198,32 +186,6 @@ def train_eval_online(
     return np.array(eval_results)
 
 
-if not os.path.exists(
-        os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/policies')):
-    os.makedirs(os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/policies'))
-
-parser = argparse.ArgumentParser(description='DreamToExplore', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
-parser.add_argument('--root_dir', type=dir_path, default=os.path.join(os.getenv('HOME', '/'),
-                                                                      'TEST/AIME/start-with-brac/start-with-brac/offlinerl/policies'),
-                    help='Root directory for writing logs/summaries/checkpoints.')
-parser.add_argument('--sub_dir', type=str, default='0', help='')
-
-parser.add_argument('--agent_name', type=str, default='sac', help='agent name.')
-parser.add_argument('--eval_target', type=int, default=1000, help='threshold for a paritally trained policy')
-
-parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.')
-parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
-parser.add_argument('--total_train_steps', type=int, default=int(5e5), help='')
-parser.add_argument('--n_eval_episodes', type=int, default=int(20), help='')
-
-parser.add_argument('--gin_file', type=str, default=[], nargs='*', help='Paths to the gin-config files.')
-parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help='Gin binding parameters.')
-args = parser.parse_args()
-config.update(vars(parser.parse_args()))
-logging.info("Parsed %i arguments.", len(config))
-
-
 def main(args):
     logging.set_verbosity(logging.INFO)
     # gin.parse_config_files_and_bindings(args.gin_file, args.gin_bindings)
@@ -249,11 +211,37 @@ def main(args):
         total_train_steps=args.total_train_steps,
         n_eval_episodes=args.n_eval_episodes,
         eval_target=args.eval_target,
+        group_size=args.group_size
     )
 
 
 if __name__ == '__main__':
+    repo_dir = "/mnt/e/pycharm_projects/AIME"
+
+    if not os.path.exists(os.path.join(os.getenv('HOME', '/'), repo_dir, "online")):
+        os.makedirs(os.path.join(os.getenv('HOME', '/'), repo_dir, "online"))
+
+    parser = argparse.ArgumentParser(description='DreamToExplore',
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    parser.add_argument('--root_dir', type=dir_path, default=os.path.join(os.getenv('HOME', '/'),
+                                                                          repo_dir, "online"),
+                        help='Root directory for writing logs/summaries/checkpoints.')
+    parser.add_argument('--sub_dir', type=str, default='0', help='')
+
+    parser.add_argument('--agent_name', type=str, default='sac', help='agent name.')
+    parser.add_argument('--eval_target', type=int, default=1000, help='threshold for a paritally trained policy')
+
+    parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.')
+    parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
+    parser.add_argument('--total_train_steps', type=int, default=int(5e5), help='')
+    parser.add_argument('--n_eval_episodes', type=int, default=int(20), help='')
+
+    parser.add_argument('--gin_file', type=str, default=[], nargs='*', help='Paths to the gin-config files.')
+    parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help='Gin binding parameters.')
+    parser.add_argument('--group_size', type=int, default=15, help='number of steps required for general advantage'
+                                                                   ' estimator')
     args = parser.parse_args(sys.argv[1:])
-    # print(' '.join(f'{k}={v}' for k, v in vars(args).items()))
-    # gin.parse_config_files_and_bindings(args.gin_file, args.gin_bindings)
+    config.update(vars(args))
+    logging.info("Parsed %i arguments.", len(config))
     main(args)
