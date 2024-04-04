@@ -55,10 +55,14 @@ class gradient_penalty(object):
     def forward(self, s, a_p, a_b, gamma=5.0):
         """Calculates interpolated gradient penalty."""
         batch_size = s.shape[0]
-        n_step = s.shape[1]
-        alpha = torch.rand([batch_size, n_step], device=self.device)
-        a_intpl = a_p.to(device=self.device) + alpha[:, :, None] * (
-                a_b.to(device=self.device) - a_p.to(device=self.device))
+        if s.ndim > 2:
+            n_step = s.shape[1]
+            alpha = torch.rand([batch_size, n_step], device=self.device)
+            alpha = alpha[:, :, None]
+        else:
+            alpha = torch.rand([batch_size], device=self.device)
+            alpha = alpha[:, None]
+        a_intpl = a_p.to(device=self.device) + alpha * (a_b.to(device=self.device) - a_p.to(device=self.device))
         c_intpl = self.c(s.to(device=self.device), a_intpl)
         slope = torch.sqrt(EPS + torch.sum(c_intpl ** 2, axis=-1))
         grad_penalty = torch.mean(torch.max(slope - 1.0, torch.zeros_like(slope)) ** 2)
