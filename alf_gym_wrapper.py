@@ -172,7 +172,7 @@ class AlfGymWrapper(AlfEnvironment):
         self._gym_env.reset()
         action = nest.map_structure(lambda spec: spec.numpy_zeros(),
                                     self._action_spec)
-        _, _, _, _, info = self._gym_env.step(action)
+        info = self._gym_env.step(action)[-1]
         self._gym_env.reset()
         info = _as_array(info)
         return nest.map_structure(lambda a: np.zeros_like(a), info)
