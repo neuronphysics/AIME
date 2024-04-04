@@ -198,30 +198,7 @@ def train_eval_online(
     return np.array(eval_results)
 
 
-if not os.path.exists(
-        os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/policies')):
-    os.makedirs(os.path.join(os.getenv('HOME', '/'), 'TEST/AIME/start-with-brac/start-with-brac/offlinerl/policies'))
 
-parser = argparse.ArgumentParser(description='DreamToExplore', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
-parser.add_argument('--root_dir', type=dir_path, default=os.path.join(os.getenv('HOME', '/'),
-                                                                      'TEST/AIME/start-with-brac/start-with-brac/offlinerl/policies'),
-                    help='Root directory for writing logs/summaries/checkpoints.')
-parser.add_argument('--sub_dir', type=str, default='0', help='')
-
-parser.add_argument('--agent_name', type=str, default='sac', help='agent name.')
-parser.add_argument('--eval_target', type=int, default=1000, help='threshold for a paritally trained policy')
-
-parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.')
-parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
-parser.add_argument('--total_train_steps', type=int, default=int(5e5), help='')
-parser.add_argument('--n_eval_episodes', type=int, default=int(20), help='')
-
-parser.add_argument('--gin_file', type=str, default=[], nargs='*', help='Paths to the gin-config files.')
-parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help='Gin binding parameters.')
-args = parser.parse_args()
-config.update(vars(parser.parse_args()))
-logging.info("Parsed %i arguments.", len(config))
 
 
 def main(args):
@@ -253,6 +230,31 @@ def main(args):
 
 
 if __name__ == '__main__':
+    repo_dir = "/home/sstevec/projects/def-jhoey/sstevec/AIME"
+
+    if not os.path.exists(os.path.join(os.getenv('HOME', '/'), repo_dir, "online")):
+        os.makedirs(os.path.join(os.getenv('HOME', '/'), repo_dir, "online"))
+
+    parser = argparse.ArgumentParser(description='DreamToExplore',
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    parser.add_argument('--root_dir', type=dir_path, default=os.path.join(os.getenv('HOME', '/'),
+                                                                          repo_dir, "online"),
+                        help='Root directory for writing logs/summaries/checkpoints.')
+    parser.add_argument('--sub_dir', type=str, default='regular', help='')
+
+    parser.add_argument('--agent_name', type=str, default='sac', help='agent name.')
+    parser.add_argument('--eval_target', type=int, default=1000, help='threshold for a paritally trained policy')
+
+    parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.')
+    parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
+    parser.add_argument('--total_train_steps', type=int, default=int(5e5), help='')
+    parser.add_argument('--n_eval_episodes', type=int, default=int(20), help='')
+
+    parser.add_argument('--gin_file', type=str, default=[], nargs='*', help='Paths to the gin-config files.')
+    parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help='Gin binding parameters.')
+    parser.add_argument('--group_size', type=int, default=15, help='number of steps required for general advantage'
+                                                                   ' estimator')
     args = parser.parse_args(sys.argv[1:])
     # print(' '.join(f'{k}={v}' for k, v in vars(args).items()))
     # gin.parse_config_files_and_bindings(args.gin_file, args.gin_bindings)
