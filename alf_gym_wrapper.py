@@ -20,6 +20,8 @@ import collections
 import gym
 import gym.spaces
 import numbers
+
+import numpy
 import numpy as np
 import torch
 
@@ -188,7 +190,12 @@ class AlfGymWrapper(AlfEnvironment):
     def _reset(self):
         # TODO: Upcoming update on gym adds **kwargs on reset. Update this to
         # support that.
-        observation, info = self._gym_env.reset()
+        res = self._gym_env.reset()
+        info = None
+        if isinstance(res, numpy.ndarray):
+            observation = res
+        elif isinstance(res, tuple):
+            observation, info = res
         self._info = info
         self._done = False
 
@@ -210,8 +217,11 @@ class AlfGymWrapper(AlfEnvironment):
         if self._auto_reset and self._done:
             return self.reset()
 
-        observation, reward, self._done, truncated, self._info = self._gym_env.step(
-            action)
+        res = self._gym_env.step(action)
+        if len(res) == 4:
+            observation, reward, self._done, self._info = res
+        else:
+            observation, reward, self._done, truncated, self._info = res
         observation = self._to_spec_dtype_observation(observation)
         self._info = nest.map_structure(_as_array, self._info)
 

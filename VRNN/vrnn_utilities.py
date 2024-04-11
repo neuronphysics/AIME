@@ -1,11 +1,6 @@
 import numpy as np
-import pandas as pd
-from typing import Dict, Any, Optional, Tuple, Union
 import matplotlib.pyplot as plt
 import torch
-import math
-import time
-import logging
 import os, sys
 import torch.nn as nn
 from collections import OrderedDict
@@ -171,7 +166,7 @@ def plot_time_sequence_uncertainty(data_y_true, data_y_sample, label_y, options,
 
         # plot settings
         axes[j,0].set_title('Output $y_{}(k)$, {} with (h,z,n)=({},{},{})'.format((j + 1),
-                                                                        options['dataset'],
+                                                                        options['wm_image_replay_buffer'],
                                                                         options['h_dim'],
                                                                         options['z_dim'],
                                                                         options['n_layers']))

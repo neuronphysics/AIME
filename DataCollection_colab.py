@@ -272,7 +272,7 @@ def scatter_update(tensor, indices, updates):
 
 
 class DatasetView(object):
-    """Interface for reading from dataset."""
+    """Interface for reading from wm_image_replay_buffer."""
 
     def __init__(self, dataset, indices):
         self._dataset = dataset
@@ -300,7 +300,7 @@ def save_copy(data, ckpt_name):
 
 
 class Dataset(nn.Module):
-    """Tensorflow module of dataset of transitions."""
+    """Tensorflow module of wm_image_replay_buffer of transitions."""
 
     def __init__(
             self,
@@ -473,7 +473,7 @@ maybe_makedirs(args.root_offlinerl_dir)
 # if not os.path.exists(data_dir):
 #    os.makedirs(data_dir)
 def get_sample_counts(n, distr):
-    """Provides size of each sub-dataset based on desired distribution."""
+    """Provides size of each sub-wm_image_replay_buffer based on desired distribution."""
     distr = torch.tensor(distr)
     distr = distr / torch.sum(distr)
     counts = []
@@ -487,7 +487,7 @@ def get_sample_counts(n, distr):
 
 
 def collect_n_transitions(tf_env, policy, data, n, log_freq=1000):
-    """Adds desired number of transitions to dataset."""
+    """Adds desired number of transitions to wm_image_replay_buffer."""
     collector = DataCollector(tf_env, policy, data)
     time_st = time.time()
     timed_at_step = 0
@@ -515,7 +515,7 @@ def collect_data(
 ):
     """
                  **** Main function ****
-    Creates dataset of transitions based on desired config.
+    Creates wm_image_replay_buffer of transitions based on desired config.
     """
     seed = 0
     torch.manual_seed(seed)
@@ -526,7 +526,7 @@ def collect_data(
     observation_spec = env.observation_spec()
     action_spec = env.action_spec()
 
-    # Initialize dataset.
+    # Initialize wm_image_replay_buffer.
     sample_sizes = list([cfg[-1] for cfg in data_config])
 
     sample_sizes = get_sample_counts(n_samples, sample_sizes)
@@ -551,7 +551,7 @@ def collect_data(
         logging.info('Return mean %.4g, std %.4g.', eval_mean, eval_std)
         logging.info('Collecting data from policy %s...', policy_name)
         collect_n_transitions(env, policy, data, n_transitions, log_freq)
-    # Save final dataset.
+    # Save final wm_image_replay_buffer.
     data_ckpt_name = os.path.join(log_dir, 'data_{}.pt'.format(env_name))
     torch.save(data, data_ckpt_name)
     time_cost = time.time() - time_st

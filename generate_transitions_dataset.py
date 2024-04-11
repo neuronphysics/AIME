@@ -155,7 +155,7 @@ def generate_dataset(
     update_rate=0.005,
     discount=0.99,
     ):
-    """Generating the dataset with ActorNetwork."""
+    """Generating the wm_image_replay_buffer with ActorNetwork."""
 
     # Create tf_env to get specs.
     tf_env = env_factory(env_name)
@@ -164,7 +164,7 @@ def generate_dataset(
     action_spec = tf_env.action_space
     initial_state = tf_env.reset()
 
-    # Initialize dataset.
+    # Initialize wm_image_replay_buffer.
     train_data = Dataset(
         observation_spec,
         action_spec,

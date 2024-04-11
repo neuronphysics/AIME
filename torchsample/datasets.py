@@ -20,7 +20,7 @@ class BaseDataset(object):
     """An abstract class representing a Dataset.
 
     All other datasets should subclass it. All subclasses should override
-    ``__len__``, that provides the size of the dataset, and ``__getitem__``,
+    ``__len__``, that provides the size of the wm_image_replay_buffer, and ``__getitem__``,
     supporting integer indexing in range from 0 to len(self) exclusive.
     """
 
@@ -162,12 +162,12 @@ class BaseDataset(object):
 
     def fit_transforms(self):
         """
-        Make a single pass through the entire dataset in order to fit 
-        any parameters of the transforms which require the entire dataset.
-        e.g. StandardScaler() requires mean and std for the entire dataset.
+        Make a single pass through the entire wm_image_replay_buffer in order to fit
+        any parameters of the transforms which require the entire wm_image_replay_buffer.
+        e.g. StandardScaler() requires mean and std for the entire wm_image_replay_buffer.
 
         If you dont call this fit function, then transforms which require properties
-        of the entire dataset will just work at the batch level.
+        of the entire wm_image_replay_buffer will just work at the batch level.
         e.g. StandardScaler() will normalize each batch by the specific batch mean/std
         """
         it_fit = hasattr(self.input_transform, 'update_fit')
@@ -245,7 +245,7 @@ class TensorDataset(BaseDataset):
 
     def __getitem__(self, index):
         """
-        Index the dataset and return the input + target
+        Index the wm_image_replay_buffer and return the input + target
         """
         input_sample = [self.input_transform[i](self.inputs[i][index]) for i in range(self.num_inputs)]
 
@@ -404,7 +404,7 @@ class CSVDataset(BaseDataset):
 
     def __getitem__(self, index):
         """
-        Index the dataset and return the input + target
+        Index the wm_image_replay_buffer and return the input + target
         """
         input_sample = [self.input_transform[i](self.input_loader(self.inputs[index, i])) for i in range(self.num_inputs)]
 
@@ -419,13 +419,13 @@ class CSVDataset(BaseDataset):
 
     def split_by_column(self, col):
         """
-        Split this dataset object into multiple dataset objects based on 
+        Split this wm_image_replay_buffer object into multiple wm_image_replay_buffer objects based on
         the unique factors of the given column. The number of returned
         datasets will be equal to the number of unique values in the given
         column. The transforms and original dataframe will all be transferred
         to the new datasets 
 
-        Useful for splitting a dataset into train/val/test datasets.
+        Useful for splitting a wm_image_replay_buffer into train/val/test datasets.
 
         Arguments
         ---------
@@ -608,7 +608,7 @@ def _is_image_file(filename):
 def _finds_inputs_and_targets(directory, class_mode, class_to_idx=None, 
             input_regex=None, target_regex=None, ):
     """
-    Map a dataset from a root folder
+    Map a wm_image_replay_buffer from a root folder
     """
     if class_mode == 'image':
         if not input_regex and not target_regex:

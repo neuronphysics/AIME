@@ -28,8 +28,8 @@ def _is_tuple_or_list(x):
 def _parse_num_inputs_and_targets_from_loader(loader):
     """ NOT IMPLEMENTED """
     #batch = next(iter(loader))
-    num_inputs = loader.dataset.num_inputs
-    num_targets = loader.dataset.num_targets
+    num_inputs = loader.wm_image_replay_buffer.num_inputs
+    num_targets = loader.wm_image_replay_buffer.num_targets
     return num_inputs, num_targets
 
 def _parse_num_inputs_and_targets(inputs, targets=None):

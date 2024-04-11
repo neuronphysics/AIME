@@ -106,7 +106,7 @@ class GaussMMVAE(nn.Module):
     def __init__(self, hyperParams):
         super().__init__()
         self.X = Variable(torch.FloatTensor(hyperParams['batch_size'], hyperParams['input_d']))
-        #self.X = tf.placeholder("float", [None, hyperParams['input_d']])
+        #self.X = tf.placeholder("float", [None, HYPER_PARAMETERS['input_d']])
         self.prior = hyperParams['prior']
         self.K = hyperParams['K']
 
@@ -420,7 +420,7 @@ class DLGMM(GaussMMVAE):
 
         self.elbo_obj = self.get_ELBO()
 
-        #self.batch_log_margLL = self.get_log_margLL(hyperParams['batchSize'])
+        #self.batch_log_margLL = self.get_log_margLL(HYPER_PARAMETERS['batchSize'])
 
 
     def init_encoder(self, hyperParams):

@@ -1,46 +1,31 @@
-
 from tqdm import tqdm
-import math
-import time
-import logging
 import os
 import numpy as np
-import pandas as pd
-from typing import Dict, Any, Optional, Tuple, Union
 from torchgan.models import Generator, Discriminator
 import torch
 import torch.nn as nn
 import torch.utils
 import torch.utils.data
-from torchvision import datasets, transforms
-from torch.autograd import Variable
 import torch.optim as optim
-from torch.nn import functional as F
-import torch.distributions as tdist
-from torch.utils.data import Dataset
-import torch.multiprocessing as mp
-import torch.nn.init as init
 import logging
-from collections import defaultdict
-from functools import partial
-import torch_optimizer
 from sklearn import metrics
-import torch.utils.data as torch_data
-import torch.optim.lr_scheduler as schedulers
 from sklearn.model_selection import train_test_split
 from statistics import mean
 from math import floor
 from matplotlib import pyplot as plt
 from matplotlib.ticker import MaxNLocator
-from Blocks import init_weights
+from VRNN.Blocks import init_weights
+
+
 ###########################
-#based on:https://github.com/chris-hzc/Conditional_Sig_Wasserstein_GANs/blob/d022cd6dcc2ea948c3cf35c585b29c198f539754/Conditional_Sig_Wasserstein_GANs_master/lib/plot.py
+# based on:https://github.com/chris-hzc/Conditional_Sig_Wasserstein_GANs/blob/d022cd6dcc2ea948c3cf35c585b29c198f539754/Conditional_Sig_Wasserstein_GANs_master/lib/plot.py
 def to_numpy(x):
     """
     Casts torch.Tensor to a numpy ndarray.
     The function detaches the tensor from its gradients, then puts it onto the cpu and at last casts it to numpy.
     """
     return x.detach().cpu().numpy()
+
 
 def compare_cross_corr(x_real, x_fake):
     """ Computes cross correlation matrices of x_real and x_fake and plots them. """
@@ -62,10 +47,12 @@ def compare_cross_corr(x_real, x_fake):
     cbar_ax = fig.add_axes([0.85, 0.15, 0.05, 0.7])
     fig.colorbar(im, cax=cbar_ax)
 
+
 def set_style(ax):
     ax.spines['right'].set_visible(False)
     ax.spines['top'].set_visible(False)
     ax.spines['bottom'].set_visible(False)
+
 
 def cacf_torch(x, max_lag, dim=(0, 1)):
     def get_lower_triangular_indices(n):
@@ -82,6 +69,7 @@ def cacf_torch(x, max_lag, dim=(0, 1)):
         cacf_list.append(cacf_i)
     cacf = torch.cat(cacf_list, 1)
     return cacf.reshape(cacf.shape[0], -1, len(ind[0]))
+
 
 def compare_hists(x_real, x_fake, ax=None, log=False, label=None):
     """ Computes histograms and plots those. """
@@ -139,6 +127,7 @@ def compare_acf(x_real, x_fake, ax=None, max_lag=64, CI=True, dim=(0, 1), drop_f
     ax.legend()
     return ax
 
+
 def skew_torch(x, dim=(0, 1), dropdims=True):
     x = x - x.mean(dim, keepdims=True)
     x_3 = torch.pow(x, 3).mean(dim, keepdims=True)
@@ -160,10 +149,10 @@ def kurtosis_torch(x, dim=(0, 1), excess=True, dropdims=True):
         kurtosis = kurtosis[0, 0]
     return kurtosis
 
+
 def plot_summary(x_fake, x_real, max_lag=None, labels=None):
     if max_lag is None:
         max_lag = min(128, x_fake.shape[1])
-
 
     dim = x_real.shape[2]
     _, axes = plt.subplots(dim, 3, figsize=(25, dim * 5))
@@ -211,12 +200,11 @@ def calc_conv_output_length(conv_layer,
         return x[0] if isinstance(x, tuple) else x
 
     l = input_length
-    p =_maybe_slice(conv_layer.padding)
-    d =_maybe_slice(conv_layer.dilation)
-    k =_maybe_slice(conv_layer.kernel_size)
-    s =_maybe_slice(conv_layer.stride)
-    return floor((l + 2*p - d*(k-1)-1)/s + 1)
-
+    p = _maybe_slice(conv_layer.padding)
+    d = _maybe_slice(conv_layer.dilation)
+    k = _maybe_slice(conv_layer.kernel_size)
+    s = _maybe_slice(conv_layer.stride)
+    return floor((l + 2 * p - d * (k - 1) - 1) / s + 1)
 
 
 class RGANGenerator(Generator):
@@ -229,7 +217,7 @@ class RGANGenerator(Generator):
                  dropout=0,
                  input_size=None,
                  last_layer=None,
-                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                 device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                  **kwargs):
         """Recursive GAN (Generator) implementation with RNN cells.
         Layers:
@@ -243,9 +231,9 @@ class RGANGenerator(Generator):
                 input: (batch_size, sequence_length, output_size)
         Args:
             sequence_length (int): Number of points in the sequence.
-                Defined by the real dataset.
+                Defined by the real wm_image_replay_buffer.
             output_size (int): Size of output (usually the last tensor dimension).
-                Defined by the real dataset.
+                Defined by the real wm_image_replay_buffer.
             hidden_size (int, optional): Size of RNN output.
                 Defaults to output_size.
             noise_size (int, optional): Size of noise used to generate fake data.
@@ -259,7 +247,6 @@ class RGANGenerator(Generator):
             input_size (int, optional): Input size of RNN, defaults to noise_size.
             last_layer (Module, optional): Last layer of the discriminator.
         """
-
 
         # Defaults
         noise_size = noise_size or output_size
@@ -284,7 +271,7 @@ class RGANGenerator(Generator):
         # TODO: Any resizing of z is valid as long as the total size
         #       remains sequence_length*noise_size. How does this affect
         #       the performance of the RNN?
-        self.encoding_dims = sequence_length*noise_size
+        self.encoding_dims = sequence_length * noise_size
 
         super(RGANGenerator, self).__init__(self.encoding_dims,
                                             self.label_type)
@@ -308,7 +295,7 @@ class RGANGenerator(Generator):
             z = z.view(-1, self.sequence_length, self.noise_size)
         h0 = torch.randn((self.num_layers, z.size(0), self.hidden_size)).to(self.device)
         c0 = torch.randn((self.num_layers, z.size(0), self.hidden_size)).to(self.device)
-        length =  torch.LongTensor([torch.max((z[i,:,0]!=0).nonzero()).item()+1 for i in range(z.shape[0])])
+        length = torch.LongTensor([torch.max((z[i, :, 0] != 0).nonzero()).item() + 1 for i in range(z.shape[0])])
         packed = nn.utils.rnn.pack_padded_sequence(
             z, length, batch_first=True, enforce_sorted=False
         )
@@ -328,7 +315,7 @@ class RGANDiscriminator(Discriminator):
                  num_layers=1,
                  dropout=0,
                  last_layer=None,
-                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                 device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                  **kwargs):
         """Recursive GAN (Discriminator) implementation with RNN cells.
         Layers:
@@ -365,7 +352,7 @@ class RGANDiscriminator(Discriminator):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dropout = dropout
-        self.label_type ="none"
+        self.label_type = "none"
         # Set kwargs (might overried above attributes)
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -389,7 +376,7 @@ class RGANDiscriminator(Discriminator):
         h0 = torch.randn((self.num_layers, x.size(0), self.hidden_size)).to(self.device)
         c0 = torch.randn((self.num_layers, x.size(0), self.hidden_size)).to(self.device)
         if length is None:
-           length =  torch.LongTensor([torch.max((x[i,:,0]!=0).nonzero()).item()+1 for i in range(x.shape[0])])
+            length = torch.LongTensor([torch.max((x[i, :, 0] != 0).nonzero()).item() + 1 for i in range(x.shape[0])])
 
         packed = nn.utils.rnn.pack_padded_sequence(
             x, length, batch_first=True, enforce_sorted=False
@@ -400,12 +387,15 @@ class RGANDiscriminator(Discriminator):
         y = self.linear(y)
         return y if self.last_layer is None else self.last_layer(y)
 
+
 def gen_noise(size):
     return torch.randn(size=size)
+
 
 def add_handler(logger, handlers):
     for handler in handlers:
         logger.addHandler(handler)
+
 
 def setup_logging(time_logging_file, config_logging_file):
     # SET UP LOGGING
@@ -432,6 +422,7 @@ def setup_logging(time_logging_file, config_logging_file):
     config_logger.addHandler(config_handler)
     return config_logger, time_logger
 
+
 def calculate_mmd_rbf(X, Y, gamma=1.0):
     """MMD using rbf (gaussian) kernel (i.e., k(x,y) = exp(-gamma * ||x-y||^2 / 2))
     Arguments:
@@ -447,6 +438,7 @@ def calculate_mmd_rbf(X, Y, gamma=1.0):
     XY = metrics.pairwise.rbf_kernel(X, Y, gamma)
     return XX.mean() + YY.mean() - 2 * XY.mean()
 
+
 def compute_grad2(d_out, x_in):
     batch_size = x_in.size(0)
     grad_dout = torch.autograd.grad(
@@ -458,8 +450,8 @@ def compute_grad2(d_out, x_in):
     reg = grad_dout2.view(batch_size, -1).sum(1)
     return reg
 
-def pad_along_axis(array: np.ndarray, target_length: int, axis: int = 0) -> np.ndarray:
 
+def pad_along_axis(array: np.ndarray, target_length: int, axis: int = 0) -> np.ndarray:
     pad_size = target_length - array.shape[axis]
 
     if pad_size <= 0:
@@ -469,6 +461,7 @@ def pad_along_axis(array: np.ndarray, target_length: int, axis: int = 0) -> np.n
     npad[axis] = (0, pad_size)
 
     return np.pad(array, pad_width=npad, mode='constant', constant_values=0)
+
 
 class RCGAN:
     """RCGAN Class
@@ -499,14 +492,14 @@ class RCGAN:
         self.device = device
         self.checkpoint_dir = checkpoint_dir
 
-        #B, T, D
+        # B, T, D
         # initiate models
         # calculate variables
         # TODO: what do we need sequence length for?
-        self.sequence_length = train_loader.dataset.tensors[1].shape[1],
+        self.sequence_length = train_loader.wm_image_replay_buffer.tensors[1].shape[1],
         self.noise_dim = noise_dim
-        self.attribute_size = train_loader.dataset.tensors[0].shape[-1]
-        num_features = train_loader.dataset.tensors[1].shape[-1]
+        self.attribute_size = train_loader.wm_image_replay_buffer.tensors[0].shape[-1]
+        num_features = train_loader.wm_image_replay_buffer.tensors[1].shape[-1]
 
         self.generator = RGANGenerator(sequence_length=self.sequence_length[0],
                                        output_size=num_features,
@@ -541,27 +534,26 @@ class RCGAN:
         self.config_logger.info("Sequence Length: {0}".format(self.sequence_length))
 
     def wgan_gp_reg(self, x_real, x_fake, center=1., lambda_gp=10.0):
-        #eps = torch.rand(batch_size, device=x_real.device).view(batch_size, 1, 1)
+        # eps = torch.rand(batch_size, device=x_real.device).view(batch_size, 1, 1)
         batch_size = x_real.shape[0]
         eps = torch.rand(batch_size, 1, 1).to(self.device)
         eps = eps.expand_as(x_real)
-        #eps = torch.randn_like(x_real).to(self.device)
+        # eps = torch.randn_like(x_real).to(self.device)
         x_interp = eps * x_real + (1 - eps) * x_fake
         x_interp = x_interp.detach()
         x_interp.requires_grad_()
         d_out = self.discriminator(x_interp)
 
-        gradients = torch.autograd.grad(inputs =x_interp,
-                                       outputs =d_out,
-                                       grad_outputs=torch.ones_like(d_out,requires_grad=False, device=self.device),
-                                       create_graph=True,
-                                       retain_graph=True,
-                                       )[0]
+        gradients = torch.autograd.grad(inputs=x_interp,
+                                        outputs=d_out,
+                                        grad_outputs=torch.ones_like(d_out, requires_grad=False, device=self.device),
+                                        create_graph=True,
+                                        retain_graph=True,
+                                        )[0]
 
         gradients = gradients.view(gradients.size(), -1)
         gradient_penalty = (((gradients + 1e-16).norm(2, dim=1) - center) ** 2).mean() * lambda_gp
         return gradient_penalty
-
 
     def save(self, epoch):
         if not os.path.exists("{0}/epoch_{1}".format(self.checkpoint_dir, epoch)):
@@ -582,18 +574,20 @@ class RCGAN:
             model_dir = "{0}/epoch_{1}".format(self.checkpoint_dir, epoch)
         batch_size = self.batch_size
 
-        while self.real_train_dl.dataset.tensors[0].shape[0] % batch_size != 0:
+        while self.real_train_dl.wm_image_replay_buffer.tensors[0].shape[0] % batch_size != 0:
             batch_size -= 1
-        rounds = self.real_train_dl.dataset.tensors[0].shape[0] // batch_size
-        sampled_features = np.zeros((0, self.real_train_dl.dataset.tensors[1].shape[1], self.real_train_dl.dataset.tensors[1].shape[-1] - 2))
-        sampled_attributes = np.zeros((0, self.real_train_dl.dataset.tensors[1].shape[1], self.real_train_dl.dataset.tensors[0].shape[-1]))
-        sampled_gen_flags = np.zeros((0, self.real_train_dl.dataset.tensors[1].shape[1]))
+        rounds = self.real_train_dl.wm_image_replay_buffer.tensors[0].shape[0] // batch_size
+        sampled_features = np.zeros(
+            (0, self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[1], self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[-1] - 2))
+        sampled_attributes = np.zeros(
+            (0, self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[1], self.real_train_dl.wm_image_replay_buffer.tensors[0].shape[-1]))
+        sampled_gen_flags = np.zeros((0, self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[1]))
         sampled_lengths = np.zeros(0)
         for i in range(rounds):
             features, attributes, gen_flags, lengths = self.sample_from(batch_size=batch_size)
-            target_length = self.real_train_dl.dataset.tensors[1].shape[1]
-            features  = pad_along_axis(features, target_length, axis = 1)
-            gen_flags = pad_along_axis(gen_flags, target_length, axis = 1)
+            target_length = self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[1]
+            features = pad_along_axis(features, target_length, axis=1)
+            gen_flags = pad_along_axis(gen_flags, target_length, axis=1)
             sampled_features = np.concatenate((sampled_features, features), axis=0)
             sampled_attributes = np.concatenate((sampled_attributes, attributes), axis=0)
             sampled_gen_flags = np.concatenate((sampled_gen_flags, gen_flags), axis=0)
@@ -640,7 +634,7 @@ class RCGAN:
             for batch_idx, (data_attribute, data_feature) in enumerate(self.real_train_dl):
                 data_attribute = data_attribute.to(self.device)
                 input_feature = data_feature.to(self.device)
-                out_real = input_feature ###
+                out_real = input_feature  ###
                 batch_size = data_attribute.shape[0]
                 ### Train Discriminator: max log(D(x)) + log(1 - D(G(z)))
                 noise = gen_noise((batch_size, self.sequence_length[0], self.noise_dim)).to(self.device)
@@ -648,24 +642,25 @@ class RCGAN:
                 input_feature = torch.cat((data_attribute, input_feature), dim=2)
                 fake = self.generator(noise)
 
-                out_fake = fake.clone()###
+                out_fake = fake.clone()  ###
 
-                x = out_fake.permute(0,2,1)
+                x = out_fake.permute(0, 2, 1)
                 padded = nn.ConstantPad1d((0, input_feature.shape[1] - fake.shape[1]), 0)(x)
-                x = padded.permute(0,2,1)
+                x = padded.permute(0, 2, 1)
                 mmd.append(calculate_mmd_rbf(torch.mean(x, dim=0).detach().cpu().numpy(),
                                              torch.mean(data_feature, dim=0).detach().cpu().numpy()))
                 fake = torch.cat((data_attribute, x), dim=2)
 
-                length_real =  torch.LongTensor([torch.max((input_feature[i,:,0]!=0).nonzero()).item()+1 for i in range(input_feature.shape[0])])
-                max_seq=torch.max(length_real)
+                length_real = torch.LongTensor([torch.max((input_feature[i, :, 0] != 0).nonzero()).item() + 1 for i in
+                                                range(input_feature.shape[0])])
+                max_seq = torch.max(length_real)
 
                 output_real = torch.cat((data_attribute, data_feature), dim=2)
 
                 disc_real = self.discriminator(input_feature, length_real)
 
                 disc_fake = self.discriminator(fake.to(self.device))
-                gradient_penalty= self.wgan_gp_reg(output_real.to(self.device), fake)
+                gradient_penalty = self.wgan_gp_reg(output_real.to(self.device), fake)
                 d_loss = -torch.mean(disc_real) + torch.mean(disc_fake) + gradient_penalty
                 self.discriminator.zero_grad()
                 self.generator.zero_grad()
@@ -677,7 +672,7 @@ class RCGAN:
                 total_samples += batch_size
                 epoch_loss += d_loss.item()
             epoch_loss = epoch_loss / total_samples
-            tqdm_descr = tqdm_train_descr_format.format( epoch_loss)
+            tqdm_descr = tqdm_train_descr_format.format(epoch_loss)
             tqdm_train_obj.set_description(tqdm_descr)
             avg_mmd.append(mean(mmd))
             self.time_logger.info('END OF EPOCH {0}'.format(epoch))
@@ -686,7 +681,8 @@ class RCGAN:
                 self.inference(epoch)
                 self.discriminator.train()
                 self.generator.train()
-                length =  torch.LongTensor([torch.max((output_real[i,:,0]!=0).nonzero()).item()+1 for i in range(output_real.shape[0])])
+                length = torch.LongTensor(
+                    [torch.max((output_real[i, :, 0] != 0).nonzero()).item() + 1 for i in range(output_real.shape[0])])
 
                 plot_summary(out_fake, out_real, max_lag=None)
                 plt.savefig('{}/summary_features_epoch_{}_RCGAN.png'.format(self.checkpoint_dir, epoch))
@@ -694,17 +690,17 @@ class RCGAN:
 
 
 if __name__ == "__main__":
-     # get saving path
+    # get saving path
     # get saving file names
-    gan_type ="RCGAN"
+    gan_type = "RCGAN"
     checkpoint_dir = os.getcwd() + '/sac/data/'
     time_logging_file = '{}/time.log'.format(checkpoint_dir)
     config_logging_file = '{}/config.log'.format(checkpoint_dir)
     checkpoint_dir = '{}/checkpoint'.format(checkpoint_dir)
     if not os.path.exists(checkpoint_dir):
-       os.makedirs(checkpoint_dir)
+        os.makedirs(checkpoint_dir)
     else:
-       pass
+        pass
     seed = 1234
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     train_ratio = 0.34
@@ -717,30 +713,30 @@ if __name__ == "__main__":
 
     # test is now 10% of the initial data set
     # validation is now 15% of the initial data set
-    x_val, x_test, y_val, y_test = train_test_split(x_test, y_test, test_size=test_ratio/(test_ratio + validation_ratio))
-    #scale the dataset
+    x_val, x_test, y_val, y_test = train_test_split(x_test, y_test,
+                                                    test_size=test_ratio / (test_ratio + validation_ratio))
+    # scale the wm_image_replay_buffer
 
     print(f" size of training input {x_train.shape}, test input {x_test.shape}, validation data size {x_val.shape}")
     print(f" training output {y_train.shape}, test output {y_test.shape}")
     if torch.cuda.is_available():
         x_train, y_train, x_test, y_test, x_val, y_val = x_train.cuda(), y_train.cuda(), x_test.cuda(), y_test.cuda(), x_val.cuda(), y_val.cuda()
 
-
-    save_frequency= 50
+    save_frequency = 50
     batch_size = 50
     train_dataset = TensorDataset(x_train, y_train)
-    #we don't shuffle because it is a time series data
-    train_loader = DataLoader(train_dataset, batch_size=batch_size , shuffle=True)
+    # we don't shuffle because it is a time series data
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     test_dataset = TensorDataset(x_test, y_test)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size , shuffle=True)
-    epoch =501
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
+    epoch = 501
 
     valid_dataset = TensorDataset(x_val, y_val)
-    valid_loader = DataLoader(valid_dataset, batch_size=1 , shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=True)
 
     trainer = RCGAN(train_loader, device=device, checkpoint_dir=checkpoint_dir,
-                         time_logging_file=time_logging_file, batch_size=batch_size,
-                         config_logging_file=config_logging_file)
-                         
+                    time_logging_file=time_logging_file, batch_size=batch_size,
+                    config_logging_file=config_logging_file)
+
     trainer.train(epochs=epoch, writer_frequency=1, saver_frequency=save_frequency)

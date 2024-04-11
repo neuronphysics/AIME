@@ -76,7 +76,7 @@ def train_eval_online(
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # Initialize dataset.
+    # Initialize wm_image_replay_buffer.
     train_data = Dataset(
         observation_spec,
         action_spec,
