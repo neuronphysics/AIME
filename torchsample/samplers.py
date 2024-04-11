@@ -6,7 +6,7 @@ class Sampler(object):
     """Base class for all Samplers.
 
     Every Sampler subclass has to provide an __iter__ method, providing a way
-    to iterate over indices of dataset elements, and a __len__ method that
+    to iterate over indices of wm_image_replay_buffer elements, and a __len__ method that
     returns the length of the returned iterators.
     """
 
@@ -69,7 +69,7 @@ class MultiSampler(Sampler):
 
         Arguments
         ---------
-        data_source : the dataset to sample from
+        data_source : the wm_image_replay_buffer to sample from
         
         desired_samples : number of samples per batch you want
             whatever the difference is between an even division will
@@ -114,7 +114,7 @@ class SequentialSampler(Sampler):
     """Samples elements sequentially, always in the same order.
 
     Arguments:
-        data_source (Dataset): dataset to sample from
+        data_source (Dataset): wm_image_replay_buffer to sample from
     """
 
     def __init__(self, nb_samples):
@@ -131,7 +131,7 @@ class RandomSampler(Sampler):
     """Samples elements randomly, without replacement.
 
     Arguments:
-        data_source (Dataset): dataset to sample from
+        data_source (Dataset): wm_image_replay_buffer to sample from
     """
 
     def __init__(self, nb_samples):

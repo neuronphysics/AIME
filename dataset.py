@@ -67,7 +67,7 @@ def scatter_update(tensor, indices, updates):
     return tensor
   
 class DatasetView(object):
-  """Interface for reading from dataset."""
+  """Interface for reading from wm_image_replay_buffer."""
 
   def __init__(self, dataset, indices):
     self._dataset = dataset
@@ -93,7 +93,7 @@ def save_copy(data, ckpt_name):
   torch.save(new_data, ckpt_name+".pt")
   
 class Dataset(nn.Module):
-  """Tensorflow module of dataset of transitions."""
+  """Tensorflow module of wm_image_replay_buffer of transitions."""
 
   def __init__(
       self,

@@ -9,26 +9,12 @@ from torch.distributions import transforms as tT
 from torch.distributions.transformed_distribution import TransformedDistribution
 from tensorboardX import SummaryWriter
 from torch.autograd import Variable
-import datetime
-import re
-from torch.testing._internal.common_utils import TestCase
-from torch.testing._internal.common_utils import run_tests
-from collections import Counter
 import collections
 import numpy as np
 import os
 import gin
-import gym
-import mujoco_py
-from absl import app
-from absl import flags
 from absl import logging
 import tensor_specs
-import time
-import alf_gym_wrapper
-import importlib
-from torch.testing._internal.common_utils import TestCase
-from collections import Counter
 import torch.distributions as pyd
 import math
 from torch.distributions import Distribution, Independent, MultivariateNormal

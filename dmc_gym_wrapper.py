@@ -18,7 +18,7 @@ Adapted and simplified from https://github.com/denisyarats/dmc2gym
 """
 
 from functools import partial
-
+from alf_gym_wrapper import tensor_spec_from_gym_space
 import gym
 from gym import spaces
 from gym.envs.registration import register
@@ -40,7 +40,7 @@ def _dmc_spec_to_box(spec):
 
     def extract_min_max(s):
         assert s.dtype == np.float64 or s.dtype == np.float32
-        dim = np.int(np.prod(s.shape))
+        dim = int(np.prod(s.shape))
         if type(s) == dm_env.specs.Array:
             bound = np.inf * np.ones(dim, dtype=np.float32)
             return -bound, bound
@@ -123,7 +123,7 @@ class DMCGYMWrapper(gym.core.Env):
         if from_pixels:
             shape = [3, height, width]
             self._observation_space = spaces.Box(
-                low=0, high=255, shape=shape, dtype=np.uint8)
+                low=0, high=1, shape=shape, dtype=np.float32)
         else:
             self._observation_space = _dmc_spec_to_box(
                 self._env.observation_spec().values())

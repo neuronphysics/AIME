@@ -1408,7 +1408,7 @@ dis_optim = torch.optim.Adam(discriminator.parameters(), lr = 0.5 * hyperParams[
 enc_scheduler = torch.optim.lr_scheduler.StepLR(enc_optim, step_size = 30, gamma = 0.5)
 dec_scheduler = torch.optim.lr_scheduler.StepLR(dec_optim, step_size = 30, gamma = 0.5)
 dis_scheduler = torch.optim.lr_scheduler.StepLR(dis_optim, step_size = 30, gamma = 0.5)
-#optimizer = optim.Adam(net.parameters(), lr=hyperParams["LEARNING_RATE"])
+#optimizer = optim.Adam(net.parameters(), lr=HYPER_PARAMETERS["LEARNING_RATE"])
 #W network (context-salient network)
 start_iter    = 1
 learning_rate = hyperParams["LEARNING_RATE"] * (hyperParams['Learning_rate_decay'] ** (start_iter // hyperParams['decay_step']))

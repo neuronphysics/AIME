@@ -247,7 +247,7 @@ class TransitDataset(torch.utils.data.Dataset):
 
     def __init__(self, states, actions, next_states):
         """
-        Custom PyTorch dataset that preprocess each transition dynamics.
+        Custom PyTorch wm_image_replay_buffer that preprocess each transition dynamics.
 
         """
         super(TransitDataset, self).__init__()

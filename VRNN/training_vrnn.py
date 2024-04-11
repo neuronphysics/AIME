@@ -344,11 +344,11 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
              'z_dim':modelstate.z_dim,
              'n_layers':modelstate.n_layers,
              'n_mixtures':modelstate.n_mixtures,
-             'dataset':'Hopper',
+             'wm_image_replay_buffer':'Hopper',
              'test_every':50,
              'showfig':'True',
              'savefig':'True',
-             'seq_len_train':loaders.dataset[0][-1].shape[-1],
+             'seq_len_train':loaders.wm_image_replay_buffer[0][-1].shape[-1],
              'batch_size':batch_size,
              'lr_scheduler_nepochs':5,
              'lr_scheduler_factor':10}
@@ -532,7 +532,7 @@ def main():
     # test is now 10% of the initial data set
     # validation is now 15% of the initial data set
     x_val, x_test, y_val, y_test = train_test_split(x_test, y_test, test_size=test_ratio/(test_ratio + validation_ratio))
-    #scale the dataset
+    #scale the wm_image_replay_buffer
 
     def seed_worker(worker_id):
         worker_seed = torch.initial_seed() % 2**32

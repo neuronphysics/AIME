@@ -70,7 +70,7 @@ class PolicyTest():
     
 
   def get_sample_counts(self, n, distr):
-    """Provides size of each sub-dataset based on desired distribution."""
+    """Provides size of each sub-wm_image_replay_buffer based on desired distribution."""
     distr = torch.tensor(distr)
     distr = distr / torch.sum(distr)
     counts = []
@@ -84,7 +84,7 @@ class PolicyTest():
 
 
   def collect_n_transitions(self, tf_env, policy, data, n, log_freq=10000):
-    """Adds desired number of transitions to dataset. Transitions come from policy"""
+    """Adds desired number of transitions to wm_image_replay_buffer. Transitions come from policy"""
     collector = DataCollector(tf_env, policy, data)
     time_st = time.time()
     timed_at_step = 0
@@ -111,7 +111,7 @@ class PolicyTest():
       log_freq=int(1e4),
       n_eval_episodes=20,
       ):
-    """Creates dataset of transitions based on desired policy config."""
+    """Creates wm_image_replay_buffer of transitions based on desired policy config."""
     print('Entered Collect Data')
     seed=0
     torch.manual_seed(seed)
@@ -122,7 +122,7 @@ class PolicyTest():
     action_spec = env.action_spec()
     
 
-    # Initialize dataset.
+    # Initialize wm_image_replay_buffer.
     # sample_sizes = list([cfg[-1] for cfg in data_config])
     sample_sizes = [2,2,2]
     sample_sizes = self.get_sample_counts(n_samples, sample_sizes)
@@ -147,7 +147,7 @@ class PolicyTest():
       logging.info('Collecting data from policy %s...', policy_name)
       self.collect_n_transitions(env, policy, data, n_transitions, log_freq)
 
-    # Save final dataset.
+    # Save final wm_image_replay_buffer.
     data_ckpt_name = os.path.join(log_dir, 'data')
     torch.save(data,data_ckpt_name)
     time_cost = time.time() - time_st

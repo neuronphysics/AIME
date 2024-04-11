@@ -5,20 +5,24 @@
 import abc
 import json
 import wavio
+import math
 from pathlib import Path
 import torch
 import torch.nn as nn
 import numpy as np
 from tempfile import TemporaryDirectory
 from typing import Any, Optional, Tuple, Union
+from VRNN.JIT_GRU import JitGRU
 REQUIRED_RATE = 48_000
 __version__ = "0.4.0"
+
+
 def np_to_wav(
-    x: np.ndarray,
-    filename: Union[str, Path],
-    rate: int = 48_000,
-    sampwidth: int = 3,
-    scale="none",
+        x: np.ndarray,
+        filename: Union[str, Path],
+        rate: int = 48_000,
+        sampwidth: int = 3,
+        scale="none",
 ):
     wavio.write(
         str(filename),
@@ -37,6 +41,7 @@ class InitializableFromConfig(object):
     @classmethod
     def parse_config(cls, config):
         return config
+
 
 class Exportable(abc.ABC):
     """
@@ -106,6 +111,7 @@ class Exportable(abc.ABC):
         Flatten the weights out to a 1D array
         """
         pass
+
 
 class _Base(nn.Module, InitializableFromConfig, Exportable):
     @abc.abstractproperty
@@ -180,11 +186,13 @@ class BaseNet(_Base):
         """
         pass
 
+
 class _L(nn.LSTM):
     """
     Tweaks to LSTM
     * Up the remembering
     """
+
     def reset_parameters(self) -> None:
         super().reset_parameters()
         # https://danijar.com/tips-for-training-recurrent-neural-networks/
@@ -204,14 +212,13 @@ class _L(nn.LSTM):
                 ] += value
 
 
-
 class LSTMCore(_L):
     def __init__(
-        self,
-        *args,
-        train_burn_in: Optional[int] = None,
-        train_truncate: Optional[int] = None,
-        **kwargs
+            self,
+            *args,
+            train_burn_in: Optional[int] = None,
+            train_truncate: Optional[int] = None,
+            **kwargs
     ):
         super().__init__(*args, **kwargs)
         if not self.batch_first:
@@ -242,8 +249,8 @@ class LSTMCore(_L):
             output_features, hidden_state = super().forward(x, last_hidden_state)
         else:
             output_features_list = []
-            h_state_list    = []
-            c_state_list    = []
+            h_state_list = []
+            c_state_list = []
             if self._train_burn_in is not None:
                 last_output_features, last_hidden_state = super().forward(
                     x[:, : self._train_burn_in, :], last_hidden_state
@@ -258,7 +265,7 @@ class LSTMCore(_L):
                     # Don't detach the burn-in state so that we can learn it.
                     last_hidden_state = tuple(z.detach() for z in last_hidden_state)
                 last_output_features, last_hidden_state = super().forward(
-                    x[:, i : i + self._train_truncate, :,],
+                    x[:, i: i + self._train_truncate, :, ],
                     last_hidden_state,
                 )
                 output_features_list.append(last_output_features)
@@ -269,7 +276,7 @@ class LSTMCore(_L):
 
             h = torch.cat(h_state_list, dim=1)
             c = torch.cat(c_state_list, dim=1)
-            hidden_state = (h,c)
+            hidden_state = (h, c)
         return output_features, hidden_state
 
     def _initial_state(self, n: Optional[int]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -285,12 +292,12 @@ class LSTM(BaseNet):
     """
 
     def __init__(
-        self,
-        hidden_size,
-        train_burn_in: Optional[int] = None,
-        train_truncate: Optional[int] = None,
-        input_size: int = 1,
-        **lstm_kwargs,
+            self,
+            hidden_size,
+            train_burn_in: Optional[int] = None,
+            train_truncate: Optional[int] = None,
+            input_size: int = 1,
+            **lstm_kwargs,
     ):
         """
         :param hidden_size: for LSTM
@@ -367,7 +374,7 @@ class LSTM(BaseNet):
         :return: (B,L)
         """
         last_hidden_state = self._initial_state(len(x))
-        if x.ndim==2:
+        if x.ndim == 2:
             x = x[:, :, None]
         if not self.training or self._train_truncate is None:
             output_features = self._core(x, last_hidden_state)[0]
@@ -384,7 +391,7 @@ class LSTM(BaseNet):
                     # Don't detach the burn-in state so that we can learn it.
                     last_hidden_state = tuple(z.detach() for z in last_hidden_state)
                 last_output_features, last_hidden_state = self._core(
-                    x[:, i : i + self._train_truncate, :,],
+                    x[:, i: i + self._train_truncate, :, ],
                     last_hidden_state,
                 )
                 output_features_list.append(last_output_features)
@@ -392,7 +399,7 @@ class LSTM(BaseNet):
         return self._head(output_features)[:, :, 0]
 
     def _export_cell_weights(
-        self, i: int, hidden_state: torch.Tensor, cell_state: torch.Tensor
+            self, i: int, hidden_state: torch.Tensor, cell_state: torch.Tensor
     ) -> np.ndarray:
         """
         * weight matrix (xh -> ifco)

@@ -327,15 +327,15 @@ class ModuleTrainer(object):
         """
         self.model.train(mode=True)
         # ----------------------------------------------------------------------
-        num_inputs = loader.dataset.num_inputs
+        num_inputs = loader.wm_image_replay_buffer.num_inputs
         print(num_inputs)
-        num_targets = loader.dataset.num_targets
-        len_inputs = len(loader.sampler) if loader.sampler else len(loader.dataset)
+        num_targets = loader.wm_image_replay_buffer.num_targets
+        len_inputs = len(loader.sampler) if loader.sampler else len(loader.wm_image_replay_buffer)
         batch_size = loader.batch_size
 
         if val_loader is not None:
-            num_val_inputs = val_loader.dataset.num_inputs
-            num_val_targets = val_loader.dataset.num_targets
+            num_val_inputs = val_loader.wm_image_replay_buffer.num_inputs
+            num_val_targets = val_loader.wm_image_replay_buffer.num_targets
             if (num_inputs != num_val_inputs) or (num_targets != num_val_targets):
                 raise ValueError('num_inputs != num_val_inputs or num_targets != num_val_targets')
         has_val_data = val_loader is not None
@@ -477,7 +477,7 @@ class ModuleTrainer(object):
         # --------------------------------------------------------
         num_inputs, num_targets = _parse_num_inputs_and_targets_from_loader(loader)
         batch_size = loader.batch_size
-        len_inputs = len(loader.sampler) if loader.sampler else len(loader.dataset)
+        len_inputs = len(loader.sampler) if loader.sampler else len(loader.wm_image_replay_buffer)
         num_batches = int(math.ceil(len_inputs / batch_size))
         # --------------------------------------------------------
 
@@ -585,7 +585,7 @@ class ModuleTrainer(object):
         self.model.train(mode=False)
         num_inputs, num_targets = _parse_num_inputs_and_targets_from_loader(loader)
         batch_size = loader.batch_size
-        len_inputs = len(loader.sampler) if loader.sampler else len(loader.dataset) 
+        len_inputs = len(loader.sampler) if loader.sampler else len(loader.wm_image_replay_buffer)
         num_batches = int(math.ceil(len_inputs / batch_size))
 
         evaluate_helper = _get_helper(self, num_inputs, num_targets)

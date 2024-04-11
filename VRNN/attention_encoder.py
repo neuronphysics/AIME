@@ -1,10 +1,8 @@
 import torch
 import torch.nn as nn
 from .Blocks import BatchMLP, LSTMBlock
-from typing import Optional
 import torch.nn.functional as F
 import numpy as np
-from torch.autograd import Variable, Function
 import math
 from torch.cuda.amp import custom_fwd, custom_bwd
 from typing import Dict, List, Optional, Tuple
