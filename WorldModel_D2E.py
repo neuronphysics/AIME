@@ -790,7 +790,8 @@ def main(config):
         discount=data['discount'],
         done=data['done']))
 
-    task_behavior_reply_buffer = DC.Dataset(observation_spec=latent_space, action_spec=act_space, size=config.length,
+    task_behavior_reply_buffer = DC.Dataset(observation_spec=latent_space, action_spec=act_space,
+                                            size=config.policy_reply_buffer_size,
                                             group_size=config.sequence_size)
     task_behavior_reply_buffer.current_size += config.batch_size
 
@@ -811,7 +812,7 @@ def main(config):
     else:
         print("Pretrain agent.")
         num_batch = config.length // config.batch_size
-        for ep in range(config.pretrain):
+        for ep in range(config.num_epoch):
             for i in range(num_batch - 1):
                 train_agent(full_train_dataset.get_batch(np.arange(i * config.batch_size, (i + 1) * config.batch_size)))
 
@@ -859,12 +860,13 @@ def parse_args():
     parser.add_argument('--log_every', type=int, default=1e4, help='print train info frequency')
     parser.add_argument('--train_every', type=int, default=5, help='frequency of training')
     parser.add_argument('--train_steps', type=int, default=1, help='frequency of training')
-    parser.add_argument("--prefill", type=int, default=2000)
+    parser.add_argument("--prefill", type=int, default=50000, help="generate prefill / 500 num of episodes")
     parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
     parser.add_argument('--batch', type=int, default=2, help='Batch size')
-    parser.add_argument('--length', type=int, default=100, help='length of ...')
+    parser.add_argument('--length', type=int, default=5000, help='num of sequence length chunk')
+    parser.add_argument('--policy_reply_buffer_size', type=int, default=10000, help='length of policy reply buffer')
     parser.add_argument('--sequence_size', type=int, default=15, help='n step size')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
     parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....')
     parser.add_argument("--max_episode_steps", type=int, default=1e3, help='an episode corresponds to 1000 steps')
     parser.add_argument("--envs", type=int, default=1, help='should be updated??')
@@ -878,8 +880,8 @@ def parse_args():
     parser.add_argument('--task', type=str, default="dmc_cheetah_run", help="name of the environment")
     parser.add_argument('--sequence_length', type=int, default=100, help="the length of an episode")
     parser.add_argument('--model_params', type=tuple, default=(200, 200), help='number of layers in the actor network')
-    parser.add_argument('--load_prefill', type=int, default=1, help='use exist prefill or not')
-    parser.add_argument('--pretrain', type=int, default=10, help='number of pretraining epochs')
+    parser.add_argument('--load_prefill', type=int, default=0, help='use exist prefill or not')
+    parser.add_argument('--num_epoch', type=int, default=10000, help='number of pretraining epochs')
     args, unknown = parser.parse_known_args()
     return args
 
