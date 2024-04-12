@@ -47,7 +47,7 @@ HYPER_PARAMETERS = {"batch_size": 240,
                     "hidden_transit": 100,
                     "LAMBDA_GP": 10,  # hyperparameter for WAE with gradient penalty
                     "LEARNING_RATE": 2e-4,
-                    "CRITIC_ITERATIONS": 1,  # TODO change it back to 5
+                    "CRITIC_ITERATIONS": 5,
                     "GAMMA": 0.99,
                     "PREDICT_DONE": False,
                     "seed": 1234,
@@ -523,30 +523,6 @@ class D2EAlgorithm(nn.Module):
             self._task_behavior._transit_discriminator.parameters()
         )
 
-    def policy(self, observation, next_observation, reward, done, state=None, mode="train"):
-        obs = self.wm.preprocess(observation, next_observation, reward, done)
-        self.tfstep.copy_(torch.tensor([int(self.step)])[0])
-
-        embed = self.wm.encoder(obs["observation"])
-        next_embed = self.wm.encoder(obs["next_observation"])
-        sample = (mode == "train") or not self.eval_state_mean
-
-        latent, _, _, _ = self.wm.transition_model.generate(
-            torch.cat([embed, action], dim=1),
-            seq_len=embed.shape[-1]
-        )
-        policy_state = latent.copy()
-        if mode == "eval":
-            a_tanh_mode, action, log_pi_a = self._task_behavior._p_fn(policy_state)
-            noise = self.parameter.eval_noise
-        elif mode in ["explore", "train"]:
-            action = self._expl_behavior._p_fn(policy_state)[1]
-            noise = self.parameter.expl_noise
-        action = action_noise(action, noise, self.act_space)
-        outputs = {"action": action}
-        state = (latent, next_embed)
-        return outputs, state
-
     def train_(self, data, state=None):
         """
         List of operations happen here in this module 
@@ -815,6 +791,8 @@ def main(config):
         for ep in range(config.num_epoch):
             for i in range(num_batch - 1):
                 train_agent(full_train_dataset.get_batch(np.arange(i * config.batch_size, (i + 1) * config.batch_size)))
+            if ep % 50 == 0:
+                torch.save(model.state_dict(), logdir / "model.pt")
 
     def train_policy(*args):
         return model.policy(*args, mode="explore" if should_expl(step) else "train")
