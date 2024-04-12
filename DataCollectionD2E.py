@@ -252,7 +252,7 @@ class Dataset(data.Dataset):
 
 
 #########################
-# utils.py
+# utils_VAE.py
 def shuffle_indices_with_steps(n, steps=1, rand=None):
     """Randomly shuffling indices while keeping segments."""
     if steps == 0:

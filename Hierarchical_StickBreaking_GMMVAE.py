@@ -17,7 +17,7 @@ try:
     import PIL.Image as Image
 except ImportError:
     import Image
-from utils import AverageMeter, ResidualBlock, LinearResidual, ResidualBlock_deconv, LayerNorm2d, CustomLinear
+from utils_VAE import AverageMeter, ResidualBlock, LinearResidual, ResidualBlock_deconv, LayerNorm2d, CustomLinear
 from torch import nn, optim
 from torchvision.utils import save_image, make_grid
 import torch.utils.data.dataloader as DataLoader

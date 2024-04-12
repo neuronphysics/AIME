@@ -2,13 +2,15 @@ import math
 import torch.nn.functional as F
 import torch
 from torch.optim import Optimizer
-import torch.nn as nn 
+import torch.nn as nn
 import numpy as np
 from torch.nn import init
 import torchvision
 
+
 class AverageMeter(object):
     """Computes and stores the average and current value"""
+
     def __init__(self):
         self.reset()
 
@@ -89,12 +91,12 @@ def tile_raster_images(X, img_shape, tile_shape, tile_spacing=(0, 0),
         # Create an output numpy ndarray to store the image
         if output_pixel_vals:
             out_array = np.zeros((out_shape[0], out_shape[1], 4),
-                                    dtype='uint8')
+                                 dtype='uint8')
         else:
             out_array = np.zeros((out_shape[0], out_shape[1], 4),
-                                    dtype=X.dtype)
+                                 dtype=X.dtype)
 
-        #colors default to 0, alpha defaults to 1 (opaque)
+        # colors default to 0, alpha defaults to 1 (opaque)
         if output_pixel_vals:
             channel_defaults = [0, 0, 0, 255]
         else:
@@ -148,12 +150,13 @@ def tile_raster_images(X, img_shape, tile_shape, tile_spacing=(0, 0),
                     if output_pixel_vals:
                         c = 255
                     out_array[
-                        tile_row * (H + Hs): tile_row * (H + Hs) + H,
-                        tile_col * (W + Ws): tile_col * (W + Ws) + W
+                    tile_row * (H + Hs): tile_row * (H + Hs) + H,
+                    tile_col * (W + Ws): tile_col * (W + Ws) + W
                     ] = this_img * c
         return out_array
 
-def PositionalEncoding2d(d_model,height,width):
+
+def PositionalEncoding2d(d_model, height, width):
     """
     Generate a 2D positional Encoding
     :param d_model: dimension of the model
@@ -161,130 +164,133 @@ def PositionalEncoding2d(d_model,height,width):
     :param width: width of the positions
     :return: d_model*height*width position matrix
     """
-    #https://github.com/wzlxjtu/PositionalEncoding2D/blob/master/positionalembedding2d.py
-    device      = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    if d_model%4!=0:
+    # https://github.com/wzlxjtu/PositionalEncoding2D/blob/master/positionalembedding2d.py
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    if d_model % 4 != 0:
         raise ValueError("Cannot use sin/cos positional encoding with "
                          "odd dimension (got dim={:d})".format(d_model))
-    height=int(height)
-    width=int(width)
-    pe = torch.zeros((d_model,height,width)).to(device)
+    height = int(height)
+    width = int(width)
+    pe = torch.zeros((d_model, height, width)).to(device)
     # Each dimension use half of d_model
-    d_model=int(d_model/2)
-    div_term=torch.exp(torch.arange(0.,d_model,2)*(-(math.log(10000.0)/d_model)))
-    pos_w=torch.arange(0.,width).unsqueeze(1)
-    pos_h=torch.arange(0.,height).unsqueeze(1)
-    pe[0:d_model:2,:,:]=torch.sin(pos_w * div_term).transpose(0,1).unsqueeze(1).repeat(1,height,1)
-    pe[1:d_model:2,:,:]=torch.cos(pos_w*div_term).transpose(0,1).unsqueeze(1).repeat(1,height,1)
-    pe[d_model::2,:,:]=torch.sin(pos_h * div_term).transpose(0,1).unsqueeze(2).repeat(1,1,width)
-    pe[d_model+1::2,:,:] = torch.cos(pos_h*div_term).transpose(0,1).unsqueeze(2).repeat(1,1,width)
-    pe=torch.reshape(pe,(1,d_model*2,height,width))
+    d_model = int(d_model / 2)
+    div_term = torch.exp(torch.arange(0., d_model, 2) * (-(math.log(10000.0) / d_model)))
+    pos_w = torch.arange(0., width).unsqueeze(1)
+    pos_h = torch.arange(0., height).unsqueeze(1)
+    pe[0:d_model:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[1:d_model:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[d_model::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+    pe[d_model + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+    pe = torch.reshape(pe, (1, d_model * 2, height, width))
     return pe
 
 
 class DoubleConv(nn.Module):
-    def __init__(self,in_channels, out_channels):
+    def __init__(self, in_channels, out_channels):
         super(DoubleConv, self).__init__()
-        self.conv=nn.Sequential(
-            nn.Conv2d(in_channels, out_channels,kernel_size=3, stride=1, padding=1, bias=False),
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels,kernel_size=3, stride=1, padding=1, bias=False),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
-            )
-    def forward(self,x):
+        )
+
+    def forward(self, x):
         return self.conv(x)
 
+
 class CrossAxialAttention(nn.Module):
-    #inspired by this code https://github.com/aL3x-O-o-Hung/TransformerForUltrasoundNeedleTracking/blob/c3fc204076a250a901628a5ca87c235fe969a253/network.py#L274
-    def __init__(self,d1,h1,w1,d2,h2,w2):
-        super(CrossAxialAttention,self).__init__()
-        self.d1           = d1
-        self.h1           = h1
-        self.w1           = w1
-        self.d2           = d2
-        self.h2           = h2//2
-        self.w2           = w2//2
-        self.pe1_h        = PositionalEncoding2d(d1,self.h2,1)
-        self.pe2_h        = PositionalEncoding2d(d2,self.h2,1)
-        self.pe1_w        = PositionalEncoding2d(d1,1,self.w2)
-        self.pe2_w        = PositionalEncoding2d(d2,1,self.w2)
-        #X:[20, 1024, 18, 24], context: [20, 100, 4, 4]
-        self.query_conv_h = nn.Conv2d(in_channels=d1,out_channels=d1,kernel_size=1,bias=False) #x
-        self.key_conv_h   = nn.Conv2d(in_channels=d2,out_channels=d2,kernel_size=1,bias=False) #context
-        self.value_conv_h = nn.Conv2d(in_channels=d2,out_channels=d2,kernel_size=1,bias=False) #context
-        self.query_conv_w = nn.Conv2d(in_channels=d1,out_channels=d1,kernel_size=1,bias=False) #x
-        self.key_conv_w   = nn.Conv2d(in_channels=d2,out_channels=d2,kernel_size=1,bias=False) #context
-        self.value_conv_w = nn.Conv2d(in_channels=d2,out_channels=d2,kernel_size=1,bias=False) #context
-        self.softmax_h    = nn.Softmax(dim=-1)
-        self.softmax_w    = nn.Softmax(dim=-1)
-        self.conv         = []
-        self.conv.append(nn.Conv2d(in_channels=d1,out_channels=d2,kernel_size=1))
-        self.conv.append(nn.BatchNorm2d(d2,eps=1e-05,momentum=0.1,affine=True,track_running_stats=True))
+    # inspired by this code https://github.com/aL3x-O-o-Hung/TransformerForUltrasoundNeedleTracking/blob/c3fc204076a250a901628a5ca87c235fe969a253/network.py#L274
+    def __init__(self, d1, h1, w1, d2, h2, w2):
+        super(CrossAxialAttention, self).__init__()
+        self.d1 = d1
+        self.h1 = h1
+        self.w1 = w1
+        self.d2 = d2
+        self.h2 = h2 // 2
+        self.w2 = w2 // 2
+        self.pe1_h = PositionalEncoding2d(d1, self.h2, 1)
+        self.pe2_h = PositionalEncoding2d(d2, self.h2, 1)
+        self.pe1_w = PositionalEncoding2d(d1, 1, self.w2)
+        self.pe2_w = PositionalEncoding2d(d2, 1, self.w2)
+        # X:[20, 1024, 18, 24], context: [20, 100, 4, 4]
+        self.query_conv_h = nn.Conv2d(in_channels=d1, out_channels=d1, kernel_size=1, bias=False)  # x
+        self.key_conv_h = nn.Conv2d(in_channels=d2, out_channels=d2, kernel_size=1, bias=False)  # context
+        self.value_conv_h = nn.Conv2d(in_channels=d2, out_channels=d2, kernel_size=1, bias=False)  # context
+        self.query_conv_w = nn.Conv2d(in_channels=d1, out_channels=d1, kernel_size=1, bias=False)  # x
+        self.key_conv_w = nn.Conv2d(in_channels=d2, out_channels=d2, kernel_size=1, bias=False)  # context
+        self.value_conv_w = nn.Conv2d(in_channels=d2, out_channels=d2, kernel_size=1, bias=False)  # context
+        self.softmax_h = nn.Softmax(dim=-1)
+        self.softmax_w = nn.Softmax(dim=-1)
+        self.conv = []
+        self.conv.append(nn.Conv2d(in_channels=d1, out_channels=d2, kernel_size=1))
+        self.conv.append(nn.BatchNorm2d(d2, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True))
         self.conv.append(nn.Sigmoid())
-        #self.conv.append(nn.UpsamplingBilinear2d(scale_factor=2))
-        self.conv         = nn.Sequential(*self.conv)
-        self.upsample     = torch.nn.UpsamplingNearest2d(size=(self.h2,self.w2))
-        self.upsample_x   = torch.nn.UpsamplingBilinear2d(size=(h2,w2))
-        self.pool         = nn.MaxPool2d(kernel_size=(2,2),stride=2)
-        self.device       = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        # self.conv.append(nn.UpsamplingBilinear2d(scale_factor=2))
+        self.conv = nn.Sequential(*self.conv)
+        self.upsample = torch.nn.UpsamplingNearest2d(size=(self.h2, self.w2))
+        self.upsample_x = torch.nn.UpsamplingBilinear2d(size=(h2, w2))
+        self.pool = nn.MaxPool2d(kernel_size=(2, 2), stride=2)
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.to(device=self.device)
 
-    def forward(self,context, x):
-        x         = x.to(self.device)
-        context   = context.to(self.device)
-        attentions= []
-        x_        = self.pool(x)
-        #change the height and weight of the context to the size of x_
-        context_  = self.upsample(context)
-        batch_size1,C1,height1,width1=x_.size()
-        batch_size2,C2,height2,width2=context_.size()
-        x_        = x_.permute(0,3,1,2).contiguous().view(-1,C1,height1,1)
-        context_  = context_.permute(0,3,1,2).contiguous().view(-1,C2,height2,1)
-        context_  = self.pe1_h + context_
-        x_        = self.pe2_h + x_  
-        
-        batch_size1_,C1_,height1_,width1_=x_.size()
-        batch_size2_,C2_,height2_,width2_=context_.size()
-        q         = self.query_conv_h(context_).view(batch_size2_,-1,height2_*width2_)
-        k         = self.key_conv_h(x_).view(batch_size1_,-1,height1_*width1_)
-        v         = self.value_conv_h(x_).view(batch_size1_,-1,height1_*width1_)
-        
-        energy    = torch.einsum('bid,bjd->bij', q, k)
+    def forward(self, context, x):
+        x = x.to(self.device)
+        context = context.to(self.device)
+        attentions = []
+        x_ = self.pool(x)
+        # change the height and weight of the context to the size of x_
+        context_ = self.upsample(context)
+        batch_size1, C1, height1, width1 = x_.size()
+        batch_size2, C2, height2, width2 = context_.size()
+        x_ = x_.permute(0, 3, 1, 2).contiguous().view(-1, C1, height1, 1)
+        context_ = context_.permute(0, 3, 1, 2).contiguous().view(-1, C2, height2, 1)
+        context_ = self.pe1_h + context_
+        x_ = self.pe2_h + x_
+
+        batch_size1_, C1_, height1_, width1_ = x_.size()
+        batch_size2_, C2_, height2_, width2_ = context_.size()
+        q = self.query_conv_h(context_).view(batch_size2_, -1, height2_ * width2_)
+        k = self.key_conv_h(x_).view(batch_size1_, -1, height1_ * width1_)
+        v = self.value_conv_h(x_).view(batch_size1_, -1, height1_ * width1_)
+
+        energy = torch.einsum('bid,bjd->bij', q, k)
         attention = self.softmax_h(energy)
         attentions.append(attention)
-        out       = torch.einsum('bjd,bij->bid', v, attention)
-        
-        out       = out.view(batch_size1_,C2_,height1_,width1_)
-        
-        out       = out.squeeze().view(batch_size1,width1,C2,height1).permute(0,2,3,1)
-        x_        = x_.squeeze().view(batch_size1,width1,C1,height1).permute(0,2,3,1)
-        #torch.Size([20, 12, 1024, 9])
-        context_  = out
-        #context_ = context_.permute(0,2,1,3).contiguous().view(-1,C2,1,width2_)
-        context_  = self.pe1_w + context_
-        x_        = self.pe2_w + x_
-        batch_size1_,C1_,height1_,width1_=x_.size()
-        batch_size2_,C2_,height2_,width2_=context_.size()
-        q         = self.query_conv_w(context_).view(batch_size2_,-1,height2_*width2_)
-        k         = self.key_conv_w(x_).view(batch_size1_,-1,height1_*width1_)
-        v         = self.value_conv_w(x_).view(batch_size1_,-1,height1_*width1_)
-        
-        energy    = torch.einsum('bid,bjd->bij', q, k)
+        out = torch.einsum('bjd,bij->bid', v, attention)
+
+        out = out.view(batch_size1_, C2_, height1_, width1_)
+
+        out = out.squeeze().view(batch_size1, width1, C2, height1).permute(0, 2, 3, 1)
+        x_ = x_.squeeze().view(batch_size1, width1, C1, height1).permute(0, 2, 3, 1)
+        # torch.Size([20, 12, 1024, 9])
+        context_ = out
+        # context_ = context_.permute(0,2,1,3).contiguous().view(-1,C2,1,width2_)
+        context_ = self.pe1_w + context_
+        x_ = self.pe2_w + x_
+        batch_size1_, C1_, height1_, width1_ = x_.size()
+        batch_size2_, C2_, height2_, width2_ = context_.size()
+        q = self.query_conv_w(context_).view(batch_size2_, -1, height2_ * width2_)
+        k = self.key_conv_w(x_).view(batch_size1_, -1, height1_ * width1_)
+        v = self.value_conv_w(x_).view(batch_size1_, -1, height1_ * width1_)
+
+        energy = torch.einsum('bid,bjd->bij', q, k)
         attention = self.softmax_w(energy)
         attentions.append(attention)
-        out       = torch.einsum('bjd,bij->bid', v, attention)
-        out       = out.view(batch_size1_,C2_,height1_,width1_)
-        
-        out       = out.squeeze().reshape(batch_size1,height1,C2,width1).permute(0,2,1,3)
-        x_        = x_.squeeze().reshape(batch_size1,height1,C1,width1).permute(0,2,1,3)
-        
-        out       = self.conv(out)
-        out       = self.upsample_x( out * x_ )
-        #if the input is:[20, 1024, 18, 24], context:[20, 100, 4, 4]
-        #out:[20, 1024, 18, 24], attention: [240, 100, 1024], x_:[20, 1024, 9, 12]
-        return out,attentions,x_
+        out = torch.einsum('bjd,bij->bid', v, attention)
+        out = out.view(batch_size1_, C2_, height1_, width1_)
+
+        out = out.squeeze().reshape(batch_size1, height1, C2, width1).permute(0, 2, 1, 3)
+        x_ = x_.squeeze().reshape(batch_size1, height1, C1, width1).permute(0, 2, 1, 3)
+
+        out = self.conv(out)
+        out = self.upsample_x(out * x_)
+        # if the input is:[20, 1024, 18, 24], context:[20, 100, 4, 4]
+        # out:[20, 1024, 18, 24], attention: [240, 100, 1024], x_:[20, 1024, 9, 12]
+        return out, attentions, x_
+
 
 class Expand(torch.nn.Module):
     def __init__(self, in_channels, e1_out_channles, e3_out_channles):
@@ -306,6 +312,7 @@ class Fire(torch.nn.Module):
       Eg.: input: ?xin_channelsx?x?
            output: ?x(e1x1+e3x3)x?x?
     """
+
     def __init__(self, in_channels, s1x1, e1x1, e3x3):
         super(Fire, self).__init__()
 
@@ -316,7 +323,6 @@ class Fire(torch.nn.Module):
         # expand
         self.expand = Expand(s1x1, e1x1, e3x3)
         self.ex_act = torch.nn.LeakyReLU(0.1)
-        
 
     def forward(self, x):
         x = self.sq_act(self.squeeze(x))
@@ -324,68 +330,70 @@ class Fire(torch.nn.Module):
         return x
 
 
-
 class SqueezeNet(torch.nn.Module):
     def __init__(self):
         super(SqueezeNet, self).__init__()
         self.net = torch.nn.Sequential(
-                torch.nn.Conv2d(in_channels=3, out_channels=96, kernel_size=(7, 7), stride=2),
-                torch.nn.ReLU(inplace=True),
-                torch.nn.MaxPool2d(kernel_size=(3, 3), stride=2),
-                torch.nn.ReLU(),
-                Fire(in_channels=96, s1x1=16, e1x1=64, e3x3=64),
-                Fire(in_channels=128, s1x1=16, e1x1=64, e3x3=64),
-                Fire(in_channels=128, s1x1=32, e1x1=128, e3x3=128),
-                torch.nn.MaxPool2d(kernel_size=(3, 3), stride=2),
-                Fire(in_channels=256, s1x1=32, e1x1=128, e3x3=128),
-                Fire(in_channels=256, s1x1=48, e1x1=192, e3x3=192),
-                Fire(in_channels=384, s1x1=48, e1x1=192, e3x3=192),
-                Fire(in_channels=384, s1x1=64, e1x1=256, e3x3=256),
-                torch.nn.MaxPool2d(kernel_size=(3, 3), stride=2, padding=1),
-                Fire(in_channels=512, s1x1=64, e1x1=256, e3x3=256),
-                )
+            torch.nn.Conv2d(in_channels=3, out_channels=96, kernel_size=(7, 7), stride=2),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.MaxPool2d(kernel_size=(3, 3), stride=2),
+            torch.nn.ReLU(),
+            Fire(in_channels=96, s1x1=16, e1x1=64, e3x3=64),
+            Fire(in_channels=128, s1x1=16, e1x1=64, e3x3=64),
+            Fire(in_channels=128, s1x1=32, e1x1=128, e3x3=128),
+            torch.nn.MaxPool2d(kernel_size=(3, 3), stride=2),
+            Fire(in_channels=256, s1x1=32, e1x1=128, e3x3=128),
+            Fire(in_channels=256, s1x1=48, e1x1=192, e3x3=192),
+            Fire(in_channels=384, s1x1=48, e1x1=192, e3x3=192),
+            Fire(in_channels=384, s1x1=64, e1x1=256, e3x3=256),
+            torch.nn.MaxPool2d(kernel_size=(3, 3), stride=2, padding=1),
+            Fire(in_channels=512, s1x1=64, e1x1=256, e3x3=256),
+        )
 
     def forward(self, x):
         out = self.net(x)
         return out.view(out.size(0), -1)
 
+
 class SqueezeUnetEncoder(nn.Module):
     def __init__(self, hidden_dim):
         super(SqueezeUnetEncoder, self).__init__()
-        
+
         self.seq = SqueezeNet()
         # print("Printing from Encoder")
         # print(self.seq)
         self.conv6 = nn.Conv2d(512, 1024, kernel_size=3, stride=1, padding=12, dilation=12)  # fc6 in paper
         self.conv7 = nn.Conv2d(1024, 1024, 3, 1, 1)  # fc7 in paper
         self.conv8 = DoubleConv(in_channels=1024, out_channels=hidden_dim)
+
     def forward(self, *input):
         x = input[0]
-        #original image size:[100, 3, 96, 96]
+        # original image size:[100, 3, 96, 96]
         # print(len(self.seq(x)))
         # conv1=self.seq[:2](x)
-        #[100, 96, 224, 224]
-        conv1 = F.adaptive_avg_pool2d(self.seq.net[:2](x),[224,224]).squeeze()
-        #[100, 128, 112, 112]
-        conv2 = F.adaptive_avg_pool2d(self.seq.net[2:6](conv1),[112,112]).squeeze()
-        #[100, 256, 56, 56]
+        # [100, 96, 224, 224]
+        conv1 = F.adaptive_avg_pool2d(self.seq.net[:2](x), [224, 224]).squeeze()
+        # [100, 128, 112, 112]
+        conv2 = F.adaptive_avg_pool2d(self.seq.net[2:6](conv1), [112, 112]).squeeze()
+        # [100, 256, 56, 56]
         # conv3 = self.seq[6:8](conv2)
-        conv3 = F.adaptive_avg_pool2d(self.seq.net[6:8](conv2),[56,56]).squeeze()
-        #[100, 256, 56, 56]
+        conv3 = F.adaptive_avg_pool2d(self.seq.net[6:8](conv2), [56, 56]).squeeze()
+        # [100, 256, 56, 56]
         # conv4 = self.seq[8:11](conv3)
-        conv4 = F.adaptive_avg_pool2d(self.seq.net[8:11](conv3),[28,28]).squeeze()
-        #[100, 384, 28, 28]
+        conv4 = F.adaptive_avg_pool2d(self.seq.net[8:11](conv3), [28, 28]).squeeze()
+        # [100, 384, 28, 28]
         # conv5= self.seq[11:](conv4)
         conv5 = F.adaptive_avg_pool2d(self.seq.net[11:](conv4), [28, 28]).squeeze()
-        #[100, 512, 28, 28]
+        # [100, 512, 28, 28]
         conv6 = self.conv6(conv5)
-        #[100, 1024, 28, 28]
+        # [100, 1024, 28, 28]
         conv7 = self.conv7(conv6)
-        #[100, 1024, 28, 28]
+        # [100, 1024, 28, 28]
         conv8 = self.conv8(conv7)
-        #[100, 64, 28, 28]
-        
+        # [100, 64, 28, 28]
+
         return conv1, conv2, conv3, conv4, conv5, conv7, conv8
+
 
 class UnetEncoder(nn.Module):
     def __init__(self, hidden_dim):
@@ -395,6 +403,7 @@ class UnetEncoder(nn.Module):
         self.conv6 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=12, dilation=12)  # fc6 in paper
         self.conv7 = nn.Conv2d(256, 256, 3, 1, 1)  # fc7 in paper
         self.conv8 = DoubleConv(in_channels=256, out_channels=hidden_dim)
+
     def forward(self, *input):
         x = input[0]
         conv1 = self.seq[:4](x)
@@ -406,7 +415,6 @@ class UnetEncoder(nn.Module):
         conv7 = self.conv7(conv6)
         conv8 = self.conv8(conv7)
         return conv1, conv2, conv3, conv4, conv5, conv7, conv8
-
 
 
 class DecoderCell(nn.Module):
@@ -429,7 +437,7 @@ class DecoderCell(nn.Module):
             self.conv3 = nn.Conv2d(out_channel, 1, kernel_size=1, padding=0)
         else:
             self.conv2 = nn.Conv2d(in_channel, 1, kernel_size=1, padding=0)
-        #print("in_channel", in_channel)
+        # print("in_channel", in_channel)
 
     def forward(self, *input):
         assert len(input) <= 2
@@ -439,19 +447,19 @@ class DecoderCell(nn.Module):
         else:
             en = input[0]
             dec = input[1]
-        
+
         if dec.size()[2] * 2 == en.size()[2]:
             dec = F.interpolate(dec, scale_factor=2, mode='bilinear', align_corners=True)
         elif dec.size()[2] != en.size()[2]:
             assert 0
-        #print("en", en.shape)
+        # print("en", en.shape)
         en = self.bn_en(en)
         en = F.relu(en)
         fmap = torch.cat((en, dec), dim=1)  # F
         fmap = self.conv1(fmap)
         fmap = F.relu(fmap)
         if not self.mode == 'C':
-            #print(self.mode)
+            # print(self.mode)
             fmap_att = self.picanet(fmap)  # F_att
             x = torch.cat((fmap, fmap_att), 1)
             x = self.conv2(x)
@@ -462,9 +470,10 @@ class DecoderCell(nn.Module):
         else:
             dec_out = self.conv2(fmap)
             _y = torch.sigmoid(dec_out)
-        #print("dec_out", dec_out.shape)
+        # print("dec_out", dec_out.shape)
 
         return dec_out, _y
+
 
 def make_layers(cfg, in_channels):
     layers = []
@@ -485,25 +494,25 @@ def make_layers(cfg, in_channels):
             in_channels = v
     return nn.Sequential(*layers)
 
+
 class PicanetG(nn.Module):
     def __init__(self, size, in_channel):
         super(PicanetG, self).__init__()
         self.renet = Renet(size, in_channel, 100)
         self.in_channel = in_channel
-        
 
     def forward(self, *input):
-        x      = input[0]
-        size   = x.size()
+        x = input[0]
+        size = x.size()
         kernel = self.renet(x)
-        ksize  = kernel.size()
-        CRA    = CrossAxialAttention(ksize[1], ksize[2], ksize[3],size[1], size[2], size[3])
+        ksize = kernel.size()
+        CRA = CrossAxialAttention(ksize[1], ksize[2], ksize[3], size[1], size[2], size[3])
         x, attn_comp, x_down = CRA(kernel, x)
-        #kernel = F.softmax(kernel, 1)
-        #kernel = kernel.reshape(size[0], 100, -1)  # ([9, 100, 16])
-        #x = F.unfold(x, [1, 1], padding=[3, 3])  # (x, [10, 10], dilation=[3, 3])
-        #x = x.reshape(size[0], size[1], 10 * 10)
-        #x = torch.matmul(x, kernel)
+        # kernel = F.softmax(kernel, 1)
+        # kernel = kernel.reshape(size[0], 100, -1)  # ([9, 100, 16])
+        # x = F.unfold(x, [1, 1], padding=[3, 3])  # (x, [10, 10], dilation=[3, 3])
+        # x = x.reshape(size[0], size[1], 10 * 10)
+        # x = torch.matmul(x, kernel)
         x = x.reshape(size[0], size[1], size[2], size[3])
         return x
 
@@ -512,7 +521,7 @@ class PicanetL(nn.Module):
     def __init__(self, in_channel):
         super(PicanetL, self).__init__()
         self.conv1 = nn.Conv2d(in_channel, 128, kernel_size=7, dilation=2, padding=6)
-        self.conv2 = nn.Conv2d(128, 8*8, kernel_size=1)
+        self.conv2 = nn.Conv2d(128, 8 * 8, kernel_size=1)
 
     def forward(self, *input):
         x = input[0]
@@ -520,19 +529,19 @@ class PicanetL(nn.Module):
         kernel = self.conv1(x)
         kernel = self.conv2(kernel)
         kernel = F.softmax(kernel, 1)
-        ksize  = kernel.size()
-        CRA    = CrossAxialAttention(ksize[1], ksize[2], ksize[3],size[1], size[2], size[3])
+        ksize = kernel.size()
+        CRA = CrossAxialAttention(ksize[1], ksize[2], ksize[3], size[1], size[2], size[3])
         x, attn_comp, x_down = CRA(kernel, x)
-        #kernel = kernel.reshape(size[0], 1, size[2] * size[3], 7 * 7)
-        #print("Before unfold", x.shape)
-        #x = F.unfold(x, kernel_size=[7, 7], dilation=[2, 2], padding=6)
-        #print("After unfold", x.shape)
-        #x = x.reshape(size[0], size[1], size[2] * size[3], -1)
-        #print(x.shape, kernel.shape)
-        #x = torch.mul(x, kernel)
-        #x = torch.sum(x, dim=3)
+        # kernel = kernel.reshape(size[0], 1, size[2] * size[3], 7 * 7)
+        # print("Before unfold", x.shape)
+        # x = F.unfold(x, kernel_size=[7, 7], dilation=[2, 2], padding=6)
+        # print("After unfold", x.shape)
+        # x = x.reshape(size[0], size[1], size[2] * size[3], -1)
+        # print(x.shape, kernel.shape)
+        # x = torch.mul(x, kernel)
+        # x = torch.sum(x, dim=3)
         x = x.reshape(size[0], size[1], size[2], size[3])
-        #print(x.size())
+        # print(x.size())
         return x
 
 
@@ -552,7 +561,7 @@ class Renet(nn.Module):
         x = input[0]
         temp = []
         x = torch.transpose(x, 1, 3)  # batch, width, height, in_channel
-        
+
         for i in range(self.size):
             h, _ = self.vertical(x[:, :, i, :])
             temp.append(h)  # batch, width, 512
@@ -566,6 +575,7 @@ class Renet(nn.Module):
         x = self.conv(x)
         return x
 
+
 ########################################
 class ResidualBlock(nn.Module):
 
@@ -577,30 +587,30 @@ class ResidualBlock(nn.Module):
         """
         super(ResidualBlock, self).__init__()
         nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
-        layers=[]
+        layers = []
         layers.append(
-                        nn.Conv2d(
-                                in_channels, 
-                                in_channels, 
-                                kernel_size, 
-                                stride, 
-                                padding, 
-                                bias    = False)
-                        
+            nn.Conv2d(
+                in_channels,
+                in_channels,
+                kernel_size,
+                stride,
+                padding,
+                bias=False)
+
         )
-        layers.append(nn.BatchNorm2d( in_channels))
+        layers.append(nn.BatchNorm2d(in_channels))
         layers.append(nl)
         layers.append(
-                        nn.Conv2d(
-                                in_channels, 
-                                in_channels, 
-                                kernel_size, 
-                                stride, 
-                                padding, 
-                                bias    = False)
-                        
+            nn.Conv2d(
+                in_channels,
+                in_channels,
+                kernel_size,
+                stride,
+                padding,
+                bias=False)
+
         )
-        layers.append(nn.BatchNorm2d( in_channels))
+        layers.append(nn.BatchNorm2d(in_channels))
         layers.append(nl)
         self.layers = nn.Sequential(*layers)
 
@@ -610,6 +620,7 @@ class ResidualBlock(nn.Module):
         # each residual block doesn't wrap (res_x + x) with an activation function
         # as the next block implement ReLU as the first layer
         return out
+
 
 class ResidualBlock_deconv(nn.Module):
     def __init__(self, channel, kernel_size, stride, padding, nonlinearity=None):
@@ -628,28 +639,32 @@ class ResidualBlock_deconv(nn.Module):
         out = out + res
         return out
 
+
 class LinearResidual(nn.Module):
     def __init__(self, input_feature, nonlinearity=None):
         super(LinearResidual, self).__init__()
         nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
-        fn=[]
+        fn = []
         fn.append(
-                nn.Linear(input_feature, input_feature)
+            nn.Linear(input_feature, input_feature)
         )
         fn.append(
-                nn.BatchNorm1d(input_feature, affine=True)
+            nn.BatchNorm1d(input_feature, affine=True)
         )
-        fn.append(nl) 
+        fn.append(nl)
         fn.append(
-                nn.Linear(input_feature, input_feature)
+            nn.Linear(input_feature, input_feature)
         )
         fn.append(
-                nn.BatchNorm1d(input_feature, affine=True)
+            nn.BatchNorm1d(input_feature, affine=True)
         )
-        fn.append(nl)                      
+        fn.append(nl)
         self.fn = nn.Sequential(*fn)
+
     def forward(self, x):
         return self.fn(x) + x
+
+
 #########################
 def build_grid(resolution, device):
     ranges = [np.linspace(0., 1., num=res) for res in resolution]
@@ -660,7 +675,10 @@ def build_grid(resolution, device):
     grid = grid.astype(np.float32)
     return torch.from_numpy(np.concatenate([grid, 1.0 - grid], axis=-1)).to(device)
 
+
 """Adds soft positional embedding with learnable projection."""
+
+
 class SoftPositionEmbed(nn.Module):
     def __init__(self, hidden_size, resolution):
         """Builds the soft position embedding layer.
@@ -668,7 +686,7 @@ class SoftPositionEmbed(nn.Module):
         hidden_size: Size of input feature dimension.
         resolution: Tuple of integers specifying width and height of grid.
         """
-        super(SoftPositionEmbed,self).__init__()
+        super(SoftPositionEmbed, self).__init__()
         self.embedding = nn.Linear(4, hidden_size, bias=True)
         self.grid = build_grid(resolution)
 
@@ -676,17 +694,19 @@ class SoftPositionEmbed(nn.Module):
         grid = self.embedding(self.grid)
         return inputs + grid
 
+
 class SlotAttention(nn.Module):
     """
     https://arxiv.org/abs/2006.15055
     https://github.com/lucidrains/slot-attention/blob/master/slot_attention/slot_attention.py
     """
-    def __init__(self, num_slots, dim, iters = 3, eps = 1e-8, hidden_dim = 128):
+
+    def __init__(self, num_slots, dim, iters=3, eps=1e-8, hidden_dim=128):
         super().__init__()
         self.num_slots = num_slots
         self.iters = iters
         self.eps = eps
-        self.scale = dim ** -0.5 
+        self.scale = dim ** -0.5
 
         self.slots_mu = nn.Parameter(torch.randn(1, 1, dim))
 
@@ -703,24 +723,24 @@ class SlotAttention(nn.Module):
 
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden_dim),
-            nn.ReLU(inplace = True),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, dim)
         )
 
-        self.norm_input  = nn.LayerNorm(dim)
-        self.norm_slots  = nn.LayerNorm(dim)
+        self.norm_input = nn.LayerNorm(dim)
+        self.norm_slots = nn.LayerNorm(dim)
         self.norm_pre_ff = nn.LayerNorm(dim)
 
-    def forward(self, inputs, num_slots = None):
+    def forward(self, inputs, num_slots=None):
         b, n, d, device = *inputs.shape, inputs.device
         n_s = num_slots if num_slots is not None else self.num_slots
-        
+
         mu = self.slots_mu.expand(b, n_s, -1)
         sigma = self.slots_logsigma.exp().expand(b, n_s, -1)
 
-        slots = mu + sigma * torch.randn(mu.shape, device = device)
+        slots = mu + sigma * torch.randn(mu.shape, device=device)
 
-        inputs = self.norm_input(inputs)        
+        inputs = self.norm_input(inputs)
         k, v = self.to_k(inputs), self.to_v(inputs)
 
         for _ in range(self.iters):
@@ -744,6 +764,7 @@ class SlotAttention(nn.Module):
             slots = slots + self.mlp(self.norm_pre_ff(slots))
 
         return slots
+
 
 ##########################
 class AdaBound(Optimizer):
@@ -859,6 +880,7 @@ class AdaBound(Optimizer):
                 p.data.add_(-step_size)
 
         return loss
+
 
 class AdaBoundW(Optimizer):
     """Implements AdaBound algorithm with Decoupled Weight Decay (arxiv.org/abs/1711.05101)

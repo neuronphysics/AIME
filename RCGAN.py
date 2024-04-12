@@ -578,9 +578,11 @@ class RCGAN:
             batch_size -= 1
         rounds = self.real_train_dl.wm_image_replay_buffer.tensors[0].shape[0] // batch_size
         sampled_features = np.zeros(
-            (0, self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[1], self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[-1] - 2))
+            (0, self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[1],
+             self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[-1] - 2))
         sampled_attributes = np.zeros(
-            (0, self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[1], self.real_train_dl.wm_image_replay_buffer.tensors[0].shape[-1]))
+            (0, self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[1],
+             self.real_train_dl.wm_image_replay_buffer.tensors[0].shape[-1]))
         sampled_gen_flags = np.zeros((0, self.real_train_dl.wm_image_replay_buffer.tensors[1].shape[1]))
         sampled_lengths = np.zeros(0)
         for i in range(rounds):
