@@ -369,7 +369,6 @@ class DistLayer(Module):
             dist = TruncatedNormal(torch.tanh(out), std, -1, 1)
             return ContDist(torch.distributions.Independent(dist, 1))
         if self._dist == "onehot":
-            # TODO out is the input with shape (16, 15, 106), how can we convert it as logit and prob
             return OneHotDist(logits=out)
         raise NotImplementedError(self._dist)
 
