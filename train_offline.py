@@ -61,7 +61,7 @@ def train_eval_offline(
     update_rate=0.005,
     discount=0.99,
     ):
-  """Training a policy with a fixed dataset."""
+  """Training a policy with a fixed wm_image_replay_buffer."""
   # Create tf_env to get specs.
   env = gym.spec(env_name).make()
   # env = alf_gym_wrapper.AlfGymWrapper(dm_env)
@@ -94,14 +94,14 @@ def train_eval_offline(
   # print('Loading data from %s ...', data_file)
   # full_data  = torch.load(data_file)
 
-  # All the following comments show the real shapes from the list version of the dataset, not the Dataset version. 
+  # All the following comments show the real shapes from the list version of the wm_image_replay_buffer, not the Dataset version.
   #   Need to verify the second dimension
-  # print(f'full_data a1 shape: {full_data._a1.shape}') # action 1 shape (10050,)
-  # print(f'full_data a2 shape: {full_data._a2.shape}') # action 2 shape (10050,)
-  # print(f'full_data s1 shape: {full_data._s1.shape}') # state shape (10050, 3)
-  # print(f'full_data s2 shape: {full_data._s2.shape}') # next state shape (10050, 3)
-  # print(f'full_data discount shape: {full_data._discount.shape}') # dsicount shape (10050,)
-  # print(f'full_data reward shape: {full_data._reward.shape}') #reward shape (10050,)
+  # print(f'full_data a1 shape: {full_data.a1.shape}') # action 1 shape (10050,)
+  # print(f'full_data a2 shape: {full_data.a2.shape}') # action 2 shape (10050,)
+  # print(f'full_data s1 shape: {full_data.s1.shape}') # state shape (10050, 3)
+  # print(f'full_data s2 shape: {full_data.s2.shape}') # next state shape (10050, 3)
+  # print(f'full_data discount shape: {full_data.discount.shape}') # dsicount shape (10050,)
+  # print(f'full_data reward shape: {full_data.reward.shape}') #reward shape (10050,)
 
 
   print(type(full_data))
@@ -109,7 +109,7 @@ def train_eval_offline(
   # for i, data in enumerate(full_data):
   #   full_data[i] = [item for j, item in enumerate(data) if j not in none_indices]
 
-  # print(f'data size: {full_data._current_size}')
+  # print(f'data size: {full_data.current_size}')
   # data_size = data.size()      
   # full_data = Dataset(observation_spec, action_spec, data_size)
 

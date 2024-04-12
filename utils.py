@@ -12,43 +12,48 @@ from plotly.graph_objs import Scatter
 from plotly.graph_objs.scatter import Line
 from einops import rearrange
 
+
 # Plots min, max and mean + standard deviation bars of a population over time
 def lineplot(xs, ys_population, title, path='', xaxis='episode'):
-  max_colour, mean_colour, std_colour, transparent = 'rgb(0, 132, 180)', 'rgb(0, 172, 237)', 'rgba(29, 202, 255, 0.2)', 'rgba(0, 0, 0, 0)'
+    max_colour, mean_colour, std_colour, transparent = 'rgb(0, 132, 180)', 'rgb(0, 172, 237)', 'rgba(29, 202, 255, 0.2)', 'rgba(0, 0, 0, 0)'
 
-  if isinstance(ys_population[0], list) or isinstance(ys_population[0], tuple):
-    ys = np.asarray(ys_population, dtype=np.float32)
-    ys_min, ys_max, ys_mean, ys_std, ys_median = ys.min(1), ys.max(1), ys.mean(1), ys.std(1), np.median(ys, 1)
-    ys_upper, ys_lower = ys_mean + ys_std, ys_mean - ys_std
+    if isinstance(ys_population[0], list) or isinstance(ys_population[0], tuple):
+        ys = np.asarray(ys_population, dtype=np.float32)
+        ys_min, ys_max, ys_mean, ys_std, ys_median = ys.min(1), ys.max(1), ys.mean(1), ys.std(1), np.median(ys, 1)
+        ys_upper, ys_lower = ys_mean + ys_std, ys_mean - ys_std
 
-    trace_max = Scatter(x=xs, y=ys_max, line=Line(color=max_colour, dash='dash'), name='Max')
-    trace_upper = Scatter(x=xs, y=ys_upper, line=Line(color=transparent), name='+1 Std. Dev.', showlegend=False)
-    trace_mean = Scatter(x=xs, y=ys_mean, fill='tonexty', fillcolor=std_colour, line=Line(color=mean_colour), name='Mean')
-    trace_lower = Scatter(x=xs, y=ys_lower, fill='tonexty', fillcolor=std_colour, line=Line(color=transparent), name='-1 Std. Dev.', showlegend=False)
-    trace_min = Scatter(x=xs, y=ys_min, line=Line(color=max_colour, dash='dash'), name='Min')
-    trace_median = Scatter(x=xs, y=ys_median, line=Line(color=max_colour), name='Median')
-    data = [trace_upper, trace_mean, trace_lower, trace_min, trace_max, trace_median]
-  else:
-    data = [Scatter(x=xs, y=ys_population, line=Line(color=mean_colour))]
-  plotly.offline.plot({
-    'data': data,
-    'layout': dict(title=title, xaxis={'title': xaxis}, yaxis={'title': title})
-  }, filename=os.path.join(path, title + '.html'), auto_open=False)
+        trace_max = Scatter(x=xs, y=ys_max, line=Line(color=max_colour, dash='dash'), name='Max')
+        trace_upper = Scatter(x=xs, y=ys_upper, line=Line(color=transparent), name='+1 Std. Dev.', showlegend=False)
+        trace_mean = Scatter(x=xs, y=ys_mean, fill='tonexty', fillcolor=std_colour, line=Line(color=mean_colour),
+                             name='Mean')
+        trace_lower = Scatter(x=xs, y=ys_lower, fill='tonexty', fillcolor=std_colour, line=Line(color=transparent),
+                              name='-1 Std. Dev.', showlegend=False)
+        trace_min = Scatter(x=xs, y=ys_min, line=Line(color=max_colour, dash='dash'), name='Min')
+        trace_median = Scatter(x=xs, y=ys_median, line=Line(color=max_colour), name='Median')
+        data = [trace_upper, trace_mean, trace_lower, trace_min, trace_max, trace_median]
+    else:
+        data = [Scatter(x=xs, y=ys_population, line=Line(color=mean_colour))]
+    plotly.offline.plot({
+        'data': data,
+        'layout': dict(title=title, xaxis={'title': xaxis}, yaxis={'title': title})
+    }, filename=os.path.join(path, title + '.html'), auto_open=False)
 
 
 def write_video(frames, title, path=''):
+    frames = np.multiply(np.stack(frames, axis=0).transpose(0, 2, 3, 1), 255).clip(0, 255).astype(np.uint8)[:, :, :,
+             ::-1]  # VideoWrite expects H x W x C in BGR
+    _, H, W, _ = frames.shape
+    writer = cv2.VideoWriter(os.path.join(path, '%s.mp4' % title), cv2.VideoWriter_fourcc(*'mp4v'), 30., (W, H), True)
+    for frame in frames:
+        writer.write(frame)
+    writer.release()
 
-  frames = np.multiply(np.stack(frames, axis=0).transpose(0, 2, 3, 1), 255).clip(0, 255).astype(np.uint8)[:, :, :, ::-1]  # VideoWrite expects H x W x C in BGR
-  _, H, W, _ = frames.shape
-  writer = cv2.VideoWriter(os.path.join(path, '%s.mp4' % title), cv2.VideoWriter_fourcc(*'mp4v'), 30., (W, H), True)
-  for frame in frames:
-    writer.write(frame)
-  writer.release()
+    pass
 
-  pass
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
+
     def __init__(self):
         self.reset()
 
@@ -129,12 +134,12 @@ def tile_raster_images(X, img_shape, tile_shape, tile_spacing=(0, 0),
         # Create an output numpy ndarray to store the image
         if output_pixel_vals:
             out_array = np.zeros((out_shape[0], out_shape[1], 4),
-                                    dtype='uint8')
+                                 dtype='uint8')
         else:
             out_array = np.zeros((out_shape[0], out_shape[1], 4),
-                                    dtype=X.dtype)
+                                 dtype=X.dtype)
 
-        #colors default to 0, alpha defaults to 1 (opaque)
+        # colors default to 0, alpha defaults to 1 (opaque)
         if output_pixel_vals:
             channel_defaults = [0, 0, 0, 255]
         else:
@@ -188,8 +193,8 @@ def tile_raster_images(X, img_shape, tile_shape, tile_spacing=(0, 0),
                     if output_pixel_vals:
                         c = 255
                     out_array[
-                        tile_row * (H + Hs): tile_row * (H + Hs) + H,
-                        tile_col * (W + Ws): tile_col * (W + Ws) + W
+                    tile_row * (H + Hs): tile_row * (H + Hs) + H,
+                    tile_col * (W + Ws): tile_col * (W + Ws) + W
                     ] = this_img * c
         return out_array
 
@@ -203,6 +208,7 @@ class AttentionBlock(nn.Module):
         score = F.softmax(score, dim=-1)
         score = torch.matmul(score, v)
         return score
+
 
 class GRN(nn.Module):
     """Global Response Normalization Module.
@@ -244,6 +250,7 @@ class GRN(nn.Module):
                 1, -1, 1, 1) + x
         return x
 
+
 class LayerNorm2d(nn.LayerNorm):
     def forward(self, x):
         x = rearrange(x, "b c h w -> b h w c")
@@ -251,9 +258,10 @@ class LayerNorm2d(nn.LayerNorm):
         x = rearrange(x, "b h w c -> b c h w")
         return x
 
+
 class ResidualBlock(nn.Module):
 
-    def __init__(self, in_channels, kernel_size, stride, padding, norm_type='layer', num_groups=1, nonlinearity=None ):
+    def __init__(self, in_channels, kernel_size, stride, padding, norm_type='layer', num_groups=1, nonlinearity=None):
         """
             1. in_channels is the number of input channels to the first conv layer,
             2. out_channels is the number of output channels of the first conv layer
@@ -261,15 +269,15 @@ class ResidualBlock(nn.Module):
         """
         super(ResidualBlock, self).__init__()
         nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
-        layers=[]
+        layers = []
         layers.append(
-                        nn.Conv2d(
-                                in_channels,
-                                in_channels,
-                                kernel_size,
-                                stride,
-                                padding,
-                                bias    = False)
+            nn.Conv2d(
+                in_channels,
+                in_channels,
+                kernel_size,
+                stride,
+                padding,
+                bias=False)
 
         )
         if norm_type == 'batch':
@@ -279,13 +287,13 @@ class ResidualBlock(nn.Module):
 
         layers.append(nl)
         layers.append(
-                        nn.Conv2d(
-                                in_channels,
-                                in_channels,
-                                kernel_size,
-                                stride,
-                                padding,
-                                bias    = False)
+            nn.Conv2d(
+                in_channels,
+                in_channels,
+                kernel_size,
+                stride,
+                padding,
+                bias=False)
 
         )
         if norm_type == 'batch':
@@ -298,10 +306,11 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x):
         out = self.layers(x)
-        out =  out + x
+        out = out + x
         # each residual block doesn't wrap (res_x + x) with an activation function
         # as the next block implement ReLU as the first layer
         return out
+
 
 class ResidualBlock_deconv(nn.Module):
     def __init__(self, channel, kernel_size, stride, padding, norm_type="layer", num_groups=1, nonlinearity=None):
@@ -309,15 +318,15 @@ class ResidualBlock_deconv(nn.Module):
         nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
         self.conv1 = nn.ConvTranspose2d(channel, channel, kernel_size, stride, padding)
         if norm_type == "batch":
-           self.norm1 = nn.BatchNorm2d(channel)
+            self.norm1 = nn.BatchNorm2d(channel)
         elif norm_type == "layer":
-           self.norm1 = nn.GroupNorm(num_groups, channel)
+            self.norm1 = nn.GroupNorm(num_groups, channel)
         self.relu = nl
         self.conv2 = nn.ConvTranspose2d(channel, channel, kernel_size, stride, padding)
         if norm_type == "batch":
-           self.norm2 = nn.BatchNorm2d(channel)
+            self.norm2 = nn.BatchNorm2d(channel)
         elif norm_type == "layer":
-           self.norm2 = nn.GroupNorm(num_groups, channel)
+            self.norm2 = nn.GroupNorm(num_groups, channel)
 
     def forward(self, x):
         res = x
@@ -325,6 +334,7 @@ class ResidualBlock_deconv(nn.Module):
         out = self.relu(self.norm2(self.conv2(out)))
         out = out + res
         return out
+
 
 class LinearResidual(nn.Module):
     def __init__(self, input_feature, nonlinearity=None, norm_type='layer'):
@@ -370,16 +380,17 @@ class CustomLinear(nn.Module):
         if flatten:
             layers.append(nn.Flatten())
         ###
-        for i in range(len(hidden_dim)-1):
-            layers.append(nn.Linear(hidden_dim[i], hidden_dim[i+1], bias=False))
+        for i in range(len(hidden_dim) - 1):
+            layers.append(nn.Linear(hidden_dim[i], hidden_dim[i + 1], bias=False))
             if norm_type != 'none':
-                layers.append(norm_layer(hidden_dim[i+1]))
-            if i== len(hidden_dim)-2:
-               layers.append( last_activation)
+                layers.append(norm_layer(hidden_dim[i + 1]))
+            if i == len(hidden_dim) - 2:
+                layers.append(last_activation)
             else:
                 layers.append(nn.SiLU())
         ###
         self.encoder = nn.Sequential(*layers)
+
     def forward(self, x):
         return self.encoder(x)
 
@@ -394,7 +405,10 @@ def build_grid(resolution, device):
     grid = grid.astype(np.float32)
     return torch.from_numpy(np.concatenate([grid, 1.0 - grid], axis=-1)).to(device)
 
+
 """Adds soft positional embedding with learnable projection."""
+
+
 class SoftPositionEmbed(nn.Module):
     def __init__(self, hidden_size, resolution):
         """Builds the soft position embedding layer.
@@ -402,7 +416,7 @@ class SoftPositionEmbed(nn.Module):
         hidden_size: Size of input feature dimension.
         resolution: Tuple of integers specifying width and height of grid.
         """
-        super(SoftPositionEmbed,self).__init__()
+        super(SoftPositionEmbed, self).__init__()
         self.embedding = nn.Linear(4, hidden_size, bias=True)
         self.grid = build_grid(resolution)
 
@@ -410,12 +424,14 @@ class SoftPositionEmbed(nn.Module):
         grid = self.embedding(self.grid)
         return inputs + grid
 
+
 class SlotAttention(nn.Module):
     """
     https://arxiv.org/abs/2006.15055
     https://github.com/lucidrains/slot-attention/blob/master/slot_attention/slot_attention.py
     """
-    def __init__(self, num_slots, dim, iters = 3, eps = 1e-8, hidden_dim = 128):
+
+    def __init__(self, num_slots, dim, iters=3, eps=1e-8, hidden_dim=128):
         super().__init__()
         self.num_slots = num_slots
         self.iters = iters
@@ -437,22 +453,22 @@ class SlotAttention(nn.Module):
 
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden_dim),
-            nn.ReLU(inplace = True),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, dim)
         )
 
-        self.norm_input  = nn.LayerNorm(dim)
-        self.norm_slots  = nn.LayerNorm(dim)
+        self.norm_input = nn.LayerNorm(dim)
+        self.norm_slots = nn.LayerNorm(dim)
         self.norm_pre_ff = nn.LayerNorm(dim)
 
-    def forward(self, inputs, num_slots = None):
+    def forward(self, inputs, num_slots=None):
         b, n, d, device = *inputs.shape, inputs.device
         n_s = num_slots if num_slots is not None else self.num_slots
 
         mu = self.slots_mu.expand(b, n_s, -1)
         sigma = self.slots_logsigma.exp().expand(b, n_s, -1)
 
-        slots = mu + sigma * torch.randn(mu.shape, device = device)
+        slots = mu + sigma * torch.randn(mu.shape, device=device)
 
         inputs = self.norm_input(inputs)
         k, v = self.to_k(inputs), self.to_v(inputs)
@@ -478,6 +494,7 @@ class SlotAttention(nn.Module):
             slots = slots + self.mlp(self.norm_pre_ff(slots))
 
         return slots
+
 
 ##########################
 class AdaBound(Optimizer):
@@ -593,6 +610,7 @@ class AdaBound(Optimizer):
                 p.data.add_(-step_size)
 
         return loss
+
 
 class AdaBoundW(Optimizer):
     """Implements AdaBound algorithm with Decoupled Weight Decay (arxiv.org/abs/1711.05101)

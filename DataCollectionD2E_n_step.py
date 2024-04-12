@@ -132,7 +132,7 @@ def scatter_update(tensor, indices, updates):
 
 
 class DatasetView(object):
-    """Interface for reading from dataset."""
+    """Interface for reading from wm_image_replay_buffer."""
 
     def __init__(self, dataset, indices):
         self._dataset = dataset
@@ -163,7 +163,7 @@ def save_copy(data, ckpt_name):
 
 
 class Dataset(data.Dataset):
-    """Tensorflow module of dataset of transitions."""
+    """Tensorflow module of wm_image_replay_buffer of transitions."""
 
     def __init__(
             self,
@@ -180,22 +180,22 @@ class Dataset(data.Dataset):
         obs_type = observation_spec.dtype
         action_shape = list(action_spec.shape)
         action_type = action_spec.dtype
-        self._s1 = self._zeros([size] + [group_size] + obs_shape, obs_type)
-        self._s2 = self._zeros([size] + [group_size] + obs_shape, obs_type)
-        self._a1 = self._zeros([size] + [group_size] + action_shape, action_type)
-        self._a2 = self._zeros([size] + [group_size] + action_shape, action_type)
-        self._discount = self._zeros([size] + [group_size], torch.float32)
-        self._reward = self._zeros([size] + [group_size], torch.float32)
-        self._done = self._zeros([size] + [group_size], torch.bool)
+        self.s1 = self._zeros([size] + [group_size] + obs_shape, obs_type)
+        self.s2 = self._zeros([size] + [group_size] + obs_shape, obs_type)
+        self.a1 = self._zeros([size] + [group_size] + action_shape, action_type)
+        self.a2 = self._zeros([size] + [group_size] + action_shape, action_type)
+        self.discount = self._zeros([size] + [group_size], torch.float32)
+        self.reward = self._zeros([size] + [group_size], torch.float32)
+        self.done = self._zeros([size] + [group_size], torch.bool)
         self._data = Transition(
-            s1=self._s1,
-            s2=self._s2,
-            a1=self._a1,
-            a2=self._a2,
-            discount=self._discount,
-            reward=self._reward,
-            done=self._done)
-        self._current_size = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
+            s1=self.s1,
+            s2=self.s2,
+            a1=self.a1,
+            a2=self.a2,
+            discount=self.discount,
+            reward=self.reward,
+            done=self.done)
+        self.current_size = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
         self._current_idx = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
         self._capacity = torch.autograd.Variable(torch.tensor(self._size))
         self._config = collections.OrderedDict(
@@ -231,7 +231,7 @@ class Dataset(data.Dataset):
 
     @property
     def size(self):
-        return self._current_size.numpy()
+        return self.current_size.numpy()
 
     def _zeros(self, shape, dtype):
         """Create a variable initialized with zeros."""
@@ -251,8 +251,24 @@ class Dataset(data.Dataset):
             batch = getattr(transitions, key)
             data[indices] = torch.tensor(batch[:effective_batch_size])
         # Update size and index.
-        if torch.less(self._current_size, self._size):
-            self._current_size += effective_batch_size
+        if torch.less(self.current_size, self._size):
+            self.current_size += effective_batch_size
+        self._current_idx += effective_batch_size
+        if self._circular:
+            if torch.greater_equal(self._current_idx, self._size):
+                self._current_idx = 0
+
+    def add_transitions_batch(self, transitions):
+        batch_size = transitions.s1.shape[0]
+        effective_batch_size = torch.minimum(torch.tensor(batch_size), torch.tensor(self._size) - self._current_idx)
+        indices = self._current_idx + torch.arange(effective_batch_size.item())
+        for key in transitions._asdict().keys():
+            data = getattr(self._data, key)
+            batch = getattr(transitions, key)
+            data[indices] = torch.tensor(batch[:effective_batch_size])
+        # Update size and index.
+        if torch.less(self.current_size, self._size):
+            self.current_size += effective_batch_size
         self._current_idx += effective_batch_size
         if self._circular:
             if torch.greater_equal(self._current_idx, self._size):
@@ -288,7 +304,7 @@ def dir_path(path):
 
 
 def get_sample_counts(n, distr):
-    """Provides size of each sub-dataset based on desired distribution."""
+    """Provides size of each sub-wm_image_replay_buffer based on desired distribution."""
     distr = torch.tensor(distr)
     distr = distr / torch.sum(distr)
     counts = []
@@ -302,7 +318,7 @@ def get_sample_counts(n, distr):
 
 
 def collect_n_transitions(tf_env, policy, data, n, log_freq=1000, group_size=15):
-    """Adds desired number of transitions to dataset."""
+    """Adds desired number of transitions to wm_image_replay_buffer."""
     collector = DataCollector(tf_env, policy, data)
     time_st = time.time()
     timed_at_step = 0
@@ -331,7 +347,7 @@ def collect_data(
 ):
     """
                  **** Main function ****
-    Creates dataset of transitions based on desired config.
+    Creates wm_image_replay_buffer of transitions based on desired config.
     """
     seed = 0
     torch.manual_seed(seed)
@@ -342,7 +358,7 @@ def collect_data(
     observation_spec = env.observation_spec()
     action_spec = env.action_spec()
 
-    # Initialize dataset.
+    # Initialize wm_image_replay_buffer.
     sample_sizes = list([cfg[-1] for cfg in data_config])
     sample_sizes = get_sample_counts(n_samples, sample_sizes)
     logging.info(", ".join(["%s" % s for s in sample_sizes]))
@@ -367,10 +383,10 @@ def collect_data(
         logging.info('Return mean %.4g, std %.4g.', eval_mean, eval_std)
         logging.info('Collecting data from policy %s...', policy_name)
         collect_n_transitions(env, policy, data, n_transitions, log_freq, group_size)
-    # Save final dataset.
+    # Save final wm_image_replay_buffer.
     assert data.size == data.capacity
     data_ckpt_name = os.path.join(log_dir, 'data_{}.pt'.format(env_name))
-    torch.save({"dataset": data, "capacity": data.capacity}, data_ckpt_name)
+    torch.save({"wm_image_replay_buffer": data, "capacity": data.capacity}, data_ckpt_name)
 
     whole_data_ckpt_name = os.path.join(log_dir, 'data_{}.pth'.format(env_name))
     with open(whole_data_ckpt_name, 'wb') as filehandler:

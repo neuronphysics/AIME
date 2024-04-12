@@ -1,26 +1,25 @@
 from torch.distributions.normal import Normal
 from torch.distributions import MultivariateNormal, OneHotCategorical, MixtureSameFamily, Categorical
 from torch.distributions.independent import Independent
-from torch.utils.data import Dataset
 import torch
 import torch.nn as nn
-import torch.nn.init as init
 import torch_optimizer
 import os
 import sys
-import itertools
 from .MaskedNorm import MaskedNorm
 from .CustomLSTM import LSTMCore
 from .attention_encoder import LatentEncoder
-from .Blocks import init_weights
 from .vrnn_utilities import _strip_prefix_if_present
 import random
 import numpy as np
-parent_dir=os.path.abspath(os.path.join(os.getcwd(), '..'))
+
+parent_dir = os.path.abspath(os.path.join(os.getcwd(), '..'))
 # passing the file name and path as argument
 sys.path.append(parent_dir)
-from RCGAN import RGANDiscriminator 
-#https://github.com/alafage/deep-traffic-generation/blob/9585e86dfd7644dc194dcd1fe304486aa02d4381/deep_traffic_generation/core/lsr.py
+from RCGAN import RGANDiscriminator
+
+
+# https://github.com/alafage/deep-traffic-generation/blob/9585e86dfd7644dc194dcd1fe304486aa02d4381/deep_traffic_generation/core/lsr.py
 class CustomMSF(MixtureSameFamily):
     """MixtureSameFamily with `rsample()` method for reparametrization.
     Args:
@@ -58,6 +57,7 @@ class CustomMSF(MixtureSameFamily):
         samples = self.component_distribution.rsample(sample_shape)
         return (comp * samples).sum(dim=1)
 
+
 class NormalNetwork(nn.Module):
     def __init__(self, in_dim, out_dim, n_components, full_cov=True):
         super().__init__()
@@ -67,10 +67,10 @@ class NormalNetwork(nn.Module):
         self.tril_indices = torch.tril_indices(row=out_dim, col=out_dim, offset=0)
         self.elu = nn.ELU()
         self.mean_net = nn.Sequential(
-                nn.Linear(in_dim, out_dim * n_components),
-            )
+            nn.Linear(in_dim, out_dim * n_components),
+        )
         ##initialize
-        #init_weights(self.mean_net[0])
+        # init_weights(self.mean_net[0])
         if full_cov:
             # Cholesky decomposition of the covariance matrix
             self.tril_net = nn.Sequential(
@@ -81,7 +81,7 @@ class NormalNetwork(nn.Module):
                 nn.Linear(in_dim, out_dim * n_components),
             )
         ##initialize
-        #init_weights(self.tril_net[0])
+        # init_weights(self.tril_net[0])
 
     def forward(self, x):
         mean = self.mean_net(x).reshape(-1, self.n_components, self.out_dim)
@@ -91,11 +91,13 @@ class NormalNetwork(nn.Module):
             tril[:, :, self.tril_indices[0], self.tril_indices[1]] = tril_values
             # diagonal element must be strictly positive
             # use diag = elu(diag) + 1 to ensure positivity
-            tril = tril - torch.diag_embed(torch.diagonal(tril, dim1=-2, dim2=-1)) + torch.diag_embed(self.elu(torch.diagonal(tril, dim1=-2, dim2=-1)) + 1 + 1e-8)
+            tril = tril - torch.diag_embed(torch.diagonal(tril, dim1=-2, dim2=-1)) + torch.diag_embed(
+                self.elu(torch.diagonal(tril, dim1=-2, dim2=-1)) + 1 + 1e-8)
         else:
             tril = self.tril_net(x).reshape(mean.shape[0], self.n_components, -1)
             tril = torch.diag_embed(self.elu(tril) + 1 + 1e-8)
         return MultivariateNormal(mean, scale_tril=tril)
+
 
 class CategoricalNetwork(nn.Module):
 
@@ -106,7 +108,7 @@ class CategoricalNetwork(nn.Module):
         )
 
         ##initialize
-        #init_weights(self.network[0])
+        # init_weights(self.network[0])
 
     def forward(self, x):
         params = self.network(x)
@@ -115,8 +117,8 @@ class CategoricalNetwork(nn.Module):
 
 class VRNN_GMM(nn.Module):
     #################################################################################
-    #The main part of the algorithm for learing the dynamics (world model)
-    #A Recurrent Latent Variable Model for Sequential Data (Junyoung Chung et al 2016)
+    # The main part of the algorithm for learing the dynamics (world model)
+    # A Recurrent Latent Variable Model for Sequential Data (Junyoung Chung et al 2016)
     ##################################################################################
     def __init__(self,
                  u_dim,
@@ -127,7 +129,7 @@ class VRNN_GMM(nn.Module):
                  n_mixtures,
                  sequence_length,
                  device,
-                 output_clamp=(-10,10),
+                 output_clamp=(-10, 10),
                  batch_norm=False,
                  masked_norm=True,
                  bias=False,
@@ -138,7 +140,7 @@ class VRNN_GMM(nn.Module):
                  dropout=0.1,
                  ):
         super(VRNN_GMM, self).__init__()
-        
+
         self.y_dim = y_dim
         self.u_dim = u_dim
         self.h_dim = h_dim
@@ -149,7 +151,7 @@ class VRNN_GMM(nn.Module):
         self.batch_norm = batch_norm
         self._MaskedNorm = masked_norm
         self.sequence_length = sequence_length
-        self.num_layer_dis   = num_layer_discriminator
+        self.num_layer_dis = num_layer_discriminator
         self._learn_init_state = learn_init_state
         self.is_bidirectional = bidirectional
         self.num_directions = 2 if self.is_bidirectional else 1
@@ -160,21 +162,21 @@ class VRNN_GMM(nn.Module):
             self.norm_y = MaskedNorm(y_dim)
 
         self._latent_encoder = LatentEncoder(
-                                             u_dim + y_dim,
-                                             hidden_dim = h_dim,
-                                             latent_dim = h_dim,
-                                             self_attention_type = self_attention_type,
-                                             n_encoder_layers = n_layers,
-                                             batchnorm = False,
-                                             dropout  = dropout,
-                                             attention_dropout = 0,
-                                             attention_layers  = 2,
-                                             use_lstm = True
-                                             )
+            u_dim + y_dim,
+            hidden_dim=h_dim,
+            latent_dim=h_dim,
+            self_attention_type=self_attention_type,
+            n_encoder_layers=n_layers,
+            batchnorm=False,
+            dropout=dropout,
+            attention_dropout=0,
+            attention_layers=2,
+            use_lstm=True
+        )
         self.output_clamp = output_clamp
         self._eps = 1e-5
         self._max_deviation = 2.0
-        self.self_attention_type= self_attention_type
+        self.self_attention_type = self_attention_type
         if dropout > 0.0:
             self.input_drop = nn.Dropout(p=dropout)
         else:
@@ -193,8 +195,8 @@ class VRNN_GMM(nn.Module):
         self.phi_y = torch.nn.Sequential(*layers_phi_y)
 
         ##initialize
-        #init_weights(self.phi_y[0])
-        #init_weights(self.phi_y[-1])
+        # init_weights(self.phi_y[0])
+        # init_weights(self.phi_y[-1])
         ###=============###
         layers_phi_u = [nn.Linear(self.u_dim, self.h_dim)]
         if self.batch_norm:
@@ -207,8 +209,8 @@ class VRNN_GMM(nn.Module):
         self.phi_u = torch.nn.Sequential(*layers_phi_u)
 
         ##initialize
-        #init_weights(self.phi_u[0])
-        #init_weights(self.phi_u[-1])
+        # init_weights(self.phi_u[0])
+        # init_weights(self.phi_u[-1])
         ######
         layers_phi_z = [nn.Linear(self.z_dim, self.h_dim)]
         if self.batch_norm:
@@ -221,41 +223,41 @@ class VRNN_GMM(nn.Module):
         self.phi_z = torch.nn.Sequential(*layers_phi_z)
 
         ##initialize
-        #init_weights(self.phi_z[0])
-        #init_weights(self.phi_z[-1])
-        #-----------------------------------------
+        # init_weights(self.phi_z[0])
+        # init_weights(self.phi_z[-1])
+        # -----------------------------------------
         # encoder function (phi_enc) -> Inference
 
-        encoder_layers=[nn.Linear(self.h_dim + self.h_dim + self.h_dim, self.h_dim)]
+        encoder_layers = [nn.Linear(self.h_dim + self.h_dim + self.h_dim, self.h_dim)]
         if self.batch_norm:
             encoder_layers.append(torch.nn.BatchNorm1d(self.h_dim))
-        encoder_layers=encoder_layers+[
+        encoder_layers = encoder_layers + [
             nn.ReLU(),
             nn.Linear(self.h_dim, self.h_dim),
         ]
         if self.batch_norm:
-            encoder_layers= encoder_layers+[nn.BatchNorm1d(self.h_dim)]
+            encoder_layers = encoder_layers + [nn.BatchNorm1d(self.h_dim)]
 
-        encoder_layers  = encoder_layers+[nn.ReLU()]
+        encoder_layers = encoder_layers + [nn.ReLU()]
 
-        self.enc        = torch.nn.Sequential(*encoder_layers)
+        self.enc = torch.nn.Sequential(*encoder_layers)
 
         ##initialize
-        #init_weights(self.enc[0])
-        #if not self.batch_norm:
+        # init_weights(self.enc[0])
+        # if not self.batch_norm:
         #    init_weights(self.enc[2])
-        #else:
+        # else:
         #    init_weights(self.enc[3])
-        #-----------------------------------------
+        # -----------------------------------------
         ###  encoder mean
-        self.enc_mean   = nn.Linear(self.h_dim, self.z_dim)
-        #init_weights(self.enc_mean)
+        self.enc_mean = nn.Linear(self.h_dim, self.z_dim)
+        # init_weights(self.enc_mean)
 
         ###  encoder log_var
         self.enc_logvar = nn.Linear(self.h_dim, self.z_dim)
-        #init_weights(self.enc_logvar)
+        # init_weights(self.enc_logvar)
 
-        #-----------------------------------------
+        # -----------------------------------------
         # prior function (phi_prior) -> Prior
 
         layers_prior = [nn.Linear(self.h_dim, self.h_dim)]
@@ -267,63 +269,63 @@ class VRNN_GMM(nn.Module):
 
         self.prior = torch.nn.Sequential(*layers_prior)
         ##initialize
-        #init_weights(self.prior[0])
+        # init_weights(self.prior[0])
 
         # prior mean
 
         self.prior_mean = nn.Linear(self.h_dim, self.z_dim)
-        #init_weights(self.prior_mean)
+        # init_weights(self.prior_mean)
 
         # prior logvar
         self.prior_logvar = nn.Linear(self.h_dim, self.z_dim)
-        #init_weights(self.prior_logvar)
+        # init_weights(self.prior_logvar)
 
-        #init_weights(self.prior_logvar)
+        # init_weights(self.prior_logvar)
 
-        #-----------------------------------------
+        # -----------------------------------------
         # decoder function (phi_dec) -> Generation
         layers_decoder = [
-            nn.Linear(self.h_dim + self.h_dim + self.h_dim, self.h_dim) #modified
+            nn.Linear(self.h_dim + self.h_dim + self.h_dim, self.h_dim)  # modified
         ]
         if self.batch_norm:
             layers_decoder.append(torch.nn.BatchNorm1d(self.h_dim))
-        layers_decoder = layers_decoder+[
+        layers_decoder = layers_decoder + [
             nn.ReLU(),
             nn.Linear(self.h_dim, self.h_dim)
         ]
         if self.batch_norm:
             layers_decoder.append(torch.nn.BatchNorm1d(self.h_dim))
-        layers_decoder = layers_decoder+[
+        layers_decoder = layers_decoder + [
             nn.ReLU(),
         ]
 
         layers_decoder.append(
-          nn.Linear(self.h_dim, self.n_mixtures + self.n_mixtures * 2 * self.y_dim )
+            nn.Linear(self.h_dim, self.n_mixtures + self.n_mixtures * 2 * self.y_dim)
         )
 
         ## (decoder) Normal distribution
         self.decoder = torch.nn.Sequential(*layers_decoder)
 
         # recurrence function (f_theta) -> Recurrence
-        #self._rnn =  nn.LSTM(self.h_dim + self.h_dim + self.h_dim, self.h_dim, self.n_layers, bias, batch_first= True)#modified
-        
-        self._rnn =  LSTMCore(input_size = self.h_dim + self.h_dim + self.h_dim, 
-                              hidden_size = self.h_dim, 
-                              num_layers = self.n_layers,  
-                              batch_first = True, 
-                              train_truncate = 100, 
-                              train_burn_in  = 80)
-        
-        self.discriminator = RGANDiscriminator(sequence_length = self.sequence_length,
-                                               input_size =  2 * self.h_dim + self.u_dim + self.y_dim,
-                                               hidden_size = self.h_dim,
-                                               num_layers = num_layer_discriminator
+        # self._rnn =  nn.LSTM(self.h_dim + self.h_dim + self.h_dim, self.h_dim, self.n_layers, bias, batch_first= True)#modified
+
+        self._rnn = LSTMCore(input_size=self.h_dim + self.h_dim + self.h_dim,
+                             hidden_size=self.h_dim,
+                             num_layers=self.n_layers,
+                             batch_first=True,
+                             train_truncate=100,
+                             train_burn_in=80)
+
+        self.discriminator = RGANDiscriminator(sequence_length=self.sequence_length,
+                                               input_size=2 * self.h_dim + self.u_dim + self.y_dim,
+                                               hidden_size=self.h_dim,
+                                               num_layers=num_layer_discriminator
                                                )
         if self._learn_init_state:
             self.to_init_state_h = nn.Linear(u_dim, self.h_dim * self.n_layers * self.num_directions)
             self.to_init_state_c = nn.Linear(u_dim, self.h_dim * self.n_layers * self.num_directions)
         self.to(self.device)
-        #self.apply(self.weight_init)
+        # self.apply(self.weight_init)
 
     def wgan_gp_reg(self, x_real, x_fake, center=1., lambda_gp=10.0):
 
@@ -331,21 +333,22 @@ class VRNN_GMM(nn.Module):
 
         eps = torch.rand((batch_size, 1, 1)).repeat(1, T, D).to(self.device)
 
-        #eps = torch.randn_like(x_real).to(self.device)
+        # eps = torch.randn_like(x_real).to(self.device)
         x_interp = (eps * x_real + (1 - eps) * x_fake)
         x_interp.requires_grad_(True)
         d_out = self.discriminator(x_interp)
-        #for name, param in self.discriminator.named_parameters():
+        # for name, param in self.discriminator.named_parameters():
         #   if param.requires_grad==True:
         #      print(name, param.data, param.grad_fn)
 
-        gradients = torch.autograd.grad(inputs = x_interp,
-                                       outputs  = d_out,
-                                       grad_outputs = torch.autograd.Variable(torch.ones_like(d_out), requires_grad=False).to(self.device),
-                                       create_graph = True,
-                                       retain_graph = True,
+        gradients = torch.autograd.grad(inputs=x_interp,
+                                        outputs=d_out,
+                                        grad_outputs=torch.autograd.Variable(torch.ones_like(d_out),
+                                                                             requires_grad=False).to(self.device),
+                                        create_graph=True,
+                                        retain_graph=True,
                                         only_inputs=True,
-                                       )[0]
+                                        )[0]
 
         gradients = gradients.view(gradients.size(), -1)
         gradient_penalty = (((gradients + 1e-16).norm(2, dim=1) - center) ** 2).mean() * lambda_gp
@@ -361,44 +364,49 @@ class VRNN_GMM(nn.Module):
         if self._learn_init_state:
             c_0 = self.to_init_state_c(torch.squeeze(first_obs[:, :, 0:1], dim=-1))
             c_0 = c_0.reshape(-1, self.n_layers, self.h_dim).transpose(0, 1).contiguous()
-            h_0 = self.to_init_state_h(torch.squeeze(first_obs[:, :, 0:1],  dim=-1))
+            h_0 = self.to_init_state_h(torch.squeeze(first_obs[:, :, 0:1], dim=-1))
             h_0 = h_0.reshape(-1, self.n_layers, self.h_dim).transpose(0, 1).contiguous()
 
         elif self.zero_init:
-            h_0 = torch.nn.Parameter(torch.zeros(self.n_layers, batch_size, self.h_dim).to(self.device), requires_grad=True)
-            c_0 = torch.nn.Parameter(torch.zeros(self.n_layers, batch_size, self.h_dim).to(self.device), requires_grad=True)
+            h_0 = torch.nn.Parameter(torch.zeros(self.n_layers, batch_size, self.h_dim).to(self.device),
+                                     requires_grad=True)
+            c_0 = torch.nn.Parameter(torch.zeros(self.n_layers, batch_size, self.h_dim).to(self.device),
+                                     requires_grad=True)
         else:
-            h_0 = torch.nn.Parameter(torch.rand(self.n_layers, batch_size, self.h_dim).to(self.device), requires_grad=True)
-            c_0 = torch.nn.Parameter(torch.rand(self.n_layers, batch_size, self.h_dim).to(self.device), requires_grad=True)
-        
+            h_0 = torch.nn.Parameter(torch.rand(self.n_layers, batch_size, self.h_dim).to(self.device),
+                                     requires_grad=True)
+            c_0 = torch.nn.Parameter(torch.rand(self.n_layers, batch_size, self.h_dim).to(self.device),
+                                     requires_grad=True)
+
         return (h_0, c_0)
 
     def forward(self, u, y):
-        deterministic_hidden_state=[]
+        deterministic_hidden_state = []
         batch_size = y.size(0)
-        #input has size (Batch, D, seq_len)
-        #seq_len = y.shape[-1]
-        seq_len = [torch.max((u[i,0,:]!=0).nonzero()).item()+1 for i in range(u.shape[0])]
+        # input has size (Batch, D, seq_len)
+        # seq_len = y.shape[-1]
+        seq_len = [torch.max((u[i, 0, :] != 0).nonzero()).item() + 1 for i in range(u.shape[0])]
 
-        noise  = torch.randn(size=(batch_size, self.sequence_length, self.z_dim)).to(self.device)
+        noise = torch.randn(size=(batch_size, self.sequence_length, self.z_dim)).to(self.device)
         fake_y = torch.zeros(batch_size, self.sequence_length, self.y_dim).to(self.device)
-        attetion_latent = torch.zeros(batch_size, self.sequence_length, 2* self.h_dim, device=self.device).to(self.device)
+        attention_latent = torch.zeros(batch_size, self.sequence_length, 2 * self.h_dim, device=self.device).to(
+            self.device)
         ##======fiding sequece length of each episode =======##
-        #mask = ~u.eq(0.0)
+        # mask = ~u.eq(0.0)
 
-        #sqn  = torch.unique(mask.sum(dim=-1), sorted=False, dim=1).squeeze(-1)
-        #sqn  = sqn.cpu()
-        #print(seq_len,sqn, u.shape)
-        #assert torch.all(torch.eq(seq_len, sqn))
+        # sqn  = torch.unique(mask.sum(dim=-1), sorted=False, dim=1).squeeze(-1)
+        # sqn  = sqn.cpu()
+        # print(seq_len,sqn, u.shape)
+        # assert torch.all(torch.eq(seq_len, sqn))
         ##==================== (new) =====================##
-        reshaped_u  = u.permute(0,2,1)
-        reshaped_y  = y.permute(0,2,1)
+        reshaped_u = u.permute(0, 2, 1)
+        reshaped_y = y.permute(0, 2, 1)
 
         assert not torch.isnan(reshaped_u).any()
         assert not torch.isnan(reshaped_y).any()
         assert torch.isfinite(reshaped_u).any()
 
-        #mistmach between input???
+        # mistmach between input???
         if self._MaskedNorm:
             normed_u = self.norm_u(reshaped_u)
             normed_y = self.norm_y(reshaped_y)
@@ -410,17 +418,17 @@ class VRNN_GMM(nn.Module):
             context_u = reshaped_u
             context_y = reshaped_y
         if self.self_attention_type is not "multihead":
-           mean_attn, logvar_attn = self._latent_encoder(context_u, context_y)
+            mean_attn, logvar_attn = self._latent_encoder(context_u, context_y)
         else:
-           mean_attn, logvar_attn, attn_loss  = self._latent_encoder(context_u, context_y)
-       #mean_attn [B, :seq_len, D_h])
+            mean_attn, logvar_attn, attn_loss = self._latent_encoder(context_u, context_y)
+        # mean_attn [B, :seq_len, D_h])
         ##=============##
         # allocation
         total_loss = 0
         # initialization
         input_ = self.input_drop(u)
-        h, c   = self.initialize_state_vectors(batch_size, first_obs=input_)
-        
+        h, c = self.initialize_state_vectors(batch_size, first_obs=input_)
+
         # for all time steps
         for i in range(len(seq_len)):
             for t in range(seq_len[i]):
@@ -433,57 +441,58 @@ class VRNN_GMM(nn.Module):
                 encoder_input = torch.cat([phi_u_t, phi_y_t, h[-1]], dim=1)
                 encoder_input = self.enc(encoder_input)
 
-                enc_mean_t     = torch.clamp(self.enc_mean(encoder_input), *self.output_clamp)
-                enc_logvar_t   = self.enc_logvar(encoder_input)
-                enc_logvar_t   = torch.clamp(nn.Softplus()(enc_logvar_t), *self.output_clamp)
+                enc_mean_t = torch.clamp(self.enc_mean(encoder_input), *self.output_clamp)
+                enc_logvar_t = self.enc_logvar(encoder_input)
+                enc_logvar_t = torch.clamp(nn.Softplus()(enc_logvar_t), *self.output_clamp)
                 posterior_dist = Independent(Normal(enc_mean_t, enc_logvar_t.exp().sqrt()), 1)
                 # prior: h_t -> z_t (for KLD loss)
-                prior_input  = h[-1]
-                prior_input  = self.prior(prior_input)
+                prior_input = h[-1]
+                prior_input = self.prior(prior_input)
 
-                prior_mean_t   = self.prior_mean(prior_input)
+                prior_mean_t = self.prior_mean(prior_input)
                 prior_logvar_t = self.prior_logvar(prior_input)
                 prior_logvar_t = nn.Softplus()(prior_logvar_t)
-                
+                # prior = self.reparametrization(prior_mean_t, prior_logvar_t)
+
                 # sampling and reparameterization: get a new z_t
-                #temp = tdist.Normal(enc_mean_t, enc_logvar_t.exp().sqrt())
-                #z_t = tdist.Normal.rsample(temp)
-                z_t      = self.reparametrization(enc_mean_t, enc_logvar_t)
+                # temp = tdist.Normal(enc_mean_t, enc_logvar_t.exp().sqrt())
+                # z_t = tdist.Normal.rsample(temp)
+                z_t = self.reparametrization(enc_mean_t, enc_logvar_t)
 
                 # feature extraction: z_t
-                phi_z_t  = self.phi_z(z_t)
+                phi_z_t = self.phi_z(z_t)
                 ### fake data for discriminator
-                fake_phi_z_t = self.phi_z(noise[:,t,:])
+                fake_phi_z_t = self.phi_z(noise[:, t, :])
                 #####=====(new)======######
 
-                #mean attention size :torch.Size([B, time, D_hid])
-                c_t_mu     = mean_attn[:, t, :]
+                # mean attention size :torch.Size([B, time, D_hid])
+                c_t_mu = mean_attn[:, t, :]
                 c_t_logvar = logvar_attn[:, t, :]
-                #phi_z_t:torch.Size([B, D_hid])
-                #c_final :torch.Size([B, D_hid])
-                c_final    =  self.reparametrization(c_t_mu, c_t_logvar)
+                # phi_z_t:torch.Size([B, D_hid])
+                # c_final :torch.Size([B, D_hid])
+                c_final = self.reparametrization(c_t_mu, c_t_logvar)
 
                 #####================######
                 # decoder: h_t, z_t -> y_t
-                decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)##(modified)
-                _ , dist = self._decode(decoder_input)
+                decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)  ##(modified)
+                _, dist = self._decode(decoder_input)
 
-                attetion_latent[:,t,:] = torch.cat([phi_z_t, c_final], dim=1)
-                #fake latent dimension pass through the decoder
-                decoder_input_fake = torch.cat([fake_phi_z_t, c_final, h[-1]], dim=1)##(modified)
-                fake_y[:,t,:], _   = self._decode(decoder_input_fake)
+                attention_latent[:, t, :] = torch.cat([phi_z_t, c_final], dim=1)
+                # fake latent dimension pass through the decoder
+                decoder_input_fake = torch.cat([fake_phi_z_t, c_final, h[-1]], dim=1)  ##(modified)
+                fake_y[:, t, :], _ = self._decode(decoder_input_fake)
 
-                RNN_inputs  = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
-                #input of RNN module torch.Size([B, 3*H]) ==>[B,T,3*H]
+                RNN_inputs = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
+                # input of RNN module torch.Size([B, 3*H]) ==>[B,T,3*H]
 
                 # recurrence: u_t+1, z_t -> h_t+1
-                _, (h, c) = self._rnn( torch.unsqueeze(RNN_inputs, 1), (h,c)) ##(modified)Size [2, B, H]
+                _, (h, c) = self._rnn(torch.unsqueeze(RNN_inputs, 1), (h, c))  ##(modified)Size [2, B, H]
 
                 # computing the loss
                 KLD = self.kld_gauss(enc_mean_t, enc_logvar_t, prior_mean_t, prior_logvar_t)
-                
+
                 assert not torch.isnan(KLD)
-                KLD_ATTN = self.kld_attention(c_t_mu, c_t_logvar) ##(new)
+                KLD_ATTN = self.kld_attention(c_t_mu, c_t_logvar)  ##(new)
                 assert not torch.isnan(KLD_ATTN)
                 # Create the observation model (generating distribution) p(y_t|z_t,h_t, c_t)
 
@@ -491,49 +500,48 @@ class VRNN_GMM(nn.Module):
                 loss_pred = log_p.mean()
                 assert not torch.isnan(loss_pred)
                 assert torch.isfinite(loss_pred)
-                
+
                 total_loss += - loss_pred + KLD + KLD_ATTN
                 deterministic_hidden_state.append(h[-1])
 
-        deterministic_hidden_state=torch.stack(deterministic_hidden_state).view(batch_size,-1,self.h_dim)
-        hs =  deterministic_hidden_state.permute(0,2,1)
+        deterministic_hidden_state = torch.stack(deterministic_hidden_state).view(batch_size, -1, self.h_dim)
+        hs = deterministic_hidden_state.permute(0, 2, 1)
 
         padded = nn.ConstantPad1d((0, reshaped_u.shape[1] - deterministic_hidden_state.shape[1]), 0)(hs)
-        hs = padded.permute(0,2,1)
+        hs = padded.permute(0, 2, 1)
 
-        #for Discriminator
-        input_feature = torch.cat((attetion_latent, reshaped_u, reshaped_y), dim=2)
+        # for Discriminator
+        input_feature = torch.cat((attention_latent, reshaped_u, reshaped_y), dim=2)
         disc_real = self.discriminator(input_feature, seq_len)
 
-        fake_input_feature = torch.cat((attetion_latent, reshaped_u, fake_y), dim=2)
+        fake_input_feature = torch.cat((attention_latent, reshaped_u, fake_y), dim=2)
         disc_fake = self.discriminator(fake_input_feature, seq_len)
-
 
         d_loss = -torch.mean(disc_real) + torch.mean(disc_fake)
 
         if self.self_attention_type is not "multihead":
-           return total_loss, d_loss, deterministic_hidden_state, input_feature, fake_input_feature
+            return total_loss, d_loss, deterministic_hidden_state, input_feature, fake_input_feature
         else:
-           return total_loss + attn_loss, d_loss, deterministic_hidden_state, input_feature, fake_input_feature
-
+            return total_loss + attn_loss, d_loss, deterministic_hidden_state, input_feature, fake_input_feature, \
+                   attention_latent
 
     def reparametrization(self, mu, log_var):
 
         # Reparametrization trick
-        var = torch.exp(log_var* 0.5)
+        var = torch.exp(log_var * 0.5)
         eps = torch.FloatTensor(var.size()).normal_(mean=0, std=1).to(self.device)
         eps = torch.autograd.Variable(eps)
 
         return eps.mul(var).add_(mu).add_(1e-7)
 
     def _decode(self, x):
-        x_decoder     = self.decoder(x)
+        x_decoder = self.decoder(x)
         # Get the mixing probabilities from the decoder
-        mix_probs    = x_decoder[:, : self.n_mixtures]
+        mix_probs = x_decoder[:, : self.n_mixtures]
         # Return all (for every component) means and standard deviations from the decoder
-        mu, sigma = x_decoder[:, self.n_mixtures :].chunk(2, dim=-1)
-                
-        sigma = nn.Softplus()(sigma )
+        mu, sigma = x_decoder[:, self.n_mixtures:].chunk(2, dim=-1)
+
+        sigma = nn.Softplus()(sigma)
         batch_n = mu.shape[0]
         mu = mu.view(batch_n, self.n_mixtures, self.y_dim)
         sigma = sigma.view(batch_n, self.n_mixtures, self.y_dim)
@@ -549,17 +557,17 @@ class VRNN_GMM(nn.Module):
         # Return a distribution p(y_t|z_t,h_t)
         out = gmm.sample()
         return out, gmm
-        
+
     def generate(self, u, seq_len=None):
         # get the batch size
         batch_size, D, T = u.shape
         hd = []
         # length of the sequence to generate
-        #seq_len = u.shape[-1]
+        # seq_len = u.shape[-1]
         if seq_len is None:
-           seq_len = [torch.max((u[i,0,:]!=0).nonzero()).item()+1 for i in range(u.shape[0])]
+            seq_len = [torch.max((u[i, 0, :] != 0).nonzero()).item() + 1 for i in range(u.shape[0])]
         elif isinstance(seq_len, int):
-           seq_len=[seq_len]*batch_size
+            seq_len = [seq_len] * batch_size
 
         # allocation
         sample = torch.zeros(batch_size, self.y_dim, T, device=self.device)
@@ -568,7 +576,7 @@ class VRNN_GMM(nn.Module):
 
         ## use the learned initial state based on the first frame.
         input_ = self.input_drop(u)
-        h, c   = self.initialize_state_vectors(batch_size, first_obs=input_)
+        h, c = self.initialize_state_vectors(batch_size, first_obs=input_)
         # for all time steps
         for i in range(len(seq_len)):
             for t in range(seq_len[i]):
@@ -576,17 +584,17 @@ class VRNN_GMM(nn.Module):
                 phi_u_t = self.phi_u(u[:, :, t])
 
                 # prior: h_t -> z_t
-                prior_input  = h[-1]
-                prior_input  = self.prior(prior_input)
+                prior_input = h[-1]
+                prior_input = self.prior(prior_input)
 
-                prior_mean_t   = self.prior_mean(prior_input)
+                prior_mean_t = self.prior_mean(prior_input)
                 prior_logvar_t = self.prior_logvar(prior_input)
                 prior_logvar_t = nn.Softplus()(prior_logvar_t)
 
                 # sampling and reparameterization: get new z_t
-                #temp = tdist.Normal(prior_mean_t, prior_logvar_t.exp().sqrt())
-                #z_t = tdist.Normal.rsample(temp)
-                
+                # temp = tdist.Normal(prior_mean_t, prior_logvar_t.exp().sqrt())
+                # z_t = tdist.Normal.rsample(temp)
+
                 z_t = self.reparametrization(prior_mean_t, prior_logvar_t)
                 # feature extraction: z_t
                 phi_z_t = self.phi_z(z_t)
@@ -597,25 +605,25 @@ class VRNN_GMM(nn.Module):
                 ##==================================##
                 # decoder: z_t, h_t -> y_t
 
-                decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)##(modified)
+                decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)  ##(modified)
 
                 sample[:, :, t], gmm = self._decode(decoder_input)
 
-                sample_mu[:, :, t]    = gmm.mean
-                sample_sigma[:, :, t] = gmm.variance**0.5
+                sample_mu[:, :, t] = gmm.mean
+                sample_sigma[:, :, t] = gmm.variance ** 0.5
 
                 # recurrence: u_t+1, z_t -> h_t+1
                 RNN_inputs = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
-                #input(B,T,H )
+                # input(B,T,H )
 
-                _, (h, c) = self._rnn(torch.unsqueeze(RNN_inputs, 1), (h,c))##(modified)
+                _, (h, c) = self._rnn(torch.unsqueeze(RNN_inputs, 1), (h, c))  ##(modified)
                 hd.append(h[-1])
 
-        hidden_state = torch.stack(hd).view(batch_size,-1,self.h_dim)
-        hs     =  hidden_state.permute(0,2,1)
+        hidden_state = torch.stack(hd).view(batch_size, -1, self.h_dim)
+        hs = hidden_state.permute(0, 2, 1)
 
         padded = nn.ConstantPad1d((0, T - hidden_state.shape[1]), 0)(hs)
-        hs     = padded.permute(0,2,1)
+        hs = padded.permute(0, 2, 1)
         return sample, sample_mu, sample_sigma, hs
 
     @staticmethod
@@ -634,31 +642,34 @@ class VRNN_GMM(nn.Module):
         samples = q.sample(sample_shape=(NUM_of_MC_SAMPLES,))
         px = p.log_prob(samples)
         qx = q.log_prob(samples)
-        return torch.mean(qx-px)  
+        return torch.mean(qx - px)
 
     @staticmethod
     def kld_attention(mu_attn, logvar_attn):
-        kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar_attn - mu_attn ** 2 - logvar_attn.exp(), dim = 1), dim = 0)
+        kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar_attn - mu_attn ** 2 - logvar_attn.exp(), dim=1), dim=0)
         return kld_loss
 
 
 class DynamicModel(VRNN_GMM):
 
-    def __init__(self, 
-                 num_inputs, 
-                 num_outputs, 
-                 h_dim=96, 
-                 z_dim=48, 
-                 n_layers=2, 
-                 n_mixtures=10, 
+    def __init__(self,
+                 num_inputs,
+                 num_outputs,
+                 h_dim=96,
+                 z_dim=48,
+                 n_layers=2,
+                 n_mixtures=10,
                  sequence_length=200,
-                 device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 
+                 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
                  learn_init_state=True,
-                 bidirectional=False, 
-                 normalizer_input=None, 
+                 bidirectional=False,
+                 normalizer_input=None,
                  normalizer_output=None,
                  *args, **kwargs):
-        super(DynamicModel, self).__init__(u_dim=num_inputs, y_dim= num_outputs, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers, n_mixtures=n_mixtures, sequence_length=sequence_length, device=device, learn_init_state=learn_init_state, bidirectional=bidirectional)
+        super(DynamicModel, self).__init__(u_dim=num_inputs, y_dim=num_outputs, h_dim=h_dim, z_dim=z_dim,
+                                           n_layers=n_layers, n_mixtures=n_mixtures, sequence_length=sequence_length,
+                                           device=device, learn_init_state=learn_init_state,
+                                           bidirectional=bidirectional)
         # Save parameters
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
@@ -666,27 +677,27 @@ class DynamicModel(VRNN_GMM):
         self.kwargs = kwargs
         self.normalizer_input = normalizer_input
         self.normalizer_output = normalizer_output
-       
+
         self.to(device)
 
     @property
     def num_model_inputs(self):
         return self.num_inputs + self.num_outputs if self.ar else self.num_inputs
 
-    def forward(self, u, y = None):
+    def forward(self, u, y=None):
         if self.normalizer_input is not None:
             u = self.normalizer_input.normalize(u)
         if y is not None and self.normalizer_output is not None:
             y = self.normalizer_output.normalize(y)
 
-        vrnn_loss, d_loss, hidden, real_feature, fake_feature = super(DynamicModel, self).forward(u, y)
-        return vrnn_loss, d_loss, hidden, real_feature, fake_feature
+        vrnn_loss, d_loss, hidden, real_feature, fake_feature, attention_latent = super(DynamicModel, self).forward(u, y)
+        return vrnn_loss, d_loss, hidden, real_feature, fake_feature, attention_latent
 
-    def generate(self, u, y=None):
+    def generate(self, u, seq_len=None):
         if self.normalizer_input is not None:
             u = self.normalizer_input.normalize(u)
 
-        y_sample, y_sample_mu, y_sample_sigma, hidden = super(DynamicModel, self).generate(u)
+        y_sample, y_sample_mu, y_sample_sigma, hidden = super(DynamicModel, self).generate(u, seq_len)
 
         if self.normalizer_output is not None:
             y_sample = self.normalizer_output.unnormalize(y_sample)
@@ -697,12 +708,14 @@ class DynamicModel(VRNN_GMM):
 
         return y_sample, y_sample_mu, y_sample_sigma, hidden
 
+
 class ModelState:
     """
     Container for all model related parameters and optimizer
     model
     optimizer
     """
+
     def __init__(self,
                  seed,
                  nu,
@@ -712,8 +725,8 @@ class ModelState:
                  z_dim=100,
                  n_layers=2,
                  n_mixtures=8,
-                 device= torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-                 optimizer_type= "MADGRAD",
+                 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+                 optimizer_type="MADGRAD",
                  **kwargs):
 
         random.seed(seed)
@@ -721,59 +734,59 @@ class ModelState:
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
 
-        self.h_dim=h_dim
-        self.z_dim=z_dim
-        self.n_layers=n_layers
-        self.n_mixtures= n_mixtures
+        self.h_dim = h_dim
+        self.z_dim = z_dim
+        self.n_layers = n_layers
+        self.n_mixtures = n_mixtures
 
-        self.model = DynamicModel( num_inputs=nu, num_outputs=ny, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers, n_mixtures=n_mixtures, sequence_length=sequence_length, device=device, **kwargs)
+        self.model = DynamicModel(num_inputs=nu, num_outputs=ny, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers,
+                                  n_mixtures=n_mixtures, sequence_length=sequence_length, device=device, **kwargs)
         if optimizer_type == "AdaBelief":
             self.optimizer = torch_optimizer.AdaBelief(self.model.parameters(),
-                                                       lr= 1e-4,
-                                                      betas=(0.9, 0.999),
-                                                      eps=1e-6,
-                                                      weight_decay=0
-                                                      )
-        elif optimizer_type=="AdamW":
+                                                       lr=1e-4,
+                                                       betas=(0.9, 0.999),
+                                                       eps=1e-6,
+                                                       weight_decay=0
+                                                       )
+        elif optimizer_type == "AdamW":
             self.optimizer = torch.optim.AdamW(self.model.parameters(),
-                                               lr= 1e-4,
+                                               lr=1e-4,
                                                betas=(0.9, 0.999),
                                                weight_decay=0.001
-                                              )
-        elif optimizer_type=="SGD":
-            self.optimizer  = torch_optimizer.SGDW(self.model.parameters(),
-                                                   lr= 1e-4,
-                                                   momentum=0,
-                                                   dampening=0,
-                                                   weight_decay=1e-2,
-                                                   nesterov=False,
-                                                   )
-        elif optimizer_type=="MADGRAD":
+                                               )
+        elif optimizer_type == "SGD":
+            self.optimizer = torch_optimizer.SGDW(self.model.parameters(),
+                                                  lr=1e-4,
+                                                  momentum=0,
+                                                  dampening=0,
+                                                  weight_decay=1e-2,
+                                                  nesterov=False,
+                                                  )
+        elif optimizer_type == "MADGRAD":
             self.optimizer = torch_optimizer.MADGRAD(self.model.parameters(),
                                                      lr=3e-4,
                                                      momentum=0.0,
                                                      weight_decay=0,
                                                      eps=1e-6,
-                                                    )
+                                                     )
         else:
             # Optimization parameters
-            yogi = torch_optimizer.Yogi(self.model.parameters(), 
-                                        lr= 0.5e-4,
-                                        betas=(0.5, 0.999), 
-                                        eps=1e-3, 
-                                        initial_accumulator=1e-6, 
-                                        weight_decay=0,)
+            yogi = torch_optimizer.Yogi(self.model.parameters(),
+                                        lr=0.5e-4,
+                                        betas=(0.5, 0.999),
+                                        eps=1e-3,
+                                        initial_accumulator=1e-6,
+                                        weight_decay=0, )
 
             self.optimizer = torch_optimizer.Lookahead(yogi, k=5, alpha=0.5)
-
 
     def load_model(self, path, name='VRNN_model.pt', map_location=None):
         file = path if os.path.isfile(path) else os.path.join(path, name)
         try:
             if map_location is None:
-               ckpt = torch.load(file, map_location=lambda storage, loc: storage)
+                ckpt = torch.load(file, map_location=lambda storage, loc: storage)
             else:
-               ckpt = torch.load(file, map_location=map_location)
+                ckpt = torch.load(file, map_location=map_location)
         except NotADirectoryError:
             raise Exception("Could not find model: " + file)
         loaded_state_dict = _strip_prefix_if_present(ckpt.pop("model"), prefix="module.")
@@ -783,15 +796,15 @@ class ModelState:
         vloss = ckpt['vloss']
         return epoch, vloss
 
-    def save_model(self, epoch, vloss, elapsed_time,  path, name='VRNN_model.pt'):
+    def save_model(self, epoch, vloss, elapsed_time, path, name='VRNN_model.pt'):
         # check if path exists and create otherwise
         if not os.path.exists(path):
             os.makedirs(path)
         torch.save({
-                'epoch': epoch,
-                'model': _strip_prefix_if_present(self.model.state_dict(), 'module.'),
-                'optimizer': self.optimizer.state_dict(),
-                'vloss': vloss,
-                'elapsed_time': elapsed_time,
-            },
+            'epoch': epoch,
+            'model': _strip_prefix_if_present(self.model.state_dict(), 'module.'),
+            'optimizer': self.optimizer.state_dict(),
+            'vloss': vloss,
+            'elapsed_time': elapsed_time,
+        },
             os.path.join(path, name))

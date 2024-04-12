@@ -147,7 +147,7 @@ def rgp_step(n_iter, losses):
     gp_pbar = tqdm(range(n_iter))
     for s in gp_pbar:
       with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples): # to do: make this a hyperparameter as well
-        # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
+        # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the wm_image_replay_buffer (including terminal flags)
         observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)    # Transitions start at time t = 0
         latent_states = observations
         # print("raw rewards", rewards)
@@ -220,7 +220,7 @@ def test_recurrent_gp(n_test):
   rmse_rewards = 0
   for s in range(n_test):
     with gpytorch.settings.num_likelihood_samples(args.num_gp_likelihood_samples): # to do: make this a hyperparameter as well
-    # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
+    # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the wm_image_replay_buffer (including terminal flags)
       observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)
       latent_states = observations
       # latent_states : <chunk_size, batch_size, z_dim>
@@ -302,7 +302,7 @@ if args.experience_replay is not '' and os.path.exists(args.experience_replay):
   metrics['steps'], metrics['episodes'] = [D.steps] * D.episodes, list(range(1, D.episodes + 1))
 elif not args.test:
   D = ExperienceReplay(args.experience_size, args.symbolic_env, env.observation_size, env.action_size, args.bit_depth, args.device, args.input_size)
-  # Initialise dataset D with S random seed episodes
+  # Initialise wm_image_replay_buffer D with S random seed episodes
   for s in range(1, args.seed_episodes + 1):
     observation, done, t = env.reset(), False, 0
     rewards = []

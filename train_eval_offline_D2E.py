@@ -64,7 +64,7 @@ def train_eval_offline(
         done=False,
         device=None
 ):
-    ###Training a policy with a fixed dataset.###
+    ###Training a policy with a fixed wm_image_replay_buffer.###
     # Create tf_env to get specs.
     dm_env = gym.spec(env_name).make()
     env = alf_gym_wrapper.AlfGymWrapper(dm_env, discount=discount)
@@ -88,7 +88,7 @@ def train_eval_offline(
             # to the value unpickled
             full_data = CustomUnpickler(f, map_location=device).load()
 
-    logging.info('Loading data from dataset with size %d , %d ...', data_size, full_data.size)
+    logging.info('Loading data from wm_image_replay_buffer with size %d , %d ...', data_size, full_data.size)
     for k, v in full_data._config.items():
         if k == 'observation_spec':
             full_data._config['observation_spec'] = observation_spec
