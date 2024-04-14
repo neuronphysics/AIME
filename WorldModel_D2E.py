@@ -93,6 +93,7 @@ class WorldModel(nn.Module):
                  restore=False):
         super(WorldModel, self).__init__()
 
+        self.sequence_len = sequence_length
         self.optimizer = None
         self.discriminator_optim = None
         self.wm_image_replay_buffer = train_data
@@ -103,13 +104,15 @@ class WorldModel(nn.Module):
             print("Directory '%s' created successfully" % self.model_path)
         except OSError as error:
             print("Directory '%s' can not be created")
+        self.ckpt_path = self.model_path + '/best_model'
+        os.makedirs(self.ckpt_path, exist_ok=True)
+        self.save_path = os.path.join(self.ckpt_path, 'WorldModel.pth')
 
         self._params = namedtuple('x', hyperParams.keys())(*hyperParams.values())
         self._discount = self._params.GAMMA
         # set the environment
         self._env_name = env_name
         domain_name, task_name = env_name.split("_")
-        print(domain_name, task_name)
         env = DMCGYMWrapper(
             domain_name=domain_name,
             task_name=task_name,
@@ -136,7 +139,6 @@ class WorldModel(nn.Module):
                 self.observation_dim = tuple(0 for i in range(len(getattr(self, attr_name))))
             self.observation_dim = tuple(map(operator.add, self.observation_dim, getattr(self, attr_name)))
             i += 1
-        print(f"total size of action and observation spaces in {env_name} are {self.action_dim} {self.observation_dim}")
 
         self.device = device
         self._clip_rewards = "tanh"
@@ -148,13 +150,9 @@ class WorldModel(nn.Module):
         self.heads["done"] = MLP(shape=2, layers=4, units=400, act="ELU", norm="none", dist="onehot",
                                  device=self.device)
 
-        self.ckpt_path = self.model_path + '/best_model'
-        os.makedirs(self.ckpt_path, exist_ok=True)
-        self.save_path = os.path.join(self.ckpt_path, 'WorldModel.pth')
-
         self.mse_loss = nn.MSELoss()
 
-        # inside VRNN folder we have main.py script : the traisition model
+        # inside VRNN folder we have main.py script : the transition model
         modelstate = ModelState(seed=self._params.seed,
                                 nu=self.state_dim + self.action_dim,
                                 ny=self.state_dim,
@@ -205,7 +203,8 @@ class WorldModel(nn.Module):
         self.writer = SummaryWriter(log_dir)
         self.writer_counter = 0
 
-        print("end of initializing the world model")
+        self.pbar = tqdm(range(self.n_discriminator_iter))
+        print("End of initializing the world model")
 
     def initialize_optimizer(self):
         self.optimizer = Optimizer("world_model",
@@ -222,11 +221,7 @@ class WorldModel(nn.Module):
                                              wd=1e-5,
                                              use_amp=self._use_amp)
 
-    def preprocess(self,
-                   observation,
-                   next_observation,
-                   reward,
-                   done):
+    def preprocess(self, observation, next_observation, reward, done):
         data = {"reward": {
             "identity": lambda x: x,
             "sign": torch.sign,
@@ -240,51 +235,68 @@ class WorldModel(nn.Module):
         data["done"] = done
         return data
 
-    # Use real data and imagine data to do training
-    def train_(self, data):
-        self.discriminator.train()
-        pbar = tqdm(range(self.n_discriminator_iter))
-        batch_size = data.s1.shape[0]
-        n_step = data.s1.shape[1]
-
-        obs = torch.reshape(data.s1, (-1, HYPER_PARAMETERS['n_channel'], HYPER_PARAMETERS['image_width'],
-                                      HYPER_PARAMETERS['image_width'])).to(self.device)
-        next_obs = torch.reshape(data.s2, (-1, HYPER_PARAMETERS['n_channel'], HYPER_PARAMETERS['image_width'],
-                                           HYPER_PARAMETERS['image_width'])).to(self.device)
-
-        z_fake, z_real = None, None
-        for _ in pbar:
+    def train_discriminator_get_latent(self, obs):
+        z_real, z_fake = None, None
+        for _ in self.pbar:
             z_real, z_x_mean, z_x_sigma, c_posterior, w_x_mean, w_x_sigma, gmm_dist, z_wc_mean_prior, \
             z_wc_logvar_prior, x_reconstructed = self.variational_autoencoder(obs)
             z_fake = gmm_dist.sample()
             critic_real = self.discriminator(z_real).reshape(-1)
             critic_fake = self.discriminator(z_fake).reshape(-1)
             gp = gradient_penalty(self.discriminator, z_real, z_fake, device=self.device)
-            loss_critic = (
-                    -(torch.mean(critic_real) - torch.mean(critic_fake)) + self._params.LAMBDA_GP * gp
-            )
+            loss_critic = (-(torch.mean(critic_real) - torch.mean(critic_fake)) + self._params.LAMBDA_GP * gp)
             self.discriminator_optim.zero_grad_()
             loss_critic.backward(retain_graph=True)
             torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self._params.MAX_GRAD_NORM, norm_type=2)
             self.discriminator_optim.step_()
 
         gen_fake = self.discriminator(z_fake).reshape(-1)
+        return z_real, gen_fake
+
+    def init_normalizer(self, full_train_set):
+        batch_size = 32
+        num_batch = full_train_set.size // batch_size
+        stacked_in, stacked_out = None, None
+        for i in range(num_batch):
+            batch = full_train_set.get_batch(np.arange(i * batch_size, (i + 1) * batch_size))
+
+            obs = torch.reshape(batch.s1, (-1, HYPER_PARAMETERS['n_channel'], HYPER_PARAMETERS['image_width'],
+                                                    HYPER_PARAMETERS['image_width'])).to(self.device)
+            next_obs = torch.reshape(batch.s2, (-1, HYPER_PARAMETERS['n_channel'], HYPER_PARAMETERS['image_width'],
+                                                         HYPER_PARAMETERS['image_width'])).to(self.device)
+            _, _, _, z_real, _, _, _ = self.encoder(obs)
+            _, _, _, z_next, _, _, _ = self.encoder(next_obs)
+            inputs, outputs = append_action_and_latent_obs(z_real, batch.a1.to(self.device), z_next,
+                                                           self.sequence_len)
+            if i == 0:
+                stacked_in = inputs.cpu().detach()
+                stacked_out = outputs.cpu().detach()
+            else:
+                stacked_in = torch.cat((stacked_in, inputs.cpu().detach()), dim=0)
+                stacked_out = torch.cat((stacked_out, outputs.cpu().detach()), dim=0)
+
+        normalizer_input, normalizer_output = compute_normalizer(stacked_in, stacked_out)
+        self.transition_model.normalizer_input = normalizer_input
+        self.transition_model.normalizer_output = normalizer_output
+
+    def train_(self, data):
+        self.discriminator.train()
+
+        obs = torch.reshape(data.s1, (-1, HYPER_PARAMETERS['n_channel'], HYPER_PARAMETERS['image_width'],
+                                      HYPER_PARAMETERS['image_width'])).to(self.device)
+        next_obs = torch.reshape(data.s2, (-1, HYPER_PARAMETERS['n_channel'], HYPER_PARAMETERS['image_width'],
+                                           HYPER_PARAMETERS['image_width'])).to(self.device)
+
+        z_real, gen_fake = self.train_discriminator_get_latent(obs)
 
         self.transition_model.train()
         self.optimizer.zero_grad()
         w_x, w_x_mean, w_x_sigma, z_next, z_next_mean, z_next_sigma, c_posterior = self.encoder(next_obs)
 
         # Prepare & normalize the input/output data for the transition model
-        inputs, outputs = append_action_and_latent_obs(z_real, data.a1.to(self.device), z_next, n_step)
+        inputs, outputs = append_action_and_latent_obs(z_real, data.a1.to(self.device), z_next, self.sequence_len)
         reshaped_inputs = inputs.permute(0, 2, 1)
         reshaped_outputs = outputs.permute(0, 2, 1)
-        # TODO move normalize to init and re-implement it
-        # train_dataset = TensorDataset(reshaped_inputs, reshaped_outputs)
-        # data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
-        # normalizer_input, normalizer_output = compute_normalizer(data_loader)
-        # self.transition_model.normalizer_input = normalizer_input
-        # self.transition_model.normalizer_output = normalizer_output
-        # u, y = next(iter(data_loader))
 
         with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
             transition_loss, transition_disc_loss, hidden, real_embed, fake_embed, latent = self.transition_model(
@@ -302,10 +314,7 @@ class WorldModel(nn.Module):
                 like = dist.log_prob(getattr(data, key).unsqueeze(-1).to(self.device))
                 likes[key] = like
                 losses[key] = -like.mean()
-        model_loss = sum(
-            self.loss_scales.get(k, 1.0) * v for k, v in losses.items()
-        )
-        print(f"sum of reward and discount losses: {model_loss}")
+        model_loss = sum(self.loss_scales.get(k, 1.0) * v for k, v in losses.items())
 
         metrics, z_posterior, z_posterior_mean, z_posterior_sigma, c_posterior, w_posterior_mean, w_posterior_sigma, \
         dist, z_prior_mean, z_prior_logvar, X_reconst = self.variational_autoencoder.get_ELBO(obs)
@@ -345,14 +354,10 @@ class WorldModel(nn.Module):
 
     def imagine(self,
                 agent: Agent,
-                start_state: Dict[str, torch.Tensor],  # a combination of previous states & actions
+                start_state: Dict[str, torch.Tensor],
                 horizon: int,
                 done: torch.Tensor = None,
                 ):
-        tqdm.write("Collect data from imagination:")
-        # inspired https://github.com/sai-prasanna/mpc_and_rl/blob/1fedaec5eec7a2a5844935d17b4fd0ad385d9d6c/dreamerv2_torch/dreamerv2_torch/world_model.py#L86
-        # Main challenge : get frames from Mujoco and build a right type data structure with latent representations which are suitable for D2EAgent class (the planner)
-        # 
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
         start_state["action"] = agent._p_fn(start_state["feat"])[1]
         seq = {k: [v] for k, v in start_state.items()}
@@ -410,7 +415,6 @@ class WorldModel(nn.Module):
         return video.permute(1, 2, 0, 3, 4).reshape(T, H, B * W, C).cpu()
 
     def save(self):
-
         torch.save(
             {'transition_model': self.transition_model.state_dict(),
              'reward_model': self.reward_model.state_dict(),
@@ -423,9 +427,7 @@ class WorldModel(nn.Module):
              'world_model_optimizer': self.optimizer.state_dict(), }, self.save_path)
 
     def load_checkpoints(self):
-
         if os.path.isfile(self.save_path):
-
             model_dicts = torch.load(self.save_path, map_location=self.device)
             self.transition_model.load_state_dict(model_dicts['transition_model'])
             self.variational_autoencoder.load_state_dict(model_dicts['observation_model'])
@@ -487,7 +489,7 @@ class D2EAlgorithm(nn.Module):
                              env_name=self._env,
                              device=self.device,
                              **kwarg)
-        print("normalize the reward .....")
+
         self.RewardNorm = StreamNorm(momentum=0.99, scale=1.0, eps=1e-8)
         self.imag_horizon = sequence_length
         self._use_amp = True if self.precision == 16 else False
@@ -585,25 +587,9 @@ class D2EAlgorithm(nn.Module):
             report[f"openl_{name}"] = self.wm.video_pred(data, key)
         return report
 
-    def initialize_lazy_modules(self, data, task_behavior_train_data):
+    def initialize_lazy_modules(self, full_train_set):
         self.wm.initialize_optimizer()
-        real_embed, outputs, metrics = self.wm.train_(data._data)
-        start = outputs["post"]
-        batch_size = data.s1.shape[0]
-        n_step = data.s1.shape[1]
-        trans = Transition(
-            s1=torch.reshape(outputs['embedding'], (batch_size, n_step, -1)).cpu(),
-            s2=torch.reshape(outputs['post'], (batch_size, n_step, -1)).cpu(),
-            a1=data.a1,
-            a2=data.a2,
-            reward=data.reward,
-            done=data.done,
-            discount=data.discount
-        )
-        task_behavior_train_data.add_transitions_batch(trans)
-
-        self._task_behavior.train_step()
-
+        self.wm.init_normalizer(full_train_set)
 
 def main(config):
     def per_episode_record(ep, mode):
@@ -635,7 +621,6 @@ def main(config):
         suite, task = config.task.split("_", 1)  ###??
         if suite == "dmc":
             domain_name, task_name = task.split("_")
-            print(domain_name, task_name)
             new_env = DMCGYMWrapper(
                 domain_name=domain_name,
                 task_name=task_name,
@@ -655,8 +640,6 @@ def main(config):
                                image_channel_first=False,
                                )
             new_env.seed(config.seed)
-            # todo big generator don't have seed
-            # env.action_space.np_random.seed(args.seed)
         else:
             raise NotImplementedError(suite)
 
@@ -699,7 +682,7 @@ def main(config):
     should_video_eval = Every(config.eval_every)
     should_expl = Until(config.expl_until // config.action_repeat)
 
-    print("Create envs.")  # debug: stuck here
+    print("Create envs")  # debug: stuck here
     num_eval_envs = min(config.envs, config.eval_eps)
     if config.envs_parallel == "none":
         train_envs = [make_env("train") for _ in range(config.envs)]
@@ -745,15 +728,13 @@ def main(config):
         train_driver.reset()
         eval_driver.reset()
 
-    print("Create agent.")
+    print("Create model")
     train_dataset_generator = iter(train_replay.dataset(**n_step_data_generation_config))
     report_dataset_generator = iter(train_replay.dataset(**n_step_data_generation_config))
     eval_dataset_generator = iter(eval_replay.dataset(**n_step_data_generation_config))
 
     environment_name = config.task.partition('_')[2]
-    print(f"name of the environment {environment_name}")
 
-    print("start initializing the D2E algorithm class ....")
     full_train_dataset = DC.Dataset(observation_spec=obs_space, action_spec=act_space, size=config.length,
                                     group_size=config.sequence_size)
     data = next(train_dataset_generator)
@@ -777,7 +758,9 @@ def main(config):
 
     model = D2EAlgorithm(HYPER_PARAMETERS, wm_imagine_reply_buffer, task_behavior_reply_buffer, config.sequence_size,
                          obs_space, act_space, latent_space, step, environment_name, batch_size=config.batch_size)
-    model.initialize_lazy_modules(wm_imagine_reply_buffer, task_behavior_reply_buffer)
+
+    model.initialize_lazy_modules(full_train_dataset)
+
     task_behavior_reply_buffer.current_size = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
     task_behavior_reply_buffer._current_idx = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
     model.requires_grad_(False)
@@ -786,10 +769,10 @@ def main(config):
     if (logdir / "model.pt").exists():
         model.load_state_dict(torch.load(logdir / "model.pt"))
     else:
-        print("Pretrain agent.")
+        print("Pretrain agent")
         num_batch = config.length // config.batch_size
         for ep in range(config.num_epoch):
-            for i in range(num_batch - 1):
+            for i in range(num_batch):
                 train_agent(full_train_dataset.get_batch(np.arange(i * config.batch_size, (i + 1) * config.batch_size)))
             if ep % 50 == 0:
                 torch.save(model.state_dict(), logdir / "model.pt")
@@ -840,11 +823,10 @@ def parse_args():
     parser.add_argument('--train_steps', type=int, default=1, help='frequency of training')
     parser.add_argument("--prefill", type=int, default=50000, help="generate prefill / 500 num of episodes")
     parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
-    parser.add_argument('--batch', type=int, default=2, help='Batch size')
-    parser.add_argument('--length', type=int, default=5000, help='num of sequence length chunk')
+    parser.add_argument('--length', type=int, default=64, help='num of sequence length chunk')
     parser.add_argument('--policy_reply_buffer_size', type=int, default=10000, help='length of policy reply buffer')
     parser.add_argument('--sequence_size', type=int, default=15, help='n step size')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
     parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....')
     parser.add_argument("--max_episode_steps", type=int, default=1e3, help='an episode corresponds to 1000 steps')
     parser.add_argument("--envs", type=int, default=1, help='should be updated??')
@@ -858,7 +840,7 @@ def parse_args():
     parser.add_argument('--task', type=str, default="dmc_cheetah_run", help="name of the environment")
     parser.add_argument('--sequence_length', type=int, default=100, help="the length of an episode")
     parser.add_argument('--model_params', type=tuple, default=(200, 200), help='number of layers in the actor network')
-    parser.add_argument('--load_prefill', type=int, default=0, help='use exist prefill or not')
+    parser.add_argument('--load_prefill', type=int, default=1, help='use exist prefill or not')
     parser.add_argument('--num_epoch', type=int, default=10000, help='number of pretraining epochs')
     args, unknown = parser.parse_known_args()
     return args

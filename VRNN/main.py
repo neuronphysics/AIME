@@ -417,7 +417,7 @@ class VRNN_GMM(nn.Module):
         else:
             context_u = reshaped_u
             context_y = reshaped_y
-        if self.self_attention_type is not "multihead":
+        if self.self_attention_type != "multihead":
             mean_attn, logvar_attn = self._latent_encoder(context_u, context_y)
         else:
             mean_attn, logvar_attn, attn_loss = self._latent_encoder(context_u, context_y)
@@ -519,7 +519,7 @@ class VRNN_GMM(nn.Module):
 
         d_loss = -torch.mean(disc_real) + torch.mean(disc_fake)
 
-        if self.self_attention_type is not "multihead":
+        if self.self_attention_type != "multihead":
             return total_loss, d_loss, deterministic_hidden_state, input_feature, fake_input_feature
         else:
             return total_loss + attn_loss, d_loss, deterministic_hidden_state, input_feature, fake_input_feature, \
@@ -694,16 +694,17 @@ class DynamicModel(VRNN_GMM):
         return vrnn_loss, d_loss, hidden, real_feature, fake_feature, attention_latent
 
     def generate(self, u, seq_len=None):
-        if self.normalizer_input is not None:
+        if self.normalizer_input is not None and seq_len == self.sequence_length:
+            # TODO currently normalizer takes a fixed seq len, considering drop the seq len out
             u = self.normalizer_input.normalize(u)
 
         y_sample, y_sample_mu, y_sample_sigma, hidden = super(DynamicModel, self).generate(u, seq_len)
 
-        if self.normalizer_output is not None:
+        if self.normalizer_output is not None and seq_len == self.sequence_length:
             y_sample = self.normalizer_output.unnormalize(y_sample)
-        if self.normalizer_output is not None:
+        if self.normalizer_output is not None and seq_len == self.sequence_length:
             y_sample_mu = self.normalizer_output.unnormalize_mean(y_sample_mu)
-        if self.normalizer_output is not None:
+        if self.normalizer_output is not None and seq_len == self.sequence_length:
             y_sample_sigma = self.normalizer_output.unnormalize_sigma(y_sample_sigma)
 
         return y_sample, y_sample_mu, y_sample_sigma, hidden
