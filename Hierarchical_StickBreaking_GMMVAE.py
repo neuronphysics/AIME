@@ -724,7 +724,7 @@ class GMMVAE(nn.Module):
         # log(variance of W)
         logvar_w = self.encoder_w_logvar(hw)
         w_x_sigma = torch.exp(0.5 * logvar_w)
-        # Build a two layers MLP to compute Q(w|x)
+        # Build a two-layer-MLP to compute Q(w|x)
         w_x = self.encoder.reparameterize(w_x_mean, logvar_w)
 
         # 3) posterior P(c|w,z)=Q(c|X)
@@ -803,11 +803,20 @@ def gauss_cross_entropy(mu_post, sigma_post, mu_prior, sigma_prior):
     return temp.sum()
 
 
+def to_tensor(x, dType):
+    global local_device
+    if isinstance(x, torch.Tensor):
+        return x.to(local_device).to(dType)
+    else:
+        return torch.tensor(x, dtype=torch.float64, device=local_device)
+
+
 def beta_fn(a, b):
     global local_device
-    return torch.exp(torch.lgamma(torch.tensor(a + epsilon(), dtype=torch.float64, device=local_device)) + torch.lgamma(
-        torch.tensor(b + epsilon(), dtype=torch.float64, device=local_device)) - torch.lgamma(
-        torch.tensor(a + b + epsilon(), dtype=torch.float64, device=local_device)))
+    ta = to_tensor(a, torch.float64)
+    tb = to_tensor(b, torch.float64)
+
+    return torch.exp(torch.lgamma(ta + epsilon()) + torch.lgamma(tb + epsilon()) - torch.lgamma(ta + tb + epsilon()))
 
 
 def gradient_penalty(critic, real, fake, device):
@@ -958,6 +967,7 @@ class InfGaussMMVAE(GMMVAE, BetaSample):
     # based on this implementation :https://github.com/enalisnick/mixture_density_VAEs
     def __init__(self, hyperParams, K, nchannel, z_dim, w_dim, hidden_dim, device, img_width, batch_size, num_layers=4,
                  include_elbo2=True, use_mse_loss=False):
+        self.prior_nu = None
         global local_device
         local_device = device
         super(InfGaussMMVAE, self).__init__(K, nchannel, z_dim, w_dim, hidden_dim, device, img_width, batch_size,
@@ -986,7 +996,8 @@ class InfGaussMMVAE(GMMVAE, BetaSample):
         x_reconstructed = self.GMM_decoder(z_x)
         self.prior_nu = self.gamma_sample(self.gamma_alpha, self.gamma_beta)
         # print(f"size of alpha (variable of beta distribution): {self.prior_nu.size()}")
-        return z_x, z_x_mean, z_x_sigma, c_posterior, w_x_mean, w_x_sigma, gmm, z_wc_mean_prior, z_wc_logvar_prior, x_reconstructed
+        return z_x, z_x_mean, z_x_sigma, c_posterior, w_x_mean, w_x_sigma, gmm, z_wc_mean_prior, z_wc_logvar_prior, \
+               x_reconstructed
 
     def compose_stick_segments(self, v):
         segments = []

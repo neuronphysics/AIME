@@ -29,8 +29,8 @@ def get_mask_from_sequence_lengths(
 
 
 class Normalizer1D(nn.Module):
-    # Data size of (batch_size,  seq_len, input_size)
-    def __init__(self, input_dim, inputs, feature_range=(-1, 1)):
+    # Data size of (batch_size, input_size, seq_len)
+    def __init__(self, input_dim, inputs):
         super(Normalizer1D, self).__init__()
         self.input_dim = input_dim
 
@@ -57,14 +57,14 @@ class Normalizer1D(nn.Module):
         return mask, new_masked_data
 
     def build_normalizers(self, x):
-        normalizers = OrderedDict()
+        normalizers = []
         scale_, min_ = [], []
         for i in range(self.input_dim):
             scaler = MinMaxScaler(feature_range=(-1, 1))
             scaler = scaler.fit(x[:, i, :])
             scale_.append(torch.from_numpy(scaler.scale_))
             min_.append(torch.from_numpy(scaler.min_))
-            normalizers[str(i)] = scaler
+            normalizers.append(scaler)
         self.scale_ = torch.stack(scale_).to(device)
         self.min_ = torch.stack(min_).to(device)
         return normalizers
@@ -75,7 +75,7 @@ class Normalizer1D(nn.Module):
         _, nd = self._build_mask(d)
         n_x = []
         for i in range(x.shape[1]):
-            n_x.append(self._norm[str(i)].transform(nd[:, i, :]))
+            n_x.append(self._norm[i].transform(nd[:, i, :]))
         y = np.stack(n_x, axis=1)
         x = np.where(np.isnan(y), 0, y)
         return torch.from_numpy(x).to(device)
@@ -87,7 +87,7 @@ class Normalizer1D(nn.Module):
         self.unnorm_mask = m
         n_x = []
         for i in range(x.shape[1]):
-            n_x.append(self._norm[str(i)].inverse_transform(nd[:, i, :]))
+            n_x.append(self._norm[i].inverse_transform(nd[:, i, :]))
 
         y = np.stack(n_x, axis=1)
         x = np.where(np.isnan(y), 0, y)
@@ -104,19 +104,10 @@ class Normalizer1D(nn.Module):
 
 
 # compute the normalizers
-def compute_normalizer(loader_train):
-    # definition #batch_size, input_dim, seq_len
-    for i, (u, y) in enumerate(loader_train):
-        if i == 0:
-            # input u output y: shape ==> torch.Size([B, D, T])
-            inputs = u
-            outputs = y
-        else:
-            inputs = torch.cat([inputs, u], dim=0)
-            outputs = torch.cat([outputs, y], dim=0)
-
-    inputs = inputs.cpu().detach().numpy()
-    outputs = outputs.cpu().detach().numpy()
+def compute_normalizer(feat, out):
+    # input shape (batch_size, seq_len, feat_dim)
+    inputs = feat.numpy().transpose(0, 2, 1)
+    outputs = out.numpy().transpose(0, 2, 1)
 
     # initialization
     u_normalizer = Normalizer1D(inputs.shape[1], inputs)

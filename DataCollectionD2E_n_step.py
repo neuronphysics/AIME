@@ -265,7 +265,7 @@ class Dataset(data.Dataset):
         for key in transitions._asdict().keys():
             data = getattr(self._data, key)
             batch = getattr(transitions, key)
-            data[indices] = torch.tensor(batch[:effective_batch_size])
+            data[indices] = batch[:effective_batch_size]
         # Update size and index.
         if torch.less(self.current_size, self._size):
             self.current_size += effective_batch_size
