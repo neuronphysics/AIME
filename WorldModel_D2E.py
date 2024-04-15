@@ -1,3 +1,4 @@
+import numpy as np
 import torch.utils.data.distributed
 from WorldModel_D2E_Structures import *
 from planner_D2E_regularizer_n_step import *
@@ -143,12 +144,13 @@ class WorldModel(nn.Module):
         self.device = device
         self._clip_rewards = "tanh"
         self.heads = nn.ModuleDict()
-        self.heads["reward"] = MLP(shape=1, layers=4, units=400, act="ELU", norm="none", dist="mse",
-                                   device=self.device)
-        self.heads["discount"] = MLP(shape=1, layers=4, units=400, act="ELU", norm="none", dist="binary",
-                                     device=self.device)
-        self.heads["done"] = MLP(shape=2, layers=4, units=400, act="ELU", norm="none", dist="onehot",
-                                 device=self.device)
+        input_shape = self.state_dim + self.action_dim
+        self.heads["reward"] = MLP(shape=1, layers=4, units=400, input_shape=input_shape, act="ELU", norm="none",
+                                   dist="mse", device=self.device)
+        self.heads["discount"] = MLP(shape=1, layers=4, units=400, input_shape=input_shape, act="ELU", norm="none",
+                                     dist="binary", device=self.device)
+        self.heads["done"] = MLP(shape=2, layers=4, units=400, input_shape=input_shape, act="ELU", norm="none",
+                                 dist="onehot", device=self.device)
 
         self.mse_loss = nn.MSELoss()
 
@@ -221,17 +223,29 @@ class WorldModel(nn.Module):
                                              wd=1e-5,
                                              use_amp=self._use_amp)
 
-    def preprocess(self, observation, next_observation, reward, done):
+    def preprocess(self, observation, reward, done):
+        if isinstance(observation, np.ndarray):
+            if observation.max() > 1:
+                observation = observation / 255.0
+            observation = torch.from_numpy(observation)
+
+        if isinstance(observation, torch.Tensor) and observation.dtype == torch.uint8:
+            observation = observation.to(torch.float32) / 255.0
+
+        if isinstance(reward, np.ndarray):
+            reward = torch.from_numpy(reward)
+
+        if isinstance(done, np.ndarray):
+            done = torch.from_numpy(done)
+
         data = {"reward": {
             "identity": lambda x: x,
             "sign": torch.sign,
             "tanh": torch.tanh,
         }[self._clip_rewards](reward).unsqueeze(-1), "discount": 1.0 - done.float().unsqueeze(-1)}
         data["discount"] *= self._discount
-        dtype = torch.float32
-        data["observation"], data["next_observation"] = (
-            i.to(dtype) if i.dtype == torch.int32 else i.to(dtype) / 255.0 - 0.5 if i.dtype == torch.uint8 else i.to(
-                i.dtype) for i in [observation, next_observation])
+        data["observation"] = observation
+
         data["done"] = done
         return data
 
@@ -261,9 +275,9 @@ class WorldModel(nn.Module):
             batch = full_train_set.get_batch(np.arange(i * batch_size, (i + 1) * batch_size))
 
             obs = torch.reshape(batch.s1, (-1, HYPER_PARAMETERS['n_channel'], HYPER_PARAMETERS['image_width'],
-                                                    HYPER_PARAMETERS['image_width'])).to(self.device)
+                                           HYPER_PARAMETERS['image_width'])).to(self.device)
             next_obs = torch.reshape(batch.s2, (-1, HYPER_PARAMETERS['n_channel'], HYPER_PARAMETERS['image_width'],
-                                                         HYPER_PARAMETERS['image_width'])).to(self.device)
+                                                HYPER_PARAMETERS['image_width'])).to(self.device)
             _, _, _, z_real, _, _, _ = self.encoder(obs)
             _, _, _, z_next, _, _, _ = self.encoder(next_obs)
             inputs, outputs = append_action_and_latent_obs(z_real, batch.a1.to(self.device), z_next,
@@ -402,27 +416,30 @@ class WorldModel(nn.Module):
         return seq
 
     def video_pred(self, observation, action):
-        truth = observation[:6] + 0.5
+        # TODO why we need all these +0.5 here???
+        truth = (observation[:5] + 0.5).to(self.device)
         inputs = observation[:5]
-        embed, embed_mean, embed_sigma, _, _, _, _, _, _, recon = self.variational_autoencoder(inputs)
+        actions = action[:5].to(self.device)
+        embed, embed_mean, embed_sigma, _, _, _, _, _, _, recon = self.variational_autoencoder(inputs.to(self.device))
 
-        next_state, sample_mu, sample_sigma, state = self.transition_model.generate(torch.cat([embed, action], dim=1))
-        openl = self.decoder(next_state)
-        model = torch.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
-        error = (model - truth + 1) / 2
-        video = torch.concat([truth, model, error], 2)
-        B, T, H, W, C = video.shape
-        return video.permute(1, 2, 0, 3, 4).reshape(T, H, B * W, C).cpu()
+        next_state, sample_mu, sample_sigma, state = self.transition_model.generate(torch.cat([embed, actions], dim=1).unsqueeze(-1))
+        openl = self.decoder(next_state.squeeze(-1))
+
+        # concatenate on a new dimension, type
+        model = torch.concat([(recon + 0.5).unsqueeze(1), (openl + 0.5).unsqueeze(1)], dim=1)
+        error = (recon - truth + 1) / 2
+        video = torch.concat([truth.unsqueeze(1), model, error.unsqueeze(1)], 1)
+        B, T, C, H, W = video.shape
+        return video.permute(1, 3, 0, 4, 2).reshape(T, H, B * W, C).cpu()
 
     def save(self):
         torch.save(
             {'transition_model': self.transition_model.state_dict(),
-             'reward_model': self.reward_model.state_dict(),
+             'reward_model': self.heads['reward'].state_dict(),
              'observation_model': self.variational_autoencoder.state_dict(),
              'observation_discriminator_model': self.discriminator.state_dict(),
-             'discount_model': self.discount_model.state_dict(),
-             'encoder_model': self.encoder.state_dict(),
-             'decoder_model': self.decoder.state_dict(),
+             'discount_model': self.heads['discount'].state_dict(),
+             'done_model': self.heads['done'].state_dict(),
              'discriminator_optimizer': self.discriminator_optim.state_dict(),
              'world_model_optimizer': self.optimizer.state_dict(), }, self.save_path)
 
@@ -432,10 +449,9 @@ class WorldModel(nn.Module):
             self.transition_model.load_state_dict(model_dicts['transition_model'])
             self.variational_autoencoder.load_state_dict(model_dicts['observation_model'])
             self.discriminator.load_state_dict(model_dicts['observation_discriminator_model'])
-            self.reward_model.load_state_dict(model_dicts['reward_model'])
-            self.discount_model.load_state_dict(model_dicts['discount_model'])
-            self.encoder.load_state_dict(model_dicts['encoder_model'])
-            self.decoder.load_state_dict(model_dicts['decoder_model'])
+            self.heads['reward'].load_state_dict(model_dicts['reward_model'])
+            self.heads['discount'].load_state_dict(model_dicts['discount_model'])
+            self.heads['done'].load_state_dict(model_dicts['done_model'])
             self.optimizer.load_state_dict(model_dicts['world_model_optimizer'])
             self.discriminator_optim.load_state_dict(model_dicts['discriminator_optimizer'])
             print("Loading models checkpoints!")
@@ -455,8 +471,8 @@ class D2EAlgorithm(nn.Module):
                  latent_space,
                  step: NCounter,
                  env_name: str,
+                 log_dir,
                  device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-                 log_dir=os.path.join(os.getcwd(), "\log"),
                  model_params=(((200, 200),), 2, 1),
                  optimizers=((0.0001, 0.5, 0.99),),
                  batch_size=50,
@@ -581,15 +597,49 @@ class D2EAlgorithm(nn.Module):
 
     def report(self, data):
         report = {}
-        data = self.wm.preprocess(data)
-        for key in self.wm.heads["decoder"].cnn_keys:
-            name = key.replace("/", "_")
-            report[f"openl_{name}"] = self.wm.video_pred(data, key)
+        processed_data = self.wm.preprocess(data['s1'], data['reward'], data['done'])
+        batch, seq, channel, image_width, _ = data['s1'].shape
+        obs = torch.reshape(processed_data['observation'], (-1, channel, image_width, image_width))
+        action = torch.reshape(data['a1'], (-1, data['a1'].shape[-1]))
+        report[f"openl_gym"] = self.wm.video_pred(obs, action)
         return report
 
     def initialize_lazy_modules(self, full_train_set):
         self.wm.initialize_optimizer()
         self.wm.init_normalizer(full_train_set)
+
+    def save(self):
+        self.wm.save()
+        self._task_behavior._build_checkpointer()
+
+    def load(self):
+        self.wm.load_checkpoints()
+        self._task_behavior._load_checkpoint()
+
+    def policy(self, observation, reward, done, state=None, mode="train"):
+        obs = self.wm.preprocess(observation, reward, done)
+        self.tfstep.copy_(torch.tensor([int(self.step)])[0])
+
+        embed = self.wm.encoder(obs["observation"].to(self.device))
+        sample = (mode == "train") or not self.eval_state_mean
+
+        action = self._task_behavior._p_fn(embed)
+        latent, _, _, _ = self.wm.transition_model.generate(
+            torch.cat([embed, action], dim=1),
+            seq_len=embed.shape[-1]
+        )
+        policy_state = latent.copy()
+        if mode == "eval":
+            a_tanh_mode, action, log_pi_a = self._task_behavior._p_fn(policy_state)
+            noise = self.parameter.eval_noise
+        elif mode in ["explore", "train"]:
+            action = self._expl_behavior._p_fn(policy_state)[1]
+            noise = self.parameter.expl_noise
+        action = action_noise(action, noise, self.act_space)
+        outputs = {"action": action}
+        state = latent
+        return outputs, state
+
 
 def main(config):
     def per_episode_record(ep, mode):
@@ -757,7 +807,8 @@ def main(config):
     wm_imagine_reply_buffer.current_size += config.batch_size
 
     model = D2EAlgorithm(HYPER_PARAMETERS, wm_imagine_reply_buffer, task_behavior_reply_buffer, config.sequence_size,
-                         obs_space, act_space, latent_space, step, environment_name, batch_size=config.batch_size)
+                         obs_space, act_space, latent_space, step, environment_name, batch_size=config.batch_size,
+                         log_dir=logdir)
 
     model.initialize_lazy_modules(full_train_dataset)
 
@@ -766,8 +817,8 @@ def main(config):
     model.requires_grad_(False)
 
     train_agent = CarryOverState(model.train_)
-    if (logdir / "model.pt").exists():
-        model.load_state_dict(torch.load(logdir / "model.pt"))
+    if config.load_model == 1:
+        model.load()
     else:
         print("Pretrain agent")
         num_batch = config.length // config.batch_size
@@ -775,7 +826,8 @@ def main(config):
             for i in range(num_batch):
                 train_agent(full_train_dataset.get_batch(np.arange(i * config.batch_size, (i + 1) * config.batch_size)))
             if ep % 50 == 0:
-                torch.save(model.state_dict(), logdir / "model.pt")
+                model.save()
+        model.save()
 
     def train_policy(*args):
         return model.policy(*args, mode="explore" if should_expl(step) else "train")
@@ -797,14 +849,19 @@ def main(config):
 
     train_driver.on_step(train_step)
 
-    while step < config.steps:
+    cur_step = 0
+    while cur_step < config.total_train_steps:
         logger.write()
         print("Start evaluation.")
         logger.add(model.report(next(eval_dataset_generator)), prefix="eval")
         eval_driver(eval_policy, episodes=config.eval_eps)
         print("Start training.")
         train_driver(train_policy, steps=config.eval_every)
-        torch.save(model.state_dict(), logdir / "model.pt")
+
+        if cur_step % 50 == 0:
+            model.save()
+    model.save()
+
     for env in train_envs + eval_envs:
         try:
             env.close()
@@ -823,10 +880,10 @@ def parse_args():
     parser.add_argument('--train_steps', type=int, default=1, help='frequency of training')
     parser.add_argument("--prefill", type=int, default=50000, help="generate prefill / 500 num of episodes")
     parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
-    parser.add_argument('--length', type=int, default=64, help='num of sequence length chunk')
+    parser.add_argument('--length', type=int, default=32, help='num of sequence length chunk')
     parser.add_argument('--policy_reply_buffer_size', type=int, default=10000, help='length of policy reply buffer')
     parser.add_argument('--sequence_size', type=int, default=15, help='n step size')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
     parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....')
     parser.add_argument("--max_episode_steps", type=int, default=1e3, help='an episode corresponds to 1000 steps')
     parser.add_argument("--envs", type=int, default=1, help='should be updated??')
@@ -841,7 +898,10 @@ def parse_args():
     parser.add_argument('--sequence_length', type=int, default=100, help="the length of an episode")
     parser.add_argument('--model_params', type=tuple, default=(200, 200), help='number of layers in the actor network')
     parser.add_argument('--load_prefill', type=int, default=1, help='use exist prefill or not')
-    parser.add_argument('--num_epoch', type=int, default=10000, help='number of pretraining epochs')
+    parser.add_argument('--num_epoch', type=int, default=1, help='number of pretraining epochs')
+    parser.add_argument('--total_train_steps', type=int, default=100, help='number of pretraining epochs')
+    parser.add_argument('--load_model', type=int, default=1, help='if 1 we load old model')
+
     args, unknown = parser.parse_known_args()
     return args
 
