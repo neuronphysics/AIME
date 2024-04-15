@@ -694,17 +694,16 @@ class DynamicModel(VRNN_GMM):
         return vrnn_loss, d_loss, hidden, real_feature, fake_feature, attention_latent
 
     def generate(self, u, seq_len=None):
-        if self.normalizer_input is not None and seq_len == self.sequence_length:
-            # TODO currently normalizer takes a fixed seq len, considering drop the seq len out
+        if self.normalizer_input is not None:
             u = self.normalizer_input.normalize(u)
 
         y_sample, y_sample_mu, y_sample_sigma, hidden = super(DynamicModel, self).generate(u, seq_len)
 
-        if self.normalizer_output is not None and seq_len == self.sequence_length:
+        if self.normalizer_output is not None:
             y_sample = self.normalizer_output.unnormalize(y_sample)
-        if self.normalizer_output is not None and seq_len == self.sequence_length:
+        if self.normalizer_output is not None:
             y_sample_mu = self.normalizer_output.unnormalize_mean(y_sample_mu)
-        if self.normalizer_output is not None and seq_len == self.sequence_length:
+        if self.normalizer_output is not None:
             y_sample_sigma = self.normalizer_output.unnormalize_sigma(y_sample_sigma)
 
         return y_sample, y_sample_mu, y_sample_sigma, hidden

@@ -252,7 +252,8 @@ class Driver:
             obs = build_dict_from_named_tuple(self._obs)
 
             # get actions for each of the env
-            actions, self._state = policy(obs, self._state, **self._kwargs)
+            actions, self._state = policy(obs['observation'], obs['reward'], obs['done'],
+                                          self._state, **self._kwargs)
             actions = [
                 {k: np.array(actions[k][i].cpu()) for k in actions}
                 for i in range(len(self._envs))
@@ -333,12 +334,14 @@ class Module(nn.Module):
 
 
 class DistLayer(Module):
-    def __init__(self, shape, device, dist="mse", min_std=0.1, init_std=0.0):
+    def __init__(self, shape, device, input_shape, dist="mse", min_std=0.1, init_std=0.0):
         super().__init__(device)
         self._shape = shape
         self._dist = dist
         self._min_std = min_std
         self._init_std = init_std
+
+        self.get("out", nn.Linear, input_shape, int(np.prod(self._shape)))
 
     def forward(self, inputs):
         out = self.get("out", nn.Linear, inputs.shape[-1], int(np.prod(self._shape)))(inputs)
@@ -374,7 +377,7 @@ class DistLayer(Module):
 
 
 class MLP(Module):
-    def __init__(self, shape, layers, units, device, act="elu", norm="none", **out):
+    def __init__(self, shape, layers, units, input_shape, device, act="elu", norm="none", **out):
         super().__init__(device)
         self._shape = (shape,) if isinstance(shape, int) else shape
         self._layers = layers
@@ -385,6 +388,12 @@ class MLP(Module):
         self._out = out
         self.to(device)
 
+        for index in range(self._layers):
+            self.get(f"dense{index}", nn.Linear, input_shape, self._units)
+            input_shape = self._units
+            self.get(f"norm{index}", NormLayer, input_shape, self._norm)
+        self.get("out", DistLayer, self._shape, self.device, self._units, **self._out)
+
     def forward(self, features):
         x = features
         x = x.reshape([-1, x.shape[-1]])
@@ -393,7 +402,7 @@ class MLP(Module):
             x = self.get(f"norm{index}", NormLayer, x.shape[-1], self._norm)(x)
             x = self._act(x)
         x = x.reshape(features.shape[:-1] + (x.shape[-1],))
-        return self.get("out", DistLayer, self._shape, self.device, **self._out)(x)
+        return self.get("out", DistLayer, self._shape, self.device, self._units, **self._out)(x)
 
 
 class D2EDataset(Dataset):

@@ -1433,6 +1433,7 @@ class D2EAgent(Agent):
         if self._train_alpha_entropy:
             checkpoint["alpha_entropy"] = self._agent_module._alpha_entropy_var
             checkpoint["alpha_entropy_optimizer"] = self._ae_optimizer.state_dict()
+        torch.save(checkpoint, self.checkpoint_path)
         return checkpoint
 
     def _load_checkpoint(self):
@@ -1447,12 +1448,12 @@ class D2EAgent(Agent):
         self._agent_module.c_net.load_state_dict(checkpoint["critic_net"])
         self._transit_discriminator.load_state_dict(checkpoint["discriminator_transition_net"])  ###
         self._transit_discriminator.fake_state_action.load_state_dict(checkpoint["generator_transition_net"])  ###
-        self._p_optimizer.load_state_dict(checkpoint["policy_optimizer1"])
+        self._p_optimizer.load_state_dict(checkpoint["policy_optimizer"])
         self._q_source_optimizer.load_state_dict(checkpoint["q_source_optimizer"])
-        self._transit_discriminator.optimizer.load_state_dict(["discriminator_transition_optimizer"])
-        self._transit_discriminator.fake_state_action.optimizer.load_state_dict(["generator_transition_optimizer"])
+        self._transit_discriminator.optimizer.load_state_dict(checkpoint["discriminator_transition_optimizer"])
+        self._transit_discriminator.fake_state_action.optimizer.load_state_dict(checkpoint["generator_transition_optimizer"])
         self._c_optimizer.load_state_dict(checkpoint["critic_optimizer"])
-        self._v_source_optimizer.load_state_dict(checkpoint["v_source_optimizer"])
+        self._v_source_optimizer.load_state_dict(checkpoint["value_source_optimizer"])
         self._global_step = checkpoint["train_step"]
         if self._train_alpha:
             self._agent_module._alpha_var = checkpoint["alpha"]
