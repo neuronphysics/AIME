@@ -385,11 +385,12 @@ def main(config):
     if prefill and config.load_prefill != 1:
         print(f"Prefill dataset ({prefill} steps).")
 
+        proto_act_space = train_envs[0]._env.gym.action_space
         random_actor = torch.distributions.independent.Independent(
-            torch.distributions.uniform.Uniform(torch.Tensor(act_space.low)[None],
-                                                torch.Tensor(act_space.high)[None]), 1)
+            torch.distributions.uniform.Uniform(torch.Tensor(proto_act_space.low)[None],
+                                                torch.Tensor(proto_act_space.high)[None]), 1)
 
-        def random_agent(o, s):
+        def random_agent(o, r, d, s):
             action = random_actor.sample()
             logprob = random_actor.log_prob(action)
             return {'action': action, 'logprob': logprob}, None
@@ -506,7 +507,7 @@ def parse_args():
     parser.add_argument('--length', type=int, default=32, help='num of sequence length chunk from pre fill data')
     parser.add_argument('--policy_reply_buffer_size', type=int, default=10000, help='length of policy reply buffer')
     parser.add_argument('--sequence_size', type=int, default=15, help='n step size')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for pre train')
+    parser.add_argument('--batch_size', type=int, default=3, help='Batch size for pre train')
     parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....')
     parser.add_argument("--max_episode_steps", type=int, default=1e3, help='an episode corresponds to 1000 steps')
     parser.add_argument("--eval_eps", type=int, default=1, help='??')
@@ -515,10 +516,10 @@ def parse_args():
     parser.add_argument('--log_keys_mean', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_max', type=str, default='^$', help='??')
     parser.add_argument('--discount', type=int, default=0.99, help="??")
-    parser.add_argument('--load_prefill', type=int, default=1, help='use exist prefill or not, 1 mean load')
+    parser.add_argument('--load_prefill', type=int, default=0, help='use exist prefill or not, 1 mean load')
     parser.add_argument('--num_pretrain_epoch', type=int, default=1, help='number of pretraining epochs')
     parser.add_argument('--num_train_epoch', type=int, default=100, help='number of formal training epochs')
-    parser.add_argument('--load_model', type=int, default=0, help='if 1 we load pre trained model')
+    parser.add_argument('--load_model', type=int, default=1, help='if 1 we load pre trained model')
 
     args, unknown = parser.parse_known_args()
     return args

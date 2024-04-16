@@ -418,10 +418,7 @@ class AgentModule(GeneralAgent):
         return utils.relu_v2(self._alpha_entropy_var)
 
     def assign_alpha(self, alpha):
-        if not isinstance(alpha, torch.Tensor):
-            self._alpha_var = torch.tensor(alpha, requires_grad=True)
-        else:
-            self._alpha_var = alpha
+        self._alpha_var = torch.tensor(alpha, requires_grad=True)
 
     def assign_alpha_entropy(self, alpha):
         self._alpha_entropy_var = torch.tensor(alpha, requires_grad=True)
@@ -1259,9 +1256,7 @@ class D2EAgent(Agent):
         self._a_optimizer = torch.optim.Adam(self._a_vars, lr=opts[4][0], betas=(opts[4][1], opts[4][2]))
         self._ae_optimizer = torch.optim.Adam(self._ae_vars, lr=opts[4][0], betas=(opts[4][1], opts[4][2]))
 
-    def _optimize_step(self, train_batch):
-        batch = {k: v.clone().detach() for k, v in train_batch.items()}
-
+    def _optimize_step(self, batch):
         info = collections.OrderedDict()
         if torch.equal(self._global_step % torch.tensor(self._update_freq),
                        torch.tensor(0, dtype=torch.float32, device=self._global_step.device)):
@@ -1273,8 +1268,7 @@ class D2EAgent(Agent):
         self._agent_module.p_net.train()
         self._p_optimizer.zero_grad()
 
-        with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
-            policy_loss, _ = self._build_p_loss(batch)
+        policy_loss, _ = self._build_p_loss(batch)
         policy_loss.backward(retain_graph=True)
 
         if self._grad_norm_clipping > 0.:
