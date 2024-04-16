@@ -19,35 +19,34 @@ from collections import defaultdict
 @with_incremental_state
 class CosformerAttention(nn.Module):
     def __init__(
-        self,
-        embed_dim,
-        num_heads,
-        kdim=None,
-        vdim=None,
-        dropout=0.0,
-        bias=True,
-        add_bias_kv=False,
-        add_zero_attn=False,
-        self_attention=False,
-        encoder_decoder_attention=False,
-        q_noise=0.0,
-        qn_block_size=8,
-        # add
-        index=0,
-        use_relu=True,
-        use_elu=False,
-        use_leak=False,
-        max_l=1024,
-        has_out=False,
-        causal=False,
-        resi=False,
-        constant=0,
+            self,
+            embed_dim,
+            num_heads,
+            kdim=None,
+            vdim=None,
+            dropout=0.0,
+            bias=True,
+            add_bias_kv=False,
+            add_zero_attn=False,
+            self_attention=False,
+            encoder_decoder_attention=False,
+            q_noise=0.0,
+            qn_block_size=8,
+            # add
+            index=0,
+            use_relu=True,
+            use_elu=False,
+            use_leak=False,
+            max_l=1024,
+            has_out=False,
+            causal=False,
+            resi=False,
+            constant=0,
     ):
         super().__init__()
         # add
         self.index = index
-        
-        
+
         self.embed_dim = embed_dim
         self.kdim = kdim if kdim is not None else embed_dim
         self.vdim = vdim if vdim is not None else embed_dim
@@ -60,9 +59,8 @@ class CosformerAttention(nn.Module):
 
         self.head_dim = embed_dim // num_heads
         assert (
-            self.head_dim * num_heads == self.embed_dim
+                self.head_dim * num_heads == self.embed_dim
         ), "embed_dim must be divisible by num_heads"
-        
 
         self.self_attention = self_attention
         self.encoder_decoder_attention = encoder_decoder_attention
@@ -70,7 +68,7 @@ class CosformerAttention(nn.Module):
         assert not self.self_attention or self.qkv_same_dim, (
             "Self-attention requires query, key and " "value to be of the same size"
         )
-        
+
         self.k_proj = quant_noise(
             nn.Linear(self.kdim, embed_dim, bias=bias), q_noise, qn_block_size
         )
@@ -121,18 +119,18 @@ class CosformerAttention(nn.Module):
         return nn.Parameter(index, requires_grad=False)
 
     def forward(
-        self,
-        query,
-        key: Optional[Tensor],
-        value: Optional[Tensor],
-        key_padding_mask: Optional[Tensor] = None,
-        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        need_weights: bool = True,
-        static_kv: bool = False,
-        attn_mask: Optional[Tensor] = None,
-        before_softmax: bool = False,
-        need_head_weights: bool = False,
-        eps=1e-4
+            self,
+            query,
+            key: Optional[Tensor],
+            value: Optional[Tensor],
+            key_padding_mask: Optional[Tensor] = None,
+            incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+            need_weights: bool = True,
+            static_kv: bool = False,
+            attn_mask: Optional[Tensor] = None,
+            before_softmax: bool = False,
+            need_head_weights: bool = False,
+            eps=1e-4
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Input shape: Time x Batch x Channel
         Args:
@@ -202,9 +200,11 @@ class CosformerAttention(nn.Module):
         # get index and send to cuda
         weight_index = self.get_index(m).to(q) * self.constant
         # (N * h, L, 2 * d)
-        q_ = torch.cat([q * torch.sin(weight_index[:, :tgt_len, :] / m), q * torch.cos(weight_index[:, :tgt_len, :] / m)], dim=-1)
+        q_ = torch.cat(
+            [q * torch.sin(weight_index[:, :tgt_len, :] / m), q * torch.cos(weight_index[:, :tgt_len, :] / m)], dim=-1)
         # (N * h, S, 2 * d)
-        k_ = torch.cat([k * torch.sin(weight_index[:, :src_len, :] / m), k * torch.cos(weight_index[:, :src_len, :] / m)], dim=-1)
+        k_ = torch.cat(
+            [k * torch.sin(weight_index[:, :src_len, :] / m), k * torch.cos(weight_index[:, :src_len, :] / m)], dim=-1)
 
         if self.causal:
             # # Need to improve speed!
@@ -226,9 +226,9 @@ class CosformerAttention(nn.Module):
             if (attn_mask == None):
                 attn_mask = (torch.triu(torch.ones(tgt_len, tgt_len)) == 1).transpose(0, 1)
                 attn_mask = attn_mask.float().masked_fill(attn_mask == 0, float('-inf')).to(q)
-            
+
             weights = torch.bmm(q_, k_.transpose(1, 2))
-            weights = weights.masked_fill(attn_mask==float("-inf"), 0)
+            weights = weights.masked_fill(attn_mask == float("-inf"), 0)
             # (N * h, L, S) -> (N * h, L, S)
             denom = torch.clamp_min(weights.sum(dim=-1, keepdim=True), eps)
             # (N * h, L, S) (N * h, L, S) -> (N * h, L, S)
@@ -251,7 +251,8 @@ class CosformerAttention(nn.Module):
             attn_output = self.out_proj(attn_output)
 
         return attn_output, None
-  
+
+
 class ParallelLinear(torch.autograd.Function):
     @staticmethod
     @custom_fwd
@@ -320,9 +321,9 @@ class ParallelExperts(nn.Module):
         results = ParallelLinear.apply(inputs, expert_size, self.w, self.b)
         return results
 
-#https://github.com/yikangshen/MoA/blob/master/moa_layer/parallel_linear/moe.py
-class MoE(nn.Module):
 
+# https://github.com/yikangshen/MoA/blob/master/moa_layer/parallel_linear/moe.py
+class MoE(nn.Module):
     """Call a Sparsely gated mixture of experts layer with 1-layer Feed-Forward networks as experts.
     Args:
     input_size: integer - size of the input
@@ -333,7 +334,8 @@ class MoE(nn.Module):
     k: an integer - how many experts to use for each batch element
     """
 
-    def __init__(self, input_size, head_size, num_experts, k, cvloss=0, switchloss=0, zloss=0, bias=False, activation=None, noisy_gating=True):
+    def __init__(self, input_size, head_size, num_experts, k, cvloss=0, switchloss=0, zloss=0, bias=False,
+                 activation=None, noisy_gating=True):
         super(MoE, self).__init__()
         self.noisy_gating = noisy_gating
         self.num_experts = num_experts
@@ -366,14 +368,14 @@ class MoE(nn.Module):
 
         if x.shape[0] == 1:
             return 0
-        return x.float().var() / (x.float().mean()**2 + eps)
+        return x.float().var() / (x.float().mean() ** 2 + eps)
 
     def compute_cvloss(self, probs):
         return self.cv_squared(F.normalize(probs.sum(0), p=1, dim=0))
 
     def compute_switchloss(self, probs, freqs):
         loss = F.normalize(probs.sum(0), p=1, dim=0) * \
-            F.normalize(freqs.float(), p=1, dim=0)
+               F.normalize(freqs.float(), p=1, dim=0)
         return loss.sum() * self.num_experts
 
     def compute_zloss(self, logits):
@@ -423,29 +425,29 @@ class MoE(nn.Module):
             top_k_gates = torch.gather(probs, 1, top_k_indices)
         else:
             top_k_gates, top_k_indices = probs.topk(self.k, dim=1)
-            
+
         # top_k_gates = top_k_gates / \
         #     (top_k_gates.sum(dim=1, keepdim=True) + 1e-6).detach()
-        
+
         zeros = torch.zeros_like(probs, requires_grad=True)
         gates = zeros.scatter(1, top_k_indices, top_k_gates)
         self.expert_size = (gates > 0).long().sum(0)
 
         top_k_gates = top_k_gates.flatten()
         top_k_experts = top_k_indices.flatten()
-        
+
         nonzeros = top_k_gates.nonzero().squeeze(-1)
         top_k_experts_nonzero = top_k_experts[nonzeros]
 
         _, _index_sorted_experts = top_k_experts_nonzero.sort(0)
         self.index_sorted_experts = nonzeros[_index_sorted_experts]
-        self.batch_index = self.index_sorted_experts.div(self.k, rounding_mode='trunc') 
+        self.batch_index = self.index_sorted_experts.div(self.k, rounding_mode='trunc')
         self.batch_gates = top_k_gates[self.index_sorted_experts]
 
         loss = 0
         loss += self.cvloss * self.compute_cvloss(gates)
         loss += self.switchloss * \
-            self.compute_switchloss(probs, self.expert_size)
+                self.compute_switchloss(probs, self.expert_size)
         loss += self.zloss * self.compute_zloss(logits)
         return loss
 
@@ -464,8 +466,8 @@ class MoE(nn.Module):
         if multiply_by_gates:
             expert_outputs = expert_outputs * self.batch_gates[:, None]
 
-        zeros = torch.zeros((bsz * length, self.input_size), 
-            dtype=expert_outputs.dtype, device=expert_outputs.device)
+        zeros = torch.zeros((bsz * length, self.input_size),
+                            dtype=expert_outputs.dtype, device=expert_outputs.device)
         y = zeros.index_add(0, self.batch_index, expert_outputs)
         y = y.view(bsz, length, self.input_size)
 
@@ -491,8 +493,8 @@ class MoE(nn.Module):
         expert_inputs = x[self.batch_index]
         expert_outputs = self.experts(expert_inputs, self.expert_size)
 
-        zeros = torch.zeros((bsz * length * self.k, self.head_size), 
-            dtype=expert_outputs.dtype, device=expert_outputs.device)
+        zeros = torch.zeros((bsz * length * self.k, self.head_size),
+                            dtype=expert_outputs.dtype, device=expert_outputs.device)
         y = zeros.index_add(0, self.index_sorted_experts, expert_outputs)
         y = y.view(bsz, length, self.k, -1)
         return y, loss
@@ -507,15 +509,13 @@ class MoE(nn.Module):
         if multiply_by_gates:
             expert_outputs = expert_outputs * self.batch_gates[:, None]
 
-        zeros = torch.zeros((bsz * length, self.input_size), 
-            dtype=expert_outputs.dtype, device=expert_outputs.device)
+        zeros = torch.zeros((bsz * length, self.input_size),
+                            dtype=expert_outputs.dtype, device=expert_outputs.device)
         y = zeros.index_add(0, self.batch_index, expert_outputs)
         y = y.view(bsz, length, self.input_size)
         return y
 
 
-
-       
 @with_incremental_state
 class MultiheadAttention(nn.Module):
     """Multi-headed attention.
@@ -524,26 +524,26 @@ class MultiheadAttention(nn.Module):
     """
 
     def __init__(
-        self,
-        embed_dim,
-        num_heads,
-        kdim=None,
-        vdim=None,
-        dropout=0.0,
-        bias=False,
-        add_bias_kv=False,
-        add_zero_attn=False,
-        self_attention=False,
-        encoder_decoder_attention=False,
-        q_noise=0.0,
-        qn_block_size=8,
-        num_expert=12,
-        head_dim=256,
-        cvloss=0, 
-        switchloss=0, 
-        zloss=0,
-        sample_topk=0,
-        noisy_gating=False,
+            self,
+            embed_dim,
+            num_heads,
+            kdim=None,
+            vdim=None,
+            dropout=0.0,
+            bias=False,
+            add_bias_kv=False,
+            add_zero_attn=False,
+            self_attention=False,
+            encoder_decoder_attention=False,
+            q_noise=0.0,
+            qn_block_size=8,
+            num_expert=12,
+            head_dim=256,
+            cvloss=0,
+            switchloss=0,
+            zloss=0,
+            sample_topk=0,
+            noisy_gating=False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -557,7 +557,7 @@ class MultiheadAttention(nn.Module):
         )
 
         self.head_dim = head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
 
         self.self_attention = self_attention
         self.encoder_decoder_attention = encoder_decoder_attention
@@ -574,9 +574,9 @@ class MultiheadAttention(nn.Module):
         )
 
         self.q_proj = quant_noise(
-            MoE(embed_dim, self.head_dim, num_expert, self.num_heads, 
-                cvloss=cvloss, switchloss=switchloss, zloss=zloss, 
-                noisy_gating=noisy_gating), 
+            MoE(embed_dim, self.head_dim, num_expert, self.num_heads,
+                cvloss=cvloss, switchloss=switchloss, zloss=zloss,
+                noisy_gating=noisy_gating),
             q_noise, qn_block_size
         )
         self.sample_topk = sample_topk
@@ -618,18 +618,18 @@ class MultiheadAttention(nn.Module):
             nn.init.xavier_normal_(self.bias_v)
 
     def forward(
-        self,
-        query,
-        key: Optional[Tensor],
-        value: Optional[Tensor],
-        query_padding_mask: Optional[Tensor] = None,
-        key_padding_mask: Optional[Tensor] = None,
-        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        need_weights: bool = True,
-        static_kv: bool = False,
-        attn_mask: Optional[Tensor] = None,
-        before_softmax: bool = False,
-        need_head_weights: bool = False,
+            self,
+            query,
+            key: Optional[Tensor],
+            value: Optional[Tensor],
+            query_padding_mask: Optional[Tensor] = None,
+            key_padding_mask: Optional[Tensor] = None,
+            incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+            need_weights: bool = True,
+            static_kv: bool = False,
+            attn_mask: Optional[Tensor] = None,
+            before_softmax: bool = False,
+            need_head_weights: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Input shape: Time x Batch x Channel
 
@@ -657,7 +657,7 @@ class MultiheadAttention(nn.Module):
         src_len = tgt_len
         if not self.skip_embed_dim_check:
             assert (
-                embed_dim == self.embed_dim
+                    embed_dim == self.embed_dim
             ), f"query dim {embed_dim} != {self.embed_dim}"
         assert list(query.size()) == [tgt_len, bsz, embed_dim]
         if key is not None:
@@ -680,18 +680,18 @@ class MultiheadAttention(nn.Module):
 
         if self.self_attention:
             q, aux_loss = self.q_proj.map(
-                query.transpose(0, 1),  
+                query.transpose(0, 1),
                 skip_mask=query_padding_mask, sample_topk=self.sample_topk
-                )
+            )
             q = q.transpose(0, 1)
             k = self.k_proj(query)
             v = self.v_proj(query)
         elif self.encoder_decoder_attention:
             # encoder-decoder attention
             q, aux_loss = self.q_proj.map(
-                query.transpose(0, 1), 
+                query.transpose(0, 1),
                 skip_mask=query_padding_mask, sample_topk=self.sample_topk
-                )
+            )
             q = q.transpose(0, 1)
             if key is None:
                 assert value is None
@@ -703,9 +703,9 @@ class MultiheadAttention(nn.Module):
         else:
             assert key is not None and value is not None
             q, aux_loss = self.q_proj.map(
-                query.transpose(0, 1), 
+                query.transpose(0, 1),
                 skip_mask=query_padding_mask, sample_topk=self.sample_topk
-                )
+            )
             q = q.transpose(0, 1)
             k = self.k_proj(key)
             v = self.v_proj(value)
@@ -868,11 +868,11 @@ class MultiheadAttention(nn.Module):
 
     @staticmethod
     def _append_prev_key_padding_mask(
-        key_padding_mask: Optional[Tensor],
-        prev_key_padding_mask: Optional[Tensor],
-        batch_size: int,
-        src_len: int,
-        static_kv: bool,
+            key_padding_mask: Optional[Tensor],
+            prev_key_padding_mask: Optional[Tensor],
+            batch_size: int,
+            src_len: int,
+            static_kv: bool,
     ) -> Optional[Tensor]:
         # saved key padding masks have shape (bsz, seq_len)
         if prev_key_padding_mask is not None and static_kv:
@@ -912,9 +912,9 @@ class MultiheadAttention(nn.Module):
 
     @torch.jit.export
     def reorder_incremental_state(
-        self,
-        incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
-        new_order: Tensor,
+            self,
+            incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
+            new_order: Tensor,
     ):
         """Reorder buffered internal state (for incremental generation)."""
         input_buffer = self._get_input_buffer(incremental_state)
@@ -923,7 +923,7 @@ class MultiheadAttention(nn.Module):
                 input_buffer_k = input_buffer[k]
                 if input_buffer_k is not None:
                     if self.encoder_decoder_attention and input_buffer_k.size(
-                        0
+                            0
                     ) == new_order.size(0):
                         break
                     input_buffer[k] = input_buffer_k.index_select(0, new_order)
@@ -931,7 +931,7 @@ class MultiheadAttention(nn.Module):
         return incremental_state
 
     def _get_input_buffer(
-        self, incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]]
+            self, incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]]
     ) -> Dict[str, Optional[Tensor]]:
         result = self.get_incremental_state(incremental_state, "attn_state")
         if result is not None:
@@ -941,9 +941,9 @@ class MultiheadAttention(nn.Module):
             return empty_result
 
     def _set_input_buffer(
-        self,
-        incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
-        buffer: Dict[str, Optional[Tensor]],
+            self,
+            incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
+            buffer: Dict[str, Optional[Tensor]],
     ):
         return self.set_incremental_state(incremental_state, "attn_state", buffer)
 
@@ -959,8 +959,8 @@ class MultiheadAttention(nn.Module):
                 # in_proj_weight used to be q + k + v with same dimensions
                 dim = int(state_dict[k].shape[0] / 3)
                 items_to_add[prefix + "q_proj.weight"] = state_dict[k][:dim]
-                items_to_add[prefix + "k_proj.weight"] = state_dict[k][dim : 2 * dim]
-                items_to_add[prefix + "v_proj.weight"] = state_dict[k][2 * dim :]
+                items_to_add[prefix + "k_proj.weight"] = state_dict[k][dim: 2 * dim]
+                items_to_add[prefix + "v_proj.weight"] = state_dict[k][2 * dim:]
 
                 keys_to_remove.append(k)
 
@@ -969,9 +969,9 @@ class MultiheadAttention(nn.Module):
                     dim = int(state_dict[k].shape[0] / 3)
                     items_to_add[prefix + "q_proj.bias"] = state_dict[k_bias][:dim]
                     items_to_add[prefix + "k_proj.bias"] = state_dict[k_bias][
-                        dim : 2 * dim
-                    ]
-                    items_to_add[prefix + "v_proj.bias"] = state_dict[k_bias][2 * dim :]
+                                                           dim: 2 * dim
+                                                           ]
+                    items_to_add[prefix + "v_proj.bias"] = state_dict[k_bias][2 * dim:]
 
                     keys_to_remove.append(prefix + "in_proj_bias")
 
@@ -980,6 +980,7 @@ class MultiheadAttention(nn.Module):
 
         for key, value in items_to_add.items():
             state_dict[key] = value
+
 
 ####
 try:
@@ -1003,15 +1004,15 @@ class ModelParallelMultiheadAttention(nn.Module):
     """
 
     def __init__(
-        self,
-        embed_dim,
-        num_heads,
-        kdim=None,
-        vdim=None,
-        dropout=0.0,
-        bias=True,
-        self_attention=False,
-        encoder_decoder_attention=False,
+            self,
+            embed_dim,
+            num_heads,
+            kdim=None,
+            vdim=None,
+            dropout=0.0,
+            bias=True,
+            self_attention=False,
+            encoder_decoder_attention=False,
     ):
         super().__init__()
         if not has_megatron_submodule:
@@ -1029,7 +1030,7 @@ class ModelParallelMultiheadAttention(nn.Module):
 
         self.num_heads_partition = num_heads // self.model_parallel_size
         assert (
-            self.num_heads_partition * self.model_parallel_size == num_heads
+                self.num_heads_partition * self.model_parallel_size == num_heads
         ), "Number of heads must be divisible by model parallel size"
 
         self.dropout_module = FairseqDropout(
@@ -1037,7 +1038,7 @@ class ModelParallelMultiheadAttention(nn.Module):
         )
         self.head_dim = embed_dim // num_heads
         assert (
-            self.head_dim * num_heads == self.embed_dim
+                self.head_dim * num_heads == self.embed_dim
         ), "embed_dim must be divisible by num_heads"
         self.scaling = self.head_dim ** -0.5
 
@@ -1045,7 +1046,7 @@ class ModelParallelMultiheadAttention(nn.Module):
         self.encoder_decoder_attention = encoder_decoder_attention
 
         assert (
-            not self.self_attention or self.qkv_same_dim
+                not self.self_attention or self.qkv_same_dim
         ), "Self-attention requires query, key and value to be of the same size"
 
         self.k_proj = ColumnParallelLinear(
@@ -1062,15 +1063,15 @@ class ModelParallelMultiheadAttention(nn.Module):
         )
 
     def forward(
-        self,
-        query,
-        key: Optional[Tensor],
-        value: Optional[Tensor],
-        key_padding_mask: Optional[Tensor] = None,
-        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        static_kv: bool = False,
-        attn_mask: Optional[Tensor] = None,
-        **unused_kwargs,
+            self,
+            query,
+            key: Optional[Tensor],
+            value: Optional[Tensor],
+            key_padding_mask: Optional[Tensor] = None,
+            incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+            static_kv: bool = False,
+            attn_mask: Optional[Tensor] = None,
+            **unused_kwargs,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Input shape: Time x Batch x Channel
         Args:
@@ -1251,11 +1252,11 @@ class ModelParallelMultiheadAttention(nn.Module):
 
     @staticmethod
     def _append_prev_key_padding_mask(
-        key_padding_mask: Optional[Tensor],
-        prev_key_padding_mask: Optional[Tensor],
-        batch_size: int,
-        src_len: int,
-        static_kv: bool,
+            key_padding_mask: Optional[Tensor],
+            prev_key_padding_mask: Optional[Tensor],
+            batch_size: int,
+            src_len: int,
+            static_kv: bool,
     ) -> Optional[Tensor]:
         # saved key padding masks have shape (bsz, seq_len)
         if prev_key_padding_mask is not None and static_kv:
@@ -1287,7 +1288,7 @@ class ModelParallelMultiheadAttention(nn.Module):
         return new_key_padding_mask
 
     def reorder_incremental_state(
-        self, incremental_state: Dict[str, Dict[str, Optional[Tensor]]], new_order
+            self, incremental_state: Dict[str, Dict[str, Optional[Tensor]]], new_order
     ):
         """Reorder buffered internal state (for incremental generation)."""
         input_buffer = self._get_input_buffer(incremental_state)
@@ -1299,7 +1300,7 @@ class ModelParallelMultiheadAttention(nn.Module):
         return incremental_state
 
     def _get_input_buffer(
-        self, incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]]
+            self, incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]]
     ) -> Dict[str, Optional[Tensor]]:
         result = self.get_incremental_state(incremental_state, "attn_state")
         if result is not None:
@@ -1309,13 +1310,15 @@ class ModelParallelMultiheadAttention(nn.Module):
             return empty_result
 
     def _set_input_buffer(
-        self,
-        incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
-        buffer: Dict[str, Optional[Tensor]],
+            self,
+            incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
+            buffer: Dict[str, Optional[Tensor]],
     ):
-        return self.set_incremental_state(incremental_state, "attn_state", buffer) 
-               
-############################################
+        return self.set_incremental_state(incremental_state, "attn_state", buffer)
+
+    ############################################
+
+
 class AttnLinear(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -1329,16 +1332,16 @@ class AttnLinear(nn.Module):
 
 class Attention(nn.Module):
     def __init__(
-        self,
-        hidden_dim,
-        attention_type,
-        attention_layers=2,
-        n_heads=8,
-        x_dim=1,
-        rep="mlp",
-        dropout=0,
-        batchnorm=False,
-        head_dim= 32,
+            self,
+            hidden_dim,
+            attention_type,
+            attention_layers=2,
+            n_heads=8,
+            x_dim=1,
+            rep="mlp",
+            dropout=0,
+            batchnorm=False,
+            head_dim=32,
     ):
         super().__init__()
         self._rep = rep
@@ -1367,10 +1370,10 @@ class Attention(nn.Module):
             self._attention_func = self._laplace_attention
         elif attention_type == "dot":
             self._attention_func = self._dot_attention
-        elif attention_type =="cosformer":
+        elif attention_type == "cosformer":
             self._W = CosformerAttention(embed_dim=hidden_dim, num_heads=n_heads, causal=True)
             self._attention_func = self._cosformer_attention
-            
+
         elif attention_type == "multihead":
             self._W = MultiheadAttention(embed_dim=hidden_dim,
                                          num_heads=n_heads,
@@ -1389,7 +1392,7 @@ class Attention(nn.Module):
             raise NotImplementedError
 
     def forward(self, k, v, q):
-        #k: (B,T,D_k)
+        # k: (B,T,D_k)
         if self._rep == "mlp":
             k = self.mlp_k(k)
             q = self.mlp_q(q)
@@ -1401,8 +1404,8 @@ class Attention(nn.Module):
 
     def _uniform_attention(self, k, v, q):
         total_points = q.shape[1]
-        rep = torch.mean(v, dim=1, keepdim=True)#(B, 1, D_v)
-        rep = rep.repeat(1, total_points, 1) #(B, T, D_v)
+        rep = torch.mean(v, dim=1, keepdim=True)  # (B, 1, D_v)
+        rep = rep.repeat(1, total_points, 1)  # (B, T, D_v)
         return rep
 
     def _laplace_attention(self, k, v, q, scale=0.5, normalise=True):
@@ -1411,8 +1414,8 @@ class Attention(nn.Module):
         keys = torch.unsqueeze(k, dim=1)  # [batch_size, 1, N_context, key_size]
         queries = torch.unsqueeze(q, dim=2)  # [batch_size, N_target, 1, key_size]
 
-        unnorm_weights = -torch.abs((keys - queries)/scale)  # [batch_size, N_target, N_context, key_size]
-        unnorm_weights = torch.sum(unnorm_weights, dim=-1, keepdim=False) # [batch_size, N_target, N_context]
+        unnorm_weights = -torch.abs((keys - queries) / scale)  # [batch_size, N_target, N_context, key_size]
+        unnorm_weights = torch.sum(unnorm_weights, dim=-1, keepdim=False)  # [batch_size, N_target, N_context]
 
         if normalise:
             attention = torch.softmax(unnorm_weights, dim=-1)  # [batch_size, N_target, N_context]
@@ -1421,11 +1424,12 @@ class Attention(nn.Module):
             attention = weight_fn(unnorm_weights)  # [batch_size, N_target, N_context]
 
         # Einstein summation over weights and values
-        output= torch.einsum('bik,bkj->bij', attention, v)  # [batch_size, N_target, value_size]
+        output = torch.einsum('bik,bkj->bij', attention, v)  # [batch_size, N_target, value_size]
 
         return output
 
-    def _dot_attention(self, k:torch.Tensor, v:torch.Tensor, q:torch.Tensor, normalise:bool = True, attention_mask: Optional[torch.Tensor]=None):
+    def _dot_attention(self, k: torch.Tensor, v: torch.Tensor, q: torch.Tensor, normalise: bool = True,
+                       attention_mask: Optional[torch.Tensor] = None):
         scale = q.shape[-1] ** 0.5
         unnorm_weights = torch.einsum("bjk,bik->bij", k, q) / scale
         if attention_mask is not None:
@@ -1437,98 +1441,101 @@ class Attention(nn.Module):
         # results: (B,T,D_v)
         rep = torch.einsum("bik,bkj->bij", weights, v)
 
-    def _cosformer_attention(self, k:torch.Tensor, v:torch.Tensor, q:torch.Tensor, attention_mask: Optional[torch.Tensor]=None):
-        attn, _ = self._W(q, k, v,attn_mask=attention_mask)
-        #cosformer attention: : (B,T,D_v)
+    def _cosformer_attention(self, k: torch.Tensor, v: torch.Tensor, q: torch.Tensor,
+                             attention_mask: Optional[torch.Tensor] = None):
+        attn, _ = self._W(q, k, v, attn_mask=attention_mask)
+        # cosformer attention: : (B,T,D_v)
         return attn
-    
-    def _multihead_attention(self, k:torch.Tensor, v:torch.Tensor, q:torch.Tensor, attention_mask: Optional[torch.Tensor]=None):
-        attn, attn_weights, aux_loss = self._W( q, k, v, query_padding_mask=attention_mask, key_padding_mask=attention_mask)
-        #k: torch.Size([B, T, D])
+
+    def _multihead_attention(self, k: torch.Tensor, v: torch.Tensor, q: torch.Tensor,
+                             attention_mask: Optional[torch.Tensor] = None):
+        attn, attn_weights, aux_loss = self._W(q, k, v, query_padding_mask=attention_mask,
+                                               key_padding_mask=attention_mask)
+        # k: torch.Size([B, T, D])
         return attn, aux_loss
 
-    def _pytorch_multihead_attention(self, k:torch.Tensor, v:torch.Tensor, q:torch.Tensor, attention_mask: Optional[torch.Tensor]=None):
+    def _pytorch_multihead_attention(self, k: torch.Tensor, v: torch.Tensor, q: torch.Tensor,
+                                     attention_mask: Optional[torch.Tensor] = None):
         # Pytorch multiheaded attention takes inputs if diff order and permutation
-        #query is ( T, B, D) when batch_first=False
+        # query is ( T, B, D) when batch_first=False
         q = q.permute(1, 0, 2)
         k = k.permute(1, 0, 2)
         v = v.permute(1, 0, 2)
-        o = self._W(q, k, v, attention_mask )[0]
+        o = self._W(q, k, v, attention_mask)[0]
         return o.permute(1, 0, 2)
 
 
-    
 class LatentEncoder(nn.Module):
     def __init__(
-        self,
-        input_dim,
-        hidden_dim=32,
-        latent_dim=32,
-        self_attention_type="dot",
-        n_encoder_layers=3,
-        batchnorm=False,
-        dropout=0,
-        attention_dropout=0,
-        attention_layers=2,
-        use_lstm=True
-        ):
+            self,
+            input_dim,
+            hidden_dim=32,
+            latent_dim=32,
+            self_attention_type="dot",
+            n_encoder_layers=3,
+            batchnorm=False,
+            dropout=0,
+            attention_dropout=0,
+            attention_layers=2,
+            use_lstm=True
+    ):
         super().__init__()
         # self._input_layer = nn.Linear(input_dim, hidden_dim)
         if use_lstm:
-            #https://github.com/alisafaya/shalstm/blob/fbce6414684dfe70e236e414bdcd7a113e20153a/shalstm/model/lstmblock.py
-            self._encoder = LSTMBlock(input_dim, hidden_dim,  dropout=dropout, batchnorm=batchnorm, num_layers=n_encoder_layers)
-            
+            # https://github.com/alisafaya/shalstm/blob/fbce6414684dfe70e236e414bdcd7a113e20153a/shalstm/model/lstmblock.py
+            self._encoder = LSTMBlock(input_dim, hidden_dim, dropout=dropout, batchnorm=batchnorm,
+                                      num_layers=n_encoder_layers)
+
         else:
-            self._encoder = BatchMLP(input_dim, hidden_dim, batchnorm=batchnorm, dropout=dropout, num_layers=n_encoder_layers)
-        
+            self._encoder = BatchMLP(input_dim, hidden_dim, batchnorm=batchnorm, dropout=dropout,
+                                     num_layers=n_encoder_layers)
+
         self._self_attention = Attention(
-                                        hidden_dim,
-                                        self_attention_type,
-                                        attention_layers,
-                                        x_dim=hidden_dim,
-                                        rep="lstm",
-                                        dropout=attention_dropout,
-                                       )
-        self._penultimate_layer = nn.Linear(2*hidden_dim, hidden_dim)
+            hidden_dim,
+            self_attention_type,
+            attention_layers,
+            x_dim=hidden_dim,
+            rep="lstm",
+            dropout=attention_dropout,
+        )
+        self._penultimate_layer = nn.Linear(2 * hidden_dim, hidden_dim)
         self._mean = nn.Linear(hidden_dim, latent_dim)
         self._log_var = nn.Linear(hidden_dim, latent_dim)
         self._self_attention_type = self_attention_type
         self._use_lstm = use_lstm
-        
 
     def forward(self, x, y):
         encoder_input = torch.cat([x, y], dim=-1)
-        
-        #encoder inputs[B, T, D_in+D_out]
+
+        # encoder inputs[B, T, D_in+D_out]
 
         # Pass final axis through MLP
         if self._use_lstm:
             encoded, _ = self._encoder(encoder_input)
         else:
-            encoded = self._encoder(encoder_input) 
-        #residual
-        residual = encoded.clone() ###???
+            encoded = self._encoder(encoder_input)
+            # residual
+        residual = encoded.clone()  ###???
         # Aggregator: take the mean over all points
         if self._self_attention_type is not "multihead":
-           attention_output = self._self_attention(encoded, encoded, encoded)
+            attention_output = self._self_attention(encoded, encoded, encoded)
         else:
-          attention_output, attention_loss = self._self_attention(encoded, encoded, encoded)
-        #attention output torch.Size([B, :src_len, H])
+            attention_output, attention_loss = self._self_attention(encoded, encoded, encoded)
+        # attention output torch.Size([B, :src_len, H])
         hidden = attention_output.mean(dim=1, keepdim=True)
-        
-        hidden = hidden.repeat(1, attention_output.shape[1],1)
-        
-        mean_attention =torch.cat([attention_output, hidden], dim=-1)
-        
+
+        hidden = hidden.repeat(1, attention_output.shape[1], 1)
+
+        mean_attention = torch.cat([attention_output, hidden], dim=-1)
+
         # Have further MLP layers that map to the parameters of the Gaussian latent
         mean_repr = torch.relu(self._penultimate_layer(mean_attention))
-        mean_representation =  mean_repr + residual ###????
+        mean_representation = mean_repr + residual  ###????
         # Then apply further linear layers to output latent mu and log sigma
-        mean    =  self._mean(mean_representation)
-        logvar  =  nn.Softplus()(self._log_var(mean_representation))
+        mean = self._mean(mean_representation)
+        logvar = nn.Softplus()(self._log_var(mean_representation))
 
         if self._self_attention_type is not "multihead":
-           return mean, logvar
+            return mean, logvar
         else:
-           return mean, logvar, attention_loss
-
+            return mean, logvar, attention_loss
