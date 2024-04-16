@@ -9,9 +9,9 @@ import datetime
 import itertools
 from tqdm import tqdm
 import imageio
-import pathlib  #
-import random  #
-import functools  #
+import pathlib
+import random
+import functools
 from numbers import Number
 from collections import namedtuple, deque, defaultdict
 from typing import Tuple, Dict, List, Iterable
@@ -35,6 +35,7 @@ from pathlib import Path
 import operator
 import re
 from planner_D2E_regularizer_n_step import *
+import DataCollectionD2E_n_step as DC
 
 CONST_SQRT_2 = math.sqrt(2)
 CONST_INV_SQRT_2PI = 1 / math.sqrt(2 * math.pi)
@@ -306,7 +307,18 @@ def get_act(name):
         raise NotImplementedError(name)
 
 
-def preprocess_transition_data(s1, a1, s2, done):
+def dict_to_tran(data):
+    return Transition(
+        s1=(data['s1'] / 255.0),
+        s2=(data['s2'] / 255.0),
+        a1=data['a1'],
+        a2=data['a2'],
+        reward=data['reward'],
+        discount=data['discount'],
+        done=data['done'])
+
+
+def decrypted_preprocess_transition_data(s1, a1, s2, done):
     inputs, outputs = make_episodes(s1, a1, s2, done)
     padded_trajectories_inputs, mask_input = pad(inputs, repeat=False)
     padded_trajectories_outputs, mask_output = pad(outputs, repeat=False)
@@ -1089,3 +1101,11 @@ class VideoRenderWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
         self.metadata.update(self._metadata)
+
+
+def append_action_and_latent_obs(s1, a1, s2, n_step):
+    latent_shape = s1.shape[-1]
+    obs = torch.reshape(s1, (-1, n_step, latent_shape))
+    next_obs = torch.reshape(s2, (-1, n_step, latent_shape))
+    inputs = torch.cat((obs, a1), dim=-1)
+    return inputs, next_obs

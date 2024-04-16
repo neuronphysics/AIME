@@ -418,7 +418,10 @@ class AgentModule(GeneralAgent):
         return utils.relu_v2(self._alpha_entropy_var)
 
     def assign_alpha(self, alpha):
-        self._alpha_var = torch.tensor(alpha, requires_grad=True)
+        if not isinstance(alpha, torch.Tensor):
+            self._alpha_var = torch.tensor(alpha, requires_grad=True)
+        else:
+            self._alpha_var = alpha
 
     def assign_alpha_entropy(self, alpha):
         self._alpha_entropy_var = torch.tensor(alpha, requires_grad=True)
@@ -441,7 +444,7 @@ class AgentModule(GeneralAgent):
         for q_net, _ in self._q_nets:
             for name, param in q_net._layers.named_parameters():
                 if 'weight' in name:
-                    q_weights += list(param)
+                    q_weights = q_weights + list(param)
         return q_weights
 
     @property
@@ -450,7 +453,7 @@ class AgentModule(GeneralAgent):
         for _, q_net in self._q_nets:
             for name, param in q_net._layers.named_parameters():
                 if 'weight' in name:
-                    q_weights += list(param)
+                    q_weights = q_weights + list(param)
         return q_weights
 
     @property
@@ -459,7 +462,7 @@ class AgentModule(GeneralAgent):
         for q_net, _ in self._q_nets:
             for param in q_net._layers:
                 if not isinstance(param, nn.ReLU):
-                    vars_ += list(param.parameters())
+                    vars_ = vars_ + list(param.parameters())
         return vars_
 
     @property
@@ -468,7 +471,7 @@ class AgentModule(GeneralAgent):
         for _, q_net in self._q_nets:
             for param in q_net._layers:
                 if not isinstance(param, nn.ReLU):
-                    vars_ += list(param.parameters())
+                    vars_ = vars_ + list(param.parameters())
         return vars_
 
     @property
@@ -481,7 +484,7 @@ class AgentModule(GeneralAgent):
         for v_net, _ in self._v_nets:
             for name, param in v_net._layers.named_parameters():
                 if 'weight' in name:
-                    v_weights += list(param)
+                    v_weights = v_weights + list(param)
         return v_weights
 
     @property
@@ -490,7 +493,7 @@ class AgentModule(GeneralAgent):
         for _, v_net in self._v_nets:
             for name, param in v_net._layers.named_parameters():
                 if 'weight' in name:
-                    v_weights += list(param)
+                    v_weights = v_weights + list(param)
         return v_weights
 
     @property
@@ -499,7 +502,7 @@ class AgentModule(GeneralAgent):
         for v_net, _ in self._v_nets:
             for param in v_net._layers:
                 if not isinstance(param, nn.ReLU):
-                    vars_ += list(param.parameters())
+                    vars_ = vars_ + list(param.parameters())
         return vars_
 
     @property
@@ -508,7 +511,7 @@ class AgentModule(GeneralAgent):
         for _, v_net in self._v_nets:
             for param in v_net._layers:
                 if not isinstance(param, nn.ReLU):
-                    vars_ += list(param.parameters())
+                    vars_ = vars_ + list(param.parameters())
         return vars_
 
     @property
@@ -523,7 +526,7 @@ class AgentModule(GeneralAgent):
         p_weights = []
         for name, param in self._p_net._layers.named_parameters():
             if 'weight' in name:
-                p_weights += list(param)
+                p_weights = p_weights + list(param)
         return p_weights
 
     @property
@@ -531,7 +534,7 @@ class AgentModule(GeneralAgent):
         vars_ = []
         for param in self._p_net._layers:
             if not isinstance(param, nn.ReLU):
-                vars_ += list(param.parameters())
+                vars_ = vars_ + list(param.parameters())
         return vars_
 
     @property
@@ -543,7 +546,7 @@ class AgentModule(GeneralAgent):
         c_weights = []
         for name, param in self._c_net._layers.named_parameters():
             if 'weight' in name:
-                c_weights += list(param)
+                c_weights = c_weights + list(param)
         return c_weights
 
     @property
@@ -551,7 +554,7 @@ class AgentModule(GeneralAgent):
         vars_ = []
         for param in self._c_net._layers:
             if not isinstance(param, nn.ReLU):
-                vars_ += list(param.parameters())
+                vars_ = vars_ + list(param.parameters())
         return vars_
 
 
@@ -682,7 +685,7 @@ class Agent(object):
         train_batch = self._get_train_batch()
         loss = self._build_loss(train_batch)
         self._optimizer.zero_grad()
-        loss.backward()
+        loss.backward(retain_graph=True)
         self._optimizer.step()
         self._global_step += 1
         if self._global_step % self._update_freq == 0:
@@ -1022,7 +1025,7 @@ class D2EAgent(Agent):
         for i in range(len(child_disc)):
             for layer in child_disc[i].children():
                 if isinstance(layer, nn.Linear):
-                    disc_weights += layer.weight
+                    disc_weights.append(layer.weight)
         norms = []
         for w in disc_weights:
             norm = torch.sum(torch.square(w))
@@ -1256,9 +1259,12 @@ class D2EAgent(Agent):
         self._a_optimizer = torch.optim.Adam(self._a_vars, lr=opts[4][0], betas=(opts[4][1], opts[4][2]))
         self._ae_optimizer = torch.optim.Adam(self._ae_vars, lr=opts[4][0], betas=(opts[4][1], opts[4][2]))
 
-    def _optimize_step(self, batch):
+    def _optimize_step(self, train_batch):
+        batch = {k: v.clone().detach() for k, v in train_batch.items()}
+
         info = collections.OrderedDict()
-        if torch.equal(self._global_step % torch.tensor(self._update_freq), torch.tensor(0, dtype=torch.float32)):
+        if torch.equal(self._global_step % torch.tensor(self._update_freq),
+                       torch.tensor(0, dtype=torch.float32, device=self._global_step.device)):
             source_vars, target_vars = self._get_source_target_vars()
             self._update_target_fns(source_vars, target_vars)
         # Update policy network parameter
@@ -1266,8 +1272,11 @@ class D2EAgent(Agent):
         # policy network's update should be done before updating q network, or there will make some errors
         self._agent_module.p_net.train()
         self._p_optimizer.zero_grad()
-        policy_loss, _ = self._build_p_loss(batch)
+
+        with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
+            policy_loss, _ = self._build_p_loss(batch)
         policy_loss.backward(retain_graph=True)
+
         if self._grad_norm_clipping > 0.:
             torch.nn.utils.clip_grad_norm_(self._agent_module.p_net.parameters(), self._grad_norm_clipping)
         if self._grad_value_clipping > 0.0:
@@ -1281,8 +1290,11 @@ class D2EAgent(Agent):
         ###fGAN
         self._transit_discriminator.optimizer.zero_grad()
         self._transit_discriminator.fake_state_action.optimizer.zero_grad()
-        value_loss, info_value = self._build_v_loss(batch)
+
+        with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
+            value_loss, info_value = self._build_v_loss(batch)
         value_loss.backward(retain_graph=True)
+
         if self._grad_norm_clipping > 0.:
             torch.nn.utils.clip_grad_norm_(v_fn.parameters(), self._grad_norm_clipping)
 
@@ -1312,7 +1324,7 @@ class D2EAgent(Agent):
         self._agent_module.c_net.train()
         self._c_optimizer.zero_grad()
         critic_loss, _ = self._build_c_loss(batch)
-        critic_loss.backward()
+        critic_loss.backward(retain_graph=True)
         self._c_optimizer.step()
         self._extra_c_step(batch)
 
@@ -1321,12 +1333,12 @@ class D2EAgent(Agent):
         if self._train_alpha:
             self._a_optimizer.zero_grad()
             a_loss, a_info = self._build_a_loss(batch)
-            a_loss.backward()
+            a_loss.backward(retain_graph=True)
             self._a_optimizer.step()
         if self._train_alpha_entropy:
             self._ae_optimizer.zero_grad()
             ae_loss, ae_info = self._build_ae_loss(batch)
-            ae_loss.backward()
+            ae_loss.backward(retain_graph=True)
             self._ae_optimizer.step()
         self._update_network_parameters(self._v_fns)
         self._update_network_parameters(self._q_fns)
@@ -1362,7 +1374,7 @@ class D2EAgent(Agent):
     def _extra_c_step(self, batch):
         self._c_optimizer.zero_grad()
         self.critic_loss, _ = self._build_c_loss(batch)
-        self.critic_loss.backward()
+        self.critic_loss.backward(retain_graph=True)
         self._c_optimizer.step()
 
     def train_step(self):
@@ -1451,7 +1463,8 @@ class D2EAgent(Agent):
         self._p_optimizer.load_state_dict(checkpoint["policy_optimizer"])
         self._q_source_optimizer.load_state_dict(checkpoint["q_source_optimizer"])
         self._transit_discriminator.optimizer.load_state_dict(checkpoint["discriminator_transition_optimizer"])
-        self._transit_discriminator.fake_state_action.optimizer.load_state_dict(checkpoint["generator_transition_optimizer"])
+        self._transit_discriminator.fake_state_action.optimizer.load_state_dict(
+            checkpoint["generator_transition_optimizer"])
         self._c_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self._v_source_optimizer.load_state_dict(checkpoint["value_source_optimizer"])
         self._global_step = checkpoint["train_step"]
@@ -1573,7 +1586,7 @@ def eval_policy_episodes(env, policy, n_episodes):
                 time_step = env.step(action.unsqueeze(0).detach().cpu())
             else:
                 time_step = env.step(action.detach().cpu())
-            total_rewards += time_step.reward or 0.
+            total_rewards = total_rewards + time_step.reward or 0.
         results.append(total_rewards)
     results = torch.tensor(results)
     return torch.mean(results).to(dtype=torch.float32), torch.std(results).to(dtype=torch.float32)

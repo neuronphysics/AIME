@@ -252,14 +252,14 @@ class Driver:
             obs = build_dict_from_named_tuple(self._obs)
 
             # get actions for each of the env
-            actions, self._state = policy(obs['observation'], obs['reward'], obs['done'],
+            actions, self._state = policy(obs['observation'], None, obs['done'],
                                           self._state, **self._kwargs)
             actions = [
                 {k: np.array(actions[k][i].cpu()) for k in actions}
                 for i in range(len(self._envs))
             ]
 
-            removed_actions = [actions[i].pop('logprob') for i in range(len(actions))]
+            # removed_actions = [actions[i].pop('logprob') for i in range(len(actions))]
 
             assert len(actions) == len(self._envs)
             obs_next = [e.step(a['action']) for e, a in zip(self._envs, actions)]
@@ -514,3 +514,383 @@ class NormalizeAction:
         orig = (action[self._key] + 1) / 2 * (self._high - self._low) + self._low
         orig = np.where(self._mask, orig, action[self._key])
         return self._env.step({**action, self._key: orig})
+
+
+class WorldModel(nn.Module):
+    def __init__(self,
+                 hyperParams,
+                 train_data,
+                 sequence_length,
+                 env_name='Hopper-v2',
+                 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+                 log_dir="logs",
+                 restore=False):
+        super(WorldModel, self).__init__()
+
+        self.sequence_len = sequence_length
+        self.optimizer = None
+        self.discriminator_optim = None
+        self.wm_image_replay_buffer = train_data
+        self.model_path = os.path.abspath(os.getcwd()) + '/model'
+
+        try:
+            os.makedirs(self.model_path, exist_ok=True)
+            print("Directory '%s' created successfully" % self.model_path)
+        except OSError as error:
+            print("Directory '%s' can not be created")
+        self.ckpt_path = self.model_path + '/best_model'
+        os.makedirs(self.ckpt_path, exist_ok=True)
+        self.save_path = os.path.join(self.ckpt_path, 'WorldModel.pth')
+
+        self._params = namedtuple('x', hyperParams.keys())(*hyperParams.values())
+        self._discount = self._params.GAMMA
+        # set the environment
+        self._env_name = env_name
+        domain_name, task_name = env_name.split("_")
+        env = DMCGYMWrapper(
+            domain_name=domain_name,
+            task_name=task_name,
+            visualize_reward=False,
+            from_pixels=True,
+            height=100,
+            width=100,
+            camera_id=0,
+        )
+
+        self._env = env
+        self.n_discriminator_iter = self._params.CRITIC_ITERATIONS
+        self._use_amp = False
+
+        # set the sizes
+        self.state_dim = self._params.latent_d
+        self.action_dim = env.action_spec().shape[0]
+
+        i = 0
+        for key, value in env.observation_spec().items():
+            attr_name = f"observation_{key}_dim"
+            setattr(self, attr_name, value.shape)
+            if i == 0:
+                self.observation_dim = tuple(0 for i in range(len(getattr(self, attr_name))))
+            self.observation_dim = tuple(map(operator.add, self.observation_dim, getattr(self, attr_name)))
+            i += 1
+
+        self.device = device
+        self._clip_rewards = "tanh"
+        self.heads = nn.ModuleDict()
+        input_shape = self.state_dim + self.action_dim
+        self.heads["reward"] = MLP(shape=1, layers=4, units=400, input_shape=input_shape, act="ELU", norm="none",
+                                   dist="mse", device=self.device)
+        self.heads["discount"] = MLP(shape=1, layers=4, units=400, input_shape=input_shape, act="ELU", norm="none",
+                                     dist="binary", device=self.device)
+        self.heads["done"] = MLP(shape=2, layers=4, units=400, input_shape=input_shape, act="ELU", norm="none",
+                                 dist="onehot", device=self.device)
+
+        self.mse_loss = nn.MSELoss()
+
+        # inside VRNN folder we have main.py script : the transition model
+        modelstate = ModelState(seed=self._params.seed,
+                                nu=self.state_dim + self.action_dim,
+                                ny=self.state_dim,
+                                sequence_length=sequence_length,
+                                h_dim=self._params.hidden_transit,
+                                z_dim=self.state_dim,
+                                n_layers=2,
+                                n_mixtures=self._params.number_of_mixtures,
+                                device=device,
+                                optimizer_type=self._params.VRNN_Optimizer_Type,
+                                )
+        self.standard_scaler = StandardScaler(self.device)
+        self.transition_model = modelstate.model
+        # getting sensory information and building latent state
+
+        self.variational_autoencoder = InfGaussMMVAE(hyperParams,
+                                                     K=self._params.K,
+                                                     nchannel=self._params.n_channel,
+                                                     z_dim=self.state_dim,
+                                                     w_dim=self._params.latent_w,
+                                                     hidden_dim=self._params.hidden_d,
+                                                     device=self.device,
+                                                     img_width=self._params.image_width,
+                                                     batch_size=self._params.batch_size,
+                                                     num_layers=4,
+                                                     include_elbo2=True,
+                                                     use_mse_loss=True)
+        self.encoder = self.variational_autoencoder.GMM_encoder
+        self.decoder = self.variational_autoencoder.GMM_decoder
+        self.discriminator = VAECritic(self.state_dim)
+
+        self.grad_heads = ["reward", "discount", "done"]
+        self.loss_scales = {"reward": 1.0, "discount": 1.0, "done": 1.0}
+        for name in self.grad_heads:
+            assert name in self.heads, name
+
+        self.parameters = itertools.chain(
+            self.transition_model.parameters(),
+            self.heads["reward"].parameters(),
+            self.heads["discount"].parameters(),
+            self.heads["done"].parameters(),
+            self.variational_autoencoder.get_trainable_parameters()
+        )
+
+        if restore:
+            self.load_checkpoints()
+
+        self.writer = SummaryWriter(log_dir)
+        self.writer_counter = 0
+
+        self.pbar = tqdm(range(self.n_discriminator_iter))
+        print("End of initializing the world model")
+
+    def initialize_optimizer(self):
+        self.optimizer = Optimizer("world_model",
+                                   self.parameters,
+                                   lr=self._params.LEARNING_RATE,
+                                   wd=self._params.weight_decay,
+                                   opt="adamw",
+                                   use_amp=self._use_amp)
+
+        self.discriminator_optim = Optimizer("discriminator_model",
+                                             self.discriminator.parameters(),
+                                             lr=0.5 * self._params.LEARNING_RATE,
+                                             opt="adam",
+                                             wd=1e-5,
+                                             use_amp=self._use_amp)
+
+    def preprocess(self, observation, reward, done):
+        if isinstance(observation, np.ndarray):
+            if observation.max() > 1:
+                observation = observation / 255.0
+            observation = torch.from_numpy(observation)
+
+        if isinstance(observation, torch.Tensor) and observation.max() > 1:
+            observation = observation.to(torch.float32) / 255.0
+
+        if reward is not None and isinstance(reward, np.ndarray):
+            reward = torch.from_numpy(reward)
+
+        if done is not None and isinstance(done, np.ndarray):
+            done = torch.from_numpy(done)
+
+        if reward is not None and done is not None:
+            data = {"reward": {
+                "identity": lambda x: x,
+                "sign": torch.sign,
+                "tanh": torch.tanh,
+            }[self._clip_rewards](reward).unsqueeze(-1), "discount": 1.0 - done.float().unsqueeze(-1)}
+            data["discount"] *= self._discount
+        else:
+            data = {}
+        data["observation"] = observation
+
+        data["done"] = done
+        return data
+
+    def train_discriminator_get_latent(self, obs):
+        z_real, z_fake = None, None
+        for _ in self.pbar:
+            z_real, z_x_mean, z_x_sigma, c_posterior, w_x_mean, w_x_sigma, gmm_dist, z_wc_mean_prior, \
+            z_wc_logvar_prior, x_reconstructed = self.variational_autoencoder(obs)
+            z_fake = gmm_dist.sample()
+            critic_real = self.discriminator(z_real).reshape(-1)
+            critic_fake = self.discriminator(z_fake).reshape(-1)
+            gp = gradient_penalty(self.discriminator, z_real, z_fake, device=self.device)
+            loss_critic = (-(torch.mean(critic_real) - torch.mean(critic_fake)) + self._params.LAMBDA_GP * gp)
+            self.discriminator_optim.zero_grad_()
+            loss_critic.backward(retain_graph=True)
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self._params.MAX_GRAD_NORM, norm_type=2)
+            self.discriminator_optim.step_()
+
+        gen_fake = self.discriminator(z_fake).reshape(-1)
+        return z_real, gen_fake
+
+    def init_normalizer(self, full_train_set):
+        batch_size = 32
+        num_batch = full_train_set.size // batch_size
+        stacked_in, stacked_out = None, None
+        for i in range(num_batch):
+            batch = full_train_set.get_batch(np.arange(i * batch_size, (i + 1) * batch_size))
+
+            obs = torch.reshape(batch.s1, (-1, self._params.n_channel, self._params.image_width,
+                                           self._params.image_width)).to(self.device)
+            next_obs = torch.reshape(batch.s2, (-1, self._params.n_channel, self._params.image_width,
+                                                self._params.image_width)).to(self.device)
+            _, _, _, z_real, _, _, _ = self.encoder(obs)
+            _, _, _, z_next, _, _, _ = self.encoder(next_obs)
+            inputs, outputs = append_action_and_latent_obs(z_real, batch.a1.to(self.device), z_next,
+                                                           self.sequence_len)
+            if i == 0:
+                stacked_in = inputs.cpu().detach()
+                stacked_out = outputs.cpu().detach()
+            else:
+                stacked_in = torch.cat((stacked_in, inputs.cpu().detach()), dim=0)
+                stacked_out = torch.cat((stacked_out, outputs.cpu().detach()), dim=0)
+
+        normalizer_input, normalizer_output = compute_normalizer(stacked_in, stacked_out)
+        self.transition_model.normalizer_input = normalizer_input
+        self.transition_model.normalizer_output = normalizer_output
+
+    def train_(self, data):
+        self.discriminator.train()
+
+        obs = torch.reshape(data.s1, (-1, self._params.n_channel, self._params.image_width,
+                                      self._params.image_width)).to(self.device)
+        next_obs = torch.reshape(data.s2, (-1, self._params.n_channel, self._params.image_width,
+                                           self._params.image_width)).to(self.device)
+
+        z_real, gen_fake = self.train_discriminator_get_latent(obs)
+
+        self.transition_model.train()
+        self.optimizer.zero_grad()
+        w_x, w_x_mean, w_x_sigma, z_next, z_next_mean, z_next_sigma, c_posterior = self.encoder(next_obs)
+
+        # Prepare & normalize the input/output data for the transition model
+        inputs, outputs = append_action_and_latent_obs(z_real, data.a1.to(self.device), z_next, self.sequence_len)
+        reshaped_inputs = inputs.permute(0, 2, 1)
+        reshaped_outputs = outputs.permute(0, 2, 1)
+
+        with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
+            transition_loss, transition_disc_loss, hidden, real_embed, fake_embed, latent = self.transition_model(
+                reshaped_inputs, reshaped_outputs)
+        with torch.backends.cudnn.flags(enabled=False):
+            transition_gradient_penalty = self.transition_model.wgan_gp_reg(real_embed, fake_embed)
+        # reward prediction and computing discount factor
+        likes, losses = {}, {}
+        for name, head in self.heads.items():
+            grad_head = name in self.grad_heads
+            inp = inputs if grad_head else inputs.detach()
+            out = head(inp)
+            dists = out if isinstance(out, dict) else {name: out}
+            for key, dist in dists.items():
+                like = dist.log_prob(getattr(data, key).unsqueeze(-1).to(self.device))
+                likes[key] = like
+                losses[key] = -like.mean()
+        model_loss = sum(self.loss_scales.get(k, 1.0) * v for k, v in losses.items())
+
+        metrics, z_posterior, z_posterior_mean, z_posterior_sigma, c_posterior, w_posterior_mean, w_posterior_sigma, \
+        dist, z_prior_mean, z_prior_logvar, X_reconst = self.variational_autoencoder.get_ELBO(obs)
+        metrics["wasserstein_gp_loss"] = -torch.mean(gen_fake)
+        metrics["total_observe_loss"] = metrics["loss"] + metrics["wasserstein_gp_loss"]
+
+        # reward and discount losses
+        for k, v in losses.items():
+            metrics.update({k + "_loss": v.detach().cpu()})
+
+        metrics["transition_total_loss"] = transition_loss + transition_disc_loss + transition_gradient_penalty
+
+        metrics["total_model_loss"] = metrics["total_observe_loss"] + metrics["transition_total_loss"] + model_loss
+        metrics["total_model_loss"].backward(retain_graph=True)
+        nn.utils.clip_grad_norm_(self.parameters, self._params.MAX_GRAD_NORM, norm_type=2)
+        self.optimizer.step_()
+
+        self.writer.add_scalar('Variational autoencoder loss', metrics["total_observe_loss"].item(),
+                               global_step=self.writer_counter)
+        self.writer.add_scalar('transition loss', metrics["transition_total_loss"].item(),
+                               global_step=self.writer_counter)
+        self.writer.add_scalar('reward loss', metrics["reward_loss"].item(), global_step=self.writer_counter)
+        self.writer.add_scalar('discount loss', metrics["discount_loss"].item(), global_step=self.writer_counter)
+        self.writer.add_scalar('total world model loss', metrics["total_model_loss"].item(),
+                               global_step=self.writer_counter)
+        self.writer_counter += 1
+
+        outs = dict(
+            embedding=z_real,
+            feature=latent,
+            like=metrics["reward_loss"] + metrics["discount_loss"],
+            prior=hidden,
+            post=z_next,
+        )
+
+        return real_embed, outs, metrics
+
+    def imagine(self,
+                agent: Agent,
+                start_state: Dict[str, torch.Tensor],
+                horizon: int,
+                done: torch.Tensor = None,
+                ):
+        flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
+        start_state["action"] = agent._p_fn(start_state["feat"])[1]
+        seq = {k: [v] for k, v in start_state.items()}
+
+        for i in range(horizon):
+            features = torch.cat([seq["feat"][i], seq["action"][i]], dim=-1).unsqueeze(-1)
+            state, sample_mu, sample_sigma, hidden = self.transition_model.generate(features, seq_len=1)
+
+            next_latent = state[:, :, -1]
+            seq['feat'].append(next_latent)
+
+            action = agent._p_fn(next_latent)[1]
+            seq["action"].append(action)
+
+        latent_seq = torch.stack(seq['feat']).transpose(0, 1)
+        act_seq = torch.stack(seq['action']).transpose(0, 1)
+        seq_feat = torch.cat((latent_seq, act_seq), dim=-1)
+
+        disc = self.heads["discount"](seq_feat[:, :-1, :]).mode().cpu().squeeze(-1)
+        seq["reward"] = self.heads["reward"](seq_feat[:, :-1, :]).mode()
+
+        seq['latent'] = latent_seq.cpu()
+        seq['action'] = act_seq.cpu()
+        seq['feat'] = seq_feat.cpu()
+
+        if done is not None:
+            # Override discount prediction for the first step with the true
+            # discount factor from the replay buffer.
+            true_first = 1.0 - flatten(done).to(disc.dtype)
+            true_first *= self._discount
+            true_first = true_first.unsqueeze(-1)
+            disc = torch.concat((true_first, disc[:, 1:]), -1)
+        else:
+            done = torch.zeros_like(disc, dtype=torch.bool)
+            done[disc <= self._discount ** DC.MUJOCO_ENVS_LENGTH[self._env_name]] = True
+        seq["weight"] = torch.cumprod(torch.cat([torch.ones_like(disc[:1]), disc[:-1]], 0), 0).unsqueeze(-1)
+        pre_done = self.heads["done"](seq_feat[:, :-1, :]).mode().cpu()
+        seq['done'] = torch.argmax(pre_done, dim=-1).to(torch.bool)
+        seq['discount'] = disc
+
+        # seq contains all the imagine data
+        return seq
+
+    def video_pred(self, observation, action):
+        # TODO why we need all these +0.5 here???
+        truth = (observation[:6] + 0.5).to(self.device)
+        inputs = observation[:5]
+        actions = action[:5].to(self.device)
+        embed, embed_mean, embed_sigma, _, _, _, _, _, _, recon = self.variational_autoencoder(inputs.to(self.device))
+
+        next_state, sample_mu, sample_sigma, state = self.transition_model.generate(torch.cat([embed, actions],
+                                                                                              dim=1)[-1, :].unsqueeze(
+            -1).unsqueeze(0))
+        openl = self.decoder(next_state.squeeze(-1))
+        model = torch.concat([(recon + 0.5), (openl + 0.5)], dim=0)
+        # concatenate on a new dimension, type
+        error = (model - truth + 1) / 2
+        video = torch.concat([truth, model, error], 2)
+        # T, C, H, W = video.shape
+        return video.permute(0, 2, 3, 1).cpu()
+
+    def save(self):
+        torch.save(
+            {'transition_model': self.transition_model.state_dict(),
+             'reward_model': self.heads['reward'].state_dict(),
+             'observation_model': self.variational_autoencoder.state_dict(),
+             'observation_discriminator_model': self.discriminator.state_dict(),
+             'discount_model': self.heads['discount'].state_dict(),
+             'done_model': self.heads['done'].state_dict(),
+             'discriminator_optimizer': self.discriminator_optim.state_dict(),
+             'world_model_optimizer': self.optimizer.state_dict(), }, self.save_path)
+
+    def load_checkpoints(self):
+        if os.path.isfile(self.save_path):
+            model_dicts = torch.load(self.save_path, map_location=self.device)
+            self.transition_model.load_state_dict(model_dicts['transition_model'])
+            self.variational_autoencoder.load_state_dict(model_dicts['observation_model'])
+            self.discriminator.load_state_dict(model_dicts['observation_discriminator_model'])
+            self.heads['reward'].load_state_dict(model_dicts['reward_model'])
+            self.heads['discount'].load_state_dict(model_dicts['discount_model'])
+            self.heads['done'].load_state_dict(model_dicts['done_model'])
+            self.optimizer.load_state_dict(model_dicts['world_model_optimizer'])
+            self.discriminator_optim.load_state_dict(model_dicts['discriminator_optimizer'])
+            print("Loading models checkpoints!")
+        else:
+            print("Checkpoints not found!")
