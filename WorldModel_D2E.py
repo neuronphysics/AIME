@@ -469,11 +469,11 @@ def main(config):
 
     cur_step = 0
     while cur_step < config.num_train_epoch:
-        logger.write()
+        # logger.write()
         # print("Start evaluation.")
         # logger.add(model.report(next(eval_dataset_generator)), prefix="eval")
         # eval_driver(eval_policy, episodes=config.eval_eps)
-        print("Start training.")
+        # print("Start training.")
         train_driver(train_policy, steps=config.eval_every)
 
         if cur_step % 50 == 0:
@@ -506,8 +506,8 @@ def parse_args():
                         help="generate (prefill / 500) num of episodes for pretrain")
     parser.add_argument('--length', type=int, default=32, help='num of sequence length chunk from pre fill data')
     parser.add_argument('--policy_reply_buffer_size', type=int, default=10000, help='length of policy reply buffer')
-    parser.add_argument('--sequence_size', type=int, default=15, help='n step size')
-    parser.add_argument('--batch_size', type=int, default=3, help='Batch size for pre train')
+    parser.add_argument('--sequence_size', type=int, default=10, help='n step size')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for pre train')
     parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....')
     parser.add_argument("--max_episode_steps", type=int, default=1e3, help='an episode corresponds to 1000 steps')
     parser.add_argument("--eval_eps", type=int, default=1, help='??')
@@ -516,10 +516,10 @@ def parse_args():
     parser.add_argument('--log_keys_mean', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_max', type=str, default='^$', help='??')
     parser.add_argument('--discount', type=int, default=0.99, help="??")
-    parser.add_argument('--load_prefill', type=int, default=0, help='use exist prefill or not, 1 mean load')
+    parser.add_argument('--load_prefill', type=int, default=1, help='use exist prefill or not, 1 mean load')
     parser.add_argument('--num_pretrain_epoch', type=int, default=1, help='number of pretraining epochs')
     parser.add_argument('--num_train_epoch', type=int, default=100, help='number of formal training epochs')
-    parser.add_argument('--load_model', type=int, default=1, help='if 1 we load pre trained model')
+    parser.add_argument('--load_model', type=int, default=0, help='if 1 we load pre trained model')
 
     args, unknown = parser.parse_known_args()
     return args
