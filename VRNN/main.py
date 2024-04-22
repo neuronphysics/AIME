@@ -8,10 +8,11 @@ import os
 import sys
 from .MaskedNorm import MaskedNorm
 from .CustomLSTM import LSTMCore
-from .attention_encoder import LatentEncoder
 from .vrnn_utilities import _strip_prefix_if_present
 import random
 import numpy as np
+from VRNN.perceiver.Utils import generate_model
+from VRNN.perceiver import perceiver_helpers
 
 parent_dir = os.path.abspath(os.path.join(os.getcwd(), '..'))
 # passing the file name and path as argument
@@ -161,18 +162,26 @@ class VRNN_GMM(nn.Module):
             self.norm_u = MaskedNorm(u_dim)
             self.norm_y = MaskedNorm(y_dim)
 
-        self._latent_encoder = LatentEncoder(
-            u_dim + y_dim,
-            hidden_dim=h_dim,
-            latent_dim=h_dim,
-            self_attention_type=self_attention_type,
-            n_encoder_layers=n_layers,
-            batchnorm=False,
-            dropout=dropout,
-            attention_dropout=0,
-            attention_layers=2,
-            use_lstm=True
-        )
+        # self._latent_encoder = LatentEncoder(
+        #     u_dim + y_dim,
+        #     hidden_dim=h_dim,
+        #     latent_dim=h_dim,
+        #     self_attention_type=self_attention_type,
+        #     n_encoder_layers=n_layers,
+        #     batchnorm=False,
+        #     dropout=dropout,
+        #     attention_dropout=0,
+        #     attention_layers=2,
+        #     use_lstm=True
+        # )
+        mock_input = self.generate_mock_input()
+        self.perceiver_model = generate_model('HiPClassBottleneck', '16', mock_input)
+        self.perceiver_model.to(self.device)
+        self.out_keys = perceiver_helpers.ModelOutputKeys
+        self.conv1 = nn.Conv1d(in_channels=128, out_channels=1, kernel_size=1, stride=1)
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(self.h_dim)
+        self.perceiver_loss = nn.MSELoss()
+
         self.output_clamp = output_clamp
         self._eps = 1e-5
         self._max_deviation = 2.0
@@ -327,6 +336,14 @@ class VRNN_GMM(nn.Module):
         self.to(self.device)
         # self.apply(self.weight_init)
 
+    def generate_mock_input(self):
+        return {
+            'latent_fea':
+                torch.from_numpy(
+                    np.random.random((1, self.u_dim + self.y_dim, 1)).astype(np.float32)).to(
+                    self.device),
+        }
+
     def wgan_gp_reg(self, x_real, x_fake, center=1., lambda_gp=10.0):
 
         batch_size, T, D = x_real.shape
@@ -417,10 +434,18 @@ class VRNN_GMM(nn.Module):
         else:
             context_u = reshaped_u
             context_y = reshaped_y
-        if self.self_attention_type != "multihead":
-            mean_attn, logvar_attn = self._latent_encoder(context_u, context_y)
-        else:
-            mean_attn, logvar_attn, attn_loss = self._latent_encoder(context_u, context_y)
+
+        latent_input = torch.cat((context_u, context_y), dim=-1)
+        latent_input = torch.reshape(latent_input, (batch_size * self.sequence_length, self.u_dim + self.y_dim, 1))
+        output = self.perceiver_model({"latent_fea": latent_input}, is_training=True)
+        perceiver_recon = output[self.out_keys.INPUT_RECONSTRUCTION]['latent_fea']
+        perceiver_latent_out = output[self.out_keys.LATENTS]['latent_fea'].transpose(1, 2)
+        perceiver_latent_out = self.conv1(perceiver_latent_out)
+        perceiver_latent_out = self.adaptive_pool(perceiver_latent_out)
+        mean_attn = torch.reshape(perceiver_latent_out, (batch_size, self.sequence_length, -1))
+
+        perceiver_recon_loss = self.perceiver_loss(perceiver_recon, latent_input)
+
         # mean_attn [B, :seq_len, D_h])
         ##=============##
         # allocation
@@ -466,11 +491,7 @@ class VRNN_GMM(nn.Module):
                 #####=====(new)======######
 
                 # mean attention size :torch.Size([B, time, D_hid])
-                c_t_mu = mean_attn[:, t, :]
-                c_t_logvar = logvar_attn[:, t, :]
-                # phi_z_t:torch.Size([B, D_hid])
-                # c_final :torch.Size([B, D_hid])
-                c_final = self.reparametrization(c_t_mu, c_t_logvar)
+                c_final = mean_attn[:, t, :]
 
                 #####================######
                 # decoder: h_t, z_t -> y_t
@@ -492,8 +513,6 @@ class VRNN_GMM(nn.Module):
                 KLD = self.kld_gauss(enc_mean_t, enc_logvar_t, prior_mean_t, prior_logvar_t)
 
                 assert not torch.isnan(KLD)
-                KLD_ATTN = self.kld_attention(c_t_mu, c_t_logvar)  ##(new)
-                assert not torch.isnan(KLD_ATTN)
                 # Create the observation model (generating distribution) p(y_t|z_t,h_t, c_t)
 
                 log_p = dist.log_prob(y[:, :, t])
@@ -501,8 +520,9 @@ class VRNN_GMM(nn.Module):
                 assert not torch.isnan(loss_pred)
                 assert torch.isfinite(loss_pred)
 
-                total_loss += - loss_pred + KLD + KLD_ATTN
+                total_loss += - loss_pred + KLD
                 deterministic_hidden_state.append(h[-1])
+        total_loss += perceiver_recon_loss
 
         deterministic_hidden_state = torch.stack(deterministic_hidden_state).view(batch_size, -1, self.h_dim)
         hs = deterministic_hidden_state.permute(0, 2, 1)
@@ -519,11 +539,7 @@ class VRNN_GMM(nn.Module):
 
         d_loss = -torch.mean(disc_real) + torch.mean(disc_fake)
 
-        if self.self_attention_type != "multihead":
-            return total_loss, d_loss, deterministic_hidden_state, input_feature, fake_input_feature
-        else:
-            return total_loss + attn_loss, d_loss, deterministic_hidden_state, input_feature, fake_input_feature, \
-                   attention_latent
+        return total_loss, d_loss, deterministic_hidden_state, input_feature, fake_input_feature, attention_latent
 
     def reparametrization(self, mu, log_var):
 
@@ -549,7 +565,7 @@ class VRNN_GMM(nn.Module):
         # Ensure that the mixing probabilities are between zero and one and sum to one
         mix_probs = torch.nn.functional.softmax(mix_probs, dim=1)
 
-        # Construct a batch of Gaussian Mixture Modles in input_shape-D consisting of
+        # Construct a batch of Gaussian Mixture Models in input_shape-D consisting of
         # GMM_components equally weighted input_shape-D Gaussian distributions
         mix = Categorical(mix_probs)
         comp = Independent(Normal(mu, sigma), 1)
@@ -558,7 +574,7 @@ class VRNN_GMM(nn.Module):
         out = gmm.sample()
         return out, gmm
 
-    def generate(self, u, seq_len=None):
+    def generate(self, u, y, seq_len=None):
         # get the batch size
         batch_size, D, T = u.shape
         hd = []
@@ -577,6 +593,16 @@ class VRNN_GMM(nn.Module):
         ## use the learned initial state based on the first frame.
         input_ = self.input_drop(u)
         h, c = self.initialize_state_vectors(batch_size, first_obs=input_)
+
+        latent_input = torch.cat((u, y), dim=1).transpose(1, 2)
+        b, s, d = latent_input.shape
+        latent_input = torch.reshape(latent_input, (batch_size * s, d, 1))
+        output = self.perceiver_model({"latent_fea": latent_input}, is_training=True)
+        perceiver_latent_out = output[self.out_keys.LATENTS]['latent_fea'].transpose(1, 2)
+        perceiver_latent_out = self.conv1(perceiver_latent_out)
+        perceiver_latent_out = self.adaptive_pool(perceiver_latent_out)
+        mean_attn = torch.reshape(perceiver_latent_out, (batch_size, s, -1))
+
         # for all time steps
         for i in range(len(seq_len)):
             for t in range(seq_len[i]):
@@ -598,14 +624,9 @@ class VRNN_GMM(nn.Module):
                 z_t = self.reparametrization(prior_mean_t, prior_logvar_t)
                 # feature extraction: z_t
                 phi_z_t = self.phi_z(z_t)
-                ##=================(new)============##
-
-                c_final = torch.distributions.Normal(torch.zeros_like(phi_z_t), torch.ones_like(phi_z_t)).rsample()
-
-                ##==================================##
                 # decoder: z_t, h_t -> y_t
 
-                decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)  ##(modified)
+                decoder_input = torch.cat([phi_z_t, mean_attn[:, t, :], h[-1]], dim=1)  ##(modified)
 
                 sample[:, :, t], gmm = self._decode(decoder_input)
 
@@ -613,7 +634,7 @@ class VRNN_GMM(nn.Module):
                 sample_sigma[:, :, t] = gmm.variance ** 0.5
 
                 # recurrence: u_t+1, z_t -> h_t+1
-                RNN_inputs = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
+                RNN_inputs = torch.cat([phi_u_t, phi_z_t, mean_attn[:, t, :]], dim=1)
                 # input(B,T,H )
 
                 _, (h, c) = self._rnn(torch.unsqueeze(RNN_inputs, 1), (h, c))  ##(modified)
@@ -690,14 +711,19 @@ class DynamicModel(VRNN_GMM):
         if y is not None and self.normalizer_output is not None:
             y = self.normalizer_output.normalize(y)
 
-        vrnn_loss, d_loss, hidden, real_feature, fake_feature, attention_latent = super(DynamicModel, self).forward(u, y)
+        vrnn_loss, d_loss, hidden, real_feature, fake_feature, attention_latent = super(DynamicModel, self).forward(u,
+                                                                                                                    y)
         return vrnn_loss, d_loss, hidden, real_feature, fake_feature, attention_latent
 
-    def generate(self, u, seq_len=None):
+    def generate(self, u, y=None, seq_len=None):
+        if y is None:
+            batch_size, _, seq_len = u.shape
+            y = torch.rand(batch_size, self.y_dim, seq_len)
         if self.normalizer_input is not None:
             u = self.normalizer_input.normalize(u)
+            y = self.normalizer_input.normalize(y)
 
-        y_sample, y_sample_mu, y_sample_sigma, hidden = super(DynamicModel, self).generate(u, seq_len)
+        y_sample, y_sample_mu, y_sample_sigma, hidden = super(DynamicModel, self).generate(u, y, seq_len)
 
         if self.normalizer_output is not None:
             y_sample = self.normalizer_output.unnormalize(y_sample)
