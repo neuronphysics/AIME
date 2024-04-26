@@ -691,6 +691,7 @@ class WorldModel(nn.Module):
             z_real, z_x_mean, z_x_sigma, c_posterior, w_x_mean, w_x_sigma, gmm_dist, z_wc_mean_prior, \
             z_wc_logvar_prior, x_reconstructed = self.variational_autoencoder(obs)
             z_fake = gmm_dist.sample()
+
             critic_real = self.discriminator(z_real).reshape(-1)
             critic_fake = self.discriminator(z_fake).reshape(-1)
             gp = gradient_penalty(self.discriminator, z_real, z_fake, device=self.device)
@@ -766,8 +767,8 @@ class WorldModel(nn.Module):
                 losses[key] = -like.mean()
         model_loss = sum(self.loss_scales.get(k, 1.0) * v for k, v in losses.items())
 
-        metrics, z_posterior, z_posterior_mean, z_posterior_sigma, c_posterior, w_posterior_mean, w_posterior_sigma, \
-        dist, z_prior_mean, z_prior_logvar, X_reconst = self.variational_autoencoder.get_ELBO(obs)
+        elbo_return = self.variational_autoencoder.get_ELBO(obs)
+        metrics = elbo_return.loss_dict
         metrics["wasserstein_gp_loss"] = -torch.mean(gen_fake)
         metrics["total_observe_loss"] = metrics["loss"] + metrics["wasserstein_gp_loss"]
 
