@@ -407,8 +407,8 @@ class AgentModule(GeneralAgent):
                 [self._modules_list.v_net_factory(),  # Learned Value-value.
                  self._modules_list.v_net_factory(), ]  # Target Value-value.
             )
-        self._alpha_var = torch.tensor(1.0, requires_grad=True)
-        self._alpha_entropy_var = torch.tensor(1.0, requires_grad=True)
+        self._alpha_var = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self._alpha_entropy_var = nn.Parameter(torch.tensor(1.0), requires_grad=True)
 
     def get_alpha(self, alpha_max=ALPHA_MAX):
         return utils.clip_v2(
@@ -418,10 +418,12 @@ class AgentModule(GeneralAgent):
         return utils.relu_v2(self._alpha_entropy_var)
 
     def assign_alpha(self, alpha):
-        self._alpha_var = torch.tensor(alpha, requires_grad=True)
+        with torch.no_grad():
+            self._alpha_var.copy_(alpha)
 
     def assign_alpha_entropy(self, alpha):
-        self._alpha_entropy_var = torch.tensor(alpha, requires_grad=True)
+        with torch.no_grad():
+            self._alpha_entropy_var.copy_(alpha)
 
     @property
     def a_variables(self):
