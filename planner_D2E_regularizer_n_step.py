@@ -1,3 +1,5 @@
+import numpy
+
 import utils_planner as utils
 import torch
 import torch.nn as nn
@@ -557,7 +559,7 @@ class AgentModule(GeneralAgent):
         return vars_
 
 
-class Agent(object):
+class Agent:
     """Class for learning policy and interacting with environment."""
 
     def __init__(
@@ -609,25 +611,25 @@ class Agent(object):
         """Builds agent components."""
         if len(self._weight_decays) == 1:
             self._weight_decays = tuple([self._weight_decays[0]] * 5)
-        self._build_fns()
-        train_batch = self._get_train_batch()
+        self.build_fns()
+        train_batch = self.get_train_batch()
         self._global_step = torch.tensor(0.0, requires_grad=False)
-        self._init_vars(train_batch)
-        self._build_optimizers()
+        self.init_vars(train_batch)
+        self.build_optimizers()
         self._train_info = collections.OrderedDict()
         self._all_train_info = collections.OrderedDict()
-        self._checkpointer = self._build_checkpointer()
+        self._checkpointer = self.build_checkpointer()
         self._test_policies = collections.OrderedDict()
-        self._build_test_policies()
-        self._online_policy = self._build_online_policy()
+        self.build_test_policies()
+        self._online_policy = self.build_online_policy()
 
-    def _build_fns(self):
+    def build_fns(self):
         self._agent_module = AgentModule(modules_list=self._modules_list)
 
-    def _get_vars(self):
+    def get_vars(self):
         return []
 
-    def _build_optimizers(self):
+    def build_optimizers(self):
         opt = self._optimizers[0]
         self._optimizer = torch.optim.Adam(
             self._agent_module.parameters(),
@@ -635,10 +637,10 @@ class Agent(object):
             betas=(opt[1], opt[2])
         )
 
-    def _build_loss(self, batch):
+    def build_loss(self, batch):
         raise NotImplementedError
 
-    def _update_target_vars(self):
+    def update_target_vars(self):
         # ?
         # requires self._vars_learning and self._vars_target as state_dict`s
         for var_name, var_t in self._vars_target.items():
@@ -647,10 +649,10 @@ class Agent(object):
                            + (1.0 - self._update_rate) * var_t.data)
             var_t.data.copy_(updated_val)
 
-    def _build_test_policies(self):
+    def build_test_policies(self):
         raise NotImplementedError
 
-    def _build_online_policy(self):
+    def build_online_policy(self):
         return None
 
     # def _random_policy_fn(self, state):
@@ -664,36 +666,26 @@ class Agent(object):
     def online_policy(self):
         return self._online_policy
 
-    def _get_train_batch(self):
+    def get_train_batch(self):
         """Samples and constructs batch of transitions."""
         batch_indices = np.random.choice(self._train_data.size, self._batch_size)
         batch_ = self._train_data.get_batch(batch_indices)
-        transition_batch = batch_
-        batch = dict(
-            s1=transition_batch.s1,
-            s2=transition_batch.s2,
-            r=transition_batch.reward,
-            dsc=transition_batch.discount,
-            a1=transition_batch.a1,
-            a2=transition_batch.a2,
-            done=transition_batch.done,
-        )
-        return batch
+        return batch_
 
-    def _train_step(self):
-        train_batch = self._get_train_batch()
-        loss = self._build_loss(train_batch)
+    def train_step(self):
+        train_batch = self.get_train_batch()
+        loss = self.build_loss(train_batch)
         self._optimizer.zero_grad()
         loss.backward(retain_graph=True)
         self._optimizer.step()
         self._global_step += 1
         if self._global_step % self._update_freq == 0:
-            self._update_target_vars()
+            self.update_target_vars()
 
-    def _init_vars(self, batch):
+    def init_vars(self, batch):
         pass
 
-    def _get_source_target_vars(self):
+    def get_source_target_vars(self):
         return [], []
 
     def _update_target_fns(self, source_vars, target_vars):
@@ -702,7 +694,7 @@ class Agent(object):
             target_vars,
             tau=self._update_rate)
 
-    def _update_network_parameters(self, func_net, tau=None):
+    def update_network_parameters(self, func_net, tau=None):
         pass
 
     def print_train_info(self):
@@ -719,11 +711,11 @@ class Agent(object):
         for k, v in self._all_train_info.items():
             utils.plot_train_info(v, k, os.path.join(plot_save_path, f"{k}.png"))
 
-    def _build_checkpointer(self):
+    def build_checkpointer(self):
         # ?save
         pass
 
-    def _load_checkpoint(self):
+    def load_checkpoint(self):
         # ?restore
         pass
 
@@ -735,9 +727,6 @@ class Agent(object):
         return self._global_step.numpy()
 
 
-############################################
-################# Policies #################
-############################################
 class ContinuousRandomPolicy(nn.Module):
     """Samples actions uniformly at random."""
 
@@ -907,8 +896,8 @@ class D2EAgent(Agent):
             grad_norm_clipping=5.0,
             transition_disc_hidden_size=128,
             transition_disc_latent_size=128,
-            tau=0.005,  ###
-            gae_lambda=0.95,  ###
+            tau=0.005,
+            gae_lambda=0.95,
             **kwargs):
         self._alpha = alpha
         self._alpha_max = alpha_max
@@ -922,18 +911,18 @@ class D2EAgent(Agent):
         self._warm_start = warm_start
         self._c_iter = c_iter
         self._ensemble_q_lambda = ensemble_q_lambda
-        self._grad_value_clipping = grad_value_clipping  ##
-        self._grad_norm_clipping = grad_norm_clipping  ###
-        self._transition_disc_hidden_size = transition_disc_hidden_size  ###
-        self._transition_disc_latent_size = transition_disc_latent_size  ####
+        self._grad_value_clipping = grad_value_clipping
+        self._grad_norm_clipping = grad_norm_clipping
+        self._transition_disc_hidden_size = transition_disc_hidden_size
+        self._transition_disc_latent_size = transition_disc_latent_size
         self.qf_criterion = nn.MSELoss()
         self.vf_criterion = nn.MSELoss()
-        self._tau = tau  ###
-        self._gae_lambda = gae_lambda  ###
+        self._tau = tau
+        self._gae_lambda = gae_lambda
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         super(D2EAgent, self).__init__(**kwargs)
 
-    def _build_fns(self):
+    def build_fns(self):
         self._agent_module = AgentModule(modules_list=self._modules_list)
         self._q_fns = self._agent_module.q_nets
         self._p_fn = self._agent_module.p_fn
@@ -943,9 +932,7 @@ class D2EAgent(Agent):
             name=self._divergence_name,
             c=self._c_fn,
             device=self.device)
-        #########################################################################################################################
-        ########################################   START of DISC cofiguration SETUP    ##########################################
-        #########################################################################################################################
+
         self._transit_discriminator = Discriminator(input_dim=self._latent_spec.shape[0] + self._action_spec.shape[0],
                                                     # number of dimension of observation plus action space
                                                     output_dim=self._latent_spec.shape[0],
@@ -953,9 +940,7 @@ class D2EAgent(Agent):
                                                     latent_dim=self._transition_disc_latent_size,
                                                     device=self.device
                                                     )
-        #########################################################################################################################
-        ##########################################   END of DISC cofiguration SETUP    ##########################################
-        #########################################################################################################################
+
         self._agent_module.assign_alpha(self._alpha)
         # entropy regularization
         if self._target_entropy is None:
@@ -1043,13 +1028,13 @@ class D2EAgent(Agent):
         return self.ensemble_q(q1s)
 
     def _build_q_loss(self, batch):
-        s1 = batch['s1']  # s_{t}(B,T)
-        s2 = batch['s2']  # s_{t+1}(B,T)
-        a1 = batch['a1']  # a_{t}(B,T)
-        a2_b = batch['a2']  # a_{t+1}(B,T)
-        r = batch['r']  # reward_{t}(B,T+1)
-        dsc = batch['dsc']
-        done = batch['done']  # done_{t}(B,T+1)
+        s1 = batch.s1  # s_{t}(B,T)
+        s2 = batch.s2  # s_{t+1}(B,T)
+        a1 = batch.a1  # a_{t}(B,T)
+        a2_b = batch.a2  # a_{t+1}(B,T)
+        r = batch.reward  # reward_{t}(B,T+1)
+        dsc = batch.discount
+        done = batch.done  # done_{t}(B,T+1)
         _, a2_p, log_pi_a2_p = self._p_fn(s2.to(device=self.device))
         q2_targets = []
         q1_preds = []
@@ -1100,8 +1085,8 @@ class D2EAgent(Agent):
         return loss, info
 
     def _build_p_loss(self, batch):
-        s = batch['s1']
-        a_b = batch['a1']
+        s = batch.s1
+        a_b = batch.a1
         _, a_p, log_pi_a_p = self._p_fn(s.to(device=self.device))
         for v_fn, v_fn_target in self._v_fns:
             v1_source = v_fn(s.to(device=self.device))
@@ -1131,9 +1116,9 @@ class D2EAgent(Agent):
         return loss, info
 
     def _build_v_loss(self, batch):
-        s1 = batch['s1']
-        a_b = batch['a1']
-        s2 = batch['s2']
+        s1 = batch.s1
+        a_b = batch.a1
+        s2 = batch.s2
         # prepare data for f-gan
         loader = preprocess_loader(s1, a_b, s2, self.device)
         _, a_p, log_a_pi = self._p_fn(s1.to(device=self.device))
@@ -1175,8 +1160,8 @@ class D2EAgent(Agent):
         return loss, info
 
     def _build_c_loss(self, batch):
-        s = batch['s1']
-        a_b = batch['a1']
+        s = batch.s1
+        a_b = batch.a1
         _, a_p, _ = self._p_fn(s.to(device=self.device))
         c_loss = self._divergence.dual_critic_loss(
             s.to(device=self.device), a_p, a_b.to(device=self.device))
@@ -1191,8 +1176,8 @@ class D2EAgent(Agent):
         return loss, info
 
     def _build_a_loss(self, batch):
-        s = batch['s1']
-        a_b = batch['a1']
+        s = batch.s1
+        a_b = batch.a1
         _, a_p, _ = self._p_fn(s.to(device=self.device))
         alpha = self._get_alpha()[0]
         div_estimate = self._divergence.dual_estimate(
@@ -1208,7 +1193,7 @@ class D2EAgent(Agent):
         return a_loss, info
 
     def _build_ae_loss(self, batch):
-        s = batch['s1']
+        s = batch.s1
         _, _, log_pi_a = self._p_fn(s.to(device=self.device))
         alpha = self._get_alpha_entropy()[0]
         ae_loss = torch.mean(alpha * (- log_pi_a - self._target_entropy))
@@ -1219,7 +1204,7 @@ class D2EAgent(Agent):
 
         return ae_loss, info
 
-    def _update_network_parameters(self, func_net, tau=None):
+    def update_network_parameters(self, func_net, tau=None):
         if tau is None:
             tau = self._tau
         with torch.no_grad():
@@ -1233,11 +1218,11 @@ class D2EAgent(Agent):
                         tau * net_param.data + (1 - tau) * target_net_param.data
                 )
 
-    def _get_source_target_vars(self):
+    def get_source_target_vars(self):
         return (self._agent_module.q_source_variables,
                 self._agent_module.q_target_variables)
 
-    def _build_optimizers(self):
+    def build_optimizers(self):
         opts = self._optimizers
 
         if len(opts) == 1:
@@ -1262,7 +1247,7 @@ class D2EAgent(Agent):
         info = collections.OrderedDict()
         if torch.equal(self._global_step % torch.tensor(self._update_freq),
                        torch.tensor(0, dtype=torch.float32, device=self._global_step.device)):
-            source_vars, target_vars = self._get_source_target_vars()
+            source_vars, target_vars = self.get_source_target_vars()
             self._update_target_fns(source_vars, target_vars)
         # Update policy network parameter
         # https://bit.ly/3Bno0GC
@@ -1336,8 +1321,8 @@ class D2EAgent(Agent):
             ae_loss, ae_info = self._build_ae_loss(batch)
             ae_loss.backward(retain_graph=True)
             self._ae_optimizer.step()
-        self._update_network_parameters(self._v_fns)
-        self._update_network_parameters(self._q_fns)
+        self.update_network_parameters(self._v_fns)
+        self.update_network_parameters(self._q_fns)
         # 1)policy loss
         info["policy_loss"] = policy_loss.cpu().item()
         # 2)Q loss
@@ -1374,10 +1359,10 @@ class D2EAgent(Agent):
         self._c_optimizer.step()
 
     def train_step(self):
-        train_batch = self._get_train_batch()
+        train_batch = self.get_train_batch()
         info = self._optimize_step(train_batch)
         for _ in range(self._c_iter - 1):
-            train_batch = self._get_train_batch()
+            train_batch = self.get_train_batch()
             self._extra_c_step(train_batch)
         for key, val in info.items():
             self._train_info[key] = val
@@ -1388,7 +1373,7 @@ class D2EAgent(Agent):
                     self._all_train_info[key] = [val]
         self._global_step += 1
 
-    def _build_test_policies(self):
+    def build_test_policies(self):
         policy = DeterministicSoftPolicy(
             a_network=self._agent_module.p_net)
         self._test_policies['main'] = policy
@@ -1398,12 +1383,12 @@ class D2EAgent(Agent):
         )
         self._test_policies['max_q'] = policy
 
-    def _build_online_policy(self):
+    def build_online_policy(self):
         return RandomSoftPolicy(
             a_network=self._agent_module.p_net,
         )
 
-    def _init_vars(self, batch):
+    def init_vars(self, batch):
         self._build_q_loss(batch)
         self._build_p_loss(batch)
         self._build_c_loss(batch)
@@ -1415,7 +1400,7 @@ class D2EAgent(Agent):
         self._a_vars = self._agent_module.a_variables
         self._ae_vars = self._agent_module.ae_variables
 
-    def _build_checkpointer(self):
+    def build_checkpointer(self):
         checkpoint = {
             "policy_net": self._agent_module.p_net.state_dict(),
             "critic_net": self._agent_module.c_net.state_dict(),
@@ -1444,7 +1429,7 @@ class D2EAgent(Agent):
         torch.save(checkpoint, self.checkpoint_path)
         return checkpoint
 
-    def _load_checkpoint(self):
+    def load_checkpoint(self):
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device)  # can load gpu's data on cpu machine
         for q_fn, q_fn_target in self._q_fns:
             q_fn.load_state_dict(checkpoint["q_net"])
@@ -1535,10 +1520,35 @@ def maybe_makedirs(log_dir):
 
 #####################################
 # from train_eval_utils
-from typing import Callable
+from typing import Callable, List
 
-Transition = collections.namedtuple(
-    'Transition', 's1, s2, a1, a2, discount, reward, done')
+
+class Transition:
+    def __init__(self, s1, s2, a1, a2, reward, discount, done):
+        self.s1 = s1
+        self.s2 = s2
+        self.a1 = a1
+        self.a2 = a2
+        self.reward = reward
+        self.discount = discount
+        self.done = done
+
+        base_shape = 0
+        check = s1
+        if isinstance(check, List):
+            base_shape += 1
+            check = s1[0]
+        if isinstance(check, torch.Tensor):
+            base_shape += len(check.shape)
+        elif isinstance(check, numpy.ndarray):
+            base_shape += len(check.size())
+
+        if base_shape >= 4 and check[0][0][0].max() > 1:
+            print("Error: transition obs not 1 based")
+
+    def __getitem__(self, key):
+        return Transition(self.s1[key], self.s2[key], self.a1[key], self.a2[key], self.reward[key],
+                          self.discount[key], self.done[key])
 
 
 class NStepTransitions:

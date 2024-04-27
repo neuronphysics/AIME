@@ -1,26 +1,16 @@
 import collections
 import numpy as np
 import os
-# import gin
 import gym
-# import mujoco_py
-from absl import app
-from absl import flags
 from absl import logging
-import tensor_specs
 import time
 import alf_gym_wrapper
 from alf_environment import TimeLimit
 import importlib
 import torch
-import torch.nn as nn
-import sys
-import shutil
 import argparse
 import pickle
-from typing import Callable
-from PIL import Image
-from planner_D2E_regularizer import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, \
+from planner_D2E_regularizer_n_step import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, \
     eval_policy_episodes
 import dill
 import nest
@@ -213,8 +203,6 @@ class Dataset(data.Dataset):
         return DatasetView(self, indices)
 
     def get_batch(self, indices):
-        indices = torch.tensor(indices, dtype=torch.int64, requires_grad=False)
-
         def get_batch_(data_):
             return gather(data_, indices)
 
@@ -246,7 +234,7 @@ class Dataset(data.Dataset):
         batch_size = transitions.s1.shape[0]
         effective_batch_size = torch.minimum(torch.tensor(batch_size), torch.tensor(self._size) - self._current_idx)
         indices = self._current_idx + torch.arange(effective_batch_size.item())
-        for key in transitions._asdict().keys():
+        for key in transitions.__dict__:
             data = getattr(self._data, key)
             batch = getattr(transitions, key)
             data[indices] = torch.tensor(batch[:effective_batch_size])
@@ -260,9 +248,11 @@ class Dataset(data.Dataset):
 
     def add_transitions_batch(self, transitions):
         batch_size = transitions.s1.shape[0]
+        # compute the capacity left
         effective_batch_size = torch.minimum(torch.tensor(batch_size), torch.tensor(self._size) - self._current_idx)
         indices = self._current_idx + torch.arange(effective_batch_size.item())
-        for key in transitions._asdict().keys():
+        # store the incoming data to dataset
+        for key in transitions.__dict__:
             data = getattr(self._data, key)
             batch = getattr(transitions, key)
             data[indices] = batch[:effective_batch_size]
@@ -275,7 +265,6 @@ class Dataset(data.Dataset):
                 self._current_idx = 0
 
 
-#########################
 # utils_VAE.py
 def shuffle_indices_with_steps(n, steps=1, rand=None):
     """Randomly shuffling indices while keeping segments."""

@@ -176,10 +176,10 @@ def train_eval_offline(
             timed_at_step = step
         if step % save_freq == 0:
             agent.checkpoint_path = agent_ckpt_name
-            agent._build_checkpointer()
+            agent.build_checkpointer()
             logging.info('Agent saved at %s.', agent_ckpt_name)
 
-    agent._build_checkpointer()
+    agent.build_checkpointer()
     time_cost = time.time() - time_st_total
     logging.info('Training finished, time cost %.4gs.', time_cost)
     logging.info("{}......".format(eval_results[0]))
