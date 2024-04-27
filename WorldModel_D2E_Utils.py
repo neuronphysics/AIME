@@ -309,8 +309,8 @@ def get_act(name):
 
 def dict_to_tran(data):
     return Transition(
-        s1=(data['s1'] / 255.0),
-        s2=(data['s2'] / 255.0),
+        s1=(data['s1']),
+        s2=(data['s2']),
         a1=data['a1'],
         a2=data['a2'],
         reward=data['reward'],
@@ -318,7 +318,7 @@ def dict_to_tran(data):
         done=data['done'])
 
 
-def decrypted_preprocess_transition_data(s1, a1, s2, done):
+def deprecated_preprocess_transition_data(s1, a1, s2, done):
     inputs, outputs = make_episodes(s1, a1, s2, done)
     padded_trajectories_inputs, mask_input = pad(inputs, repeat=False)
     padded_trajectories_outputs, mask_output = pad(outputs, repeat=False)
@@ -556,31 +556,24 @@ class JSONLOutput:
 
 
 class TensorBoardOutput:
-    def __init__(self, logdir, fps=20):
-        # The TensorFlow summary writer supports file protocols like gs://. We use
-        # os.path over pathlib here to preserve those prefixes.
+    def __init__(self, logdir, summary_writer, fps=20):
         self._logdir = os.path.expanduser(logdir)
-        self._writer = None
+        self._writer = summary_writer
         self._fps = fps
 
     def __call__(self, summaries):
-        self._ensure_writer()
         for step, name, value in summaries:
             if len(value.shape) == 0:
-                self._writer.add_scalar("scalars/" + name, value, step)
+                self._writer.add_scalar(name, value, step)
             elif len(value.shape) == 2:
                 self._writer.add_image(name, value, step)
             elif len(value.shape) == 3:
                 self._writer.add_image(name, value, step)
             elif len(value.shape) == 4:
-                self._video_summary(name, value, step)
+                self.video_summary(name, value, step)
         self._writer.flush()
 
-    def _ensure_writer(self):
-        if not self._writer:
-            self._writer = SummaryWriter(self._logdir, max_queue=1000)
-
-    def _video_summary(self, name, video, step):
+    def video_summary(self, name, video, step):
         name = name if isinstance(name, str) else name.decode("utf-8")
         if np.issubdtype(video.dtype, np.floating):
             video = np.clip(255 * video, 0, 255).astype(np.uint8)
@@ -588,6 +581,15 @@ class TensorBoardOutput:
         video = video.transpose(0, 3, 1, 2).reshape((1, T, C, H, W))
 
         self._writer.add_video(name, video, step, 4)
+
+    def log_dict(self, info, prefix, step):
+        res = []
+        for key, value in info.items():
+            if isinstance(value, torch.Tensor):
+                value = value.cpu().numpy()
+            temp = (step, prefix + "/" + key, value)
+            res.append(temp)
+        self(res)
 
 
 class TanhBijector(torch.distributions.Transform):
@@ -924,16 +926,15 @@ class VideoRecorder:
 
 
 class Logger:
-    def __init__(self, step, outputs, multiplier=1):
-        self._step = step
+    def __init__(self, outputs, ):
+        self._step = 0
         self._outputs = outputs
-        self._multiplier = multiplier
         self._last_step = None
         self._last_time = None
         self._metrics = []
 
     def add(self, mapping, prefix=None):
-        step = int(self._step) * self._multiplier
+        step = self._step
         for name, value in dict(mapping).items():
             name = f"{prefix}_{name}" if prefix else name
             value = np.array(value)
@@ -943,6 +944,7 @@ class Logger:
                     "interpreted as scalar, image, or video."
                 )
             self._metrics.append((step, name, value))
+        step += 1
 
     def scalar(self, name, value):
         self.add({name: value})
@@ -954,7 +956,7 @@ class Logger:
         self.add({name: value})
 
     def write(self, fps=False):
-        fps and self.scalar("fps", self._compute_fps())
+        # fps and self.scalar("fps", self._compute_fps())
         if not self._metrics:
             return
         for output in self._outputs:

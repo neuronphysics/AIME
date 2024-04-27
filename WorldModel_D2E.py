@@ -77,23 +77,20 @@ class D2EAlgorithm(nn.Module):
     # https://github.com/sai-prasanna/dreamerv2_torch/tree/main/dreamerv2_torch/agent.py
     def __init__(self,
                  hyperParams,
-                 train_data,
-                 agent_reply_buffer,
-                 sequence_length,
+                 config,
                  obs_space,
                  act_space,
                  latent_space,
                  step: NCounter,
                  env_name: str,
                  log_dir,
+                 prefill_data_generator,
                  device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
                  model_params=(((200, 200),), 2, 1),
                  optimizers=((0.0001, 0.5, 0.99),),
-                 batch_size=50,
                  update_freq=1,
                  update_rate=0.005,
                  discount=0.99,
-                 replay_buffer_size=int(1e6),
                  eval_state_mean=False,
                  precision=32,
                  **kwarg):
@@ -101,7 +98,8 @@ class D2EAlgorithm(nn.Module):
         self.parameter = namedtuple('x', hyperParams.keys())(*hyperParams.values())
         self._env = env_name
         self._discount = discount
-        self.batch_size = batch_size
+        self.config = config
+        self.batch_size = config.batch_size
 
         self.obs_space = obs_space
         self.act_space = act_space
@@ -111,49 +109,55 @@ class D2EAlgorithm(nn.Module):
         self.device = device
         self.precision = precision
         self.eval_state_mean = eval_state_mean
-        self.sequence_length = sequence_length
+        self.sequence_length = config.sequence_size
         self.register_buffer("tfstep", torch.ones(()) * int(self.step))
+
+        # every next will give 32 (hard coded) data sample
+        self.prefill_generator = prefill_data_generator
+
+        self.task_behavior_reply_buffer = DC.Dataset(observation_spec=latent_space, action_spec=act_space,
+                                                     size=config.policy_reply_buffer_size,
+                                                     group_size=config.sequence_size)
+        self.task_behavior_reply_buffer.current_size += config.batch_size
+
         self.wm = WorldModel(hyperParams,
-                             train_data=train_data,
                              sequence_length=self.sequence_length,
                              env_name=self._env,
                              device=self.device,
+                             writer=config.writer,
                              **kwarg)
 
         self.RewardNorm = StreamNorm(momentum=0.99, scale=1.0, eps=1e-8)
-        self.imag_horizon = sequence_length
-        self._use_amp = True if self.precision == 16 else False
+        self.imag_horizon = config.sequence_size
+        self.use_amp = True if self.precision == 16 else False
 
-        train_summary_dir = os.path.join(log_dir, 'train')
-        self.train_summary_writer = SummaryWriter(train_summary_dir)
         # Construct agent.
-        # Initialize wm_image_replay_buffer.
-
         agent_flags = utils.Flags(
             observation_spec=latent_space,
             action_spec=act_space,
             model_params=model_params,
             optimizers=optimizers,
-            batch_size=batch_size,
+            batch_size=self.batch_size,
             weight_decays=(self.parameter.weight_decay,),
             update_freq=update_freq,
             update_rate=update_rate,
             discount=discount,
             done=self.parameter.PREDICT_DONE,
             env_name=env_name,
-            train_data=agent_reply_buffer
+            train_data=self.task_behavior_reply_buffer
         )
         agent_args = Config(agent_flags).agent_args
-        self._task_behavior = D2EAgent(**vars(agent_args))
-        self._task_behavior_params = itertools.chain(
-            self._task_behavior._get_q_source_vars(),
-            self._task_behavior._get_p_vars(),
-            self._task_behavior._get_c_vars(),
-            self._task_behavior._get_v_source_vars(),
-            self._task_behavior._a_vars,
-            self._task_behavior._ae_vars,
-            self._task_behavior._transit_discriminator.parameters()
+        self.task_behavior = D2EAgent(**vars(agent_args))
+        self.task_behavior_params = itertools.chain(
+            self.task_behavior._get_q_source_vars(),
+            self.task_behavior._get_p_vars(),
+            self.task_behavior._get_c_vars(),
+            self.task_behavior._get_v_source_vars(),
+            self.task_behavior._a_vars,
+            self.task_behavior._ae_vars,
+            self.task_behavior._transit_discriminator.parameters()
         )
+        self.task_behavior_reply_buffer.current_size -= config.batch_size
 
     def train_(self, data, state=None):
         """
@@ -179,10 +183,10 @@ class D2EAlgorithm(nn.Module):
         done_slice = data.done[:, slice_index]
         start = {"feat": z_real_slice}
 
-        with RequiresGrad(self._task_behavior_params):
-            with torch.cuda.amp.autocast(self._use_amp):
+        with RequiresGrad(self.task_behavior_params):
+            with torch.cuda.amp.autocast(self.use_amp):
                 seq = self.wm.imagine(
-                    self._task_behavior,
+                    self.task_behavior,
                     start,
                     self.imag_horizon,
                     done_slice,
@@ -192,22 +196,22 @@ class D2EAlgorithm(nn.Module):
                 mets1 = {f"reward_{k}": v for k, v in mets1.items()}
 
                 # add seq to task behavior reply buffer
-                rewards = rewards.squeeze(-1).cpu()
-                trans = Transition(s1=seq['latent'][:, :-1, :], s2=seq['latent'][:, 1:, :], a1=seq['action'][:, :-1, :],
-                                   a2=seq['action'][:, 1:, :], reward=rewards, done=seq['done'],
-                                   discount=seq['discount'])
-                self._task_behavior._train_data.add_transitions_batch(trans)
+                if state is None:
+                    rewards = rewards.squeeze(-1).cpu()
+                    trans = Transition(s1=seq['latent'][:, :-1, :], s2=seq['latent'][:, 1:, :],
+                                       a1=seq['action'][:, :-1, :],
+                                       a2=seq['action'][:, 1:, :], reward=rewards, done=seq['done'],
+                                       discount=seq['discount'])
+                    self.task_behavior._train_data.add_transitions_batch(trans)
 
                 # train the policy
-                self._task_behavior.train_step()
-                # step = self._task_behavior.global_step
-                # get all the loss values from policy network
-                # here: https://github.com/neuronphysics/AIME/blob/1077b972d2ce85882cf54558370b21d83f687ce5/planner_D2E_regularizer.py#L1329
-                mets2 = self._task_behavior._all_train_info
+                self.task_behavior.train_step()
+
+                mets2 = self.task_behavior._all_train_info
                 metrics.update({"expl_" + key: value for key, value in mets2.items()})
                 metrics.update(**mets1)
 
-        return state, metrics
+        return metrics
 
     def report(self, data):
         report = {}
@@ -222,13 +226,26 @@ class D2EAlgorithm(nn.Module):
         self.wm.initialize_optimizer()
         self.wm.init_normalizer(full_train_set)
 
+        process_batch = self.config.policy_reply_buffer_prefill_batch
+        for i in range(self.config.policy_reply_buffer_size // process_batch + 1):
+            tran = dict_to_tran(next(self.prefill_generator))
+            obs = torch.reshape(tran.s1, (-1, self.parameter.n_channel, self.parameter.image_width,
+                                          self.parameter.image_width)).to(self.device)
+            next_obs = torch.reshape(tran.s2, (-1, self.parameter.n_channel, self.parameter.image_width,
+                                               self.parameter.image_width)).to(self.device)
+            _, _, _, z_real, _, _, _ = self.wm.encoder(obs)
+            _, _, _, z_next, _, _, _ = self.wm.encoder(next_obs)
+            tran.s1 = z_real.reshape(process_batch, -1, self.parameter.latent_d).detach().cpu()
+            tran.s2 = z_next.reshape(process_batch, -1, self.parameter.latent_d).detach().cpu()
+            self.task_behavior_reply_buffer.add_transitions_batch(tran)
+
     def save(self):
         self.wm.save()
-        self._task_behavior._build_checkpointer()
+        self.task_behavior.build_checkpointer()
 
     def load(self):
         self.wm.load_checkpoints()
-        self._task_behavior._load_checkpoint()
+        self.task_behavior.load_checkpoint()
 
     def policy(self, observation, reward, done, state=None, mode="train"):
         obs = self.wm.preprocess(observation, reward, done)
@@ -237,20 +254,20 @@ class D2EAlgorithm(nn.Module):
         _, _, _, z_x, _, _, _ = self.wm.encoder(obs["observation"].to(self.device))
 
         start = {"feat": z_x}
-        seq = self.wm.imagine(self._task_behavior, start, self.imag_horizon, torch.from_numpy(done))
+        seq = self.wm.imagine(self.task_behavior, start, self.imag_horizon, torch.from_numpy(done))
         policy_state = seq['latent']
 
-        # action = self._task_behavior._p_fn(z_x)[1]
+        # action = self.task_behavior._p_fn(z_x)[1]
         # latent, _, _, _ = self.wm.transition_model.generate(
         #     torch.cat([z_x, action], dim=1).unsqueeze(-1),
         #     seq_len=1
         # )
         # policy_state = latent.clone().detach().squeeze(-1)
         if mode == "eval":
-            a_tanh_mode, action, log_pi_a = self._task_behavior._p_fn(policy_state)
+            a_tanh_mode, action, log_pi_a = self.task_behavior._p_fn(policy_state)
             noise = self.parameter.eval_noise
         elif mode in ["explore", "train"]:
-            action = self._task_behavior._p_fn(policy_state)[1]
+            action = self.task_behavior._p_fn(policy_state)[1]
             noise = self.parameter.expl_noise
         action = action[:, 0, :]
         action = action_noise(action, noise, self.act_space)
@@ -260,29 +277,30 @@ class D2EAlgorithm(nn.Module):
 
 
 def main(config):
+    ep_num = dict(train=0, eval=0)
+    video_log_fre = dict(train=10, eval=1)
+
     def per_episode_record(ep, mode):
+        cur_ep_num = ep_num[mode]
+        ep_num[mode] = cur_ep_num + 1
+
         length = len(ep["reward"]) - 1
         score = float(ep["reward"].astype(np.float64).sum())
         print(f"{mode.title()} episode has {length} steps and return {score:.1f}.")
-        logger.scalar(f"{mode}_return", score)
-        logger.scalar(f"{mode}_length", length)
+        writer.add_scalar(f"per_ep_{mode}/return", score, global_step=cur_ep_num)
+        writer.add_scalar(f"per_ep_{mode}/length", length, global_step=cur_ep_num)
         for key, value in ep.items():
             if re.match(config.log_keys_sum, key):
-                logger.scalar(f"sum_{mode}_{key}", ep[key].sum())
+                writer.add_scalar(f"per_ep_{mode}/sum_{key}", ep[key].sum(), global_step=cur_ep_num)
             if re.match(config.log_keys_mean, key):
-                logger.scalar(f"mean_{mode}_{key}", ep[key].mean())
+                writer.add_scalar(f"per_ep_{mode}/mean_{key}", ep[key].mean(), global_step=cur_ep_num)
             if re.match(config.log_keys_max, key):
-                logger.scalar(f"max_{mode}_{key}", ep[key].max(0).mean())
-        should = {"train": should_video_train, "eval": should_video_eval}[mode]
-        replay = dict(train=train_replay, eval=eval_replay)[mode]
-        logger.add(replay.stats, prefix=mode)
+                writer.add_scalar(f"per_ep_{mode}/max_{key}", ep[key].max(0).mean(), global_step=cur_ep_num)
 
-        if should(step) or True:
-            episode_name = str(replay.stats['loaded_episodes'])
+        if cur_ep_num % video_log_fre[mode] == 0:
             for key in config.log_keys_video:
-                logger.video(f"{mode}_policy_{key}_ep_{episode_name}", np.transpose(ep[key], (0, 2, 3, 1)))
-
-        logger.write()
+                writer_wrapper.video_summary(f"video/{mode}/{key}_{str(cur_ep_num)}",
+                                             np.transpose(ep[key], (0, 2, 3, 1)), 1)
 
     def make_env(mode):
         suite, task = config.task.split("_", 1)
@@ -319,6 +337,8 @@ def main(config):
         random.seed(config.seed)
         torch.cuda.manual_seed(config.seed)
 
+    environment_name = config.task.partition('_')[2]
+
     # set up log dir
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)
@@ -337,19 +357,13 @@ def main(config):
 
     # set up logger
     step = NCounter(train_replay.stats["total_steps"])
-    outputs = [
-        TerminalOutput(),
-        JSONLOutput(logdir),
-        TensorBoardOutput(logdir),
-    ]
-    logger = Logger(step, outputs, multiplier=config.action_repeat)
-    metrics = collections.defaultdict(list)
+    writer = SummaryWriter(log_dir=os.path.expanduser(logdir))
+    config.writer = writer
+    writer_wrapper = TensorBoardOutput(logdir, writer)
 
     # set up flow control utils
     should_train = Every(config.train_every)
     should_log = Every(config.log_every)
-    should_video_train = Every(config.eval_every)
-    should_video_eval = Every(config.eval_every)
     should_expl = Until(config.expl_until // config.action_repeat)
 
     # set up envs
@@ -400,35 +414,28 @@ def main(config):
         train_driver.reset()
         eval_driver.reset()
 
-    pre_train_data_generation_config = dict({'batch': config.length, 'length': config.sequence_size})
-    pre_train_dataset_generator = iter(train_replay.dataset(**pre_train_data_generation_config))
+    # generate pre train data set
+    pretrain_data_generation_config = dict({'batch': config.length, 'length': config.sequence_size})
+    pretrain_dataset_generator = iter(train_replay.dataset(**pretrain_data_generation_config))
 
-    full_train_dataset = DC.Dataset(observation_spec=obs_space, action_spec=act_space, size=config.length,
-                                    group_size=config.sequence_size)
-    data = next(pre_train_dataset_generator)
-    full_train_dataset.add_transitions_batch(dict_to_tran(data))
+    pre_train_dataset = DC.Dataset(observation_spec=obs_space, action_spec=act_space, size=config.length,
+                                   group_size=config.sequence_size)
+    data = next(pretrain_dataset_generator)
+    pre_train_dataset.add_transitions_batch(dict_to_tran(data))
 
-    task_behavior_reply_buffer = DC.Dataset(observation_spec=latent_space, action_spec=act_space,
-                                            size=config.policy_reply_buffer_size,
-                                            group_size=config.sequence_size)
-    task_behavior_reply_buffer.current_size += config.batch_size
+    #
+    policy_pretrain_generator_config = dict({'batch': config.policy_reply_buffer_prefill_batch,
+                                             'length': config.sequence_size})
+    policy_pretrain_dataset_generator = iter(train_replay.dataset(**policy_pretrain_generator_config))
 
-    wm_imagine_reply_buffer = DC.Dataset(observation_spec=obs_space, action_spec=act_space, size=config.batch_size,
-                                         group_size=config.sequence_size)
-    wm_imagine_reply_buffer.current_size += config.batch_size
+    # create the model
+    model = D2EAlgorithm(HYPER_PARAMETERS, config, obs_space, act_space, latent_space, step, environment_name,
+                         logdir, policy_pretrain_dataset_generator)
 
-    environment_name = config.task.partition('_')[2]
-    model = D2EAlgorithm(HYPER_PARAMETERS, wm_imagine_reply_buffer, task_behavior_reply_buffer, config.sequence_size,
-                         obs_space, act_space, latent_space, step, environment_name, batch_size=config.batch_size,
-                         log_dir=logdir)
-
-    model.initialize_lazy_modules(full_train_dataset)
-
-    task_behavior_reply_buffer.current_size = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
-    task_behavior_reply_buffer._current_idx = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
+    # init lazy module and normalizer based on the pretrain dataset
+    model.initialize_lazy_modules(pre_train_dataset)
     model.requires_grad_(False)
 
-    train_agent = CarryOverState(model.train_)
     if config.load_model == 1:
         model.load()
     else:
@@ -436,7 +443,8 @@ def main(config):
         num_batch = config.length // config.batch_size
         for ep in range(config.num_pretrain_epoch):
             for i in range(num_batch):
-                train_agent(full_train_dataset.get_batch(np.arange(i * config.batch_size, (i + 1) * config.batch_size)))
+                model.train_(pre_train_dataset.get_batch(np.arange(i * config.batch_size, (i + 1) * config.batch_size)),
+                             state="pretrain")
             if ep % 50 == 0:
                 model.save()
         model.save()
@@ -449,16 +457,15 @@ def main(config):
         return model.policy(*args, mode="eval")
 
     def train_model(tran, worker):
+        # every few step in the env, we will train the agent
         if should_train(step):
             for _ in range(config.train_steps):
-                mets = train_agent(dict_to_tran(next(train_dataset_generator)))
-                [metrics[key].append(value) for key, value in mets.items()]
-        if should_log(step):
-            for name, values in metrics.items():
-                logger.scalar(name, np.array(torch.tensor(values, device='cpu'), np.float64).mean())
-                metrics[name].clear()
-            logger.add(model.report(next(report_dataset_generator)), prefix="train")
-            logger.write(fps=True)
+                mets = model.train_(dict_to_tran(next(train_dataset_generator)))
+                if should_log(step):
+                    for name, values in mets.items():
+                        writer.add_scalar("train_time/" + name,
+                                          np.array(torch.tensor(values, device='cpu'), np.float64).mean(), step.value)
+                    writer_wrapper.log_dict(model.report(next(report_dataset_generator)), "train_report", step.value)
 
     train_data_generation_config = dict({'batch': config.batch_size, 'length': config.sequence_size})
     train_dataset_generator = iter(train_replay.dataset(**train_data_generation_config))
@@ -467,16 +474,14 @@ def main(config):
 
     train_driver.on_step(train_model)
 
-    cur_step = 0
-    while cur_step < config.num_train_epoch:
-        logger.write()
-        print("Start evaluation.")
-        logger.add(model.report(next(eval_dataset_generator)), prefix="eval")
+    cur_epoch = 0
+    while cur_epoch < config.num_train_epoch:
+        writer_wrapper.log_dict(model.report(next(eval_dataset_generator)), "eval_report", cur_epoch)
         eval_driver(eval_policy, episodes=config.eval_eps)
-        print("Start training.")
-        train_driver(train_policy, steps=config.eval_every)
-
-        if cur_step % 50 == 0:
+        # if it does not finish an episode, it will continue from where it left
+        train_driver(train_policy, steps=25000)
+        cur_epoch += 1
+        if cur_epoch % 50 == 0:
             model.save()
     model.save()
 
@@ -496,16 +501,18 @@ def parse_args():
     parser.add_argument("--envs", type=int, default=1, help='should be updated??')
     parser.add_argument('--model_params', type=tuple, default=(200, 200), help='number of layers in the actor network')
     parser.add_argument("--envs_parallel", type=str, default="none", help='??')
+    parser.add_argument("--policy_reply_buffer_prefill_batch", type=int, default=32, help='how fast we fill out the '
+                                                                                          'policy reply buffer')
 
     parser.add_argument("--action_repeat", type=int, default=2, choices=[1, 2, 3])
-    parser.add_argument('--eval_every', type=int, default=1e5)
-    parser.add_argument('--log_every', type=int, default=1e4, help='print train info frequency')
-    parser.add_argument('--train_every', type=int, default=5, help='frequency of training')
+    parser.add_argument('--log_every', type=int, default=10, help='print train info frequency')
+    parser.add_argument('--train_every', type=int, default=5, help='frequency of training agent')
     parser.add_argument('--train_steps', type=int, default=1, help='number of steps for formal training')
-    parser.add_argument("--prefill", type=int, default=50000,
+
+    parser.add_argument("--prefill", type=int, default=2000,
                         help="generate (prefill / 500) num of episodes for pretrain")
     parser.add_argument('--length', type=int, default=32, help='num of sequence length chunk from pre fill data')
-    parser.add_argument('--policy_reply_buffer_size', type=int, default=10000, help='length of policy reply buffer')
+    parser.add_argument('--policy_reply_buffer_size', type=int, default=100, help='length of policy reply buffer')
     parser.add_argument('--sequence_size', type=int, default=10, help='n step size')
     parser.add_argument('--batch_size', type=int, default=3, help='Batch size for pre train')
     parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....')
@@ -518,8 +525,8 @@ def parse_args():
     parser.add_argument('--discount', type=int, default=0.99, help="??")
     parser.add_argument('--load_prefill', type=int, default=1, help='use exist prefill or not, 1 mean load')
     parser.add_argument('--num_pretrain_epoch', type=int, default=1, help='number of pretraining epochs')
-    parser.add_argument('--num_train_epoch', type=int, default=10000, help='number of formal training epochs')
-    parser.add_argument('--load_model', type=int, default=0, help='if 1 we load pre trained model')
+    parser.add_argument('--num_train_epoch', type=int, default=1000, help='number of formal training epochs')
+    parser.add_argument('--load_model', type=int, default=1, help='if 1 we load pre trained model')
 
     args, unknown = parser.parse_known_args()
     return args

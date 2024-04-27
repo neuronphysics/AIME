@@ -235,10 +235,11 @@ class Driver:
                 if ob is None or ob.done
             }
 
+            # note that obs here is 255 based, we store it as 1 based
             for i, ob in obs.items():
                 self._obs[i] = ob() if callable(ob) else ob
                 tran = Transition(
-                    s1=ob.observation,
+                    s1=self._obs[i].observation / 255.0,
                     s2=None,
                     a1=None,
                     a2=None,
@@ -249,10 +250,11 @@ class Driver:
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
                 self._eps[i] = [tran]
 
+
             obs = build_dict_from_named_tuple(self._obs)
 
             # get actions for each of the env
-            actions, self._state = policy(obs['observation'], None, obs['done'],
+            actions, self._state = policy(obs['observation'] / 255.0, None, obs['done'],
                                           self._state, **self._kwargs)
             actions = [
                 {k: np.array(actions[k][i].cpu()) for k in actions}
@@ -267,8 +269,8 @@ class Driver:
             obs_next = [ob() if callable(ob) else ob for ob in obs_next]
             for i, (act, ob, ob_next) in enumerate(zip(actions, self._obs, obs_next)):
                 tran = Transition(
-                    s1=ob.observation,
-                    s2=ob_next.observation,
+                    s1=ob.observation / 255.0,
+                    s2=ob_next.observation / 255.0,
                     a1=ob.prev_action,
                     a2=act['action'],
                     discount=ob_next.discount,
@@ -519,18 +521,16 @@ class NormalizeAction:
 class WorldModel(nn.Module):
     def __init__(self,
                  hyperParams,
-                 train_data,
                  sequence_length,
                  env_name='Hopper-v2',
                  device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-                 log_dir="logs",
+                 writer=None,
                  restore=False):
         super(WorldModel, self).__init__()
 
         self.sequence_len = sequence_length
         self.optimizer = None
         self.discriminator_optim = None
-        self.wm_image_replay_buffer = train_data
         self.model_path = os.path.abspath(os.getcwd()) + '/model'
 
         try:
@@ -635,10 +635,9 @@ class WorldModel(nn.Module):
         if restore:
             self.load_checkpoints()
 
-        self.writer = SummaryWriter(log_dir)
+        self.writer = writer
         self.writer_counter = 0
 
-        self.pbar = tqdm(range(self.n_discriminator_iter))
         print("End of initializing the world model")
 
     def initialize_optimizer(self):
@@ -687,7 +686,7 @@ class WorldModel(nn.Module):
 
     def train_discriminator_get_latent(self, obs):
         z_real, z_fake = None, None
-        for _ in self.pbar:
+        for _ in range(self.n_discriminator_iter):
             z_real, z_x_mean, z_x_sigma, c_posterior, w_x_mean, w_x_sigma, gmm_dist, z_wc_mean_prior, \
             z_wc_logvar_prior, x_reconstructed = self.variational_autoencoder(obs)
             z_fake = gmm_dist.sample()
@@ -783,13 +782,13 @@ class WorldModel(nn.Module):
         nn.utils.clip_grad_norm_(self.parameters, self._params.MAX_GRAD_NORM, norm_type=2)
         self.optimizer.step_()
 
-        self.writer.add_scalar('Variational autoencoder loss', metrics["total_observe_loss"].item(),
+        self.writer.add_scalar('WM/variational_autoencoder_loss', metrics["total_observe_loss"].item(),
                                global_step=self.writer_counter)
-        self.writer.add_scalar('transition loss', metrics["transition_total_loss"].item(),
+        self.writer.add_scalar('WM/transition_loss', metrics["transition_total_loss"].item(),
                                global_step=self.writer_counter)
-        self.writer.add_scalar('reward loss', metrics["reward_loss"].item(), global_step=self.writer_counter)
-        self.writer.add_scalar('discount loss', metrics["discount_loss"].item(), global_step=self.writer_counter)
-        self.writer.add_scalar('total world model loss', metrics["total_model_loss"].item(),
+        self.writer.add_scalar('WM/reward_loss', metrics["reward_loss"].item(), global_step=self.writer_counter)
+        self.writer.add_scalar('WM/discount_loss', metrics["discount_loss"].item(), global_step=self.writer_counter)
+        self.writer.add_scalar('WM/total_world_model_loss', metrics["total_model_loss"].item(),
                                global_step=self.writer_counter)
         self.writer_counter += 1
 
