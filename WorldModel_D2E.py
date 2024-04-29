@@ -438,6 +438,7 @@ def main(config):
 
     if config.load_model == 1:
         model.load()
+        print("Pretrain skipped")
     else:
         print("Pretrain agent")
         num_batch = config.length // config.batch_size
@@ -445,7 +446,7 @@ def main(config):
             for i in range(num_batch):
                 model.train_(pre_train_dataset.get_batch(np.arange(i * config.batch_size, (i + 1) * config.batch_size)),
                              state="pretrain")
-            if ep % 50 == 0:
+            if ep % config.save_fre == 0:
                 model.save()
         model.save()
 
@@ -474,14 +475,15 @@ def main(config):
 
     train_driver.on_step(train_model)
 
+    print("Start training")
     cur_epoch = 0
     while cur_epoch < config.num_train_epoch:
         writer_wrapper.log_dict(model.report(next(eval_dataset_generator)), "eval_report", cur_epoch)
         eval_driver(eval_policy, episodes=config.eval_eps)
         # if it does not finish an episode, it will continue from where it left
-        train_driver(train_policy, steps=25000)
+        train_driver(train_policy, steps=config.train_epoch_length)
         cur_epoch += 1
-        if cur_epoch % 50 == 0:
+        if cur_epoch % config.save_fre == 0:
             model.save()
     model.save()
 
@@ -504,30 +506,38 @@ def parse_args():
     parser.add_argument("--policy_reply_buffer_prefill_batch", type=int, default=32, help='how fast we fill out the '
                                                                                           'policy reply buffer')
 
-    parser.add_argument("--action_repeat", type=int, default=2, choices=[1, 2, 3])
-    parser.add_argument('--log_every', type=int, default=10, help='print train info frequency')
-    parser.add_argument('--train_every', type=int, default=5, help='frequency of training agent')
-    parser.add_argument('--train_steps', type=int, default=1, help='number of steps for formal training')
-
-    parser.add_argument("--prefill", type=int, default=2000,
-                        help="generate (prefill / 500) num of episodes for pretrain")
-    parser.add_argument('--length', type=int, default=32, help='num of sequence length chunk from pre fill data')
-    parser.add_argument('--policy_reply_buffer_size', type=int, default=100, help='length of policy reply buffer')
-    parser.add_argument('--sequence_size', type=int, default=10, help='n step size')
-    parser.add_argument('--batch_size', type=int, default=3, help='Batch size for pre train')
     parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....')
     parser.add_argument("--max_episode_steps", type=int, default=1e3, help='an episode corresponds to 1000 steps')
     parser.add_argument("--eval_eps", type=int, default=1, help='??')
+    parser.add_argument('--discount', type=int, default=0.99, help="??")
+    parser.add_argument("--action_repeat", type=int, default=2, choices=[1, 2, 3])
+
+    parser.add_argument('--log_every', type=int, default=1000, help='print train info frequency, unit is steps')
+    parser.add_argument('--train_every', type=int, default=5, help='frequency of training agent, unit is steps')
+    parser.add_argument('--train_steps', type=int, default=1, help='number of steps for formal training')
+    parser.add_argument('--save_fre', type=int, default=2, help='frequency of saving model, recommend 2')
+
+    parser.add_argument("--prefill", type=int, default=60000,
+                        help="generate (prefill / 500) num of episodes for pretrain")
+    parser.add_argument('--length', type=int, default=15000, help='num of sequence length chunk generated from prefill '
+                                                                  'data for pretrain purpose')
+    parser.add_argument('--policy_reply_buffer_size', type=int, default=100, help='length of policy reply buffer')
+    parser.add_argument('--sequence_size', type=int, default=10, help='n step size')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for pretrain and train process')
+
+    parser.add_argument('--load_prefill', type=int, default=0, help='use exist prefill or not, 1 mean load, '
+                                                                    '0 means generate new prefill, we need to generate '
+                                                                    'new prefill when running in the first time')
+    parser.add_argument('--num_pretrain_epoch', type=int, default=50, help='number of pretraining epochs')
+    parser.add_argument('--num_train_epoch', type=int, default=10000, help='number of formal training epochs')
+    parser.add_argument('--train_epoch_length', type=int, default=1500, help='total number of steps of 1 train epoch')
+    parser.add_argument('--load_model', type=int, default=0, help='if 1 we load pre trained model, 0 means '
+                                                                  'generate new model')
+
     parser.add_argument("--log_keys_video", type=list, default=['s2'], help='??')
     parser.add_argument('--log_keys_sum', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_mean', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_max', type=str, default='^$', help='??')
-    parser.add_argument('--discount', type=int, default=0.99, help="??")
-    parser.add_argument('--load_prefill', type=int, default=1, help='use exist prefill or not, 1 mean load')
-    parser.add_argument('--num_pretrain_epoch', type=int, default=1, help='number of pretraining epochs')
-    parser.add_argument('--num_train_epoch', type=int, default=1000, help='number of formal training epochs')
-    parser.add_argument('--load_model', type=int, default=1, help='if 1 we load pre trained model')
-
     args, unknown = parser.parse_known_args()
     return args
 
