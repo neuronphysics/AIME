@@ -1,38 +1,19 @@
-import pandas as pd
-import numpy as np
 import datetime
-import math
 import time
-import logging
-import os, sys
-import torch
-import torch.nn as nn
-import torch.utils
 import torch.utils.data
-from torchvision import datasets, transforms
-from torch.autograd import Variable
-import torch.optim as optim
-from torch.nn import functional as F
-import torch.distributions as tdist
-from torch.distributions import MultivariateNormal, OneHotCategorical
 from torch.utils.data import Dataset, TensorDataset
 from torch.utils.data import DataLoader
-import torch.multiprocessing as mp
-import torch.nn.init as init
 from tqdm import tqdm
-from collections import defaultdict
-from functools import partial
-from .Normalization import Normalizer1D, compute_normalizer
-from .main import ModelState, DynamicModel, VRNN_GMM
-from .vrnn_utilities import *
+from VRNN.Normalization import Normalizer1D, compute_normalizer
+from VRNN.main import ModelState, DynamicModel, VRNN_GMM
+from VRNN.vrnn_utilities import *
 from sklearn.model_selection import train_test_split
 from tensorboardX import SummaryWriter
-import torch.backends.cudnn as cudnn
 import torch.utils.data.distributed
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import random
 import argparse
+import pandas as pd
 
 parser = argparse.ArgumentParser(
     description='the vrnn transition model (Chung et al. 2016) conditioned on the context, distributed data parallel ')
