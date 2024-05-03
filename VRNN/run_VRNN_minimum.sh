@@ -7,31 +7,14 @@
 #SBATCH --mem=90G
 #SBATCH --time=01-15:59
 #SBATCH --account=def-jhoey
-#SBATCH --output=/home/memole/TEST/AIME/Hopper-transit-run-seed-1_%N-%j.out
-#SBATCH --error=/home/memole/TEST/AIME/Hopper-transit-run-seed-1_%N-%j.err
-module load StdEnv/2020
-module load python/3.8.10
-module load scipy-stack
-source /home/memole/dm_control/bin/activate
+#SBATCH --output=Hopper-transit-run-seed-1_%N-%j.out
+#SBATCH --error=Hopper-transit-run-seed-1_%N-%j.err
+source /home/sstevec/vir_env/gen_env/bin/activate
+module load StdEnv/2020 gcc/9.3.0 opencv/4.7.0
+module load mujoco
+module load scipy-stack/2022a
+module load python/3.10
 
-
-
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/memole/.mujoco/mujoco210/bin
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
-export TORCH_CXX_FLAGS="-D_GLIBCXX_USE_CXX11_ABI=0"
-pip install --upgrade pip
-pip install dill --no-index
-pip install einops --no-index
-pip install torch-optimizer --no-index
-#pip install git+https://github.com/torchgan/torchgan.git
-#pip install git+https://github.com/WarrenWeckesser/wavio.git
-pip install git+https://github.com/cooper-org/cooper.git
-#pip install git+https://github.com/AdamCobb/hamiltorch.git
-#pip install git+https://github.com/facebookresearch/fairseq.git
-pip install --no-index wandb
-#pip install torch-geometric
-wandb offline
-tensorboard --logdir=./tensorlog --port 6006 --bind_all --load_fast false &
 #python DataCollectionD2E.py --env_name=HalfCheetah-v2
 #python train_eval_offline_D2E.py --env_name=HalfCheetah-v2
 export NCCL_BLOCKING_WAIT=1  #Set this environment variable if you wish to use the NCCL backend for inter-GPU communication.
