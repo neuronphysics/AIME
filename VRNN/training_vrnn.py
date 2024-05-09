@@ -18,7 +18,7 @@ import pandas as pd
 parser = argparse.ArgumentParser(
     description='the vrnn transition model (Chung et al. 2016) conditioned on the context, distributed data parallel ')
 parser.add_argument('--lr', default=0.0002, help='')
-parser.add_argument('--batch_size', type=int, default=768, help='')
+parser.add_argument('--batch_size', type=int, default=24, help='')
 parser.add_argument('--max_epochs', type=int, default=4, help='')
 parser.add_argument('--num_workers', type=int, default=0, help='')
 
@@ -308,7 +308,8 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
     # %% load model
 
     # Compute normalizers (here just used for initialization, real values loaded below)
-    normalizer_input, normalizer_output = compute_normalizer(loaders)
+    test_x, test_y = loaders.dataset.tensors
+    normalizer_input, normalizer_output = compute_normalizer(test_x.transpose(1, 2).cpu(), test_y.transpose(1, 2).cpu())
 
     # Define model
 
@@ -340,7 +341,7 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
                'test_every': 50,
                'showfig': 'True',
                'savefig': 'True',
-               'seq_len_train': loaders.wm_image_replay_buffer[0][-1].shape[-1],
+               'seq_len_train': test_x.shape[-1],
                'batch_size': batch_size,
                'lr_scheduler_nepochs': 5,
                'lr_scheduler_factor': 10}
@@ -433,17 +434,17 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
     return df
 
 
-def main():
+def main(arg):
     print("Starting...")
-    path = os.getcwd()
-    parentfolder = os.path.dirname(path)
-    args = parser.parse_args()
+    args = parser.parse_args(arg)
 
     ngpus_per_node = torch.cuda.device_count()
     os.environ["NCCL_DEBUG"] = "INFO"
-    """ This next line is the key to getting DistributedDataParallel working on SLURM:
-		SLURM_NODEID is 0 or 1 in this example, SLURM_LOCALID is the id of the 
- 		current process inside a node and is also 0 or 1 in this example."""
+    """
+    This next line is the key to getting DistributedDataParallel working on SLURM:
+    SLURM_NODEID is 0 or 1 in this example, SLURM_LOCALID is the id of the
+    current process inside a node and is also 0 or 1 in this example.
+    """
 
     print("echo GPUs per node: {}".format(torch.cuda.device_count()))
     print("local ID: ", os.environ.get("SLURM_LOCALID"), " node ID: ", os.environ.get("SLURM_NODEID"),
@@ -462,11 +463,19 @@ def main():
     device = torch.device('cuda', local_rank if torch.cuda.is_available() else 'cpu')
     print('Using device:{}'.format(device))
 
-    """ this block initializes a process group and initiate communications
-		between all processes running on all nodes """
+    """
+    this block initializes a process group and initiate communications
+    between all processes running on all nodes
+    """
 
     print('From Rank: {}, ==> Initializing Process Group...'.format(rank))
     print(f"init_method = {args.init_method}")
+
+    # local test use, remove this when running on server
+    # rank = 0
+    # current_device = 0
+    # device = torch.device('cuda', 0 if torch.cuda.is_available() else 'cpu')
+
     # init the process group
     dist.init_process_group(backend=args.dist_backend,
                             init_method=args.init_method,
@@ -474,6 +483,7 @@ def main():
                             rank=rank,
                             timeout=datetime.timedelta(0, 240)  # 20s connection timeout
                             )
+
     print("process group ready!")
 
     print('From Rank: {}, ==> Making model..'.format(rank))
@@ -483,8 +493,7 @@ def main():
     # get saving path
     input_filename = "transit_data/gym_transition_inputs.pt"
     target_filename = "transit_data/gym_transition_outputs.pt"
-    filepath = os.getcwd()
-    parentfolder = os.path.dirname(filepath)
+    parentfolder = os.getcwd()
     # read input data
     variable_episodes = torch.load(os.path.join(parentfolder, input_filename))
     final_next_state = torch.load(os.path.join(parentfolder, target_filename))
@@ -567,7 +576,8 @@ def main():
     valid_dataset = TensorDataset(validation_x, validation_y)
     valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=True)
 
-    normalizer_input, normalizer_output = compute_normalizer(train_loader)
+    normalizer_input, normalizer_output = compute_normalizer(train_x.transpose(1, 2).cpu(),
+                                                             train_y.transpose(1, 2).cpu())
 
     # Define model
 
@@ -619,7 +629,3 @@ def main():
     file_name = file_general_path + '_VRNN_GMM_GYM_TEST.csv'
 
     df.to_csv(file_name)
-
-
-if __name__ == "__main__":
-    main()
