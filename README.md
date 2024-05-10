@@ -20,12 +20,8 @@ http://localhost:16010
 pip install -e git+https://github.com/ncullen93/torchsample.git#egg=torchsample 
 
 # Reference
-1. https://github.com/zhenwendai/RGP
-2. https://github.com/EmbodiedVision/dlgpd
-3. https://pyro.ai/examples/index.html
-4. https://gpytorch.ai/
-5. https://github.com/Kaixhin/PlaNet
-6. https://github.com/ku2482/slac.pytorch
-7. https://github.com/Olloxan/Pytorch-A2C
-8. https://github.com/higgsfield/Imagination-Augmented-Agents
-9. https://github.com/pranz24/pytorch-soft-actor-critic
+1. https://github.com/google-research/google-research/tree/ccc94ce348360ddcd41c749d4088d468ccfd1eaf/behavior_regularized_offline_rl
+2. https://github.com/danijar/dreamerv2
+3. https://github.com/dgedon/DeepSSM_SysID/
+4. https://github.com/Kaixhin/PlaNet
+5. https://github.com/google-deepmind/hierarchical_perceiver/
