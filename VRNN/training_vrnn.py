@@ -73,7 +73,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 u = u.to(device)
                 y = y.to(device)
                 # forward pass over model
-                vloss_, d_loss, hidden, real_feature, fake_feature = modelstate.model(u, y)
+                vloss_, d_loss, hidden, real_feature, fake_feature, attention_latent = modelstate.model(u, y)
 
                 total_batches += u.size()[0]
                 total_points += np.prod(u.shape)
@@ -107,7 +107,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
             if torch.cuda.is_available():
                 with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(
                         enabled=False):
-                    loss_, disc_loss, hidden, real, fake = modelstate.model(u, y)
+                    loss_, disc_loss, hidden, real, fake, attention_latent = modelstate.model(u, y)
 
                 with torch.backends.cudnn.flags(enabled=False):
                     gradient_penalty = modelstate.model.module.wgan_gp_reg(real, fake)
@@ -171,7 +171,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 """
             else:
                 # forward pass over model
-                loss_, disc_loss, hidden, real, fake = modelstate.model(u, y)
+                loss_, disc_loss, hidden, real, fake, attention_latent = modelstate.model(u, y)
 
                 with torch.backends.cudnn.flags(enabled=False):
                     gradient_penalty = modelstate.model.module.wgan_gp_reg(real, fake)
@@ -446,35 +446,35 @@ def main(arg):
     current process inside a node and is also 0 or 1 in this example.
     """
 
-    print("echo GPUs per node: {}".format(torch.cuda.device_count()))
-    print("local ID: ", os.environ.get("SLURM_LOCALID"), " node ID: ", os.environ.get("SLURM_NODEID"),
-          "number of tasks: ", os.environ.get("SLURM_NTASKS"))
-    local_rank = int(os.environ.get("SLURM_LOCALID"))
-
-    rank = int(os.environ.get("SLURM_NODEID")) * ngpus_per_node + local_rank
-    print('cuda visible: ', os.environ.get('CUDA_VISIBLE_DEVICES'))
-    proc_id = int(os.environ.get("SLURM_PROCID"))
-    job_id = int(os.environ.get("SLURM_JOBID"))
-    n_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES"))
-    available_gpus = list(os.environ.get('CUDA_VISIBLE_DEVICES').replace(',', ""))
-    current_device = local_rank
-
-    torch.cuda.set_device(current_device)
-    device = torch.device('cuda', local_rank if torch.cuda.is_available() else 'cpu')
-    print('Using device:{}'.format(device))
-
-    """
-    this block initializes a process group and initiate communications
-    between all processes running on all nodes
-    """
-
-    print('From Rank: {}, ==> Initializing Process Group...'.format(rank))
-    print(f"init_method = {args.init_method}")
+    # print("echo GPUs per node: {}".format(torch.cuda.device_count()))
+    # print("local ID: ", os.environ.get("SLURM_LOCALID"), " node ID: ", os.environ.get("SLURM_NODEID"),
+    #       "number of tasks: ", os.environ.get("SLURM_NTASKS"))
+    # local_rank = int(os.environ.get("SLURM_LOCALID"))
+    #
+    # rank = int(os.environ.get("SLURM_NODEID")) * ngpus_per_node + local_rank
+    # print('cuda visible: ', os.environ.get('CUDA_VISIBLE_DEVICES'))
+    # proc_id = int(os.environ.get("SLURM_PROCID"))
+    # job_id = int(os.environ.get("SLURM_JOBID"))
+    # n_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES"))
+    # available_gpus = list(os.environ.get('CUDA_VISIBLE_DEVICES').replace(',', ""))
+    # current_device = local_rank
+    #
+    # torch.cuda.set_device(current_device)
+    # device = torch.device('cuda', local_rank if torch.cuda.is_available() else 'cpu')
+    # print('Using device:{}'.format(device))
+    #
+    # """
+    # this block initializes a process group and initiate communications
+    # between all processes running on all nodes
+    # """
+    #
+    # print('From Rank: {}, ==> Initializing Process Group...'.format(rank))
+    # print(f"init_method = {args.init_method}")
 
     # local test use, remove this when running on server
-    # rank = 0
-    # current_device = 0
-    # device = torch.device('cuda', 0 if torch.cuda.is_available() else 'cpu')
+    rank = 0
+    current_device = 0
+    device = torch.device('cuda', 0 if torch.cuda.is_available() else 'cpu')
 
     # init the process group
     dist.init_process_group(backend=args.dist_backend,
@@ -484,11 +484,11 @@ def main(arg):
                             timeout=datetime.timedelta(0, 240)  # 20s connection timeout
                             )
 
-    print("process group ready!")
-
-    print('From Rank: {}, ==> Making model..'.format(rank))
-    print("echo final check; ngpus_per_node={},local_rank={},rank={},available_gpus={},current_device={}"
-          .format(ngpus_per_node, local_rank, rank, available_gpus, current_device))
+    # print("process group ready!")
+    #
+    # print('From Rank: {}, ==> Making model..'.format(rank))
+    # print("echo final check; ngpus_per_node={},local_rank={},rank={},available_gpus={},current_device={}"
+    #       .format(ngpus_per_node, local_rank, rank, available_gpus, current_device))
 
     # get saving path
     input_filename = "transit_data/gym_transition_inputs.pt"
@@ -547,8 +547,8 @@ def main(arg):
     print(f" size of training input {x_train.shape}")
     print(f" size of test input {x_test.shape}, validation data size {x_val.shape}")
     print(f" training output {y_train.shape}, test output {y_test.shape}")
-    if torch.cuda.is_available():
-        train_x, train_y, test_x, test_y, validation_x, validation_y = x_train.cuda(), y_train.cuda(), x_test.cuda(), y_test.cuda(), x_val.cuda(), y_val.cuda()
+
+    train_x, train_y, test_x, test_y, validation_x, validation_y = x_train, y_train, x_test, y_test, x_val, y_val
 
     u_dim = variable_episodes.shape[-1]
     y_dim = final_next_state.shape[-1]
