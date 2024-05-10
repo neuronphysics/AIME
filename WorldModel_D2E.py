@@ -494,7 +494,7 @@ def main(config):
             pass
 
 
-def parse_args():
+def parse_args(known_arg):
     parser = argparse.ArgumentParser(description="Evaluate your search algorithms.")
     parser.add_argument('--logdir', type=str, default=os.path.join(os.getcwd(), 'logs'),
                         help='a path to the log directory')
@@ -538,9 +538,9 @@ def parse_args():
     parser.add_argument('--log_keys_sum', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_mean', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_max', type=str, default='^$', help='??')
-    args, unknown = parser.parse_known_args()
+    args, unknown = parser.parse_known_args(known_arg)
     return args
 
 
 if __name__ == "__main__":
-    main(parse_args())
+    main(parse_args(sys.argv[1:]))
