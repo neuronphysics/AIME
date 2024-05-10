@@ -446,35 +446,35 @@ def main(arg):
     current process inside a node and is also 0 or 1 in this example.
     """
 
-    # print("echo GPUs per node: {}".format(torch.cuda.device_count()))
-    # print("local ID: ", os.environ.get("SLURM_LOCALID"), " node ID: ", os.environ.get("SLURM_NODEID"),
-    #       "number of tasks: ", os.environ.get("SLURM_NTASKS"))
-    # local_rank = int(os.environ.get("SLURM_LOCALID"))
-    #
-    # rank = int(os.environ.get("SLURM_NODEID")) * ngpus_per_node + local_rank
-    # print('cuda visible: ', os.environ.get('CUDA_VISIBLE_DEVICES'))
-    # proc_id = int(os.environ.get("SLURM_PROCID"))
-    # job_id = int(os.environ.get("SLURM_JOBID"))
-    # n_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES"))
-    # available_gpus = list(os.environ.get('CUDA_VISIBLE_DEVICES').replace(',', ""))
-    # current_device = local_rank
-    #
-    # torch.cuda.set_device(current_device)
-    # device = torch.device('cuda', local_rank if torch.cuda.is_available() else 'cpu')
-    # print('Using device:{}'.format(device))
-    #
-    # """
-    # this block initializes a process group and initiate communications
-    # between all processes running on all nodes
-    # """
-    #
-    # print('From Rank: {}, ==> Initializing Process Group...'.format(rank))
-    # print(f"init_method = {args.init_method}")
+    print("echo GPUs per node: {}".format(torch.cuda.device_count()))
+    print("local ID: ", os.environ.get("SLURM_LOCALID"), " node ID: ", os.environ.get("SLURM_NODEID"),
+          "number of tasks: ", os.environ.get("SLURM_NTASKS"))
+    local_rank = int(os.environ.get("SLURM_LOCALID"))
+
+    rank = int(os.environ.get("SLURM_NODEID")) * ngpus_per_node + local_rank
+    print('cuda visible: ', os.environ.get('CUDA_VISIBLE_DEVICES'))
+    proc_id = int(os.environ.get("SLURM_PROCID"))
+    job_id = int(os.environ.get("SLURM_JOBID"))
+    n_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES"))
+    available_gpus = list(os.environ.get('CUDA_VISIBLE_DEVICES').replace(',', ""))
+    current_device = local_rank
+
+    torch.cuda.set_device(current_device)
+    device = torch.device('cuda', local_rank if torch.cuda.is_available() else 'cpu')
+    print('Using device:{}'.format(device))
+
+    """
+    this block initializes a process group and initiate communications
+    between all processes running on all nodes
+    """
+
+    print('From Rank: {}, ==> Initializing Process Group...'.format(rank))
+    print(f"init_method = {args.init_method}")
 
     # local test use, remove this when running on server
-    rank = 0
-    current_device = 0
-    device = torch.device('cuda', 0 if torch.cuda.is_available() else 'cpu')
+    # rank = 0
+    # current_device = 0
+    # device = torch.device('cuda', 0 if torch.cuda.is_available() else 'cpu')
 
     # init the process group
     dist.init_process_group(backend=args.dist_backend,
@@ -484,11 +484,11 @@ def main(arg):
                             timeout=datetime.timedelta(0, 240)  # 20s connection timeout
                             )
 
-    # print("process group ready!")
-    #
-    # print('From Rank: {}, ==> Making model..'.format(rank))
-    # print("echo final check; ngpus_per_node={},local_rank={},rank={},available_gpus={},current_device={}"
-    #       .format(ngpus_per_node, local_rank, rank, available_gpus, current_device))
+    print("process group ready!")
+
+    print('From Rank: {}, ==> Making model..'.format(rank))
+    print("echo final check; ngpus_per_node={},local_rank={},rank={},available_gpus={},current_device={}"
+          .format(ngpus_per_node, local_rank, rank, available_gpus, current_device))
 
     # get saving path
     input_filename = "transit_data/gym_transition_inputs.pt"
