@@ -788,6 +788,7 @@ class WorldModel(nn.Module):
                                global_step=self.writer_counter)
         self.writer.add_scalar('WM/reward_loss', metrics["reward_loss"].item(), global_step=self.writer_counter)
         self.writer.add_scalar('WM/discount_loss', metrics["discount_loss"].item(), global_step=self.writer_counter)
+        self.writer.add_scalar('WM/done_loss', metrics["done_loss"].item(), global_step=self.writer_counter)
         self.writer.add_scalar('WM/total_world_model_loss', metrics["total_model_loss"].item(),
                                global_step=self.writer_counter)
         self.writer_counter += 1

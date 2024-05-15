@@ -19,6 +19,7 @@ parser = argparse.ArgumentParser(
     description='the vrnn transition model (Chung et al. 2016) conditioned on the context, distributed data parallel ')
 parser.add_argument('--lr', default=0.0002, help='')
 parser.add_argument('--batch_size', type=int, default=24, help='')
+parser.add_argument('--max_seq_len', type=int, default=150, help='')
 parser.add_argument('--max_epochs', type=int, default=4, help='')
 parser.add_argument('--num_workers', type=int, default=0, help='')
 
@@ -79,6 +80,8 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 total_points += np.prod(u.shape)
                 total_vloss += vloss_.item()
 
+                # TODO
+                break
         return total_vloss / total_points  # total_batches
 
     def train(epoch):
@@ -548,11 +551,17 @@ def main(arg):
     print(f" size of test input {x_test.shape}, validation data size {x_val.shape}")
     print(f" training output {y_train.shape}, test output {y_test.shape}")
 
-    train_x, train_y, test_x, test_y, validation_x, validation_y = x_train, y_train, x_test, y_test, x_val, y_val
+    max_seq = args.max_seq_len
+    train_x = remove_longer_data(x_train, max_seq)
+    train_y = remove_longer_data(y_train, max_seq)
+    test_x = remove_longer_data(x_test, max_seq)
+    test_y = remove_longer_data(y_test, max_seq)
+    validation_x = remove_longer_data(x_val, max_seq)
+    validation_y = remove_longer_data(y_val, max_seq)
 
     u_dim = variable_episodes.shape[-1]
     y_dim = final_next_state.shape[-1]
-    seq_len = variable_episodes.shape[1]
+    seq_len = max_seq
 
     batch_size = args.batch_size
     train_dataset = TensorDataset(train_x, train_y)
@@ -629,3 +638,10 @@ def main(arg):
     file_name = file_general_path + '_VRNN_GMM_GYM_TEST.csv'
 
     df.to_csv(file_name)
+
+
+def remove_longer_data(data, max_seq):
+    # data should come in with (batch, data_dim, seq_len)
+    data_dim = data.shape[1]
+    indices = ((data[:, :, max_seq] == 0).sum(dim=1) == data_dim)
+    return data[indices][:, :, :max_seq]
