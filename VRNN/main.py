@@ -126,6 +126,7 @@ class VRNN_GMM(nn.Module):
                  y_dim,
                  h_dim,
                  z_dim,
+                 image_size,
                  n_layers,
                  n_mixtures,
                  sequence_length,
@@ -146,6 +147,7 @@ class VRNN_GMM(nn.Module):
         self.u_dim = u_dim
         self.h_dim = h_dim
         self.z_dim = z_dim
+        self.image_size = image_size
         self.n_layers = n_layers
         self.n_mixtures = n_mixtures
         self.device = device
@@ -342,6 +344,9 @@ class VRNN_GMM(nn.Module):
                 torch.from_numpy(
                     np.random.random((1, self.u_dim + self.y_dim, 1)).astype(np.float32)).to(
                     self.device),
+            'image': torch.from_numpy(
+                np.random.random((1, 3, self.image_size * self.image_size)).astype(np.float32)).to(
+                self.device),
         }
 
     def wgan_gp_reg(self, x_real, x_fake, center=1., lambda_gp=10.0):
@@ -397,7 +402,7 @@ class VRNN_GMM(nn.Module):
 
         return (h_0, c_0)
 
-    def forward(self, u, y):
+    def forward(self, u, y, obs):
         deterministic_hidden_state = []
         batch_size = y.size(0)
         # input has size (Batch, D, seq_len)
@@ -437,14 +442,19 @@ class VRNN_GMM(nn.Module):
 
         latent_input = torch.cat((context_u, context_y), dim=-1)
         latent_input = torch.reshape(latent_input, (batch_size * self.sequence_length, self.u_dim + self.y_dim, 1))
-        output = self.perceiver_model({"latent_fea": latent_input}, is_training=True)
-        perceiver_recon = output[self.out_keys.INPUT_RECONSTRUCTION]['latent_fea']
+        flatten_obs = obs.reshape(-1, 3, self.image_size * self.image_size)
+        output = self.perceiver_model(
+            {"latent_fea": latent_input, 'image': flatten_obs},
+            is_training=True)
+        perceiver_recon_latent = output[self.out_keys.INPUT_RECONSTRUCTION]['latent_fea']
+        perceiver_recon_img = output[self.out_keys.INPUT_RECONSTRUCTION]['image']
         perceiver_latent_out = output[self.out_keys.LATENTS]['latent_fea'].transpose(1, 2)
         perceiver_latent_out = self.conv1(perceiver_latent_out)
         perceiver_latent_out = self.adaptive_pool(perceiver_latent_out)
         mean_attn = torch.reshape(perceiver_latent_out, (batch_size, self.sequence_length, -1))
 
-        perceiver_recon_loss = self.perceiver_loss(perceiver_recon, latent_input)
+        perceiver_recon_loss = self.perceiver_loss(perceiver_recon_latent, latent_input) + self.perceiver_loss(
+            perceiver_recon_img, flatten_obs)
 
         # mean_attn [B, :seq_len, D_h])
         ##=============##
@@ -676,6 +686,7 @@ class DynamicModel(VRNN_GMM):
     def __init__(self,
                  num_inputs,
                  num_outputs,
+                 image_size,
                  h_dim=96,
                  z_dim=48,
                  n_layers=2,
@@ -688,6 +699,7 @@ class DynamicModel(VRNN_GMM):
                  normalizer_output=None,
                  *args, **kwargs):
         super(DynamicModel, self).__init__(u_dim=num_inputs, y_dim=num_outputs, h_dim=h_dim, z_dim=z_dim,
+                                           image_size=image_size,
                                            n_layers=n_layers, n_mixtures=n_mixtures, sequence_length=sequence_length,
                                            device=device, learn_init_state=learn_init_state,
                                            bidirectional=bidirectional)
@@ -705,14 +717,15 @@ class DynamicModel(VRNN_GMM):
     def num_model_inputs(self):
         return self.num_inputs + self.num_outputs if self.ar else self.num_inputs
 
-    def forward(self, u, y=None):
+    def forward(self, u, y=None, obs=None):
         if self.normalizer_input is not None:
             u = self.normalizer_input.normalize(u)
         if y is not None and self.normalizer_output is not None:
             y = self.normalizer_output.normalize(y)
 
         vrnn_loss, d_loss, hidden, real_feature, fake_feature, attention_latent = super(DynamicModel, self).forward(u,
-                                                                                                                    y)
+                                                                                                                    y,
+                                                                                                                    obs)
         return vrnn_loss, d_loss, hidden, real_feature, fake_feature, attention_latent
 
     def generate(self, u, y=None, seq_len=None):
@@ -746,6 +759,7 @@ class ModelState:
                  seed,
                  nu,
                  ny,
+                 image_size,
                  sequence_length,
                  h_dim=80,
                  z_dim=100,
@@ -765,7 +779,8 @@ class ModelState:
         self.n_layers = n_layers
         self.n_mixtures = n_mixtures
 
-        self.model = DynamicModel(num_inputs=nu, num_outputs=ny, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers,
+        self.model = DynamicModel(image_size=image_size, num_inputs=nu, num_outputs=ny, h_dim=h_dim, z_dim=z_dim,
+                                  n_layers=n_layers,
                                   n_mixtures=n_mixtures, sequence_length=sequence_length, device=device, **kwargs)
         if optimizer_type == "AdaBelief":
             self.optimizer = torch_optimizer.AdaBelief(self.model.parameters(),

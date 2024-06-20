@@ -250,7 +250,6 @@ class Driver:
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
                 self._eps[i] = [tran]
 
-
             obs = build_dict_from_named_tuple(self._obs)
 
             # get actions for each of the env
@@ -588,7 +587,8 @@ class WorldModel(nn.Module):
         self.mse_loss = nn.MSELoss()
 
         # inside VRNN folder we have main.py script : the transition model
-        modelstate = ModelState(seed=self._params.seed,
+        modelstate = ModelState(image_size=self._params.image_width,
+                                seed=self._params.seed,
                                 nu=self.state_dim + self.action_dim,
                                 ny=self.state_dim,
                                 sequence_length=sequence_length,
@@ -750,7 +750,7 @@ class WorldModel(nn.Module):
 
         with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
             transition_loss, transition_disc_loss, hidden, real_embed, fake_embed, latent = self.transition_model(
-                reshaped_inputs, reshaped_outputs)
+                reshaped_inputs, reshaped_outputs, obs)
         with torch.backends.cudnn.flags(enabled=False):
             transition_gradient_penalty = self.transition_model.wgan_gp_reg(real_embed, fake_embed)
         # reward prediction and computing discount factor
