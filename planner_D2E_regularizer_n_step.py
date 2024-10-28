@@ -643,11 +643,13 @@ class Agent:
     def update_target_vars(self):
         # ?
         # requires self._vars_learning and self._vars_target as state_dict`s
-        for var_name, var_t in self._vars_target.items():
-            updated_val = (self._update_rate
+        # Perform updates
+        with torch.no_grad():
+           for var_name, var_t in self._vars_target.items():
+                updated_val = (self._update_rate
                            * self._vars_learning[var_name].data
                            + (1.0 - self._update_rate) * var_t.data)
-            var_t.data.copy_(updated_val)
+                var_t.data.copy_(updated_val)
 
     def build_test_policies(self):
         raise NotImplementedError

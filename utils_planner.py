@@ -204,8 +204,10 @@ def plot_train_info(vals, name, savepath):
 
 
 def soft_variables_update(source_variables, target_variables, tau=1.0):
-    for (v_s, v_t) in zip(source_variables, target_variables):
-        v_t = (1 - tau) * v_t + tau * v_s
+    with torch.no_grad():  # No gradient calculations needed
+         for (v_s, v_t) in zip(source_variables, target_variables):
+            # Use in-place operation with `copy_` to modify `v_t` directly
+            v_t.data.copy_((1 - tau) * v_t.data + tau * v_s.data)
     return v_t
 
 
