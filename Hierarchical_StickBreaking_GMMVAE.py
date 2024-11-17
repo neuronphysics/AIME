@@ -6,13 +6,15 @@ from torch.distributions import Normal, Categorical, Independent, Gamma, Beta, M
 from torch.autograd import Variable
 from collections import OrderedDict
 from abc import ABCMeta, abstractmethod
+from typing import Optional, Tuple
 import os
-
+import torch.nn as nn
+import math
 try:
     import PIL.Image as Image
 except ImportError:
     import Image
-from utils_VAE import AverageMeter, ResidualBlock, LinearResidual, ResidualBlock_deconv, LayerNorm2d, CustomLinear
+from utils_VAE import ResidualBlock, LinearResidual, ResidualBlockDeconv, LayerNorm2d, CustomLinear
 from torch import nn, optim
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
@@ -22,14 +24,10 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 np.random.seed(42)
 
-local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-SMALL = torch.tensor(np.finfo(np.float32).eps, dtype=torch.float64, device=local_device)
-pi_ = torch.tensor(np.pi, dtype=torch.float64, device=local_device)
-log_norm_constant = -0.5 * torch.log(2 * pi_)
 
 
 def epsilon():
-    global SMALL
+    SMALL = torch.finfo(torch.float32).eps
     return SMALL
 
 
@@ -58,13 +56,13 @@ def calculate_channel_sizes(image_channels, max_filters, num_layers):
     return channel_sizes
 
 
-def init_mlp(layer_sizes, stdev=.01, bias_init=0.):
-    global local_device
+def init_mlp(layer_sizes, stdev=.01, bias_init=0., device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
+    
     params = {'w': [], 'b': []}
     for n_in, n_out in zip(layer_sizes[:-1], layer_sizes[1:]):
         params['w'].append(
-            torch.nn.init.normal_(torch.empty(n_in, n_out, device=local_device), std=stdev).requires_grad_(True))
-        params['b'].append(torch.empty(n_out, device=local_device).fill_(bias_init).requires_grad_(True))
+            torch.nn.init.normal_(torch.empty(n_in, n_out, device=device), std=stdev).requires_grad_(True))
+        params['b'].append(torch.empty(n_out, device=device).fill_(bias_init).requires_grad_(True))
     return params
 
 
@@ -241,7 +239,7 @@ class VAEEncoder(nn.Module):
         self.img_width = img_width
         self.enc_kernel = 4
         self.enc_stride = 2
-        self.enc_padding = 3
+        self.enc_padding = 1
         self.res_kernel = 3
         self.res_stride = 1
         self.res_padding = 1
@@ -291,6 +289,7 @@ class VAEEncoder(nn.Module):
                     self.res_kernel,
                     self.res_stride,
                     self.res_padding,
+                    norm_type,
                     nonlinearity=self.activation
                 ))
 
@@ -330,6 +329,7 @@ class VAEEncoder(nn.Module):
     def forward(self, X):
 
         # Encode
+        
         h = self.encoder(X)
         # Get latent variables
         self.hlayer = self.linear_layers(h)
@@ -368,7 +368,7 @@ class VAEDecoder(nn.Module):
         self.img_width = img_width
         self.dec_kernel = 4
         self.dec_stride = 2
-        self.dec_padding = 3
+        self.dec_padding = 1
         self.res_kernel = 3
         self.res_stride = 1
         self.res_padding = 1
@@ -421,6 +421,8 @@ class VAEDecoder(nn.Module):
                         kernel_size=self.dec_kernel,
                         stride=self.dec_stride,
                         padding=self.dec_padding,
+                        output_padding=1, 
+                        bias=False
                     )
                 )
             else:
@@ -449,11 +451,12 @@ class VAEDecoder(nn.Module):
             if (i == num_layers // 2):
                 # add a residual Layer
                 decoder_layers.append(
-                    ResidualBlock_deconv(
+                    ResidualBlockDeconv(
                         out_channels,
                         self.res_kernel,
                         self.res_stride,
                         self.res_padding,
+                        norm_type,
                         nonlinearity=self.activation
                     )
                 )
@@ -465,6 +468,8 @@ class VAEDecoder(nn.Module):
 
     def forward(self, x):
         return self.decoder(x)
+
+
 
 
 class VAECritic(nn.Module):
@@ -496,7 +501,7 @@ class VAECritic(nn.Module):
             layers.append(self.activation)
             if (i == (num_layers // 2 - 1)):
                 # add a residual block
-                LinearResidual(size // 2)
+                layers.append(LinearResidual(size // 2))
             size = size // 2
         layers.append(nn.Linear(size, size * 2, bias=False))
 
@@ -508,7 +513,7 @@ class VAECritic(nn.Module):
         # Activation Function
         layers.append(self.activation)
         # add anther residual block
-        LinearResidual(size * 2)
+        layers.append(LinearResidual(size * 2))
         layers.append(nn.Linear(size * 2, 1))
         self.model = nn.Sequential(*layers)
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -516,7 +521,6 @@ class VAECritic(nn.Module):
 
     def forward(self, x):
         return self.model(x)
-
 
 class LinearBN(nn.Module):
     def __init__(self, in_features, out_features, bias=False, activation=nn.LeakyReLU(0.1), norm_type='layer'):
@@ -594,7 +598,6 @@ class GMMVAE(nn.Module):
         self.encoder_gamma_a = init_mlp([hidden_dim, self.K - 1], 1e-8)  # Q(pi|x)
         self.encoder_gamma_b = init_mlp([hidden_dim, self.K - 1], 1e-8)  # Q(pi|x)
 
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.to(device=self.device)
 
     def GMM_decoder(self, z_input):
@@ -701,30 +704,29 @@ def gauss_cross_entropy(mu_post, sigma_post, mu_prior, sigma_prior):
     return temp.sum()
 
 
-def to_tensor(x, dType):
-    global local_device
+def to_tensor(x, dType, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
+    
     if isinstance(x, torch.Tensor):
-        return x.to(local_device).to(dType)
+        return x.to(device).to(dType)
     else:
-        return torch.tensor(x, dtype=torch.float64, device=local_device)
+        return torch.tensor(x, dtype=torch.float64, device=device)
 
 
 def beta_fn(a, b):
-    global local_device
     ta = to_tensor(a, torch.float64)
     tb = to_tensor(b, torch.float64)
 
     return torch.exp(torch.lgamma(ta + epsilon()) + torch.lgamma(tb + epsilon()) - torch.lgamma(ta + tb + epsilon()))
 
 
-def gradient_penalty(critic, real, fake, device):
+def gradient_penalty(critic, real, fake, device,  penalty=10.0):
     # wasserstein distance with gradient penalty model
     BATCH_SIZE = real.shape[0]
     # one epsilon value for each
     epsilon = torch.rand((BATCH_SIZE, 1)).to(device)
-    epsilon = epsilon.expand_as(real)
+    epsilon = epsilon.expand_as(real).contiguous()
     # Get random interpolation between real and fake samples
-    interpolated_images = real * epsilon + fake * (1 - epsilon)
+    interpolated_images = real.detach() * epsilon + fake.detach() * (1 - epsilon)
     # set it to require grad info
     interpolated_images = torch.autograd.Variable(interpolated_images, requires_grad=True).to(device)
     # calculate critic score
@@ -733,20 +735,21 @@ def gradient_penalty(critic, real, fake, device):
     gradient = torch.autograd.grad(
         inputs=interpolated_images,
         outputs=mixed_scores,
-        grad_outputs=torch.ones_like(mixed_scores),
+        grad_outputs=torch.ones_like(mixed_scores).to(device),
         create_graph=True,
         retain_graph=True,
+        only_inputs=True
     )[0]
     gradient = gradient.view(gradient.shape[0], -1)
     gradient_norm = gradient.norm(2, dim=1)
-    gradient_penalty = torch.mean(torch.pow(gradient_norm - 1, 2))
+    gradient_penalty = torch.mean(torch.pow(gradient_norm - 1, 2)) * penalty
     return gradient_penalty
 
 
-def compute_kumar2beta_kld(a, b, alpha, beta):
-    global local_device
+def compute_kumar2beta_kld(a, b, alpha, beta, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
+    
 
-    EULER_GAMMA = torch.tensor(0.5772156649015328606, dtype=torch.float, device=local_device)
+    EULER_GAMMA = torch.tensor(0.5772156649015328606, dtype=torch.float, device=device)
 
     upper_limit = 10000.0
 
@@ -777,45 +780,43 @@ def compute_kumar2beta_kld(a, b, alpha, beta):
     return torch.clamp(kl, min=0.)
 
 
-def log_normal_pdf(sample, mean, sigma):
-    global local_device
-    global SMALL
-    d = torch.sub(sample, mean).to(device=local_device)
-    d2 = torch.mul(-1, torch.mul(d, d)).to(device=local_device)
-    s2 = torch.mul(2, torch.mul(sigma, sigma)).to(device=local_device)
-    return torch.sum(torch.div(d2, s2 + SMALL) - torch.log(
-        torch.mul(sigma, torch.sqrt(2 * torch.tensor(pi_, dtype=torch.float, device=local_device))) + SMALL), dim=1)
+def log_normal_pdf(sample, mean, sigma, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
+    
+    
+    d = torch.sub(sample, mean).to(device=device)
+    d2 = torch.mul(-1, torch.mul(d, d)).to(device=device)
+    s2 = torch.mul(2, torch.mul(sigma, sigma)).to(device=device)
+    return torch.sum(torch.div(d2, s2 + epsilon()) - torch.log(
+        torch.mul(sigma, torch.sqrt(2 * torch.pi)) + epsilon()), dim=1)
 
 
 def log_beta_pdf(v, alpha, beta):
-    global SMALL
-    return torch.sum((alpha - 1) * torch.log(v + SMALL) + (beta - 1) * torch.log(1 - v + SMALL) - torch.log(
-        beta_fn(alpha, beta) + SMALL), dim=1, keepdim=True)
+    return torch.sum((alpha - 1) * torch.log(v + epsilon()) + (beta - 1) * torch.log(1 - v + epsilon()) - torch.log(
+        beta_fn(alpha, beta) + epsilon()), dim=1, keepdim=True)
 
 
 def log_kumar_pdf(v, a, b):
-    global SMALL
+    
     return torch.sum(
-        torch.mul(a - 1, torch.log(v + SMALL)) + torch.mul(b - 1, torch.log(1 - torch.pow(v, a) + SMALL)) + torch.log(
-            a + SMALL) + torch.log(b + SMALL), dim=1, keepdim=True)
+        torch.mul(a - 1, torch.log(v + epsilon())) + torch.mul(b - 1, torch.log(1 - torch.pow(v, a) + epsilon())) + torch.log(a + epsilon()) + torch.log(b + epsilon()), dim=1, keepdim=True)
 
 
 def mcMixtureEntropy(pi_samples, z, mu, sigma, K):
-    global SMALL
+    
     s = torch.mul(pi_samples[0], torch.exp(log_normal_pdf(z[0], mu[0], sigma[0])))
     for k in range(K - 1):
         s = s + torch.mul(pi_samples[k + 1], torch.exp(log_normal_pdf(z[k + 1], mu[k + 1], sigma[k + 1])))
-    return -torch.log(s + SMALL)
+    return -torch.log(s + epsilon())
 
 
-def gumbel_softmax_sample(logits, temperature, eps=1e-20):
-    global local_device
+def gumbel_softmax_sample(logits, temperature, eps=1e-20, device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
+    
     # Sample from Gumbel
-    U = torch.rand(logits.shape).to(device=local_device)
+    U = torch.rand(logits.shape).to(device=device)
     g = -Variable(torch.log(-torch.log(U + eps) + eps))
     # Gumbel-Softmax sample
     y = logits + g
-    return nn.Softmax(dim=-1)(y / temperature).to(device=local_device)
+    return nn.Softmax(dim=-1)(y / temperature).to(device=device)
 
 
 def gumbel_softmax(logits, temperature, latent_dim, categorical_dim):
@@ -855,10 +856,9 @@ class ElboReturn:
 class InfGaussMMVAE(GMMVAE, BetaSample):
     # based on this implementation :https://github.com/enalisnick/mixture_density_VAEs
     def __init__(self, hyperParams, K, nchannel, z_dim, w_dim, hidden_dim, device, img_width, batch_size, num_layers=4,
-                 include_elbo2=True, use_mse_loss=False):
+                 include_elbo2=True, use_mse_loss=True):
         self.prior_nu = None
-        global local_device
-        local_device = device
+    
         super(InfGaussMMVAE, self).__init__(K, nchannel, z_dim, w_dim, hidden_dim, device, img_width, batch_size,
                                             max_filters=512, num_layers=num_layers, small_conv=False,
                                             use_mse_loss=use_mse_loss)
@@ -902,13 +902,13 @@ class InfGaussMMVAE(GMMVAE, BetaSample):
         """
         #KL divergence P(c|z,w)=Q(c|x) while P(c|pi) is the prior
         """
-        global SMALL
+        
         a_inv = torch.pow(self.kumar_a, -1)
         b_inv = torch.pow(self.kumar_b, -1)
         # compose into stick segments using pi = v \prod (1-v)
         v_means = torch.mul(self.kumar_b, beta_fn(1. + a_inv, self.kumar_b)).to(device=self.device)
         # u       = (r1 - r2) * torch.rand(a_inv.shape[0],self.K-1) + r2
-        u = torch.distributions.uniform.Uniform(low=SMALL, high=1 - SMALL).sample([1]).squeeze()
+        u = torch.distributions.uniform.Uniform(low=epsilon(), high=1 - epsilon()).sample([1]).squeeze()
         v_samples = torch.pow(1 - torch.pow(u, b_inv), a_inv).to(device=self.device)
         if v_samples.ndim > 2:
             v_samples = v_samples.squeeze()
@@ -956,8 +956,17 @@ class InfGaussMMVAE(GMMVAE, BetaSample):
         qc = qc.expand(-1, self.K, 1)
         qc = qc.permute(1, 0, 2)
         return torch.sum(torch.bmm(KLD_table, qc)).to(device=self.device)
-
+    
+    def configure_optimizers(self) -> None:
+        """Configure optimizers with learning rate scheduling"""
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
+        
+    
     def get_ELBO(self, X):
+        
         z_posterior, z_posterior_mean, z_posterior_sigma, c_posterior, w_posterior_mean, w_posterior_sigma, dist, \
         z_prior_mean, z_prior_logvar, x_reconst = self.forward(X)
 
@@ -992,7 +1001,7 @@ class InfGaussMMVAE(GMMVAE, BetaSample):
             criterion = nn.MSELoss(reduction='sum')
         else:
             criterion = nn.BCELoss(reduction='sum')
-
+        
         elbo5 = criterion(x_reconst.reshape(-1, self.nchannel * self.img_size * self.img_size),
                           X.reshape(-1, self.nchannel * self.img_size * self.img_size))
 

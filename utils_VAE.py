@@ -11,6 +11,7 @@ import plotly
 from plotly.graph_objs import Scatter
 from plotly.graph_objs.scatter import Line
 from einops import rearrange
+from typing import Optional, Union
 
 
 def write_video(frames, title, path=''):
@@ -24,24 +25,6 @@ def write_video(frames, title, path=''):
 
     pass
 
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
 
 
 def scale_to_unit_interval(ndar, eps=1e-8):
@@ -233,82 +216,119 @@ class LayerNorm2d(nn.LayerNorm):
         return x
 
 
-class ResidualBlock(nn.Module):
 
-    def __init__(self, in_channels, kernel_size, stride, padding, norm_type='layer', num_groups=1, nonlinearity=None):
+class ResidualBlock(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 kernel_size: int,
+                 stride: int,
+                 padding: int,
+                 norm_type: str = 'layer',
+                 num_groups: int = 1,
+                 nonlinearity: Optional[nn.Module] = None) -> None:
         """
-            1. in_channels is the number of input channels to the first conv layer,
-            2. out_channels is the number of output channels of the first conv layer
-                and the number of input channels to the second conv layer
+        Initializes a ResidualBlock module.
+
+        Args:
+            in_channels (int): Number of input channels.
+            kernel_size (int): Size of the convolutional kernel.
+            stride (int): Stride of the convolution.
+            padding (int): Padding added to all four sides of the input.
+            norm_type (str, optional): Type of normalization ('batch' or 'layer'). Defaults to 'layer'.
+            num_groups (int, optional): Number of groups for GroupNorm. Defaults to 1.
+            nonlinearity (Optional[nn.Module], optional): Non-linear activation function. Defaults to LeakyReLU(0.2).
         """
         super(ResidualBlock, self).__init__()
         nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
-        layers = []
-        layers.append(
-            nn.Conv2d(
-                in_channels,
-                in_channels,
-                kernel_size,
-                stride,
-                padding,
-                bias=False)
-
-        )
-        if norm_type == 'batch':
-            layers.append(nn.BatchNorm2d(in_channels))
-        elif norm_type == 'layer':
-            layers.append(nn.GroupNorm(num_groups, in_channels))
-
-        layers.append(nl)
-        layers.append(
-            nn.Conv2d(
-                in_channels,
-                in_channels,
-                kernel_size,
-                stride,
-                padding,
-                bias=False)
-
-        )
-        if norm_type == 'batch':
-            layers.append(nn.BatchNorm2d(in_channels))
-        elif norm_type == 'layer':
-            layers.append(nn.GroupNorm(num_groups, in_channels))
-
-        layers.append(nl)
+        layers = [
+            nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding, bias=False),
+            self._get_normalization_layer(norm_type, in_channels, num_groups),
+            nl,
+            nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding, bias=False),
+            self._get_normalization_layer(norm_type, in_channels, num_groups),
+            nl
+        ]
         self.layers = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def _get_normalization_layer(self, norm_type: str, num_features: int, num_groups: int) -> nn.Module:
+        if norm_type == 'batch':
+            return nn.BatchNorm2d(num_features)
+        elif norm_type == 'layer':
+            return nn.GroupNorm(num_groups, num_features)
+        else:
+            raise ValueError(f"Unsupported normalization type: {norm_type}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the residual block.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (N, C, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor of the same shape as input.
+        """
         out = self.layers(x)
-        out = out + x
-        # each residual block doesn't wrap (res_x + x) with an activation function
-        # as the next block implement ReLU as the first layer
+        out += x
         return out
 
 
-class ResidualBlock_deconv(nn.Module):
-    def __init__(self, channel, kernel_size, stride, padding, norm_type="layer", num_groups=1, nonlinearity=None):
-        super(ResidualBlock_deconv, self).__init__()
+
+class ResidualBlockDeconv(nn.Module):
+    def __init__(self, 
+                 channel: int, 
+                 kernel_size: int, 
+                 stride: int, 
+                 padding: int, 
+                 norm_type: str = "layer", 
+                 num_groups: int = 1, 
+                 nonlinearity: Optional[nn.Module] = None) -> None:
+        """
+        Initializes a ResidualBlockDeconv module.
+
+        Args:
+            channel (int): Number of input/output channels.
+            kernel_size (int): Size of the convolutional kernel.
+            stride (int): Stride of the convolution.
+            padding (int): Padding added to all four sides of the input.
+            norm_type (str, optional): Type of normalization ('batch' or 'layer'). Defaults to 'layer'.
+            num_groups (int, optional): Number of groups for GroupNorm. Defaults to 1.
+            nonlinearity (Optional[nn.Module], optional): Non-linear activation function. Defaults to LeakyReLU(0.2).
+        """
+        super(ResidualBlockDeconv, self).__init__()
         nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
-        self.conv1 = nn.ConvTranspose2d(channel, channel, kernel_size, stride, padding)
-        if norm_type == "batch":
-            self.norm1 = nn.BatchNorm2d(channel)
-        elif norm_type == "layer":
-            self.norm1 = nn.GroupNorm(num_groups, channel)
-        self.relu = nl
-        self.conv2 = nn.ConvTranspose2d(channel, channel, kernel_size, stride, padding)
-        if norm_type == "batch":
-            self.norm2 = nn.BatchNorm2d(channel)
-        elif norm_type == "layer":
-            self.norm2 = nn.GroupNorm(num_groups, channel)
 
-    def forward(self, x):
+        # Define the layers within a sequential block for clarity
+        self.layers = nn.Sequential(
+            nn.ConvTranspose2d(channel, channel, kernel_size, stride, padding),
+            self._get_normalization_layer(norm_type, channel, num_groups),
+            nl,
+            nn.ConvTranspose2d(channel, channel, kernel_size, stride, padding),
+            self._get_normalization_layer(norm_type, channel, num_groups),
+            nl
+        )
+
+    def _get_normalization_layer(self, norm_type: str, num_features: int, num_groups: int) -> nn.Module:
+        if norm_type == "batch":
+            return nn.BatchNorm2d(num_features)
+        elif norm_type == "layer":
+            return nn.GroupNorm(num_groups, num_features)
+        else:
+            raise ValueError(f"Unsupported normalization type: {norm_type}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the residual block.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (N, C, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor of the same shape as input.
+        """
         res = x
-        out = self.relu(self.norm1(self.conv1(x)))
-        out = self.relu(self.norm2(self.conv2(out)))
-        out = out + res
-        return out
-
+        out = self.layers(x)
+        return out + res
 
 class LinearResidual(nn.Module):
     def __init__(self, input_feature, nonlinearity=None, norm_type='layer'):
