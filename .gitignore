@@ -3,3 +3,13 @@ __pycache__
 sbatch_scripts
 results*
 result*
+logs/
+run/
+model/
+*.egg-info/
+build/
+__pycache__/
+*.so
+.vscode/
+.env
+*.pth
