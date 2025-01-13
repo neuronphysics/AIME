@@ -162,7 +162,7 @@ class AdaptiveStickBreaking(nn.Module):
     """
     Implements adaptive stick-breaking construction for Dirichlet Process
     """
-    def __init__(self, max_components: int, hidden_dim: int, device: torch.device, dkl_taylor_order:int=10):
+    def __init__(self, max_components: int, hidden_dim: int, device: torch.device,  prior_alpha: float = 1.0, prior_beta: float = 1.0, dkl_taylor_order:int=10):
         super().__init__()
         self._max_K = max_components
         self.hidden_dim = hidden_dim
@@ -176,8 +176,8 @@ class AdaptiveStickBreaking(nn.Module):
                                             )
         # Gamma hyperprior parameters (can be learned or fixed)
         # Named gamma hyperprior parameters
-        self.gamma_a = nn.Parameter(torch.tensor(1.0, device=self.device), requires_grad=True)
-        self.gamma_b = nn.Parameter(torch.tensor(1.0, device=self.device), requires_grad=True)
+        self.gamma_a = nn.Parameter(torch.tensor(prior_alpha, device=self.device), requires_grad=True)
+        self.gamma_b = nn.Parameter(torch.tensor(prior_beta, device=self.device), requires_grad=True)
 
         # Register parameter names
         self.register_parameter('gamma_prior_a', self.gamma_a)
@@ -401,7 +401,9 @@ class DPGMMPrior(nn.Module):
         max_components: int,
         latent_dim: int,
         hidden_dim: int,
-        device: torch.device
+        device: torch.device,
+        prior_alpha: float = 1.0,  # Add these parameters
+        prior_beta: float = 1.0
     ):
         super().__init__()
         self.max_K = max_components
@@ -410,7 +412,7 @@ class DPGMMPrior(nn.Module):
         self.device = device
 
         # Stick-breaking process
-        self.stick_breaking = AdaptiveStickBreaking(max_components, hidden_dim, device)
+        self.stick_breaking = AdaptiveStickBreaking(max_components, hidden_dim, device, prior_alpha=prior_alpha, prior_beta=prior_beta)
 
         # Component parameters generators
         self.component_nn = nn.Sequential(
@@ -645,7 +647,9 @@ class DPGMMVariationalAutoencoder(nn.Module):
         device: torch.device,
         use_actnorm: bool= False,
         learning_rate: float = 1e-5,
-        grad_clip:float =1.0
+        grad_clip:float =1.0,
+        prior_alpha: float = 1.0,  # Add these parameters
+        prior_beta: float = 1.0
     ):
         super().__init__()
         self.max_K = max_components
@@ -670,7 +674,7 @@ class DPGMMVariationalAutoencoder(nn.Module):
         ).to(device)
 
         # DP-GMM prior
-        self.prior = DPGMMPrior(max_components, latent_dim, hidden_dim, device)
+        self.prior = DPGMMPrior(max_components, latent_dim, hidden_dim, device, prior_alpha=prior_alpha,prior_beta=prior_beta)
 
         # Decoder network (can reuse your existing decoder architecture)
         self.decoder = VAEDecoder(

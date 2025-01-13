@@ -613,7 +613,9 @@ class WorldModel(nn.Module):
                                                                    device=device,
                                                                    use_actnorm=self._params.use_actnorm,
                                                                    learning_rate=self._params.lr,
-                                                                   grad_clip=self._params.grad_clip)
+                                                                   grad_clip=self._params.grad_clip,
+                                                                   prior_alpha=self._params.prior_alpha,
+                                                                   prior_beta=self._params.prior_beta)
         self.encoder = self.variational_autoencoder.encoder
         self.decoder = self.variational_autoencoder.decoder
         self.image_discriminator = self.variational_autoencoder.image_discriminator
@@ -687,8 +689,8 @@ class WorldModel(nn.Module):
                                            self._params.image_width)).to(self.device)
             next_obs = torch.reshape(batch.s2, (-1, self._params.n_channel, self._params.image_width,
                                                 self._params.image_width)).to(self.device)
-            _, _, _, z_real, _, _, _ = self.encoder(obs)
-            _, _, _, z_next, _, _, _ = self.encoder(next_obs)
+            z_real, _, _ = self.encoder(obs)
+            z_next, _, _ = self.encoder(next_obs)
             inputs, outputs = append_action_and_latent_obs(z_real, batch.a1.to(self.device), z_next,
                                                            self.sequence_len)
             if i == 0:

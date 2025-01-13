@@ -37,16 +37,15 @@ Overall, this script aims to provide a comprehensive framework for dream to expl
 """
 
 HYPER_PARAMETERS = {
-                    "input_d": 1,
                     "prior_alpha": 7.,  # gamma_alpha
                     "prior_beta": 1.,  # gamma_beta
                     "image_width": 100,
 
-                    "hidden_transit": 100,
+                    "hidden_transit": 60,
                     "GAMMA": 0.99,
                     "PREDICT_DONE": False,
                     "seed": 1234,
-                    "number_of_mixtures": 8,
+                    "number_of_mixtures": 15,
                     "weight_decay": 1e-5,
                     "n_channel": 3,
                     "VRNN_Optimizer_Type": "MADGRAD",
@@ -56,8 +55,8 @@ HYPER_PARAMETERS = {
                     "eval_noise": 0.0,
                     "replay_buffer_size": int(1e4),
 
-                    'max_components': 38,
-                    'latent_dim': 40,
+                    'max_components': 20,
+                    'latent_dim': 45,
                     'hidden_dim': 35,
                     'batch_size': 25,
                     'lr': 1e-4,
@@ -244,8 +243,8 @@ class D2EAlgorithm(nn.Module):
                                           self.parameter.image_width)).to(self.device)
             next_obs = torch.reshape(tran.s2, (-1, self.parameter.n_channel, self.parameter.image_width,
                                                self.parameter.image_width)).to(self.device)
-            _, _, _, z_real, _, _, _ = self.wm.encoder(obs)
-            _, _, _, z_next, _, _, _ = self.wm.encoder(next_obs)
+            z_real, _, _= self.wm.encoder(obs)
+            z_next, _, _= self.wm.encoder(next_obs)
             tran.s1 = z_real.reshape(process_batch, -1, self.parameter.latent_dim).detach().cpu()
             tran.s2 = z_next.reshape(process_batch, -1, self.parameter.latent_dim).detach().cpu()
             self.task_behavior_reply_buffer.add_transitions_batch(tran)
@@ -393,7 +392,7 @@ def main(config):
     act_space = train_envs[0]._env._action_spec
     obs_space = train_envs[0]._env._observation_spec
     latent_space = tensor_spec_from_gym_space(
-        spaces.Box(low=0, high=1, shape=(HYPER_PARAMETERS['latent_d'],), dtype=np.float32))
+        spaces.Box(low=0, high=1, shape=(HYPER_PARAMETERS['latent_dim'],), dtype=np.float32))
 
     # set up train and eval drivers
     train_driver = Driver(train_envs)
