@@ -3,6 +3,8 @@ from WorldModel_D2E_Structures import *
 from planner_D2E_regularizer_n_step import *
 from gym import spaces
 from alf_gym_wrapper import tensor_spec_from_gym_space
+import os
+os.environ['MUJOCO_GL'] = 'egl'  # or ‘osmesa’ for software rendering
 
 sys.path.append(os.path.join(os.getcwd(), 'VRNN'))
 
@@ -34,19 +36,13 @@ Overall, this script aims to provide a comprehensive framework for dream to expl
 
 """
 
-HYPER_PARAMETERS = {"batch_size": 240,
+HYPER_PARAMETERS = {
                     "input_d": 1,
                     "prior_alpha": 7.,  # gamma_alpha
                     "prior_beta": 1.,  # gamma_beta
-                    "K": 25,
                     "image_width": 100,
-                    "hidden_d": 300,
-                    "latent_d": 100,
-                    "latent_w": 200,
+
                     "hidden_transit": 100,
-                    "LAMBDA_GP": 10,  # hyperparameter for WAE with gradient penalty
-                    "LEARNING_RATE": 2e-4,
-                    "CRITIC_ITERATIONS": 5,
                     "GAMMA": 0.99,
                     "PREDICT_DONE": False,
                     "seed": 1234,
@@ -59,6 +55,21 @@ HYPER_PARAMETERS = {"batch_size": 240,
                     "expl_noise": 0.0,
                     "eval_noise": 0.0,
                     "replay_buffer_size": int(1e4),
+
+                    'max_components': 38,
+                    'latent_dim': 40,
+                    'hidden_dim': 35,
+                    'batch_size': 25,
+                    'lr': 1e-4,
+                    'beta': 1.0,
+                    'lambda_img': 1.0,
+                    'lambda_latent': 3.0,
+                    'n_critic': 3,
+                    'grad_clip': 0.5,
+                    'img_disc_channels': 16,
+                    'img_disc_layers': 5,
+                    'latent_disc_layers': 3,
+                    'use_actnorm': True
                     }
 
 
@@ -235,8 +246,8 @@ class D2EAlgorithm(nn.Module):
                                                self.parameter.image_width)).to(self.device)
             _, _, _, z_real, _, _, _ = self.wm.encoder(obs)
             _, _, _, z_next, _, _, _ = self.wm.encoder(next_obs)
-            tran.s1 = z_real.reshape(process_batch, -1, self.parameter.latent_d).detach().cpu()
-            tran.s2 = z_next.reshape(process_batch, -1, self.parameter.latent_d).detach().cpu()
+            tran.s1 = z_real.reshape(process_batch, -1, self.parameter.latent_dim).detach().cpu()
+            tran.s2 = z_next.reshape(process_batch, -1, self.parameter.latent_dim).detach().cpu()
             self.task_behavior_reply_buffer.add_transitions_batch(tran)
 
     def save(self):
