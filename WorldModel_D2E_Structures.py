@@ -1,4 +1,5 @@
 from WorldModel_D2E_Utils import *
+from dpgmm_stickbreaking_prior_vae import DPGMMVariationalAutoencoder
 
 Transition = collections.namedtuple(
     'Transition', 's1, s2, a1, a2, discount, reward, done')
@@ -249,7 +250,6 @@ class Driver:
                 )
                 [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
                 self._eps[i] = [tran]
-
 
             obs = build_dict_from_named_tuple(self._obs)
 
@@ -558,11 +558,11 @@ class WorldModel(nn.Module):
         )
 
         self._env = env
-        self.n_discriminator_iter = self._params.CRITIC_ITERATIONS
+        self.n_discriminator_iter = self._params.n_critic
         self._use_amp = False
 
         # set the sizes
-        self.state_dim = self._params.latent_d
+        self.state_dim = self._params.latent_dim
         self.action_dim = env.action_spec().shape[0]
 
         i = 0
@@ -603,21 +603,21 @@ class WorldModel(nn.Module):
         self.transition_model = modelstate.model
         # getting sensory information and building latent state
 
-        self.variational_autoencoder = InfGaussMMVAE(hyperParams,
-                                                     K=self._params.K,
-                                                     nchannel=self._params.n_channel,
-                                                     z_dim=self.state_dim,
-                                                     w_dim=self._params.latent_w,
-                                                     hidden_dim=self._params.hidden_d,
-                                                     device=self.device,
-                                                     img_width=self._params.image_width,
-                                                     batch_size=self._params.batch_size,
-                                                     num_layers=4,
-                                                     include_elbo2=True,
-                                                     use_mse_loss=True)
-        self.encoder = self.variational_autoencoder.GMM_encoder
-        self.decoder = self.variational_autoencoder.GMM_decoder
-        self.discriminator = VAECritic(self.state_dim)
+        self.variational_autoencoder = DPGMMVariationalAutoencoder(max_components=self._params.max_components,
+                                                                   input_dim=self._params.image_width,
+                                                                   latent_dim=self._params.latent_dim,
+                                                                   hidden_dim=self._params.hidden_dim,
+                                                                   img_disc_channels=self._params.img_disc_channels,
+                                                                   img_disc_layers=self._params.img_disc_layers,
+                                                                   latent_disc_layers=self._params.latent_disc_layers,
+                                                                   device=device,
+                                                                   use_actnorm=self._params.use_actnorm,
+                                                                   learning_rate=self._params.lr,
+                                                                   grad_clip=self._params.grad_clip)
+        self.encoder = self.variational_autoencoder.encoder
+        self.decoder = self.variational_autoencoder.decoder
+        self.image_discriminator = self.variational_autoencoder.image_discriminator
+        self.latent_discriminator = self.variational_autoencoder.latent_discriminator
 
         self.grad_heads = ["reward", "discount", "done"]
         self.loss_scales = {"reward": 1.0, "discount": 1.0, "done": 1.0}
@@ -629,7 +629,6 @@ class WorldModel(nn.Module):
             self.heads["reward"].parameters(),
             self.heads["discount"].parameters(),
             self.heads["done"].parameters(),
-            self.variational_autoencoder.get_trainable_parameters()
         )
 
         if restore:
@@ -643,17 +642,10 @@ class WorldModel(nn.Module):
     def initialize_optimizer(self):
         self.optimizer = Optimizer("world_model",
                                    self.parameters,
-                                   lr=self._params.LEARNING_RATE,
+                                   lr=self._params.lr,
                                    wd=self._params.weight_decay,
                                    opt="adamw",
                                    use_amp=self._use_amp)
-
-        self.discriminator_optim = Optimizer("discriminator_model",
-                                             self.discriminator.parameters(),
-                                             lr=0.5 * self._params.LEARNING_RATE,
-                                             opt="adam",
-                                             wd=1e-5,
-                                             use_amp=self._use_amp)
 
     def preprocess(self, observation, reward, done):
         if isinstance(observation, np.ndarray):
@@ -683,25 +675,6 @@ class WorldModel(nn.Module):
 
         data["done"] = done
         return data
-
-    def train_discriminator_get_latent(self, obs):
-        z_real, z_fake = None, None
-        for _ in range(self.n_discriminator_iter):
-            z_real, z_x_mean, z_x_sigma, c_posterior, w_x_mean, w_x_sigma, gmm_dist, z_wc_mean_prior, \
-            z_wc_logvar_prior, x_reconstructed = self.variational_autoencoder(obs)
-            z_fake = gmm_dist.sample()
-
-            critic_real = self.discriminator(z_real).reshape(-1)
-            critic_fake = self.discriminator(z_fake).reshape(-1)
-            gp = gradient_penalty(self.discriminator, z_real, z_fake, device=self.device)
-            loss_critic = (-(torch.mean(critic_real) - torch.mean(critic_fake)) + self._params.LAMBDA_GP * gp)
-            self.discriminator_optim.zero_grad_()
-            loss_critic.backward(retain_graph=True)
-            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self._params.MAX_GRAD_NORM, norm_type=2)
-            self.discriminator_optim.step_()
-
-        gen_fake = self.discriminator(z_fake).reshape(-1)
-        return z_real, gen_fake
 
     def init_normalizer(self, full_train_set):
         batch_size = 32
@@ -737,11 +710,14 @@ class WorldModel(nn.Module):
         next_obs = torch.reshape(data.s2, (-1, self._params.n_channel, self._params.image_width,
                                            self._params.image_width)).to(self.device)
 
-        z_real, gen_fake = self.train_discriminator_get_latent(obs)
+        losses, metrics, z_real = self.variational_autoencoder.training_step(obs, self._params.beta,
+                                                                             self._params.n_critic,
+                                                                             self._params.lambda_img,
+                                                                             self._params.lambda_latent)
 
         self.transition_model.train()
         self.optimizer.zero_grad()
-        w_x, w_x_mean, w_x_sigma, z_next, z_next_mean, z_next_sigma, c_posterior = self.encoder(next_obs)
+        z_next, z_next_mean, z_next_logvar = self.encoder(next_obs)
 
         # Prepare & normalize the input/output data for the transition model
         inputs, outputs = append_action_and_latent_obs(z_real, data.a1.to(self.device), z_next, self.sequence_len)
@@ -765,11 +741,6 @@ class WorldModel(nn.Module):
                 likes[key] = like
                 losses[key] = -like.mean()
         model_loss = sum(self.loss_scales.get(k, 1.0) * v for k, v in losses.items())
-
-        elbo_return = self.variational_autoencoder.get_ELBO(obs)
-        metrics = elbo_return.loss_dict
-        metrics["wasserstein_gp_loss"] = -torch.mean(gen_fake)
-        metrics["total_observe_loss"] = metrics["loss"] + metrics["wasserstein_gp_loss"]
 
         # reward and discount losses
         for k, v in losses.items():

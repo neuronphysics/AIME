@@ -22,7 +22,6 @@ from torch.distributions import Distribution, constraints
 from torch.distributions.utils import broadcast_all
 import torch.utils.data.distributed
 from torch.utils.tensorboard import SummaryWriter
-from Hierarchical_StickBreaking_GMMVAE import InfGaussMMVAE, VAECritic, gradient_penalty
 from VRNN.main import ModelState
 from VRNN.Normalization import compute_normalizer
 import argparse
