@@ -829,8 +829,8 @@ class WorldModel(nn.Module):
         truth = (observation[:6] + 0.5).to(self.device)
         inputs = observation[:5]
         actions = action[:5].to(self.device)
-        embed, embed_mean, embed_sigma, _, _, _, _, _, _, recon = self.variational_autoencoder(inputs.to(self.device))
-
+        recon, params  = self.variational_autoencoder(inputs.to(self.device))
+        embed = params["z"]
         next_state, sample_mu, sample_sigma, state = self.transition_model.generate(torch.cat([embed, actions],
                                                                                               dim=1)[-1, :].unsqueeze(
             -1).unsqueeze(0))
