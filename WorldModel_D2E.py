@@ -41,11 +41,11 @@ HYPER_PARAMETERS = {
                     "prior_beta": 1.,  # gamma_beta
                     "image_width": 100,
 
-                    "hidden_transit": 60,
+                    "hidden_transit": 10,
                     "GAMMA": 0.99,
                     "PREDICT_DONE": False,
                     "seed": 1234,
-                    "number_of_mixtures": 15,
+                    "number_of_mixtures": 3,
                     "weight_decay": 1e-5,
                     "n_channel": 3,
                     "VRNN_Optimizer_Type": "MADGRAD",
@@ -55,10 +55,10 @@ HYPER_PARAMETERS = {
                     "eval_noise": 0.0,
                     "replay_buffer_size": int(1e4),
 
-                    'max_components': 20,
-                    'latent_dim': 45,
-                    'hidden_dim': 35,
-                    'batch_size': 25,
+                    'max_components': 2,
+                    'latent_dim': 10,
+                    'hidden_dim': 10,
+                    'batch_size': 1,
                     'lr': 1e-4,
                     'beta': 1.0,
                     'lambda_img': 1.0,
@@ -261,7 +261,7 @@ class D2EAlgorithm(nn.Module):
         obs = self.wm.preprocess(observation, reward, done)
         self.tfstep.copy_(torch.tensor([int(self.step)])[0])
 
-        _, _, _, z_x, _, _, _ = self.wm.encoder(obs["observation"].to(self.device))
+        z_x, _, _= self.wm.encoder(obs["observation"].to(self.device))
 
         start = {"feat": z_x}
         seq = self.wm.imagine(self.task_behavior, start, self.imag_horizon, torch.from_numpy(done))
