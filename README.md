@@ -39,3 +39,37 @@ After installing PyTorch, install the remaining dependencies using the `requirem
 7. https://github.com/Olloxan/Pytorch-A2C
 8. https://github.com/higgsfield/Imagination-Augmented-Agents
 9. https://github.com/pranz24/pytorch-soft-actor-critic
+
+
+# MILA cluster setup
+Bash setup script:
+```sh
+module load anaconda/3
+module load mujoco/2.0
+module load mujoco-py/2.0
+
+export MUJOCO_PATH=$HOME/.mujoco/mujoco210
+export MUJOCO_PY_MUJOCO_PATH=$MUJOCO_PATH
+export MJLIB_PATH=$MUJOCO_PATH/lib/libmujoco.so
+export MUJOCO_GL="egl"
+
+export LD_LIBRARY_PATH=$HOME/.mujoco/mujoco210/bin:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
+export DISPLAY=:0
+export CPATH=$CONDA_PREFIX/include
+```
+
+Follow this: https://github.com/openai/mujoco-py?tab=readme-ov-file#install-mujoco
+
+Make sure `fairseq` is NOT in requirements.txt.
+
+```sh
+conda create --name AIME python=3.10
+conda activate AIME
+pip install -r requirements.txt
+conda install -c conda-forge 'libstdcxx-ng>=13.2.0' 'libgcc-ng>=13.2.0'
+pip install "cython<3"
+conda install -c conda-forge glew
+conda install -c conda-forge mesalib
+conda install -c menpo glfw3
+```
