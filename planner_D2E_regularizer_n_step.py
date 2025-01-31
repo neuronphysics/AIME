@@ -303,6 +303,7 @@ class ValueNetwork(nn.Module):
                 self._layers.append(nn.Linear(latent_spec.shape[0], hidden_size))
             else:
                 self._layers.append(nn.Linear(hidden_size, hidden_size))
+            self._layers.append(nn.LayerNorm(hidden_size))
             self._layers.append(nn.ReLU())
         output_layer = nn.Linear(hidden_size, 1)
         self._layers.append(output_layer)
@@ -1143,8 +1144,21 @@ class D2EAgent(Agent):
 
         v_target = q1_pred_ensemble - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (
                 div_estimate + disc_estimate_loss)
-        # v_loss= self.vf_criterion(v_pred, v_target.detach())
-        v_loss = WeightedLoss(v_pred - v_target.detach())
+        
+        def compute_expectile_loss(diff, expectile=0.8):
+             """Compute expectile loss with asymmetric weights
+                IQN: Implicit Quantile Networks for Distributional Learning" (Dabney et al., 2018)
+                    
+             """
+             weight = torch.where(diff > 0, 
+                           torch.tensor(expectile, device=self.device),
+                           torch.tensor(1-expectile, device=self.device))
+             return (weight * (diff ** 2)).mean()
+    
+        # Calculate value loss using expectile regression
+        value_diff = v_pred - v_target.detach()
+        v_loss = compute_expectile_loss(value_diff)
+
         v_w_norm = self._get_v_weight_norm()
         v_norm_loss = self._weight_decays[3] * v_w_norm
         # get weights of f-gan

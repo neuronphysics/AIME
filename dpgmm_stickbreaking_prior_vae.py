@@ -1072,15 +1072,25 @@ class DPGMMVariationalAutoencoder(nn.Module):
         """
         Compute adversarial losses for both image and latent space
         """
-        # Image space adversarial loss
-        fake_img_score = self.image_discriminator(reconstruction)
+        # Get features and scores for real/fake images
+        real_features = self.image_discriminator(x, get_features=True)
+        fake_features = self.image_discriminator(reconstruction, get_features=True) 
+    
+        # Regular adversarial loss
+        fake_img_score = fake_features[-1] # Last feature is discriminator output
         img_adv_loss = -torch.mean(fake_img_score)
-
-        # Latent space adversarial loss
+    
+        # Feature matching loss
+        feat_match_loss = compute_feature_matching_loss(
+        real_features,
+        fake_features
+        )
+    
+        # Latent space adversarial loss stays the same
         fake_latent_score = self.latent_discriminator(z)
         latent_adv_loss = -torch.mean(fake_latent_score)
 
-        return img_adv_loss, latent_adv_loss
+        return img_adv_loss, latent_adv_loss, feat_match_loss
 
     def generator_step(
         self,
@@ -1102,7 +1112,7 @@ class DPGMMVariationalAutoencoder(nn.Module):
         vae_losses = self.compute_loss(x, reconstruction, params, beta)
 
         # Compute adversarial losses
-        img_adv_loss, latent_adv_loss = self.compute_adversarial_losses(
+        img_adv_loss, latent_adv_loss, feature_match_loss = self.compute_adversarial_losses(
             x, reconstruction, params['z'], prior_z
         )
         # Ensure all loss components are scalars
@@ -1114,7 +1124,8 @@ class DPGMMVariationalAutoencoder(nn.Module):
         total_loss = (
             vae_losses['loss'] +  # Original ELBO and DPGMM terms
             lambda_img * img_adv_loss +  # Image adversarial loss
-            lambda_latent * latent_adv_loss  # Latent adversarial loss
+            lambda_latent * latent_adv_loss + # Latent adversarial loss
+            feature_match_loss  # Feature matching loss
         )
 
         # Optimize generator

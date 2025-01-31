@@ -39,7 +39,6 @@ Overall, this script aims to provide a comprehensive framework for dream to expl
 HYPER_PARAMETERS = {
                     "prior_alpha": 7.,  # gamma_alpha
                     "prior_beta": 1.,  # gamma_beta
-                    "image_width": 100,
 
                     "hidden_transit": 10,
                     "GAMMA": 0.99,
@@ -114,6 +113,10 @@ class D2EAlgorithm(nn.Module):
         self.obs_space = obs_space
         self.act_space = act_space
         self.latent_space = latent_space
+
+        # Update hyperParams with image size from config
+        hyperParams['image_width'] = config.image_width
+        hyperParams['image_height'] = config.image_height
 
         self.step = step
         self.device = device
@@ -243,8 +246,8 @@ class D2EAlgorithm(nn.Module):
                                           self.parameter.image_width)).to(self.device)
             next_obs = torch.reshape(tran.s2, (-1, self.parameter.n_channel, self.parameter.image_width,
                                                self.parameter.image_width)).to(self.device)
-            z_real, _, _= self.wm.encoder(obs)
-            z_next, _, _= self.wm.encoder(next_obs)
+            z_real, _, _ = self.wm.encoder(obs)
+            z_next, _, _ = self.wm.encoder(next_obs)
             tran.s1 = z_real.reshape(process_batch, -1, self.parameter.latent_dim).detach().cpu()
             tran.s2 = z_next.reshape(process_batch, -1, self.parameter.latent_dim).detach().cpu()
             self.task_behavior_reply_buffer.add_transitions_batch(tran)
@@ -316,15 +319,17 @@ def main(config):
         suite, task = config.task.split("_", 1)
         if suite == "dmc":
             domain_name, task_name = task.split("_")
+            
             new_env = DMCGYMWrapper(
                 domain_name=domain_name,
                 task_name=task_name,
                 visualize_reward=False,
                 from_pixels=True,
-                height=100,
-                width=100,
-                camera_id=1,
+                height=config.image_height, 
+                width=config.image_width,    
+                camera_id=0,
             )
+            
             new_env = FrameSkip(new_env, config.action_repeat)
             new_env = wrap_env(new_env,
                                env_id=None,
@@ -348,7 +353,7 @@ def main(config):
         torch.cuda.manual_seed(config.seed)
 
     environment_name = config.task.partition('_')[2]
-
+    
     # set up log dir
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)
@@ -427,7 +432,7 @@ def main(config):
     # generate pre train data set
     pretrain_data_generation_config = dict({'batch': config.length, 'length': config.sequence_size})
     pretrain_dataset_generator = iter(train_replay.dataset(**pretrain_data_generation_config))
-
+    print(f"observation space: {obs_space}, action space: {act_space}")
     pre_train_dataset = DC.Dataset(observation_spec=obs_space, action_spec=act_space, size=config.length,
                                    group_size=config.sequence_size)
     data = next(pretrain_dataset_generator)
@@ -511,9 +516,9 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
     parser.add_argument('--task', type=str, default="dmc_cheetah_run", help="name of the environment")
     parser.add_argument("--envs", type=int, default=1, help='should be updated??')
-    parser.add_argument('--model_params', type=tuple, default=(200, 200), help='number of layers in the actor network')
+    parser.add_argument('--model_params', type=tuple, default=(40, 40), help='number of layers in the actor network')
     parser.add_argument("--envs_parallel", type=str, default="none", help='??')
-    parser.add_argument("--policy_reply_buffer_prefill_batch", type=int, default=32, help='how fast we fill out the '
+    parser.add_argument("--policy_reply_buffer_prefill_batch", type=int, default=8, help='how fast we fill out the '
                                                                                           'policy reply buffer')
 
     parser.add_argument('--expl_until', type=int, default=0, help='frequency of explore....')
@@ -548,6 +553,10 @@ def parse_args():
     parser.add_argument('--log_keys_sum', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_mean', type=str, default='^$', help='??')
     parser.add_argument('--log_keys_max', type=str, default='^$', help='??')
+    parser.add_argument('--image_height', type=int, default=84, 
+                        help='Height of input images')
+    parser.add_argument('--image_width', type=int, default=84,
+                        help='Width of input images')
     args, unknown = parser.parse_known_args()
     return args
 
