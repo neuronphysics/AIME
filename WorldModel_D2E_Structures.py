@@ -552,8 +552,8 @@ class WorldModel(nn.Module):
             task_name=task_name,
             visualize_reward=False,
             from_pixels=True,
-            height=100,
-            width=100,
+            height=self._params.image_width,
+            width=self._params.image_height,
             camera_id=0,
         )
 
@@ -666,10 +666,10 @@ class WorldModel(nn.Module):
 
         if reward is not None and done is not None:
             data = {"reward": {
-                "identity": lambda x: x,
-                "sign": torch.sign,
-                "tanh": torch.tanh,
-            }[self._clip_rewards](reward).unsqueeze(-1), "discount": 1.0 - done.float().unsqueeze(-1)}
+                    "identity": lambda x: x,
+                    "sign": torch.sign,
+                    "tanh": torch.tanh,
+                    }[self._clip_rewards](reward).unsqueeze(-1), "discount": 1.0 - done.float().unsqueeze(-1)}
             data["discount"] *= self._discount
         else:
             data = {}
@@ -712,7 +712,8 @@ class WorldModel(nn.Module):
         next_obs = torch.reshape(data.s2, (-1, self._params.n_channel, self._params.image_width,
                                            self._params.image_width)).to(self.device)
 
-        losses, metrics, z_real = self.variational_autoencoder.training_step(obs, self._params.beta,
+        losses, metrics, z_real = self.variational_autoencoder.training_step(obs, 
+                                                                             self._params.beta,
                                                                              self._params.n_critic,
                                                                              self._params.lambda_img,
                                                                              self._params.lambda_latent)

@@ -342,37 +342,62 @@ class ImageDiscriminator(nn.Module):
 
         kw = 4
         padw = 1
+        self.layers = nn.ModuleList()
         
-        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
+        # Initial layer
+        self.layers.append(
+            nn.Sequential(
+                nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw),
+                nn.LeakyReLU(0.2, True))
+        )
         nf_mult = 1
         nf_mult_prev = 1
         for n in range(1, n_layers):  # gradually increase the number of filters
             nf_mult_prev = nf_mult
             nf_mult = min(2 ** n, 8)
-            sequence += [
+            layer=nn.Sequential(
                 nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
                 norm_layer(ndf * nf_mult),
                 nn.LeakyReLU(0.2, True)
-            ]
+            )
             if n==(n_layers-1):
-               sequence += [attentionBlock(ndf* nf_mult)]
+               layer.append(attentionBlock(ndf* nf_mult))
+            self.layers.append(layer)
 
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
-        sequence += [
-            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
-            norm_layer(ndf * nf_mult),
-            nn.LeakyReLU(0.2, True)
-        ]
+        self.layers.append(
+            nn.Sequential(
+                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
+                norm_layer(ndf * nf_mult),
+                nn.LeakyReLU(0.2, True)
+            )
+        )
+        self.layers.append(
+            nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw))
 
-        sequence += [
-            nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]  # output 1 channel prediction map
-        self.main = nn.Sequential(*sequence)
+        # output 1 channel prediction map
+        
         self.to(device)
 
-    def forward(self, input):
-        """Standard forward."""
-        return self.main(input)
+    def get_features(self, x):
+        """Extract features from intermediate layers"""
+        features = []
+        for layer in self.layers:
+            x = layer(x)
+            features.append(x)
+        return features
+
+    def forward(self, x, get_features=False):
+        """Forward pass with option to return intermediate features"""
+        if get_features:
+            return self.get_features(x)
+        
+        # Regular forward pass
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
 
 class LatentDiscriminator(nn.Module):
     # define the descriminator/critic
@@ -567,3 +592,15 @@ class VAEDecoder(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
+def compute_feature_matching_loss( real_features, fake_features, lambda_feat=1.0):
+    """Compute feature matching loss between real and fake image features"""
+    feat_match_loss = 0.0
+    num_layers = len(real_features)
+    
+    # Match mean activations for each layer
+    for i in range(num_layers):
+        real_mean = real_features[i].mean(dim=[0,2,3]) # Average across batch and spatial dims
+        fake_mean = fake_features[i].mean(dim=[0,2,3])
+        feat_match_loss += torch.nn.functional.l1_loss(fake_mean, real_mean.detach())
+        
+    return lambda_feat * feat_match_loss / num_layers

@@ -41,7 +41,7 @@ def train_eval_online(
         log_dir,
         env_name='HalfCheetah-v2',
         # Train and eval args.
-        total_train_steps=int(1e6),
+        total_train_steps=int(5e6),
         summary_freq=100,
         print_freq=1000,
         plot_train_freq=500,
@@ -55,9 +55,9 @@ def train_eval_online(
         initial_explore_steps=10000,
         replay_buffer_size=int(1e6),
         model_params=(((200, 200),), 2, 1),
-        optimizers=((0.0001, 0.5, 0.99),),
+        optimizers=((0.00001, 0.9, 0.999),),
         batch_size=256,
-        weight_decays=(0.0,),
+        weight_decays=(0.005,),
         update_freq=1,
         update_rate=0.005,
         discount=0.99,
@@ -230,7 +230,7 @@ def main(args):
 
 
 if __name__ == '__main__':
-    repo_dir = "/home/sstevec/projects/def-jhoey/sstevec/AIME"
+    repo_dir = "/home/zsheikhb/D2E/main"
 
     if not os.path.exists(os.path.join(os.getenv('HOME', '/'), repo_dir, "online")):
         os.makedirs(os.path.join(os.getenv('HOME', '/'), repo_dir, "online"))
