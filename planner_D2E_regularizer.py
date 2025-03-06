@@ -122,6 +122,7 @@ class ActorNetwork(nn.Module):
                 self._layers.append(nn.Linear(latent_spec.shape[0], hidden_size))
             else:
                 self._layers.append(nn.Linear(hidden_size, hidden_size))
+            self._layers.append(nn.LayerNorm(hidden_size))
             self._layers.append(nn.ReLU())
         output_layer = nn.Linear(hidden_size, self._action_spec.shape[0] * 2)
         self._layers.append(output_layer)
@@ -241,6 +242,7 @@ class CriticNetwork(nn.Module):
                 self._layers.append(nn.Linear(latent_spec.shape[0] + action_spec.shape[0], hidden_size))
             else:
                 self._layers.append(nn.Linear(hidden_size, hidden_size))
+            self._layers.append(nn.LayerNorm(hidden_size))
             self._layers.append(nn.ReLU())
         output_layer = nn.Linear(hidden_size, 1)
         self._layers.append(output_layer)
@@ -275,6 +277,7 @@ class ValueNetwork(nn.Module):
                 self._layers.append(nn.Linear(latent_spec.shape[0], hidden_size))
             else:
                 self._layers.append(nn.Linear(hidden_size, hidden_size))
+            self._layers.append(nn.LayerNorm(hidden_size))
             self._layers.append(nn.ReLU())
         output_layer = nn.Linear(hidden_size, 1)
         self._layers.append(output_layer)

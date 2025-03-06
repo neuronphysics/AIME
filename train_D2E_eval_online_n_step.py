@@ -10,7 +10,8 @@ import re
 from typing import Dict, Any
 from DataCollectionD2E_n_step import *
 from planner_D2E_regularizer_n_step import D2EAgent, Config, eval_policies, ContinuousRandomPolicy
-
+import sys
+from pathlib import Path
 config: Dict[str, Any] = {}
 
 
@@ -216,7 +217,7 @@ def main(args):
 
 
 if __name__ == '__main__':
-    repo_dir = "/mnt/e/pycharm_projects/AIME"
+    repo_dir = Path.cwd()
 
     if not os.path.exists(os.path.join(os.getenv('HOME', '/'), repo_dir, "online")):
         os.makedirs(os.path.join(os.getenv('HOME', '/'), repo_dir, "online"))
