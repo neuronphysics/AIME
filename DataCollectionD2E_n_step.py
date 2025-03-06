@@ -58,46 +58,117 @@ def get_transition(time_step, next_time_step, action, next_action):
 
 
 def strip_action(action):
-    if action.ndim < 1:
-        action = action.unsqueeze(0).detach().cpu()
-    elif action.ndim > 1:
-        action = action.detach().cpu()[0]
-    else:
-        action = action.detach().cpu()
+    action = action.detach().cpu().numpy()
+    if action.ndim == 0:
+        action = action.expand_dims(axis=0)
+    elif action.ndim > 2:
+        action = action.squeeze()
+    if action.ndim == 2 and action.shape[0] == 1:
+        action = action.squeeze(0)
     return action
 
-
 class DataCollector(object):
-    """Class for collecting sequence of environment experience."""
-
     def __init__(self, env, policy, data):
         self._env = env
         self._policy = policy
         self._data = data
+        self._current_time_step = None
         self._saved_action = None
 
-    def collect_transition(self, t):
-        time_step = self._env.current_time_step()
+    def collect_transition(self, n_steps):
+        if self._current_time_step is None or self._current_time_step.is_last():
+            self._current_time_step = self._env.reset()
+            self._saved_action = None
+
         if self._saved_action is None:
-            self._saved_action = strip_action(self._policy(torch.from_numpy(time_step.observation)))
-        action = self._saved_action
+            self._saved_action = self._safe_get_action(self._current_time_step.observation)
 
-        n_step_tran = NStepTransitions(start_time_step=time_step, start_action=action)
-        for i in range(t):
-            next_time_step = self._env.step(action)
-            next_action = strip_action(self._policy(torch.from_numpy(next_time_step.observation)))
-            self._saved_action = next_action
-            action = next_action
+        transition = NStepTransitions(
+            start_time_step=self._current_time_step,
+            start_action=self._saved_action
+        )
+        
+        steps_collected = 0
+        terminal_encountered = False
 
-            if not time_step.is_last():
-                n_step_tran.add_step(next_time_step, next_action)
+        for _ in range(n_steps):
+            next_time_step = self._env.step(self._saved_action)
+            steps_collected += 1
+
+            if next_time_step.is_last():
+                terminal_encountered = True
+                next_action = None
+                logging.info("Terminal step encountered at step %d", steps_collected)
             else:
-                return 0
-        self._data.add_transitions(n_step_tran.get_transition())
-        return 1
+                next_action = self._safe_get_action(next_time_step.observation)
+
+            transition.add_step(next_time_step, next_action)
+            if terminal_encountered:
+                break
+            else:
+               self._current_time_step = next_time_step
+               self._saved_action = next_action
+
+        if steps_collected > 0:
+            final_transition = transition.get_transition(group_size=n_steps)
+            self._validate_transition(final_transition, terminal_encountered)
+            self._data.add_transitions(final_transition)
+
+        # Explicitly ensure terminal steps are marked
+        if terminal_encountered:
+            self._current_time_step = None
+            self._saved_action = None
+        return steps_collected
+
+    def _safe_get_action(self, observation):
+        obs_tensor = torch.from_numpy(observation).float()
+        with torch.no_grad():
+            return strip_action(self._policy(obs_tensor))
+
+    def _validate_transition(self, transition, was_terminal):
+        """Handle both tensor and numpy data"""
+        def _to_numeric_array(x):
+            if isinstance(x, torch.Tensor):
+                x = x.cpu().numpy()
+            if isinstance(x, np.ndarray) and x.dtype == bool:
+                return x
+            if isinstance(x, np.ndarray) and x.dtype == object:
+               # Handle ragged arrays, converting each element to numpy array if needed
+               converted = []
+               for item in x:
+                   if isinstance(item, torch.Tensor):
+                      item = item.cpu().numpy()
+                   converted.append(item.astype(np.float32))
+               return np.array(converted, dtype=np.float32)
+
+            return x.astype(np.float32) if isinstance(x, np.ndarray) else x
+    
+        a1_np = _to_numeric_array(transition.a1)
+        s1_np = _to_numeric_array(transition.s1)
+
+        # Check for NaNs
+        if isinstance(a1_np, np.ndarray):
+           assert not np.isnan(a1_np).any(), "NaN values in actions"
+        if isinstance(s1_np, np.ndarray):
+           assert not np.isnan(s1_np).any(), "NaN values in states"
+        if was_terminal:
+           done = _to_numeric_array(transition.done)
+           done = done.astype(np.bool)
+           discount = _to_numeric_array(transition.discount)
+        
+           # Check for at least one terminal step
+           if not np.any(done):
+               # Force mark the last step as terminal if missing
+               done[-1] = True
+               discount[-1] = 0.0
+               logging.warning("Forced terminal flag on last transition step")
+
+           # Ensure the last terminal step has discount 0
+           terminal_indices = np.where(done)[0]
+           for idx in terminal_indices:
+               assert discount[idx] == 0, "Terminal discount must be 0"
 
 
-#######################
 def gather(params, indices, axis=None):
     if axis is None:
         axis = 0
@@ -168,31 +239,34 @@ class Dataset(data.Dataset):
         self._circular = circular
         obs_shape = list(observation_spec.shape)
         obs_type = observation_spec.dtype
+        
         action_shape = list(action_spec.shape)
         action_type = action_spec.dtype
-        self.s1 = self._zeros([size] + [group_size] + obs_shape, obs_type)
-        self.s2 = self._zeros([size] + [group_size] + obs_shape, obs_type)
-        self.a1 = self._zeros([size] + [group_size] + action_shape, action_type)
-        self.a2 = self._zeros([size] + [group_size] + action_shape, action_type)
-        self.discount = self._zeros([size] + [group_size], torch.float32)
-        self.reward = self._zeros([size] + [group_size], torch.float32)
-        self.done = self._zeros([size] + [group_size], torch.bool)
+        self.s1 = self._zeros([size, group_size] + obs_shape, obs_type)
+        self.s2 = self._zeros([size, group_size] + obs_shape, obs_type)
+        self.a1 = self._zeros([size, group_size] + action_shape, action_type)
+        self.a2 = self._zeros([size, group_size] + action_shape, action_type)
+        self.discount = self._zeros([size, group_size], torch.float32)
+        self.reward = self._zeros([size, group_size], torch.float32)
+        self.done = self._zeros([size, group_size], torch.bool)
         self._data = Transition(
-            s1=self.s1,
-            s2=self.s2,
-            a1=self.a1,
-            a2=self.a2,
-            discount=self.discount,
-            reward=self.reward,
-            done=self.done)
+                                 s1=self.s1,
+                                 s2=self.s2,
+                                 a1=self.a1,
+                                 a2=self.a2,
+                                 discount=self.discount,
+                                 reward=self.reward,
+                                 done=self.done
+                                )
         self.current_size = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
         self._current_idx = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
         self._capacity = torch.autograd.Variable(torch.tensor(self._size))
         self._config = collections.OrderedDict(
-            observation_spec=observation_spec,
-            action_spec=action_spec,
-            size=size,
-            circular=circular)
+                                                observation_spec=observation_spec,
+                                                action_spec=action_spec,
+                                                size=size,
+                                                circular=circular
+                                             )
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     @property
@@ -226,25 +300,71 @@ class Dataset(data.Dataset):
         return torch.autograd.Variable(torch.zeros(shape, dtype=dtype))
 
     def add_transitions(self, transitions):
-        for i in transitions._fields:
-            attr = getattr(transitions, i)
-            if torch.is_tensor(attr):
-                attr = attr.detach().cpu()
-            transitions = transitions._replace(**{i: np.expand_dims(attr, axis=0)})
+        assert isinstance(transitions, Transition)
+        # Convert all elements to numpy arrays first
+        processed = {}
+        for field in transitions._fields:
+            data = getattr(transitions, field)
+            if isinstance(data, torch.Tensor):
+               data = data.cpu().numpy()
+            if isinstance(data, list):    
+                data=np.stack(data)
+            if field in ['a1', 'a2'] and isinstance(data[0], torch.Tensor):  # [T, action_dim]
+                actions = [t.cpu().numpy() for t in data]
+                data = np.stack(actions)  # Shape: [T, action_dim]
+                data = np.expand_dims(data, axis=0)  # Shape: [1, T, action_dim]
+            
+            processed[field] = data
+    
+        transitions = Transition(**processed)
+    
         batch_size = transitions.s1.shape[0]
-        effective_batch_size = torch.minimum(torch.tensor(batch_size), torch.tensor(self._size) - self._current_idx)
-        indices = self._current_idx + torch.arange(effective_batch_size.item())
-        for key in transitions.__dict__:
+        effective_batch_size = min(batch_size, self._size - self._current_idx)
+        indices = self._current_idx + torch.arange(effective_batch_size)
+
+        for key in transitions._asdict().keys():
             data = getattr(self._data, key)
             batch = getattr(transitions, key)
-            data[indices] = torch.tensor(batch[:effective_batch_size])
-        # Update size and index.
-        if torch.less(self.current_size, self._size):
-            self.current_size += effective_batch_size
+            # Ensure proper shape [batch_size, group_size, ...]
+            if batch.ndim < data.ndim:
+               for _ in range(data.ndim - batch.ndim):
+                  batch = np.expand_dims(batch, axis=0)
+
+            # Check if shapes match along group_size dimension
+            if batch.shape[1] != data.shape[1]:
+               # Handle potential mismatch in group_size dimension
+               if batch.shape[1] < data.shape[1]:
+                   # Pad batch to match expected group_size
+                   pad_length = data.shape[1] - batch.shape[1]
+                   pad_shape = list(batch.shape)
+                   pad_shape[1] = pad_length
+                
+                   # Create padding based on data type
+                   if key in ['done']:
+                       # For boolean fields, pad with True (indicating terminal state)
+                       padding = np.ones(pad_shape, dtype=batch.dtype)
+                   elif key in ['discount']:
+                       # For discount, pad with zeros
+                       padding = np.zeros(pad_shape, dtype=batch.dtype)
+                   else:
+                       # For other fields, repeat the last values
+                       # Extract the last values along dimension 1
+                       last_values = batch[:, -1:].repeat(pad_length, axis=1)
+                       padding = last_values
+                
+                   # Concatenate original data with padding along group_size dimension
+                   batch = np.concatenate([batch, padding], axis=1)
+               else:
+                   # If batch has more steps than expected, truncate
+                   batch = batch[:, :data.shape[1]]
+        
+            data[indices] = torch.from_numpy(batch[:effective_batch_size])
+    
+        if self.current_size < self._size:
+           self.current_size += effective_batch_size
         self._current_idx += effective_batch_size
-        if self._circular:
-            if torch.greater_equal(self._current_idx, self._size):
-                self._current_idx = 0
+        if self._circular and self._current_idx >= self._size:
+           self._current_idx = 0
 
     def add_transitions_batch(self, transitions):
         batch_size = transitions.s1.shape[0]
@@ -253,6 +373,7 @@ class Dataset(data.Dataset):
         indices = self._current_idx + torch.arange(effective_batch_size.item())
         # store the incoming data to dataset
         for key in transitions.__dict__:
+            #TODO: check whether we get the correct shape of a1 and a2
             data = getattr(self._data, key)
             batch = getattr(transitions, key)
             data[indices] = batch[:effective_batch_size]
@@ -306,25 +427,52 @@ def get_sample_counts(n, distr):
     return counts
 
 
+
 def collect_n_transitions(tf_env, policy, data, n, log_freq=1000, group_size=15):
-    """Adds desired number of transitions to wm_image_replay_buffer."""
+    """Collects exactly n transitions with proper terminal handling"""
+    print("Max steps from the gym spec:", tf_env.spec.max_episode_steps)
+
     collector = DataCollector(tf_env, policy, data)
     time_st = time.time()
     timed_at_step = 0
     steps_collected = 0
+    
     while steps_collected < n:
-        count = collector.collect_transition(group_size)
+        # Calculate remaining steps to avoid overshooting
+        remaining = n - steps_collected
+        actual_group_size = min(group_size, remaining)
+        
+        count = collector.collect_transition(actual_group_size)
+        
+        # Handle potential collection failures
+        if count == 0:
+            logging.warning("Failed to collect any transitions - check environment")
+            time.sleep(0.1)  # Prevent tight loop on failure
+            continue
+            
         steps_collected += count
-        if (steps_collected % log_freq == 0
-            or steps_collected == n) and count > 0:
-            steps_per_sec = ((steps_collected - timed_at_step)
-                             / (time.time() - time_st))
+        
+        # Logging with progress awareness
+        if (steps_collected % log_freq == 0) or (steps_collected == n):
+            elapsed = time.time() - time_st
+            steps_per_sec = (steps_collected - timed_at_step) / elapsed
+            logging.info(
+                'Collected %d/%d (%.1f%%) @ %.2f steps/s', 
+                steps_collected, n,
+                100 * steps_collected / n,
+                steps_per_sec
+            )
             timed_at_step = steps_collected
             time_st = time.time()
-            logging.info('(%d/%d) steps collected at %.4g steps/s.', steps_collected,
-                         n, steps_per_sec)
 
-
+    # Final validation
+    if steps_collected != n:
+        logging.error("Failed to collect requested transitions (%d/%d)", 
+                     steps_collected, n)
+    else:
+        logging.info("Successfully collected %d transitions", n)
+        
+    
 def collect_data(
         log_dir,
         data_config,

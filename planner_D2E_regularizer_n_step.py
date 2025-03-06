@@ -8,22 +8,21 @@ from torch.distributions import transforms as tT
 from torch.distributions.transformed_distribution import TransformedDistribution
 from torch.autograd import Variable
 import collections
+from typing import Callable, List
 import numpy as np
 import os
 import gin
 from absl import logging
 import tensor_specs
-from torch.distributions import Distribution, Independent, MultivariateNormal
+from torch.distributions import Normal, Independent, MultivariateNormal
 import torch.distributions as pyd
 import math
-from f_divergence import Discriminator, preprocess_loader
+from f_divergence import Discriminator
 
 local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-LOG_STD_MIN = torch.tensor(-20, dtype=torch.float32, device=local_device, requires_grad=False)
 
-LOG_STD_MAX = torch.tensor(2, dtype=torch.float32, device=local_device, requires_grad=False)
-
+ALPHA_MAX = 500.0
 
 def get_spec_means_mags(spec, device):
     means = (spec.maximum + spec.minimum) / 2.0
@@ -33,29 +32,49 @@ def get_spec_means_mags(spec, device):
     return means, mags
 
 
-def _calculate_n_step_returns(rewards: torch.Tensor,
-                              v_next: torch.Tensor,
-                              v_target: torch.Tensor,
-                              done: torch.Tensor,
-                              gamma: float = 0.99,  # discount
-                              lambd: float = 0.95,
-                              # The GAE (lambda) parameter:Factor for trade-off of bias vs variance for Generalized Advantage Estimator.
-                              device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                              ) -> torch.Tensor:
-    """Generalized Advantage Estimator (https://arxiv.org/abs/1506.02438)
-    source :https://github.com/IrisLi17/onpolicy_algorithm/blob/8223093d26758f4ea0f2d9763ad19a530c6a1f0c/onpolicy/storage.py#L494
+
+def gae(
+    value_current: torch.Tensor, # [batch_size, n_steps]
+    value_next: torch.Tensor,
+    reward: torch.Tensor,
+    terminated: torch.Tensor,
+    gamma: float,
+    lam: float,
+    device: torch.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+) -> torch.Tensor:
     """
-    batch_size, n_step = rewards.shape
-    n_step_returns = torch.zeros(rewards.shape, dtype=torch.float32).to(device=device)
+    Compute Generalized Advantage Estimation (GAE) during n-step transitions. 
+    Q_target = V(s) + Σ(γλ)^t δ_t where δ_t = r + γV(s') - V(s)
+    Paper: https://arxiv.org/abs/1506.02438.
+
+    Args:
+        state_value (Tensor): state value `(num_envs, n_steps + 1)`, 
+        which includes the next state value of final transition
+        reward (Tensor): `(num_envs, n_steps)`
+        terminated (Tensor): `(num_envs, n_steps)`
+        gamma (float): discount factor
+        lam (float): lambda or bias-variance trade-off parameter
+
+    Returns:
+        GAE (Tensor): `(num_envs, n_steps)`
+    """
+    def normalize_advantages(advantages):
+        return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    batch_size, n_step = reward.shape
+    n_step_returns = torch.zeros(reward.shape, dtype=torch.float32).to(device=device)
 
     gae = torch.zeros(batch_size, dtype=torch.float32).to(device=device)
     for t in reversed(range(n_step)):
-        masked = (1.0 - done[:, t].float().to(device=device))
-        delta = rewards[:, t].to(device=device) + gamma * v_next[:, t] * masked - v_target[:, t]
-        gae = delta + gamma * lambd * gae * masked
-        n_step_returns[:, t] = v_target[:, t] + gae
-    return n_step_returns
+        masked = (1.0 - terminated[:, t].float().to(device=device))
+        assert torch.all((masked == 0) | (masked == 1)), "Masks should be binary (0 or 1)"
+        delta = reward[:, t].to(device=device) + gamma * value_next[:, t] * masked - value_current[:, t]
+        gae = delta + gamma * lam * gae * masked
+        n_step_returns[:,t] = gae
+     
+    return normalize_advantages(n_step_returns)
 
+        
 
 class Split(torch.nn.Module):
     """
@@ -89,6 +108,7 @@ class TanhTransform(pyd.transforms.Transform):
     sign = +1
 
     def __init__(self, cache_size=1):
+        super().__init__(cache_size=cache_size)
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         super().__init__(cache_size=cache_size)
 
@@ -167,6 +187,10 @@ class ActorNetwork(nn.Module):
 
     def _get_outputs(self, state):
         h = state
+        LOG_STD_MIN = torch.tensor(-20, dtype=torch.float32, device=local_device, requires_grad=False)
+
+        LOG_STD_MAX = torch.tensor(2, dtype=torch.float32, device=local_device, requires_grad=False)
+
 
         for l in nn.Sequential(*(list(self._layers.children())[:-1])):
             h = l(h)
@@ -198,9 +222,9 @@ class ActorNetwork(nn.Module):
                 mvn,
                 tT.ComposeTransform([
                     tT.AffineTransform(loc=self._action_means.to(device=self.device),
-                                       scale=self._action_mags.to(device=self.device), event_dim=2),
+                                       scale=self._action_mags.to(device=self.device), event_dim=1),
                     TanhTransform(),
-                    tT.AffineTransform(loc=mean, scale=std, event_dim=2)]))
+                    tT.AffineTransform(loc=mean, scale=std, event_dim=1)]))
         else:
             mvn = MultivariateNormal(torch.full_like(mean, 0).to(device=self.device),
                                      torch.diag(torch.full_like(mean, 1).to(device=self.device)))
@@ -237,7 +261,8 @@ class ActorNetwork(nn.Module):
         log_pi_a = a_dist.log_prob(a_sample)
 
         a_sample = torch.reshape(a_sample, a_tanh_mode.shape)
-
+        log_pi_a = log_pi_a.reshape(a_sample.shape[:-1])
+        
         return a_tanh_mode, a_sample, log_pi_a
 
     def sample_n(self, state, n=1):
@@ -248,6 +273,7 @@ class ActorNetwork(nn.Module):
 
     def sample(self, state):
         return self.sample_n(state, n=1)[1][0]
+
 
 
 class CriticNetwork(nn.Module):
@@ -269,12 +295,14 @@ class CriticNetwork(nn.Module):
                 self._layers.append(nn.Linear(latent_spec.shape[0] + action_spec.shape[0], hidden_size))
             else:
                 self._layers.append(nn.Linear(hidden_size, hidden_size))
+
+            self._layers.append(nn.LayerNorm(hidden_size))
             self._layers.append(nn.ReLU())
         output_layer = nn.Linear(hidden_size, 1)
         self._layers.append(output_layer)
 
         with torch.no_grad():
-            weights_init_(self._layers, init_type='xavier', gain=0.01)
+            weights_init_(self._layers, init_type='orthogonal', gain=0.01)
 
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.to(device=self.device)
@@ -309,7 +337,7 @@ class ValueNetwork(nn.Module):
         self._layers.append(output_layer)
         # initialize the network weights and biases
         with torch.no_grad():
-            weights_init_(self._layers, init_type='kaiming')
+            weights_init_(self._layers, init_type='orthogonal')
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.to(device=self.device)
 
@@ -366,7 +394,6 @@ def get_modules(model_params, observation_spec, action_spec):
 #######################################
 ################ AGENT ################
 #######################################
-ALPHA_MAX = 500.0
 
 
 class GeneralAgent(nn.Module):
@@ -569,7 +596,7 @@ class Agent:
             action_spec=None,
             time_step_spec=None,
             modules=None,
-            optimizers=((0.001, 0.5, 0.99),),
+            optimizers=((0.0001, 0.9, 0.999),),
             batch_size=64,
             weight_decays=(0.5,),
             update_freq=1,
@@ -895,10 +922,8 @@ class D2EAgent(Agent):
             ensemble_q_lambda=1.0,
             grad_value_clipping=1.0,
             grad_norm_clipping=5.0,
-            transition_disc_hidden_size=128,
-            transition_disc_latent_size=128,
-            tau=0.005,
-            gae_lambda=0.95,
+            tau=0.001,
+            gae_lambda=0.9,
             **kwargs):
         self._alpha = alpha
         self._alpha_max = alpha_max
@@ -914,8 +939,7 @@ class D2EAgent(Agent):
         self._ensemble_q_lambda = ensemble_q_lambda
         self._grad_value_clipping = grad_value_clipping
         self._grad_norm_clipping = grad_norm_clipping
-        self._transition_disc_hidden_size = transition_disc_hidden_size
-        self._transition_disc_latent_size = transition_disc_latent_size
+
         self.qf_criterion = nn.MSELoss()
         self.vf_criterion = nn.MSELoss()
         self._tau = tau
@@ -934,13 +958,6 @@ class D2EAgent(Agent):
             c=self._c_fn,
             device=self.device)
 
-        self._transit_discriminator = Discriminator(input_dim=self._latent_spec.shape[0] + self._action_spec.shape[0],
-                                                    # number of dimension of observation plus action space
-                                                    output_dim=self._latent_spec.shape[0],
-                                                    hidden_dim=self._transition_disc_hidden_size,
-                                                    latent_dim=self._transition_disc_latent_size,
-                                                    device=self.device
-                                                    )
 
         self._agent_module.assign_alpha(self._alpha)
         # entropy regularization
@@ -1002,20 +1019,6 @@ class D2EAgent(Agent):
             norms.append(norm)
         return torch.stack(norms).sum(dim=0)
 
-    def _get_disc_weight_norm(self):
-        disc_weights = []
-        child_disc = [self._transit_discriminator._condition_disc, self._transit_discriminator.trunk, \
-                      self._transit_discriminator.fake_state_action.output_emb, \
-                      self._transit_discriminator.fake_state_action.model]
-        for i in range(len(child_disc)):
-            for layer in child_disc[i].children():
-                if isinstance(layer, nn.Linear):
-                    disc_weights.append(layer.weight)
-        norms = []
-        for w in disc_weights:
-            norm = torch.sum(torch.square(w))
-            norms.append(norm)
-        return torch.stack(norms).sum(dim=0)
 
     def ensemble_q(self, qs):
         lambda_ = self._ensemble_q_lambda
@@ -1036,35 +1039,34 @@ class D2EAgent(Agent):
         r = batch.reward  # reward_{t}(B,T+1)
         dsc = batch.discount
         done = batch.done  # done_{t}(B,T+1)
+        # Get target calculations
+
         _, a2_p, log_pi_a2_p = self._p_fn(s2.to(device=self.device))
         q2_targets = []
         q1_preds = []
         for q_fn, q_fn_target in self._q_fns:
             q2_target_ = q_fn_target(s2.to(device=self.device), a2_p)
             q1_pred = q_fn(s1.to(device=self.device), a1.to(device=self.device))
+
             q1_preds.append(q1_pred)
             q2_targets.append(q2_target_)
-
+        #stack for ensemble estimation
         q2_targets = torch.stack(q2_targets, dim=-1)
         q2_target = self._ensemble_q2_target(q2_targets)
+        #calculate the divergence
         div_estimate = self._divergence.dual_estimate(
             s2.to(device=self.device), a2_p, a2_b.to(device=self.device))
-        # using new states generated by EIM
-        target_v_next = q2_target - self._get_alpha_entropy()[0] * log_pi_a2_p
+        
+        target_v_next = q2_target.squeeze() - self._get_alpha_entropy()[0] * log_pi_a2_p
 
         for _, v_fn_target in self._v_fns:
-            real_v_target = v_fn_target(s2.to(device=self.device))
-
-            # v2_target = q2_target - self._v_fn(s2.to(device=self.device))- self._get_alpha_entropy()[0] * log_pi_a2_p# Equation 21 in Dream to Explore
+            v_current = v_fn_target(s1.to(device=self.device))
+        
         if self._value_penalty:
-            target_v_next = target_v_next - self._get_alpha()[0] * div_estimate
-
-        target_v_next = target_v_next.squeeze()
-        real_v_target = real_v_target.squeeze()
-
-        q1_target = _calculate_n_step_returns(r, target_v_next, real_v_target, done, self._discount, self._gae_lambda,
-                                              self.device)
-
+            target_v_next = target_v_next - self._get_alpha()[0] * div_estimate.squeeze()
+        
+        q1_target = r.to(device=self.device) + (
+                1.0 - done.float().to(device=self.device)) * self._discount * torch.minimum(target_v_next, v_current.squeeze()) 
         q_losses = []
         for q1_pred in q1_preds:
             q_loss_ = self.qf_criterion(q1_pred.view(-1), q1_target.detach().view(-1))
@@ -1088,24 +1090,35 @@ class D2EAgent(Agent):
     def _build_p_loss(self, batch):
         s = batch.s1
         a_b = batch.a1
+        s2 = batch.s2
+        batch_size, group_size = s.shape[0], s.shape[1]
+        
         _, a_p, log_pi_a_p = self._p_fn(s.to(device=self.device))
-        for v_fn, v_fn_target in self._v_fns:
-            v1_source = v_fn(s.to(device=self.device))
-        q1s = []
-        for q_fn, _ in self._q_fns:
-            q1_ = q_fn(s.to(device=self.device), a_p)
-            q1s.append(q1_)
-
-        q1s = torch.stack(q1s, dim=-1)
-        q1 = self._ensemble_q1(q1s)
+        
+        
+        for v_fn, _ in self._v_fns:
+            v_next = v_fn(s2.to(device=self.device))
+            v_current = v_fn(s.to(device=self.device))
+        # Compute the GAE advantage.
+        # Assumes batch.reward and batch.done are available and have shape [B, T]
+        advantage = gae(
+                        value_current=v_current.reshape(batch_size, group_size),
+                        value_next=v_next.reshape(batch_size, group_size),
+                        reward=batch.reward.to(device=self.device), 
+                        terminated=batch.done.to(device=self.device),
+                        gamma=self._discount, 
+                        lam=self._gae_lambda,
+                        device=self.device
+                        )
+        
         div_estimate = self._divergence.dual_estimate(
             s.to(device=self.device), a_p, a_b.to(device=self.device))
+        div_estimate = div_estimate.reshape(batch_size, group_size)
         q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
         p_loss = torch.mean(
             self._get_alpha_entropy()[0] * log_pi_a_p
-            + self._get_alpha()[0] * div_estimate + (
-                    v1_source  # new term based on Equation 10 in dream to explore paper
-                    - q1) * q_start)
+            + self._get_alpha()[0] * div_estimate +advantage * q_start)
+
         p_w_norm = self._get_p_weight_norm()
         norm_loss = self._weight_decays[1] * p_w_norm
         loss = p_loss + norm_loss
@@ -1113,20 +1126,20 @@ class D2EAgent(Agent):
         info = collections.OrderedDict()
         info['p_loss'] = p_loss
         info['p_norm'] = p_w_norm
-        info['v1_source_mean'] = v1_source.mean()
+        info['v1_source_mean'] = v_current.mean()
+        info['advantage_mean'] = advantage.mean()
         return loss, info
 
     def _build_v_loss(self, batch):
         s1 = batch.s1
         a_b = batch.a1
-        s2 = batch.s2
         # prepare data for f-gan
-        loader = preprocess_loader(s1, a_b, s2, self.device)
+        
         _, a_p, log_a_pi = self._p_fn(s1.to(device=self.device))
         #########################
-        # input_data next_state (s2) and state (s1)
         for v_fn, v_fn_target in self._v_fns:
             v_pred = v_fn(s1.to(device=self.device))
+
         q1_pred = []
         for q_fn, q_fn_target in self._q_fns:
             q1_ = q_fn(s1.to(device=self.device), a_p)
@@ -1136,41 +1149,26 @@ class D2EAgent(Agent):
         q1_pred_ensemble = self.ensemble_q(q1_pred)
         div_estimate = self._divergence.dual_estimate(
             s1.to(device=self.device), a_p, a_b.to(device=self.device))
-        disc_estimate_loss, disc_grad_penalty = self._transit_discriminator.update(loader)
         # https://github.com/AnujMahajanOxf/VIREL/blob/master/VIREL_code/beta.py
         # https://github.com/haarnoja/sac/blob/8258e33633c7e37833cc39315891e77adfbe14b2/sac/algos/sac.py#L295
         # https://github.com/rail-berkeley/rlkit/blob/60bdfcd09f48f73a450da139b2ba7910b8cede53/rlkit/torch/smac/pearl.py#L247
         # Equation 20 in Dream to Explore paper
-
-        v_target = q1_pred_ensemble - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (
-                div_estimate + disc_estimate_loss)
+        v_target = q1_pred_ensemble.squeeze() - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (
+                div_estimate.squeeze())
         
-        def compute_expectile_loss(diff, expectile=0.8):
-             """Compute expectile loss with asymmetric weights
-                IQN: Implicit Quantile Networks for Distributional Learning" (Dabney et al., 2018)
-                    
-             """
-             weight = torch.where(diff > 0, 
-                           torch.tensor(expectile, device=self.device),
-                           torch.tensor(1-expectile, device=self.device))
-             return (weight * (diff ** 2)).mean()
-    
         # Calculate value loss using expectile regression
-        value_diff = v_pred - v_target.detach()
-        v_loss = compute_expectile_loss(value_diff)
+    
+        v_loss = WeightedLoss(v_pred.squeeze() - v_target.detach())
 
         v_w_norm = self._get_v_weight_norm()
         v_norm_loss = self._weight_decays[3] * v_w_norm
-        # get weights of f-gan
-        disc_w_norm = self._get_disc_weight_norm()
-        disc_norm_loss = self._weight_decays[4] * disc_w_norm
+        
 
-        loss = v_loss + v_norm_loss + disc_norm_loss + disc_grad_penalty
+        loss = v_loss + v_norm_loss 
         info = collections.OrderedDict()
         info['value_loss'] = v_loss
         info['vale_norm'] = v_w_norm
-        info['transition_fgan'] = disc_estimate_loss
-        info['transition_penalty'] = disc_grad_penalty
+
         return loss, info
 
     def _build_c_loss(self, batch):
@@ -1269,13 +1267,15 @@ class D2EAgent(Agent):
         self._agent_module.p_net.train()
         self._p_optimizer.zero_grad()
 
-        policy_loss, _ = self._build_p_loss(batch)
+        policy_loss, p_info = self._build_p_loss(batch)
         policy_loss.backward(retain_graph=True)
 
+        # Safely clip policy gradients if parameters have gradients
         if self._grad_norm_clipping > 0.:
             torch.nn.utils.clip_grad_norm_(self._agent_module.p_net.parameters(), self._grad_norm_clipping)
         if self._grad_value_clipping > 0.0:
             torch.nn.utils.clip_grad_value_(self._agent_module.p_net.parameters(), self._grad_value_clipping)
+  
         self._p_optimizer.step()
         # Update value network
         for v_fn, v_fn_target in self._v_fns:
@@ -1283,11 +1283,9 @@ class D2EAgent(Agent):
 
         self._v_source_optimizer.zero_grad()
         ###fGAN
-        self._transit_discriminator.optimizer.zero_grad()
-        self._transit_discriminator.fake_state_action.optimizer.zero_grad()
+        
 
-        with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
-            value_loss, info_value = self._build_v_loss(batch)
+        value_loss, info_value = self._build_v_loss(batch)
         value_loss.backward(retain_graph=True)
 
         if self._grad_norm_clipping > 0.:
@@ -1298,11 +1296,12 @@ class D2EAgent(Agent):
 
         self._v_source_optimizer.step()
         ###fGAN
-        self._transit_discriminator.optimizer.step()
-        self._transit_discriminator.fake_state_action.optimizer.step()
+        
         # Update q networks parameter
         for q_fn, q_fn_target in self._q_fns:
             q_fn.train()
+        
+
         self._q_source_optimizer.zero_grad()
 
         q_losses, q_info = self._build_q_loss(batch)
@@ -1347,8 +1346,7 @@ class D2EAgent(Agent):
         info["q2_target_mean"] = q_info["q2_target_mean"].cpu().item()
         # ) value loss
         info["value_loss"] = value_loss.cpu().item()
-        info["transition_fgan"] = info_value["transition_fgan"].cpu().item()
-        info["transition_penalty"] = info_value["transition_penalty"].cpu().item()
+        
         # 7) critic loss
         info["critic_loss"] = self.critic_loss.cpu().item()
         # 8)alpha loss
@@ -1361,9 +1359,9 @@ class D2EAgent(Agent):
             self._agent_module.assign_alpha_entropy(ae_info["alpha_entropy"])
         if self._global_step % 10 == 0:
             logging.info(
-                "Policy Loss:{}, Value Loss:{}, Q Loss: {}, Reward: {}, q1_target:{}, q2_target:{}, transition dynamics gan:{} ".format(
+                "Policy Loss:{}, Value Loss:{}, Q Loss: {}, Reward: {}, q1_target:{}, q2_target:{}, ".format(
                     info["policy_loss"], info["value_loss"], info["Q_loss"], info["reward_mean"],
-                    info["q1_target_mean"], info["q2_target_mean"], info["transition_fgan"]))
+                    info["q1_target_mean"], info["q2_target_mean"]))
         return info
 
     def _extra_c_step(self, batch):
@@ -1418,14 +1416,10 @@ class D2EAgent(Agent):
         checkpoint = {
             "policy_net": self._agent_module.p_net.state_dict(),
             "critic_net": self._agent_module.c_net.state_dict(),
-            "discriminator_transition_net": self._transit_discriminator.state_dict(),
-            "generator_transition_net": self._transit_discriminator.fake_state_action.state_dict(),
             "q_source_optimizer": self._q_source_optimizer.state_dict(),
             "critic_optimizer": self._c_optimizer.state_dict(),
             "policy_optimizer": self._p_optimizer.state_dict(),
             "value_source_optimizer": self._v_source_optimizer.state_dict(),
-            "discriminator_transition_optimizer": self._transit_discriminator.optimizer.state_dict(),
-            "generator_transition_optimizer": self._transit_discriminator.fake_state_action.optimizer.state_dict(),
             "train_step": self._global_step
         }
         for q_fn, q_fn_target in self._q_fns:
@@ -1453,13 +1447,8 @@ class D2EAgent(Agent):
             v_fn_target.load_state_dict(checkpoint["v_net_target"])
         self._agent_module.p_net.load_state_dict(checkpoint["policy_net"])
         self._agent_module.c_net.load_state_dict(checkpoint["critic_net"])
-        self._transit_discriminator.load_state_dict(checkpoint["discriminator_transition_net"])  ###
-        self._transit_discriminator.fake_state_action.load_state_dict(checkpoint["generator_transition_net"])  ###
         self._p_optimizer.load_state_dict(checkpoint["policy_optimizer"])
         self._q_source_optimizer.load_state_dict(checkpoint["q_source_optimizer"])
-        self._transit_discriminator.optimizer.load_state_dict(checkpoint["discriminator_transition_optimizer"])
-        self._transit_discriminator.fake_state_action.optimizer.load_state_dict(
-            checkpoint["generator_transition_optimizer"])
         self._c_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self._v_source_optimizer.load_state_dict(checkpoint["value_source_optimizer"])
         self._global_step = checkpoint["train_step"]
@@ -1534,37 +1523,38 @@ def maybe_makedirs(log_dir):
 
 #####################################
 # from train_eval_utils
-from typing import Callable, List
+_TransitionTuple = collections.namedtuple('_TransitionTuple', ['s1', 's2', 'a1', 'a2', 'reward', 'discount', 'done'])
 
+class Transition(_TransitionTuple):
+    """Wrapper around namedtuple that adds validation."""
+    
+    def __new__(cls, s1, s2, a1, a2, reward, discount, done):
+        # Validation logic
+        if s1 is not None:  # Skip validation for empty transitions
+            def get_total_dims(data):
+                if isinstance(data, (list, tuple)):
+                    if len(data) == 0:
+                        return 0
+                    return 1 + get_total_dims(data[0])  # Add 1 for the list dimension
+                if isinstance(data, (torch.Tensor, numpy.ndarray)):
+                    return len(data.shape)
+                return 0
 
-class Transition:
-    def __init__(self, s1, s2, a1, a2, reward, discount, done):
-        self.s1 = s1
-        self.s2 = s2
-        self.a1 = a1
-        self.a2 = a2
-        self.reward = reward
-        self.discount = discount
-        self.done = done
+            total_dims = get_total_dims(s1)
+            
+            # Validate observation values if we have enough dimensions
+            if total_dims >= 4:
+                if isinstance(s1, (torch.Tensor, numpy.ndarray)):
+                    if numpy.asarray(s1).max() > 1:
+                        print("Error: transition obs not normalized (values > 1)")
+                elif isinstance(s1, list):
+                    arr = numpy.asarray(s1)
+                    if arr.max() > 1:
+                        print("Error: transition obs not normalized (values > 1)")
 
-        base_shape = 0
-        check = s1
-        if isinstance(check, List):
-            base_shape += 1
-            check = s1[0]
-        if isinstance(check, torch.Tensor):
-            base_shape += len(check.shape)
-        elif isinstance(check, numpy.ndarray):
-            base_shape += len(check.size())
-
-        if base_shape >= 4 and check[0][0][0].max() > 1:
-            print("Error: transition obs not 1 based")
-
-    def __getitem__(self, key):
-        return Transition(self.s1[key], self.s2[key], self.a1[key], self.a2[key], self.reward[key],
-                          self.discount[key], self.done[key])
-
-
+        # Create new instance using namedtuple's __new__
+        return super(Transition, cls).__new__(cls, s1, s2, a1, a2, reward, discount, done)
+    
 class NStepTransitions:
     def __init__(self, start_time_step, start_action):
         self.time_steps = [start_time_step]
@@ -1579,19 +1569,69 @@ class NStepTransitions:
             done=[])
 
     def add_step(self, next_time_step, next_action):
+        
         self.transition.s1.append(self.time_steps[-1].observation)
         self.transition.s2.append(next_time_step.observation)
-        self.transition.a1.append(self.actions[-1].numpy())
-        self.transition.a2.append(next_action.numpy())
-        self.transition.reward.append(next_time_step.reward)
-        self.transition.discount.append(next_time_step.discount)
-        self.transition.done.append(next_time_step.done)
+        self.transition.a1.append(self.actions[-1])
+        if next_action is None and next_time_step.is_last():
+            self.transition.a2.append(np.zeros_like(self.actions[-1]))
+        else:
+            self.transition.a2.append(next_action)
+        self.transition.reward.append(float(next_time_step.reward))
+        if next_time_step.is_last():
+           self.transition.discount.append(0.0)
+        else:
+           self.transition.discount.append(float(next_time_step.discount))
+        self.transition.done.append(next_time_step.is_last())
 
         self.time_steps.append(next_time_step)
-        self.actions.append(next_action)
+        self.actions.append(next_action if next_action is not None else np.zeros_like(self.actions[-1]))
 
-    def get_transition(self):
-        return self.transition
+    def get_transition(self,group_size=15):
+        pad_length = group_size - len(self.transition.done)
+        s1 = np.array(self.transition.s1)
+        s2 = np.array(self.transition.s2)
+        a1 = np.array(self.transition.a1)
+        a2 = np.array(self.transition.a2)
+        reward = np.array(self.transition.reward, dtype=np.float32)
+        discount = np.array(self.transition.discount, dtype=np.float32)
+        done = np.array(self.transition.done, dtype=np.bool_)
+
+        # If we need padding, add it
+        if pad_length > 0:
+            # Use the last state for padding
+            last_state = s2[-1] if len(s2) > 0 else s1[-1]
+            s1_pad = np.tile(last_state, (pad_length, 1))
+            s2_pad = np.tile(last_state, (pad_length, 1))
+            
+            # Use zeros for action padding
+            a1_pad = np.zeros((pad_length,) + a1.shape[1:], dtype=a1.dtype)
+            a2_pad = np.zeros((pad_length,) + a2.shape[1:], dtype=a2.dtype)
+            
+            # Pad reward with zeros, discount with zeros, and mark all padded steps as terminal
+            reward_pad = np.zeros(pad_length, dtype=np.float32)
+            discount_pad = np.zeros(pad_length, dtype=np.float32)
+            done_pad = np.ones(pad_length, dtype=np.bool_)
+            
+            # Concatenate original data with padding
+            s1 = np.concatenate([s1, s1_pad])
+            s2 = np.concatenate([s2, s2_pad])
+            a1 = np.concatenate([a1, a1_pad])
+            a2 = np.concatenate([a2, a2_pad])
+            reward = np.concatenate([reward, reward_pad])
+            discount = np.concatenate([discount, discount_pad])
+            done = np.concatenate([done, done_pad])
+        
+        # Return the properly shaped and padded transition
+        return Transition(
+            s1=s1,
+            s2=s2,
+            a1=a1,
+            a2=a2,
+            reward=reward,
+            discount=discount,
+            done=done
+        )
 
 
 def eval_policy_episodes(env, policy, n_episodes):

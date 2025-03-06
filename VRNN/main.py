@@ -175,7 +175,7 @@ class VRNN_GMM(nn.Module):
         #     use_lstm=True
         # )
         mock_input = self.generate_mock_input()
-        self.perceiver_model = generate_model('HiPClassBottleneck', '16', mock_input)
+        self.perceiver_model = generate_model('HiPClassBottleneck', 'Mini', mock_input)
         self.perceiver_model.to(self.device)
         self.out_keys = perceiver_helpers.ModelOutputKeys
         self.conv1 = nn.Conv1d(in_channels=128, out_channels=1, kernel_size=1, stride=1)
