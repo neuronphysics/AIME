@@ -29,7 +29,7 @@ class Optimizer(nn.Module):
         assert len(loss.shape) == 0, loss.shape
         metrics = {}
         metrics[f"{self._name}_loss"] = loss.detach().cpu().numpy()
-        self._scaler.scale(loss).backward()
+        self._scaler.scale(loss).backward(retain_graph=retain_graph)
         self._scaler.unscale_(self._opt)
         # loss.backward(retain_graph=retain_graph)
         norm = torch.nn.utils.clip_grad_norm_(self._params, self._clip)
@@ -578,11 +578,11 @@ class WorldModel(nn.Module):
         self._clip_rewards = "tanh"
         self.heads = nn.ModuleDict()
         input_shape = self.state_dim + self.action_dim
-        self.heads["reward"] = MLP(shape=1, layers=4, units=400, input_shape=input_shape, act="ELU", norm="none",
+        self.heads["reward"] = MLP(shape=1, layers=2, units=400, input_shape=input_shape, act="ELU", norm="layer",
                                    dist="mse", device=self.device)
-        self.heads["discount"] = MLP(shape=1, layers=4, units=400, input_shape=input_shape, act="ELU", norm="none",
+        self.heads["discount"] = MLP(shape=1, layers=2, units=400, input_shape=input_shape, act="ELU", norm="layer",
                                      dist="binary", device=self.device)
-        self.heads["done"] = MLP(shape=2, layers=4, units=400, input_shape=input_shape, act="ELU", norm="none",
+        self.heads["done"] = MLP(shape=2, layers=2, units=400, input_shape=input_shape, act="ELU", norm="layer",
                                  dist="onehot", device=self.device)
 
         self.mse_loss = nn.MSELoss()
@@ -719,7 +719,7 @@ class WorldModel(nn.Module):
                                                                              self._params.lambda_latent)
 
         self.transition_model.train()
-        self.optimizer.zero_grad()
+        
         z_next, z_next_mean, z_next_logvar = self.encoder(next_obs)
 
         # Prepare & normalize the input/output data for the transition model

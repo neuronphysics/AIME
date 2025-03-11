@@ -391,7 +391,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     result_dir = Path('results')
     result_dir.mkdir(exist_ok=True)
-    writer = SummaryWriter(log_dir='runs/dpgmm_vae_experiment')
+    writer = SummaryWriter(log_dir='run/dpgmm_vae_experiment')
 
     # Load dataset
     train_dataset = OxfordIIITPetsAugmented(
