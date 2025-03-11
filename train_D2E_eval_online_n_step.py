@@ -28,7 +28,7 @@ def train_eval_online(
         log_dir,
         env_name='HalfCheetah-v2',
         # Train and eval args.
-        total_train_steps=int(1e6),
+        total_train_steps=int(3e6),
         summary_freq=100,
         print_freq=1000,
         plot_train_freq=500,
@@ -39,11 +39,11 @@ def train_eval_online(
         eval_target=None,  # Target return value to stop training.
         eval_target_n=2,  # Stop after n consecutive evals above eval_target.
         # Agent train args.
-        initial_explore_steps=10000,
+        initial_explore_steps=20000,
         replay_buffer_size=int(1e6),
         model_params=(((200, 200),), 2, 1),
-        optimizers=((0.0001, 0.5, 0.99),),
-        batch_size=256,
+        optimizers=((0.0001, 0.9, 0.999),),
+        batch_size=128,
         weight_decays=(0.0,),
         update_freq=1,
         update_rate=0.005,

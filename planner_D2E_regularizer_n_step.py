@@ -1,5 +1,5 @@
 import numpy
-
+import gc
 import utils_planner as utils
 import torch
 import torch.nn as nn
@@ -33,48 +33,61 @@ def get_spec_means_mags(spec, device):
 
 
 
-def gae(
-    value_current: torch.Tensor, # [batch_size, n_steps]
-    value_next: torch.Tensor,
-    reward: torch.Tensor,
-    terminated: torch.Tensor,
-    gamma: float,
-    lam: float,
-    device: torch.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-) -> torch.Tensor:
-    """
-    Compute Generalized Advantage Estimation (GAE) during n-step transitions. 
-    Q_target = V(s) + Σ(γλ)^t δ_t where δ_t = r + γV(s') - V(s)
-    Paper: https://arxiv.org/abs/1506.02438.
-
-    Args:
-        state_value (Tensor): state value `(num_envs, n_steps + 1)`, 
-        which includes the next state value of final transition
-        reward (Tensor): `(num_envs, n_steps)`
-        terminated (Tensor): `(num_envs, n_steps)`
-        gamma (float): discount factor
-        lam (float): lambda or bias-variance trade-off parameter
-
-    Returns:
-        GAE (Tensor): `(num_envs, n_steps)`
-    """
-    def normalize_advantages(advantages):
-        return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-    batch_size, n_step = reward.shape
-    n_step_returns = torch.zeros(reward.shape, dtype=torch.float32).to(device=device)
-
-    gae = torch.zeros(batch_size, dtype=torch.float32).to(device=device)
-    for t in reversed(range(n_step)):
-        masked = (1.0 - terminated[:, t].float().to(device=device))
-        assert torch.all((masked == 0) | (masked == 1)), "Masks should be binary (0 or 1)"
-        delta = reward[:, t].to(device=device) + gamma * value_next[:, t] * masked - value_current[:, t]
-        gae = delta + gamma * lam * gae * masked
-        n_step_returns[:,t] = gae
-     
-    return normalize_advantages(n_step_returns)
-
+class Moments(nn.Module):
+    """Track statistics using percentiles for robust normalization."""
+    
+    def __init__(self, decay=0.99, max_val=1e8, percentile_low=0.05, percentile_high=0.95):
+        super().__init__()
+        self._decay = decay
+        self._max = max_val
+        self._percentile_low = percentile_low
+        self._percentile_high = percentile_high
+        self.register_buffer("low", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("high", torch.zeros((), dtype=torch.float32))
+    
+    def forward(self, x):
+        """Update running statistics and return normalization parameters."""
+        # Get flat distribution for percentile calculation
+        x_flat = x.flatten()
         
+        # Calculate percentiles for the current batch
+        low = torch.quantile(x_flat, self._percentile_low)
+        high = torch.quantile(x_flat, self._percentile_high)
+        
+        # Update tracked statistics with exponential decay
+        self.low = self._decay * self.low + (1 - self._decay) * low
+        self.high = self._decay * self.high + (1 - self._decay) * high
+        
+        # Calculate scaling factor with maximum bound
+        invscale = torch.max(torch.tensor(1.0/self._max, device=self.low.device), 
+                            self.high - self.low)
+        
+        return self.low.detach(), invscale.detach()
+    
+    def normalize(self, x):
+        """Normalize values using current statistics."""
+        return (x - self.low) / torch.max(self.high - self.low, 
+                                          torch.tensor(1.0/self._max, device=self.low.device))
+
+
+def compute_lambda_values(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    continues: torch.Tensor,
+    lmbda: float = 0.95,
+    ) -> torch.Tensor:
+    """Compute λ-returns as in DreamerV2 paper."""
+    # Start with the last value estimate
+
+    vals = [values[-1:]]
+    # Intermediate terms (combining one-step return and continued λ-return)
+    interm = rewards + continues * values * (1 - lmbda)
+    # Recursively compute λ-returns going backwards   
+    for t in reversed(range(len(continues))):
+        vals.append(interm[t] + continues[t] * lmbda * vals[-1])
+    # Return all values except the initial bootstrap value
+    ret = torch.cat(list(reversed(vals))[:-1])
+    return ret        
 
 class Split(torch.nn.Module):
     """
@@ -598,7 +611,7 @@ class Agent:
             modules=None,
             optimizers=((0.0001, 0.9, 0.999),),
             batch_size=64,
-            weight_decays=(0.5,),
+            weight_decays=(0.01,),
             update_freq=1,
             update_rate=0.005,
             discount=0.99,
@@ -923,7 +936,7 @@ class D2EAgent(Agent):
             grad_value_clipping=1.0,
             grad_norm_clipping=5.0,
             tau=0.001,
-            gae_lambda=0.9,
+            lambda_=0.95,
             **kwargs):
         self._alpha = alpha
         self._alpha_max = alpha_max
@@ -939,11 +952,15 @@ class D2EAgent(Agent):
         self._ensemble_q_lambda = ensemble_q_lambda
         self._grad_value_clipping = grad_value_clipping
         self._grad_norm_clipping = grad_norm_clipping
+        self._lambda = lambda_
+
+        # Initialize moments for adaptive normalization
+        self.moments = Moments(decay=0.99, max_val=1e8)
 
         self.qf_criterion = nn.MSELoss()
         self.vf_criterion = nn.MSELoss()
         self._tau = tau
-        self._gae_lambda = gae_lambda
+        
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         super(D2EAgent, self).__init__(**kwargs)
 
@@ -1064,7 +1081,7 @@ class D2EAgent(Agent):
         
         if self._value_penalty:
             target_v_next = target_v_next - self._get_alpha()[0] * div_estimate.squeeze()
-        
+        #Use method similar to Conservative Q-Learning (CQL) or Twin Delayed DDPG (TD3) techniques, where taking the minimum of multiple value estimates reduces overestimation bias.
         q1_target = r.to(device=self.device) + (
                 1.0 - done.float().to(device=self.device)) * self._discount * torch.minimum(target_v_next, v_current.squeeze()) 
         q_losses = []
@@ -1084,40 +1101,57 @@ class D2EAgent(Agent):
         info['q2_target_mean'] = torch.mean(q2_target)
         info['q1_target_mean'] = torch.mean(q1_target)
         info['v2_target_mean'] = torch.mean(target_v_next)  # added in D2E
-
+        del q_loss, q_losses, q1_preds, q2_targets, q2_target, q1_target, div_estimate
+        torch.cuda.empty_cache()
+        gc.collect()
         return loss, info
-
+    
     def _build_p_loss(self, batch):
         s = batch.s1
         a_b = batch.a1
         s2 = batch.s2
         batch_size, group_size = s.shape[0], s.shape[1]
-        
+    
         _, a_p, log_pi_a_p = self._p_fn(s.to(device=self.device))
-        
-        
+    
         for v_fn, _ in self._v_fns:
-            v_next = v_fn(s2.to(device=self.device))
             v_current = v_fn(s.to(device=self.device))
-        # Compute the GAE advantage.
-        # Assumes batch.reward and batch.done are available and have shape [B, T]
-        advantage = gae(
-                        value_current=v_current.reshape(batch_size, group_size),
-                        value_next=v_next.reshape(batch_size, group_size),
-                        reward=batch.reward.to(device=self.device), 
-                        terminated=batch.done.to(device=self.device),
-                        gamma=self._discount, 
-                        lam=self._gae_lambda,
-                        device=self.device
-                        )
         
+        # Calculate terminals and discounts for lambda returns
+        terminal_mask = (1.0 - batch.done.float()).to(device=self.device)
+        continues = terminal_mask * self._discount
+    
+        # Compute lambda returns instead of GAE
+        rewards = batch.reward.to(device=self.device)
+        values = v_current.reshape(batch_size, group_size)
+    
+        # Compute lambda returns
+        lambda_returns = compute_lambda_values(
+                                              rewards, 
+                                              values,
+                                              continues,
+                                              lmbda=self._lambda
+                                            )
+    
+        # Calculate advantages as lambda returns minus value estimates
+        advantages = lambda_returns - values
+    
+        # Apply adaptive normalization to advantages
+        offset, invscale = self.moments(advantages)
+        normalized_advantages = (advantages - offset) / invscale
+    
+        # Compute divergence estimate
         div_estimate = self._divergence.dual_estimate(
             s.to(device=self.device), a_p, a_b.to(device=self.device))
         div_estimate = div_estimate.reshape(batch_size, group_size)
+    
+        # Complete policy loss calculation with normalization
         q_start = torch.gt(self._global_step, self._warm_start).type(torch.float32)
         p_loss = torch.mean(
             self._get_alpha_entropy()[0] * log_pi_a_p
-            + self._get_alpha()[0] * div_estimate +advantage * q_start)
+            + self._get_alpha()[0] * div_estimate 
+            + normalized_advantages * q_start
+        )
 
         p_w_norm = self._get_p_weight_norm()
         norm_loss = self._weight_decays[1] * p_w_norm
@@ -1127,48 +1161,62 @@ class D2EAgent(Agent):
         info['p_loss'] = p_loss
         info['p_norm'] = p_w_norm
         info['v1_source_mean'] = v_current.mean()
-        info['advantage_mean'] = advantage.mean()
+        info['advantage_mean'] = advantages.mean()
+        info['normalized_advantage_mean'] = normalized_advantages.mean()
+        info['lambda_returns_mean'] = lambda_returns.mean()
+        del p_loss, div_estimate, advantages, normalized_advantages, offset, invscale
+        torch.cuda.empty_cache()
+        gc.collect()
         return loss, info
 
     def _build_v_loss(self, batch):
         s1 = batch.s1
         a_b = batch.a1
         # prepare data for f-gan
-        
+        batch_size, group_size = s1.shape[0], s1.shape[1]
         _, a_p, log_a_pi = self._p_fn(s1.to(device=self.device))
         #########################
         for v_fn, v_fn_target in self._v_fns:
             v_pred = v_fn(s1.to(device=self.device))
 
-        q1_pred = []
-        for q_fn, q_fn_target in self._q_fns:
-            q1_ = q_fn(s1.to(device=self.device), a_p)
-            q1_pred.append(q1_)
-
-        q1_pred = torch.stack(q1_pred, dim=-1)
-        q1_pred_ensemble = self.ensemble_q(q1_pred)
-        div_estimate = self._divergence.dual_estimate(
-            s1.to(device=self.device), a_p, a_b.to(device=self.device))
-        # https://github.com/AnujMahajanOxf/VIREL/blob/master/VIREL_code/beta.py
-        # https://github.com/haarnoja/sac/blob/8258e33633c7e37833cc39315891e77adfbe14b2/sac/algos/sac.py#L295
-        # https://github.com/rail-berkeley/rlkit/blob/60bdfcd09f48f73a450da139b2ba7910b8cede53/rlkit/torch/smac/pearl.py#L247
-        # Equation 20 in Dream to Explore paper
-        v_target = q1_pred_ensemble.squeeze() - self._get_alpha_entropy()[0] * log_a_pi - self._get_alpha()[0] * (
-                div_estimate.squeeze())
-        
-        # Calculate value loss using expectile regression
+        # Calculate terminals and discounts
+        terminal_mask = (1.0 - batch.done.float()).to(device=self.device)
+        continues = terminal_mask * self._discount
     
-        v_loss = WeightedLoss(v_pred.squeeze() - v_target.detach())
-
+    
+        # Calculate lambda returns using rewards and values
+        rewards = batch.reward.to(device=self.device)
+        values = v_pred.reshape(batch_size, group_size)
+    
+        lambda_returns = compute_lambda_values(
+                                            rewards,
+                                            values,
+                                            continues,
+                                            lmbda=self._lambda
+                                              )
+    
+        # Calculate divergence
+        div_estimate = self._divergence.dual_estimate(
+               s1.to(device=self.device), a_p, a_b.to(device=self.device))
+    
+        # Include the BRAC regularization in target
+        penalty = self._get_alpha()[0] * div_estimate.squeeze() - self._get_alpha_entropy()[0] * log_a_pi
+        v_target = lambda_returns - penalty.reshape(batch_size, group_size)
+    
+        # Use standard MSE loss instead of expectile regression
+        v_loss = F.mse_loss(values, v_target.detach())
+    
         v_w_norm = self._get_v_weight_norm()
         v_norm_loss = self._weight_decays[3] * v_w_norm
-        
-
+    
         loss = v_loss + v_norm_loss 
         info = collections.OrderedDict()
         info['value_loss'] = v_loss
-        info['vale_norm'] = v_w_norm
-
+        info['value_norm'] = v_w_norm
+        info['lambda_returns_mean'] = lambda_returns.mean()
+        del v_pred, s1, a_p, log_a_pi, v_target, penalty, div_estimate
+        torch.cuda.empty_cache()
+        gc.collect()
         return loss, info
 
     def _build_c_loss(self, batch):
@@ -1176,7 +1224,7 @@ class D2EAgent(Agent):
         a_b = batch.a1
         _, a_p, _ = self._p_fn(s.to(device=self.device))
         c_loss = self._divergence.dual_critic_loss(
-            s.to(device=self.device), a_p, a_b.to(device=self.device))
+            s.to(device=self.device), a_p.to(device=self.device), a_b.to(device=self.device))
         c_w_norm = self._get_c_weight_norm()
         norm_loss = self._weight_decays[2] * c_w_norm
         loss = c_loss + norm_loss
@@ -1184,7 +1232,9 @@ class D2EAgent(Agent):
         info = collections.OrderedDict()
         info['c_loss'] = c_loss
         info['c_norm'] = c_w_norm
-
+        del s, a_p, a_b  # ⬅️ Add this
+        torch.cuda.empty_cache()
+        gc.collect()
         return loss, info
 
     def _build_a_loss(self, batch):
@@ -1268,7 +1318,7 @@ class D2EAgent(Agent):
         self._p_optimizer.zero_grad()
 
         policy_loss, p_info = self._build_p_loss(batch)
-        policy_loss.backward(retain_graph=True)
+        policy_loss.backward()
 
         # Safely clip policy gradients if parameters have gradients
         if self._grad_norm_clipping > 0.:
@@ -1286,7 +1336,7 @@ class D2EAgent(Agent):
         
 
         value_loss, info_value = self._build_v_loss(batch)
-        value_loss.backward(retain_graph=True)
+        value_loss.backward()
 
         if self._grad_norm_clipping > 0.:
             torch.nn.utils.clip_grad_norm_(v_fn.parameters(), self._grad_norm_clipping)
@@ -1305,7 +1355,7 @@ class D2EAgent(Agent):
         self._q_source_optimizer.zero_grad()
 
         q_losses, q_info = self._build_q_loss(batch)
-        q_losses.backward(retain_graph=True)
+        q_losses.backward()
         if self._grad_norm_clipping > 0.:
             torch.nn.utils.clip_grad_norm_(q_fn.parameters(), self._grad_norm_clipping)
 
@@ -1367,8 +1417,11 @@ class D2EAgent(Agent):
     def _extra_c_step(self, batch):
         self._c_optimizer.zero_grad()
         self.critic_loss, _ = self._build_c_loss(batch)
-        self.critic_loss.backward(retain_graph=True)
+        self.critic_loss.backward()
         self._c_optimizer.step()
+        del batch
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def train_step(self):
         train_batch = self.get_train_batch()
@@ -1420,7 +1473,8 @@ class D2EAgent(Agent):
             "critic_optimizer": self._c_optimizer.state_dict(),
             "policy_optimizer": self._p_optimizer.state_dict(),
             "value_source_optimizer": self._v_source_optimizer.state_dict(),
-            "train_step": self._global_step
+            "train_step": self._global_step, 
+            "moment": self.moments.state_dict(),
         }
         for q_fn, q_fn_target in self._q_fns:
             checkpoint["q_net"] = q_fn.state_dict()
@@ -1451,6 +1505,7 @@ class D2EAgent(Agent):
         self._q_source_optimizer.load_state_dict(checkpoint["q_source_optimizer"])
         self._c_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self._v_source_optimizer.load_state_dict(checkpoint["value_source_optimizer"])
+        self.moments.load_state_dict(checkpoint["moment"])
         self._global_step = checkpoint["train_step"]
         if self._train_alpha:
             self._agent_module._alpha_var = checkpoint["alpha"]
