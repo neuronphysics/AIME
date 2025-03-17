@@ -1,6 +1,11 @@
 from WorldModel_D2E_Utils import *
 from dpgmm_stickbreaking_prior_vae import DPGMMVariationalAutoencoder
-
+import copy
+import numpy as np
+import torch
+import warnings
+from alf_environment import AlfEnvironmentBaseWrapper
+from tensor_specs import BoundedTensorSpec
 Transition = collections.namedtuple(
     'Transition', 's1, s2, a1, a2, discount, reward, done')
 
@@ -488,35 +493,62 @@ class StandardScaler(object):
         return output
 
 
-class NormalizeAction:
-    def __init__(self, env, key="action"):
-        self._env = env
-        self._key = key
-        space = env.act_space[key]
-        self._mask = np.isfinite(space.low) & np.isfinite(space.high)
-        self._low = np.where(self._mask, space.low, -1)
-        self._high = np.where(self._mask, space.high, 1)
 
-    def __getattr__(self, name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        try:
-            return getattr(self._env, name)
-        except AttributeError:
-            raise ValueError(name)
+class NormalizeAction(AlfEnvironmentBaseWrapper):
+    """
+    Normalizes actions from [-1, 1] to the environment's action range.
+    Maintains compatibility with ALF's time_step interface and D2E requirements.
+    """
 
-    @property
-    def act_space(self):
-        low = np.where(self._mask, -np.ones_like(self._low), self._low)
-        high = np.where(self._mask, np.ones_like(self._low), self._high)
-        space = gym.spaces.Box(low, high, dtype=np.float32)
-        return {**self._env.act_space, self._key: space}
+    def __init__(self, env):
+        super().__init__(env)
+        
+        # Original action spec and bounds
+        self._orig_action_spec = env.action_spec()
+        self._low = self._orig_action_spec.minimum
+        self._high = self._orig_action_spec.maximum
+        
+        # Create mask for dimensions with finite bounds
+        self._mask = np.isfinite(self._low) & np.isfinite(self._high)
+        
+        # Create normalized action spec
+        self._action_spec = self._create_normalized_spec()
 
-    def step(self, action):
-        orig = (action[self._key] + 1) / 2 * (self._high - self._low) + self._low
-        orig = np.where(self._mask, orig, action[self._key])
-        return self._env.step({**action, self._key: orig})
+    def _create_normalized_spec(self):
+        """Create [-1, 1] bounded spec for finite action dimensions."""
+        return BoundedTensorSpec(
+            shape=self._orig_action_spec.shape,
+            dtype=self._orig_action_spec.dtype,
+            minimum=np.where(self._mask, -np.ones_like(self._low), self._low),
+            maximum=np.where(self._mask, np.ones_like(self._high), self._high),
+            name='normalized_action'
+        )
 
+    def action_spec(self):
+        return self._action_spec
+
+    def _step(self, action):
+        """Denormalize action and step environment."""
+        # Convert tensor to numpy array if needed
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().numpy()
+        
+        # Validate action range
+        if np.any((action < -1.01) | (action > 1.01)):
+            warnings.warn("Actions outside [-1, 1] range detected after normalization. "
+                          "Clipping to valid range.")
+            action = np.clip(action, -1.0, 1.0)
+        
+        # Denormalize finite dimensions
+        denormalized = (action + 1) / 2 * (self._high - self._low) + self._low
+        denormalized = np.where(self._mask, denormalized, action)
+        
+        return self._env._step(denormalized)
+
+
+    def __repr__(self):
+        return f'NormalizeAction({self._env})'
+        
 
 class WorldModel(nn.Module):
     def __init__(self,
@@ -556,7 +588,7 @@ class WorldModel(nn.Module):
             width=self._params.image_height,
             camera_id=0,
         )
-
+        env = NormalizeAction(env)
         self._env = env
         self.n_discriminator_iter = self._params.n_critic
         self._use_amp = False
@@ -615,7 +647,9 @@ class WorldModel(nn.Module):
                                                                    learning_rate=self._params.lr,
                                                                    grad_clip=self._params.grad_clip,
                                                                    prior_alpha=self._params.prior_alpha,
-                                                                   prior_beta=self._params.prior_beta)
+                                                                   prior_beta=self._params.prior_beta,
+                                                                   create_optimizers=False  # Disable internal optimizers
+                                                                  )
         self.encoder = self.variational_autoencoder.encoder
         self.decoder = self.variational_autoencoder.decoder
         self.image_discriminator = self.variational_autoencoder.image_discriminator
@@ -627,6 +661,9 @@ class WorldModel(nn.Module):
             assert name in self.heads, name
 
         self.parameters = itertools.chain(
+            self.variational_autoencoder.encoder.parameters(),
+            self.variational_autoencoder.decoder.parameters(),
+            self.variational_autoencoder.prior.parameters(),
             self.transition_model.parameters(),
             self.heads["reward"].parameters(),
             self.heads["discount"].parameters(),
@@ -648,7 +685,21 @@ class WorldModel(nn.Module):
                                    wd=self._params.weight_decay,
                                    opt="adamw",
                                    use_amp=self._use_amp)
-
+        # Discriminator optimizers
+        self.image_disc_optimizer = Optimizer(
+                                        "img_discriminator",
+                                        self.image_discriminator.parameters(),
+                                        lr=self._params.lr,
+                                        wd=self._params.weight_decay,
+                                        opt="adamw"
+                                        )
+        self.latent_disc_optimizer = Optimizer(
+                                        "latent_discriminator",
+                                        self.latent_discriminator.parameters(),
+                                        lr=self._params.lr,
+                                        wd=self._params.weight_decay,
+                                        opt="adamw"
+                                        )
     def preprocess(self, observation, reward, done):
         if isinstance(observation, np.ndarray):
             if observation.max() > 1:
@@ -705,21 +756,43 @@ class WorldModel(nn.Module):
         self.transition_model.normalizer_output = normalizer_output
 
     def train_(self, data):
-        self.discriminator.train()
+        
 
         obs = torch.reshape(data.s1, (-1, self._params.n_channel, self._params.image_width,
                                       self._params.image_width)).to(self.device)
         next_obs = torch.reshape(data.s2, (-1, self._params.n_channel, self._params.image_width,
                                            self._params.image_width)).to(self.device)
 
-        losses, metrics, z_real = self.variational_autoencoder.training_step(obs, 
-                                                                             self._params.beta,
-                                                                             self._params.n_critic,
-                                                                             self._params.lambda_img,
-                                                                             self._params.lambda_latent)
-
-        self.transition_model.train()
+    
         
+        reconstruction, params = self.variational_autoencoder(obs)
+        
+        z_real = params['z']
+        prior_z = torch.randn_like(z_real)
+        # Compute losses
+        losses = self.variational_autoencoder.compute_loss(obs, reconstruction, params)
+
+        # Train discriminators
+        
+        for _ in range(self.n_discriminator_iter):
+            disc_loss = self.variational_autoencoder.discriminator_step(
+                obs, reconstruction, prior_z, z_real
+            )
+            self.image_disc_optimizer.zero_grad()
+            disc_loss['img_disc_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(self.image_discriminator.parameters(), self._grad_clip)
+            self.image_disc_optimizer.step()
+
+            # Update latent discriminator
+            self.latent_disc_optimizer.zero_grad()
+            disc_loss['latent_disc_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(self.latent_discriminator.parameters(), self._grad_clip)
+            self.latent_disc_optimizer.step()
+
+
+        # Train generator
+        gen_losses = self.variational_autoencoder.generator_step(obs , self._params.beta, self._params.lambda_img, self._params.lambda_latent)
+
         z_next, z_next_mean, z_next_logvar = self.encoder(next_obs)
 
         # Prepare & normalize the input/output data for the transition model
@@ -727,11 +800,9 @@ class WorldModel(nn.Module):
         reshaped_inputs = inputs.permute(0, 2, 1)
         reshaped_outputs = outputs.permute(0, 2, 1)
 
-        with torch.autocast(device_type='cuda', dtype=torch.float32) and torch.backends.cudnn.flags(enabled=False):
-            transition_loss, transition_disc_loss, hidden, real_embed, fake_embed, latent = self.transition_model(
+        transition_loss, transition_disc_loss, hidden, real_embed, fake_embed, latent = self.transition_model(
                 reshaped_inputs, reshaped_outputs)
-        with torch.backends.cudnn.flags(enabled=False):
-            transition_gradient_penalty = self.transition_model.wgan_gp_reg(real_embed, fake_embed)
+        transition_gradient_penalty = self.transition_model.wgan_gp_reg(real_embed, fake_embed)
         # reward prediction and computing discount factor
         likes, losses = {}, {}
         for name, head in self.heads.items():
@@ -744,20 +815,28 @@ class WorldModel(nn.Module):
                 likes[key] = like
                 losses[key] = -like.mean()
         model_loss = sum(self.loss_scales.get(k, 1.0) * v for k, v in losses.items())
-
+        metrics = {}
         # reward and discount losses
         for k, v in losses.items():
             metrics.update({k + "_loss": v.detach().cpu()})
 
         metrics["transition_total_loss"] = transition_loss + transition_disc_loss + transition_gradient_penalty
 
-        metrics["total_model_loss"] = metrics["total_observe_loss"] + metrics["transition_total_loss"] + model_loss
-        metrics["total_model_loss"].backward(retain_graph=True)
+        metrics["total_model_loss"] =  metrics["transition_total_loss"] + model_loss + gen_losses['total_loss'] 
+        
+        self.optimizer.zero_grad()
+        metrics["total_model_loss"].backward()
         nn.utils.clip_grad_norm_(self.parameters, self._params.MAX_GRAD_NORM, norm_type=2)
         self.optimizer.step_()
+        # Update discriminators
+        
 
-        self.writer.add_scalar('WM/variational_autoencoder_loss', metrics["total_observe_loss"].item(),
+
+        self.writer.add_scalar('WM/variational_autoencoder_loss', gen_losses['total_loss'].item(),
                                global_step=self.writer_counter)
+        self.writer.add_scalar('WM/vae_img_disc_loss', disc_loss['img_disc_loss'].item(), global_step=self.writer_counter)
+        self.writer.add_scalar('WM/vae_latent_disc_loss', disc_loss['latent_disc_loss'].item(), global_step=self.writer_counter)
+        self.writer.add_scalar('WM/vae_recon_loss', gen_losses[0]["recon_loss"].item(), global_step=self.writer_counter)
         self.writer.add_scalar('WM/transition_loss', metrics["transition_total_loss"].item(),
                                global_step=self.writer_counter)
         self.writer.add_scalar('WM/reward_loss', metrics["reward_loss"].item(), global_step=self.writer_counter)
@@ -848,10 +927,12 @@ class WorldModel(nn.Module):
             {'transition_model': self.transition_model.state_dict(),
              'reward_model': self.heads['reward'].state_dict(),
              'observation_model': self.variational_autoencoder.state_dict(),
-             'observation_discriminator_model': self.discriminator.state_dict(),
+             'observation_discriminator_model': self.image_discriminator.state_dict(),
+             'latent_discriminator_model': self.latent_discriminator.state_dict(),
              'discount_model': self.heads['discount'].state_dict(),
              'done_model': self.heads['done'].state_dict(),
-             'discriminator_optimizer': self.discriminator_optim.state_dict(),
+             'img_discriminator_optimizer': self.img_disc_optim.state_dict(),
+             'latent_discriminator_optimizer': self.latent_disc_optim.state_dict(),
              'world_model_optimizer': self.optimizer.state_dict(), }, self.save_path)
 
     def load_checkpoints(self):
@@ -859,12 +940,14 @@ class WorldModel(nn.Module):
             model_dicts = torch.load(self.save_path, map_location=self.device)
             self.transition_model.load_state_dict(model_dicts['transition_model'])
             self.variational_autoencoder.load_state_dict(model_dicts['observation_model'])
-            self.discriminator.load_state_dict(model_dicts['observation_discriminator_model'])
+            self.image_discriminator.load_state_dict(model_dicts['observation_discriminator_model'])
+            self.latent_discriminator.load_state_dict(model_dicts['latent_discriminator_model'])
             self.heads['reward'].load_state_dict(model_dicts['reward_model'])
             self.heads['discount'].load_state_dict(model_dicts['discount_model'])
             self.heads['done'].load_state_dict(model_dicts['done_model'])
             self.optimizer.load_state_dict(model_dicts['world_model_optimizer'])
-            self.discriminator_optim.load_state_dict(model_dicts['discriminator_optimizer'])
+            self.img_disc_optim.load_state_dict(model_dicts['img_discriminator_optimizer'])
+            self.latent_disc_optim.load_state_dict(model_dicts['latent_discriminator_optimizer'])
             print("Loading models checkpoints!")
         else:
             print("Checkpoints not found!")

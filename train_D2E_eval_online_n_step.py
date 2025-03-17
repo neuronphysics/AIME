@@ -235,12 +235,12 @@ if __name__ == '__main__':
 
     parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.')
     parser.add_argument('--seed', type=int, default=0, help='random seed, mainly for training samples.')
-    parser.add_argument('--total_train_steps', type=int, default=int(5e5), help='')
+    parser.add_argument('--total_train_steps', type=int, default=int(5e6), help='')
     parser.add_argument('--n_eval_episodes', type=int, default=int(20), help='')
 
     parser.add_argument('--gin_file', type=str, default=[], nargs='*', help='Paths to the gin-config files.')
     parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help='Gin binding parameters.')
-    parser.add_argument('--group_size', type=int, default=15, help='number of steps required for general advantage'
+    parser.add_argument('--group_size', type=int, default=50, help='number of steps required for general advantage'
                                                                    ' estimator')
     args = parser.parse_args(sys.argv[1:])
     config.update(vars(args))

@@ -649,7 +649,8 @@ class DPGMMVariationalAutoencoder(nn.Module):
         learning_rate: float = 1e-5,
         grad_clip:float =1.0,
         prior_alpha: float = 1.0,  # Add these parameters
-        prior_beta: float = 1.0
+        prior_beta: float = 1.0,
+        create_optimizers: bool = True  # Add this parameter
     ):
         super().__init__()
         self.max_K = max_components
@@ -705,31 +706,33 @@ class DPGMMVariationalAutoencoder(nn.Module):
             num_layers=latent_disc_layers,
             norm_type='layer'
         ).to(device)
-
-        # Separate optimizers
-        self.gen_optimizer = torch.optim.AdamW(
-            list(self.encoder.parameters()) +
-            list(self.decoder.parameters()) +
-            list(self.prior.parameters()),
-            lr= self._lr, 
-            betas=(0.9, 0.999),
-            weight_decay=0.01
-        )
-        self.img_disc_optimizer = torch.optim.AdamW(
-            self.image_discriminator.parameters(),
-            lr= self._lr, 
-            betas=(0.9, 0.999),
-            weight_decay=0.01
-        )
-        self.latent_disc_optimizer = torch.optim.AdamW(
-            self.latent_discriminator.parameters(),
-            lr= self._lr, 
-            betas=(0.9, 0.999),
-            weight_decay=0.01
-        )
-        self.gen_scheduler = get_improved_scheduler(self.gen_optimizer)
-        self.img_disc_scheduler = get_improved_scheduler(self.img_disc_optimizer)
-        self.latent_disc_scheduler = get_improved_scheduler(self.latent_disc_optimizer)
+        
+        self.has_optimizers = create_optimizers
+        if self.has_optimizers:
+            # Separate optimizers
+            self.gen_optimizer = torch.optim.AdamW(
+                list(self.encoder.parameters()) +
+                list(self.decoder.parameters()) +
+                list(self.prior.parameters()),
+                lr= self._lr, 
+                betas=(0.9, 0.999),
+                weight_decay=0.01
+            )
+            self.img_disc_optimizer = torch.optim.AdamW(
+                self.image_discriminator.parameters(),
+                lr= self._lr, 
+                betas=(0.9, 0.999),
+                weight_decay=0.01
+            )
+            self.latent_disc_optimizer = torch.optim.AdamW(
+                self.latent_discriminator.parameters(),
+                lr= self._lr, 
+                betas=(0.9, 0.999),
+                weight_decay=0.01
+            )
+            self.gen_scheduler = get_improved_scheduler(self.gen_optimizer)
+            self.img_disc_scheduler = get_improved_scheduler(self.img_disc_optimizer)
+            self.latent_disc_scheduler = get_improved_scheduler(self.latent_disc_optimizer)
 
         # Add step counter for schedulers
         self.current_steps = 0
@@ -1004,6 +1007,7 @@ class DPGMMVariationalAutoencoder(nn.Module):
         """
         Training step for both discriminators
         """
+
         # Image discriminator
         real_img_score = self.image_discriminator(real_images)
         fake_img_score = self.image_discriminator(fake_images.detach())
@@ -1035,32 +1039,45 @@ class DPGMMVariationalAutoencoder(nn.Module):
             torch.mean(fake_latent_score) - torch.mean(real_latent_score) +
             10.0 * latent_gp
         )
+        result = {
+            'img_disc_loss': img_disc_loss,
+            'latent_disc_loss': latent_disc_loss,
+            'img_gp': img_gp,
+            'latent_gp': latent_gp,
+            'real_img_score': real_img_score.mean(),
+            'fake_img_score': fake_img_score.mean(),
+            'real_latent_score': real_latent_score.mean(),
+            'fake_latent_score': fake_latent_score.mean()
+            }
+    
+        # Only perform optimization if optimizers exist and we're configured to use them
+        if self.has_optimizers and hasattr(self, 'img_disc_optimizer') and hasattr(self, 'latent_disc_optimizer'):
+            # Update image discriminator
+            self.img_disc_optimizer.zero_grad()
+            img_disc_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.image_discriminator.parameters(), self._grad_clip)
+            self.img_disc_optimizer.step()
 
-        # Update discriminators
-        self.img_disc_optimizer.zero_grad()
-        img_disc_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.image_discriminator.parameters(), self._grad_clip)
-        self.img_disc_optimizer.step()
-
-        self.latent_disc_optimizer.zero_grad()
-        latent_disc_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.latent_discriminator.parameters(), self._grad_clip)
-        self.latent_disc_optimizer.step()
-        # Step the discriminator schedulers
-        self.img_disc_scheduler.step()
-        self.latent_disc_scheduler.step()
-        return {
-            'img_disc_loss': img_disc_loss.item(),
-            'latent_disc_loss': latent_disc_loss.item(),
-            'img_disc_lr': self.img_disc_scheduler.get_last_lr()[0],
-            'latent_disc_lr': self.latent_disc_scheduler.get_last_lr()[0],
-            'img_gp': img_gp.item(),
-            'latent_gp': latent_gp.item(),
-            'real_img_score': real_img_score.mean().item(),
-            'fake_img_score': fake_img_score.mean().item(),
-            'real_latent_score': real_latent_score.mean().item(),
-            'fake_latent_score': fake_latent_score.mean().item()
-        }
+            # Update latent discriminator
+            self.latent_disc_optimizer.zero_grad()
+            latent_disc_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.latent_discriminator.parameters(), self._grad_clip)
+            self.latent_disc_optimizer.step()
+        
+            # Step the discriminator schedulers if available
+            if hasattr(self, 'img_disc_scheduler') and hasattr(self, 'latent_disc_scheduler'):
+                self.img_disc_scheduler.step()
+                self.latent_disc_scheduler.step()
+                # Add learning rates to result if available
+                result['img_disc_lr'] = self.img_disc_scheduler.get_last_lr()[0]
+                result['latent_disc_lr'] = self.latent_disc_scheduler.get_last_lr()[0]
+        
+            # Convert tensor values to items for return value when optimization is performed
+            #for key in list(result.keys()):
+            #    if torch.is_tensor(result[key]):
+            #        result[key] = result[key].item()
+    
+        return result
 
     def compute_adversarial_losses(
         self,
@@ -1127,23 +1144,33 @@ class DPGMMVariationalAutoencoder(nn.Module):
             lambda_latent * latent_adv_loss + # Latent adversarial loss
             feature_match_loss  # Feature matching loss
         )
+        result = {
+                **vae_losses,
+                'img_adv_loss': img_adv_loss,
+                'latent_adv_loss': latent_adv_loss,
+                'total_loss': total_loss,
+                'feature_match_loss': feature_match_loss
+            }
+        if self.has_optimizers and hasattr(self, 'gen_optimizer'):
+            # Optimize generator
+            torch.cuda.empty_cache()
 
-        # Optimize generator
-        torch.cuda.empty_cache()
+            self.gen_optimizer.zero_grad()
+            total_loss.backward()
 
-        self.gen_optimizer.zero_grad()
-        total_loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(self.parameters(), self._grad_clip)
-        self.gen_optimizer.step()
-        self.gen_scheduler.step()
-        return {
-            **vae_losses,
-            'gen_lr': self.gen_scheduler.get_last_lr()[0],
-            'img_adv_loss': img_adv_loss.item(),
-            'latent_adv_loss': latent_adv_loss.item(),
-            'total_loss': total_loss.item()
-        }
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self._grad_clip)
+            self.gen_optimizer.step()
+        
+            if hasattr(self, 'gen_scheduler'):
+                self.gen_scheduler.step()
+                result['gen_lr'] = self.gen_scheduler.get_last_lr()[0]
+        
+            # Convert tensor values to items for return value when optimization is performed
+            #for key in list(result.keys()):
+            #    if torch.is_tensor(result[key]):
+            #        result[key] = result[key].item()
+    
+        return result       
 
     def training_step(self,
                       x: torch.Tensor,
