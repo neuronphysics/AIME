@@ -168,7 +168,6 @@ class D2EAlgorithm(nn.Module):
             self.task_behavior._get_v_source_vars(),
             self.task_behavior._a_vars,
             self.task_behavior._ae_vars,
-            self.task_behavior._transit_discriminator.parameters()
         )
         self.task_behavior_reply_buffer.current_size -= config.batch_size
 
@@ -329,6 +328,7 @@ def main(config):
                 width=config.image_width,    
                 camera_id=0,
             )
+            new_env = NormalizeAction(new_env)
             
             new_env = FrameSkip(new_env, config.action_repeat)
             new_env = wrap_env(new_env,

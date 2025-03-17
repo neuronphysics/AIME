@@ -1,3 +1,4 @@
+from __future__ import annotations
 import numpy
 import gc
 import utils_planner as utils
@@ -8,17 +9,21 @@ from torch.distributions import transforms as tT
 from torch.distributions.transformed_distribution import TransformedDistribution
 from torch.autograd import Variable
 import collections
-from typing import Callable, List
 import numpy as np
 import os
 import gin
-from absl import logging
+import absl 
+import logging
 import tensor_specs
 from torch.distributions import Normal, Independent, MultivariateNormal
 import torch.distributions as pyd
 import math
 from f_divergence import Discriminator
-
+from abc import ABC, abstractmethod
+from typing import Any, Callable, Dict, List, Optional, Union, cast, Tuple
+import dataclasses
+from dataclasses import dataclass, field
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 local_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 
@@ -766,29 +771,341 @@ class Agent:
     @property
     def global_step(self):
         return self._global_step.numpy()
+###############################################
+##################  Networks  #################
+###############################################
+#source:https://github.com/facebookresearch/ReAgent
+class Sampler(ABC):
+    """Given scores, select the action."""
+
+    @abstractmethod
+    def sample_action(self, scores: Any) -> rlt.ActorOutput:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def log_prob(self, scores: Any, action: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError()
+
+    def update(self) -> None:
+        """Call to update internal parameters (e.g. decay epsilon)"""
+        pass
+
+class NoDuplicatedWarningLogger:
+    def __init__(self, logger):
+        self.logger = logger
+        self.msg = set()
+
+    def warning(self, msg):
+        if msg not in self.msg:
+            self.logger.warning(msg)
+            self.msg.add(msg)
 
 
-class ContinuousRandomPolicy(nn.Module):
-    """Samples actions uniformly at random."""
+logger = logging.getLogger(__name__)
+no_dup_logger = NoDuplicatedWarningLogger(logger)
 
-    def __init__(self, action_spec):
-        super(ContinuousRandomPolicy, self).__init__()
-        self._action_spec = action_spec
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        self.to(device=self.device)
+# From preprocessed observation, produce scores for sampler to select action
+DiscreteScorer = Callable[[Any, Optional[torch.Tensor]], Any]
+ContinuousScorer = Callable[[Any], Any]
+Scorer = Union[DiscreteScorer, ContinuousScorer]
+IdListFeatureValue = Tuple[torch.Tensor, torch.Tensor]
+# (offset, key, value)
+IdScoreListFeatureValue = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+# name -> value
+IdListFeature = Dict[str, IdListFeatureValue]
+IdScoreListFeature = Dict[str, IdScoreListFeatureValue]
 
-    def __call__(self, observation):
-        action = tensor_specs.sample_bounded_spec(
-            self._action_spec,
-            # outer_dims=[observation.shape[0]]
+@dataclasses.dataclass
+class BaseDataClass:
+    def _replace(self, **kwargs) -> BaseDataClass:
+        return dataclasses.replace(self, **kwargs)
+   
+@dataclass
+class TensorDataClass(BaseDataClass):
+    def __getattr__(self, attr):
+        if attr.startswith("__") and attr.endswith("__"):
+            raise AttributeError
+
+        tensor_attr = getattr(torch.Tensor, attr, None)
+
+        if tensor_attr is None or not callable(tensor_attr):
+            # TODO: can we get this working well with jupyter?
+            
+            print(f"Attempting to call {self.__class__.__name__}.{attr} on "f"{type(self)} (instance of TensorDataClass).")
+
+            if tensor_attr is None:
+                raise AttributeError(
+                    f"{self.__class__.__name__}doesn't have {attr} attribute."
+                )
+            else:
+                raise RuntimeError(f"{self.__class__.__name__}.{attr} is not callable.")
+
+        def continuation(*args, **kwargs):
+            def f(v):
+                # if possible, returns v.attr(*args, **kwargs).
+                # otws, return v
+                if (
+                    isinstance(v, (torch.Tensor, TensorDataClass, KeyedJaggedTensor))
+                    and getattr(v, attr, None) is not None
+                ):
+                    return getattr(v, attr)(*args, **kwargs)
+                elif isinstance(v, dict):
+                    return {kk: f(vv) for kk, vv in v.items()}
+                elif isinstance(v, tuple):
+                    return tuple(f(vv) for vv in v)
+                return v
+
+            return type(self)(**f(self.__dict__))
+
+        return continuation
+
+    def cuda(self, *args, **kwargs):
+        cuda_tensor = {}
+        for k, v in self.__dict__.items():  # noqa F402
+            if isinstance(v, torch.Tensor):
+                kwargs["non_blocking"] = kwargs.get("non_blocking", True)
+                cuda_tensor[k] = v.cuda(*args, **kwargs)
+            elif isinstance(v, TensorDataClass):
+                cuda_tensor[k] = v.cuda(*args, **kwargs)
+            else:
+                cuda_tensor[k] = v
+        return type(self)(**cuda_tensor)
+
+    def cpu(self):
+        cpu_tensor = {}
+        for k, v in self.__dict__.items():  # noqa F402
+            if isinstance(v, (torch.Tensor, TensorDataClass)):
+                cpu_tensor[k] = v.cpu()
+            else:
+                cpu_tensor[k] = v
+        return type(self)(**cpu_tensor)
+
+@torch.fx.wrap
+def run_post_init_validation(
+    float_features: torch.Tensor,
+) -> None:
+    usage: str = (
+        "For sequence features, use `stacked_float_features`."
+        + "For document features, use `candidate_doc_float_features`."
+    )
+
+    if float_features.ndim == 3:
+        if not torch.jit.is_scripting():
+            no_dup_logger.warning(f"`float_features` should be 2D.\n{usage}")
+        pass
+    elif float_features.ndim != 2:
+        raise ValueError(
+            f"float_features should be 2D; got {float_features.shape}.\n{usage}"
         )
-        return action
+
+@dataclass
+class DocList(TensorDataClass):
+    # the shape is (batch_size, num_candidates, num_document_features)
+    float_features: torch.Tensor
+    # the shapes below are (batch_size, num_candidates)
+    # mask indicates whether the candidate is present or not; its dtype is torch.bool
+    # pyre-fixme[8]: Attribute has type `Tensor`; used as `None`.
+    mask: torch.Tensor = None
+    # value is context dependent; it could be action probability or the score
+    # of the document from another model
+    # pyre-fixme[8]: Attribute has type `Tensor`; used as `None`.
+    value: torch.Tensor = None
+
+    def __post_init__(self):
+        assert (
+            len(self.float_features.shape) == 3
+        ), f"Unexpected shape: {self.float_features.shape}"
+        if self.mask is None:
+            self.mask = self.float_features.new_ones(
+                self.float_features.shape[:2], dtype=torch.bool
+            )
+        if self.value is None:
+            self.value = self.float_features.new_ones(self.float_features.shape[:2])
+
+    @torch.no_grad()
+    def select_slate(self, action: torch.Tensor):
+        row_idx = torch.repeat_interleave(
+            torch.arange(action.shape[0]).unsqueeze(1), action.shape[1], dim=1
+        )
+        mask = self.mask[row_idx, action]
+        float_features = self.float_features[row_idx, action]
+        value = self.value[row_idx, action]
+        return DocList(float_features, mask, value)
+
+    def as_feature_data(self):
+        _batch_size, _slate_size, feature_dim = self.float_features.shape
+        return FeatureData(self.float_features.view(-1, feature_dim))
+
+@dataclass
+class FeatureData(TensorDataClass):
+    # For dense features, shape is (batch_size, feature_dim)
+    float_features: torch.Tensor
+    # For sparse features saved in KeyedJaggedTensor format
+    id_list_features: Optional[KeyedJaggedTensor] = None
+    id_score_list_features: Optional[KeyedJaggedTensor] = None
+
+    # For sparse features saved in dictionary format
+    id_list_features_raw: IdListFeature = dataclasses.field(default_factory=dict)
+    id_score_list_features_raw: IdScoreListFeature = dataclasses.field(
+        default_factory=dict
+    )
+
+    # For sequence, shape is (stack_size, batch_size, feature_dim)
+    stacked_float_features: Optional[torch.Tensor] = None
+    # For ranking algos,
+    candidate_docs: Optional[DocList] = None
+    # Experimental: sticking this here instead of putting it in float_features
+    # because a lot of places derive the shape of float_features from
+    # normalization parameters.
+    time_since_first: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        run_post_init_validation(
+            float_features=self.float_features,
+        )
+
+    @property
+    def has_float_features_only(self) -> bool:
+        return (
+            not self.id_list_features
+            and not self.id_score_list_features
+            and self.time_since_first is None
+            and self.candidate_docs is None
+        )
+
+    def get_tiled_batch(self, num_tiles: int):
+        assert (
+            self.has_float_features_only
+        ), f"only works for float features now: {self}"
+        """
+        tiled_feature should be (batch_size * num_tiles, feature_dim)
+        forall i in [batch_size],
+        tiled_feature[i*num_tiles:(i+1)*num_tiles] should be feat[i]
+        """
+        feat = self.float_features
+        assert (
+            len(feat.shape) == 2
+        ), f"Need feat shape to be (batch_size, feature_dim), got {feat.shape}."
+        batch_size, _ = feat.shape
+        tiled_feat = feat.repeat_interleave(repeats=num_tiles, dim=0)
+        return FeatureData(float_features=tiled_feat)
+
+    def concat_user_doc(self):
+        assert not self.has_float_features_only, "only works when DocList present"
+        assert self.float_features.dim() == 2  # batch_size x state_dim
+        batch_size, state_dim = self.float_features.shape
+        # batch_size x num_docs x candidate_dim
+        assert self.candidate_docs.float_features.dim() == 3
+        assert len(self.candidate_docs.float_features) == batch_size
+        _, num_docs, candidate_dim = self.candidate_docs.float_features.shape
+        state_tiled = (
+            torch.repeat_interleave(self.float_features, num_docs, dim=0)
+            .reshape(batch_size, num_docs, state_dim)
+            .float()
+        )
+        return torch.cat((state_tiled, self.candidate_docs.float_features), dim=2)
+
+    def get_ranking_state(self, has_user_feat: bool):
+        if has_user_feat:
+            return self.concat_user_doc()
+        else:
+            # pyre-fixme[16]: `Optional` has no attribute `float_features`.
+            return self.candidate_docs.float_features.float()
 
 
+@dataclass
+class ActorOutput(TensorDataClass):
+    action: torch.Tensor
+    log_prob: Optional[torch.Tensor] = None
+    squashed_mean: Optional[torch.Tensor] = None
+
+class AgentPolicy:
+    def __init__(self, scorer: Scorer, sampler: Sampler) -> None:
+        """
+        The Policy composes the scorer and sampler to create actions.
+
+        Args:
+            scorer: given preprocessed input, outputs intermediate scores
+                used for sampling actions
+            sampler: given scores (from the scorer), samples an action.
+        """
+        self.scorer = scorer
+        self.sampler = sampler
+
+    def act(
+        self, obs: Any, possible_actions_mask: Optional[torch.Tensor] = None
+    ) -> ActorOutput:
+        """
+        Performs the composition described above.
+        These are the actions being put into the replay buffer, not necessary
+        the actions taken by the environment!
+        """
+        scorer_inputs = (obs,)
+        if possible_actions_mask is not None:
+            scorer_inputs += (possible_actions_mask,)
+        scores = self.scorer(*scorer_inputs)
+        actor_output = self.sampler.sample_action(scores)
+        return actor_output.cpu().detach()
+
+class Policy(AgentPolicy):
+    def __init__(self, scorer: Scorer, sampler: Sampler) -> None:
+        super().__init__(scorer=scorer, sampler=sampler)
+
+    def act(
+        self, obs: Any, possible_actions_mask: Optional[torch.Tensor] = None
+    ) -> ActorOutput:
+        """
+        Chooses the best arm from a set of availabe arms based on contextual features.
+        GreedyActionSampler may be applied.
+        """
+        scorer_inputs = (obs,)
+        if possible_actions_mask is not None:
+            scorer_inputs += (possible_actions_mask,)
+        model_output = self.scorer(*scorer_inputs)
+        scores = model_output["ucb"]
+        actor_output = self.sampler.sample_action(scores)
+        return actor_output.cpu().detach()
+
+class ContinuousRandomPolicy(Policy):
+    def __init__(self, action_spec) -> None:
+        self.action_spec = action_spec
+        
+        self.low = torch.full(action_spec.shape, float(action_spec.minimum), dtype=torch.float32)
+        self.high = torch.full(action_spec.shape, float(action_spec.maximum), dtype=torch.float32)
+
+        self.dist = torch.distributions.uniform.Uniform(self.low, self.high)
+
+    @classmethod
+    def create_for_env(cls, env) -> "ContinuousRandomPolicy":
+        return cls(env.action_spec())
+    
+    def act(
+        self, obs: Any, possible_actions_mask: Optional[torch.Tensor] = None
+    ) -> ActorOutput:
+        """Act randomly regardless of the observation."""
+        # Convert to tensor if necessary and ensure batch dimension
+        if isinstance(obs, np.ndarray):
+            obs = torch.from_numpy(obs).float()
+        elif not isinstance(obs, torch.Tensor):
+            obs = torch.tensor(obs, dtype=torch.float32)
+        
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)  # Add batch dimension if missing
+        
+        batch_size = obs.size(0)
+        action = self.dist.sample((batch_size,))
+        log_prob = self.dist.log_prob(action).sum(-1)
+
+        # Remove batch dimension if single sample
+        if batch_size == 1:
+            action = action.squeeze(0)  # Shape: [action_dim]
+            
+        return ActorOutput(action=action, log_prob=log_prob)
+        
 class GaussianRandomSoftPolicy(nn.Module):
     """Adds Gaussian noise to actor's action."""
 
-    def __init__(self, a_network, std=0.1, clip_eps=1e-3):
+    def __init__(self, a_network, std=0.3, clip_eps=1e-3):
         super(GaussianRandomSoftPolicy, self).__init__()
         self._a_network = a_network
         self._std = std
@@ -828,12 +1145,13 @@ class RandomSoftPolicy(nn.Module):
     def __init__(self, a_network):
         super(RandomSoftPolicy, self).__init__()
         self._a_network = a_network
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.device = next(a_network.parameters()).device  # Match device
         self.to(device=self.device)
 
-    def __call__(self, latent_states):
-        action = self._a_network(latent_states)[1]
-        return action
+    def act(self, obs: Any, possible_actions_mask: Optional[torch.Tensor] = None) -> ActorOutput:
+        
+        _, action, log_prob = self._a_network(obs.to(self.device))
+        return ActorOutput(action=action, log_prob=log_prob)
 
 
 class MaxQSoftPolicy(nn.Module):
