@@ -174,12 +174,9 @@ class D2EAlgorithm(nn.Module):
     def train_(self, data, state=None):
         """
         List of operations happen here in this module 
-        1)train the world model
-        2)imagine state, action, reward, and discount from the world model
-        3) normalize reward
-        4) update reward and put them as an appropriate format to train D2E agent
-        5) train the policy
-        6) we should minimize the difference between the reward and discount (maybe observation) here too???
+        1) train the world model on read data
+        2) generate starting state from real observation for imagine state, action, reward, and discount from the world model
+        3) imagine trajectories and train policy on the imagined trajectories
         """
 
         metrics = {}
@@ -276,7 +273,7 @@ class D2EAlgorithm(nn.Module):
         # )
         # policy_state = latent.clone().detach().squeeze(-1)
         if mode == "eval":
-            a_tanh_mode, action, log_pi_a = self.task_behavior._p_fn(policy_state)
+            a_tanh_mode, action, log_pi_a, entropy_pi_a = self.task_behavior._p_fn(policy_state)
             noise = self.parameter.eval_noise
         elif mode in ["explore", "train"]:
             action = self.task_behavior._p_fn(policy_state)[1]
@@ -403,6 +400,7 @@ def main(config):
     train_driver = Driver(train_envs)
     train_driver.on_episode(lambda ep: per_episode_record(ep, mode="train"))
     train_driver.on_step(lambda tran, worker: step.increment())
+    #Each collected transition is added to the replay buffer through callbacks:
     train_driver.on_step(train_replay.add_step)
     train_driver.on_reset(train_replay.add_step)
     eval_driver = Driver(eval_envs)
@@ -413,7 +411,7 @@ def main(config):
     prefill = max(0, config.prefill - train_replay.stats["total_steps"])
     if prefill and config.load_prefill != 1:
         print(f"Prefill dataset ({prefill} steps).")
-
+        #create a random actor: initial exploration phase
         proto_act_space = train_envs[0]._env.gym.action_space
         random_actor = torch.distributions.independent.Independent(
             torch.distributions.uniform.Uniform(torch.Tensor(proto_act_space.low)[None],
@@ -474,6 +472,9 @@ def main(config):
 
     def train_model(tran, worker):
         # every few step in the env, we will train the agent
+        """
+        The core training happens in the train_step function, which is called after each environment step
+        """
         if should_train(step):
             for _ in range(config.train_steps):
                 mets = model.train_(dict_to_tran(next(train_dataset_generator)))
@@ -495,6 +496,7 @@ def main(config):
     while cur_epoch < config.num_train_epoch:
         writer_wrapper.log_dict(model.report(next(eval_dataset_generator)), "eval_report", cur_epoch)
         eval_driver(eval_policy, episodes=config.eval_eps)
+        # Collect more data with the current policy during training during training phase
         # if it does not finish an episode, it will continue from where it left
         train_driver(train_policy, steps=config.train_epoch_length)
         cur_epoch += 1

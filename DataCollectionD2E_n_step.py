@@ -60,11 +60,12 @@ def get_transition(time_step, next_time_step, action, next_action):
 def strip_action(action):
     action = action.detach().cpu().numpy()
     if action.ndim == 0:
-        action = action.expand_dims(axis=0)
+        action = np.expand_dims(action,axis=0)
     elif action.ndim > 2:
         action = action.squeeze()
     if action.ndim == 2 and action.shape[0] == 1:
         action = action.squeeze(0)
+    
     return action
 
 class DataCollector(object):
@@ -79,51 +80,88 @@ class DataCollector(object):
         if self._current_time_step is None or self._current_time_step.is_last():
             self._current_time_step = self._env.reset()
             self._saved_action = None
+            logging.info("Environment reset - starting new episode")
 
         if self._saved_action is None:
             self._saved_action = self._safe_get_action(self._current_time_step.observation)
 
+
         transition = NStepTransitions(
-            start_time_step=self._current_time_step,
-            start_action=self._saved_action
+              start_time_step=self._current_time_step,
+              start_action=self._saved_action
         )
-        
+    
         steps_collected = 0
         terminal_encountered = False
-
-        for _ in range(n_steps):
+        episode_step_counter = getattr(self, '_episode_step_counter', 0)
+    
+        for step in range(n_steps):
+            # Track episode step count (globally across transitions)
+            episode_step_counter += 1
             next_time_step = self._env.step(self._saved_action)
             steps_collected += 1
 
+            # Enhanced termination logging
             if next_time_step.is_last():
                 terminal_encountered = True
                 next_action = None
-                logging.info("Terminal step encountered at step %d", steps_collected)
+            
+                # Try to determine termination reason
+                if hasattr(self._env, '_max_episode_steps') and episode_step_counter >= self._env._max_episode_steps:
+                    reason = "max episode steps reached"
+                elif hasattr(next_time_step, 'discount') and next_time_step.discount == 0.0:
+                    reason = "environment signaled termination (discount=0)"
+                elif hasattr(next_time_step, 'reward') and next_time_step.reward <= -100:
+                    reason = "large negative reward (potential failure state)"
+                else:
+                    reason = "unknown reason (inspect environment internals)"
+                
+                logging.info(f"Terminal step encountered at step {steps_collected} (episode step {episode_step_counter}). "
+                        f"Reason: {reason}. Reward: {next_time_step.reward}")
+            
+                # Reset episode counter
+                episode_step_counter = 0
             else:
                 next_action = self._safe_get_action(next_time_step.observation)
+            
+                # Log step info occasionally to track progress
+                ##DEBUG
+                #if episode_step_counter % 100 == 0:
+                #    logging.info(f"Episode continuing - step {episode_step_counter}, reward: {next_time_step.reward}")
 
             transition.add_step(next_time_step, next_action)
             if terminal_encountered:
                 break
             else:
-               self._current_time_step = next_time_step
-               self._saved_action = next_action
+                self._current_time_step = next_time_step
+                self._saved_action = next_action
+
+        # Store the episode counter for the next call
+        self._episode_step_counter = episode_step_counter
 
         if steps_collected > 0:
             final_transition = transition.get_transition(group_size=n_steps)
             self._validate_transition(final_transition, terminal_encountered)
+            # Log reward statistics for debugging
+            #logging.info(f"Collected {steps_collected} steps. " f"Rewards: {final_transition.reward}")
+            
+            #logging.info(f"Adding transition with {steps_collected} steps collected. " f"Terminal: {terminal_encountered}. " f"Group size: {n_steps}")
+        
             self._data.add_transitions(final_transition)
 
         # Explicitly ensure terminal steps are marked
         if terminal_encountered:
             self._current_time_step = None
             self._saved_action = None
+            #logging.info("Completed episode - will reset on next collection")
+    
         return steps_collected
-
+    
     def _safe_get_action(self, observation):
         obs_tensor = torch.from_numpy(observation).float()
         with torch.no_grad():
-            return strip_action(self._policy(obs_tensor))
+            actor_output = self._policy.act(obs_tensor)
+            return strip_action(actor_output.action)
 
     def _validate_transition(self, transition, was_terminal):
         """Handle both tensor and numpy data"""
@@ -486,9 +524,9 @@ def collect_data(
                  **** Main function ****
     Creates wm_image_replay_buffer of transitions based on desired config.
     """
-    seed = 0
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    #seed = 0
+    #torch.manual_seed(seed)
+    #np.random.seed(seed)
     dm_env = gym.spec(env_name).make()
     env = alf_gym_wrapper.AlfGymWrapper(dm_env, discount=0.99)
     env = TimeLimit(env, MUJOCO_ENVS_LENNGTH[env_name])

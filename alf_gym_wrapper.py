@@ -29,6 +29,79 @@ import data_structures as ds
 from alf_environment import AlfEnvironment
 import nest
 from tensor_specs import TensorSpec, BoundedTensorSpec, torch_dtype_to_str
+from common import configurable
+from collections import deque, OrderedDict
+def _gym_space_to_nested_space(space):
+    """Change gym Space to a nest which can be handled by alf.nest functions."""
+
+    if isinstance(space, gym.spaces.Dict):
+        return dict((k, _gym_space_to_nested_space(s))
+                    for k, s in space.spaces.items())
+    elif isinstance(space, gym.spaces.Tuple):
+        return tuple(_gym_space_to_nested_space(s) for s in space.spaces)
+    else:
+        return space
+
+
+def _nested_space_to_gym_space(space):
+    """Change nested space to gym Space"""
+
+    if isinstance(space, (dict, OrderedDict)):
+        spaces = dict(
+            (k, _nested_space_to_gym_space(s)) for k, s in space.items())
+        return gym.spaces.Dict(spaces)
+    elif isinstance(space, tuple):
+        spaces = tuple(_nested_space_to_gym_space(s) for s in space)
+        return gym.spaces.Tuple(spaces)
+    else:
+        return space
+
+@configurable
+class ContinuousActionMapping(gym.ActionWrapper):
+    """Map continuous actions to a desired action space, while keeping discrete
+    actions unchanged."""
+
+    def __init__(self, env, low, high):
+        """
+        Args:
+            env (gym.Env): Gym env to be wrapped
+            low (float): the action lower bound to map to.
+            high (float): the action higher bound to map to.
+        """
+        super(ContinuousActionMapping, self).__init__(env)
+
+        def _space_bounds(space):
+            if isinstance(space, gym.spaces.Box):
+                assert np.all(np.isfinite(space.low))
+                assert np.all(np.isfinite(space.high))
+                return (space.low, space.high)
+
+        nested_action_space = _gym_space_to_nested_space(self.action_space)
+        self._bounds = nest.map_structure(_space_bounds,
+                                              nested_action_space)
+        self._nested_action_space = nest.map_structure(
+            lambda space: (gym.spaces.Box(
+                low=low, high=high, shape=space.shape, dtype=space.dtype)
+                           if isinstance(space, gym.spaces.Box) else space),
+            nested_action_space)
+        self.action_space = _nested_space_to_gym_space(
+            self._nested_action_space)
+
+    def action(self, action):
+        def _scale_back(a, b, space):
+            if isinstance(space, gym.spaces.Box):
+                # a and b should be mutually broadcastable
+                b0, b1 = b
+                a0, a1 = space.low, space.high
+                return (a - a0) / (a1 - a0) * (b1 - b0) + b0
+            return a
+
+        # map action back to its original space
+        action = nest.map_structure_up_to(action, _scale_back, action,
+                                              self._bounds,
+                                              self._nested_action_space)
+        return action
+
 
 
 def tensor_spec_from_gym_space(space,

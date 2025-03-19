@@ -846,12 +846,12 @@ class WorldModel(nn.Module):
         self.writer_counter += 1
 
         outs = dict(
-            embedding=z_real,
-            feature=latent,
-            like=metrics["reward_loss"] + metrics["discount_loss"],
-            prior=hidden,
-            post=z_next,
-        )
+                    embedding=z_real,
+                    feature=latent,
+                    like=metrics["reward_loss"] + metrics["discount_loss"],
+                    prior=hidden,
+                    post=z_next,
+                   )
 
         return real_embed, outs, metrics
 
