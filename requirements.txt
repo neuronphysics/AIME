@@ -112,6 +112,7 @@ torch
 torch-optimizer
 torchaudio
 torchgan
+torchrec
 torchvision
 tqdm
 triton
