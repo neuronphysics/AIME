@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from ml_collections.config_dict import config_dict
-
+import cv2
 from VRNN.perceiver import perceiver
 
 DEFAULT_MODEL_KWARGS = config_dict.ConfigDict({
@@ -89,3 +89,29 @@ def random_mask_image_group(images, group_size, mask_percent, num_channel):
 
     return masked_image.reshape(masked_image.shape[0], masked_image.shape[1] * masked_image.shape[2],
                                 num_channel)
+
+def random_mask_image_dot(image, grid_size, circle_mask_percent, num_channel):
+    # Calculate the number of pixels to select
+    num_pixels = int(np.prod(image.shape[:-1]) * circle_mask_percent)
+
+    # Select random pixels
+    indices = np.random.choice(np.prod(image.shape[:-1]), num_pixels, replace=False)
+    indices = np.unravel_index(indices, image.shape[:-1])
+
+    # Create a mask
+    mask = np.ones_like(image[..., 0], dtype=np.uint8)
+
+    # Apply circle mask around the selected pixels
+    for i in range(len(indices[0])):
+        center_x = indices[1][i]
+        center_y = indices[2][i]
+        cv2.circle(mask[indices[0][i]], (center_x, center_y), grid_size, 0, -1)
+
+    expended_mask = np.repeat(mask[..., np.newaxis], 3, axis=-1)
+    # Apply the mask to the image
+    masked_image = image * expended_mask
+
+    return masked_image.reshape(masked_image.shape[0], masked_image.shape[1] * masked_image.shape[2],
+                                num_channel)
+
+
