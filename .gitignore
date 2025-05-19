@@ -17,3 +17,4 @@ __pycache__/
 *.pth
 data/*
 VRNN/perceiver/data/
+VRNN/perceiver/model/
