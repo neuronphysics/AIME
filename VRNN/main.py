@@ -13,7 +13,7 @@ import random
 import numpy as np
 from VRNN.perceiver.Utils import generate_model
 from VRNN.perceiver import perceiver_helpers
-
+from .lstm import LSTMLayer
 parent_dir = os.path.abspath(os.path.join(os.getcwd(), '..'))
 # passing the file name and path as argument
 sys.path.append(parent_dir)
@@ -115,7 +115,154 @@ class CategoricalNetwork(nn.Module):
         params = self.network(x)
         return OneHotCategorical(logits=params)
 
+class ResidualBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim, use_silu=True, use_layer_norm=True):
+        super().__init__()
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.activation = nn.SiLU() if use_silu else nn.ReLU()
+        self.norm = nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity()
+        
+    def forward(self, x):
+        residual = x
+        out = self.norm(self.linear1(x))
+        out = self.activation(out)
+        out = self.linear2(out)
+        return self.activation(out + residual)
 
+class ResidualEncoderBlock(nn.Module):
+    """
+    Residual block with layer normalization and SiLU activation
+    """
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.linear1 = nn.Linear(dim, dim)
+        self.ln2 = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim, dim)
+        
+        # Initialize weights using Kaiming initialization
+        nn.init.kaiming_normal_(self.linear1.weight, nonlinearity='linear')
+        nn.init.kaiming_normal_(self.linear2.weight, nonlinearity='linear')
+        nn.init.zeros_(self.linear1.bias)
+        nn.init.zeros_(self.linear2.bias)
+        
+    def forward(self, x):
+        residual = x
+        # First layer with normalization and SiLU activation
+        x = self.ln1(x)
+        x = self.linear1(x)
+        x = torch.nn.functional.silu(x)  # SiLU activation
+        
+        # Second layer with dropout
+        x = self.ln2(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        
+        # Add residual connection
+        return x + residual
+
+class VRNNEncoder(nn.Module):
+    """
+    Enhanced VRNN encoder that produces mean and logvariance for the latent distribution.
+    Incorporates layer normalization, SiLU activation, and residual connections.
+    """
+    def __init__(
+        self, 
+        input_dim,      # Combined dimension of [phi_u_t, phi_y_t, h_t]
+        hidden_dim,     # Hidden dimension 
+        latent_dim,     # Dimension of latent variable z
+        num_blocks=2,   # Number of residual blocks
+        dropout=0.1,    # Dropout probability
+        clamp_values=(-10, 10)  # Output clamping range
+    ):
+        super().__init__()
+        
+        self.clamp_values = clamp_values
+        
+        # Initial projection
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        
+        # Residual blocks
+        self.blocks = nn.ModuleList([
+            ResidualEncoderBlock(hidden_dim, dropout) 
+            for _ in range(num_blocks)
+        ])
+        
+        # Layer norm before output heads
+        self.ln_out = nn.LayerNorm(hidden_dim)
+        
+        # Mean and logvar heads
+        self.mean = nn.Linear(hidden_dim, latent_dim)
+        self.logvar = nn.Linear(hidden_dim, latent_dim)
+        
+        # Initialize output heads with smaller weights
+        nn.init.xavier_normal_(self.mean.weight, gain=0.5)
+        nn.init.xavier_normal_(self.logvar.weight, gain=0.5)
+        nn.init.zeros_(self.mean.bias)
+        nn.init.zeros_(self.logvar.bias)
+        
+    def forward(self, x):
+        """
+        Forward pass through the encoder.
+        
+        Args:
+            x: Tensor of shape [batch_size, input_dim] containing concatenated 
+               [phi_u_t, phi_y_t, h_t]
+               
+        Returns:
+            mean: Mean of the latent distribution
+            logvar: Log variance of the latent distribution
+        """
+        # Project input to hidden dimension
+        x = self.input_projection(x)
+        x = torch.nn.functional.silu(x)
+        
+        # Pass through residual blocks
+        for block in self.blocks:
+            x = block(x)
+        
+        # Final layer normalization
+        x = self.ln_out(x)
+        
+        # Mean and logvar heads
+        mean = self.mean(x)
+        logvar = self.logvar(x)
+        
+        # Clamp outputs for numerical stability
+        mean = torch.clamp(mean, *self.clamp_values)
+        
+        # Use softplus to ensure positive variance, then clamp
+        logvar = torch.nn.functional.softplus(logvar)
+        logvar = torch.clamp(logvar, *self.clamp_values)
+        
+        return mean, logvar
+    
+class DecoderResidualBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.hidden = nn.Linear(hidden_dim, hidden_dim)
+        self.output = nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x):
+        # Project to hidden dimension
+        x = self.input_proj(x)
+        x = self.ln1(x)
+        x = torch.nn.functional.silu(x)
+        
+        # Residual connection within hidden dim
+        residual = x
+        x = self.ln2(self.hidden(x))
+        x = torch.nn.functional.silu(x + residual)
+        
+        # Final projection to output dim
+        return self.output(x)
+
+    
 class VRNN_GMM(nn.Module):
     #################################################################################
     # The main part of the algorithm for learing the dynamics (world model)
@@ -135,10 +282,11 @@ class VRNN_GMM(nn.Module):
                  masked_norm=True,
                  bias=False,
                  self_attention_type="multihead",
-                 num_layer_discriminator=3,
+                 num_layer_discriminator=2,
                  learn_init_state=True,
                  bidirectional=False,
                  dropout=0.1,
+                 use_orthogonal=True,
                  ):
         super(VRNN_GMM, self).__init__()
 
@@ -193,43 +341,20 @@ class VRNN_GMM(nn.Module):
         ###=============###
         # feature-extracting transformations (phi_y, phi_u and phi_z)
 
-        layers_phi_y = [nn.Linear(self.y_dim, self.h_dim)]
-        if self.batch_norm:  # Add batch normalization when requested
-            layers_phi_y.append(torch.nn.BatchNorm1d(self.h_dim))
-        layers_phi_y = layers_phi_y + [
-            nn.ReLU(),
-            nn.Linear(self.h_dim, self.h_dim),
-        ]
 
-        self.phi_y = torch.nn.Sequential(*layers_phi_y)
-
+        self.phi_y =  ResidualBlock(self.y_dim, self.h_dim)
         ##initialize
         # init_weights(self.phi_y[0])
         # init_weights(self.phi_y[-1])
         ###=============###
-        layers_phi_u = [nn.Linear(self.u_dim, self.h_dim)]
-        if self.batch_norm:
-            layers_phi_u.append(torch.nn.BatchNorm1d(self.h_dim))
-        layers_phi_u = layers_phi_u + [
-            nn.ReLU(),
-            nn.Linear(self.h_dim, self.h_dim),
-        ]
 
-        self.phi_u = torch.nn.Sequential(*layers_phi_u)
+        self.phi_u = ResidualBlock(self.u_dim, self.h_dim)
 
         ##initialize
         # init_weights(self.phi_u[0])
         # init_weights(self.phi_u[-1])
         ######
-        layers_phi_z = [nn.Linear(self.z_dim, self.h_dim)]
-        if self.batch_norm:
-            layers_phi_z.append(torch.nn.BatchNorm1d(self.h_dim))
-        layers_phi_z = layers_phi_z + [
-            nn.ReLU(),
-            nn.Linear(self.h_dim, self.h_dim),
-        ]
-
-        self.phi_z = torch.nn.Sequential(*layers_phi_z)
+        self.phi_z = ResidualBlock(self.z_dim, self.h_dim)
 
         ##initialize
         # init_weights(self.phi_z[0])
@@ -237,94 +362,42 @@ class VRNN_GMM(nn.Module):
         # -----------------------------------------
         # encoder function (phi_enc) -> Inference
 
-        encoder_layers = [nn.Linear(self.h_dim + self.h_dim + self.h_dim, self.h_dim)]
-        if self.batch_norm:
-            encoder_layers.append(torch.nn.BatchNorm1d(self.h_dim))
-        encoder_layers = encoder_layers + [
-            nn.ReLU(),
-            nn.Linear(self.h_dim, self.h_dim),
-        ]
-        if self.batch_norm:
-            encoder_layers = encoder_layers + [nn.BatchNorm1d(self.h_dim)]
 
-        encoder_layers = encoder_layers + [nn.ReLU()]
-
-        self.enc = torch.nn.Sequential(*encoder_layers)
-
-        ##initialize
-        # init_weights(self.enc[0])
-        # if not self.batch_norm:
-        #    init_weights(self.enc[2])
-        # else:
-        #    init_weights(self.enc[3])
-        # -----------------------------------------
-        ###  encoder mean
-        self.enc_mean = nn.Linear(self.h_dim, self.z_dim)
-        # init_weights(self.enc_mean)
-
-        ###  encoder log_var
-        self.enc_logvar = nn.Linear(self.h_dim, self.z_dim)
-        # init_weights(self.enc_logvar)
+        self.enc = VRNNEncoder(self.h_dim + self.h_dim + self.h_dim, self.h_dim, self.z_dim)
 
         # -----------------------------------------
         # prior function (phi_prior) -> Prior
 
-        layers_prior = [nn.Linear(self.h_dim, self.h_dim)]
-        if self.batch_norm:
-            layers_prior.append(torch.nn.BatchNorm1d(self.h_dim))
-        layers_prior = layers_prior + [
-            nn.ReLU(),
-        ]
 
-        self.prior = torch.nn.Sequential(*layers_prior)
-        ##initialize
-        # init_weights(self.prior[0])
+        self.prior = VRNNEncoder(self.h_dim, self.h_dim, self.z_dim,num_blocks=1)
 
-        # prior mean
-
-        self.prior_mean = nn.Linear(self.h_dim, self.z_dim)
-        # init_weights(self.prior_mean)
-
-        # prior logvar
-        self.prior_logvar = nn.Linear(self.h_dim, self.z_dim)
         # init_weights(self.prior_logvar)
 
         # init_weights(self.prior_logvar)
 
         # -----------------------------------------
         # decoder function (phi_dec) -> Generation
-        layers_decoder = [
-            nn.Linear(self.h_dim + self.h_dim + self.h_dim, self.h_dim)  # modified
-        ]
-        if self.batch_norm:
-            layers_decoder.append(torch.nn.BatchNorm1d(self.h_dim))
-        layers_decoder = layers_decoder + [
-            nn.ReLU(),
-            nn.Linear(self.h_dim, self.h_dim)
-        ]
-        if self.batch_norm:
-            layers_decoder.append(torch.nn.BatchNorm1d(self.h_dim))
-        layers_decoder = layers_decoder + [
-            nn.ReLU(),
-        ]
-
-        layers_decoder.append(
-            nn.Linear(self.h_dim, self.n_mixtures + self.n_mixtures * 2 * self.y_dim)
-        )
-
-        ## (decoder) Normal distribution
-        self.decoder = torch.nn.Sequential(*layers_decoder)
-
+        self.decoder = DecoderResidualBlock(
+                        input_dim=3*self.h_dim, 
+                        hidden_dim=self.h_dim,
+                        output_dim=self.n_mixtures + self.n_mixtures * 2 * self.y_dim
+                        )   
+            
         # recurrence function (f_theta) -> Recurrence
-        # self._rnn =  nn.LSTM(self.h_dim + self.h_dim + self.h_dim, self.h_dim, self.n_layers, bias, batch_first= True)#modified
-
+        self._rnn = LSTMLayer(
+            input_size=self.h_dim + self.h_dim + self.h_dim,
+            hidden_size=self.h_dim,
+            n_lstm_layers=self.n_layers,
+            use_orthogonal=use_orthogonal
+        )
+        """
         self._rnn = LSTMCore(input_size=self.h_dim + self.h_dim + self.h_dim,
                              hidden_size=self.h_dim,
                              num_layers=self.n_layers,
                              batch_first=True,
                              train_truncate=100,
                              train_burn_in=80)
-
+        """
         self.discriminator = RGANDiscriminator(sequence_length=self.sequence_length,
                                                input_size=2 * self.h_dim + self.u_dim + self.y_dim,
                                                hidden_size=self.h_dim,
@@ -401,21 +474,13 @@ class VRNN_GMM(nn.Module):
         deterministic_hidden_state = []
         batch_size = y.size(0)
         # input has size (Batch, D, seq_len)
-        # seq_len = y.shape[-1]
+        
         seq_len = [torch.max((u[i, 0, :] != 0).nonzero()).item() + 1 for i in range(u.shape[0])]
 
         noise = torch.randn(size=(batch_size, self.sequence_length, self.z_dim)).to(self.device)
         fake_y = torch.zeros(batch_size, self.sequence_length, self.y_dim).to(self.device)
         attention_latent = torch.zeros(batch_size, self.sequence_length, 2 * self.h_dim, device=self.device).to(
             self.device)
-        ##======fiding sequece length of each episode =======##
-        # mask = ~u.eq(0.0)
-
-        # sqn  = torch.unique(mask.sum(dim=-1), sorted=False, dim=1).squeeze(-1)
-        # sqn  = sqn.cpu()
-        # print(seq_len,sqn, u.shape)
-        # assert torch.all(torch.eq(seq_len, sqn))
-        ##==================== (new) =====================##
         reshaped_u = u.permute(0, 2, 1)
         reshaped_y = y.permute(0, 2, 1)
 
@@ -455,73 +520,64 @@ class VRNN_GMM(nn.Module):
         h, c = self.initialize_state_vectors(batch_size, first_obs=input_)
 
         # for all time steps
-        for i in range(len(seq_len)):
-            for t in range(seq_len[i]):
-                # feature extraction: y_t
-                phi_y_t = self.phi_y(y[:, :, t])
-                # feature extraction: u_t
-                phi_u_t = self.phi_u(u[:, :, t])
+        for t in range(max(seq_len)):
+            # Create masks for this time step (1 for active sequences, 0 for completed sequences)
+            masks = torch.tensor([1.0 if t < seq_len[i] else 0.0 for i in range(batch_size)], device=self.device)
+            active_indices = torch.where(masks > 0)[0]
+        
+            # Skip if no active sequences remain
+            if len(active_indices) == 0:
+                break
+            # feature extraction: y_t
+            phi_y_t = self.phi_y(y[active_indices, :, t])
+            # feature extraction: u_t
+            phi_u_t = self.phi_u(u[active_indices, :, t])
 
-                # encoder: u_t, y_t, h_t -> z_t posterior
-                encoder_input = torch.cat([phi_u_t, phi_y_t, h[-1]], dim=1)
-                encoder_input = self.enc(encoder_input)
+            # encoder: u_t, y_t, h_t -> z_t posterior
+            encoder_input = torch.cat([phi_u_t, phi_y_t, h[:, active_indices, :][-1]], dim=1)
 
-                enc_mean_t = torch.clamp(self.enc_mean(encoder_input), *self.output_clamp)
-                enc_logvar_t = self.enc_logvar(encoder_input)
-                enc_logvar_t = torch.clamp(nn.Softplus()(enc_logvar_t), *self.output_clamp)
-                posterior_dist = Independent(Normal(enc_mean_t, enc_logvar_t.exp().sqrt()), 1)
-                # prior: h_t -> z_t (for KLD loss)
-                prior_input = h[-1]
-                prior_input = self.prior(prior_input)
+            enc_mean_t , enc_logvar_t = self.enc(encoder_input)
+            posterior_dist = Independent(Normal(enc_mean_t, enc_logvar_t.exp().sqrt()), 1)
+            # prior: h_t -> z_t (for KLD loss)
+            prior_mean_t, prior_logvar_t = self.prior(h[:, active_indices, :][-1])
+            
+            z_t = posterior_dist.rsample()
+            # feature extraction: z_t
+            phi_z_t = self.phi_z(z_t)
+            ### fake data for discriminator
+            fake_phi_z_t = self.phi_z(noise[active_indices, t, :])
 
-                prior_mean_t = self.prior_mean(prior_input)
-                prior_logvar_t = self.prior_logvar(prior_input)
-                prior_logvar_t = nn.Softplus()(prior_logvar_t)
-                # prior = self.reparametrization(prior_mean_t, prior_logvar_t)
+            # mean attention size :torch.Size([B, time, D_hid])
+            c_final = mean_attn[active_indices, t, :]
 
-                # sampling and reparameterization: get a new z_t
-                # temp = tdist.Normal(enc_mean_t, enc_logvar_t.exp().sqrt())
-                # z_t = tdist.Normal.rsample(temp)
-                z_t = self.reparametrization(enc_mean_t, enc_logvar_t)
+            # decoder: h_t, z_t -> y_t
+            decoder_input = torch.cat([phi_z_t, c_final, h[:,active_indices,:][-1]], dim=1)  ##(modified)
+            _, dist = self._decode(decoder_input)
 
-                # feature extraction: z_t
-                phi_z_t = self.phi_z(z_t)
-                ### fake data for discriminator
-                fake_phi_z_t = self.phi_z(noise[:, t, :])
-                #####=====(new)======######
+            attention_latent[:, t, :] = torch.cat([phi_z_t, c_final], dim=1)
+            # fake latent dimension pass through the decoder
+            decoder_input_fake = torch.cat([fake_phi_z_t, c_final, h[:, active_indices, :][-1]], dim=1)  ##(modified)
+            fake_y[active_indices, t, :], _ = self._decode(decoder_input_fake)
 
-                # mean attention size :torch.Size([B, time, D_hid])
-                c_final = mean_attn[:, t, :]
+            RNN_inputs = torch.cat([phi_u_t, phi_z_t, c_final], dim=1).unsqueeze(0)
+            # input of RNN module torch.Size([B, 3*H]) ==>[B,T,3*H]
 
-                #####================######
-                # decoder: h_t, z_t -> y_t
-                decoder_input = torch.cat([phi_z_t, c_final, h[-1]], dim=1)  ##(modified)
-                _, dist = self._decode(decoder_input)
+            # recurrence: u_t+1, z_t -> h_t+1
+            _, (h, c) = self._rnn(RNN_inputs,
+                                  h[:, active_indices, :], 
+                                  c[:, active_indices, :],
+                                  masks[active_indices])  ##(modified)Size [2, B, H]
 
-                attention_latent[:, t, :] = torch.cat([phi_z_t, c_final], dim=1)
-                # fake latent dimension pass through the decoder
-                decoder_input_fake = torch.cat([fake_phi_z_t, c_final, h[-1]], dim=1)  ##(modified)
-                fake_y[:, t, :], _ = self._decode(decoder_input_fake)
+            # computing the loss
+            KLD = self.kld_gauss(enc_mean_t, enc_logvar_t, prior_mean_t, prior_logvar_t)
 
-                RNN_inputs = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
-                # input of RNN module torch.Size([B, 3*H]) ==>[B,T,3*H]
-
-                # recurrence: u_t+1, z_t -> h_t+1
-                _, (h, c) = self._rnn(torch.unsqueeze(RNN_inputs, 1), (h, c))  ##(modified)Size [2, B, H]
-
-                # computing the loss
-                KLD = self.kld_gauss(enc_mean_t, enc_logvar_t, prior_mean_t, prior_logvar_t)
-
-                assert not torch.isnan(KLD)
+            assert not torch.isnan(KLD)
                 # Create the observation model (generating distribution) p(y_t|z_t,h_t, c_t)
 
-                log_p = dist.log_prob(y[:, :, t])
-                loss_pred = log_p.mean()
-                assert not torch.isnan(loss_pred)
-                assert torch.isfinite(loss_pred)
-
-                total_loss += - loss_pred + KLD
-                deterministic_hidden_state.append(h[-1])
+            log_p = dist.log_prob(y[active_indices, :, t])
+            loss_pred = log_p.mean()
+            total_loss += - loss_pred + KLD
+            deterministic_hidden_state.append(h[-1])
         total_loss += perceiver_recon_loss
 
         deterministic_hidden_state = torch.stack(deterministic_hidden_state).view(batch_size, -1, self.h_dim)
@@ -541,14 +597,6 @@ class VRNN_GMM(nn.Module):
 
         return total_loss, d_loss, deterministic_hidden_state, input_feature, fake_input_feature, attention_latent
 
-    def reparametrization(self, mu, log_var):
-
-        # Reparametrization trick
-        var = torch.exp(log_var * 0.5)
-        eps = torch.FloatTensor(var.size()).normal_(mean=0, std=1).to(self.device)
-        eps = torch.autograd.Variable(eps)
-
-        return eps.mul(var).add_(mu).add_(1e-7)
 
     def _decode(self, x):
         x_decoder = self.decoder(x)
@@ -611,17 +659,15 @@ class VRNN_GMM(nn.Module):
 
                 # prior: h_t -> z_t
                 prior_input = h[-1]
-                prior_input = self.prior(prior_input)
 
-                prior_mean_t = self.prior_mean(prior_input)
-                prior_logvar_t = self.prior_logvar(prior_input)
-                prior_logvar_t = nn.Softplus()(prior_logvar_t)
+                prior_mean_t, prior_logvar_t = self.prior(prior_input)
+            
 
                 # sampling and reparameterization: get new z_t
                 # temp = tdist.Normal(prior_mean_t, prior_logvar_t.exp().sqrt())
-                # z_t = tdist.Normal.rsample(temp)
+                temp = Independent(Normal(prior_mean_t, prior_logvar_t.exp().sqrt()), 1)
+                z_t = temp.rsample(temp)
 
-                z_t = self.reparametrization(prior_mean_t, prior_logvar_t)
                 # feature extraction: z_t
                 phi_z_t = self.phi_z(z_t)
                 # decoder: z_t, h_t -> y_t

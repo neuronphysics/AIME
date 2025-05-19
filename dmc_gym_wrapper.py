@@ -18,7 +18,6 @@ Adapted and simplified from https://github.com/denisyarats/dmc2gym
 """
 
 from functools import partial
-from alf_gym_wrapper import tensor_spec_from_gym_space
 import gym
 from gym import spaces
 from gym.envs.registration import register

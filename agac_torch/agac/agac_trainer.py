@@ -9,11 +9,11 @@ from gym.spaces import Box, Discrete
 from mpi4py import MPI
 from welford import Welford
 
-from agac.agac_ppo import PPO
-from agac.configs import ExperimentConfig
-from agac.logger import LogData, Logger
-from agac.memory import Memory, Transition
-from agac.utils import DiscreteGrid, compute_advantages_and_returns
+from agac_torch.agac.agac_ppo import PPO
+from agac_torch.agac.configs import ExperimentConfig
+from agac_torch.agac.logger import LogData, Logger
+from agac_torch.agac.memory import Memory, Transition
+from agac_torch.agac.utils import DiscreteGrid, compute_advantages_and_returns
 
 comm = MPI.COMM_WORLD
 num_workers = comm.Get_size()

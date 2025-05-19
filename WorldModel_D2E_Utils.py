@@ -1,5 +1,4 @@
 from abc import ABC
-
 import cloudpickle
 import atexit
 import traceback
@@ -16,25 +15,24 @@ from numbers import Number
 from collections import namedtuple, deque, defaultdict
 from typing import Tuple, Dict, List, Iterable
 import gym
+import torch.nn.functional as F
 from torch.utils.data import Dataset, TensorDataset
 from torch.utils.data import DataLoader, IterableDataset
 from torch.distributions import Distribution, constraints
 from torch.distributions.utils import broadcast_all
 import torch.utils.data.distributed
-from torch.utils.tensorboard import SummaryWriter
-from VRNN.main import ModelState
+from agac_torch.agac.configs import AlgorithmConfig,LoggingConfig, ReinforcementLearningConfig
 from VRNN.Normalization import compute_normalizer
-import argparse
+import numpy as np
 import json
 import time
-from dmc_gym_wrapper import DMCGYMWrapper
 from gym_wrappers import wrap_env, FrameSkip
 import sys
 from pathlib import Path
 import operator
 import re
-from planner_D2E_regularizer_n_step import *
-import DataCollectionD2E_n_step as DC
+import math
+from agac_torch.agac.agac_ppo import *
 
 CONST_SQRT_2 = math.sqrt(2)
 CONST_INV_SQRT_2PI = 1 / math.sqrt(2 * math.pi)
@@ -1110,3 +1108,53 @@ def append_action_and_latent_obs(s1, a1, s2, n_step):
     next_obs = torch.reshape(s2, (-1, n_step, latent_shape))
     inputs = torch.cat((obs, a1), dim=-1)
     return inputs, next_obs
+
+def create_agac_config(config, env_name, layers_dim, adv_layers_dim):
+    """Create and return a properly configured ExperimentConfig for AGAC."""
+    
+    # Create ExperimentConfig for AGAC with all required parameters
+    agac_config = ExperimentConfig(
+        algorithm=AlgorithmConfig(
+            max_steps=config.max_steps if hasattr(config, 'max_steps') else 1000000,
+            eval_freq=config.eval_freq if hasattr(config, 'eval_freq') else 10000,
+            num_episodes_eval=1,  # Number of episodes to evaluate
+            train_freq=config.train_every,  # Same as main config
+            num_epochs=5,  # Number of PPO epochs per update
+            seed=config.seed,
+            env_name=env_name,
+            discrete=False,  # For continuous control tasks
+            gpu=-1  # Default to CPU
+        ),
+        reinforcement_learning=ReinforcementLearningConfig(
+            batch_size=config.batch_size,
+            actor_learning_rate=3e-4,
+            critic_learning_rate=3e-4,
+            adversary_learning_rate=3e-4,  # Same as actor
+            discount=config.discount if hasattr(config, 'discount') else 0.99,
+            lambda_gae=0.95,  # Standard GAE lambda
+            layers_dim=layers_dim,
+            intrinsic_reward_coefficient=0.01,  # Start with small coefficient
+            entropy_coefficient=0.01,
+            clipping_epsilon=0.2,  # Standard PPO clip
+            value_loss_clip=0.2,
+            value_loss_coeff=0.5,
+            adversary_loss_coeff=0.1,
+            layers_num_channels=[64, 64, 32],  # For CNN if used
+            adv_layers_dim=adv_layers_dim,
+            clip_grad_norm=0.5,
+            cnn_extractor=False,  # No CNN extractor by default
+            nb_stack=1,  # Default frame stacking
+            episodic_count_coefficient=0.0  # Disable episodic counts by default
+        ),
+        logging=LoggingConfig(
+            save_models=True,
+            save_models_freq=100,
+            use_neptune=False,  # No Neptune logging
+            experiment_name=f"D2E_{env_name}",
+            neptune_user_name="",
+            neptune_project_name="",
+            log_grid=False  # No grid logging
+        )
+    )
+    
+    return agac_config

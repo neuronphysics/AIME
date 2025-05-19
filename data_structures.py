@@ -21,7 +21,7 @@ import torch
 
 import nest as nest
 import tensor_specs as ts
-from common import *
+
 def to_tensor(data, dtype=None):
     """Convert the data to a torch tensor.
     Args:

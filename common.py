@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Various functions used by different alf modules."""
+from __future__ import annotations
 from torch.utils.tensorboard import SummaryWriter
 from absl import flags, logging
-import collections
 from collections import OrderedDict
 import copy
 import functools

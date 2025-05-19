@@ -303,9 +303,8 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
 def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name_general, batch_size, test_rank,
              **kwargs):
     # switch to cpu computations for testing
-    # options['device'] = 'cpu'
 
-    # %% load model
+    # load model
 
     # Compute normalizers (here just used for initialization, real values loaded below)
     test_x, test_y = loaders.dataset.tensors
@@ -345,10 +344,9 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
                'batch_size': batch_size,
                'lr_scheduler_nepochs': 5,
                'lr_scheduler_factor': 10}
-    # %% plot and save the loss curve
+    
     plot_losscurve(df, options, path_general, file_name_general)
 
-    # %% others
 
     if bool(kwargs):
         file_name_add = kwargs['file_name_add']
@@ -361,10 +359,7 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
     num_model_param = get_n_params(modelstate.model)
     print('Model parameters: {}'.format(num_model_param))
 
-    # %% RUN PERFORMANCE EVAL
-    # %%
-
-    # %% sample from the model
+    # sample from the model
     for i, (u_test, y_test) in enumerate(loaders):
         # getting output distribution parameter only implemented for selected models
         u_test = u_test.to(device)
@@ -384,7 +379,7 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
     y_test = np.where(np.isnan(y_test), 0, y_test)  # change nan values to zero
     y_test_noisy = y_test + np.sqrt(0.1) * np.random.randn(yshape[0], yshape[1], yshape[2])
 
-    # %% plot resulting predictions
+    # plot resulting predictions
     # for narendra_li problem show test data mean pm 3sigma as well
     data_y_true = [y_test, np.sqrt(0.1) * np.ones_like(y_test)]
     data_y_sample = [y_sample_mu, y_sample_sigma]
@@ -401,7 +396,7 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
                                    path_general=path_general,
                                    file_name_general=file_name_general)
 
-    # %% compute performance values
+    # compute performance values
 
     # compute marginal likelihood (same as for predictive distribution loss in training)
     marginal_likeli = compute_marginalLikelihood(y_test_noisy, y_sample_mu, y_sample_sigma, doprint=True)
@@ -412,7 +407,6 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
     # compute RMSE
     rmse = compute_rmse(y_test_noisy, y_sample_mu, doprint=True)
 
-    # %% Collect data
 
     # options_dict
     options_dict = {'h_dim': options['h_dim'],

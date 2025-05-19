@@ -21,8 +21,7 @@ import copy
 import cv2
 import gym
 import numpy as np
-import random
-from alf_environment import TimeLimit
+from time_limit import TimeLimit
 from alf_gym_wrapper import AlfGymWrapper
 import nest
 from nest import transform_nest

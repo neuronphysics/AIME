@@ -15,67 +15,195 @@ from core.networks.actors import DiscreteActor, GaussianActor
 from core.networks.critics import CNNContinuousVNetwork, ContinuousVNetwork
 from core.utils.mpi_utils import sync_grads, sync_networks
 from core.utils.types import Action, Distribution, Observation
-
+from abc import ABC, abstractmethod
 comm = MPI.COMM_WORLD
 num_workers = comm.Get_size()
 rank = comm.Get_rank()
 
-
-class PPO:
+class Agent(ABC):
+    """
+    Abstract base class for reinforcement learning agents.
+    
+    This class defines the interface that all agent implementations (like PPO)
+    should follow, handling common initialization tasks and defining abstract
+    methods that child classes must implement.
+    """
+    
     def __init__(self, obs_space: Box, action_space: Space, config: ExperimentConfig):
+        """
+        Initialize the agent with observation space, action space, and experiment configuration.
+        
+        Args:
+            obs_space: The observation space of the environment.
+            action_space: The action space of the environment.
+            config: Configuration parameters for the experiment.
+        """
+        # Set up device configuration
+        if config.algorithm.gpu != -1:
+            self._device = torch.device("cuda:" + str(config.algorithm.gpu))
+        else:
+            self._device = "cpu"
+            
+        # Determine if the action space is discrete or continuous
+        self._discrete = config.algorithm.discrete
+        
+        # Store observation and action dimensions
+        self._observation_dim = obs_space.shape
+        if self._discrete:
+            self._action_dim = action_space.n
+        else:
+            self._observation_dim = self._observation_dim[0]
+            self._action_dim = action_space.shape[0]
+            self._max_action = action_space.high[0]
+            
+        # Initialize monitoring dictionary for logging
+        self._monitor = dict()
+    
+    @abstractmethod
+    def select_action(self, observation: Observation, deterministic: bool = False) -> Action:
+        """
+        Select an action given an observation.
+        
+        Args:
+            observation: The current observation from the environment.
+            deterministic: Whether to select actions deterministically or sample from a distribution.
+            
+        Returns:
+            The selected action and any additional information.
+        """
+        pass
+    
+    @abstractmethod
+    def compute_values(self, observations: Observation) -> np.ndarray:
+        """
+        Compute value estimations for a batch of observations.
+        
+        Args:
+            observations: A batch of observations from the environment.
+            
+        Returns:
+            The estimated values for each observation.
+        """
+        pass
+    
+    @abstractmethod
+    def compute_distributions(self, observations: Observation) -> Distribution:
+        """
+        Compute action distributions conditional on observations.
+        
+        Args:
+            observations: A batch of observations from the environment.
+            
+        Returns:
+            The action distribution for each observation.
+        """
+        pass
+    
+    @abstractmethod
+    def train_on_batch(self, batch: Batch, *args, **kwargs):
+        """
+        Update agent's networks based on a batch of transitions.
+        
+        Args:
+            batch: A batch of transition data for training.
+            *args, **kwargs: Additional arguments that may be required by specific agents.
+        """
+        pass
+    
+    def get_actor_weights(self) -> List:
+        """
+        Returns actor network weights.
+        
+        Returns:
+            The weights of the actor network.
+        """
+        pass
+    
+    def set_actor_weights(self, params):
+        """
+        Set actor network weights.
+        
+        Args:
+            params: The parameters to set for the actor network.
+        """
+        pass
+    
+    def to_tensor(self, data, dtype=torch.float32):
+        """
+        Convert numpy array to PyTorch tensor and move to the correct device.
+        
+        Args:
+            data: The numpy array to convert.
+            dtype: The desired data type of the tensor.
+            
+        Returns:
+            The converted PyTorch tensor on the agent's device.
+        """
+        return torch.tensor(data, device=self._device, dtype=dtype)
+    
+    @property
+    def logs(self) -> List[LogData]:
+        """
+        Get monitoring logs for the agent.
+        
+        Returns:
+            A list of log data objects.
+        """
+        return []
+
+
+
+#TODO: integerate this code into WorldModelD2E.py code
+class PPO(Agent):
+    def __init__(self, obs_space: Box, action_space: Space, config: ExperimentConfig):
+        super().__init__(obs_space, action_space, config)
+
         rl_config = config.reinforcement_learning
         layers_dim = rl_config.layers_dim
         adv_layers_dim = rl_config.adv_layers_dim
         actor_lr = rl_config.actor_learning_rate
         critic_lr = rl_config.critic_learning_rate
 
-        self._discrete = config.algorithm.discrete
         self._clipping_epsilon = rl_config.clipping_epsilon
         self._value_loss_clip = rl_config.value_loss_clip
         self._value_loss_coeff = rl_config.value_loss_coeff
         self._adv_loss_coeff = rl_config.adversary_loss_coeff
         self._entropy_coeff = rl_config.entropy_coefficient
         self._clip_grad_norm = rl_config.clip_grad_norm
-        if config.algorithm.gpu != -1:
-            self._device = torch.device("cuda:" + str(config.algorithm.gpu))
-        else:
-            self._device = "cpu"
-        observation_dim = obs_space.shape
+    
 
         if self._discrete:
-            action_dim = action_space.n
+
             self._actor = DiscreteActor(
-                observation_dim,
-                action_dim,
+                self._observation_dim,
+                self._action_dim,
                 layers_dim,
                 cnn_extractor=rl_config.cnn_extractor,
                 layers_num_channels=rl_config.layers_num_channels,
             )
             self._adversary = DiscreteActor(
-                observation_dim,
-                action_dim,
+                self._observation_dim,
+                self._action_dim,
                 adv_layers_dim,
                 cnn_extractor=rl_config.cnn_extractor,
                 layers_num_channels=rl_config.layers_num_channels,
             )
         else:
             # Continuous action space
-            observation_dim = observation_dim[0]
-            action_dim = action_space.shape[0]
-            max_action = action_space.high[0]
+            
             self._actor = GaussianActor(
-                observation_dim, action_dim, max_action, layers_dim
+                self._observation_dim, self._action_dim, self._max_action, layers_dim
             )
             self._adversary = GaussianActor(
-                observation_dim, action_dim, max_action, adv_layers_dim
+                self._observation_dim, self._action_dim, self._max_action, adv_layers_dim
             )
-
+        #initialize critic network
         if rl_config.cnn_extractor:
             self._critic = CNNContinuousVNetwork(
-                observation_dim, layers_dim, rl_config.layers_num_channels
+                self._observation_dim, layers_dim, rl_config.layers_num_channels
             )
         else:
-            self._critic = ContinuousVNetwork(observation_dim, layers_dim)
+            self._critic = ContinuousVNetwork(self._observation_dim, layers_dim)
 
         # To device
         self._actor.to(self._device)
@@ -95,9 +223,7 @@ class PPO:
         self._critic_optimizer = torch.optim.Adam(
             self._critic.parameters(), lr=critic_lr, eps=1e-5
         )
-
-        # Monitoring
-        self._monitor = dict()
+  
 
     def get_actor_weights(self):
         """

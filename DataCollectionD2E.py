@@ -4,9 +4,6 @@ import os
 # import gin
 import gym
 # import mujoco_py
-from absl import app
-from absl import flags
-from absl import logging
 import tensor_specs
 import time
 import alf_gym_wrapper
@@ -17,15 +14,12 @@ import torch.nn as nn
 import sys
 import shutil
 import argparse
-import pickle
-from typing import Callable
-from PIL import Image
-from planner_D2E_regularizer import parse_policy_cfg, Transition, map_structure, maybe_makedirs, load_policy, \
-    eval_policy_episodes
+
+
 import dill
 import nest
 from torch.utils import data
-
+from agac_torch.agac.memory import Memory, Transition
 #####################################
 # from train_eval_utils
 
@@ -54,52 +48,8 @@ MUJOCO_ENVS_LENNGTH = {"Ant-v2": 1000,
                        }
 
 
-def get_transition(time_step, next_time_step, action, next_action):
-    return Transition(
-        s1=time_step.observation,
-        s2=next_time_step.observation,
-        a1=action,
-        a2=next_action,
-        reward=next_time_step.reward,
-        discount=next_time_step.discount,
-        done=next_time_step.done)
 
 
-class DataCollector(object):
-    """Class for collecting sequence of environment experience."""
-
-    def __init__(self, env, policy, data):
-        self._env = env
-        self._policy = policy
-        self._data = data
-        self._saved_action = None
-
-    def collect_transition(self):
-        """Collect single transition from environment."""
-        time_step = self._env.current_time_step()
-        if self._saved_action is None:
-            self._saved_action = self._policy(torch.from_numpy(time_step.observation))
-
-        action = self._saved_action
-        if action.ndim < 1:
-            next_time_step = self._env.step(action.unsqueeze(0).detach().cpu())
-        elif action.ndim > 1:
-            next_time_step = self._env.step(action.detach().cpu()[0])
-        else:
-            next_time_step = self._env.step(action.detach().cpu())
-
-        next_action = self._policy(torch.from_numpy(next_time_step.observation))
-        self._saved_action = next_action
-        if not time_step.is_last():
-            transition = get_transition(time_step, next_time_step,
-                                        action, next_action)
-            self._data.add_transitions(transition)
-            return 1
-        else:
-            return 0
-
-
-#######################
 def gather(params, indices, axis=None):
     if axis is None:
         axis = 0
@@ -114,17 +64,8 @@ def gather(params, indices, axis=None):
     elif axis == 3:
         return params[:, :, :, indices]
 
-
-def scatter_update(tensor, indices, updates):
-    tensor = torch.tensor(tensor)
-    indices = torch.tensor(indices, dtype=torch.long)
-    updates = torch.tensor(updates)
-    tensor[indices] = updates
-    return tensor
-
-
 class DatasetView(object):
-    """Interface for reading from wm_image_replay_buffer."""
+    """Interface for reading from dataset."""
 
     def __init__(self, dataset, indices):
         self._dataset = dataset
@@ -138,6 +79,323 @@ class DatasetView(object):
     @property
     def size(self):
         return self._indices.shape[0]
+
+class Dataset(data.Dataset):
+    """Enhanced dataset based on Memory's Transition structure but with tensor storage."""
+
+    def __init__(
+            self,
+            observation_spec,
+            action_spec,
+            size,
+            circular=True,
+    ):
+        super(Dataset, self).__init__()
+        self._size = size
+        self._circular = circular
+        
+        # Get shapes from specs
+        obs_shape = list(observation_spec.shape)
+        obs_type = observation_spec.dtype
+        action_shape = list(action_spec.shape)
+        action_type = action_spec.dtype
+        
+        # Create tensor storage for all fields in the Transition structure
+        self.observation = self._zeros([size] + obs_shape, obs_type)
+        self.action = self._zeros([size] + action_shape, action_type)
+        self.extrinsic_return = self._zeros([size], torch.float32)
+        self.advantage = self._zeros([size], torch.float32)
+        self.agac_advantage = self._zeros([size], torch.float32)
+        self.value = self._zeros([size], torch.float32)
+        self.log_pi = self._zeros([size], torch.float32)
+        self.adv_log_pi = self._zeros([size], torch.float32)
+        
+        # For logits, we need to know the shape, but we'll assume a vector for now
+        logits_shape = [size, action_shape[0] * 2]  # Placeholder - adjust as needed
+        self.logits_pi = self._zeros(logits_shape, torch.float32)
+        self.adv_logits_pi = self._zeros(logits_shape, torch.float32)
+        
+        self.done = self._zeros([size], torch.bool)
+        
+        # Store all tensors in a structured way for easy access
+        self._data = Transition(
+            observation=self.observation,
+            action=self.action,
+            extrinsic_return=self.extrinsic_return,
+            advantage=self.advantage,
+            agac_advantage=self.agac_advantage,
+            value=self.value,
+            log_pi=self.log_pi,
+            adv_log_pi=self.adv_log_pi,
+            logits_pi=self.logits_pi,
+            adv_logits_pi=self.adv_logits_pi,
+            done=self.done
+        )
+        
+        # Track current size and position
+        self.current_size = torch.tensor(0, requires_grad=False)
+        self._current_idx = torch.tensor(0, requires_grad=False)
+        self._capacity = torch.tensor(self._size)
+        
+        # Store configuration
+        self._config = collections.OrderedDict(
+            observation_spec=observation_spec,
+            action_spec=action_spec,
+            size=size,
+            circular=circular
+        )
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Create a memory to help with batching and advantage normalization
+        self._memory = Memory(max_size=size)
+
+    def _zeros(self, shape, dtype):
+        """Create a variable initialized with zeros."""
+        return torch.zeros(shape, dtype=dtype)
+
+    @property
+    def config(self):
+        return self._config
+
+    @property
+    def data(self):
+        return self._data
+
+    @property
+    def capacity(self):
+        return self._size
+
+    @property
+    def size(self):
+        return self.current_size.item()
+
+    def create_view(self, indices):
+        return DatasetView(self, indices)
+
+    def get_batch(self, indices):
+        """Get a batch of transitions at the given indices."""
+        def get_batch_(data_):
+            return gather(data_, indices)
+
+        transition_batch = nest.map_structure(get_batch_, self._data)
+        return transition_batch
+    
+    def get_epoch_batches(self, batch_size):
+        """Use Memory's get_epoch_batches to create normalized batches."""
+        # First, fill the memory with our tensor data
+        self._sync_memory()
+        
+        # Then use Memory's functionality to get normalized batches
+        return self._memory.get_epoch_batches(batch_size)
+    
+    def _sync_memory(self):
+        """Sync tensor data to Memory for normalization operations."""
+        self._memory.reset()
+        
+        # Convert tensor data to Transition objects and add to memory
+        for i in range(self.size):
+            trans = Transition(
+                observation=self.observation[i].cpu().numpy(),
+                action=self.action[i].cpu().numpy(),
+                extrinsic_return=self.extrinsic_return[i].cpu().numpy(),
+                advantage=self.advantage[i].cpu().numpy(),
+                agac_advantage=self.agac_advantage[i].cpu().numpy(),
+                value=self.value[i].cpu().numpy(),
+                log_pi=self.log_pi[i].cpu().numpy(),
+                adv_log_pi=self.adv_log_pi[i].cpu().numpy(),
+                logits_pi=self.logits_pi[i].cpu().numpy(),
+                adv_logits_pi=self.adv_logits_pi[i].cpu().numpy(),
+                done=self.done[i].cpu().numpy()
+            )
+            self._memory.add(trans)
+
+    def add_transitions(self, transitions):
+        """Add transitions to the dataset."""
+        assert isinstance(transitions, Transition)
+        
+        # Process incoming transitions to ensure numpy arrays
+        processed = {}
+        for field in transitions._fields:
+            data = getattr(transitions, field)
+            
+            # Convert tensors to numpy
+            if isinstance(data, torch.Tensor):
+                data = data.cpu().numpy()
+            
+            # Handle lists
+            if isinstance(data, list):
+                # Convert list of tensors if needed
+                if data and isinstance(data[0], torch.Tensor):
+                    data = [t.cpu().numpy() for t in data]
+                data = np.stack(data)
+                
+            processed[field] = data
+        
+        transitions = Transition(**processed)
+        
+        # Get batch size from first field shape
+        batch_size = transitions.observation.shape[0]
+        effective_batch_size = min(batch_size, self._size - self._current_idx)
+        indices = self._current_idx + torch.arange(effective_batch_size)
+        
+        # Store each field in its corresponding tensor
+        for key in transitions._fields:
+            data = getattr(self._data, key)
+            batch = getattr(transitions, key)
+            
+            # Ensure batch is the right shape for indexing
+            if isinstance(batch, np.ndarray) and batch.ndim > 0:
+                # If tensor has more dimensions than batch, add dimensions
+                if data.ndim > batch.ndim:
+                    for _ in range(data.ndim - batch.ndim):
+                        batch = np.expand_dims(batch, axis=-1)
+                # If batch has more dimensions than tensor, reduce dimensions
+                elif batch.ndim > data.ndim:
+                    while batch.ndim > data.ndim:
+                        if batch.shape[-1] == 1:
+                            batch = np.squeeze(batch, axis=-1)
+                        else:
+                            # Can't reduce safely, reshape needed
+                            break
+            
+            # Convert to tensor and store
+            data[indices] = torch.tensor(batch[:effective_batch_size])
+        
+        # Update size and index
+        if self.current_size < self._size:
+            self.current_size += effective_batch_size
+        self._current_idx += effective_batch_size
+        
+        # Handle circular buffer
+        if self._circular and self._current_idx >= self._size:
+            self._current_idx = torch.tensor(0, requires_grad=False)
+            
+        # Update memory with the new transitions for normalization
+        self._update_memory_with_transitions(transitions, effective_batch_size)
+            
+        return effective_batch_size
+    
+    def _update_memory_with_transitions(self, transitions, count):
+        """Helper to update memory with new transitions."""
+        # For a single transition
+        if transitions.observation.ndim == 1 or (
+            transitions.observation.ndim > 1 and transitions.observation.shape[0] == 1):
+            self._memory.add(transitions)
+        # For batched transitions
+        else:
+            for i in range(min(count, transitions.observation.shape[0])):
+                # Extract individual transition
+                trans = Transition(
+                    observation=transitions.observation[i],
+                    action=transitions.action[i],
+                    extrinsic_return=transitions.extrinsic_return[i] 
+                        if transitions.extrinsic_return.ndim > 0 else transitions.extrinsic_return,
+                    advantage=transitions.advantage[i] 
+                        if transitions.advantage.ndim > 0 else transitions.advantage,
+                    agac_advantage=transitions.agac_advantage[i] 
+                        if transitions.agac_advantage.ndim > 0 else transitions.agac_advantage,
+                    value=transitions.value[i] 
+                        if transitions.value.ndim > 0 else transitions.value,
+                    log_pi=transitions.log_pi[i] 
+                        if transitions.log_pi.ndim > 0 else transitions.log_pi,
+                    adv_log_pi=transitions.adv_log_pi[i] 
+                        if transitions.adv_log_pi.ndim > 0 else transitions.adv_log_pi,
+                    logits_pi=transitions.logits_pi[i] 
+                        if transitions.logits_pi.ndim > 0 else transitions.logits_pi,
+                    adv_logits_pi=transitions.adv_logits_pi[i] 
+                        if transitions.adv_logits_pi.ndim > 0 else transitions.adv_logits_pi,
+                    done=transitions.done[i] 
+                        if transitions.done.ndim > 0 else transitions.done
+                )
+                self._memory.add(trans)
+        
+    def add_transitions_batch(self, batch):
+        """
+        Add a batch of transitions using the Memory's Batch format.
+        
+        This method accepts a Batch namedtuple (containing pluralized fields like 
+        'observations', 'actions', etc.) and converts it to the internal storage format.
+        
+        Args:
+            batch: A Batch namedtuple containing batched transition data
+            
+        Returns:
+            int: The number of transitions actually added
+        """
+        # First convert the Batch format to Transition format
+        # Map plural batch fields to singular transition fields
+        batch_size = len(batch.observations)
+        
+        # Create a list of individual transitions to add to memory
+        # This preserves the Memory's normalization capabilities
+        transitions = []
+        for i in range(batch_size):
+            trans = Transition(
+                observation=batch.observations[i],
+                action=batch.actions[i],
+                extrinsic_return=batch.extrinsic_returns[i],
+                advantage=batch.advantages[i],
+                agac_advantage=batch.agac_advantages[i],
+                value=batch.values[i],
+                log_pi=batch.log_pis[i],
+                adv_log_pi=batch.adv_log_pis[i],
+                logits_pi=batch.logits_pi[i],
+                adv_logits_pi=batch.adv_logits_pi[i],
+                done=batch.dones[i]
+            )
+            transitions.append(trans)
+        
+        # Now use our existing add_transitions method to add each transition
+        # This reuses all the shape handling and memory updating logic
+        count = 0
+        for trans in transitions:
+            # Wrap in an additional dimension to indicate batch size of 1
+            wrapped_trans = Transition(
+                observation=np.expand_dims(trans.observation, 0),
+                action=np.expand_dims(trans.action, 0),
+                extrinsic_return=np.expand_dims(trans.extrinsic_return, 0) 
+                    if np.isscalar(trans.extrinsic_return) else np.expand_dims(trans.extrinsic_return, 0),
+                advantage=np.expand_dims(trans.advantage, 0) 
+                    if np.isscalar(trans.advantage) else np.expand_dims(trans.advantage, 0),
+                agac_advantage=np.expand_dims(trans.agac_advantage, 0) 
+                    if np.isscalar(trans.agac_advantage) else np.expand_dims(trans.agac_advantage, 0),
+                value=np.expand_dims(trans.value, 0) 
+                    if np.isscalar(trans.value) else np.expand_dims(trans.value, 0),
+                log_pi=np.expand_dims(trans.log_pi, 0) 
+                    if np.isscalar(trans.log_pi) else np.expand_dims(trans.log_pi, 0),
+                adv_log_pi=np.expand_dims(trans.adv_log_pi, 0) 
+                    if np.isscalar(trans.adv_log_pi) else np.expand_dims(trans.adv_log_pi, 0),
+                logits_pi=np.expand_dims(trans.logits_pi, 0) 
+                    if np.isscalar(trans.logits_pi) else np.expand_dims(trans.logits_pi, 0),
+                adv_logits_pi=np.expand_dims(trans.adv_logits_pi, 0) 
+                    if np.isscalar(trans.adv_logits_pi) else np.expand_dims(trans.adv_logits_pi, 0),
+                done=np.expand_dims(trans.done, 0) 
+                    if np.isscalar(trans.done) else np.expand_dims(trans.done, 0)
+            )
+            
+            result = self.add_transitions(wrapped_trans)
+            count += result
+            
+            # If we've filled the buffer, stop adding
+            if result == 0:
+                break
+        
+        return count
+        
+    def get_advantages_stats(self):
+        """Get advantage statistics using Memory's implementation."""
+        self._sync_memory()
+        return self._memory.get_advantages_stats()
+
+def scatter_update(tensor, indices, updates):
+    tensor = torch.tensor(tensor)
+    indices = torch.tensor(indices, dtype=torch.long)
+    updates = torch.tensor(updates)
+    tensor[indices] = updates
+    return tensor
+
+
 
 
 def save_copy(data, ckpt_name):
@@ -153,102 +411,6 @@ def save_copy(data, ckpt_name):
     with open(ckpt_name + '.pth', 'wb') as filehandler:
         dill.dump(new_data, filehandler)
 
-
-class Dataset(data.Dataset):
-    """Tensorflow module of wm_image_replay_buffer of transitions."""
-
-    def __init__(
-            self,
-            observation_spec,
-            action_spec,
-            size,
-            circular=True,
-    ):
-        super(Dataset, self).__init__()
-        self._size = size
-        self._circular = circular
-        obs_shape = list(observation_spec.shape)
-        obs_type = observation_spec.dtype
-        action_shape = list(action_spec.shape)
-        action_type = action_spec.dtype
-        self._s1 = self._zeros([size] + obs_shape, obs_type)
-        self._s2 = self._zeros([size] + obs_shape, obs_type)
-        self._a1 = self._zeros([size] + action_shape, action_type)
-        self._a2 = self._zeros([size] + action_shape, action_type)
-        self._discount = self._zeros([size], torch.float32)
-        self._reward = self._zeros([size], torch.float32)
-        self._done = self._zeros([size], torch.bool)
-        self._data = Transition(
-            s1=self._s1,
-            s2=self._s2,
-            a1=self._a1,
-            a2=self._a2,
-            discount=self._discount,
-            reward=self._reward,
-            done=self._done)
-        self._current_size = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
-        self._current_idx = torch.autograd.Variable(torch.tensor(0), requires_grad=False)
-        self._capacity = torch.autograd.Variable(torch.tensor(self._size))
-        self._config = collections.OrderedDict(
-            observation_spec=observation_spec,
-            action_spec=action_spec,
-            size=size,
-            circular=circular)
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    @property
-    def config(self):
-        return self._config
-
-    def create_view(self, indices):
-        return DatasetView(self, indices)
-
-    def get_batch(self, indices):
-        indices = torch.tensor(indices, dtype=torch.int64, requires_grad=False)
-
-        def get_batch_(data_):
-            return gather(data_, indices)
-
-        transition_batch = nest.map_structure(get_batch_, self._data)
-        return transition_batch
-
-    @property
-    def data(self):
-        return self._data
-
-    @property
-    def capacity(self):
-        return self._size
-
-    @property
-    def size(self):
-        return self._current_size.numpy()
-
-    def _zeros(self, shape, dtype):
-        """Create a variable initialized with zeros."""
-        return torch.autograd.Variable(torch.zeros(shape, dtype=dtype))
-
-    def add_transitions(self, transitions):
-        assert isinstance(transitions, Transition)
-        for i in transitions._fields:
-            attr = getattr(transitions, i)
-            if torch.is_tensor(attr):
-                attr = attr.detach().cpu()
-            transitions = transitions._replace(**{i: np.expand_dims(attr, axis=0)})
-        batch_size = transitions.s1.shape[0]
-        effective_batch_size = torch.minimum(torch.tensor(batch_size), torch.tensor(self._size) - self._current_idx)
-        indices = self._current_idx + torch.arange(effective_batch_size.item())
-        for key in transitions._asdict().keys():
-            data = getattr(self._data, key)
-            batch = getattr(transitions, key)
-            data[indices] = torch.tensor(batch[:effective_batch_size])
-        # Update size and index.
-        if torch.less(self._current_size, self._size):
-            self._current_size += effective_batch_size
-        self._current_idx += effective_batch_size
-        if self._circular:
-            if torch.greater_equal(self._current_idx, self._size):
-                self._current_idx = 0
 
 
 #########################
@@ -292,145 +454,3 @@ def get_sample_counts(n, distr):
     counts.append(remainder)
     return counts
 
-
-def collect_n_transitions(tf_env, policy, data, n, log_freq=1000):
-    """Adds desired number of transitions to wm_image_replay_buffer."""
-    collector = DataCollector(tf_env, policy, data)
-    time_st = time.time()
-    timed_at_step = 0
-    steps_collected = 0
-    while steps_collected < n:
-        count = collector.collect_transition()
-        steps_collected += count
-        if (steps_collected % log_freq == 0
-            or steps_collected == n) and count > 0:
-            steps_per_sec = ((steps_collected - timed_at_step)
-                             / (time.time() - time_st))
-            timed_at_step = steps_collected
-            time_st = time.time()
-            logging.info('(%d/%d) steps collected at %.4g steps/s.', steps_collected,
-                         n, steps_per_sec)
-
-
-def collect_data(
-        log_dir,
-        data_config,
-        n_samples=int(1e3),
-        env_name='HalfCheetah-v2',
-        log_freq=int(1e2),
-        n_eval_episodes=20,
-):
-    """
-                 **** Main function ****
-    Creates wm_image_replay_buffer of transitions based on desired config.
-    """
-    seed = 0
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    dm_env = gym.spec(env_name).make()
-    env = alf_gym_wrapper.AlfGymWrapper(dm_env, discount=0.99)
-    env = TimeLimit(env, MUJOCO_ENVS_LENNGTH[env_name])
-    observation_spec = env.observation_spec()
-    action_spec = env.action_spec()
-
-    # Initialize wm_image_replay_buffer.
-    sample_sizes = list([cfg[-1] for cfg in data_config])
-    sample_sizes = get_sample_counts(n_samples, sample_sizes)
-    logging.info(", ".join(["%s" % s for s in sample_sizes]))
-    data = Dataset(
-        observation_spec,
-        action_spec,
-        n_samples,
-        circular=False)
-
-    # Collect data for each policy in data_config.
-    time_st = time.time()
-    test_results = collections.OrderedDict()
-    for (policy_name, policy_cfg, _), n_transitions in zip(
-            data_config, sample_sizes):
-        policy_cfg = parse_policy_cfg(policy_cfg)
-        policy = load_policy(policy_cfg, action_spec, observation_spec)
-        logging.info('Testing policy %s...', policy_name)
-        eval_mean, eval_std = eval_policy_episodes(
-            env, policy, n_eval_episodes)
-        test_results[policy_name] = [eval_mean, eval_std]
-        logging.info('Return mean %.4g, std %.4g.', eval_mean, eval_std)
-        logging.info('Collecting data from policy %s...', policy_name)
-        collect_n_transitions(env, policy, data, n_transitions, log_freq)
-    # Save final wm_image_replay_buffer.
-    assert data.size == data.capacity
-    data_ckpt_name = os.path.join(log_dir, 'data_{}.pt'.format(env_name))
-    torch.save({"wm_image_replay_buffer": data, "capacity": data.capacity}, data_ckpt_name)
-
-    whole_data_ckpt_name = os.path.join(log_dir, 'data_{}.pth'.format(env_name))
-    with open(whole_data_ckpt_name, 'wb') as filehandler:
-        pickle.dump(data, filehandler)
-    time_cost = time.time() - time_st
-    logging.info('Finished: %d transitions collected, '
-                 'saved at %s, '
-                 'time cost %.4gs.', n_samples, data_ckpt_name, time_cost)
-
-
-def main(args):
-    logging.set_verbosity(logging.INFO)
-    sub_dir = args.sub_offlinerl_dir
-    log_dir = os.path.join(
-        args.root_offlinerl_dir,
-        args.env_name,
-        args.data_name,
-        sub_dir,
-    )
-    maybe_makedirs(log_dir)
-    # print(args.config_dir)
-    config_module = importlib.import_module(
-        '{}.{}'.format(args.config_dir, args.config_file))
-    collect_data(
-        log_dir=log_dir,
-        data_config=config_module.get_data_config(args.env_name,
-                                                  args.policy_root_dir),
-        n_samples=args.n_samples,
-        env_name=args.env_name,
-        n_eval_episodes=args.n_eval_episodes)
-
-
-def collect_gym_data(args):
-    args.sub_offlinerl_dir = '0'
-    # args.env_name = 'HalfCheetah-v2'
-    args.data_name = 'example'
-    args.config_file = 'D2E_example'
-    data_dir = 'testdata'
-    args.test_srcdir = os.getcwd()
-    args.policy_root_dir = os.path.join(args.test_srcdir,
-                                        data_dir)
-    args.n_samples = 100000  # Short collection.
-    args.n_eval_episodes = 50
-    main(args)
-
-
-if __name__ == "__main__":
-    repo_dir = "/mnt/e/pycharm_projects/AIME"
-
-    parser = argparse.ArgumentParser(description='DreamToExplore')
-    parser.add_argument('--root_offlinerl_dir', type=dir_path,
-                        default=os.path.join(os.getenv('HOME', '/'), repo_dir, 'offlinerl'),
-                        help='Root directory for saving data')
-    parser.add_argument('--sub_offlinerl_dir', type=str, default=None, help='sub directory for saving data.')
-    parser.add_argument('--test_srcdir', type=str, default=None, help='directory for saving test data.')
-    parser.add_argument('--env_name', type=str, default='HalfCheetah-v2', help='env name.')
-    parser.add_argument('--data_name', type=str, default='random', help='data name.')
-    parser.add_argument('--env_loader', type=str, default='mujoco', help='env loader, suite/gym.')
-    parser.add_argument('--config_dir', type=str, default='configs', help='config file dir.')
-    parser.add_argument('--config_file', type=str, default='d2e_pure', help='config file name.')
-    parser.add_argument('--policy_root_dir', type=str, default=None,
-                        help='Directory in which to find the behavior policy.')
-    parser.add_argument('--n_samples', type=int, default=int(1e3), help='number of transitions to collect.')
-    parser.add_argument('--n_eval_episodes', type=int, default=20, help='number episodes to eval each policy.')
-    parser.add_argument("--gin_file", type=str, default=[], nargs='*', help='Paths to the gin-config files.')
-
-    parser.add_argument('--gin_bindings', type=str, default=[], nargs='*', help='Gin binding parameters.')
-    args = parser.parse_args()
-    if not os.path.exists(os.path.join(args.root_offlinerl_dir, f"{args.env_name}/example/0")):
-        os.makedirs(os.path.join(args.root_offlinerl_dir, f"{args.env_name}/example/0"))
-
-    ##############################
-    collect_gym_data(args)

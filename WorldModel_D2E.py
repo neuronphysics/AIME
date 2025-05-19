@@ -1,16 +1,37 @@
-import torch.utils.data.distributed
+import DataCollectionD2E as DC
 from WorldModel_D2E_Structures import *
-from planner_D2E_regularizer_n_step import *
+from WorldModel_D2E_Utils import *
 from gym import spaces
-from alf_gym_wrapper import tensor_spec_from_gym_space
+from tensor_utils import tensor_spec_from_gym_space
 import os
+from agac_torch.agac.agac_ppo import PPO
+from agac_torch.agac.memory import Memory, Transition
+from copy import deepcopy
+from welford import Welford
+from gym.spaces import Box, Discrete
+from agac_torch.agac.utils import DiscreteGrid, compute_advantages_and_returns
+import sys
+from pathlib import Path
+import gym
+from agac_torch.agac.configs import ExperimentConfig
+from torch.utils.tensorboard import SummaryWriter
+import argparse
+from typing import Dict, List, Iterator, Union
+import random
+import numpy as np
+import re
+import functools
+import pathlib
 os.environ['MUJOCO_GL'] = 'egl'  # or ‘osmesa’ for software rendering
 
 sys.path.append(os.path.join(os.getcwd(), 'VRNN'))
-
+sys.path.append(os.path.join(os.getcwd(), 'agac_torch'))
 path = str(Path(Path(__file__).parent.absolute()).parent.absolute())
 sys.path.insert(0, os.getcwd())
 
+comm = MPI.COMM_WORLD
+num_workers = comm.Get_size()
+rank = comm.Get_rank()
 try:
     import rich.traceback
 
@@ -19,56 +40,48 @@ except ImportError:
     pass
 
 """
-The purpose of this script is to integrate three key components of our dream to explore algorithm:
-(1) latent representation learning, 
-(2) environment dynamics learning (prediction), 
-(3) planning. 
-The first component involves the use of an infinite Gaussian mixture variational autoencoder to learn latent representations (implemented in Hierarchical_StickBreaking_GMMVAE.py). 
-The second component focuses on learning the dynamics of the environment through a variational sequential neural process (VSNP) architecture, which can be found in the VRNN directory and main.py file. 
-The third component involves building a variational model-based actor critic algorithm using planner_D2E_regularizer.py.
+Dream to Explore (D2E): World Model Implementation
 
-We create a world model that combines the first two components and adds two extra heads to compute reward and discount. 
-Next, we develop the D2E algorithm that brings together the world model and the planning algorithm. 
-The goal is to learn the latent dynamics of the environment through the world model and then simulate imaginative trajectories from the model. 
-Finally, we use the planning algorithm to determine the best policy that maximizes the expected reward from the simulated trajectories.
+This code implements a world model-based reinforcement learning algorithm inspired by Dreamer/DreamerV2 
+with the integration of Adversarially Guided Actor-Critic (AGAC) for enhanced exploration.
 
-Overall, this script aims to provide a comprehensive framework for dream to explore algorithm that incorporates various key components and techniques to enable effective learning of the world model and planning.
+## Key Components:
 
+1. World Model:
+   - Encoder (DPGMM-VAE): Maps observations to latent states, learning rich representations
+   - Transition Model (VRNN): Predicts next latent states using deterministic and stochastic states
+   - Prediction Heads: Estimate rewards and episode termination from latent states
+   - Discriminator: Trains adversarially to improve representation quality
+
+2. Actor-Critic with Adversarial Guidance:
+   - Actor: Policy network mapping latent states to actions
+   - Adversary: Secondary policy trained to maximize KL divergence from actor
+   - Critic: Value network estimating expected returns
+   - Intrinsic Motivation: Rewards based on policy-adversary disagreement
+
+Training Process:
+
+1. Model Learning:
+   - Train the world model on real experience from the environment
+   - Maximize ELBO for representation learning with additional adversarial objectives
+
+2. Imagination:
+   - Use the world model to generate imagined trajectories
+   - Sample actions from the current policy and roll out future states
+
+3. Policy Learning:
+   - Train actor and critic on imagined trajectories
+   - AGAC provides intrinsic rewards based on actor-adversary divergence
+   - Use both dynamics and reinforcement gradients for stable training
+
+4. Environment Interaction:
+   - Collect real experiences using the latest policy
+   - Add new data to replay buffer and continue the training cycle
+
+This approach combines the sample efficiency of model-based methods with the exploration 
+benefits of adversarial techniques, enabling effective learning in sparse-reward environments.
 """
 
-HYPER_PARAMETERS = {
-                    "prior_alpha": 7.,  # gamma_alpha
-                    "prior_beta": 1.,  # gamma_beta
-
-                    "hidden_transit": 10,
-                    "GAMMA": 0.99,
-                    "PREDICT_DONE": False,
-                    "seed": 1234,
-                    "number_of_mixtures": 3,
-                    "weight_decay": 1e-5,
-                    "n_channel": 3,
-                    "VRNN_Optimizer_Type": "MADGRAD",
-                    "MAX_GRAD_NORM": 100.,
-                    "expl_behavior": "greedy",
-                    "expl_noise": 0.0,
-                    "eval_noise": 0.0,
-                    "replay_buffer_size": int(1e4),
-
-                    'max_components': 2,
-                    'latent_dim': 10,
-                    'hidden_dim': 10,
-                    'batch_size': 1,
-                    'lr': 1e-4,
-                    'beta': 1.0,
-                    'lambda_img': 1.0,
-                    'lambda_latent': 3.0,
-                    'n_critic': 3,
-                    'grad_clip': 0.5,
-                    'img_disc_channels': 16,
-                    'img_disc_layers': 5,
-                    'latent_disc_layers': 3,
-                    'use_actnorm': True
-                    }
 
 
 def action_noise(action, amount, act_space):
@@ -83,207 +96,487 @@ def action_noise(action, amount, act_space):
 
 
 class D2EAlgorithm(nn.Module):
-    # https://github.com/sai-prasanna/dreamerv2_torch/tree/main/dreamerv2_torch/agent.py
+ 
+    """
+    Dream to Explore (D2E): A world model-based reinforcement learning agent that
+    combines DreamerV2's architecture with:
+    
+    1. Enhanced representation learning via DPGMM prior
+    2. Powerful dynamics model using VRNN with attention
+    3. Improved exploration via Adversarially Guided Actor-Critic (AGAC)
+    
+    This implementation follows a modular architecture with clear separation between:
+    - World model learning (representation, dynamics, prediction)
+    - Policy optimization through imagination
+    - Environment interaction for data collection
+    """
     def __init__(self,
-                 hyperParams,
-                 config,
-                 obs_space,
-                 act_space,
-                 latent_space,
+                 config: ExperimentConfig,
+                 obs_space: gym.Space,
+                 act_space: gym.Space,
+                 latent_space: gym.Space,
                  step: NCounter,
                  env_name: str,
-                 log_dir,
-                 prefill_data_generator,
-                 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-                 model_params=(((200, 200),), 2, 1),
-                 optimizers=((0.0001, 0.5, 0.99),),
-                 update_freq=1,
-                 update_rate=0.005,
-                 discount=0.99,
-                 eval_state_mean=False,
-                 precision=32,
-                 **kwarg):
+                 log_dir: str,
+                 prefill_data_generator:Iterator[Dict[str, Union[torch.Tensor, np.ndarray]]],
+                 device:torch.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+                **kwargs):
+
+
+
         super().__init__()
-        self.parameter = namedtuple('x', hyperParams.keys())(*hyperParams.values())
+        """
+        Initialize the D2E agent with its components and parameters.
+        
+        Args:
+            config: Configuration object containing hyperparameters
+            obs_space: Observation space of the environment
+            act_space: Action space of the environment
+            latent_space: Specification for the latent space
+            step: Step counter object
+            env_name: Name of the environment
+            log_dir: Directory for logging
+            prefill_data_generator: Iterator for prefill data
+            device: Device to run computations on (CPU or GPU)
+        """        
+        # Store parameters
         self._env = env_name
-        self._discount = discount
         self.config = config
         self.batch_size = config.batch_size
-
         self.obs_space = obs_space
         self.act_space = act_space
         self.latent_space = latent_space
-
-        # Update hyperParams with image size from config
-        hyperParams['image_width'] = config.image_width
-        hyperParams['image_height'] = config.image_height
-
+        self.log_dir = log_dir
         self.step = step
         self.device = device
-        self.precision = precision
-        self.eval_state_mean = eval_state_mean
         self.sequence_length = config.sequence_size
         self.register_buffer("tfstep", torch.ones(()) * int(self.step))
 
-        # every next will give 32 (hard coded) data sample
+        # Data sources
         self.prefill_generator = prefill_data_generator
-
-        self.task_behavior_reply_buffer = DC.Dataset(observation_spec=latent_space, action_spec=act_space,
-                                                     size=config.policy_reply_buffer_size,
-                                                     group_size=config.sequence_size)
+        self._discount = config.discount if hasattr(config, 'discount') else 0.99
+        
+        # Task behavior replay buffer for policy learning
+        self.task_behavior_reply_buffer = DC.Dataset(
+            observation_spec=latent_space, 
+            action_spec=act_space,
+            size=config.policy_reply_buffer_size
+        )
         self.task_behavior_reply_buffer.current_size += config.batch_size
 
-        self.wm = WorldModel(hyperParams,
-                             sequence_length=self.sequence_length,
-                             env_name=self._env,
-                             device=self.device,
-                             writer=config.writer,
-                             **kwarg)
+        # Initialize World Model
+        # This is the primary model for learning representations and dynamics
+        self.wm = WorldModel(
+            config.world_model,
+            sequence_length=self.sequence_length,
+            env_name=self._env,
+            device=self.device,
+            writer=config.writer,
+            **kwargs
+        )
 
-        self.RewardNorm = StreamNorm(momentum=0.99, scale=1.0, eps=1e-8)
+        # Stream normalization for reward processing
+        self.reward_norm = StreamNorm(momentum=0.99, scale=1.0, eps=1e-8)
+        
+        # Imagination horizon for planning
         self.imag_horizon = config.sequence_size
+        # Initialize AGAC memory for storing imagined trajectories
+        self.agac_memory = Memory()
+        self.task_behavior = PPO(latent_space, act_space, agac_config)
+
+        # Configure precision
+        agac_config = create_agac_config(config=config, env_name=env_name)
+        self.precision = getattr(agac_config.reinforcement_learning, 'precision', 32) if hasattr(config, 'reinforcement_learning') else 32
         self.use_amp = True if self.precision == 16 else False
+        
+        # Initialize AGAC policy (Adversarially Guided Actor-Critic)
+        self.intrinsic_coef = getattr(agac_config.reinforcement_learning, 'intrinsic_reward_coefficient', 0.01) if hasattr(config, 'reinforcement_learning') else 0.01
+        self._lambda_gae = getattr(agac_config.reinforcement_learning, 'lambda_gae', 0.95) if hasattr(config, 'reinforcement_learning') else 0.95
+        
+        
+        
+        # Monitoring metrics
+        self._metrics = {}
 
-        # Construct agent.
-        agent_flags = utils.Flags(
-            observation_spec=latent_space,
-            action_spec=act_space,
-            model_params=model_params,
-            optimizers=optimizers,
-            batch_size=self.batch_size,
-            weight_decays=(self.parameter.weight_decay,),
-            update_freq=update_freq,
-            update_rate=update_rate,
-            discount=discount,
-            done=self.parameter.PREDICT_DONE,
-            env_name=env_name,
-            train_data=self.task_behavior_reply_buffer
-        )
-        agent_args = Config(agent_flags).agent_args
-        self.task_behavior = D2EAgent(**vars(agent_args))
-        self.task_behavior_params = itertools.chain(
-            self.task_behavior._get_q_source_vars(),
-            self.task_behavior._get_p_vars(),
-            self.task_behavior._get_c_vars(),
-            self.task_behavior._get_v_source_vars(),
-            self.task_behavior._a_vars,
-            self.task_behavior._ae_vars,
-        )
-        self.task_behavior_reply_buffer.current_size -= config.batch_size
-
-    def train_(self, data, state=None):
+    def initialize_lazy_modules(self, full_train_set):
         """
-        List of operations happen here in this module 
-        1) train the world model on read data
-        2) generate starting state from real observation for imagine state, action, reward, and discount from the world model
-        3) imagine trajectories and train policy on the imagined trajectories
+        Initialize lazy-loaded modules and normalizers.
+        
+        Args:
+            full_train_set: Dataset to use for initialization
         """
+        # Initialize world model optimizer
+        self.wm.initialize_optimizer()
+        
+        # Initialize normalizers based on training data
+        self.wm.init_normalizer(full_train_set)
+        
+        # Prefill policy replay buffer with encoded observations
+        process_batch = self.config.policy_reply_buffer_prefill_batch
+        for i in range(self.config.policy_reply_buffer_size // process_batch + 1):
+            # Get next transition
+            tran = dict_to_tran(next(self.prefill_generator))
+            
+            # Encode observations
+            obs = torch.reshape(
+                tran.s1, 
+                (-1, self.parameter.n_channel, self.parameter.image_width, self.parameter.image_width)
+            ).to(self.device)
+            
+            next_obs = torch.reshape(
+                tran.s2, 
+                (-1, self.parameter.n_channel, self.parameter.image_width, self.parameter.image_width)
+            ).to(self.device)
+            
+            # Get latent representations
+            z_real, _, _ = self.wm.encoder(obs)
+            z_next, _, _ = self.wm.encoder(next_obs)
+            
+            # Store latent transitions
+            tran.s1 = z_real.reshape(process_batch, -1, self.parameter.latent_dim).detach().cpu()
+            tran.s2 = z_next.reshape(process_batch, -1, self.parameter.latent_dim).detach().cpu()
+            
+            # Add to replay buffer
+            self.task_behavior_reply_buffer.add_transitions_batch(tran)
 
+    def train_world_model(self, data):
+        """
+        Train the world model on a batch of real experience.
+        
+        This function handles the representation and dynamics learning parts
+        of the D2E algorithm, training the DPGMM-VAE and VRNN models.
+        
+        Args:
+            data: Batch of experience data
+            
+        Returns:
+            Dictionary with world model outputs and metrics
+        """
         metrics = {}
+        
+        # Train world model components
+        real_embed, outs, world_model_metrics = self.wm.train_(data)
+        
+        # Extract latent states from outputs
+        z_real = outs['embedding']  # Current latent state
+        z_next = outs['post']      # Next latent state
+        
+        # Store metrics
+        metrics.update(world_model_metrics)
+        
+        return {
+            'z_real': z_real,
+            'z_next': z_next,
+            'real_embed': real_embed,
+            'outs': outs,
+            'metrics': metrics
+        }
 
-        real_embed, outs, mets = self.wm.train_(data)
-        z_real = outs['embedding']
-        z_next = outs['post']
-        metrics.update(mets)
+    def imagine_trajectories(self, start_state, horizon, policy=None, done=None):
+        """
+        Generate imagined trajectories using the world model.
+        
+        This is a key part of the DreamerV2 algorithm - using the learned model
+        to generate imagined experiences for policy improvement.
+        
+        Args:
+            start_state: Initial latent state
+            horizon: Number of steps to imagine
+            policy: Policy to use for action selection (uses self.task_behavior if None)
+            done: Terminal indicators for initial states
+            
+        Returns:
+            Dictionary of imagined trajectory data
+        """
+        with torch.no_grad():
+            # Use world model to imagine trajectories
+            seq = self.wm.imagine(
+                self.task_behavior if policy is None else policy,
+                start_state,
+                horizon,
+                done
+            )
+            
+            # Normalize rewards using streaming normalization
+            normalized_rewards, reward_metrics = self.reward_norm(seq["reward"])
+            seq["normalized_reward"] = normalized_rewards
+            
+            return seq, reward_metrics
 
-        # we take a slice of (batch, seq, ...)
-        slice_index = 0
-        z_real_slice = torch.reshape(z_real, (self.batch_size, self.sequence_length, -1))[:, slice_index, :]
-        done_slice = data.done[:, slice_index]
-        start = {"feat": z_real_slice}
-
-        with RequiresGrad(self.task_behavior_params):
-            with torch.cuda.amp.autocast(self.use_amp):
-                seq = self.wm.imagine(
-                    self.task_behavior,
-                    start,
-                    self.imag_horizon,
-                    done_slice,
+    def prepare_agac_transitions(self, imagined_trajectories):
+        """
+        Convert imagined trajectories to AGAC transition format for policy training.
+        
+        Args:
+            imagined_trajectories: Trajectories from imagine_trajectories
+            
+        Returns:
+            Number of transitions added to memory
+        """
+        # Extract trajectory components
+        latent_states = imagined_trajectories['latent']
+        
+        rewards = imagined_trajectories['reward']
+        dones = imagined_trajectories['done']
+        
+        batch_size, seq_len = latent_states.shape[0], latent_states.shape[1] - 1
+        
+        # Get policy outputs for all states
+        pi_outputs = []
+        adv_outputs = []
+        values = []
+        intrinsic_rewards = []
+        actions_list = []
+        
+        # Generate policy outputs for each state in the trajectory
+        for t in range(seq_len):
+            state = latent_states[:, t]
+            
+            # Get policy and value outputs
+            action, log_pi, adv_log_pi, params_pi, params_adv = self.task_behavior.select_action(
+                state.cpu().numpy(), deterministic=False)
+            value = self.task_behavior.compute_values(state.cpu().numpy())
+            
+            # Store policy outputs
+            pi_outputs.append((log_pi, params_pi))
+            adv_outputs.append((adv_log_pi, params_adv))
+            values.append(value)
+            
+            # Calculate intrinsic rewards (KL divergence between policy and adversary)
+            intrinsic_rewards.append(log_pi - adv_log_pi)
+            actions_list.append(action.copy())
+        
+        # Determine value for terminal states
+        if torch.all(dones[:, -1] == 1):
+            last_r = 0.0
+        else:
+            # Use critic for value estimation of non-terminal states
+            last_state = latent_states[:, -1][dones[:, -1] == 0]
+            if last_state.shape[0] > 0:  # Only if there are non-terminal states
+                last_r = self.task_behavior.compute_values(last_state.cpu().numpy()).mean()
+            else:
+                last_r = 0.0
+        
+        # Calculate advantages using GAE
+        advantages, returns = compute_advantages_and_returns(
+            rewards.squeeze(-1).cpu().numpy()[:, :-1],
+            np.vstack(values).T,  # Reshape to [batch_size, seq_len]
+            last_r,
+            self._discount,
+            self._lambda_gae
+        )
+        
+        # Add intrinsic rewards to advantages
+        intrinsic_rewards = np.array(intrinsic_rewards).T  # Reshape to [batch_size, seq_len]
+        agac_advantages = advantages + self.intrinsic_coef * intrinsic_rewards
+        
+        # Create transitions for each state in each trajectory
+        transitions_added = 0
+        for i in range(batch_size):
+            for t in range(seq_len):
+                # Create transition with policy information
+                transition = Transition(
+                    observation=latent_states[i, t].cpu().numpy(),
+                    action=actions_list[t][i],
+                    extrinsic_return=returns[i, t],
+                    advantage=advantages[i, t],
+                    agac_advantage=agac_advantages[i, t],
+                    value=values[t][i],
+                    log_pi=pi_outputs[t][0][i],
+                    adv_log_pi=adv_outputs[t][0][i],
+                    logits_pi=pi_outputs[t][1][i],
+                    adv_logits_pi=adv_outputs[t][1][i],
+                    done=dones[i, t].cpu().numpy()
                 )
+                
+                # Add to AGAC memory
+                self.agac_memory.add(transition)
+                transitions_added += 1
+        
+        return transitions_added
 
-                rewards, mets1 = self.RewardNorm(seq["reward"])
-                mets1 = {f"reward_{k}": v for k, v in mets1.items()}
+    def train_policy(self, num_updates=5):
+        """
+        Train the AGAC policy on imagined trajectories.
+        
+        Args:
+            num_updates: Number of policy updates to perform
+            
+        Returns:
+            Dictionary with policy training metrics
+        """
+        policy_metrics = {}
+        
+        # Skip if not enough data
+        if self.agac_memory.num_elements < self.batch_size:
+            return {"policy_training_skipped": True}
+        
+        # Perform multiple updates with current data
+        for _ in range(num_updates):
+            # Sample batch of transitions
+            batch = self.agac_memory.sample(self.batch_size)
+            
+            # Train AGAC policy
+            self.task_behavior.train_on_batch(batch, self.intrinsic_coef)
+        
+        # Collect metrics from AGAC
+        for log in self.task_behavior.logs:
+            policy_metrics[log.name] = log.value
+        
+        return policy_metrics
 
-                # add seq to task behavior reply buffer
-                if state is None:
-                    rewards = rewards.squeeze(-1).cpu()
-                    trans = Transition(s1=seq['latent'][:, :-1, :], s2=seq['latent'][:, 1:, :],
-                                       a1=seq['action'][:, :-1, :],
-                                       a2=seq['action'][:, 1:, :], reward=rewards, done=seq['done'],
-                                       discount=seq['discount'])
-                    self.task_behavior._train_data.add_transitions_batch(trans)
+    def train_step(self, data, state=None):
+        """
+        Perform one complete training step on both world model and policy.
+        
+        This is the main training function that follows the DreamerV2 pattern:
+        1. Train world model on real experience
+        2. Generate imagined trajectories using the world model
+        3. Train policy on imagined trajectories
+        
+        Args:
+            data: Batch of real experience
+            state: Optional state for recurrent processing
+            
+        Returns:
+            Dictionary with all training metrics
+        """
+        all_metrics = {}
+        
+        # 1. Train world model on real experience
+        wm_results = self.train_world_model(data)
+        all_metrics.update(wm_results['metrics'])
+        
+        # Extract latent state from first step for imagination
+        z_real = wm_results['z_real']
+        z_real_slice = torch.reshape(z_real, (self.batch_size, self.sequence_length, -1))[:, 0, :]
+        done_slice = data.done[:, 0] if hasattr(data, 'done') else None
+        
+        # Prepare initial state for imagination
+        start_state = {"feat": z_real_slice}
+        
+        # 2. Generate imagined trajectories
+        imagined_traj, reward_metrics = self.imagine_trajectories(
+            start_state, 
+            self.imag_horizon,
+            done=done_slice
+        )
+        
+        # Add reward normalization metrics
+        reward_metrics = {f"reward_{k}": v for k, v in reward_metrics.items()}
+        all_metrics.update(reward_metrics)
+        
+        # 3. Prepare trajectories for policy training
+        transitions_added = self.prepare_agac_transitions(imagined_traj)
+        all_metrics["transitions_added"] = transitions_added
+        
+        # 4. Train policy on imagined trajectories
+        policy_metrics = self.train_policy(num_updates=5)
+        all_metrics.update(policy_metrics)
+        
+        # 5. Manage memory
+        # Flush memory if it gets too large to avoid off-policy data
+        if self.agac_memory.num_elements > 10000:
+            self.agac_memory.reset()
+            all_metrics["memory_flushed"] = True
+        
+        return all_metrics
 
-                # train the policy
-                self.task_behavior.train_step()
+    def policy(self, observation, reward, done, state=None, mode="train"):
+        """
+        Select actions from current policy based on observations.
+        
+        This function handles:
+        1. Preprocessing observations
+        2. Encoding observations to latent states
+        3. Using the policy to select actions
+        
+        Args:
+            observation: Environment observation
+            reward: Reward from environment
+            done: Terminal indicator
+            state: Optional recurrent state
+            mode: Policy mode ('train', 'explore', or 'eval')
+            
+        Returns:
+            Selected action and updated state
+        """
+        # Preprocess observations
+        obs = self.wm.preprocess(observation, reward, done)
+        
+        # Update step counter (used for schedules)
+        self.tfstep.copy_(torch.tensor([int(self.step)])[0])
 
-                mets2 = self.task_behavior._all_train_info
-                metrics.update({"expl_" + key: value for key, value in mets2.items()})
-                metrics.update(**mets1)
+        # Encode observation to latent state
+        z_x, _, _ = self.wm.encoder(obs["observation"].to(self.device))
 
-        return metrics
+        # Set initial state for imagination
+        start = {"feat": z_x}
+        
+        # Generate imagined trajectory (unused here, but could be used for planning)
+        seq = self.wm.imagine(
+            self.task_behavior, 
+            start, 
+            self.imag_horizon, 
+            torch.from_numpy(done)
+        )
+        
+        # Extract policy state from imagined trajectory
+        policy_state = seq['latent']
+
+        # Convert to numpy for AGAC
+        z_np = z_x.cpu().numpy()
+        
+        # Select action based on mode
+        if mode == "eval":
+            action, _, _, _, _ = self.task_behavior.select_action(z_np, deterministic=True)
+            noise = self.parameter.eval_noise
+        elif mode in ["explore", "train"]:
+            action, _, _, _, _ = self.task_behavior.select_action(z_np, deterministic=False)
+            noise = self.parameter.expl_noise
+        
+        # Apply action noise for exploration
+        action = torch.tensor(action, device=self.device)
+        action = action_noise(action, noise, self.act_space)
+        
+        # Package outputs
+        outputs = {"action": action}
+        return outputs, z_x
 
     def report(self, data):
+        """
+        Generate visualization and metrics for logging.
+        
+        Args:
+            data: Batch of data for visualization
+            
+        Returns:
+            Dictionary of visualizations
+        """
         report = {}
+        
+        # Preprocess data
         processed_data = self.wm.preprocess(data['s1'], data['reward'], data['done'])
+        
+        # Reshape for prediction
         batch, seq, channel, image_width, _ = data['s1'].shape
         obs = torch.reshape(processed_data['observation'], (-1, channel, image_width, image_width))
         action = torch.reshape(data['a1'], (-1, data['a1'].shape[-1]))
+        
+        # Generate video prediction
         report[f"openl_gym"] = self.wm.video_pred(obs, action)
+        
         return report
-
-    def initialize_lazy_modules(self, full_train_set):
-        self.wm.initialize_optimizer()
-        self.wm.init_normalizer(full_train_set)
-
-        process_batch = self.config.policy_reply_buffer_prefill_batch
-        for i in range(self.config.policy_reply_buffer_size // process_batch + 1):
-            tran = dict_to_tran(next(self.prefill_generator))
-            obs = torch.reshape(tran.s1, (-1, self.parameter.n_channel, self.parameter.image_width,
-                                          self.parameter.image_width)).to(self.device)
-            next_obs = torch.reshape(tran.s2, (-1, self.parameter.n_channel, self.parameter.image_width,
-                                               self.parameter.image_width)).to(self.device)
-            z_real, _, _ = self.wm.encoder(obs)
-            z_next, _, _ = self.wm.encoder(next_obs)
-            tran.s1 = z_real.reshape(process_batch, -1, self.parameter.latent_dim).detach().cpu()
-            tran.s2 = z_next.reshape(process_batch, -1, self.parameter.latent_dim).detach().cpu()
-            self.task_behavior_reply_buffer.add_transitions_batch(tran)
-
+    
     def save(self):
+        """Save model weights to disk"""
         self.wm.save()
         self.task_behavior.build_checkpointer()
 
     def load(self):
+        """Load model weights from disk"""
         self.wm.load_checkpoints()
         self.task_behavior.load_checkpoint()
-
-    def policy(self, observation, reward, done, state=None, mode="train"):
-        obs = self.wm.preprocess(observation, reward, done)
-        self.tfstep.copy_(torch.tensor([int(self.step)])[0])
-
-        z_x, _, _= self.wm.encoder(obs["observation"].to(self.device))
-
-        start = {"feat": z_x}
-        seq = self.wm.imagine(self.task_behavior, start, self.imag_horizon, torch.from_numpy(done))
-        policy_state = seq['latent']
-
-        # action = self.task_behavior._p_fn(z_x)[1]
-        # latent, _, _, _ = self.wm.transition_model.generate(
-        #     torch.cat([z_x, action], dim=1).unsqueeze(-1),
-        #     seq_len=1
-        # )
-        # policy_state = latent.clone().detach().squeeze(-1)
-        if mode == "eval":
-            a_tanh_mode, action, log_pi_a, entropy_pi_a = self.task_behavior._p_fn(policy_state)
-            noise = self.parameter.eval_noise
-        elif mode in ["explore", "train"]:
-            action = self.task_behavior._p_fn(policy_state)[1]
-            noise = self.parameter.expl_noise
-        action = action[:, 0, :]
-        action = action_noise(action, noise, self.act_space)
-        outputs = {"action": action}
-        state = policy_state
-        return outputs, state
-
 
 def main(config):
     ep_num = dict(train=0, eval=0)
@@ -400,7 +693,6 @@ def main(config):
     train_driver = Driver(train_envs)
     train_driver.on_episode(lambda ep: per_episode_record(ep, mode="train"))
     train_driver.on_step(lambda tran, worker: step.increment())
-    #Each collected transition is added to the replay buffer through callbacks:
     train_driver.on_step(train_replay.add_step)
     train_driver.on_reset(train_replay.add_step)
     eval_driver = Driver(eval_envs)
@@ -411,7 +703,7 @@ def main(config):
     prefill = max(0, config.prefill - train_replay.stats["total_steps"])
     if prefill and config.load_prefill != 1:
         print(f"Prefill dataset ({prefill} steps).")
-        #create a random actor: initial exploration phase
+
         proto_act_space = train_envs[0]._env.gym.action_space
         random_actor = torch.distributions.independent.Independent(
             torch.distributions.uniform.Uniform(torch.Tensor(proto_act_space.low)[None],
@@ -442,8 +734,14 @@ def main(config):
     policy_pretrain_dataset_generator = iter(train_replay.dataset(**policy_pretrain_generator_config))
 
     # create the model
-    model = D2EAlgorithm(HYPER_PARAMETERS, config, obs_space, act_space, latent_space, step, environment_name,
-                         logdir, policy_pretrain_dataset_generator)
+    model = D2EAlgorithm(config, 
+                         obs_space, 
+                         act_space, 
+                         latent_space, 
+                         step, 
+                         environment_name,
+                         logdir, 
+                         policy_pretrain_dataset_generator)
 
     # init lazy module and normalizer based on the pretrain dataset
     model.initialize_lazy_modules(pre_train_dataset)
@@ -472,9 +770,6 @@ def main(config):
 
     def train_model(tran, worker):
         # every few step in the env, we will train the agent
-        """
-        The core training happens in the train_step function, which is called after each environment step
-        """
         if should_train(step):
             for _ in range(config.train_steps):
                 mets = model.train_(dict_to_tran(next(train_dataset_generator)))
@@ -496,7 +791,6 @@ def main(config):
     while cur_epoch < config.num_train_epoch:
         writer_wrapper.log_dict(model.report(next(eval_dataset_generator)), "eval_report", cur_epoch)
         eval_driver(eval_policy, episodes=config.eval_eps)
-        # Collect more data with the current policy during training during training phase
         # if it does not finish an episode, it will continue from where it left
         train_driver(train_policy, steps=config.train_epoch_length)
         cur_epoch += 1
