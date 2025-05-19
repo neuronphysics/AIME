@@ -7,7 +7,6 @@ import torch_optimizer
 import os
 import sys
 from .MaskedNorm import MaskedNorm
-from .CustomLSTM import LSTMCore
 from .vrnn_utilities import _strip_prefix_if_present
 import random
 import numpy as np
@@ -390,14 +389,7 @@ class VRNN_GMM(nn.Module):
             n_lstm_layers=self.n_layers,
             use_orthogonal=use_orthogonal
         )
-        """
-        self._rnn = LSTMCore(input_size=self.h_dim + self.h_dim + self.h_dim,
-                             hidden_size=self.h_dim,
-                             num_layers=self.n_layers,
-                             batch_first=True,
-                             train_truncate=100,
-                             train_burn_in=80)
-        """
+        
         self.discriminator = RGANDiscriminator(sequence_length=self.sequence_length,
                                                input_size=2 * self.h_dim + self.u_dim + self.y_dim,
                                                hidden_size=self.h_dim,
@@ -813,44 +805,88 @@ class ModelState:
 
         self.model = DynamicModel(num_inputs=nu, num_outputs=ny, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers,
                                   n_mixtures=n_mixtures, sequence_length=sequence_length, device=device, **kwargs)
+
+        generator_parameters = [p for n, p in self.model.named_parameters() 
+                           if 'discriminator' not in n]
+        discriminator_parameters = [p for n, p in self.model.named_parameters() 
+                               if 'discriminator' in n]
+
         if optimizer_type == "AdaBelief":
-            self.optimizer = torch_optimizer.AdaBelief(self.model.parameters(),
+            self.optimizer_gen = torch_optimizer.AdaBelief(generator_parameters,
                                                        lr=1e-4,
                                                        betas=(0.9, 0.999),
                                                        eps=1e-6,
                                                        weight_decay=0
                                                        )
+            self.optimizer_disc = torch_optimizer.AdaBelief(discriminator_parameters,
+                                                            lr=1e-4,
+                                                            betas=(0.9, 0.999),
+                                                            eps=1e-6,
+                                                            weight_decay=0
+                                                            )
         elif optimizer_type == "AdamW":
-            self.optimizer = torch.optim.AdamW(self.model.parameters(),
-                                               lr=1e-4,
-                                               betas=(0.9, 0.999),
-                                               weight_decay=0.001
-                                               )
+            self.optimizer_gen = torch.optim.AdamW(generator_parameters,
+                                                  lr=1e-4,
+                                                  betas=(0.9, 0.999),
+                                                  weight_decay=0.0001
+                                                 )
+            self.optimizer_disc = torch.optim.AdamW(discriminator_parameters,
+                                                    lr=3e-4,  
+                                                    betas=(0.9, 0.999),
+                                                    weight_decay=0.0001
+                                                    )
         elif optimizer_type == "SGD":
-            self.optimizer = torch_optimizer.SGDW(self.model.parameters(),
+            self.optimizer_gen = torch_optimizer.SGDW(generator_parameters,
                                                   lr=1e-4,
                                                   momentum=0,
                                                   dampening=0,
                                                   weight_decay=1e-2,
                                                   nesterov=False,
                                                   )
+            self.optimizer_disc = torch_optimizer.SGDW(discriminator_parameters,
+                                                   lr=1e-4,                          
+                                                    momentum=0,
+                                                    dampening=0,        
+                                                    weight_decay=1e-2,      
+                                                    nesterov=False,
+                                                  )
         elif optimizer_type == "MADGRAD":
-            self.optimizer = torch_optimizer.MADGRAD(self.model.parameters(),
-                                                     lr=3e-4,
-                                                     momentum=0.0,
-                                                     weight_decay=0,
-                                                     eps=1e-6,
-                                                     )
+            self.optimizer_gen = torch_optimizer.MADGRAD(
+                                        generator_parameters,
+                                        lr=3e-4,
+                                        momentum=0.0,
+                                        weight_decay=0,
+                                        eps=1e-6)
+        
+            # For discriminator, can use different optimizer settings
+            self.optimizer_disc = torch_optimizer.MADGRAD(
+                                        discriminator_parameters,
+                                        lr=5e-4,  # Often higher learning rate for discriminator
+                                        momentum=0.0,
+                                        weight_decay=0,
+                                        eps=1e-6)
+
         else:
             # Optimization parameters
-            yogi = torch_optimizer.Yogi(self.model.parameters(),
+            yogi_gen = torch_optimizer.Yogi(    generator_parameters,
                                         lr=0.5e-4,
                                         betas=(0.5, 0.999),
                                         eps=1e-3,
                                         initial_accumulator=1e-6,
                                         weight_decay=0, )
+            self.optimizer_gen = torch_optimizer.Lookahead(yogi_gen, k=5, alpha=0.5)
+            # For discriminator, can use different optimizer settings       
+            yogi_disc = torch_optimizer.Yogi(    discriminator_parameters,
+                                        lr=0.5e-4,      
+                                        betas=(0.5, 0.999),
+                                        eps=1e-3,
+                                        initial_accumulator=1e-6,
+                                        weight_decay=0, )
+            self.optimizer_disc = torch_optimizer.Lookahead(yogi_disc, k=5, alpha=0.5)
+        # For backward compatibility
+        self.optimizer = self.optimizer_gen
 
-            self.optimizer = torch_optimizer.Lookahead(yogi, k=5, alpha=0.5)
+                                                    
 
     def load_model(self, path, name='VRNN_model.pt', map_location=None):
         file = path if os.path.isfile(path) else os.path.join(path, name)
