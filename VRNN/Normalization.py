@@ -3,7 +3,7 @@ import torch.nn as nn
 import os, sys
 import numpy as np
 import einops
-
+from sklearn.preprocessing import RobustScaler
 from sklearn.preprocessing import MinMaxScaler
 from collections import OrderedDict
 
@@ -105,101 +105,170 @@ class MaskedNormalizer1D(nn.Module):
 
 
 class Normalizer1D(nn.Module):
-    # Data size of (batch_size, input_size, seq_len)
-    def __init__(self, inputs):
+    """
+    Normalizes variable-length sequences with zero padding preserved.
+    Data shape: (batch_size, feature_dim, seq_len)
+    """
+    def __init__(self, inputs, clip_range=(-5, 5)):
         super(Normalizer1D, self).__init__()
-        self.min_ = None
-        self.scale_ = None
-        self.input_dim = inputs.shape[-1]
-        self.max_seq = inputs.shape[1]
-
+        self.clip_range = clip_range
+        self.input_dim = inputs.shape[1]
+        self.max_seq = inputs.shape[2]
+        
+        # Store device for consistent tensor operations
+        self.device = inputs.device
+        
+        # Create padding masks - identify which values are originally zero
+        self.register_buffer('padding_mask', (inputs == 0))
+        
+        # Build and store normalizers
         self._norm = self.build_normalizers(inputs)
-
-        self.to(device)
+        self.to(self.device)
 
     def build_normalizers(self, x):
+        """Build a normalizer for each feature dimension across all timesteps"""
         normalizers = []
-        scale_, min_ = [], []
-
-        for seq in range(self.max_seq):
-            norm_seq, scale_seq, min_seq = [], [], []
-            for i in range(self.input_dim):
-                scaler = MinMaxScaler(feature_range=(-1, 1))
-                scaler = scaler.fit(x[:, seq, i].unsqueeze(-1))
-                scale_seq.append(torch.from_numpy(scaler.scale_))
-                min_seq.append(torch.from_numpy(scaler.min_))
-                norm_seq.append(scaler)
-            normalizers.append(norm_seq)
-            scale_.append(scale_seq)
-            min_.append(min_seq)
-        self.scale_ = torch.tensor(scale_).to(device)
-        self.min_ = torch.tensor(min_).to(device)
+        scale_factors = []
+        centers = []
+        
+        for i in range(self.input_dim):
+            # Collect all non-zero values for this feature across all timesteps
+            valid_values = []
+            for seq in range(self.max_seq):
+                x_data = x[:, i, seq]
+                non_zero_mask = (x_data != 0)
+                if non_zero_mask.sum() > 0:
+                    valid_values.append(x_data[non_zero_mask].cpu().numpy())
+            
+            # Fit scaler to valid values
+            if len(valid_values) > 0:
+                valid_values = np.concatenate(valid_values).reshape(-1, 1)
+                scaler = RobustScaler()
+                scaler.fit(valid_values)
+                scale_factors.append(torch.tensor(scaler.scale_[0], device=self.device))
+                centers.append(torch.tensor(scaler.center_[0], device=self.device))
+            else:
+                # If no valid values, use identity transformation
+                scaler = RobustScaler()
+                scaler.fit(np.array([[0], [1]]))
+                scale_factors.append(torch.tensor(1.0, device=self.device))
+                centers.append(torch.tensor(0.0, device=self.device))
+            
+            normalizers.append(scaler)
+        
+        # Register buffers for scale factors and centers
+        self.register_buffer('scale_factors', torch.stack(scale_factors))
+        self.register_buffer('centers', torch.stack(centers))
+        
         return normalizers
 
     def normalize(self, x):
-        # (B, D, T)
-        batch, dim, seq = x.shape
-        d = x.cpu().detach()
-        reshape_input = d.transpose(2, 1)
-
-        n_x = []
-        for seq_c in range(seq):
-            n_x_seq = []
-            for i in range(x.shape[1]):
-                n_x_seq.append(self._norm[seq_c][i].transform(reshape_input[:, seq_c, i].unsqueeze(-1).numpy()))
-            n_x.append(np.stack(n_x_seq, axis=1))
-        y = np.stack(n_x, axis=0)
-        x = np.where(np.isnan(y), 0, y)
-        res = torch.from_numpy(x).to(device).squeeze(-1)
-        return res.permute(1, 2, 0)
+        """Normalize input tensor while preserving zero padding"""
+        # Create result tensor
+        result = torch.zeros_like(x, device=self.device)
+        non_zero_mask = (x != 0)
+        
+        # Process each feature
+        for i in range(x.shape[1]):
+            feature_mask = non_zero_mask[:, i, :]
+            
+            if not feature_mask.any():
+                continue  # Skip features with all zeros
+            
+            # Process each timestep
+            for t in range(x.shape[2]):
+                time_mask = feature_mask[:, t]
+                
+                if not time_mask.any():
+                    continue  # Skip timesteps with all zeros
+                
+                # Get values and convert to NumPy
+                values = x[time_mask, i, t].cpu().numpy().reshape(-1, 1)
+                
+                # Transform values
+                transformed = self._norm[i].transform(values).flatten()
+                
+                # Clip to ensure stable range
+                transformed = np.clip(transformed, self.clip_range[0], self.clip_range[1])
+                
+                # Convert back to tensor and assign
+                result[time_mask, i, t] = torch.tensor(
+                    transformed, 
+                    dtype=x.dtype, 
+                    device=self.device
+                )
+        
+        return result
 
     def unnormalize(self, x):
-        # (T, B, D)
-        batch, dim, seq = x.shape
-        d = x.cpu().detach()
-        reshape_input = d.transpose(2, 1)
-
-        n_x = []
-        for seq_c in range(seq):
-            n_x_seq = []
-            for i in range(x.shape[1]):
-                n_x_seq.append(self._norm[seq_c][i].inverse_transform(reshape_input[:, seq_c, i].unsqueeze(-1).numpy()))
-            n_x.append(np.stack(n_x_seq, axis=1))
-        y = np.stack(n_x, axis=0)
-        x = np.where(np.isnan(y), 0, y)
-        res = torch.from_numpy(x).to(device).squeeze(-1)
-        return res.permute(1, 2, 0)
+        """Unnormalize tensor while preserving zero padding"""
+        # Create result tensor
+        result = torch.zeros_like(x, device=self.device)
+        non_zero_mask = (x != 0)
+        
+        # Process each feature
+        for i in range(x.shape[1]):
+            feature_mask = non_zero_mask[:, i, :]
+            
+            if not feature_mask.any():
+                continue  # Skip features with all zeros
+            
+            # Process each timestep
+            for t in range(x.shape[2]):
+                time_mask = feature_mask[:, t]
+                
+                if not time_mask.any():
+                    continue  # Skip timesteps with all zeros
+                
+                # Get values and convert to NumPy
+                values = x[time_mask, i, t].cpu().numpy().reshape(-1, 1)
+                
+                # Inverse transform values
+                untransformed = self._norm[i].inverse_transform(values).flatten()
+                
+                # Convert back to tensor and assign
+                result[time_mask, i, t] = torch.tensor(
+                    untransformed, 
+                    dtype=x.dtype, 
+                    device=self.device
+                )
+        
+        return result
 
     def unnormalize_mean(self, x_mu):
-        d = x_mu.clone()
-        batch_size, latent, cur_seq = d.shape
-        tight_min = self.min_[:cur_seq, :]
-        tight_scale = self.scale_[:cur_seq, :]
-
-        normX = torch.sub(d, tight_min.transpose(0, 1))
-        return torch.div(normX, tight_scale.transpose(0, 1))
+        """Unnormalize mean values - delegates to unnormalize"""
+        return self.unnormalize(x_mu)
 
     def unnormalize_sigma(self, x_sigma):
-        d = x_sigma.clone()
-        batch_size, latent, cur_seq = d.shape
-        tight_scale = self.scale_[:cur_seq, :]
+        """
+        Unnormalize standard deviations by scaling only (no center adjustment)
+        This is optimized to use vectorized operations
+        """
+        result = torch.zeros_like(x_sigma, device=self.device)
+        non_zero_mask = (x_sigma != 0)
+        
+        # Process each feature with vectorized operations
+        for i in range(x_sigma.shape[1]):
+            feature_mask = non_zero_mask[:, i, :]
+            
+            if feature_mask.any():
+                # Scale by the robust scaler's scale factor
+                result[:, i, :][feature_mask] = x_sigma[:, i, :][feature_mask] * self.scale_factors[i]
+        
+        return result
 
-        return torch.div(d, tight_scale.transpose(0, 1))
-
-
-# compute the normalizers
-def compute_normalizer(feat, out):
-    # input shape (batch_size, seq_len, feat_dim)
+# Update compute_normalizer function with default clip range
+def compute_normalizer(feat, out, clip_range=(-5, 5)):
+    """Create normalizers for both input features and output targets"""
+    # input shape (batch_size, feat_dim, seq_len)
     inputs = feat
     outputs = out
 
-    # initialization
-    u_normalizer = Normalizer1D(inputs)
-    y_normalizer = Normalizer1D(outputs)
+    # Create normalizers with the same clip range
+    u_normalizer = Normalizer1D(inputs, clip_range=clip_range)
+    y_normalizer = Normalizer1D(outputs, clip_range=clip_range)
 
     return u_normalizer, y_normalizer
-
-
 if __name__ == "__main__":
     total_size = 16
     max_sequence = 15

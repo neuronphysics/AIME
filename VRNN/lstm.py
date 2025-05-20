@@ -28,59 +28,33 @@ class LSTMLayer(nn.Module):
                     nn.init.xavier_uniform_(param)
         
     def forward(self, x, hxs, cxs, masks):
-        # no batch size
-        if x.size(0) == hxs.size(0) and x.size(0) == cxs.size(0):
-            x, (hxs, cxs) = \
-                self.lstm(x.unsqueeze(0),
-                          ((hxs * masks.repeat(1, self.n_lstm_layers).unsqueeze(-1)).transpose(0, 1).contiguous(),
-                           (cxs * masks.repeat(1, self.n_lstm_layers).unsqueeze(-1)).transpose(0, 1).contiguous()))
-            x = x.squeeze(0)
-            hxs = hxs.transpose(0, 1)
-            cxs = cxs.transpose(0, 1)
-        else:
-            # x is a (T, N, -1) tensor that has been flatten to (T * N, -1)
-            N = hxs.size(0)
-            T = int(x.size(0) / N)
-            # unflatten
-            x = x.view(T, N, x.size(1))
-            # Same deal with masks
-            masks = masks.view(T, N)
-            # Let's figure out which steps in the sequence have a zero for any agent
-            # We will always assume t=0 has a zero in it as that makes the logic cleaner
-            has_zeros = ((masks[1:] == 0.0)
-                         .any(dim=-1)
-                         .nonzero()
-                         .squeeze()
-                         .cpu())
-            # +1 to correct the masks[1:]
-            if has_zeros.dim() == 0:
-                # Deal with scalar
-                has_zeros = [has_zeros.item() + 1]
-            else:
-                has_zeros = (has_zeros + 1).numpy().tolist()
-            # add t=0 and t=T to the list
-            has_zeros = [0] + has_zeros + [T]
-
-            hxs = hxs.transpose(0, 1)
-            cxs = cxs.transpose(0, 1)
-            outputs = []
-            for i in range(len(has_zeros) - 1):
-                # We can now process steps that don't have any zeros in masks together!
-                # This is much faster
-                start_idx = has_zeros[i]
-                end_idx = has_zeros[i + 1]
-                hxs_temp = (hxs * masks[start_idx].view(1, -1, 1).repeat(self.n_lstm_layers, 1, 1)).contiguous()
-                cxs_temp = (cxs * masks[start_idx].view(1, -1, 1).repeat(self.n_lstm_layers, 1, 1)).contiguous()
-                lstm_scores, (hxs, cxs) = self.lstm(x[start_idx:end_idx], (hxs_temp, cxs_temp))
-                outputs.append(lstm_scores)
-
-            # assert len(outputs) == T
-            # x is a (T, N, -1) tensor
-            x = torch.cat(outputs, dim=0)
-            # flatten
-            x = x.reshape(T * N, -1)
-            hxs = hxs.transpose(0, 1)
-            cxs = cxs.transpose(0, 1)
-
-        x = self.norm(x)
-        return x, (hxs, cxs)
+        """
+        Process one timestep input with correct dimension handling
+        Args:
+            x: Input tensor (batch_size, input_size)
+            hxs: Hidden state (n_layers, batch_size, hidden_size)
+            cxs: Cell state (n_layers, batch_size, hidden_size)
+            masks: Binary mask for active sequences (batch_size,)
+        """
+        batch_size = x.size(0)
+    
+        # Reshape mask for broadcasting (n_layers, batch_size, 1)
+        mask_expanded = masks.view(1, -1, 1).expand(self.n_lstm_layers, batch_size, 1)
+    
+        # Apply mask to states (zeros out states for completed sequences)
+        hxs_masked = hxs * mask_expanded
+        cxs_masked = cxs * mask_expanded
+    
+        # Add sequence dimension for LSTM input
+        x_sequence = x.unsqueeze(0)
+    
+        # LSTM forward pass
+        output, (hxs_new, cxs_new) = self.lstm(x_sequence, (hxs_masked, cxs_masked))
+    
+        # Remove sequence dimension
+        output = output.squeeze(0)
+    
+        # Apply layer normalization
+        output = self.norm(output)
+    
+        return output, (hxs_new, cxs_new)

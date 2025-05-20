@@ -121,9 +121,9 @@ class ResidualBlock(nn.Module):
         self.linear2 = nn.Linear(hidden_dim, hidden_dim)
         self.activation = nn.SiLU() if use_silu else nn.ReLU()
         self.norm = nn.LayerNorm(hidden_dim) if use_layer_norm else nn.Identity()
-        
+        self.residual_projection = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity() 
     def forward(self, x):
-        residual = x
+        residual = self.residual_projection(x)
         out = self.norm(self.linear1(x))
         out = self.activation(out)
         out = self.linear2(out)
@@ -465,6 +465,8 @@ class VRNN_GMM(nn.Module):
     def forward(self, u, y):
         deterministic_hidden_state = []
         batch_size = y.size(0)
+        u=u.to(self.device)
+        y=y.to(self.device)
         # input has size (Batch, D, seq_len)
         
         seq_len = [torch.max((u[i, 0, :] != 0).nonzero()).item() + 1 for i in range(u.shape[0])]
@@ -514,9 +516,9 @@ class VRNN_GMM(nn.Module):
         # for all time steps
         for t in range(max(seq_len)):
             # Create masks for this time step (1 for active sequences, 0 for completed sequences)
+            
             masks = torch.tensor([1.0 if t < seq_len[i] else 0.0 for i in range(batch_size)], device=self.device)
             active_indices = torch.where(masks > 0)[0]
-        
             # Skip if no active sequences remain
             if len(active_indices) == 0:
                 break
@@ -551,7 +553,7 @@ class VRNN_GMM(nn.Module):
             decoder_input_fake = torch.cat([fake_phi_z_t, c_final, h[:, active_indices, :][-1]], dim=1)  ##(modified)
             fake_y[active_indices, t, :], _ = self._decode(decoder_input_fake)
 
-            RNN_inputs = torch.cat([phi_u_t, phi_z_t, c_final], dim=1).unsqueeze(0)
+            RNN_inputs = torch.cat([phi_u_t, phi_z_t, c_final], dim=1)
             # input of RNN module torch.Size([B, 3*H]) ==>[B,T,3*H]
 
             # recurrence: u_t+1, z_t -> h_t+1

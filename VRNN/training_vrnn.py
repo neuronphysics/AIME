@@ -9,7 +9,7 @@ import os
 import wandb
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import nullcontext
 # Add the parent directory to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -851,7 +851,7 @@ def main(arg):
                             init_method=args.init_method,
                             world_size=args.world_size,
                             rank=rank,
-                            timeout=datetime.timedelta(0, 240)  # 240s connection timeout
+                            timeout=timedelta(0, 240)  # 240s connection timeout
                             )
 
     print("process group ready!")
@@ -861,8 +861,9 @@ def main(arg):
           .format(ngpus_per_node, local_rank, rank, available_gpus, current_device))
 
     # Get saving path
-    input_filename = "transition_dat/gym_transition_inputs.pt"
+    input_filename = "transition_data/gym_transition_inputs.pt"
     target_filename = "transition_data/gym_transition_outputs.pt"
+    #parentfolder = os.path.dirname(os.getcwd())
     parentfolder = os.getcwd()
     
     # Read input data
