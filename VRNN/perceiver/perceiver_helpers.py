@@ -7,8 +7,8 @@ import torch.nn.init as init
 from typing import List, Sequence, Tuple, Optional
 import torch.nn.functional as func
 from torch import einsum
-from xformers.ops.fmha import memory_efficient_attention
-from xformers.ops.fmha.attn_bias import AttentionBias
+#from xformers.ops.fmha import memory_efficient_attention
+#from xformers.ops.fmha.attn_bias import AttentionBias
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 

@@ -2,12 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, Gamma, Categorical, Independent, MixtureSameFamily
-from typing import Dict, Tuple, Union
-from ..models import (
+from typing import Dict, Tuple, Union, Optional
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from models import (
     VAEEncoder, VAEDecoder, 
     ImageDiscriminator, LatentDiscriminator,
     LinearResidual, AttentionPosterior, AttentionPrior,
-    compute_feature_matching_loss, AddEpsilon
+    compute_feature_matching_loss, AddEpsilon, check_tensor
 )
 import math
 from collections import OrderedDict
@@ -17,14 +20,12 @@ from VRNN.perceiver.Utils import generate_model
 from VRNN.perceiver import perceiver_helpers
 import VRNN.perceiver.perceiver as perceiver
 
-@torch.jit.script
 def beta_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     """Compute beta function in log space for numerical stability"""
     eps= torch.finfo(torch.float32).eps
     return torch.lgamma(a + eps) + torch.lgamma(b + eps) - torch.lgamma(a + b + eps)
 
-@torch.jit.script
 def prune_small_components(pi: torch.Tensor, threshold: float = 1e-5) -> torch.Tensor:
     """Prune components with very small mixing proportions"""
     # Find components above threshold
@@ -186,7 +187,6 @@ class AdaptiveStickBreaking(nn.Module):
 
  
     @staticmethod
-    @torch.jit.script
     def sample_kumaraswamy(
                            a: torch.Tensor, 
                            b: torch.Tensor, 
@@ -238,7 +238,6 @@ class AdaptiveStickBreaking(nn.Module):
         return v, perm
 
     @staticmethod
-    @torch.jit.script
     def compute_stick_breaking_proportions( v: torch.Tensor, max_k:int, perm: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Convert samples to stick-breaking proportions with optional permutation inversion
         # Compute stick-breaking proportions using vectorized operations
@@ -339,8 +338,7 @@ class AdaptiveStickBreaking(nn.Module):
 
 
     @staticmethod
-    @torch.jit.script
-    def compute_kumar2beta_kl( a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor, n_approx: int, eps: torch.Float=torch.finfo(torch.float32).eps) -> torch.Tensor:
+    def compute_kumar2beta_kl( a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor, n_approx: int, eps: float=torch.finfo(torch.float32).eps) -> torch.Tensor:
         """
         Compute KL divergence between Kumaraswamy(a,b) and Beta(alpha,beta)
         KL(K(a,b) || B(α,β)) = 
@@ -935,9 +933,9 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             nn.Linear(self.hidden_dim, self.latent_dim * 2)  # mean and logvar
         )
         
-        # Attention predictor: p(A_{t+1}|h_{t+1}, z_{t+1}, A_t)
+        # Attention predictor: p(A_{t+1}|h_{t+1}, z_{t+1}, A_t, a_t)
         self.self_model_attention = nn.Sequential(
-            nn.Linear(self.hidden_dim + self.latent_dim + self.attention_dim,
+            nn.Linear(self.hidden_dim + self.latent_dim + self.attention_dim + self.action_dim,
                      self.attention_dim * 2),
             nn.LayerNorm(self.attention_dim * 2),
             nn.SiLU(),
@@ -2131,9 +2129,9 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         # Sample predicted z_{t+1}
         z_pred = z_mean + z_std * torch.randn_like(z_std)
         
-        # 3. Predict A_{t+1} ~ p(A_{t+1}|h_{t+1}, z_{t+1}, A_t)
+        # 3. Predict A_{t+1} ~ p(A_{t+1}|h_{t+1}, z_{t+1}, A_t, a_t)
         # Attention evolution depends on predicted states and current attention
-        attention_input = torch.cat([h_pred, z_pred, attention_t], dim=-1)
+        attention_input = torch.cat([h_pred, z_pred, attention_t, a_t], dim=-1)
         attention_params = self.self_model_attention(attention_input)
         attention_mean, attention_logvar = torch.chunk(attention_params, 2, dim=-1)
         attention_logvar = torch.clamp(attention_logvar, min=-10, max=2)
