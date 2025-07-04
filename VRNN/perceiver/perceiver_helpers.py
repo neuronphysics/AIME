@@ -288,7 +288,7 @@ class Attention(nn.Module):
         q = self.reshape_for_heads(q, self.qk_channels_per_head)
         k = self.reshape_for_heads(k, self.qk_channels_per_head)
         v = self.reshape_for_heads(v, self.v_channels_per_head)
-        
+        """
         # Prepare for xFormers: merge batch and group dims, move heads dim
         # [b, g, len, h, d] -> [b*g, len, h, d]
         q_flat = q.reshape(-1, q_len, self.num_heads, self.qk_channels_per_head).contiguous()
@@ -322,8 +322,24 @@ class Attention(nn.Module):
                                             )
         
         # Reshape back to original format: [b*g, q_len, h*d] -> [b, g, q_len, h*d]
-        output = output.reshape(b, g, q_len, self.num_heads * self.v_channels_per_head)
-        
+        result = output.reshape(b, g, q_len, self.num_heads * self.v_channels_per_head)
+        """
+
+
+        # Scaled dot-product attention
+        scale = 1.0 / math.sqrt(self.qk_channels_per_head)
+        attn_scores = einsum('bgnhc,bgmhc->bghnm', q, k) * scale
+
+        if attention_mask is not None:
+            attn_scores = attn_scores.masked_fill(attention_mask == 0, float('-inf'))
+        attn_probs = func.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        # Combine heads
+        result = einsum('bghnm,bgmhd->bgnhd', attn_probs, v)
+        b, g, i, h, c = result.shape
+        result = torch.reshape(result, (b, g, i, h * c))
+
         # Final linear projection
-        return self.attention_output_linear(output)
+        return self.attention_output_linear(result), attn_probs
     

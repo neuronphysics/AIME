@@ -282,7 +282,7 @@ class RGANGenerator(Generator):
 
         self.dropout = nn.Dropout(dropout)
         # self.batchnorm = nn.BatchNorm1d(hidden_size)
-        self.linear = nn.Linear(hidden_size, output_size)
+        self.linear =  nn.utils.spectral_norm(nn.Linear(hidden_size, output_size))
         self.last_layer = last_layer
 
         # Initialize all weights.
@@ -365,7 +365,7 @@ class RGANDiscriminator(Discriminator):
         self.rnn = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
 
         self.dropout = nn.Dropout(dropout)
-        self.linear = nn.Linear(hidden_size, 1)
+        self.linear =  nn.utils.spectral_norm(nn.Linear(hidden_size, 1))
         self.last_layer = last_layer
 
         # Initialize all weights.

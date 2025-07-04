@@ -18,3 +18,4 @@ __pycache__/
 data/*
 VRNN/perceiver/data/
 VRNN/perceiver/model/
+transition_data/

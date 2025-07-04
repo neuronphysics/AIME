@@ -309,18 +309,7 @@ class VRNN_GMM(nn.Module):
             self.norm_u = MaskedNorm(u_dim)
             self.norm_y = MaskedNorm(y_dim)
 
-        # self._latent_encoder = LatentEncoder(
-        #     u_dim + y_dim,
-        #     hidden_dim=h_dim,
-        #     latent_dim=h_dim,
-        #     self_attention_type=self_attention_type,
-        #     n_encoder_layers=n_layers,
-        #     batchnorm=False,
-        #     dropout=dropout,
-        #     attention_dropout=0,
-        #     attention_layers=2,
-        #     use_lstm=True
-        # )
+
         mock_input = self.generate_mock_input()
         self.perceiver_model = generate_model('HiPClassBottleneck', 'Mini', mock_input)
         self.perceiver_model.to(self.device)
@@ -337,7 +326,6 @@ class VRNN_GMM(nn.Module):
             self.input_drop = nn.Dropout(p=dropout)
         else:
             self.input_drop = nn.Identity()
-        ###=============###
         # feature-extracting transformations (phi_y, phi_u and phi_z)
 
 
@@ -345,7 +333,7 @@ class VRNN_GMM(nn.Module):
         ##initialize
         # init_weights(self.phi_y[0])
         # init_weights(self.phi_y[-1])
-        ###=============###
+        
 
         self.phi_u = ResidualBlock(self.u_dim, self.h_dim)
 

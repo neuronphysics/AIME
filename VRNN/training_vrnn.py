@@ -366,7 +366,7 @@ def run_train(modelstate, loader_train, loader_valid, device, dataframe, path_ge
                 modelstate.optimizer_gen.zero_grad()
         
                 # Generator loss combines VRNN reconstruction + KL terms with adversarial component
-                gen_loss = vrnn_loss + torch.mean(disc_loss)  # Negative discriminator loss for generator
+                gen_loss = vrnn_loss - torch.mean(disc_loss)  # Negative discriminator loss for generator
         
                 if torch.cuda.is_available():
                     scaler.scale(gen_loss).backward()
@@ -687,13 +687,13 @@ def run_test(seed, nu, ny, seq_len, loaders, df, device, path_general, file_name
     temp = 250
 
     plot_time_sequence_uncertainty(data_y_true,
-                                data_y_sample,
-                                label_y,
-                                options,
-                                batch_show=0,
-                                x_limit_show=[0, temp],
-                                path_general=path_general,
-                                file_name_general=file_name_general)
+                                   data_y_sample,
+                                   label_y,
+                                   options,
+                                   batch_show=0,
+                                   x_limit_show=[0, temp],
+                                   path_general=path_general,
+                                   file_name_general=file_name_general)
 
     print("\n--- Computing Performance Metrics ---")
     
@@ -893,9 +893,9 @@ def main(arg):
     random.seed(seed)
 
     plt.ion()
-    train_ratio = 0.34
-    validation_ratio = 0.33
-    test_ratio = 0.33
+    train_ratio = 0.20
+    validation_ratio = 0.15
+    test_ratio = 0.65
     
     # Validate input data
     assert torch.isfinite(variable_episodes).any()
@@ -938,12 +938,12 @@ def main(arg):
                                                                     )
     # Create data loaders
     train_loader = DataLoader(train_dataset,
-                            batch_size=batch_size,
-                            shuffle=False,
-                            num_workers=args.num_workers,
-                            sampler=train_sampler,
-                            worker_init_fn=seed_worker,
-                            generator=g)
+                              batch_size=batch_size,
+                              shuffle=False,
+                              num_workers=args.num_workers,
+                              sampler=train_sampler,
+                              worker_init_fn=seed_worker,
+                              generator=g)
 
     test_dataset = TensorDataset(test_x, test_y)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)

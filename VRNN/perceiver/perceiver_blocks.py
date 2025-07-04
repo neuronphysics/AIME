@@ -113,6 +113,7 @@ class HiPCrossAttention(nn.Module):
         self.q_layer_norm = nn.LayerNorm(output_num_channels, elementwise_affine=True)
         self.kv_layer_norm = nn.LayerNorm(input_num_channel, elementwise_affine=True)
         self.dense_layer_norm = nn.LayerNorm(output_num_channels, elementwise_affine=True)
+        self._attention_weights = None
 
     def _subsample_query_inputs(self, query_inputs):
         """Randomly subsample the number of query inputs."""
@@ -166,12 +167,12 @@ class HiPCrossAttention(nn.Module):
         # input_q = output_channels = query_inputs.shape[-1]
         # self.attention_module.update_params(qk_channels, v_channels, output_channels, input_q, input_k, input_v)
 
-        attention = self.attention_module(
+        attention, attention_weights = self.attention_module(
             inputs_q=self.q_layer_norm(query_inputs),
             inputs_kv=self.kv_layer_norm(inputs),
             attention_mask=attention_mask
         )
-
+        self._attention_weights = attention_weights
         if self.use_post_attention_residual:
             attention = attention + query_inputs
 

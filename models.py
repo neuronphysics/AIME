@@ -1,9 +1,26 @@
 import torch
 import torch.nn as nn
-from typing import Optional, List
+import math
+from typing import Optional, List, Tuple
 import logging
 import functools
 from torch.utils.checkpoint import checkpoint
+import torch.nn.functional as F
+class AddEpsilon(nn.Module):
+    def __init__(self, eps):
+        super().__init__()
+        self.eps = eps
+        
+    def forward(self, x):
+        return x + self.eps
+ 
+@torch.jit.script
+def check_tensor(tensor: torch.Tensor, name: str) -> None:
+    """Validate tensor values for debugging"""
+    if torch.isnan(tensor).any():
+        raise ValueError(f"NaN detected in {name}")
+    if torch.isinf(tensor).any():
+        raise ValueError(f"Inf detected in {name}")
 
 def get_improved_scheduler(optimizer, warmup_steps=10000):
     """Create learning rate scheduler with warmup"""
@@ -31,34 +48,391 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
+
+class AttentionPosterior(nn.Module):
+    """
+    Improved posterior with explicit spatial processing
+    """
+    
+    def __init__(
+        self,
+        image_size: int,
+        attention_resolution: int,
+        hidden_dim: int,
+        context_dim: int
+    ):
+        super().__init__()
+        self.image_size = image_size
+        self.attention_resolution = attention_resolution
+        
+        # Bottom-up saliency extraction
+        self.saliency_net = nn.Sequential(
+            nn.Conv2d(3, 16, 3, stride=2, padding=1),
+            nn.GroupNorm(4, 16),
+            nn.SiLU(),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, 3, stride=1, padding=1)
+        )
+        
+        # Top-down modulation
+        self.top_down_projection = nn.Sequential(
+            nn.Linear(hidden_dim + context_dim, 64),
+            nn.LayerNorm(64),
+            nn.SiLU()
+        )
+        
+        # Spatial attention computation
+        self.attention_conv = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1),  # Combine bottom-up and top-down
+            nn.GroupNorm(16, 64),
+            nn.SiLU(),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+            nn.Conv2d(32, 1, 1)  # Output attention logits
+        )
+        self.attention_pool = nn.Sequential(
+            nn.Conv2d(64, hidden_dim//2, 1),  # Reduce channels
+            nn.GroupNorm(8, hidden_dim//2),
+            nn.SiLU()
+        )
+    
+    def forward(
+        self,
+        observation: torch.Tensor,
+        hidden_state: torch.Tensor,
+        context: torch.Tensor
+    ) -> torch.Tensor:
+        batch_size = observation.shape[0]
+        
+        # Bottom-up saliency
+        saliency_features = self.saliency_net(observation)
+        
+        # Top-down modulation
+        top_down = torch.cat([hidden_state, context], dim=-1)
+        top_down_features = self.top_down_projection(top_down)
+        top_down_spatial = top_down_features.view(batch_size, -1, 1, 1)
+        top_down_spatial = top_down_spatial.expand(
+            -1, -1, 
+            saliency_features.shape[2], 
+            saliency_features.shape[3]
+        )
+        
+        # Combine features
+        combined = torch.cat([saliency_features, top_down_spatial], dim=1)
+        
+        # Compute attention
+        H = W = self.attention_resolution
+        attention_logits = self.attention_conv(combined).squeeze(1)
+        attention_probs = F.softmax(
+            attention_logits.view(batch_size, -1), 
+            dim=-1
+        ).view(batch_size, H, W)
+        
+        return attention_probs
+
+    def attention_weighted_features(
+        self,
+        features: torch.Tensor,  # [B, C, H, W]
+        attention_probs: torch.Tensor  # [B, H, W]
+    ) -> torch.Tensor:
+        """
+        Extract attention-weighted features for downstream processing
+        """
+        batch_size = features.shape[0]
+        
+        # Ensure attention and features have same spatial dimensions
+        if attention_probs.shape[-2:] != features.shape[-2:]:
+            attention_probs = F.interpolate(
+                attention_probs.unsqueeze(1),
+                size=features.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1)
+        
+        # Apply attention weighting
+        attention_expanded = attention_probs.unsqueeze(1)  # [B, 1, H, W]
+        weighted_features = features * attention_expanded
+        
+        # Spatial pooling guided by attention
+        pooled_features = self.attention_pool(weighted_features)
+        
+        # Weighted average pooling
+        spatial_sum = (pooled_features * attention_expanded).sum(dim=[2, 3])
+        normalization = attention_expanded.sum(dim=[2, 3]) + 1e-8
+        
+        return spatial_sum / normalization  # [B, hidden_dim//2]
+    
+    def visualize_attention(
+        self,
+        attention_map: torch.Tensor,  # [B, H, W]
+        original_image: torch.Tensor,  # [B, 3, 84, 84]
+        alpha: float = 0.5
+    ) -> torch.Tensor:
+        """
+        Create visualization by overlaying attention on original image
+        """
+        batch_size = attention_map.shape[0]
+        
+        # Upsample attention to image size
+        attention_upsampled = F.interpolate(
+            attention_map.unsqueeze(1),
+            size=(self.image_size, self.image_size),
+            mode='bilinear',
+            align_corners=False
+        )  # [B, 1, 84, 84]
+        
+        # Normalize attention for visualization
+        att_min = attention_upsampled.view(batch_size, -1).min(dim=1, keepdim=True)[0].view(batch_size, 1, 1, 1)
+        att_max = attention_upsampled.view(batch_size, -1).max(dim=1, keepdim=True)[0].view(batch_size, 1, 1, 1)
+        attention_normalized = (attention_upsampled - att_min) / (att_max - att_min + 1e-8)
+        
+        # Create heatmap (red channel intensified by attention)
+        heatmap = torch.zeros_like(original_image)
+        heatmap[:, 0, :, :] = attention_normalized.squeeze(1)  # Red channel
+        
+        # Blend with original image
+        visualization = alpha * heatmap + (1 - alpha) * original_image
+        
+        return visualization.clamp(0, 1)
+
+
+class AttentionPrior(nn.Module):
+    """
+    Improved attention prior that preserves spatial relationships
+    Implements true spatial attention dynamics modeling
+    """
+    
+    def __init__(
+        self,
+        attention_resolution: int = 21,
+        hidden_dim: int = 256,
+        latent_dim: int = 32,
+        motion_kernels: int = 8,
+        use_separable_conv: bool = True
+    ):
+        super().__init__()
+        self.attention_resolution = attention_resolution
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        
+        # Spatial attention dynamics modeling
+        if use_separable_conv:
+            # More efficient separable convolutions
+            self.spatial_dynamics = nn.Sequential(
+                # Depthwise convolution (spatial processing)
+                nn.Conv2d(1, 1, 5, padding=2, groups=1),
+                nn.GroupNorm(1, 1),
+                nn.SiLU(),
+                # Pointwise convolution (channel mixing)
+                nn.Conv2d(1, 16, 1),
+                nn.GroupNorm(4, 16),
+                nn.SiLU(),
+                # Another depthwise for larger receptive field
+                nn.Conv2d(16, 16, 5, padding=2, groups=16),
+                nn.GroupNorm(4, 16),
+                nn.SiLU(),
+                nn.Conv2d(16, 32, 1),
+                nn.GroupNorm(8, 32),
+                nn.SiLU()
+            )
+        else:
+            # Standard convolutions
+            self.spatial_dynamics = nn.Sequential(
+                nn.Conv2d(1, 16, 3, padding=1),
+                nn.GroupNorm(4, 16),
+                nn.SiLU(),
+                nn.Conv2d(16, 32, 3, padding=1),
+                nn.GroupNorm(8, 32),
+                nn.SiLU(),
+                nn.Conv2d(32, 32, 3, padding=1),
+                nn.GroupNorm(8, 32),
+                nn.SiLU()
+            )
+        
+        # Motion prediction kernels (learned attention movement patterns)
+        self.motion_kernels = nn.Parameter(
+            torch.randn(motion_kernels, 1, 5, 5) * 0.01
+        )
+        
+        # Context integration (h_t, z_t influence on spatial dynamics)
+        self.context_projection = nn.Sequential(
+            nn.Linear(hidden_dim + latent_dim, 128),
+            nn.LayerNorm(128),
+            nn.SiLU(),
+            nn.Linear(128, 32 + motion_kernels)  # For feature modulation
+        )
+        
+        # Spatial-aware fusion
+        self.spatial_fusion = nn.Sequential(
+            nn.Conv2d(32 + motion_kernels, 16, 1),
+            nn.GroupNorm(4, 16),
+            nn.SiLU(),
+            nn.Conv2d(16, 1, 1)  # Output attention logits
+        )
+        
+        # Optional: Attention movement predictor
+        self.movement_predictor = nn.Conv2d(1, 2, 3, padding=1)  # Predicts dx, dy
+    
+    def compute_motion_features(
+        self, 
+        prev_attention: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Extract motion-relevant features from previous attention
+        """
+        batch_size = prev_attention.shape[0]
+        prev_attention = prev_attention.unsqueeze(1)  # [B, 1, H, W]
+        
+        # Apply learned motion kernels
+        motion_responses = []
+        for kernel in self.motion_kernels:
+            response = F.conv2d(
+                prev_attention,
+                kernel.unsqueeze(0),
+                padding=2
+            )
+            motion_responses.append(response)
+        
+        motion_features = torch.cat(motion_responses, dim=1)  # [B, K, H, W]
+        return motion_features
+    
+    def forward(
+        self,
+        prev_attention: torch.Tensor,  # [B, H, W]
+        hidden_state: torch.Tensor,    # [B, hidden_dim]
+        latent_state: torch.Tensor     # [B, latent_dim]
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Compute spatially-aware attention prior
+        """
+        batch_size = prev_attention.shape[0]
+        
+        # 1. Extract spatial dynamics from previous attention
+        spatial_features = self.spatial_dynamics(
+            prev_attention.unsqueeze(1)
+        )  # [B, 32, H, W]
+        
+        # 2. Compute motion features
+        motion_features = self.compute_motion_features(prev_attention)
+        
+        # 3. Get context modulation
+        context = torch.cat([hidden_state, latent_state], dim=-1)
+        context_weights = self.context_projection(context)  # [B, 32 + K]
+        
+        # Split into spatial and motion weights
+        spatial_weights, motion_weights = torch.split(
+            context_weights, 
+            [32, self.motion_kernels.shape[0]], 
+            dim=-1
+        )
+        
+        # 4. Modulate features with context
+        # Reshape for spatial broadcasting
+        spatial_weights = spatial_weights.view(batch_size, 32, 1, 1)
+        motion_weights = motion_weights.view(batch_size, -1, 1, 1)
+        
+        modulated_spatial = spatial_features * torch.sigmoid(spatial_weights)
+        modulated_motion = motion_features * torch.sigmoid(motion_weights)
+        
+        # 5. Combine and predict next attention
+        combined_features = torch.cat([modulated_spatial, modulated_motion], dim=1)
+        attention_logits = self.spatial_fusion(combined_features).squeeze(1)
+        
+        # 6. Apply softmax to get probabilities
+        attention_probs = F.softmax(
+            attention_logits.view(batch_size, -1), 
+            dim=-1
+        ).view(batch_size, self.attention_resolution, self.attention_resolution)
+        
+        # 7. Optional: Predict attention movement
+        movement = self.movement_predictor(prev_attention.unsqueeze(1))
+        dx, dy = movement[:, 0], movement[:, 1]
+        
+        return attention_probs, {
+            'spatial_features': spatial_features,
+            'motion_features': motion_features,
+            'predicted_movement': (dx, dy),
+            'attention_logits': attention_logits
+        }
+
 class LinearResidual(nn.Module):
-    def __init__(self, input_feature, nonlinearity=None, norm_type='layer'):
-        super(LinearResidual, self).__init__()
-        nl = nn.LeakyReLU(0.2) if nonlinearity is None else nonlinearity
+    def __init__(
+        self,
+        input_feature: int,
+        hidden_dim: int,
+        *,
+        nonlinearity=None,
+        norm_type: str = "layer",   # 'layer' | 'batch' | None
+        drop_p: float = 0.2         # dropout probability
+    ):
+        super().__init__()
+
+        nl = nn.SiLU() if nonlinearity is None else nonlinearity
+        self.residual_projection = (
+            nn.Linear(input_feature, hidden_dim, bias=True)
+            if input_feature != hidden_dim else nn.Identity()
+        )
 
         layers = []
-        layers.append(nn.Linear(input_feature, input_feature))
+    
+        layers.append(nn.Linear(hidden_dim, hidden_dim, bias=True))
 
-        if norm_type == 'batch':
-            layers.append(nn.BatchNorm1d(input_feature, affine=True))
-        elif norm_type == 'layer':
-            layers.append(nn.LayerNorm(input_feature))
+        if norm_type == "batch":
+            layers.append(nn.BatchNorm1d(hidden_dim, affine=True))
+        elif norm_type == "layer":
+            layers.append(nn.LayerNorm(hidden_dim))
 
-        layers.append(nl)
+        layers.extend([nl, nn.Dropout(drop_p)])
 
-        layers.append(nn.Linear(input_feature, input_feature))
+        
+        layers.append(nn.Linear(hidden_dim, hidden_dim, bias=True))
 
-        if norm_type == 'batch':
-            layers.append(nn.BatchNorm1d(input_feature, affine=True))
-        elif norm_type == 'layer':
-            layers.append(nn.LayerNorm(input_feature))
+        if norm_type == "batch":
+            layers.append(nn.BatchNorm1d(hidden_dim, affine=True))
+        elif norm_type == "layer":
+            layers.append(nn.LayerNorm(hidden_dim))
 
-        layers.append(nl)
+        layers.extend([nl, nn.Dropout(drop_p)])
 
         self.fn = nn.Sequential(*layers)
+        self.reset_parameters()     # custom init
+
+    def reset_parameters(self):
+        """
+        Kaiming-uniform (fan_in) for all weight matrices (good for SiLU/ReLU).
+        Last linear in the residual branch → weight = 0, bias = 0
+          so the block begins as (roughly) the identity mapping.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        last_linear = None
+        for m in reversed(self.fn):
+            if isinstance(m, nn.Linear):
+                last_linear = m
+                break
+        if last_linear is not None:
+            nn.init.zeros_(last_linear.weight)
+            if last_linear.bias is not None:
+                nn.init.zeros_(last_linear.bias)
+
+        # If a projection exists, re-init it the same way
+        if isinstance(self.residual_projection, nn.Linear):
+            nn.init.kaiming_uniform_(
+                self.residual_projection.weight, a=math.sqrt(5)
+            )
+            if self.residual_projection.bias is not None:
+                nn.init.zeros_(self.residual_projection.bias)
 
     def forward(self, x):
-        return self.fn(x) + x
+        residual = self.residual_projection(x)
+        return self.fn(residual) + residual
 
 
 class ResidualBlock(nn.Module):
@@ -80,7 +454,7 @@ class ResidualBlock(nn.Module):
         for i in range(num_layers):
             layers.extend(
                 [
-                    nn.LeakyReLU(1e-2),
+                    nn.SiLU(),
                     nn.Conv2d(
                         ch,
                         ch,
@@ -401,7 +775,7 @@ class ImageDiscriminator(nn.Module):
 
 class LatentDiscriminator(nn.Module):
     # define the descriminator/critic
-    def __init__(self, input_dims, num_layers=4, norm_type='layer', activation= nn.GELU(), device= torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
+    def __init__(self, input_dims, num_layers=4, norm_type='layer', activation= nn.SiLU(), device= torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
         super(LatentDiscriminator, self).__init__()
         self.norm_type = norm_type
         self.activation = activation
@@ -428,7 +802,7 @@ class LatentDiscriminator(nn.Module):
             layers.append(self.activation)
             if (i == (num_layers // 2 - 1)):
                 # add a residual block
-                layers.append(LinearResidual(size // 2))
+                layers.append(LinearResidual(size // 2, size // 2, nonlinearity=self.activation, norm_type=self.norm_type))
             size = size // 2
         layers.append(nn.Linear(size, size * 2, bias=False))
 
@@ -440,7 +814,7 @@ class LatentDiscriminator(nn.Module):
         # Activation Function
         layers.append(self.activation)
         # add anther residual block
-        layers.append(LinearResidual(size * 2))
+        layers.append(LinearResidual(size * 2, size * 2, nonlinearity=self.activation, norm_type=self.norm_type))
         layers.append(nn.Linear(size * 2, 1))
         self.model = nn.Sequential(*layers)
         self.device = device
