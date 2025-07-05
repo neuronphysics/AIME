@@ -1543,7 +1543,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         return {
             'image':
                 torch.from_numpy(
-                    np.random.random((1, self.image_size, self.input_channels)).astype(np.float32)).to(
+                    np.random.random((1, self.image_size*self.image_size, self.input_channels)).astype(np.float32)).to(
                     self.device),
         }
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
@@ -2027,7 +2027,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         batch_size, seq_len = observations.shape[:2]
         
         # Flatten observations for perceiver
-        obs_flat = observations.reshape(batch_size * seq_len, -1, 1)
+        obs_flat = observations.reshape(batch_size * seq_len, -1, self.input_channels)
         
         # Process through perceiver
         perceiver_output = self.perceiver_model({'image': obs_flat}, is_training=True)

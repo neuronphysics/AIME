@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import time
 import tensorflow as tf
-
+import zlib
 from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentEncoder
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/expert ./dmc_vb/"""
 
@@ -45,68 +45,155 @@ class DMCVBInfo:
 
 class TFRecordConverter:
     """Convert TFRecord files to PyTorch-compatible format"""
-    
     @staticmethod
-    def parse_tfrecord_episode(tfrecord_path: Path) -> Dict[str, np.ndarray]:
-        """Parse a single TFRecord episode file"""
+    def decode_zlib_observation(obs_bytes: bytes, target_shape=(64, 64, 3)) -> Optional[np.ndarray]:
+        """
+        Decompress zlib-encoded raw pixel observations
         
-        # Feature specifications for DMC Vision Benchmark
-        context_features = {
-            #'episode_id': tf.io.FixedLenFeature([], tf.int64),
-            #'episode_length': tf.io.FixedLenFeature([], tf.int64),
-        }
+        This implementation embodies principles of information recovery through
+        reversible compression transforms, revealing the underlying visual manifold.
+        """
         
-        sequence_features = {
-            'observation/pixels': tf.io.FixedLenSequenceFeature([], tf.string),
-            'action': tf.io.FixedLenSequenceFeature([21], tf.float32),  # 21 for humanoid
-            'reward': tf.io.FixedLenSequenceFeature([], tf.float32),
-            'is_first': tf.io.FixedLenSequenceFeature([], tf.int64),
-            'is_last': tf.io.FixedLenSequenceFeature([], tf.int64),
-            'is_terminal': tf.io.FixedLenSequenceFeature([], tf.int64),
-        }
         
-        # Parse TFRecord
+        try:
+            # Phase 1: Decompress using zlib
+            decompressed = zlib.decompress(obs_bytes)
+            
+            # Phase 2: Convert to numpy array
+            obs_array = np.frombuffer(decompressed, dtype=np.uint8)
+            
+            # Phase 3: Reshape to canonical dimensions
+            height, width, channels = target_shape
+    
+            
+            return obs_array.reshape(height, width, channels)        
+                
+        except zlib.error as e:
+            print(f"Zlib decompression failed: {e}")
+            return None       
+         
+    @staticmethod
+    def parse_tfrecord_episode(tfrecord_path: Path, action_dim:int) -> Dict[str, np.ndarray]:
+        """
+        Robust TFRecord parser acknowledging compressed observation encoding
+        
+        This implementation synthesizes insights from:
+        - Information-theoretic compression principles
+        - Empirical data morphology analysis
+        - Canonical DMC-VB preprocessing pipelines
+        """
+        
         dataset = tf.data.TFRecordDataset(str(tfrecord_path))
         
-        episode_data = None
-        for raw_record in dataset.take(1):  # Only one episode per file
-            context, sequence = tf.io.parse_single_sequence_example(
-                raw_record,
-                context_features=context_features,
-                sequence_features=sequence_features
-            )
+        # Accumulate all timesteps for complete episode reconstruction
+        timesteps = []
+        
+        for idx, raw_record in enumerate(dataset):
+            example = tf.train.Example()
+            example.ParseFromString(raw_record.numpy())
             
-            episode_length = tf.shape(sequence['reward'])[0].numpy()
+            features = example.features.feature
             
-            # Process observations
-            observations = []
-            for t in range(episode_length):
-                obs_bytes = sequence['observation/pixels'][t]
-                obs = tf.io.decode_raw(obs_bytes, tf.uint8)
-                obs = tf.reshape(obs, [84, 84, 3]).numpy()
-                observations.append(obs)
+            # Check if this is an episode boundary marker
+            if 'episode_id' in features or 'episode_length' in features:
+                continue  # Skip metadata records
             
-            episode_data['observation_pixels'] = np.array(observations)
+            timestep_data = {}
             
-            # Process actions
-            episode_data['action'] = sequence['action'].numpy()
+            # Robust observation decoding with compression awareness
+            if 'steps/observation/pixels' in features:
+                obs_bytes = features['steps/observation/pixels'].bytes_list.value[0]
+                if obs_bytes[:2] == b'\x78\x9c':  # zlib header
+                    obs = TFRecordConverter.decode_zlib_observation(obs_bytes)
+                    if obs is None:
+                        print(f"Failed to decode observation at timestep {idx}, skipping...")
+                        continue
+                    else:
+                        timestep_data['observation'] = obs
+                else:
+                    try:
+                        # Utilize TensorFlow's format-agnostic decoder
+                        # This leverages internal heuristics for JPEG/PNG/BMP/GIF detection
+                        obs_tensor = tf.io.decode_image(obs_bytes, channels=3)
+                        obs = obs_tensor.numpy()
+                    
+                        timestep_data['observation'] = obs
+                    
+                    except Exception as e:
+                        print(f"Observation decoding failed for timestep: {e}")
+                        # Critical: Continue to next timestep rather than attempting fallback
+                        continue
             
-            # Process rewards
-            episode_data['reward'] = sequence['reward'].numpy()
+            # Parse actions with robustness
+            if 'steps/action' in features:
+                action_bytes= features['steps/action'].bytes_list.value[0]
+                if action_bytes[:2] == b'\x78\x9c':  # zlib header
+                    try:
+                        decompressed = zlib.decompress(action_bytes)
+                        action_values = np.frombuffer(decompressed, dtype=np.float64)
+                    except zlib.error as e:
+                        print(f"Action decompression failed: {e}")
+                        continue
+                else:
+                    action_values = np.frombuffer(action_bytes, dtype=np.float64)
+                
+                # Validate action dimension
+                if len(action_values) == action_dim:
+                    timestep_data['action'] = action_values
+                else:
+                    print(f"Unexpected action dimension: {len(action_values)}")
+                    continue
             
-            # Process done flags (is_last or is_terminal indicates episode end)
-            is_last = sequence['is_last'].numpy()
-            is_terminal = sequence['is_terminal'].numpy()
-            episode_data['done'] = np.logical_or(is_last, is_terminal).astype(np.float32)
+            # Parse rewards
+            if 'steps/reward' in features:
+                reward_values = features['steps/reward'].float_list.value
+                if reward_values:
+                    timestep_data['reward'] = float(reward_values[0])
+            
+            # Parse termination flags
+            for flag_name in ['is_first', 'is_last', 'is_terminal']:
+                feature_key = f'steps/{flag_name}'
+                if feature_key in features:
+                    flag_values = features[feature_key].int64_list.value
+                    if flag_values:
+                        timestep_data[flag_name] = int(flag_values[0])
+            
+            # Only add complete timesteps
+            if 'observation' in timestep_data and 'action' in timestep_data:
+                timesteps.append(timestep_data)
+        
+        # Reconstruct episode from timesteps
+        episode_data = {}
+        
+        if timesteps:
+            # Stack observations
+            episode_data['observation_pixels'] = np.stack([t['observation'] for t in timesteps])
+            
+            # Stack actions
+            episode_data['action'] = np.stack([t['action'] for t in timesteps])
+            
+            # Stack rewards
+            episode_data['reward'] = np.array([t.get('reward', 0.0) for t in timesteps], dtype=np.float32)
+            
+            # Construct done flags from termination indicators
+            done_flags = []
+            for i, t in enumerate(timesteps):
+                is_done = t.get('is_last', 0) or t.get('is_terminal', 0)
+                done_flags.append(float(is_done))
+            
+            episode_data['done'] = np.array(done_flags, dtype=np.float32)
+            
+            # Ensure at least one done flag
             if not np.any(episode_data['done']):
-                # If no done flags, mark last timestep as done
-                episode_data['done'] = np.zeros(episode_length, dtype=np.float32)
                 episode_data['done'][-1] = 1.0
-            # Store episode length
-            episode_data['episode_length'] = episode_length
             
+            episode_data['episode_length'] = len(timesteps)
+            
+            print(f"Parsed episode: {episode_data['episode_length']} timesteps, "
+                f"observations shape: {episode_data['observation_pixels'].shape}")
+        
         return episode_data
-
+    
 class DMCVBDataset(Dataset):
     """PyTorch Dataset for DMC Vision Benchmark data"""
     
@@ -210,7 +297,7 @@ class DMCVBDataset(Dataset):
         if episode_path.suffix == '.h5':
             return self._load_h5_episode(episode_path)
         elif '.tfrecord' in episode_path.suffix:
-            return TFRecordConverter.parse_tfrecord_episode(episode_path)
+            return TFRecordConverter.parse_tfrecord_episode(episode_path, self.action_dim)
         elif episode_path.suffix == '.npz':
             return self._load_npz_episode(episode_path)
         else:
@@ -718,8 +805,8 @@ def main():
         'batch_size': 16,
         'sequence_length': 10,
         'frame_stack': 3,
-        'img_height': 84,
-        'img_width': 84,
+        'img_height': 64,
+        'img_width': 64,
         'learning_rate': 4e-5,
         'n_epochs': 100,
         'num_workers': 4,

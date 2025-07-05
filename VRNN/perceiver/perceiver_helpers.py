@@ -7,7 +7,7 @@ import torch.nn.init as init
 from typing import List, Sequence, Tuple, Optional
 import torch.nn.functional as func
 from torch import einsum
-#from xformers.ops.fmha import memory_efficient_attention
+from xformers.ops.fmha import memory_efficient_attention
 #from xformers.ops.fmha.attn_bias import AttentionBias
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -269,6 +269,7 @@ class Attention(nn.Module):
         # Channel sizes per head
         self.qk_channels_per_head = self.qk_channels // self.num_heads
         self.v_channels_per_head = self.v_channels // self.num_heads
+        self.dropout = nn.Dropout(dropout_prob)
 
     def reshape_for_heads(self, x, channels_per_head):
         b, g, i, c = x.size()

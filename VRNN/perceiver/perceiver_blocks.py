@@ -243,7 +243,7 @@ class SelfAttention(nn.Module):
         # Self-attention block
         qkv_inputs = self.layer_norm1(inputs)
         self.attention.output_index_dim = qkv_inputs.shape[-2]
-        attention_out = self.attention(qkv_inputs, qkv_inputs, attention_mask)
+        attention_out, _ = self.attention(qkv_inputs, qkv_inputs, attention_mask)
         if self.drop_path_rate > 0.:
             x = x + self._drop_path(attention_out, is_training)
         else:
