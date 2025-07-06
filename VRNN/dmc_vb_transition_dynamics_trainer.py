@@ -641,17 +641,28 @@ class DMCVBTrainer:
         return torch.stack(consistencies).mean()
     
     def compute_predictive_accuracy(self, outputs: Dict) -> float:
+
         """Compute accuracy of self-model predictions"""
-        if not outputs.get('one_step_h_prediction_loss'):
+        if not any(outputs.get(f'one_step_{x}_prediction_loss') for x in ['h', 'z', 'att']):
             return 0.0
         
-        # Use negative of prediction loss as accuracy proxy
-        h_acc = -outputs.get('one_step_h_prediction_loss', 0)
-        z_acc = -outputs.get('one_step_z_prediction_loss', 0)
-        att_acc = -outputs.get('one_step_att_prediction_loss', 0)
+        accuracies = []
+        for modality in ['h', 'z', 'att']:
+            loss_key = f'one_step_{modality}_prediction_loss'
+            if loss_key in outputs and outputs[loss_key]:
+                losses = outputs[loss_key]
+                # Handle both list of tensors and single tensor cases
+                if isinstance(losses, list):
+                    loss_tensor = torch.stack([l.detach() for l in losses])
+                else:
+                    loss_tensor = losses.detach()
+                
+                # Compute negative mean as accuracy proxy
+                accuracy = -loss_tensor.mean().cpu().item()
+                accuracies.append(accuracy)
         
-        # Average accuracy
-        return (h_acc + z_acc + att_acc) / 3
+        return np.mean(accuracies) if accuracies else 0.0
+
     
     def visualize_results(self, epoch: int, n_samples: int = 4):
         """Visualize model outputs"""
@@ -808,7 +819,7 @@ def main():
         'img_height': 64,
         'img_width': 64,
         'learning_rate': 4e-5,
-        'n_epochs': 200,
+        'n_epochs': 400,
         'num_workers': 4,
         
         # Loss weights

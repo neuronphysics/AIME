@@ -1241,7 +1241,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             'one_step_h_prediction_loss': [],
             'one_step_z_prediction_loss': [],
             'one_step_att_prediction_loss': [],
-            'attention_kl_losses': [],
             'self_model_kl_losses': [],
             'unused_penalties': [],  
         }
@@ -1429,7 +1428,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 
                 attention_pred_dist = Normal(self_pred['attention_mean'], 
                                         torch.exp(0.5 * self_pred['attention_logvar']))
-                attention_actual_dist = Normal(attention_state, torch.ones_like(attention_state) * 0.1)
+                attention_actual_dist = Normal(attention_features, torch.ones_like(attention_features)  * 0.1)
                 attention_kl = torch.distributions.kl_divergence(attention_actual_dist, attention_pred_dist).mean()
                 
                 outputs['self_model_kl_losses'].append({
@@ -1463,11 +1462,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             if outputs[key]:
                 outputs[key] = torch.stack(outputs[key], dim=1)
         
-        # Average losses over time
-        for key in ['reconstruction_losses', 'kl_latents', 'kumaraswamy_kl_losses', 'attention_losses',
-                    'alpha_prior_losses', 'cluster_entropies', 'unused_penalties']:
-            if outputs[key]:
-                outputs[key] = torch.stack(outputs[key]).mean()
         
         # One-step prediction bonuses (negative of losses for ELBO)
         if outputs['one_step_h_prediction_loss']:
@@ -1485,27 +1479,25 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         else:
             outputs['future_att_bonus'] = torch.tensor(0.0).to(self.device)
         
-        # Attention KL average
-        if outputs['attention_kl_losses']:
-            outputs['attention_kl'] = torch.stack(outputs['attention_kl_losses']).mean()
-        else:
-            outputs['attention_kl'] = torch.tensor(0.0).to(self.device)
         
         # Schema consistency (if using global context)
         if self.use_global_context and context_sequence is not None:
             perceiver_attention = self.attention_extractor(context_sequence)
-            schema_consistency = F.mse_loss(
-                outputs['attention_states'][:, :perceiver_attention.shape[1]], 
+            attn_features = torch.stack(outputs['attention_features'], dim=1)
+            
+            outputs['schema_consistency_loss'] = F.mse_loss(
+                attn_features, 
                 perceiver_attention,
                 reduction='mean'
             )
-            outputs['schema_consistency_loss'] = schema_consistency
+            
         else:
             outputs['schema_consistency_loss'] = torch.tensor(0.0).to(self.device)
         
         # Perceiver loss
         if perceiver_recon is not None:
-            obs_flat = observations.reshape(-1, self.image_size * self.image_size * self.input_channels, 1)
+            # Transform to Perceiver's expected format: [batch*seq, H*W, C]
+            obs_flat = observations.reshape(-1, self.image_size * self.image_size, self.input_channels)
             outputs['perceiver_loss'] = F.mse_loss(perceiver_recon, obs_flat, reduction='mean')
         else:
             outputs['perceiver_loss'] = torch.tensor(0.0).to(self.device)
@@ -1610,18 +1602,22 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         # === ELBO Components (already computed in forward_sequence) ===
         
         # 1. Reconstruction fidelity (E_q[log p(o|z)])
-        losses['recon_loss'] = outputs['reconstruction_losses'].mean()
+        losses['recon_loss'] = torch.stack(outputs['reconstruction_losses']).mean() if outputs['reconstruction_losses'] else torch.tensor(0.0).to(self.device)
         
         # 2. Latent dynamics regularization (KL[q(z|o)||p(z|h,c,π)])
-        losses['kl_z'] = torch.stack(outputs['kl_latents']).mean() if outputs['kl_latents'] else 0.0
+        losses['kl_z'] = torch.stack(outputs['kl_latents']).mean() if outputs['kl_latents'] else torch.tensor(0.0).to(self.device)
         
         # 3. Stick-breaking process regularization
-        losses['kumar_beta_kl'] = torch.stack(outputs['kumaraswamy_kl_losses']).mean() if outputs['kumaraswamy_kl_losses'] else 0.0
+        losses['kumar_beta_kl'] = torch.stack(outputs['kumaraswamy_kl_losses']).mean() if outputs['kumaraswamy_kl_losses'] else torch.tensor(0.0).to(self.device)
         
         # 4. Concentration hyperprior (sign correction: should be positive KL)
         # Note: alpha_prior_losses stored as negative log prob, so we negate
-        losses['alpha_prior'] = -torch.stack(outputs['alpha_prior_losses']).mean() if outputs['alpha_prior_losses'] else 0.0
-        
+        losses['alpha_prior'] = -torch.stack(outputs['alpha_prior_losses']).mean() if outputs['alpha_prior_losses'] else torch.tensor(0.0).to(self.device)
+        # Cluster entropy (negative for maximization)
+        losses['cluster_entropy'] = torch.stack(outputs['cluster_entropies']).mean() if outputs['cluster_entropies'] else torch.tensor(0.0).to(self.device)
+
+        # Attention losses
+        losses['attention_kl'] = torch.stack(outputs['attention_losses']).mean() if outputs['attention_losses'] else torch.tensor(0.0).to(self.device)        
         # 5. Self-model alignment
         if outputs['self_model_kl_losses']:
             self_model_kls = [loss['total'] for loss in outputs['self_model_kl_losses']]
@@ -1629,14 +1625,12 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         else:
             losses['self_model_kl'] = torch.tensor(0.0).to(self.device)
         
-        # 6. Cluster entropy (negative for maximization)
-        losses['cluster_entropy'] = torch.stack(outputs['cluster_entropies']).mean() if outputs['cluster_entropies'] else 0.0
-        
+       
         # 7. Future prediction bonuses (already computed with correct sign)
         losses['future_pred_bonus'] = outputs['future_h_bonus'] + outputs['future_z_bonus']
         
         # 8. Attention components
-        losses['attention_kl'] = torch.stack(outputs['attention_kl_losses']).mean() if outputs['attention_kl_losses'] else 0.0
+        
         losses['attention_pred_bonus'] = outputs['future_att_bonus']
         
         # 9. Schema consistency
@@ -1928,8 +1922,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         
             # Step the discriminator schedulers if available
             if hasattr(self, 'img_disc_scheduler') and hasattr(self, 'latent_disc_scheduler'):
-                self.img_disc_scheduler.step()
-                self.latent_disc_scheduler.step()
+                self.img_disc_scheduler.step(img_disc_loss.item())
+                self.latent_disc_scheduler.step(latent_disc_loss.item())
                 # Add learning rates to result if available
                 result['img_disc_lr'] = self.img_disc_scheduler.get_last_lr()[0]
                 result['latent_disc_lr'] = self.latent_disc_scheduler.get_last_lr()[0]
@@ -2225,7 +2219,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                     batch_size, num_groups, num_heads, Q, K = attention_weights.shape
                     
                     # Reshape to separate batch and groups
-                    print(f"Extracting attention weights from block {i} with shape {attention_weights.shape}, batch_size {batch_size}, num_groups {num_groups}")
+                    #print(f"Extracting attention weights from block {i} with shape {attention_weights.shape}, batch_size {batch_size}, num_groups {num_groups}")
                     attention_weights = attention_weights.view(
                         batch_size, num_groups, 
                         attention_weights.shape[2],  # num_heads
