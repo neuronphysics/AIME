@@ -268,7 +268,7 @@ class DMCVBDataset(Dataset):
         
         # Split into train/eval
         n_episodes = len(episode_files)
-        n_train = int(0.8 * n_episodes)
+        n_train = int(0.95 * n_episodes)
         
         if self.split == 'train':
             return episode_files[:n_train]
@@ -469,8 +469,8 @@ class DMCVBTrainer:
             split='train',
             sequence_length=config['sequence_length'],
             frame_stack=config.get('frame_stack', 3),
-            img_height=config.get('img_height', 84),
-            img_width=config.get('img_width', 84),
+            img_height=config.get('img_height', 64),
+            img_width=config.get('img_width', 64),
             add_state= False
         )
         
@@ -480,8 +480,8 @@ class DMCVBTrainer:
             split='eval',
             sequence_length=config['sequence_length'],
             frame_stack=config.get('frame_stack', 3),
-            img_height=config.get('img_height', 84),
-            img_width=config.get('img_width', 84),
+            img_height=config.get('img_height', 64),
+            img_width=config.get('img_width', 64),
             add_state= False
         )
         
@@ -793,22 +793,22 @@ def main():
         
         # Model settings
         'max_components': 20,
-        'latent_dim': 32,
-        'hidden_dim': 256,
-        'context_dim': 128,
-        'attention_dim': 64,
-        'attention_resolution': 21,
+        'latent_dim': 28,
+        'hidden_dim': 32,
+        'context_dim': 20,
+        'attention_dim': 24,
+        'attention_resolution': 16,
         'input_channels': 3* 3,  # 3 stacked frames
         'HiP_type': 'Mini',
         
         # Training settings
-        'batch_size': 16,
+        'batch_size': 5,
         'sequence_length': 10,
         'frame_stack': 3,
         'img_height': 64,
         'img_width': 64,
         'learning_rate': 4e-5,
-        'n_epochs': 100,
+        'n_epochs': 200,
         'num_workers': 4,
         
         # Loss weights

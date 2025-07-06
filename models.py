@@ -59,7 +59,8 @@ class AttentionPosterior(nn.Module):
         image_size: int,
         attention_resolution: int,
         hidden_dim: int,
-        context_dim: int
+        context_dim: int, 
+        input_channels: int = 3
     ):
         super().__init__()
         self.image_size = image_size
@@ -67,7 +68,7 @@ class AttentionPosterior(nn.Module):
         
         # Bottom-up saliency extraction
         self.saliency_net = nn.Sequential(
-            nn.Conv2d(3, 16, 3, stride=2, padding=1),
+            nn.Conv2d(input_channels, 16, 3, stride=2, padding=1),
             nn.GroupNorm(4, 16),
             nn.SiLU(),
             nn.Conv2d(16, 32, 3, stride=2, padding=1),

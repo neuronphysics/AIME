@@ -631,14 +631,18 @@ class AttentionSchema(nn.Module):
         attention_resolution: int = 21,
         hidden_dim: int = 256,
         latent_dim: int = 32,
-        context_dim: int = 128
+        context_dim: int = 128,
+        attention_dim: int = 64,
+        input_channels: int = 3,
+        device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ):
         super().__init__()
         
         # Posterior (bottom-up, stimulus-driven attention)
         self.posterior_net = AttentionPosterior(
             image_size, attention_resolution, 
-            hidden_dim, context_dim
+            hidden_dim, context_dim,
+            input_channels
         )
         
         # Prior (top-down, predictive attention schema)
@@ -657,8 +661,9 @@ class AttentionSchema(nn.Module):
             nn.SiLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(32, hidden_dim // 2)
+            nn.Linear(32, attention_dim)
         )
+        self.to(device)
     
     def compute_attention_dynamics_loss(
         self,
@@ -830,16 +835,23 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
     
         # Get variant configuration
         variant_config = perceiver.VARIANTS[self.HiP_type]
-    
-        # Extract key dimensions from the processor block (middle block)
-        processor_idx = len(variant_config['num_groups']) // 2
-        perceiver_latent_dim = variant_config['num_z_channels'][processor_idx]
-    
         # Initialize perceiver
         mock_input = self.generate_mock_input()
         self.perceiver_model = generate_model('HiPClassBottleneck', self.HiP_type, mock_input)
         self.perceiver_model.to(self.device)
         self.out_keys = perceiver_helpers.ModelOutputKeys
+        # Extract key dimensions from the processor block (middle block)
+        with torch.no_grad():
+            # Run a forward pass to get actual dimensions
+            test_output = self.perceiver_model(mock_input, is_training=False)
+            test_latents = test_output[self.out_keys.LATENTS]['image']
+            
+            # Get actual channel dimension
+            perceiver_latent_dim = test_latents.shape[-1]  # [batch, index, channels]
+            
+        print(f"Detected Perceiver context output dimension: {perceiver_latent_dim}")
+   
+
     
         # Architecture-aware projection
         self.perceiver_projection = nn.Sequential(
@@ -906,10 +918,12 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         # Compute attention state from h, c, z
         self.attention_prior_posterior = AttentionSchema(
                                                         image_size=self.image_size,
-                                                        attention_resolution=attention_resolution,  # 84/4
+                                                        attention_resolution=attention_resolution,  # 64/4
                                                         hidden_dim=self.hidden_dim,
                                                         latent_dim=self.latent_dim,
-                                                        context_dim=self.context_dim
+                                                        context_dim=self.context_dim,
+                                                        attention_dim=self.attention_dim,
+                                                        input_channels=self.input_channels,
                                                         )
         # Feature extractor for attention
         self.phi_attention = LinearResidual(self.attention_dim, self.hidden_dim)
@@ -1207,6 +1221,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             'latents': [],
             'z_means': [],
             'z_logvars': [],
+            'attention_features': [],
             'attention_states': [],
             'attention_maps': [],
             'hidden_states': [],
@@ -1277,6 +1292,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             attention_features = self.attention_prior_posterior.attention_encoder(
                 attention_map.unsqueeze(1)  # Add channel dimension
             )
+            outputs['attention_features'].append(attention_features)
             attention_state = self.phi_attention(attention_features)
             outputs['attention_states'].append(attention_state)
             
@@ -1356,7 +1372,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 # We made predictions at t-1, now evaluate them against actual values at t
                 
                 # Get predictions made at previous timestep
-                prev_pred = outputs['self_predictions'][-1]
+                prev_pred = outputs['self_predictions'][t-1]
                 
                 # Compare with actual values
                 # Hidden state prediction loss
@@ -1378,7 +1394,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
 
             # === Self-Model Predictions ===
             # TODO:6. Future prediction bonuses (need t and t+tau)? Does this predict next hidden state? 
-            if t > 0 and t < seq_len-1:
+            if t < seq_len- 1:
                 # Get next context if available
                 c_next = context_sequence[:, t+1] if t+1 < seq_len and self.use_global_context else c_t
                 
@@ -1386,17 +1402,21 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 self_pred = self.self_model_step(
                     h[-1], 
                     outputs['latents'][-1],
-                    outputs['attention_states'][-1], 
+                    outputs['attention_features'][-1], 
                     actions[:, t],
                     c_next
                 )
                 outputs['self_predictions'].append(self_pred)
+                if t > 0:
                 
-                # Compute self-model losses
-                self_loss = self._compute_self_model_loss(
-                    self_pred, h[-1], z_t, attention_state
-                )
-                outputs['self_model_losses'].append(self_loss)
+                    # Compute self-model losses
+                    self_loss = self._compute_self_model_loss(
+                        outputs['self_predictions'][t-1],
+                        h[-1],
+                        z_t,
+                        outputs['attention_features'][t-1]
+                        )
+                    outputs['self_model_losses'].append(self_loss)
                 # Compute self-model KL losses
                 # These compare current states with what was predicted
                 h_pred_dist = Normal(self_pred['h_mean'], torch.exp(0.5 * self_pred['h_logvar']))
@@ -2202,15 +2222,15 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                     # attention_weights shape: [batch*groups, num_heads, queries, keys]
                     # We need to reshape and process these weights
                     
-                    batch_size = attention_weights.shape[0] // block.num_output_groups
-                    num_groups = block.num_output_groups
+                    batch_size, num_groups, num_heads, Q, K = attention_weights.shape
                     
                     # Reshape to separate batch and groups
+                    print(f"Extracting attention weights from block {i} with shape {attention_weights.shape}, batch_size {batch_size}, num_groups {num_groups}")
                     attention_weights = attention_weights.view(
                         batch_size, num_groups, 
-                        attention_weights.shape[1],  # num_heads
-                        attention_weights.shape[2],  # queries
-                        attention_weights.shape[3]   # keys
+                        attention_weights.shape[2],  # num_heads
+                        attention_weights.shape[3],  # queries
+                        attention_weights.shape[4]   # keys
                     )
                     
                     # Average over heads and groups for visualization
