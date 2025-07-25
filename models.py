@@ -825,6 +825,421 @@ class LatentDiscriminator(nn.Module):
         return self.model(x)
 
 
+
+class CausalSelfAttention(nn.Module):
+    """
+    Causal self-attention with proper masking for temporal discrimination
+    """
+    def __init__(self, n_embd, n_head, attn_pdrop=0.1, resid_pdrop=0.1, 
+                 sequence_length=128):
+        super().__init__()
+        assert n_embd % n_head == 0
+        
+        # Key, query, value projections for all heads
+        self.key = nn.Linear(n_embd, n_embd)
+        self.query = nn.Linear(n_embd, n_embd)
+        self.value = nn.Linear(n_embd, n_embd)
+        
+        # Output projection
+        self.proj = nn.Linear(n_embd, n_embd)
+        
+        # Regularization
+        self.attn_drop = nn.Dropout(attn_pdrop)
+        self.resid_drop = nn.Dropout(resid_pdrop)
+        
+        # Causal mask to ensure attention only attends to the left
+        self.register_buffer("mask", 
+            torch.tril(torch.ones(sequence_length, sequence_length))
+            .view(1, 1, sequence_length, sequence_length))
+        
+        self.n_head = n_head
+        self.n_embd = n_embd
+        
+    def forward(self, x):
+        B, T, C = x.size()  # batch, sequence length, embedding dim
+        
+        # Calculate query, key, values for all heads in batch
+        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        
+        # Causal self-attention
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_drop(att)
+        y = att @ v
+        
+        # Re-assemble all head outputs
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
+        # Output projection
+        y = self.resid_drop(self.proj(y))
+        return y
+
+class TransformerBlock(nn.Module):
+    """Transformer block with causal attention"""
+    def __init__(self, n_embd, n_head, attn_pdrop=0.1, resid_pdrop=0.1,
+                 sequence_length=128):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, attn_pdrop, resid_pdrop,
+                                        sequence_length)
+        self.ln_2 = nn.LayerNorm(n_embd)
+        self.mlp = nn.ModuleDict(dict(
+            c_fc    = nn.Linear(n_embd, 4 * n_embd),
+            c_proj  = nn.Linear(4 * n_embd, n_embd),
+            act     = nn.GELU(),
+            dropout = nn.Dropout(resid_pdrop),
+        ))
+        
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        m = self.mlp
+        x = x + m.dropout(m.c_proj(m.act(m.c_fc(self.ln_2(x)))))
+        return x
+
+class TemporalDiscriminator(nn.Module):
+    """
+    Temporal Discriminator using Causal Transformer
+    
+    Evaluates sequence quality by processing temporal relationships
+    """
+    def __init__(
+        self,
+        input_channels: int = 3,
+        image_size: int = 64,
+        hidden_dim: int = 512,
+        n_layers: int = 6,
+        n_heads: int = 8,
+        sequence_length: int = 16,
+        feature_extractor_channels: List[int] = [64, 128, 256, 512],
+        use_spectral_norm: bool = True,
+        device: torch.device = torch.device('cuda')
+    ):
+        super().__init__()
+        self.image_size = image_size
+        self.sequence_length = sequence_length
+        self.hidden_dim = hidden_dim
+        self.device = device
+        
+        # Frame-level feature extractor (CNN)
+        self.frame_encoder = self._build_frame_encoder(
+            input_channels, feature_extractor_channels, use_spectral_norm
+        )
+        
+        # Calculate feature dimension after CNN
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, input_channels, image_size, image_size)
+            dummy_features = self.frame_encoder(dummy_input)
+            feature_dim = dummy_features.shape[1]
+        
+        # Project CNN features to transformer dimension
+        self.feature_projection = nn.Linear(feature_dim, hidden_dim)
+        
+        # Positional encoding
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, sequence_length, hidden_dim)
+        )
+        self.drop = nn.Dropout(0.1)
+        
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(
+                hidden_dim, n_heads, 
+                sequence_length=sequence_length
+            ) for _ in range(n_layers)
+        ])
+        
+        # Final normalization
+        self.ln_f = nn.LayerNorm(hidden_dim)
+        
+        # Discrimination heads
+        self.temporal_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        self.per_frame_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+        self.to(device)
+        
+    def _build_frame_encoder(self, input_channels, channels, use_spectral_norm):
+        """Build CNN for frame-level feature extraction"""
+        layers = []
+        in_channels = input_channels
+        
+        for out_channels in channels:
+            conv = nn.Conv2d(in_channels, out_channels, 4, 2, 1)
+            if use_spectral_norm:
+                conv = nn.utils.spectral_norm(conv)
+            
+            layers.extend([
+                conv,
+                nn.LeakyReLU(0.2, inplace=True)
+            ])
+            in_channels = out_channels
+        
+        # Global average pooling
+        layers.append(nn.AdaptiveAvgPool2d(1))
+        layers.append(nn.Flatten())
+        
+        return nn.Sequential(*layers)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+    
+    def extract_features(self, x):
+        """
+        Extract features from sequence of frames
+        
+        Args:
+            x: [batch_size, seq_len, channels, height, width]
+        
+        Returns:
+            features: [batch_size, seq_len, hidden_dim]
+        """
+        B, T, C, H, W = x.shape
+        
+        # Process all frames through CNN
+        x_flat = x.view(B * T, C, H, W)
+        features_flat = self.frame_encoder(x_flat)
+        features = features_flat.view(B, T, -1)
+        
+        # Project to transformer dimension
+        features = self.feature_projection(features)
+        
+        return features
+    
+    def forward(self, x, return_features=False):
+        """
+        Forward pass through temporal discriminator
+        
+        Args:
+            x: [batch_size, seq_len, channels, height, width]
+            return_features: If True, return intermediate features
+        
+        Returns:
+            dict with discrimination scores and optionally features
+        """
+        B, T, C, H, W = x.shape
+        assert T <= self.sequence_length, f"Sequence length {T} exceeds maximum {self.sequence_length}"
+        
+        # Extract frame features
+        features = self.extract_features(x)
+        
+        # Add positional embeddings
+        features = features + self.pos_embed[:, :T, :]
+        features = self.drop(features)
+        
+        # Process through transformer
+        hidden = features
+        all_hidden_states = []
+        
+        for block in self.blocks:
+            hidden = block(hidden)
+            if return_features:
+                all_hidden_states.append(hidden)
+        
+        hidden = self.ln_f(hidden)
+        
+        # Get discrimination scores
+        # 1. Temporal coherence score (from last timestep)
+        temporal_score = self.temporal_head(hidden[:, -1, :])
+        
+        # 2. Per-frame quality scores
+        per_frame_scores = self.per_frame_head(hidden)
+        
+        outputs = {
+            'temporal_score': temporal_score,  # [B, 1]
+            'per_frame_scores': per_frame_scores,  # [B, T, 1]
+            'final_score': temporal_score + per_frame_scores.mean(dim=1)  # Combined
+        }
+        
+        if return_features:
+            outputs['features'] = all_hidden_states
+            outputs['frame_features'] = features
+        
+        return outputs
+
+class TemporalLatentDiscriminator(nn.Module):
+    """
+    Temporal Discriminator for Latent Sequences using Self-Attention
+    
+    Processes latent sequences to evaluate temporal coherence and quality
+    """
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int = 256,
+        n_layers: int = 4,
+        n_heads: int = 4,
+        sequence_length: int = 16,
+        use_spectral_norm: bool = True,
+        dropout: float = 0.1,
+        device: torch.device = torch.device('cuda')
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.sequence_length = sequence_length
+        self.device = device
+        
+        # Project latent to hidden dimension
+        self.input_projection = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(0.2)
+        )
+        
+        if use_spectral_norm:
+            self.input_projection[0] = nn.utils.spectral_norm(self.input_projection[0])
+        
+        # Positional encoding
+        self.pos_encoding = nn.Parameter(
+            torch.zeros(1, sequence_length, hidden_dim)
+        )
+        
+        # Temporal processing blocks
+        self.temporal_blocks = nn.ModuleList()
+        for _ in range(n_layers):
+            # Self-attention block
+            self.temporal_blocks.append(
+                nn.ModuleDict({
+                    'attention': nn.MultiheadAttention(
+                        hidden_dim, n_heads, 
+                        dropout=dropout, 
+                        batch_first=True
+                    ),
+                    'norm1': nn.LayerNorm(hidden_dim),
+                    'ffn': nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim * 4),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(hidden_dim * 4, hidden_dim),
+                        nn.Dropout(dropout)
+                    ),
+                    'norm2': nn.LayerNorm(hidden_dim)
+                })
+            )
+        
+        # Output heads
+        self.temporal_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        self.sequence_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        # Contrastive head for temporal consistency
+        self.consistency_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.to(device)
+    
+    def compute_temporal_features(self, x):
+        """
+        Extract temporal features using self-attention
+        
+        Args:
+            x: [batch_size, seq_len, latent_dim]
+        
+        Returns:
+            features: [batch_size, seq_len, hidden_dim]
+        """
+        B, T, D = x.shape
+        
+        # Project to hidden dimension
+        h = self.input_projection(x)
+        
+        # Add positional encoding
+        h = h + self.pos_encoding[:, :T, :]
+        
+        # Process through temporal blocks
+        for block in self.temporal_blocks:
+            # Self-attention
+            h_norm = block['norm1'](h)
+            attn_out, _ = block['attention'](h_norm, h_norm, h_norm)
+            h = h + attn_out
+            
+            # FFN
+            h_norm = block['norm2'](h)
+            h = h + block['ffn'](h_norm)
+        
+        return h
+    
+    def forward(self, x, return_features=False):
+        """
+        Forward pass through temporal latent discriminator
+        
+        Args:
+            x: [batch_size, seq_len, latent_dim]
+            return_features: If True, return intermediate features
+        
+        Returns:
+            Dictionary with discrimination scores
+        """
+        B, T, D = x.shape
+        assert T <= self.sequence_length, f"Sequence length {T} exceeds maximum {self.sequence_length}"
+        
+        # Extract temporal features
+        features = self.compute_temporal_features(x)
+        
+        # Temporal coherence score (from last timestep)
+        temporal_score = self.temporal_head(features[:, -1, :])
+        
+        # Sequence quality score (average pooled)
+        sequence_score = self.sequence_head(features.mean(dim=1))
+        
+        # Temporal consistency score
+        # Compare adjacent timesteps
+        if T > 1:
+            # Compute differences between adjacent timesteps
+            diffs = features[:, 1:, :] - features[:, :-1, :]
+            diff_features = torch.cat([
+                diffs.mean(dim=1),  # Average temporal difference
+                diffs.std(dim=1)    # Temporal variance
+            ], dim=-1)
+            consistency_score = self.consistency_head(diff_features)
+        else:
+            consistency_score = torch.zeros(B, 1).to(x.device)
+        
+        outputs = {
+            'temporal_score': temporal_score,
+            'sequence_score': sequence_score,
+            'consistency_score': consistency_score,
+            'final_score': temporal_score + sequence_score + 0.5 * consistency_score
+        }
+        
+        if return_features:
+            outputs['features'] = features
+
+        return outputs
+
 class VAEEncoder(torch.nn.Module):
     def __init__(
         self,

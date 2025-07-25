@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import h5py
-import json
+import random
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
@@ -15,8 +15,9 @@ from collections import defaultdict
 import time
 import tensorflow as tf
 import zlib
+from torch.utils.tensorboard import SummaryWriter
 from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentEncoder
-"""Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/expert ./dmc_vb/"""
+"""Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
 
 class DMCVBInfo:
     """PyTorch version of DMC Vision Benchmark info"""
@@ -244,37 +245,49 @@ class DMCVBDataset(Dataset):
         print(f"Loaded {len(self.episodes)} episodes")
         print(f"Minimum episode length (at first done): {self.min_episode_length}")
         print(f"Total sequences available: {len(self.sequence_indices)}")
+        
 
     def _load_episode_paths(self) -> List[Path]:
         """Load all episode file paths"""
-        episode_dir = self.data_dir / "dmc_vb" / f"{self.domain_name}_{self.task_name}" / self.policy_level / "none"
+        all_episode_files = []
+        policy_levels = ['expert', 'medium']
+        subfolders =['none', 'dynamic_medium', 'static_medium']
+        base_dir = self.data_dir / "dmc_vb" / f"{self.domain_name}_{self.task_name}"
+        # Collect episodes from all combinations
+        for policy_level in policy_levels:
+            for subfolder in subfolders:
+                episode_dir = base_dir / policy_level / subfolder
+                
+                if not episode_dir.exists():
+                    print(f"Skipping non-existent directory: {episode_dir}")
+                    continue
+                
+                # Get all tfrecord files from this directory
+                episode_files = sorted(episode_dir.glob("distracting_control-*.tfrecord-*"))
+                
+                if len(episode_files) == 0:
+                    # Try general tfrecord pattern as fallback
+                    episode_files = sorted(episode_dir.glob("*.tfrecord*"))
+                
+                if len(episode_files) > 0:
+                    print(f"Found {len(episode_files)} episodes in {policy_level}/{subfolder}")
+                    all_episode_files.extend(episode_files)
         
-        if not episode_dir.exists():
-            raise ValueError(f"Dataset directory not found: {episode_dir}")
+        if len(all_episode_files) == 0:
+            raise ValueError(f"No episode files found in any directory under {base_dir}")
         
-        # Get all tfrecord files
-        episode_files = sorted(episode_dir.glob("distracting_control-*.tfrecord-*"))
-        
-        if len(episode_files) == 0:
-            # Try general tfrecord pattern as fallback
-            episode_files = sorted(episode_dir.glob("*.tfrecord*"))
-        
-        if len(episode_files) == 0:
-            # Try h5 files as alternative
-            episode_files = sorted(episode_dir.glob("*.h5"))
-        
-        if len(episode_files) == 0:
-            raise ValueError(f"No episode files found in {episode_dir}")
+        # Shuffle all episodes to mix expert and medium data
+        random.shuffle(all_episode_files)
         
         # Split into train/eval
-        n_episodes = len(episode_files)
+        n_episodes = len(all_episode_files)
         n_train = int(0.95 * n_episodes)
         
         if self.split == 'train':
-            return episode_files[:n_train]
+            return all_episode_files[:n_train]
         else:
-            return episode_files[n_train:]
-        
+            return all_episode_files[n_train:]
+
     def _load_all_episodes(self) -> List[Dict[str, np.ndarray]]:
         """Load all episodes into memory"""
         episode_paths = self._load_episode_paths()
@@ -507,13 +520,29 @@ class DMCVBTrainer:
         self.best_eval_loss = float('inf')
         
         # Setup wandb if configured
-        if config.get('use_wandb', False):
+        
+        self.use_wandb = config.get('use_wandb', False) and self._try_init_wandb(config)
+        if not self.use_wandb:
+            log_dir = f"runs/{config.get('experiment_name', 'dpgmm_vrnn')}_{time.strftime('%Y%m%d_%H%M%S')}"
+            self.writer = SummaryWriter(log_dir)
+            print(f"TensorBoard logging to: {log_dir}")
+        else:
+            self.writer = None
+
+    def _try_init_wandb(self, config):
+        """Attempt to initialize W&B, return success status"""
+        try:
+            import wandb
             wandb.init(
                 project=config.get('wandb_project', 'dpgmm-vrnn-dmc'),
                 config=config,
                 name=config.get('experiment_name', None)
             )
-    
+            return True
+        except:
+            print("W&B initialization failed, falling back to TensorBoard")
+            return False
+        
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
         self.model.train()
@@ -533,7 +562,6 @@ class DMCVBTrainer:
                 beta=self.config.get('beta', 1.0),
                 n_critic=self.config.get('n_critic', 3),
                 lambda_img=self.config.get('lambda_img', 0.2),
-                lambda_latent=self.config.get('lambda_latent', 0.1),
                 lambda_pred=self.config.get('lambda_pred', 0.1),
                 lambda_att=self.config.get('lambda_att', 0.1),
                 lambda_schema=self.config.get('lambda_schema', 0.1),
@@ -712,8 +740,10 @@ class DMCVBTrainer:
             plt.tight_layout()
             
             # Save or log figure
-            if self.config.get('use_wandb', False):
+            if self.use_wandb:
                 wandb.log({f'visualizations/epoch_{epoch}': wandb.Image(fig)})
+            elif self.writer:
+                self.writer.add_figure(f'visualizations/epoch_{epoch}', fig, epoch)
             else:
                 plt.savefig(f'visualizations_epoch_{epoch}.png')
             
@@ -766,8 +796,11 @@ class DMCVBTrainer:
             all_metrics = {**train_metrics, **eval_metrics}
             
             # Log metrics
-            if self.config.get('use_wandb', False):
+            if self.use_wandb:
                 wandb.log(all_metrics, step=epoch)
+            elif self.writer:
+                for key, value in all_metrics.items():
+                    self.writer.add_scalar(key, value, epoch)
             
             # Store metrics
             for key, value in all_metrics.items():
@@ -787,6 +820,9 @@ class DMCVBTrainer:
             # Save checkpoint
             if epoch % self.config.get('checkpoint_every', 10) == 0:
                 self.save_checkpoint(epoch)
+        # Cleanup
+        if self.writer:
+            self.writer.close()
         
         print("Training completed!")
 
@@ -803,7 +839,7 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 20,
+        'max_components': 10,
         'latent_dim': 28,
         'hidden_dim': 32,
         'context_dim': 20,
@@ -833,11 +869,11 @@ def main():
         'n_critic': 3,
         
         # Logging
-        'use_wandb': True,
+        'use_wandb': False,
         'wandb_project': 'dpgmm-vrnn-dmc',
         'wandb_entity': 'zahrasheikh',
         'experiment_name': 'humanoid_walk_expert',
-        'visualize_every': 10,
+        'visualize_every': 5,
         'checkpoint_every': 10
     }
     

@@ -8,7 +8,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (
     VAEEncoder, VAEDecoder, 
-    ImageDiscriminator, LatentDiscriminator,
+    TemporalDiscriminator, TemporalLatentDiscriminator,
     LinearResidual, AttentionPosterior, AttentionPrior,
     compute_feature_matching_loss, AddEpsilon, check_tensor
 )
@@ -19,7 +19,7 @@ import numpy as np
 from VRNN.perceiver.Utils import generate_model
 from VRNN.perceiver import perceiver_helpers
 import VRNN.perceiver.perceiver as perceiver
-
+from VRNN.Kumaraswamy import KumaraswamyStable
 def beta_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     """Compute beta function in log space for numerical stability"""
@@ -46,17 +46,21 @@ class GammaPosterior(nn.Module):
     Amortized variational posterior for Gamma distribution
     Maps encoder hidden states to Gamma parameters
     """
-    def __init__(self, hidden_dim: int, device: torch.device):
+    def __init__(self, hidden_dim: int, device: torch.device, eps: float= torch.finfo(torch.float32).eps):
+    
         super().__init__()
         # Network for generating Gamma parameters from hidden states
         # Give unique names to each layer
         self.param_net = nn.Sequential(OrderedDict([
             ('gamma_fc', nn.Linear(hidden_dim, hidden_dim)),
             ('gamma_ln', nn.LayerNorm(hidden_dim)),
-            ('gamma_relu', nn.LeakyReLU()),
+            ('gamma_relu', nn.GELU()),
             ('gamma_out', nn.Linear(hidden_dim, 2)),
-            ('gamma_softplus', nn.Softplus())
+            ('gamma_ln_out', nn.LayerNorm(2)),
+            ('gamma_softplus', nn.Softplus(beta=0.5)), 
+            ('gamma_eps', AddEpsilon(eps))  # Ensure positive parameters
         ]))
+        self.eps = eps
         self.device = device
         self.to(device)
 
@@ -64,10 +68,12 @@ class GammaPosterior(nn.Module):
         """
         Generate Gamma parameters from hidden representation
         """
-        eps = torch.finfo(torch.float32).eps
-        params = self.param_net(h) + eps
+        
+        params = self.param_net(h)
         concentration, rate = params.split(1, dim=-1)
-        return concentration.squeeze(-1), rate.squeeze(-1)
+        concentration = torch.clamp(concentration.squeeze(-1), min=self.eps)
+        rate = torch.clamp(rate.squeeze(-1), min=self.eps)
+        return concentration, rate
 
     def sample(self, h: torch.Tensor, n_samples: int = 1) -> torch.Tensor:
         """
@@ -109,21 +115,20 @@ class KumaraswamyNetwork(nn.Module):
 
         # Networks for Kumaraswamy parameters a and b
         self.net_a = nn.Sequential(OrderedDict([
-            ('kumar_a_fc', nn.Linear(hidden_dim, hidden_dim)),
+            ('kumar_a_fc', nn.utils.spectral_norm(nn.Linear(hidden_dim, hidden_dim))),
             ('kumar_a_ln',nn.LayerNorm(hidden_dim)),
-            ('kumar_a_relu', nn.LeakyReLU()),
-            ('kumar_a_out', nn.Linear(hidden_dim , self.K - 1)),
-            ('kumar_a_softplus', nn.Softplus()), # Ensure positive parameters
-            ('kumar_a_eps', AddEpsilon(self.eps))
+            ('kumar_a_relu', nn.SiLU()),
+            ('kumar_a_out', nn.utils.spectral_norm(nn.Linear(hidden_dim , self.K - 1))),
+            ('kumar_a_ln_out', nn.LayerNorm(self.K - 1)),
         ]))
 
         self.net_b = nn.Sequential(OrderedDict([
-            ('kumar_b_fc', nn.Linear(hidden_dim, hidden_dim)),
+            ('kumar_b_fc', nn.utils.spectral_norm(nn.Linear(hidden_dim, hidden_dim))),
             ('kumar_b_ln',nn.LayerNorm(hidden_dim)),
-            ('kumar_b_relu', nn.LeakyReLU()),
-            ('kumar_b_out', nn.Linear(hidden_dim , self.K - 1)),
-            ('kumar_b_softplus', nn.Softplus()), # Ensure positive parameters
-            ('kumar_b_eps', AddEpsilon(self.eps))
+            ('kumar_b_relu', nn.SiLU()),
+            ('kumar_b_out', nn.utils.spectral_norm(nn.Linear(hidden_dim , self.K - 1))),
+            ('kumar_b_ln_out', nn.LayerNorm(self.K - 1)),
+
         ]))
         self.to(device)
 
@@ -138,18 +143,18 @@ class KumaraswamyNetwork(nn.Module):
             a, b: Kumaraswamy parameters [batch_size, K-1]
         """
         # Add small epsilon to ensure strictly positive parameters
-        min_val =self.eps*10
-        max_val = 1e3
-        a = torch.clamp(self.net_a(h) , min=min_val, max=max_val)
-        b = torch.clamp(self.net_b(h) , min=min_val, max=max_val)
-        if torch.isnan(a).any() or torch.isnan(b).any():
-            print(f"Warning: NaN in Kumaraswamy parameters: h_range= ({h.min()}, {h.max()})a_range=({a.min()}, {a.max()}), b_range=({b.min()}, {b.max()})")
-            mean_a = torch.nanmean(a)  # Compute mean with ignoring NaNs
-            a = torch.where(torch.isnan(a), mean_a, a)
-            mean_b = torch.nanmean(b)  
-            b = torch.where(torch.isnan(b), mean_b, b)
+        min_val = -5.0
+        max_val = 5.0
+        log_a = torch.clamp(self.net_a(h) , min=min_val, max=max_val)
+        log_b = torch.clamp(self.net_b(h) , min=min_val, max=max_val)
+        if torch.isnan(log_a).any() or torch.isnan(log_b).any():
+            print(f"Warning: NaN in Kumaraswamy parameters: h_range= ({h.min()}, {h.max()})a_range=({log_a.min()}, {log_a.max()}), b_range=({log_b.min()}, {log_b.max()})")
+            mean_a = torch.nanmean(log_a)  # Compute mean with ignoring NaNs
+            log_a = torch.where(torch.isnan(log_a)| torch.isinf(log_a), mean_a, log_a)
+            mean_b = torch.nanmean(log_b)  
+            log_b = torch.where(torch.isnan(log_b)| torch.isinf(log_b), mean_b, log_b)
 
-        return a, b
+        return log_a, log_b
 
 class AdaptiveStickBreaking(nn.Module):
     """
@@ -188,8 +193,8 @@ class AdaptiveStickBreaking(nn.Module):
  
     @staticmethod
     def sample_kumaraswamy(
-                           a: torch.Tensor, 
-                           b: torch.Tensor, 
+                           log_a: torch.Tensor, 
+                           log_b: torch.Tensor, 
                            max_k: int, 
                            use_rand_perm: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -198,44 +203,35 @@ class AdaptiveStickBreaking(nn.Module):
         X=(1-(1-U)**(1/b))**(1/a)
         https://arxiv.org/pdf/2410.00660
         """
-        a = a.to(a.device)
-        b = b.to(b.device)
-        eps = torch.finfo(torch.float32).eps
-        tiny = torch.finfo(torch.float16).tiny
-        # Clamp parameters for stability
-        a = torch.clamp(a, min=eps)
-        b = torch.clamp(b, min=eps)
-    
-        check_tensor(a, "kumar_a")
-        check_tensor(b, "kumar_b")
-        
+        log_a = log_a.to(log_a.device)
+        log_b = log_b.to(log_b.device)
+
+        check_tensor(log_a, "kumar_a")
+        check_tensor(log_b, "kumar_b")
+
         # Optional random permutation
         if use_rand_perm:
             # Generate random permutation indices
-            perm = torch.argsort(torch.rand_like(a, device= a.device), dim=-1)
+            perm = torch.argsort(torch.rand_like(log_a, device= log_a.device), dim=-1)
             # Apply permutation
             perm = perm.view(-1, max_k-1)
-            
-            a = a.gather( dim=1, index=perm) # [batch_size, K-1]
-            b = b.gather( dim=1, index=perm) # [batch_size, K-1]
+
+            log_a = torch.gather(log_a, dim=1, index=perm) # [batch_size, K-1]
+            log_b = torch.gather(log_b, dim=1, index=perm) # [batch_size, K-1]
             # Generate full permutation for output
             
         else:
             perm = None
         
         # Sample uniformly with numerical stability
-        u = torch.rand_like(a).clamp(tiny, 1.0 - eps).to(a.device)
-
-        # Compute in log space for stability
-        # More stable than log(1-u)
-        log_1minus_v = torch.clamp(torch.log1p(-u) / b, max=1.0-eps)
-    
-        # Use log1p for improved numerical stability
-        log_v = torch.log1p(-torch.exp(log_1minus_v)) / a
-    
-        # Convert from log space with clamping
-        v = torch.exp(log_v).clamp( min=tiny, max=1.0-eps)
+        # Create stable Kumaraswamy distributions
+        kumar_dist = KumaraswamyStable(log_a, log_b)
+        
+        # Sample using the stable implementation
+        v = kumar_dist.rsample()
+        
         return v, perm
+
 
     @staticmethod
     def compute_stick_breaking_proportions( v: torch.Tensor, max_k:int, perm: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -268,7 +264,7 @@ class AdaptiveStickBreaking(nn.Module):
     
         # Stack components
         pi = torch.stack(pi_components, dim=1)
-        pi =prune_small_components(pi, threshold=1e-5)
+        
 
         # Apply inverse permutation if needed
         if perm is not None:
@@ -277,7 +273,7 @@ class AdaptiveStickBreaking(nn.Module):
             inv_perm = torch.argsort(full_perm, dim=1)  # [batch_size, K]
             pi = torch.gather(pi, 1, inv_perm)
 
-        # Prune small components for numerical stability????
+        pi = pi / (pi.sum(dim=-1, keepdim=True) + torch.finfo(torch.float32).eps)  # Normalize to sum to 1
         
         return pi
     
@@ -296,10 +292,10 @@ class AdaptiveStickBreaking(nn.Module):
         
         # Generate stick-breaking proportions
         # Get Kumaraswamy parameters
-        kumar_a, kumar_b = self.kumar_net(h)
+        log_kumar_a, log_kumar_b = self.kumar_net(h)
         
         # Sample v from Kumaraswamy for each alpha sample
-        v, perm = self.sample_kumaraswamy(kumar_a, kumar_b, self.max_K, use_rand_perm)  # [n_samples, batch, K-1]
+        v, perm = self.sample_kumaraswamy(log_kumar_a, log_kumar_b, self.max_K, use_rand_perm)  # [n_samples, batch, K-1]
 
 
         # Initialize mixing proportions
@@ -308,34 +304,11 @@ class AdaptiveStickBreaking(nn.Module):
         
         
         return pi, {
-            'kumar_a': kumar_a,
-            'kumar_b': kumar_b,
+            'kumar_a': torch.exp(log_kumar_a),
+            'kumar_b': torch.exp(log_kumar_b),
             'v': v.squeeze(0) if n_samples == 1 else v,
             'perm':perm
         }
-
-
-    def concentration_prior(self, h: torch.Tensor, n_samples: int = 10) -> torch.Tensor:
-        """
-        Compute the log prior probability of the concentration parameter alpha.
-        This is part of the hierarchical model where alpha ~ Gamma(gamma_a, gamma_b).
-
-        Args:
-            n_samples: Number of samples to use for Monte Carlo estimation
-
-        Returns:
-            Log probability of the concentration parameter under the prior
-        """
-        # Get multiple samples from the variational posterior
-        alpha_samples = self.alpha_posterior.sample(h, n_samples)  # [n_samples]
-
-        # Compute log probability under Gamma prior for each sample
-        prior_dist = Gamma(self.gamma_a, self.gamma_b)
-        log_probs = prior_dist.log_prob(alpha_samples)
-
-        # Average over samples for more stable estimation
-        return log_probs.mean()  # Average over all samples
-
 
     @staticmethod
     def compute_kumar2beta_kl( a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor, n_approx: int, eps: float=torch.finfo(torch.float32).eps) -> torch.Tensor:
@@ -351,8 +324,8 @@ class AdaptiveStickBreaking(nn.Module):
         EULER_GAMMA = 0.5772156649
         assert a.shape == b.shape == alpha.shape == beta.shape
 
-        a = torch.clamp(a, min=eps)
-        b = torch.clamp(b, min=eps)
+        a = torch.clamp(a, min=eps, max=1e2)  # Ensure a is positive
+        b = torch.clamp(b, min=eps, max=1e2)  # Ensure b is positive
         alpha = torch.clamp(alpha, min=eps)
         beta = torch.clamp(beta, min=eps)
  
@@ -362,7 +335,7 @@ class AdaptiveStickBreaking(nn.Module):
 
         # Taylor expansion for E[log(1-v)]
                 
-        log_taylor = torch.logsumexp(torch.stack([beta_fn(m *a_inv, b) - torch.log(m + a * b) for m in range(1, n_approx + 1)], dim=-1), dim=-1)
+        log_taylor = torch.logsumexp(torch.stack([beta_fn(m *a_inv, b) - torch.log(m + ab) for m in range(1, n_approx + 1)], dim=-1), dim=-1)
         kl = torch.mul(torch.mul(beta - 1, b), torch.exp(log_taylor))
         # Add remaining terms
         psi_b = torch.digamma(b + eps)
@@ -370,6 +343,13 @@ class AdaptiveStickBreaking(nn.Module):
         term2 = torch.log(ab + eps) + beta_fn(alpha, beta)
         term2 += torch.div(-(b - 1), b + eps)
         kl += term1 + term2
+        if torch.any(kl > 1000):
+            print(f"WARNING: Large Kumar-Beta KL detected: max={kl.max().item()}, mean={kl.mean().item()}")
+            print(f"  a range: ({a.min().item()}, {a.max().item()})")
+            print(f"  b range: ({b.min().item()}, {b.max().item()})")
+            print(f"  alpha range: ({alpha.min().item()}, {alpha.max().item()})")
+            print(f"  beta range: ({beta.min().item()}, {beta.max().item()})")
+
         return torch.clamp(kl, min=0.0) 
     
 
@@ -406,65 +386,65 @@ class DPGMMPrior(nn.Module):
         # Component parameters generators
         self.component_nn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(),
-            nn.Linear(hidden_dim, 2 * latent_dim * max_components)
+            nn.Linear(hidden_dim, 2 * latent_dim * max_components),
+            nn.LayerNorm(2 * latent_dim * max_components),
+            nn.Tanh()  # Ensure outputs are bounded
         )
         self.to(device)
 
     def compute_kl_divergence_mc(
-                                 self,
-                                 q_dist: torch.distributions.Distribution,
-                                 prior_params: Dict[str, torch.Tensor],
-                                 n_samples: int = 100
-                                ) -> torch.Tensor:
+        self,
+        posterior_mean: torch.Tensor,
+        posterior_logvar: torch.Tensor,
+        prior_params: Dict[str, torch.Tensor],
+        n_samples: int = 10  # Add n_samples argument
+    ) -> torch.Tensor:
         """
-        Compute KL(q||p) between neural network posterior q and DPGMM prior p
-        using Monte Carlo estimation.
-
-        Args:
-            q_dist: Posterior distribution (from encoder)
-            prior_params: Dictionary containing DPGMM parameters
-            n_samples: Number of MC samples
-
-        Returns:
-            Estimated KL divergence
-        """
-        # Sample from posterior q(z|x)
-        batch_size = prior_params['pi'].shape[0]
-        z_samples = q_dist.rsample((n_samples,))  # [n_samples, batch_size, latent_dim]
-
-        # Compute log q(z|x)
-        log_q = q_dist.log_prob(z_samples)  # [n_samples, batch_size]
-        if log_q.dim() > 2:
-           log_q = log_q.sum(-1)  # Sum over latent dimensions if needed
-
-        # Prepare samples and parameters for log_p computation
-        z_flat = z_samples.view(-1, self.latent_dim)  # [n_samples * batch_size, latent_dim]
-        # Properly repeat the parameters for each MC sample
-        
-        pi_rep = prior_params['pi'].unsqueeze(0).repeat(n_samples, 1, 1)  # [n_samples, batch_size, K]
-        pi_rep = pi_rep.reshape(-1, self.max_K)
-        
-        means_exp = prior_params['means'].unsqueeze(0).expand(n_samples, -1, -1, -1)  # [n_samples, batch_size, K, latent_dim]
-        means_rep = means_exp.reshape( -1, self.max_K, self.latent_dim)  # [n_samples * batch_size, K, latent_dim]
-        
-        vars_rep = torch.exp(prior_params['log_vars'])
-        covs_exp = torch.diag_embed(vars_rep).unsqueeze(0).expand(n_samples, -1, -1, -1, -1)  # [n_samples, batch_size, K, latent_dim, latent_dim]
-        covs_rep = covs_exp.reshape( -1, self.max_K, self.latent_dim, self.latent_dim)  # [n_samples * batch_size, K, latent_dim, latent_dim]
-        
-        # Now all parameters have shape [n_samples * batch_size, ...]
-        log_p = dp_gmm_log_prob(z_flat, pi_rep, means_rep, covs_rep)
+        Computes KL[ q(z|x) || p(z) ] where:
+            p(z) = GMM(prior_weights, prior_means, prior_log_vars)
+            q(z|x) = Gaussian(posterior_means, posterior_log_vars)
     
-        # Reshape back to [n_samples, batch_size]
-        log_p = log_p.view(n_samples, batch_size)
+        Uses Monte Carlo sampling with reparameterization.
+        """
 
-        # KL = E_q[log q(z) - log p(z)]
-        kl = (log_q - log_p).mean(0)  # Average over MC samples
-        return kl.mean()  # Average over batch
+        prior_weights = prior_params['pi']
+        prior_means = prior_params['means']
+        prior_logvars = prior_params['log_vars']
+        B, D = posterior_mean.shape
+        K = prior_weights.shape[1]
+        eps = torch.finfo(torch.float32).eps
 
+        # Sample from posterior (n_samples, B, D)
+        noise = torch.randn(n_samples, B, D, device=posterior_mean.device)
+        z = posterior_mean.unsqueeze(0) + noise * torch.exp(0.5 * posterior_logvar).unsqueeze(0)
+
+        # Log-posterior: (n_samples, B)
+        log_q = -0.5 * (
+            D * math.log(2 * math.pi) +
+            posterior_logvar.sum(dim=-1) +
+            ((z - posterior_mean.unsqueeze(0)) ** 2 * torch.exp(-posterior_logvar.unsqueeze(0))
+        ).sum(dim=-1))
+
+        # Log-prior: (n_samples, B, K) -> (n_samples, B)
+        z_expanded = z.unsqueeze(2).expand(-1, -1, K, -1)  # (n_samples, B, K, D)
+        log_component_densities = -0.5 * (
+            D * math.log(2 * math.pi) +
+            prior_logvars.sum(dim=-1).unsqueeze(0) +  # (1, B, K)
+            ((z_expanded - prior_means.unsqueeze(0)) ** 2 * 
+            torch.exp(-prior_logvars.unsqueeze(0))).sum(dim=-1)
+        )
+        log_prior_components = log_component_densities + torch.log(prior_weights.unsqueeze(0).clamp(min=eps))
+        log_p = torch.logsumexp(log_prior_components, dim=2)  # (n_samples, B)
+
+        # KL divergence: average over samples and batch
+        kl_samples = log_q - log_p  # (n_samples, B)
+        return kl_samples.mean()  # Scalar
+    
     def compute_kl_loss(self, params: Dict, alpha: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         """
-        Compute KL divergence between Kumaraswamy and Beta distributions
+        Compute KL divergence between Kumaraswamy and Beta distributions and prior gamma distributions
         """
         total_kl = 0.0
         batch_size = params['kumar_a'].shape[0]
@@ -542,84 +522,6 @@ class DPGMMPrior(nn.Module):
         return torch.sum(cumsum < (1.0 - threshold), dim=-1) + 1
 
 
-def log_gaussian(x: torch.Tensor, mu: torch.Tensor, Sigma: torch.Tensor) -> torch.Tensor:
-    """
-    Optimized computation of log N(x | mu, Sigma) for batched data.
-    Args:
-        x: [B, K, D] tensor of points
-        mu: [B, K, D] tensor of means
-        Sigma: [B, K, D, D] tensor of covariance matrices
-    Returns:
-        [B, K] tensor of log probabilities
-    """
-    B, K, D = x.shape
-    
-    # Make tensors contiguous and reshape
-    x_flat = x.reshape(-1, D)  # [B*K, D]
-    mu_flat = mu.reshape(-1, D)  # [B*K, D]
-    Sigma_flat = Sigma.reshape(-1, D, D) # [B*K, D, D]
-    
-    # Compute difference vectors
-    diff = x_flat - mu_flat # [B*K, D]
-    
-    # First attempt with small epsilon
-    eps = torch.finfo(x.dtype).eps
-    try:
-        # Cholesky decomposition: Sigma = LL^T
-        L = torch.linalg.cholesky(
-            Sigma_flat + eps * torch.eye(D, device=Sigma_flat.device)[None, :, :]
-        )
-    except RuntimeError:
-        # Fallback with larger epsilon if first attempt fails
-        L = torch.linalg.cholesky(
-            Sigma_flat + 1e-3 * torch.eye(D, device=Sigma_flat.device)[None, :, :]
-        )
-    
-    # Solve system and compute quadratic term
-    y = torch.cholesky_solve(diff.unsqueeze(-1), L)
-    quad_term = torch.sum(diff * y.squeeze(-1), dim=-1)
-    
-    # Compute log determinant from Cholesky factor
-    logdet = 2 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)
-    
-    # Combine terms for final log probability
-    log_prob = -0.5 * (quad_term + D * math.log(2 * math.pi) + logdet)
-    
-    return log_prob.view(B, K)
-
-def dp_gmm_log_prob(x: torch.Tensor, pis: torch.Tensor, mus: torch.Tensor,
-                    Sigmas: torch.Tensor) -> torch.Tensor:
-    """
-    Compute log probability under a Gaussian mixture model.
-
-    Args:
-        x: [batch_size, D] tensor of points
-        pis: [batch_size, K] tensor of mixture weights
-        mus: [batch_size, K, D] tensor of means
-        Sigmas: [batch_size, K, D, D] tensor of covariance matrices
-
-    Returns:
-        [batch_size] tensor of log probabilities
-    """
-    batch_size, K, D = mus.shape
-
-    # Expand x for broadcasting with components
-    x_expanded = x.unsqueeze(1).expand(-1, K, -1)  # [batch_size, K, D]
-    # Ensure inputs have correct shape
-    
-
-    # Compute log probabilities for all components
-    log_gaussians = log_gaussian(x_expanded, mus, Sigmas)  # [batch_size, K]
-    log_pis = torch.log(pis + torch.finfo(torch.float32).eps)
-
-    # Use log-sum-exp trick for numerical stability
-    log_components = log_pis + log_gaussians  # [batch_size, K]
-    
-    max_log_comp = torch.max(log_components, dim=1, keepdim=True)[0]
-    return max_log_comp.squeeze(1) + torch.log(
-        torch.sum(torch.exp(log_components - max_log_comp), dim=1)
-    )
-
 class AttentionSchema(nn.Module):
     """
     Complete attention schema implementation with proper spatial modeling
@@ -676,28 +578,47 @@ class AttentionSchema(nn.Module):
         if len(attention_sequence) < 2:
             return 0.0
         
-        total_loss = 0.0
-        for t in range(1, len(attention_sequence)):
-            curr_att = attention_sequence[t]
-            prev_att = attention_sequence[t-1]
-            
-            # Compute actual movement
-            prev_com = self._center_of_mass(prev_att)
-            curr_com = self._center_of_mass(curr_att)
-            actual_dx = curr_com[0] - prev_com[0]
-            actual_dy = curr_com[1] - prev_com[1]
-            
-            # Compare with predicted movement
-            pred_dx, pred_dy = predicted_movements[t-1]
-            movement_error = (
-                (pred_dx.mean(dim=[1,2]) - actual_dx)**2 + 
-                (pred_dy.mean(dim=[1,2]) - actual_dy)**2
-            ).mean()
-            
-            total_loss += movement_error
+        # Stack all attention maps into a tensor [T, B, H, W]
+        attention_tensor = torch.stack(attention_sequence, dim=0)
+        T, B, H, W = attention_tensor.shape
         
-        return total_loss / (len(attention_sequence) - 1)
-    
+        # Compute center of mass for all timesteps at once
+        y_coords = torch.arange(H, device=attention_tensor.device).float()
+        x_coords = torch.arange(W, device=attention_tensor.device).float()
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+        
+        # Expand grids to match tensor dimensions [1, 1, H, W]
+        y_grid = y_grid.unsqueeze(0).unsqueeze(0)
+        x_grid = x_grid.unsqueeze(0).unsqueeze(0)
+        
+        # Compute weighted centers [T, B]
+        total_mass = attention_tensor.sum(dim=[2, 3], keepdim=True) + 1e-8
+        y_com = (attention_tensor * y_grid).sum(dim=[2, 3]) / total_mass.squeeze(-1).squeeze(-1)
+        x_com = (attention_tensor * x_grid).sum(dim=[2, 3]) / total_mass.squeeze(-1).squeeze(-1)
+        
+        # Stack coordinates [T, B, 2]
+        centers = torch.stack([x_com, y_com], dim=-1)
+        
+        # Compute actual movements between consecutive timesteps [T-1, B, 2]
+        actual_movements = centers[1:] - centers[:-1]
+        actual_dx = actual_movements[..., 0]  # [T-1, B]
+        actual_dy = actual_movements[..., 1]  # [T-1, B]
+        
+        # Stack predicted movements [T-1, ...]
+        pred_movements = torch.stack(predicted_movements, dim=0)  # [T-1, B, H, W] or similar
+        
+        # Compute predicted movement averages
+        pred_dx_mean = pred_movements[..., 0].mean(dim=[2, 3]) if pred_movements.dim() > 3 else pred_movements[..., 0]
+        pred_dy_mean = pred_movements[..., 1].mean(dim=[2, 3]) if pred_movements.dim() > 3 else pred_movements[..., 1]
+        
+        # Compute squared error [T-1, B]
+        movement_error = (pred_dx_mean - actual_dx)**2 + (pred_dy_mean - actual_dy)**2
+        
+        # Average over time and batch
+        total_loss = movement_error.mean()
+
+        return total_loss
+
     def _center_of_mass(self, attention_map):
         """Compute attention center of mass for movement tracking"""
         batch_size, H, W = attention_map.shape
@@ -708,7 +629,7 @@ class AttentionSchema(nn.Module):
         y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
         
         # Compute weighted average
-        total_mass = attention_map.sum(dim=[1, 2], keepdim=True) + 1e-8
+        total_mass = attention_map.sum(dim=[1, 2], keepdim=True) + torch.finfo(torch.float32).eps  # Avoid division by zero
         y_com = (attention_map * y_grid).sum(dim=[1, 2]) / total_mass.squeeze()
         x_com = (attention_map * x_grid).sum(dim=[1, 2]) / total_mass.squeeze()
         
@@ -736,9 +657,9 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         device: torch.device= torch.device('cuda'),
         use_actnorm: bool= False,
         input_channels: int = 3,  # Number of input channels (e.g., RGB images)
-        learning_rate: float = 4e-5,
-        grad_clip:float =1.0,
-        prior_alpha: float = 1.0,  # Add these parameters
+        learning_rate: float = 1e-5,
+        grad_clip:float =0.5,
+        prior_alpha: float = 5.0,  # Add these parameters
         prior_beta: float = 1.0,
         weight_decay: float = 0.00001,
         use_orthogonal: bool = True,  # Use orthogonal initialization for LSTM,
@@ -871,19 +792,25 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
     
     def _init_discriminators(self, img_disc_channels, img_disc_layers, latent_disc_layers, use_actnorm: bool):        
         # Initialize discriminators
-        self.image_discriminator = ImageDiscriminator(
-            input_nc=self.input_channels,  # For RGB images
-            ndf=img_disc_channels,
-            n_layers=img_disc_layers,
-            use_actnorm=use_actnorm
-        ).to(self.device)
+        self.image_discriminator = TemporalDiscriminator(
+            input_channels=self.input_channels,
+            image_size= self.image_size,
+            hidden_dim=self.hidden_dim,
+            n_layers= img_disc_layers,
+            n_heads= 4,
+            sequence_length=self.sequence_length,
+            device= self.device,
+            )
 
         # Latent discriminator operates on flattened latent vectors
-        self.latent_discriminator = LatentDiscriminator(
-            input_dims=self.latent_dim,
-            num_layers=latent_disc_layers,
-            norm_type='layer'
-        ).to(self.device)
+        self.latent_discriminator = TemporalLatentDiscriminator(
+            latent_dim=self.latent_dim,
+            hidden_dim=self.hidden_dim,
+            n_layers= latent_disc_layers,
+            n_heads= 4,
+            sequence_length=self.sequence_length,
+            device=self.device,
+            )
 
     def _init_vrnn_dynamics(self,use_orthogonal: bool = True, number_lstm_layer: int = 2):
         """Initialize VRNN components with context conditioning"""
@@ -898,7 +825,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             nn.LayerNorm(self.hidden_dim * 2),
             nn.SiLU(),
             LinearResidual(self.hidden_dim * 2, self.hidden_dim * 2),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim + self.context_dim)
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim + self.context_dim),
+            nn.LayerNorm(self.hidden_dim + self.context_dim)
         )
         
         # VRNN recurrence: h_t = f(h_{t-1}, z_t, c_t, A_t, a_t)
@@ -908,7 +836,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             n_lstm_layers= number_lstm_layer,
             use_orthogonal=use_orthogonal
         )
-        
+        self.rnn_layer_norm = nn.LayerNorm(self.hidden_dim)
         # Initialize hidden states
         self.h0 = nn.Parameter(torch.zeros(2, 1, self.hidden_dim))
         self.c0 = nn.Parameter(torch.zeros(2, 1, self.hidden_dim))
@@ -936,7 +864,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             nn.LayerNorm(self.hidden_dim * 2),
             nn.SiLU(),  
             LinearResidual(self.hidden_dim * 2, self.hidden_dim * 2),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim * 2)  # mean and logvar
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim * 2),  # mean and logvar
+            nn.LayerNorm(self.hidden_dim * 2)
         )
         
         # Latent predictor: p(z_{t+1}|h_{t+1}, c_{t+1})
@@ -944,7 +873,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             nn.Linear(self.hidden_dim + self.context_dim, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.latent_dim * 2)  # mean and logvar
+            nn.Linear(self.hidden_dim, self.latent_dim * 2),  # mean and logvar
+            nn.LayerNorm(self.latent_dim * 2)  # mean and logvar
         )
         
         # Attention predictor: p(A_{t+1}|h_{t+1}, z_{t+1}, A_t, a_t)
@@ -953,7 +883,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                      self.attention_dim * 2),
             nn.LayerNorm(self.attention_dim * 2),
             nn.SiLU(),
-            nn.Linear(self.attention_dim * 2, self.attention_dim * 2)  # mean and logvar
+            nn.Linear(self.attention_dim * 2, self.attention_dim * 2),  # mean and logvar
+            nn.LayerNorm(self.attention_dim * 2)  # mean and logvar
         )
 
 
@@ -1034,6 +965,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         # 4. VRNN dynamics parameters
         vrnn_params = {
             'params': list(self._rnn.parameters()) + 
+                      list(self.rnn_layer_norm.parameters()) +
                       list(self.phi_z.parameters()) + 
                       list(self.phi_a.parameters()) + 
                       list(self.phi_c.parameters()) +
@@ -1236,13 +1168,13 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             'kumaraswamy_kl_losses': [],
             'kl_latents': [],
             'reconstruction_losses': [],
-            'alpha_prior_losses': [],
             'cluster_entropies': [],
             'one_step_h_prediction_loss': [],
             'one_step_z_prediction_loss': [],
             'one_step_att_prediction_loss': [],
-            'self_model_kl_losses': [],
             'unused_penalties': [],  
+            'alpha_prior_kl': [],
+            'self_model_kl_losses': [],
         }
         
         # Process sequence step by step
@@ -1310,11 +1242,11 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         
             # === KL Divergence Computation ===
             # 1. KL between posterior and DP-GMM prior
-            q_dist = Normal(z_mean_t, torch.exp(0.5 * z_logvar_t))
-            kl_z = self.prior.compute_kl_divergence_mc(q_dist, prior_params, n_samples=10)
+
+            kl_z = self.prior.compute_kl_divergence_mc(z_mean_t, z_logvar_t, prior_params)
             outputs['kl_latents'].append(kl_z)
             
-            # 2. KL for stick-breaking (Kumaraswamy vs Beta)
+            # 2. KL for stick-breaking (Kumaraswamy vs Beta and Gamma prior vs Gamma posterior)
             kumar_beta_kl = self.prior.compute_kl_loss(
                 prior_params, 
                 prior_params['alpha'], 
@@ -1322,7 +1254,9 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             )
             # Stick-breaking KL
             outputs['kumaraswamy_kl_losses'].append(kumar_beta_kl)
-
+            # 3.Compute concentration prior KL
+            alpha_prior_kl = self.prior.stick_breaking.compute_gamma2gamma_kl(h_prior)
+            outputs['alpha_prior_kl'].append(alpha_prior_kl)
             # 4. Compute effective number of components and penalty for unused components
             K_eff = self.prior.get_effective_components(prior_params['pi'])
 
@@ -1341,9 +1275,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
 
             outputs['unused_penalties'].append(unused_penalty)
             outputs['K_eff'] = K_eff.float().mean()
-            # TODO:Alpha prior? What is this?
-            alpha_prior = self.prior.stick_breaking.concentration_prior(h_prior, n_samples=10)
-            outputs['alpha_prior_losses'].append(-alpha_prior)  # Negative for ELBO
+           # Negative for ELBO
 
             # 5. Cluster entropy
             pi_t = prior_params['pi']
@@ -1419,8 +1351,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 # Compute self-model KL losses
                 # These compare current states with what was predicted
                 h_pred_dist = Normal(self_pred['h_mean'], torch.exp(0.5 * self_pred['h_logvar']))
-                h_actual_dist = Normal(h[-1], torch.ones_like(h[-1]) * 0.1)
-                h_kl = torch.distributions.kl_divergence(h_actual_dist, h_pred_dist).mean()
+                
                 
                 z_pred_dist = Normal(self_pred['z_mean'], torch.exp(0.5 * self_pred['z_logvar']))
                 z_actual_dist = Normal(z_t, torch.ones_like(z_t) * 0.1)
@@ -1432,10 +1363,10 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 attention_kl = torch.distributions.kl_divergence(attention_actual_dist, attention_pred_dist).mean()
                 
                 outputs['self_model_kl_losses'].append({
-                    'h_kl': h_kl,
+                    'h_{t+1}': h_pred_dist,
                     'z_kl': z_kl,
                     'attention_kl': attention_kl,
-                    'total': h_kl + z_kl + attention_kl
+                    'total': z_kl + attention_kl
                 })
     
             # === VRNN State Update ===
@@ -1452,7 +1383,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 rnn_input, h, c, 
                 torch.ones(batch_size).to(self.device)
             )
-            
+            rnn_output = self.rnn_layer_norm(rnn_output)
             outputs['hidden_states'].append(h[-1])
         
         # === Compute aggregated losses ===
@@ -1588,75 +1519,69 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         }
     
     def compute_total_loss(self, observations, actions=None, beta=1.0, 
-                        entropy_weight=0.1, lambda_img=0.1, lambda_latent=0.1,
+                        entropy_weight=0.1, lambda_img=1.0, 
                         lambda_pred=0.1, lambda_att=0.1, lambda_schema=0.1):
         """
-        Theoretically-aligned loss computation leveraging pre-computed components
+        Corrected loss computation recognizing that kumar_beta_kl already includes alpha prior KL
         """
-        # Forward pass computes all component losses
         outputs = self.forward_sequence(observations, actions)
-        batch_size, seq_len = observations.shape[:2]
-        
         losses = {}
         
-        # === ELBO Components (already computed in forward_sequence) ===
-        
-        # 1. Reconstruction fidelity (E_q[log p(o|z)])
+        # === Reconstruction Term (Positive in Loss) ===
+        # This is -E_q[log p(x|z)] under Gaussian assumption
         losses['recon_loss'] = torch.stack(outputs['reconstruction_losses']).mean() if outputs['reconstruction_losses'] else torch.tensor(0.0).to(self.device)
         
-        # 2. Latent dynamics regularization (KL[q(z|o)||p(z|h,c,π)])
+        # === KL Divergence Terms ===
+        
+        # 1. Latent KL: KL[q(z|x) || p(z|h,c)]
         losses['kl_z'] = torch.stack(outputs['kl_latents']).mean() if outputs['kl_latents'] else torch.tensor(0.0).to(self.device)
         
-        # 3. Stick-breaking process regularization
-        losses['kumar_beta_kl'] = torch.stack(outputs['kumaraswamy_kl_losses']).mean() if outputs['kumaraswamy_kl_losses'] else torch.tensor(0.0).to(self.device)
+        # 2. Hierarchical KL (includes BOTH stick-breaking AND alpha prior)
+        # This is what your compute_kl_loss returns
+        losses['hierarchical_kl'] = torch.stack(outputs['kumaraswamy_kl_losses']).mean() if outputs['kumaraswamy_kl_losses'] else torch.tensor(0.0).to(self.device)
         
-        # 4. Concentration hyperprior (sign correction: should be positive KL)
-        # Note: alpha_prior_losses stored as negative log prob, so we negate
-        losses['alpha_prior'] = -torch.stack(outputs['alpha_prior_losses']).mean() if outputs['alpha_prior_losses'] else torch.tensor(0.0).to(self.device)
-        # Cluster entropy (negative for maximization)
+        # Note: We do NOT add alpha_prior_kl separately because it's already in hierarchical_kl!
+        
+        # 3. Attention KL
+        losses['attention_kl'] = torch.stack(outputs['attention_losses']).mean() if outputs['attention_losses'] else torch.tensor(0.0).to(self.device)
+        
+        # === Other Terms ===
         losses['cluster_entropy'] = torch.stack(outputs['cluster_entropies']).mean() if outputs['cluster_entropies'] else torch.tensor(0.0).to(self.device)
-
-        # Attention losses
-        losses['attention_kl'] = torch.stack(outputs['attention_losses']).mean() if outputs['attention_losses'] else torch.tensor(0.0).to(self.device)        
-        # 5. Self-model alignment
-        if outputs['self_model_kl_losses']:
-            self_model_kls = [loss['total'] for loss in outputs['self_model_kl_losses']]
-            losses['self_model_kl'] = torch.stack(self_model_kls).mean()
-        else:
-            losses['self_model_kl'] = torch.tensor(0.0).to(self.device)
+        losses['unused_penalty'] = torch.stack(outputs['unused_penalties']).mean() if outputs['unused_penalties'] else torch.tensor(0.0).to(self.device)
         
-       
-        # 7. Future prediction bonuses (already computed with correct sign)
+        # Prediction bonuses (already negative)
         losses['future_pred_bonus'] = outputs['future_h_bonus'] + outputs['future_z_bonus']
-        
-        # 8. Attention components
-        
         losses['attention_pred_bonus'] = outputs['future_att_bonus']
         
-        # 9. Schema consistency
+        # Auxiliary losses
         losses['schema_consistency'] = outputs['schema_consistency_loss']
-        
-        # 10. Perceiver auxiliary loss
         losses['perceiver_loss'] = outputs['perceiver_loss']
         
-        # === Compute ELBO with proper mathematical formulation ===
-        # ELBO = E_q[log p(o|z)] - KL_terms + entropy + prediction_bonuses
-        losses['elbo'] = (
-            -losses['recon_loss']                              # Negative for minimization
-            - beta * losses['kl_z']                           # KL penalties
-            - beta * losses['kumar_beta_kl']                  
-            - beta * losses['alpha_prior']                    
-            - beta * losses['self_model_kl']                  
-            + entropy_weight * losses['cluster_entropy']      # Entropy bonus
-            + lambda_pred * losses['future_pred_bonus']       # Prediction rewards
-            - beta * losses['attention_kl']                   # Attention regularization
-            + lambda_att * losses['attention_pred_bonus']     # Attention prediction
-            - lambda_schema * losses['schema_consistency']    # Schema alignment
-            - 0.1 * losses['perceiver_loss']                 # Auxiliary perceiver loss
+        # === Total Loss (Minimizing Negative ELBO) ===
+        losses['total_vae_loss'] = (
+            # Reconstruction (positive - we want to minimize error)
+            lambda_img * losses['recon_loss'] +
+            
+            # KL terms (positive - we want distributions to be close)
+            beta * losses['kl_z'] +
+            beta * losses['hierarchical_kl'] +  # This includes both Kumar-Beta AND Alpha-Gamma KL!
+            beta * losses['attention_kl'] +
+            
+            # Penalties (positive)
+            losses['unused_penalty'] +
+            lambda_schema * losses['schema_consistency'] +
+            0.1 * losses['perceiver_loss'] +
+            
+            # Entropy (negative - we want to maximize diversity)
+            - entropy_weight * losses['cluster_entropy'] +
+            
+            # Prediction bonuses (negative - rewards for good predictions)
+            lambda_pred * losses['future_pred_bonus'] +
+            lambda_att * losses['attention_pred_bonus']
         )
         
-        # Total VAE loss (negative ELBO for minimization)
-        losses['total_vae_loss'] = -losses['elbo']
+        # For monitoring, let's also track ELBO
+        losses['elbo'] = -losses['total_vae_loss']
         
         return losses, outputs
     
@@ -1718,18 +1643,17 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         Compute gradient penalty for WGAN-GP
         """
         batch_size = real_samples.size(0)
-        alpha = torch.rand(batch_size, 1, device=device)
-
-        # Expand alpha for proper broadcasting
-        if len(real_samples.shape) > 2:  # For image discriminator
-            alpha = alpha.view(-1, 1, 1, 1)
+        if len(real_samples.shape) == 5:  # [B,T,C,H,W]
+            alpha = torch.rand(batch_size, 1, 1, 1, 1, device=device)
+        elif len(real_samples.shape) == 3:  # [B,T,Z]
+            alpha = torch.rand(batch_size, 1, 1, device=device)
 
         # Get interpolated samples
         interpolates = alpha * real_samples + (1 - alpha) * fake_samples
         interpolates.requires_grad_(True)
 
         # Get discriminator output for interpolated samples
-        disc_interpolates = discriminator(interpolates)
+        disc_interpolates = discriminator(interpolates)['final_score']
 
         # Compute gradients
         gradients = torch.autograd.grad(
@@ -1774,15 +1698,14 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
 
         # 2. KL divergence for latent space using Expected KL calculation
         # Similar to ExpectedKLDivergence from InfGaussMMVAE
-        q_dist = torch.distributions.Normal(
-            params['z_mean'],
-            torch.exp(0.5 * params['z_logvar'])
-        )
+        
+        q_mean = params['z_mean']
+        q_logvar = params['z_logvar']
         # Get encoder's hidden state
         h = self.encoder.hlayer
 
         # Compute KL using Monte Carlo estimation
-        kl_z = self.prior.compute_kl_divergence_mc(q_dist, params)
+        kl_z = self.prior.compute_kl_divergence_mc(q_mean, q_logvar, params)
         losses['kl_z'] = kl_z
 
 
@@ -1810,9 +1733,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         losses['unused_penalty'] = unused_penalty
         losses['K_eff'] = K_eff.float().mean()
 
-        # 5. Prior over concentration parameter (alpha)
-        alpha_prior = self.prior.stick_breaking.concentration_prior(h, self.max_K-1)
-        losses['alpha_prior'] = alpha_prior
 
         # 6. Prior over mixture weights (stick-breaking construction)
         # This ensures the weights sum to 1 and follow the DP construction
@@ -1838,8 +1758,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             recon_loss +
             beta * kl_z +
             beta * kumar_beta_kl +
-            unused_penalty -
-            alpha_prior + # Negative because we're maximizing ELBO
+            unused_penalty +
             beta * pi_prior+
             entropy_weight * entropy # Add weighted entropy to total loss
         )
@@ -1855,19 +1774,24 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
 
     def discriminator_step(
         self,
-        real_images: torch.Tensor,
-        fake_images: torch.Tensor,
-        real_latents: torch.Tensor,
-        fake_latents: torch.Tensor
+        real_images: torch.Tensor, #[B, T, C, H, W]
+        fake_images: torch.Tensor, #[B, T, C, H, W]
+        real_latents: torch.Tensor, #[B, T, Z]
+        fake_latents: torch.Tensor #[B, T, Z]
     ) -> Dict[str, torch.Tensor]:
         """
         Training step for both discriminators
         """
-
-        # Image discriminator
-        real_img_score = self.image_discriminator(real_images)
-        fake_img_score = self.image_discriminator(fake_images.detach())
-
+        seq_len = real_images.shape[1]  # Get sequence length from real images
+        # Temporal Image Discriminator
+        real_img_outputs = self.image_discriminator(real_images)
+        fake_img_outputs = self.image_discriminator(fake_images.detach())
+    
+        # Extract final scores
+        real_img_score = real_img_outputs['final_score']
+        fake_img_score = fake_img_outputs['final_score']
+        # Gradient penalty requires computing second-order gradients
+        # Gradient penalty for images (sample random interpolation points in sequence)
         img_gp = self.compute_gradient_penalty(
             self.image_discriminator,
             real_images,
@@ -1875,14 +1799,18 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             self.device
         )
 
+
         img_disc_loss = (
             torch.mean(fake_img_score) - torch.mean(real_img_score) +
             10.0 * img_gp
         )
 
-        # Latent discriminator
-        real_latent_score = self.latent_discriminator(real_latents)
-        fake_latent_score = self.latent_discriminator(fake_latents.detach())
+        # Temporal Latent Discriminator
+        real_latent_outputs = self.latent_discriminator(real_latents)
+        fake_latent_outputs = self.latent_discriminator(fake_latents.detach())
+    
+        real_latent_score = real_latent_outputs['final_score']
+        fake_latent_score = fake_latent_outputs['final_score']
 
         latent_gp = self.compute_gradient_penalty(
             self.latent_discriminator,
@@ -1895,6 +1823,14 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             torch.mean(fake_latent_score) - torch.mean(real_latent_score) +
             10.0 * latent_gp
         )
+        # Temporal consistency losses
+        img_consistency_loss = torch.mean(
+            fake_img_outputs['per_frame_scores'].std(dim=1)
+        )
+    
+        latent_consistency_loss = torch.mean(
+            torch.abs(fake_latent_outputs['consistency_score'])
+        )
         result = {
             'img_disc_loss': img_disc_loss,
             'latent_disc_loss': latent_disc_loss,
@@ -1903,14 +1839,18 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             'real_img_score': real_img_score.mean(),
             'fake_img_score': fake_img_score.mean(),
             'real_latent_score': real_latent_score.mean(),
-            'fake_latent_score': fake_latent_score.mean()
-            }
+            'fake_latent_score': fake_latent_score.mean(),
+            'img_temporal_score': real_img_outputs['temporal_score'].mean(),
+            'latent_temporal_score': real_latent_outputs['temporal_score'].mean(),
+            'img_consistency_loss': img_consistency_loss,
+            'latent_consistency_loss': latent_consistency_loss
+        }
     
         # Only perform optimization if optimizers exist and we're configured to use them
         if self.has_optimizers and hasattr(self, 'img_disc_optimizer') and hasattr(self, 'latent_disc_optimizer'):
             # Update image discriminator
             self.img_disc_optimizer.zero_grad()
-            img_disc_loss.backward()
+            img_disc_loss.backward(retain_graph=True)
             torch.nn.utils.clip_grad_norm_(self.image_discriminator.parameters(), self._grad_clip)
             self.img_disc_optimizer.step()
 
@@ -1928,42 +1868,79 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 result['img_disc_lr'] = self.img_disc_scheduler.get_last_lr()[0]
                 result['latent_disc_lr'] = self.latent_disc_scheduler.get_last_lr()[0]
         
-            # Convert tensor values to items for return value when optimization is performed
-            #for key in list(result.keys()):
-            #    if torch.is_tensor(result[key]):
-            #        result[key] = result[key].item()
     
         return result
 
     def compute_adversarial_losses(
         self,
-        x: torch.Tensor,
-        reconstruction: torch.Tensor,
-        z: torch.Tensor,
-        prior_z: torch.Tensor
+        x: torch.Tensor, #[B, T, C, H, W  ]
+        reconstruction: torch.Tensor, #[B, T, C, H, W]
+        z: torch.Tensor, #[B, T, Z]
+        prior_z: torch.Tensor #[B, T, Z]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute adversarial losses for both image and latent space
         """
-        # Get features and scores for real/fake images
-        real_features = self.image_discriminator(x, get_features=True)
-        fake_features = self.image_discriminator(reconstruction, get_features=True) 
-    
-        # Regular adversarial loss
-        fake_img_score = fake_features[-1] # Last feature is discriminator output
-        img_adv_loss = -torch.mean(fake_img_score)
-    
-        # Feature matching loss
-        feat_match_loss = compute_feature_matching_loss(
-        real_features,
-        fake_features
+        # Image sequence adversarial loss
+        fake_img_outputs = self.image_discriminator(reconstruction)
+        img_adv_loss = -torch.mean(fake_img_outputs['final_score'])
+        #reward for generating temporally consistent images
+        temporal_bonus = -fake_img_outputs['temporal_score'].mean()
+        
+        # Per-frame quality bonus
+        # Encourage consistent quality across all frames
+        per_frame_scores = fake_img_outputs['per_frame_scores'].squeeze(-1)  # [B, T]
+        frame_quality_bonus = -per_frame_scores.mean()
+        
+        # Variance penalty to encourage temporal smoothness
+        frame_variance_penalty = per_frame_scores.var(dim=1).mean()
+        
+        # Combined image adversarial loss
+        total_img_adv = (
+            img_adv_loss + 
+            0.2 * temporal_bonus + 
+            0.1 * frame_quality_bonus + 
+            0.1 * frame_variance_penalty
         )
-    
-        # Latent space adversarial loss stays the same
-        fake_latent_score = self.latent_discriminator(z)
-        latent_adv_loss = -torch.mean(fake_latent_score)
-
-        return img_adv_loss, latent_adv_loss, feat_match_loss
+        
+        # === Latent Adversarial Loss ===
+        fake_latent_outputs = self.latent_discriminator(z)
+        
+        # Main adversarial loss
+        latent_adv_loss = -fake_latent_outputs['final_score'].mean()
+        
+        # Temporal consistency bonus
+        consistency_bonus = -fake_latent_outputs['consistency_score'].mean()
+        
+        # Sequence quality bonus
+        sequence_bonus = -fake_latent_outputs['sequence_score'].mean()
+        
+        # Combined latent adversarial loss
+        total_latent_adv = (
+            latent_adv_loss + 
+            0.2 * consistency_bonus + 
+            0.1 * sequence_bonus
+        )
+        
+        # === Feature Matching Loss ===
+        # This helps stabilize training
+        real_features = self.image_discriminator.extract_features(x)
+        
+        fake_features = self.image_discriminator.extract_features(reconstruction)
+        
+        # L1 loss between feature statistics
+        feature_match_loss = F.l1_loss(
+            fake_features.mean(dim=[0, 1]),  # Mean across batch and time
+            real_features.mean(dim=[0, 1]).detach()
+        )
+        
+        # Add variance matching
+        feature_match_loss += 0.5 * F.l1_loss(
+            fake_features.var(dim=[0, 1]),
+            real_features.var(dim=[0, 1]).detach()
+        )
+        
+        return total_img_adv, total_latent_adv, feature_match_loss    
 
     def generator_step(
         self,
@@ -2288,7 +2265,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                             beta: float = 1.0,
                             n_critic: int = 3,
                             lambda_img: float = 0.2,
-                            lambda_latent: float = 0.1,
                             lambda_pred: float = 0.1,
                             lambda_att: float = 0.1,
                             lambda_schema: float = 0.1,
@@ -2303,33 +2279,25 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         
         Returns:
             Dictionary with all loss values
-        """
-        batch_size, seq_len = observations.shape[:2]
-        
+        """        
         # Normalize observations if needed
         observations = self.prepare_images_for_training(observations)
         
         # 1. Forward pass and compute all VAE losses
         vae_losses, outputs = self.compute_total_loss(
             observations, actions, beta, entropy_weight, 
-            lambda_img, lambda_latent, lambda_pred, lambda_att, lambda_schema
+            lambda_img, lambda_pred, lambda_att, lambda_schema
         )
         
         # 2. Discriminator training
-        # Sample random timesteps for adversarial training
-        t_samples = torch.randint(0, seq_len, (n_critic,))
         
         disc_losses_list = []
-        for t in t_samples:
-            real_images = observations[:, t]
-            fake_images = outputs['reconstructions'][:, t].detach()
+        for _ in range(n_critic):
             
-            # Sample from standard normal as "real" latents
-            real_latents = torch.randn_like(outputs['latents'][:, t])
-            fake_latents = outputs['latents'][:, t].detach()
+            real_latents = torch.randn_like(outputs['latents'])
             
             disc_loss = self.discriminator_step(
-                real_images, fake_images, real_latents, fake_latents
+                observations, outputs['reconstructions'], real_latents, outputs['latents']
             )
             disc_losses_list.append(disc_loss)
         
@@ -2339,27 +2307,29 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             for k in disc_losses_list[0].keys()
         }
         
-        # 3. Generator training with adversarial losses
-        # Sample a timestep for generator adversarial loss
-        t_gen = torch.randint(0, seq_len, (1,)).item()
+        # 4. Generator training with adversarial losses
+        # Get fresh discriminator outputs (no detach)
+        img_adv_loss, latent_adv_loss, feat_match_loss = self.compute_adversarial_losses(
+            observations,
+            outputs['reconstructions'],
+            outputs['latents'],
+            real_latents
+        )
         
-        fake_img_score = self.image_discriminator(outputs['reconstructions'][:, t_gen])
-        fake_latent_score = self.latent_discriminator(outputs['latents'][:, t_gen])
+        # 5. Total generator loss
+        total_gen_loss = (
+            vae_losses['total_vae_loss'] +
+            lambda_img * img_adv_loss +
+            0.1 * latent_adv_loss +      # Reduced weight for latent adversarial
+            0.1 * feat_match_loss        # Feature matching
+        )
         
-        # Get feature matching loss
-        real_features = self.image_discriminator(observations[:, t_gen], get_features=True)
-        fake_features = self.image_discriminator(outputs['reconstructions'][:, t_gen], get_features=True)
-        feat_match_loss = compute_feature_matching_loss(real_features, fake_features)
-        
-        # Adversarial losses
-        img_adv_loss = -torch.mean(fake_img_score)
-        latent_adv_loss = -torch.mean(fake_latent_score)
         
         # 4. Total generator loss
         total_gen_loss = (
             vae_losses['elbo'] +
             lambda_img * img_adv_loss +
-            lambda_latent * latent_adv_loss +
+            latent_adv_loss +
             feat_match_loss
         )
         

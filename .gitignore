@@ -20,3 +20,4 @@ VRNN/perceiver/data/
 VRNN/perceiver/model/
 transition_data/
 wandb/
+checkpoints/
