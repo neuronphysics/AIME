@@ -48,10 +48,21 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
-
+class SoftSpatialRegularizer(nn.Module):
+    """Minimal differentiable spatial regularization"""
+    def __init__(self, device):
+        super().__init__()
+        self.temperature = nn.Parameter(torch.tensor(1.0))
+        self.device = device
+        self.to(device)
+        
+    def forward(self, coords):
+        return 0.995 * torch.tanh(coords / self.temperature)
+    
 class AttentionPosterior(nn.Module):
     """
-    Improved posterior with explicit spatial processing
+    Resolution-agnostic attention posterior that can produce attention maps
+    at any desired resolution, independent of input image size
     """
     
     def __init__(
@@ -60,46 +71,121 @@ class AttentionPosterior(nn.Module):
         attention_resolution: int,
         hidden_dim: int,
         context_dim: int, 
-        input_channels: int = 3
+        input_channels: int = 3,
+        feature_channels: int = 64,
+        use_dilated_conv: bool = True,
+        device: Optional[torch.device] = torch.device("cpu" if not torch.cuda.is_available() else "cuda")
     ):
         super().__init__()
         self.image_size = image_size
         self.attention_resolution = attention_resolution
+        self.feature_channels = feature_channels
+        self.spatial_regularizer = SoftSpatialRegularizer(device)
+        # Bottom-up saliency extraction that preserves spatial resolution
+        if use_dilated_conv:
+            # Dilated convolutions preserve resolution while increasing receptive field
+            self.saliency_net = nn.Sequential(
+                # Layer 1: 3x3 receptive field
+                nn.Conv2d(input_channels, 16, kernel_size=3, stride=1, padding=1, dilation=1),
+                nn.GroupNorm(4, 16),
+                nn.SiLU(),
+                
+                # Layer 2: 7x7 receptive field (with dilation)
+                nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=2, dilation=2),
+                nn.GroupNorm(8, 32),
+                nn.SiLU(),
+                
+                # Layer 3: 15x15 receptive field
+                nn.Conv2d(32, 48, kernel_size=3, stride=1, padding=4, dilation=4),
+                nn.GroupNorm(12, 48),
+                nn.SiLU(),
+                
+                # Layer 4: 31x31 receptive field
+                nn.Conv2d(48, feature_channels, kernel_size=3, stride=1, padding=8, dilation=8),
+                nn.GroupNorm(16, feature_channels),
+                nn.SiLU()
+            )
+        else:
+            # Standard convolutions with stride=1 to preserve resolution
+            self.saliency_net = nn.Sequential(
+                nn.Conv2d(input_channels, 16, kernel_size=5, stride=1, padding=2),
+                nn.GroupNorm(4, 16),
+                nn.SiLU(),
+                
+                nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2),
+                nn.GroupNorm(8, 32),
+                nn.SiLU(),
+                
+                nn.Conv2d(32, 48, kernel_size=3, stride=1, padding=1),
+                nn.GroupNorm(12, 48),
+                nn.SiLU(),
+                
+                nn.Conv2d(48, feature_channels, kernel_size=3, stride=1, padding=1),
+                nn.GroupNorm(16, feature_channels),
+                nn.SiLU()
+            )
         
-        # Bottom-up saliency extraction
-        self.saliency_net = nn.Sequential(
-            nn.Conv2d(input_channels, 16, 3, stride=2, padding=1),
-            nn.GroupNorm(4, 16),
-            nn.SiLU(),
-            nn.Conv2d(16, 32, 3, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            nn.Conv2d(32, 64, 3, stride=1, padding=1)
+        # Adaptive spatial transformer to handle any resolution mismatch
+        self.spatial_adapter = nn.Sequential(
+            nn.AdaptiveAvgPool2d((attention_resolution, attention_resolution)),
+            nn.Conv2d(feature_channels, feature_channels, kernel_size=1),
+            nn.GroupNorm(16, feature_channels),
+            nn.SiLU()
         )
         
         # Top-down modulation
         self.top_down_projection = nn.Sequential(
-            nn.Linear(hidden_dim + context_dim, 64),
-            nn.LayerNorm(64),
+            nn.Linear(hidden_dim + context_dim, feature_channels * 2),
+            nn.LayerNorm(feature_channels * 2),
+            nn.SiLU(),
+            nn.Linear(feature_channels * 2, feature_channels),
+            nn.LayerNorm(feature_channels),
             nn.SiLU()
         )
         
-        # Spatial attention computation
-        self.attention_conv = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1),  # Combine bottom-up and top-down
+        # Spatial attention computation with multi-scale processing
+        self.attention_conv = nn.ModuleList([
+            # Multi-scale attention heads
+            nn.Sequential(
+                nn.Conv2d(feature_channels * 2, 64, kernel_size=1, stride=1),
+                nn.GroupNorm(16, 64),
+                nn.SiLU()
+            ),
+            nn.Sequential(
+                nn.Conv2d(feature_channels * 2, 64, kernel_size=3, stride=1, padding=1),
+                nn.GroupNorm(16, 64),
+                nn.SiLU()
+            ),
+            nn.Sequential(
+                nn.Conv2d(feature_channels * 2, 64, kernel_size=5, stride=1, padding=2),
+                nn.GroupNorm(16, 64),
+                nn.SiLU()
+            )
+        ])
+        
+        # Combine multi-scale features
+        self.attention_fusion = nn.Sequential(
+            nn.Conv2d(64 * 3, 128, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(32, 128),
+            nn.SiLU(),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(16, 64),
             nn.SiLU(),
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            nn.Conv2d(32, 1, 1)  # Output attention logits
+            nn.Conv2d(64, 1, kernel_size=1)  # Output attention logits
         )
+        
+        # Feature extraction for downstream processing
         self.attention_pool = nn.Sequential(
-            nn.Conv2d(64, hidden_dim//2, 1),  # Reduce channels
+            nn.Conv2d(feature_channels, hidden_dim//2, kernel_size=1),
             nn.GroupNorm(8, hidden_dim//2),
-            nn.SiLU()
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten()
         )
-    
+        
+        # Optional: learnable temperature for attention sharpening
+        self.temperature = nn.Parameter(torch.ones(1))
+        
     def forward(
         self,
         observation: torch.Tensor,
@@ -108,43 +194,72 @@ class AttentionPosterior(nn.Module):
     ) -> torch.Tensor:
         batch_size = observation.shape[0]
         
-        # Bottom-up saliency
-        saliency_features = self.saliency_net(observation)
+        # Extract bottom-up saliency features (preserves input resolution)
+        saliency_features = self.saliency_net(observation)  # [B, C, H, W]
         
-        # Top-down modulation
+        # Adapt to attention resolution
+        adapted_features = self.spatial_adapter(saliency_features)  # [B, C, attention_res, attention_res]
+        
+        # Generate top-down modulation signal
         top_down = torch.cat([hidden_state, context], dim=-1)
-        top_down_features = self.top_down_projection(top_down)
+        top_down_features = self.top_down_projection(top_down)  # [B, C]
+        
+        # Reshape for spatial broadcasting
         top_down_spatial = top_down_features.view(batch_size, -1, 1, 1)
         top_down_spatial = top_down_spatial.expand(
             -1, -1, 
-            saliency_features.shape[2], 
-            saliency_features.shape[3]
+            self.attention_resolution, 
+            self.attention_resolution
         )
         
-        # Combine features
-        combined = torch.cat([saliency_features, top_down_spatial], dim=1)
+        # Combine bottom-up and top-down features
+        combined = torch.cat([adapted_features, top_down_spatial], dim=1)  # [B, 2*C, H, W]
         
-        # Compute attention
-        H = W = self.attention_resolution
-        attention_logits = self.attention_conv(combined).squeeze(1)
-        attention_probs = F.softmax(
-            attention_logits.view(batch_size, -1), 
-            dim=-1
-        ).view(batch_size, H, W)
+        # Multi-scale attention computation
+        multi_scale_features = []
+        for attention_head in self.attention_conv:
+            features = attention_head(combined)
+            multi_scale_features.append(features)
         
-        return attention_probs
+        # Fuse multi-scale features
+        fused_features = torch.cat(multi_scale_features, dim=1)
+        attention_logits = self.attention_fusion(fused_features)  # [B, 1, H, W]
+        B, C, H, W = attention_logits.shape
+        # Apply temperature-controlled softmax
+        attention_logits = attention_logits / self.temperature
+        attention_probs = F.softmax(attention_logits.view(B, C, -1), dim=-1).view(B, C, H, W)
+        y_coords = torch.linspace(-1, 1, H, device=attention_logits.device)
+        x_coords = torch.linspace(-1, 1, W, device=attention_logits.device)
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+        
+        # Compute center of attention
+        y_center = (attention_probs * y_grid).sum(dim=[2, 3])  # [B, C]
+        x_center = (attention_probs * x_grid).sum(dim=[2, 3])  # [B, C]
 
+        # For single-channel attention
+        if C == 1:
+            attention_probs = attention_probs.squeeze(1)  # [B, H, W]
+            coords = torch.stack([x_center.squeeze(1), y_center.squeeze(1)], dim=-1)  # [B, 2]
+        else:
+            coords = torch.stack([x_center, y_center], dim=-1)  # [B, C, 2]
+        
+        # Store for use in dynamics
+        
+
+        return attention_probs, self.spatial_regularizer(coords)
+    
     def attention_weighted_features(
         self,
         features: torch.Tensor,  # [B, C, H, W]
-        attention_probs: torch.Tensor  # [B, H, W]
+        attention_probs: torch.Tensor  # [B, H_att, W_att]
     ) -> torch.Tensor:
         """
         Extract attention-weighted features for downstream processing
+        Handles any resolution mismatch between features and attention
         """
         batch_size = features.shape[0]
         
-        # Ensure attention and features have same spatial dimensions
+        # Adapt attention map to feature resolution if needed
         if attention_probs.shape[-2:] != features.shape[-2:]:
             attention_probs = F.interpolate(
                 attention_probs.unsqueeze(1),
@@ -157,48 +272,50 @@ class AttentionPosterior(nn.Module):
         attention_expanded = attention_probs.unsqueeze(1)  # [B, 1, H, W]
         weighted_features = features * attention_expanded
         
-        # Spatial pooling guided by attention
+        # Extract pooled features
         pooled_features = self.attention_pool(weighted_features)
         
-        # Weighted average pooling
-        spatial_sum = (pooled_features * attention_expanded).sum(dim=[2, 3])
-        normalization = attention_expanded.sum(dim=[2, 3]) + 1e-8
-        
-        return spatial_sum / normalization  # [B, hidden_dim//2]
+        return pooled_features  # [B, hidden_dim//2]
     
     def visualize_attention(
         self,
-        attention_map: torch.Tensor,  # [B, H, W]
-        original_image: torch.Tensor,  # [B, 3, 84, 84]
+        attention_map: torch.Tensor,  # [B, H_att, W_att]
+        original_image: torch.Tensor,  # [B, C, H_img, W_img]
         alpha: float = 0.5
     ) -> torch.Tensor:
         """
         Create visualization by overlaying attention on original image
+        Handles any resolution mismatch
         """
         batch_size = attention_map.shape[0]
+        img_h, img_w = original_image.shape[-2:]
         
         # Upsample attention to image size
         attention_upsampled = F.interpolate(
             attention_map.unsqueeze(1),
-            size=(self.image_size, self.image_size),
+            size=(img_h, img_w),
             mode='bilinear',
             align_corners=False
-        )  # [B, 1, 84, 84]
+        )  # [B, 1, H_img, W_img]
         
         # Normalize attention for visualization
-        att_min = attention_upsampled.view(batch_size, -1).min(dim=1, keepdim=True)[0].view(batch_size, 1, 1, 1)
-        att_max = attention_upsampled.view(batch_size, -1).max(dim=1, keepdim=True)[0].view(batch_size, 1, 1, 1)
+        att_min = attention_upsampled.view(batch_size, -1).min(dim=1, keepdim=True)[0]
+        att_min = att_min.view(batch_size, 1, 1, 1)
+        att_max = attention_upsampled.view(batch_size, -1).max(dim=1, keepdim=True)[0]
+        att_max = att_max.view(batch_size, 1, 1, 1)
         attention_normalized = (attention_upsampled - att_min) / (att_max - att_min + 1e-8)
         
         # Create heatmap (red channel intensified by attention)
         heatmap = torch.zeros_like(original_image)
         heatmap[:, 0, :, :] = attention_normalized.squeeze(1)  # Red channel
         
+        # Optionally add some yellow/orange for high attention areas
+        heatmap[:, 1, :, :] = (attention_normalized.squeeze(1) > 0.5).float() * attention_normalized.squeeze(1) * 0.5
+        
         # Blend with original image
         visualization = alpha * heatmap + (1 - alpha) * original_image
         
         return visualization.clamp(0, 1)
-
 
 class AttentionPrior(nn.Module):
     """
@@ -1004,26 +1121,35 @@ class TemporalDiscriminator(nn.Module):
     
     def extract_features(self, x):
         """
-        Extract features from sequence of frames
+        Extract features for feature matching loss - SIMPLE VERSION
         
         Args:
             x: [batch_size, seq_len, channels, height, width]
         
         Returns:
-            features: [batch_size, seq_len, hidden_dim]
+            List of feature tensors at different scales
         """
         B, T, C, H, W = x.shape
+        features = []
         
-        # Process all frames through CNN
+        # 1. Get CNN features
         x_flat = x.view(B * T, C, H, W)
-        features_flat = self.frame_encoder(x_flat)
-        features = features_flat.view(B, T, -1)
+        h = x_flat
         
-        # Project to transformer dimension
-        features = self.feature_projection(features)
+        # Only save features after conv layers
+        for layer in self.frame_encoder:
+            h = layer(h)
+            if isinstance(layer, nn.Conv2d):
+                # Reshape to [B, T, C, H, W]
+                feat = h.view(B, T, *h.shape[1:])
+                features.append(feat)
+        
+        frame_feats = h.view(B, T, -1)  # [B, T, feature_dim]
+        frame_feats_projected = self.feature_projection(frame_feats)  # [B, T, hidden_dim]
+        features.append(frame_feats_projected)
         
         return features
-    
+
     def forward(self, x, return_features=False):
         """
         Forward pass through temporal discriminator
@@ -1039,8 +1165,8 @@ class TemporalDiscriminator(nn.Module):
         assert T <= self.sequence_length, f"Sequence length {T} exceeds maximum {self.sequence_length}"
         
         # Extract frame features
-        features = self.extract_features(x)
-        
+        frame_features = self.extract_features(x)
+        features = frame_features[-1]  # Get last feature tensor [B, T, hidden_dim]
         # Add positional embeddings
         features = features + self.pos_embed[:, :T, :]
         features = self.drop(features)
@@ -1071,7 +1197,7 @@ class TemporalDiscriminator(nn.Module):
         
         if return_features:
             outputs['features'] = all_hidden_states
-            outputs['frame_features'] = features
+            outputs['frame_features'] = frame_features#multiscale features
         
         return outputs
 

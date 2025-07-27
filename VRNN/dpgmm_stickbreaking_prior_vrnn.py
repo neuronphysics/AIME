@@ -43,6 +43,7 @@ def prune_small_components(pi: torch.Tensor, threshold: float = 1e-5) -> torch.T
 
 class GammaPosterior(nn.Module):
     """
+    Example code:https://github.com/threewisemonkeys-as/PyTorch-VAE/blob/4ed0fc7581d4792b435134aa9e06d5e35a5db118/models/gamma_vae.py
     Amortized variational posterior for Gamma distribution
     Maps encoder hidden states to Gamma parameters
     """
@@ -390,7 +391,6 @@ class DPGMMPrior(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(hidden_dim, 2 * latent_dim * max_components),
             nn.LayerNorm(2 * latent_dim * max_components),
-            nn.Tanh()  # Ensure outputs are bounded
         )
         self.to(device)
 
@@ -542,9 +542,12 @@ class AttentionSchema(nn.Module):
         
         # Posterior (bottom-up, stimulus-driven attention)
         self.posterior_net = AttentionPosterior(
-            image_size, attention_resolution, 
-            hidden_dim, context_dim,
-            input_channels
+            image_size, 
+            attention_resolution, 
+            hidden_dim, 
+            context_dim,
+            input_channels,
+            use_dilated_conv=True,  # Use dilated convolutions for better spatial context
         )
         
         # Prior (top-down, predictive attention schema)
@@ -655,7 +658,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         img_disc_layers:int,
         latent_disc_layers:int,
         device: torch.device= torch.device('cuda'),
-        use_actnorm: bool= False,
+        use_spectral_norm: bool= True,
         input_channels: int = 3,  # Number of input channels (e.g., RGB images)
         learning_rate: float = 1e-5,
         grad_clip:float =0.5,
@@ -701,8 +704,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         self._init_vrnn_dynamics(use_orthogonal=use_orthogonal,number_lstm_layer=number_lstm_layer)
         self._init_attention_schema(attention_resolution)
         self._init_self_model()
-        self._init_discriminators(img_disc_channels, img_disc_layers, 
-                                 latent_disc_layers, use_actnorm)
+        self._init_discriminators( img_disc_layers, latent_disc_layers, use_spectral_norm)
 
         
 
@@ -781,16 +783,17 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                                                   nn.Conv1d(perceiver_latent_dim // 2, 1, kernel_size=1),
                                                   nn.AdaptiveAvgPool1d(self.context_dim)
                                                   ).to(self.device)
-    
+        
         # Attention extractor remains the same
         self.attention_extractor = nn.Sequential(
-                                                 nn.Linear(self.context_dim, self.attention_dim * 2),
-                                                 nn.LayerNorm(self.attention_dim * 2),
+                                                 nn.Linear(self.context_dim, self.attention_dim),
+                                                 nn.LayerNorm(self.attention_dim),
                                                  nn.SiLU(),
-                                                 nn.Linear(self.attention_dim * 2, self.attention_dim)
+                                                 nn.Linear(self.attention_dim, self.attention_dim+self.hidden_dim//2 + 2),
+                                                 nn.LayerNorm(self.attention_dim+self.hidden_dim//2 + 2)
                                                  ).to(self.device)
-    
-    def _init_discriminators(self, img_disc_channels, img_disc_layers, latent_disc_layers, use_actnorm: bool):        
+
+    def _init_discriminators(self, img_disc_layers, latent_disc_layers, use_spectral_norm: bool):
         # Initialize discriminators
         self.image_discriminator = TemporalDiscriminator(
             input_channels=self.input_channels,
@@ -799,6 +802,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             n_layers= img_disc_layers,
             n_heads= 4,
             sequence_length=self.sequence_length,
+            use_spectral_norm= use_spectral_norm,
             device= self.device,
             )
 
@@ -854,13 +858,13 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                                                         input_channels=self.input_channels,
                                                         )
         # Feature extractor for attention
-        self.phi_attention = LinearResidual(self.attention_dim, self.hidden_dim)
+        self.phi_attention = LinearResidual(self.attention_dim + self.hidden_dim//2 + 2, 2*self.hidden_dim)
     
     def _init_self_model(self):
         """Initialize comprehensive self-modeling components"""
         # Hidden state predictor: p(h_{t+1}|h_t, z_t, a_t)
         self.self_model_h = nn.Sequential(
-            nn.Linear(self.hidden_dim + self.action_dim+ self.latent_dim,self.hidden_dim * 2),
+            nn.Linear(self.hidden_dim + self.action_dim + self.latent_dim, self.hidden_dim * 2),
             nn.LayerNorm(self.hidden_dim * 2),
             nn.SiLU(),  
             LinearResidual(self.hidden_dim * 2, self.hidden_dim * 2),
@@ -878,13 +882,14 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         )
         
         # Attention predictor: p(A_{t+1}|h_{t+1}, z_{t+1}, A_t, a_t)
+        attention_feature_dim = self.attention_dim + self.hidden_dim//2 + 2
         self.self_model_attention = nn.Sequential(
-            nn.Linear(self.hidden_dim + self.latent_dim + self.attention_dim + self.action_dim,
-                     self.attention_dim * 2),
-            nn.LayerNorm(self.attention_dim * 2),
+            nn.Linear(self.hidden_dim + self.latent_dim + attention_feature_dim + self.action_dim,
+                     self.hidden_dim * 2),
+            nn.LayerNorm(self.hidden_dim * 2),
             nn.SiLU(),
-            nn.Linear(self.attention_dim * 2, self.attention_dim * 2),  # mean and logvar
-            nn.LayerNorm(self.attention_dim * 2)  # mean and logvar
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim * 2),  # mean and logvar
+            nn.LayerNorm(self.hidden_dim * 2)  # mean and logvar
         )
 
 
@@ -979,7 +984,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
     
         # 5. Attention schema parameters (FIXED - was missing attention_computer)
         attention_params = {
-            'params': list(self.attention_prior_posterior.parameters()),
+            'params': list(self.attention_prior_posterior.parameters())+
+            [self.attention_prior_posterior.posterior_net.spatial_regularizer.temperature],
             'lr': learning_rate,
             'weight_decay': weight_decay,
             'name': 'attention_schema'
@@ -1214,17 +1220,30 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 ).to(self.device) / (self.attention_resolution ** 2)
             
             # Posterior attention computation
-            attention_map = self.attention_prior_posterior.posterior_net(
+            attention_map, attention_coords = self.attention_prior_posterior.posterior_net(
                 o_t, h[-1], c_t
             )
             outputs['attention_maps'].append(attention_map)
-            
+            saliency_features = self.attention_prior_posterior.posterior_net.saliency_net(o_t)
+            weighted_visual_features = self.attention_prior_posterior.posterior_net.attention_weighted_features(
+            saliency_features, attention_map
+           )            
             # Extract attention features
             attention_features = self.attention_prior_posterior.attention_encoder(
                 attention_map.unsqueeze(1)  # Add channel dimension
             )
+            
+            attention_features = torch.cat([
+             attention_features,      # Spatial statistics: [B, attention_dim//2]
+             weighted_visual_features,         # Content features: [B, hidden_dim//2]
+             attention_coords      # Spatial coordinates: [B, 2]
+            ], dim=-1)
+    
             outputs['attention_features'].append(attention_features)
             attention_state = self.phi_attention(attention_features)
+            attention_state_mean, attention_state_logvar = torch.chunk(attention_state, 2, dim=-1)
+            attention_state_logvar = torch.clamp(attention_state_logvar, min=-10.0, max=2.0)  # Stability
+            attention_state= attention_state_mean + torch.exp(0.5 * attention_state_logvar) * torch.randn_like(attention_state_mean)
             outputs['attention_states'].append(attention_state)
             
             # === Prior Network p(z_t|o_<t, z_<t) ===
@@ -1320,7 +1339,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 # Attention prediction loss
                 att_pred_dist = Normal(prev_pred['attention_mean'], 
                                     torch.exp(0.5 * prev_pred['attention_logvar']))
-                att_pred_loss = -att_pred_dist.log_prob(attention_features).mean()
+                att_pred_loss = -att_pred_dist.log_prob(attention_state).mean()
                 outputs['one_step_att_prediction_loss'].append(att_pred_loss)
 
             # === Self-Model Predictions ===
@@ -1345,7 +1364,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                         outputs['self_predictions'][t-1],
                         h[-1],
                         z_t,
-                        outputs['attention_features'][t-1]
+                        outputs['attention_states'][t-1]
                         )
                     outputs['self_model_losses'].append(self_loss)
                 # Compute self-model KL losses
@@ -1359,7 +1378,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 
                 attention_pred_dist = Normal(self_pred['attention_mean'], 
                                         torch.exp(0.5 * self_pred['attention_logvar']))
-                attention_actual_dist = Normal(attention_features, torch.ones_like(attention_features)  * 0.1)
+                attention_actual_dist = Normal(attention_state_mean, 
+                                        torch.exp(0.5 * attention_state_logvar))
                 attention_kl = torch.distributions.kl_divergence(attention_actual_dist, attention_pred_dist).mean()
                 
                 outputs['self_model_kl_losses'].append({
@@ -1375,7 +1395,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             # === Update recurrent state ===
             phi_z_t = self.phi_z(z_t)
             phi_c_t = self.phi_c(c_t)
-            phi_attention_t = self.phi_attention(attention_features)
+            phi_attention_t = attention_state
             phi_a_t = self.phi_a(a_t)
             
             rnn_input = torch.cat([phi_z_t, phi_c_t, phi_attention_t, phi_a_t], dim=-1)
@@ -1870,6 +1890,44 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         
     
         return result
+    
+    def compute_feature_matching_loss(self, real_features, fake_features):
+        """
+        Compute feature matching loss between real and fake features
+        
+        Uses both mean and standard deviation matching for better stability
+        """
+        feat_match_loss = 0.0
+        num_features = len(real_features)
+        
+        for i in range(num_features):
+            real_feat = real_features[i]
+            fake_feat = fake_features[i]
+            
+            # For CNN features: [B, T, C, H, W]
+            if real_feat.dim() == 5:
+                # Match mean and std across spatial dimensions
+                real_mean = real_feat.mean(dim=[3, 4])  # [B, T, C]
+                fake_mean = fake_feat.mean(dim=[3, 4])
+                real_std = real_feat.std(dim=[3, 4])
+                fake_std = fake_feat.std(dim=[3, 4])
+                
+                feat_match_loss += F.l1_loss(fake_mean, real_mean.detach())
+                feat_match_loss += F.l1_loss(fake_std, real_std.detach())
+                
+            # For feature vectors: [B, T, D]
+            elif real_feat.dim() == 3:
+                # Match mean and std across feature dimension
+                real_mean = real_feat.mean(dim=2)  # [B, T]
+                fake_mean = fake_feat.mean(dim=2)
+                real_std = real_feat.std(dim=2)
+                fake_std = fake_feat.std(dim=2)
+                
+                feat_match_loss += F.l1_loss(fake_mean, real_mean.detach())
+                feat_match_loss += F.l1_loss(fake_std, real_std.detach())
+
+        return  feat_match_loss /  (2*num_features)  # Normalize by number of features
+
 
     def compute_adversarial_losses(
         self,
@@ -1882,7 +1940,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         Compute adversarial losses for both image and latent space
         """
         # Image sequence adversarial loss
-        fake_img_outputs = self.image_discriminator(reconstruction)
+        fake_img_outputs = self.image_discriminator(reconstruction, return_features=True)
         img_adv_loss = -torch.mean(fake_img_outputs['final_score'])
         #reward for generating temporally consistent images
         temporal_bonus = -fake_img_outputs['temporal_score'].mean()
@@ -1924,21 +1982,11 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         
         # === Feature Matching Loss ===
         # This helps stabilize training
-        real_features = self.image_discriminator.extract_features(x)
-        
-        fake_features = self.image_discriminator.extract_features(reconstruction)
+        real_features = self.image_discriminator(x, return_features=True)['frame_features']
+        fake_features = fake_img_outputs['frame_features']
         
         # L1 loss between feature statistics
-        feature_match_loss = F.l1_loss(
-            fake_features.mean(dim=[0, 1]),  # Mean across batch and time
-            real_features.mean(dim=[0, 1]).detach()
-        )
-        
-        # Add variance matching
-        feature_match_loss += 0.5 * F.l1_loss(
-            fake_features.var(dim=[0, 1]),
-            real_features.var(dim=[0, 1]).detach()
-        )
+        feature_match_loss = self.compute_feature_matching_loss(real_features, fake_features) 
         
         return total_img_adv, total_latent_adv, feature_match_loss    
 
@@ -2544,6 +2592,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         generated_observations = [initial_obs]
         generated_latents = []
         generated_attentions = []
+        generated_attention_coords = []
+        attention_uncertainties = []
         hidden_states = []
         
         with torch.no_grad():
@@ -2570,16 +2620,30 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 self.attention_resolution, 
                 self.attention_resolution
             ).to(device) / (self.attention_resolution ** 2)
-            
+            attention_map, attention_coords = self.attention_prior_posterior.posterior_net(
+                initial_obs, h[-1], c_0
+            )            
             # Process initial step through VRNN
             attention_features = self.attention_prior_posterior.attention_encoder(
                 attention_map.unsqueeze(1)
             )
-            
+            saliency_features = self.attention_prior_posterior.posterior_net.saliency_net(
+                initial_obs
+            )
+            weighted_visual_features = self.attention_prior_posterior.posterior_net.attention_weighted_features(
+            saliency_features, attention_map
+           )
+            #Get coordinates directly from posterior attention map
+            generated_attention_coords.append(attention_coords)
+            attention_features = torch.cat([attention_features, weighted_visual_features, attention_coords], dim=-1)
             # Feature extraction
             phi_z = self.phi_z(z_0)
             phi_c = self.phi_c(c_0)
             phi_attention = self.phi_attention(attention_features)
+            phi_attention_mean, phi_attention_logvar = torch.chunk(phi_attention, 2, dim=-1)
+            phi_attention_std = torch.exp(0.5 * phi_attention_logvar.clamp(min=-10, max=2))
+            phi_attention = phi_attention_mean + phi_attention_std * torch.randn_like(phi_attention_std).to(device)
+            attention_uncertainties.append(phi_attention_std.mean(dim=-1))
             phi_a = self.phi_a(initial_action)
             
             # Update LSTM
@@ -2610,11 +2674,33 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 attention_features = self.attention_prior_posterior.attention_encoder(
                     attention_map.unsqueeze(1)
                 )
-                
+                #TODO: is this correct? Should we use attention_features or attention_map?
+                if 'predicted_movement' in attention_info:
+                    dx, dy = attention_info['predicted_movement']
+                    # Update attention coordinates based on movement
+                    new_coords = attention_coords + torch.stack([dx.mean(dim=[1,2]), 
+                                                            dy.mean(dim=[1,2])], dim=-1)
+                    new_coords = self.attention_prior_posterior.posterior_net.spatial_regularizer(new_coords)
+                    generated_attention_coords.append(new_coords)
+                    attention_coords = new_coords
+   
+                approx_saliency = self.attention_prior_posterior.posterior_net.saliency_net(o_next)
+                approx_weighted_features = self.attention_prior_posterior.posterior_net.attention_weighted_features(
+                approx_saliency, attention_map
+                )
+                attention_features = torch.cat([
+                    attention_features,
+                    approx_weighted_features,
+                    attention_coords
+                    ], dim=-1)
                 # Update VRNN state
                 phi_z = self.phi_z(z_next)
                 phi_c = self.phi_c(current_c_t)
                 phi_attention = self.phi_attention(attention_features)
+                phi_attention_mean, phi_attention_logvar = torch.chunk(phi_attention, 2, dim=-1)
+                phi_attention_std = torch.exp(0.5 * phi_attention_logvar.clamp(min=-10, max=2))
+                attention_uncertainties.append(phi_attention_std.mean(dim=-1))
+                phi_attention = phi_attention_mean + phi_attention_std * torch.randn_like(phi_attention_std).to(device)
                 phi_a = self.phi_a(current_action)
                 
                 rnn_input = torch.cat([phi_z, phi_c, phi_attention, phi_a], dim=-1)
@@ -2640,6 +2726,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             'observations': generated_observations,
             'latents': generated_latents,
             'attention_maps': generated_attentions,
+            'attention_uncertainties': torch.stack(attention_uncertainties, dim=1),
+            'attention_coords': torch.stack(generated_attention_coords, dim=1),
             'hidden_states': torch.stack(hidden_states, dim=1) if hidden_states else None,
             'initial_context': c_0
         }

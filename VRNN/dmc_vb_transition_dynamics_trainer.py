@@ -693,69 +693,98 @@ class DMCVBTrainer:
 
     
     def visualize_results(self, epoch: int, n_samples: int = 4):
-        """Visualize model outputs"""
         self.model.eval()
         
-        # Get a batch of data
-        batch = next(iter(self.eval_loader))
-        observations = batch['observations'][:n_samples].to(self.device)
-        actions = batch['actions'][:n_samples].to(self.device)
+        fig, axes = plt.subplots(2 * n_samples, 4, figsize=(16, 2 * n_samples * 4))
+        
+        # Get training batch
+        train_batch = next(iter(self.train_loader))
+        train_obs = train_batch['observations'][:n_samples].to(self.device)
+        train_actions = train_batch['actions'][:n_samples].to(self.device)
+        
+        # Get eval batch (with randomization)
+        batch_idx = random.randint(0, len(self.eval_loader) - 1)
+        for i, eval_batch in enumerate(self.eval_loader):
+            if i == batch_idx:
+                break
+        eval_obs = eval_batch['observations'][:n_samples].to(self.device)
+        eval_actions = eval_batch['actions'][:n_samples].to(self.device)
         
         with torch.no_grad():
-            # Get model outputs
-            vae_losses, outputs = self.model.compute_total_loss(
-                observations=observations,
-                actions=actions
-            )
-            
-            # Create visualization
-            fig, axes = plt.subplots(n_samples, 4, figsize=(16, n_samples * 4))
-            
-            for i in range(n_samples):
-                # Original observation (first frame)
-                axes[i, 0].imshow(self.denormalize_image(observations[i, 0, :3]))
-                axes[i, 0].set_title('Original')
-                axes[i, 0].axis('off')
+            # Process both batches
+            for dataset_idx, (observations, actions, dataset_name) in enumerate([
+                (train_obs, train_actions, "Train"),
+                (eval_obs, eval_actions, "Eval")
+            ]):
+                _, outputs = self.model.compute_total_loss(
+                    observations=observations,
+                    actions=actions
+                )
                 
-                # Reconstruction
-                axes[i, 1].imshow(self.denormalize_image(outputs['reconstructions'][i, 0, :3]))
-                axes[i, 1].set_title('Reconstruction')
-                axes[i, 1].axis('off')
-                
-                # Attention map
-                if 'attention_maps' in outputs and outputs['attention_maps'] is not None:
-                    att_map = outputs['attention_maps'][i, 0].cpu().numpy()
-                    axes[i, 2].imshow(att_map, cmap='hot')
-                    axes[i, 2].set_title('Attention')
-                    axes[i, 2].axis('off')
-                
-                # Cluster assignments
-                if 'prior_params' in outputs and len(outputs['prior_params']) > 0:
-                    pi = outputs['prior_params'][0]['pi'][i].cpu().numpy()
-                    axes[i, 3].bar(range(len(pi)), pi)
-                    axes[i, 3].set_title('Cluster Weights')
-                    axes[i, 3].set_xlabel('Component')
-                    axes[i, 3].set_ylabel('Weight')
-            
-            plt.tight_layout()
-            
-            # Save or log figure
-            if self.use_wandb:
-                wandb.log({f'visualizations/epoch_{epoch}': wandb.Image(fig)})
-            elif self.writer:
-                self.writer.add_figure(f'visualizations/epoch_{epoch}', fig, epoch)
-            else:
-                plt.savefig(f'visualizations_epoch_{epoch}.png')
-            
-            plt.close()
-    
+                for i in range(n_samples):
+                    row_idx = dataset_idx * n_samples + i
+                    
+                    # Original
+                    axes[row_idx, 0].imshow(self.denormalize_image(observations[i, 0, :3]))
+                    axes[row_idx, 0].set_title(f'{dataset_name} Original')
+                    axes[row_idx, 0].axis('off')
+                    
+                    # Reconstruction
+                    axes[row_idx, 1].imshow(self.denormalize_image(outputs['reconstructions'][i, 0, :3]))
+                    axes[row_idx, 1].set_title(f'{dataset_name} Reconstruction')
+                    axes[row_idx, 1].axis('off')
+                    
+                    # Attention map
+                    if 'attention_maps' in outputs and outputs['attention_maps'] is not None:
+                        att_map = outputs['attention_maps'][i, 0].cpu().numpy()
+                        axes[row_idx, 2].imshow(att_map, cmap='hot')
+                        axes[row_idx, 2].set_title(f'{dataset_name} Attention')
+                        axes[row_idx, 2].axis('off')
+                    
+                    # Cluster weights
+                    if 'prior_params' in outputs and len(outputs['prior_params']) > 0:
+                        pi = outputs['prior_params'][0]['pi'][i].cpu().numpy()
+                        axes[row_idx, 3].bar(range(len(pi)), pi)
+                        axes[row_idx, 3].set_title(f'{dataset_name} Clusters')
+                        axes[row_idx, 3].set_xlabel('Component')
+                        axes[row_idx, 3].set_ylabel('Weight')
+        
+        plt.tight_layout()
+        
+        if self.use_wandb:
+            wandb.log({f'train_eval_viz/epoch_{epoch}': wandb.Image(fig)})
+        elif self.writer:
+            self.writer.add_figure(f'train_eval_viz/epoch_{epoch}', fig, epoch)
+        else:
+            plt.savefig(f'train_eval_viz_epoch_{epoch}.png')
+
+        plt.close()
+
     def denormalize_image(self, img: torch.Tensor) -> np.ndarray:
-        """Convert from [-1, 1] to [0, 1] for visualization"""
-        img = img.cpu()
+        """Convert from [-1, 1] to [0, 1] for visualization
+        Args:
+        image: Tensor of shape [C, H, W] or [B, C, H, W]
+        to_uint8: If True, convert to uint8 (0-255), else keep as float (0-1)
+    
+        Returns:
+        numpy array of shape [H, W, C] or [B, H, W, C]
+
+        """
+        if img.dim() == 3:  # [C, H, W]
+            img = img.unsqueeze(0)  # Add batch dimension
+            squeeze_batch = True
+        else:
+            squeeze_batch = False
+
+        
         img = (img + 1) / 2
         img = torch.clamp(img, 0, 1)
-        return img.permute(1, 2, 0).numpy()
-    
+        img = img.cpu().permute(0,2,3,1).numpy()
+        img = (img * 255).astype(np.uint8)
+        if squeeze_batch:
+            img = img[0]
+        return img
+
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save model checkpoint"""
         checkpoint = {
@@ -829,7 +858,11 @@ class DMCVBTrainer:
 
 def main():
     """Main training script"""
+    torch.set_float32_matmul_precision('high')  # Enable TensorFloat32 cores
     
+    # Additional foundational configurations
+    torch.backends.cudnn.benchmark = True  # Enable cuDNN autotuner
+
     # Configuration
     config = {
         # Data settings
@@ -844,7 +877,7 @@ def main():
         'hidden_dim': 32,
         'context_dim': 20,
         'attention_dim': 24,
-        'attention_resolution': 16,
+        'attention_resolution': 64,
         'input_channels': 3* 3,  # 3 stacked frames
         'HiP_type': 'Mini',
         
@@ -854,19 +887,19 @@ def main():
         'frame_stack': 3,
         'img_height': 64,
         'img_width': 64,
-        'learning_rate': 4e-5,
+        'learning_rate': 1e-5,
         'n_epochs': 400,
         'num_workers': 4,
         
         # Loss weights
         'beta': 1.0,
-        'entropy_weight': 0.1,
-        'lambda_img': 0.2,
-        'lambda_latent': 0.1,
+        'entropy_weight': 0.9,
+        'lambda_img': 0.9,
+        'lambda_latent': 0.8,
         'lambda_pred': 0.1,
         'lambda_att': 0.1,
         'lambda_schema': 0.1,
-        'n_critic': 3,
+        'n_critic': 2,
         
         # Logging
         'use_wandb': False,
