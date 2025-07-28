@@ -873,11 +873,11 @@ def main():
         
         # Model settings
         'max_components': 10,
-        'latent_dim': 28,
-        'hidden_dim': 32,
+        'latent_dim': 24,
+        'hidden_dim': 32, #mut be divisible by 8
         'context_dim': 20,
-        'attention_dim': 24,
-        'attention_resolution': 64,
+        'attention_dim': 16,
+        'attention_resolution': 16,
         'input_channels': 3* 3,  # 3 stacked frames
         'HiP_type': 'Mini',
         

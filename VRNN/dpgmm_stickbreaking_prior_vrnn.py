@@ -984,8 +984,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
     
         # 5. Attention schema parameters (FIXED - was missing attention_computer)
         attention_params = {
-            'params': list(self.attention_prior_posterior.parameters())+
-            [self.attention_prior_posterior.posterior_net.spatial_regularizer.temperature],
+            'params': list(self.attention_prior_posterior.parameters()),
             'lr': learning_rate,
             'weight_decay': weight_decay,
             'name': 'attention_schema'
@@ -1181,6 +1180,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             'unused_penalties': [],  
             'alpha_prior_kl': [],
             'self_model_kl_losses': [],
+            'predicted_movements': [],
         }
         
         # Process sequence step by step
@@ -1297,16 +1297,25 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
            # Negative for ELBO
 
             # 5. Cluster entropy
-            pi_t = prior_params['pi']
-            entropy_t = -torch.sum(pi_t * torch.log(pi_t + torch.finfo(torch.float32).eps), dim=-1)
+            entropy_t, cluster_stats = self.compute_conditional_entropy(
+                logits=prior_dist.mixture_distribution.logits,
+                params=prior_params
+            )
             outputs['cluster_entropies'].append(entropy_t)
-
             # 3. Attention dynamics KL
             if t > 0  :
                 # Prior attention prediction
-                prior_attention, _ = self.attention_prior_posterior.prior_net(
-                    prev_attention, h[-1], z_t
+                z_prev = outputs['latents'][-2] if len(outputs['latents']) > 1 else z_t
+                prior_attention, prior_information = self.attention_prior_posterior.prior_net(
+                    prev_attention, h[-1], z_prev
                 )
+
+                if 'predicted_movement' in prior_information:
+                    dx, dy = prior_information['predicted_movement']
+                    # Stack dx and dy into a single tensor [B, 2, H, W]
+                    movement_tensor = torch.stack([dx, dy], dim=1)
+                    outputs['predicted_movements'].append(movement_tensor)
+
                 attention_kl = F.kl_div(
                     F.log_softmax(attention_map.view(batch_size, -1), dim=-1),
                     F.softmax(prior_attention.view(batch_size, -1), dim=-1),
@@ -1405,14 +1414,22 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             )
             rnn_output = self.rnn_layer_norm(rnn_output)
             outputs['hidden_states'].append(h[-1])
-        
+
+        if len(outputs['attention_maps']) >= 2 and len(outputs['predicted_movements']) > 0:
+            outputs['attention_dynamics_loss'] = self.attention_prior_posterior.compute_attention_dynamics_loss(
+                outputs['attention_maps'],  # Still a list here
+                outputs['predicted_movements']  # Still a list of tuples here
+            )
+        else:
+            outputs['attention_dynamics_loss'] = torch.tensor(0.0).to(self.device)
+
         # === Compute aggregated losses ===
         # Stack temporal sequences
         for key in ['reconstructions', 'latents', 'attention_states', 
                     'hidden_states', 'attention_maps']:
             if outputs[key]:
                 outputs[key] = torch.stack(outputs[key], dim=1)
-        
+
         
         # One-step prediction bonuses (negative of losses for ELBO)
         if outputs['one_step_h_prediction_loss']:
@@ -1586,7 +1603,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             beta * losses['kl_z'] +
             beta * losses['hierarchical_kl'] +  # This includes both Kumar-Beta AND Alpha-Gamma KL!
             beta * losses['attention_kl'] +
-            
+            beta * outputs['attention_dynamics_loss'] +  # Attention dynamics loss
             # Penalties (positive)
             losses['unused_penalty'] +
             lambda_schema * losses['schema_consistency'] +
