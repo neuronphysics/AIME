@@ -277,8 +277,8 @@ class AdaptiveStickBreaking(nn.Module):
         pi = pi / (pi.sum(dim=-1, keepdim=True) + torch.finfo(torch.float32).eps)  # Normalize to sum to 1
         
         return pi
-    
-    def forward(self, h: torch.Tensor, n_samples: int = 10, use_rand_perm: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    def forward(self, h: torch.Tensor, n_samples: int = 10, use_rand_perm: bool = True, truncation_threshold: float = 0.995) -> Tuple[torch.Tensor, Dict]:
         """
         Generate mixing proportions using stick-breaking process
 
@@ -301,14 +301,32 @@ class AdaptiveStickBreaking(nn.Module):
 
         # Initialize mixing proportions
         pi = self.compute_stick_breaking_proportions(v, self.max_K, perm)
-        assert pi.shape[-1] == self.max_K  # Add this check
+        # Adaptive truncation: find where cumulative sum exceeds threshold
+        pi_sorted, sort_idx = torch.sort(pi, dim=-1, descending=True)
+        pi_cumsum = torch.cumsum(pi_sorted, dim=-1)
+        
+        # Find truncation point for each sample
+        truncation_mask = pi_cumsum < truncation_threshold
+        # Add one more component to exceed threshold
+        truncation_mask[:, 1:] = truncation_mask[:, 1:] | truncation_mask[:, :-1]
+        
+        # Zero out unused components
+        pi_truncated = pi_sorted * truncation_mask.float()
+        
+        # Restore original order
+        _, unsort_idx = torch.sort(sort_idx, dim=-1)
+        pi_final = torch.gather(pi_truncated, 1, unsort_idx)
+        
+        # Renormalize
+        pi_final = pi_final / (pi_final.sum(dim=-1, keepdim=True) + torch.finfo(torch.float32).eps )
         
         
         return pi, {
             'kumar_a': torch.exp(log_kumar_a),
             'kumar_b': torch.exp(log_kumar_b),
-            'v': v.squeeze(0) if n_samples == 1 else v,
-            'perm':perm
+            'v': v,
+            'perm':perm,
+            'active_components': truncation_mask.sum(dim=-1).float().mean(),  # Count active components
         }
 
     @staticmethod
@@ -443,44 +461,31 @@ class DPGMMPrior(nn.Module):
         return kl_samples.mean()  # Scalar
     
     def compute_kl_loss(self, params: Dict, alpha: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """
-        Compute KL divergence between Kumaraswamy and Beta distributions and prior gamma distributions
-        """
-        total_kl = 0.0
-        batch_size = params['kumar_a'].shape[0]
-    
-        # Reshape alpha to [batch_size, n_samples]
-
+        kumar_beta_kl = 0.0
         
-        # For each stick-breaking weight
+        # For each stick-breaking component
         for k in range(self.max_K - 1):
-
-            kumar_a_k = params['kumar_a'][:, k:k+1]  # [batch_size, 1]
-            kumar_b_k = params['kumar_b'][:, k:k+1]  # [batch_size, 1]
+            kumar_a_k = params['kumar_a'][:, k]
+            kumar_b_k = params['kumar_b'][:, k]
             
-            alpha_k = alpha[:, k:k+1] if k < alpha.shape[1] else alpha[:, -1:] # Get alpha for current stick
-
-            beta_alpha = torch.ones_like(alpha_k).squeeze(-1)  # Beta(1,α)
-            beta_beta = alpha_k.squeeze(-1)  # Current stick's α
-                        
-            assert kumar_a_k.shape == kumar_b_k.shape == beta_alpha.shape == beta_beta.shape, \
-            f"Shape mismatch: kumar_a={kumar_a_k.shape}, kumar_b={kumar_b_k.shape}, " \
-            f"beta_alpha={beta_alpha.shape}, beta_beta={beta_beta.shape} at component {k} of {self.max_K}"
-
-            # Compute KL between Kumaraswamy and Beta
-            kl = self.stick_breaking.compute_kumar2beta_kl(
-                                                           kumar_a_k,
-                                                           kumar_b_k,
-                                                           beta_alpha,
-                                                           beta_beta,
-                                                           self.stick_breaking.M
-                                                           )
-            total_kl += kl
-
-        # Add KL for hierarchical prior over alpha (positive or negative?)
-        alpha_kl = self.stick_breaking.compute_gamma2gamma_kl(h)#TODO
-        total_kl = total_kl.mean()+ alpha_kl
-        return total_kl
+            # Beta parameters for stick k
+            beta_alpha = torch.ones_like(kumar_a_k)
+            beta_beta = alpha  # Use the full alpha, not sliced
+            
+            kl_k = self.stick_breaking.compute_kumar2beta_kl(
+                kumar_a_k.unsqueeze(-1),
+                kumar_b_k.unsqueeze(-1),
+                beta_alpha,
+                beta_beta,
+                self.stick_breaking.M
+            )
+            kumar_beta_kl += kl_k.squeeze()
+        
+        # Add Gamma-Gamma KL for concentration parameter
+        alpha_kl = self.stick_breaking.compute_gamma2gamma_kl(h)
+        
+        return kumar_beta_kl.mean() + alpha_kl
+    
 
     def forward(self, h: torch.Tensor, n_samples: int = 10) -> Tuple[torch.distributions.Distribution, Dict]:
         """
@@ -668,7 +673,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         use_orthogonal: bool = True,  # Use orthogonal initialization for LSTM,
         number_lstm_layer: int = 2,  # Number of LSTM layers
         HiP_type: str = 'Mini',  # Type of perceiver model
-        attention_temperature: float = 1.0,
         self_model_weight: float = 0.5,
         use_global_context: bool = True,
         context_window_size: int = 10,
@@ -690,7 +694,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         self.HiP_type = HiP_type
         self.min_temperature = 0.1
         self.temperature = nn.Parameter(torch.ones(1) * 1.0)
-        self.attention_temperature = attention_temperature
         self.self_model_weight = self_model_weight
         self.use_global_context = use_global_context
         self.context_window_size = context_window_size
@@ -1178,7 +1181,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             'one_step_z_prediction_loss': [],
             'one_step_att_prediction_loss': [],
             'unused_penalties': [],  
-            'alpha_prior_kl': [],
             'self_model_kl_losses': [],
             'predicted_movements': [],
         }
@@ -1273,9 +1275,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             )
             # Stick-breaking KL
             outputs['kumaraswamy_kl_losses'].append(kumar_beta_kl)
-            # 3.Compute concentration prior KL
-            alpha_prior_kl = self.prior.stick_breaking.compute_gamma2gamma_kl(h_prior)
-            outputs['alpha_prior_kl'].append(alpha_prior_kl)
+            
             # 4. Compute effective number of components and penalty for unused components
             K_eff = self.prior.get_effective_components(prior_params['pi'])
 
@@ -1370,10 +1370,10 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 
                     # Compute self-model losses
                     self_loss = self._compute_self_model_loss(
-                        outputs['self_predictions'][t-1],
-                        h[-1],
-                        z_t,
-                        outputs['attention_states'][t-1]
+                        outputs['self_predictions'][t-1], # Prediction made at t-1 for time t
+                        h[-1],                            # Actual h at time t 
+                        z_t,                              # Actual z at time t
+                        attention_state                   # Actual attention state at timestep t
                         )
                     outputs['self_model_losses'].append(self_loss)
                 # Compute self-model KL losses
