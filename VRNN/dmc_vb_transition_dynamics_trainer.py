@@ -710,8 +710,11 @@ class DMCVBTrainer:
         
         # Use actual batch size from the data
         batch_size = min(train_obs.shape[0], eval_obs.shape[0], 4)  # Cap at 4 for visualization
-        
-        fig, axes = plt.subplots(2 * batch_size, 5, figsize=(10, 2 * batch_size * 4))
+        subplot_size = 4
+        fig_width = 5 * subplot_size  # 5 columns for each type of visualization
+        fig_height = 2 * batch_size * 4
+
+        fig, axes = plt.subplots(2 * batch_size, 5, figsize=(fig_width, fig_height))
         
         with torch.no_grad():
             # Process both batches
@@ -738,12 +741,14 @@ class DMCVBTrainer:
                     # Original
                     axes[row_idx, 0].imshow(self.denormalize_image(orig_img))
                     axes[row_idx, 0].set_title(f'{dataset_name} Original')
+                    axes[row_idx, 0].set_aspect('equal')
                     axes[row_idx, 0].axis('off')
                     
                     # Reconstruction - also extract first RGB frame
                     recon_img = outputs['reconstructions'][i, 0, :3]  # [3, H, W]
                     axes[row_idx, 1].imshow(self.denormalize_image(recon_img))
                     axes[row_idx, 1].set_title(f'{dataset_name} Reconstruction')
+                    axes[row_idx, 1].set_aspect('equal')
                     axes[row_idx, 1].axis('off')
                     seq_len = observations.shape[1]
                     perceiver_idx = i * seq_len + 0  # First timestep
@@ -759,6 +764,7 @@ class DMCVBTrainer:
                     
                     axes[row_idx, 2].imshow(self.denormalize_image(perceiver_img))
                     axes[row_idx, 2].set_title(f'{dataset_name} Perceiver Recon')
+                    axes[row_idx, 2].set_aspect('equal')
                     axes[row_idx, 2].axis('off')
                                  
                     # Attention map
@@ -766,6 +772,7 @@ class DMCVBTrainer:
                         att_map = outputs['attention_maps'][i, 0].cpu().numpy()
                         axes[row_idx, 3].imshow(att_map, cmap='hot')
                         axes[row_idx, 3].set_title(f'{dataset_name} Attention')
+                        axes[row_idx, 3].set_aspect('equal')
                         axes[row_idx, 3].axis('off')
 
                     # Cluster weights
@@ -775,16 +782,26 @@ class DMCVBTrainer:
                         axes[row_idx, 4].set_title(f'{dataset_name} Clusters')
                         axes[row_idx, 4].set_xlabel('Component')
                         axes[row_idx, 4].set_ylabel('Weight')
+                        axes[row_idx, 4].set_box_aspect(1)  # Make it square
+                    
+                        # Set reasonable limits
+                        axes[row_idx, 4].set_xlim(-0.5, len(pi)-0.5)
+                        axes[row_idx, 4].set_ylim(0, 1.0)  # Assuming weights are normalized
+                    
+                        # Adjust tick labels for readability
+                        axes[row_idx, 4].tick_params(axis='both', which='major', labelsize=8)
 
-        plt.tight_layout()
-        
+        # Ensure tight layout with consistent spacing
+        plt.tight_layout(pad=1.0, h_pad=1.5, w_pad=1.5)
+        plt.rcParams["figure.dpi"] = 250
+
         if self.use_wandb:
             wandb.log({f'train_eval_viz/epoch_{epoch}': wandb.Image(fig)})
         elif self.writer:
             self.writer.add_figure(f'train_eval_viz/epoch_{epoch}', fig, epoch)
         else:
             plt.savefig(f'train_eval_viz_epoch_{epoch}.png')
-
+        
         plt.close()
 
     def denormalize_image(self, img: torch.Tensor) -> np.ndarray:
@@ -905,13 +922,13 @@ def main():
         'context_dim': 20,
         'attention_dim': 16,
         'attention_resolution': 16,
-        'input_channels': 3* 3,  # 3 stacked frames
+        'input_channels': 3* 1,  # 3 stacked frames
         'HiP_type': 'Mini',
         
         # Training settings
         'batch_size': 5,
         'sequence_length': 10,
-        'frame_stack': 3,
+        'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
         'learning_rate': 4e-5,

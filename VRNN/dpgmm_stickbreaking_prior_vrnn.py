@@ -1567,12 +1567,9 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             outputs['schema_consistency_loss'] = torch.tensor(0.0).to(self.device)
         
         # Perceiver loss
-        if perceiver_recon is not None:
-            # Transform to Perceiver's expected format: [batch*seq, H*W, C]
-            obs_flat = observations.reshape(-1, self.image_size * self.image_size, self.input_channels)
-            outputs['perceiver_loss'] = F.mse_loss(perceiver_recon, obs_flat, reduction='mean')
-        else:
-            outputs['perceiver_loss'] = torch.tensor(0.0).to(self.device)
+        obs_flat = observations.reshape(-1, self.image_size * self.image_size, self.input_channels)
+        outputs['perceiver_loss'] = F.mse_loss(perceiver_recon, obs_flat, reduction='mean')
+        
         
         # Add auxiliary outputs
         outputs['context_sequence'] = context_sequence
@@ -1711,7 +1708,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             # Penalties (positive)
             losses['unused_penalty'] +
             lambda_schema * losses['schema_consistency'] +
-            0.1 * losses['perceiver_loss'] +
+            1.0 * losses['perceiver_loss'] +
             
             # Entropy (negative - we want to maximize diversity)
             - entropy_weight * losses['cluster_entropy'] +
