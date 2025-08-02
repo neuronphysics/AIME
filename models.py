@@ -92,49 +92,17 @@ class AttentionPosterior(nn.Module):
         self.spatial_regularizer = SoftSpatialRegularizer(device)
         
         # Bottom-up saliency extraction (unchanged from original)
-        if use_dilated_conv:
-            self.saliency_net = nn.Sequential(
-                # Layer 1: 3x3 receptive field
-                nn.Conv2d(input_channels, 16, kernel_size=3, stride=1, padding=1, dilation=1),
-                nn.GroupNorm(4, 16),
-                nn.SiLU(),
-                
-                # Layer 2: 7x7 receptive field (with dilation)
-                nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=2, dilation=2),
-                nn.GroupNorm(8, 32),
-                nn.SiLU(),
-                
-                # Layer 3: 15x15 receptive field
-                nn.Conv2d(32, 48, kernel_size=3, stride=1, padding=4, dilation=4),
-                nn.GroupNorm(12, 48),
-                nn.SiLU(),
-                
-                # Layer 4: 31x31 receptive field
-                nn.Conv2d(48, feature_channels, kernel_size=3, stride=1, padding=8, dilation=8),
-                nn.GroupNorm(16, feature_channels),
-                nn.SiLU()
-            )
-        else:
-            # Standard convolutions with stride=1 to preserve resolution
-            self.saliency_net = nn.Sequential(
-                nn.Conv2d(input_channels, 16, kernel_size=5, stride=1, padding=2),
-                nn.GroupNorm(4, 16),
-                nn.SiLU(),
-                
-                nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2),
-                nn.GroupNorm(8, 32),
-                nn.SiLU(),
-                
-                nn.Conv2d(32, 48, kernel_size=3, stride=1, padding=1),
-                nn.GroupNorm(12, 48),
-                nn.SiLU(),
-                
-                nn.Conv2d(48, feature_channels, kernel_size=3, stride=1, padding=1),
-                nn.GroupNorm(16, feature_channels),
-                nn.SiLU()
+        self.saliency_net = SaliencyModule(
+                image_size=image_size,
+                input_channels=input_channels,
+                feature_channels=feature_channels,
+                num_heads=4,  # Fewer heads for efficiency in early layers
+                patch_size=4,  # Small patches for fine-grained attention
+                num_layers=4,  # Matches the 4 conv layers we're replacing
+                device=device
             )
         
-        # Spatial adapter (unchanged)
+        # Spatial adapter
         self.spatial_adapter = nn.Sequential(
             nn.AdaptiveAvgPool2d((attention_resolution, attention_resolution)),
             nn.Conv2d(feature_channels, feature_channels, kernel_size=1),
@@ -170,31 +138,31 @@ class AttentionPosterior(nn.Module):
         # Multi-scale processing layers (preserving original multi-scale approach)
         self.multi_scale_projections = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(feature_channels, 64),
-                nn.LayerNorm(64),
+                nn.Linear(feature_channels, hidden_dim),
+                nn.LayerNorm(hidden_dim),
                 nn.SiLU()
             ),
             nn.Sequential(
-                nn.Linear(feature_channels, 64),
-                nn.LayerNorm(64),
+                nn.Linear(feature_channels, hidden_dim),
+                nn.LayerNorm(hidden_dim),
                 nn.SiLU()
             ),
             nn.Sequential(
-                nn.Linear(feature_channels, 64),
-                nn.LayerNorm(64),
+                nn.Linear(feature_channels, hidden_dim),
+                nn.LayerNorm(hidden_dim),
                 nn.SiLU()
             )
         ])
         
         # Attention fusion (adapted for sequence format)
         self.attention_fusion = nn.Sequential(
-            nn.Linear(64 * 3, 128),
-            nn.LayerNorm(128),
+            nn.Linear(hidden_dim * 3, hidden_dim*2),
+            nn.LayerNorm(hidden_dim*2),
             nn.SiLU(),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
+            nn.Linear(hidden_dim*2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(64, 1)  # Output attention logits
+            nn.Linear(hidden_dim, 1)  # Output attention logits
         )
         
         # Feature extraction for downstream processing (matching original)
@@ -365,7 +333,194 @@ class AttentionPosterior(nn.Module):
         visualization = alpha * heatmap + (1 - alpha) * original_image
         
         return visualization.clamp(0, 1)
+
+class SaliencyModule(nn.Module):
+    """
+    Drop-in replacement for convolutional saliency extraction using attention.
+    Maintains the same interface: takes [B, C, H, W] and outputs [B, feature_channels, H, W]
+    but internally uses attention to determine saliency with global context.
+    """
     
+    def __init__(
+        self,
+        image_size: int,
+        input_channels: int,
+        feature_channels: int,
+        num_heads: int,
+        patch_size: int,
+        num_layers: int,
+        device: torch.device
+    ):
+        super().__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_patches_per_dim = image_size // patch_size
+        self.num_patches = self.num_patches_per_dim ** 2
+        self.feature_channels = feature_channels
+        
+        # Patch embedding - this is our only "convolution"
+        # It converts image patches into feature vectors
+        self.patch_embed = nn.Conv2d(
+            input_channels, 
+            feature_channels, 
+            kernel_size=patch_size, 
+            stride=patch_size
+        )
+        
+        # Learnable position embeddings for spatial awareness
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, self.num_patches, feature_channels) * 0.02
+        )
+        
+        # Global context token - learns to aggregate global information
+        self.global_token = nn.Parameter(
+            torch.randn(1, 1, feature_channels) * 0.02
+        )
+        
+        # Attention layers that progressively refine saliency
+        self.attention_blocks = nn.ModuleList([
+            SaliencyAttentionBlock(
+                dim=feature_channels,
+                num_heads=num_heads,
+                include_global=(i == 0),  # First layer establishes global context
+                layer_scale_init=0.1 if i < 2 else 1.0  # Gradual influence
+            )
+            for i in range(num_layers)
+        ])
+        
+        # Output projection to ensure we have exactly feature_channels
+        self.output_norm = nn.LayerNorm(feature_channels)
+        
+        # Reconstruction projection to convert back to spatial format
+        self.to_spatial = nn.ConvTranspose2d(
+            feature_channels,
+            feature_channels,
+            kernel_size=patch_size,
+            stride=patch_size
+        )
+        
+        self.to(device)
+    
+    def forward(self, x):
+        """
+        Extract saliency using attention mechanisms.
+        
+        This method converts the image to patches, applies self-attention
+        to find salient regions based on global context, then reconstructs
+        the spatial feature map.
+        """
+        B, C, H, W = x.shape
+        
+        # Convert image to patches
+        patches = self.patch_embed(x)  # [B, feature_channels, H/P, W/P]
+        patches = patches.flatten(2).transpose(1, 2)  # [B, num_patches, feature_channels]
+        
+        # Add positional embeddings
+        patches = patches + self.pos_embed
+        
+        # Prepend global context token
+        global_tokens = self.global_token.expand(B, -1, -1)
+        patches_with_global = torch.cat([global_tokens, patches], dim=1)  # [B, 1+num_patches, C]
+        
+        # Apply attention blocks
+        for i, block in enumerate(self.attention_blocks):
+            if i == 0:
+                # First block processes with global token
+                patches_with_global = block(patches_with_global, include_global=True)
+                # Extract updated global context
+                self.global_context = patches_with_global[:, 0]  # Store for potential use
+                # Continue with just patches
+                patches = patches_with_global[:, 1:]
+            else:
+                # Subsequent blocks refine saliency
+                patches = block(patches, include_global=False)
+        
+        # Final normalization
+        patches = self.output_norm(patches)
+        
+        # Reshape back to spatial format
+        patches_spatial = patches.transpose(1, 2).reshape(
+            B, self.feature_channels, self.num_patches_per_dim, self.num_patches_per_dim
+        )
+        
+        # Upsample to original resolution
+        saliency_features = self.to_spatial(patches_spatial)
+        
+        # Ensure output has correct spatial dimensions
+        if saliency_features.shape[-2:] != (H, W):
+            saliency_features = F.interpolate(
+                saliency_features, 
+                size=(H, W), 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
+        return saliency_features
+
+
+class SaliencyAttentionBlock(nn.Module):
+    """
+    A single attention block for saliency detection.
+    Uses self-attention to identify salient regions based on relationships
+    between different parts of the image.
+    """
+    
+    def __init__(
+        self, 
+        dim: int, 
+        num_heads: int, 
+        include_global: bool = False,
+        layer_scale_init: float = 1.0
+    ):
+        super().__init__()
+        self.include_global = include_global
+        
+        # Pre-norm architecture for stability
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            dim, 
+            num_heads, 
+            dropout=0.1, 
+            batch_first=True
+        )
+        
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(0.1)
+        )
+        
+        # Layer scale for training stability
+        self.layer_scale_1 = nn.Parameter(
+            torch.ones(dim) * layer_scale_init
+        )
+        self.layer_scale_2 = nn.Parameter(
+            torch.ones(dim) * layer_scale_init
+        )
+    
+    def forward(self, x, include_global=None):
+        """
+        Apply self-attention to find salient relationships.
+        
+        The attention mechanism here asks: "Which patches should be 
+        considered salient based on their relationships to all other patches?"
+        """
+        # Override with parameter if specified
+        if include_global is None:
+            include_global = self.include_global
+        
+        # Self-attention with residual
+        normed = self.norm1(x)
+        attn_output, _ = self.attn(normed, normed, normed)
+        x = x + self.layer_scale_1 * attn_output
+        
+        # MLP with residual
+        x = x + self.layer_scale_2 * self.mlp(self.norm2(x))
+        
+        return x
 class AttentionPrior(nn.Module):
     """
     Attention-based spatial dynamics prediction using efficient self-attention

@@ -481,9 +481,9 @@ class DMCVBTrainer:
             domain_name=config['domain_name'],
             split='train',
             sequence_length=config['sequence_length'],
-            frame_stack=config.get('frame_stack', 3),
-            img_height=config.get('img_height', 64),
-            img_width=config.get('img_width', 64),
+            frame_stack=config['frame_stack'],
+            img_height=config['img_height'],
+            img_width=config['img_width'],
             add_state= False
         )
         
@@ -492,9 +492,9 @@ class DMCVBTrainer:
             domain_name=config['domain_name'],
             split='eval',
             sequence_length=config['sequence_length'],
-            frame_stack=config.get('frame_stack', 3),
-            img_height=config.get('img_height', 64),
-            img_width=config.get('img_width', 64),
+            frame_stack=config['frame_stack'],
+            img_height=config['img_height'],
+            img_width=config['img_width'],
             add_state= False
         )
         
@@ -534,9 +534,9 @@ class DMCVBTrainer:
         try:
             import wandb
             wandb.init(
-                project=config.get('wandb_project', 'dpgmm-vrnn-dmc'),
+                project=config['wandb_project'],
                 config=config,
-                name=config.get('experiment_name', None)
+                name=config['experiment_name']
             )
             return True
         except:
@@ -559,13 +559,13 @@ class DMCVBTrainer:
             losses = self.model.training_step_sequence(
                 observations=observations,
                 actions=actions,
-                beta=self.config.get('beta', 1.0),
-                n_critic=self.config.get('n_critic', 3),
-                lambda_img=self.config.get('lambda_img', 0.2),
-                lambda_pred=self.config.get('lambda_pred', 0.1),
-                lambda_att=self.config.get('lambda_att', 0.1),
-                lambda_schema=self.config.get('lambda_schema', 0.1),
-                entropy_weight=self.config.get('entropy_weight', 0.1)
+                beta=self.config['beta'],
+                n_critic=self.config['n_critic'],
+                lambda_img=self.config['lambda_img'],
+                lambda_pred=self.config['lambda_pred'],
+                lambda_att=self.config['lambda_att'],
+                lambda_schema=self.config['lambda_schema'],
+                entropy_weight=self.config['entropy_weight']
             )
             
             # Track metrics
@@ -576,9 +576,9 @@ class DMCVBTrainer:
             
             # Update progress bar
             pbar.set_postfix({
-                'total_loss': losses.get('total_gen_loss', 0),
-                'recon_loss': losses.get('recon_loss', 0),
-                'kl_z': losses.get('kl_z', 0)
+                'total_loss': losses['total_gen_loss'],
+                'recon_loss': losses['recon_loss'],
+                'kl_z': losses['kl_z']
             })
         
         # Compute epoch averages
@@ -602,8 +602,8 @@ class DMCVBTrainer:
                 vae_losses, outputs = self.model.compute_total_loss(
                     observations=observations,
                     actions=actions,
-                    beta=self.config.get('beta', 1.0),
-                    entropy_weight=self.config.get('entropy_weight', 0.1)
+                    beta=self.config['beta'],
+                    entropy_weight=self.config['entropy_weight']
                 )
                 
                 # Track metrics
@@ -692,63 +692,90 @@ class DMCVBTrainer:
         return np.mean(accuracies) if accuracies else 0.0
 
     
-    def visualize_results(self, epoch: int, n_samples: int = 4):
+    def visualize_results(self, epoch: int):
         self.model.eval()
-        
-        fig, axes = plt.subplots(2 * n_samples, 4, figsize=(16, 2 * n_samples * 4))
         
         # Get training batch
         train_batch = next(iter(self.train_loader))
-        train_obs = train_batch['observations'][:n_samples].to(self.device)
-        train_actions = train_batch['actions'][:n_samples].to(self.device)
+        train_obs = train_batch['observations'].to(self.device)
+        train_actions = train_batch['actions'].to(self.device)
         
         # Get eval batch (with randomization)
         batch_idx = random.randint(0, len(self.eval_loader) - 1)
         for i, eval_batch in enumerate(self.eval_loader):
             if i == batch_idx:
                 break
-        eval_obs = eval_batch['observations'][:n_samples].to(self.device)
-        eval_actions = eval_batch['actions'][:n_samples].to(self.device)
+        eval_obs = eval_batch['observations'].to(self.device)
+        eval_actions = eval_batch['actions'].to(self.device)
+        
+        # Use actual batch size from the data
+        batch_size = min(train_obs.shape[0], eval_obs.shape[0], 4)  # Cap at 4 for visualization
+        
+        fig, axes = plt.subplots(2 * batch_size, 5, figsize=(10, 2 * batch_size * 4))
         
         with torch.no_grad():
             # Process both batches
+            out=[]
             for dataset_idx, (observations, actions, dataset_name) in enumerate([
-                (train_obs, train_actions, "Train"),
-                (eval_obs, eval_actions, "Eval")
+                (train_obs[:batch_size], train_actions[:batch_size], "Train"),
+                (eval_obs[:batch_size], eval_actions[:batch_size], "Eval")
             ]):
                 _, outputs = self.model.compute_total_loss(
                     observations=observations,
                     actions=actions
                 )
-                
-                for i in range(n_samples):
-                    row_idx = dataset_idx * n_samples + i
+                out.append(outputs)
+                perceiver_reconst= outputs['perceiver_recon']
+                for i in range(batch_size):
+                    row_idx = dataset_idx * batch_size + i
+                    
+                    # Extract first RGB frame from stacked frames
+                    # observations shape: [batch, seq, channels, H, W]
+                    # For 3 stacked frames with 3 channels each: channels = 9
+                    # Get first frame's RGB channels (indices 0, 1, 2)
+                    orig_img = observations[i, 0, :3]  # [3, H, W]
                     
                     # Original
-                    axes[row_idx, 0].imshow(self.denormalize_image(observations[i, 0, :3]))
+                    axes[row_idx, 0].imshow(self.denormalize_image(orig_img))
                     axes[row_idx, 0].set_title(f'{dataset_name} Original')
                     axes[row_idx, 0].axis('off')
                     
-                    # Reconstruction
-                    axes[row_idx, 1].imshow(self.denormalize_image(outputs['reconstructions'][i, 0, :3]))
+                    # Reconstruction - also extract first RGB frame
+                    recon_img = outputs['reconstructions'][i, 0, :3]  # [3, H, W]
+                    axes[row_idx, 1].imshow(self.denormalize_image(recon_img))
                     axes[row_idx, 1].set_title(f'{dataset_name} Reconstruction')
                     axes[row_idx, 1].axis('off')
+                    seq_len = observations.shape[1]
+                    perceiver_idx = i * seq_len + 0  # First timestep
                     
+                    # Extract and reshape perceiver reconstruction
+                    perceiver_img = perceiver_reconst[perceiver_idx]  # [H*W, C]
+                    H, W = self.model.image_size, self.model.image_size
+                    perceiver_img = perceiver_img.reshape(H, W, -1)  # [H, W, C]
+                    perceiver_img = perceiver_img[:,:, :3]  # Keep only RGB channels
+                    
+                    # Convert to [C, H, W] for denormalization
+                    perceiver_img = torch.from_numpy(perceiver_img.cpu().numpy()).permute(2, 0, 1)
+                    
+                    axes[row_idx, 2].imshow(self.denormalize_image(perceiver_img))
+                    axes[row_idx, 2].set_title(f'{dataset_name} Perceiver Recon')
+                    axes[row_idx, 2].axis('off')
+                                 
                     # Attention map
                     if 'attention_maps' in outputs and outputs['attention_maps'] is not None:
                         att_map = outputs['attention_maps'][i, 0].cpu().numpy()
-                        axes[row_idx, 2].imshow(att_map, cmap='hot')
-                        axes[row_idx, 2].set_title(f'{dataset_name} Attention')
-                        axes[row_idx, 2].axis('off')
-                    
+                        axes[row_idx, 3].imshow(att_map, cmap='hot')
+                        axes[row_idx, 3].set_title(f'{dataset_name} Attention')
+                        axes[row_idx, 3].axis('off')
+
                     # Cluster weights
                     if 'prior_params' in outputs and len(outputs['prior_params']) > 0:
                         pi = outputs['prior_params'][0]['pi'][i].cpu().numpy()
-                        axes[row_idx, 3].bar(range(len(pi)), pi)
-                        axes[row_idx, 3].set_title(f'{dataset_name} Clusters')
-                        axes[row_idx, 3].set_xlabel('Component')
-                        axes[row_idx, 3].set_ylabel('Weight')
-        
+                        axes[row_idx, 4].bar(range(len(pi)), pi)
+                        axes[row_idx, 4].set_title(f'{dataset_name} Clusters')
+                        axes[row_idx, 4].set_xlabel('Component')
+                        axes[row_idx, 4].set_ylabel('Weight')
+
         plt.tight_layout()
         
         if self.use_wandb:
@@ -843,11 +870,11 @@ class DMCVBTrainer:
             print(f"  Active Components: {train_metrics.get('train/effective_components', 0):.2f}")
             
             # Visualize periodically
-            if epoch % self.config.get('visualize_every', 10) == 0:
+            if epoch % self.config['visualize_every'] == 0:
                 self.visualize_results(epoch)
             
             # Save checkpoint
-            if epoch % self.config.get('checkpoint_every', 10) == 0:
+            if epoch % self.config['checkpoint_every'] == 0:
                 self.save_checkpoint(epoch)
         # Cleanup
         if self.writer:
@@ -887,18 +914,18 @@ def main():
         'frame_stack': 3,
         'img_height': 64,
         'img_width': 64,
-        'learning_rate': 1e-5,
+        'learning_rate': 4e-5,
         'n_epochs': 400,
         'num_workers': 4,
         
         # Loss weights
         'beta': 1.0,
-        'entropy_weight': 0.9,
-        'lambda_img': 0.9,
-        'lambda_latent': 0.8,
-        'lambda_pred': 0.1,
-        'lambda_att': 0.1,
-        'lambda_schema': 0.1,
+        'entropy_weight': 0.8,
+        'lambda_img': 2.0,
+        'lambda_latent': 1.0,
+        'lambda_pred': 2.0,
+        'lambda_att': 2.0,
+        'lambda_schema': 1.0,
         'n_critic': 2,
         
         # Logging

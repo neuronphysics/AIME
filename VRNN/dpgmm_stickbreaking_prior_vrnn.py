@@ -330,7 +330,7 @@ class AdaptiveStickBreaking(nn.Module):
         }
 
     @staticmethod
-    def compute_kumar2beta_kl( a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor, n_approx: int, eps: float=torch.finfo(torch.float32).eps) -> torch.Tensor:
+    def compute_kumar2beta_kl( a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor, n_approx: int, eps: float=100*torch.finfo(torch.float32).eps) -> torch.Tensor:
         """
         Compute KL divergence between Kumaraswamy(a,b) and Beta(alpha,beta)
         KL(K(a,b) || B(α,β)) = 
@@ -343,8 +343,8 @@ class AdaptiveStickBreaking(nn.Module):
         EULER_GAMMA = 0.5772156649
         assert a.shape == b.shape == alpha.shape == beta.shape
 
-        a = torch.clamp(a, min=eps, max=1e2)  # Ensure a is positive
-        b = torch.clamp(b, min=eps, max=1e2)  # Ensure b is positive
+        a = torch.clamp(a, min=eps, max=50)  # Ensure a is positive
+        b = torch.clamp(b, min=eps, max=50)  # Ensure b is positive
         alpha = torch.clamp(alpha, min=eps)
         beta = torch.clamp(beta, min=eps)
  
@@ -460,32 +460,43 @@ class DPGMMPrior(nn.Module):
         kl_samples = log_q - log_p  # (n_samples, B)
         return kl_samples.mean()  # Scalar
     
-    def compute_kl_loss(self, params: Dict, alpha: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        kumar_beta_kl = 0.0
-        
-        # For each stick-breaking component
-        for k in range(self.max_K - 1):
-            kumar_a_k = params['kumar_a'][:, k]
-            kumar_b_k = params['kumar_b'][:, k]
-            
-            # Beta parameters for stick k
-            beta_alpha = torch.ones_like(kumar_a_k)
-            beta_beta = alpha  # Use the full alpha, not sliced
-            
-            kl_k = self.stick_breaking.compute_kumar2beta_kl(
-                kumar_a_k.unsqueeze(-1),
-                kumar_b_k.unsqueeze(-1),
-                beta_alpha,
-                beta_beta,
-                self.stick_breaking.M
-            )
-            kumar_beta_kl += kl_k.squeeze()
-        
-        # Add Gamma-Gamma KL for concentration parameter
-        alpha_kl = self.stick_breaking.compute_gamma2gamma_kl(h)
-        
-        return kumar_beta_kl.mean() + alpha_kl
     
+    def compute_kl_loss(self, params: Dict, alpha: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """
+        Compute KL divergence between Kumaraswamy and Beta distributions and prior gamma distributions
+        """
+        total_kl = 0.0
+        
+        # For each stick-breaking weight
+        for k in range(self.max_K - 1):
+
+            kumar_a_k = params['kumar_a'][:, k:k+1]  # [batch_size, 1]
+            kumar_b_k = params['kumar_b'][:, k:k+1]  # [batch_size, 1]
+            
+            alpha_k = alpha[:, k:k+1] if k < alpha.shape[1] else alpha[:, -1:] # Get alpha for current stick
+
+            beta_alpha = torch.ones_like(alpha_k).squeeze(-1)  # Beta(1,α)
+            beta_beta = alpha_k.squeeze(-1)  # Current stick's α
+                        
+                        
+            assert kumar_a_k.shape == kumar_b_k.shape == beta_alpha.shape == beta_beta.shape, \
+            f"Shape mismatch: kumar_a={kumar_a_k.shape}, kumar_b={kumar_b_k.shape}, " \
+            f"beta_alpha={beta_alpha.shape}, beta_beta={beta_beta.shape} at component {k} of {self.max_K}"
+
+            # Compute KL between Kumaraswamy and Beta
+            kl = self.stick_breaking.compute_kumar2beta_kl(
+                                                           kumar_a_k,
+                                                           kumar_b_k,
+                                                           beta_alpha,
+                                                           beta_beta,
+                                                           self.stick_breaking.M
+                                                           )
+            total_kl += kl
+
+        # Add KL for hierarchical prior over alpha (positive or negative?)
+        alpha_kl = self.stick_breaking.compute_gamma2gamma_kl(h)
+        total_kl = total_kl.mean() + alpha_kl
+        return total_kl
 
     def forward(self, h: torch.Tensor, n_samples: int = 10) -> Tuple[torch.distributions.Distribution, Dict]:
         """
@@ -552,7 +563,7 @@ class AttentionSchema(nn.Module):
             hidden_dim, 
             context_dim,
             input_channels,
-            use_dilated_conv=True,  # Use dilated convolutions for better spatial context
+            device=device
         )
         
         # Prior (top-down, predictive attention schema)
@@ -620,7 +631,11 @@ class AttentionSchema(nn.Module):
         pred_dy_mean = pred_movements[..., 1].mean(dim=[2, 3]) if pred_movements.dim() > 3 else pred_movements[..., 1]
         
         # Compute squared error [T-1, B]
-        movement_error = (pred_dx_mean - actual_dx)**2 + (pred_dy_mean - actual_dy)**2
+        movement_error = F.huber_loss(
+            torch.stack([pred_dx_mean, pred_dy_mean]), 
+            torch.stack([actual_dx, actual_dy]),
+            delta=0.1
+            )
         
         # Average over time and batch
         total_loss = movement_error.mean()
@@ -642,7 +657,90 @@ class AttentionSchema(nn.Module):
         x_com = (attention_map * x_grid).sum(dim=[1, 2]) / total_mass.squeeze()
         
         return torch.stack([x_com, y_com], dim=-1)
-
+    
+class PerceiverContextEmbedding(nn.Module):
+    """
+    Maintains a learnable context memory that gets updated by attending to Perceiver outputs.
+    
+    Think of this as having a persistent "understanding" of context that gets
+    refined based on global information from the Perceiver, rather than 
+    regenerating context from scratch each time.
+    """
+    def __init__(self, perceiver_latent_dim, context_dim, num_heads=4, dropout=0.1, device='cuda'):
+        super().__init__()
+        self.perceiver_latent_dim = perceiver_latent_dim
+        self.context_dim = context_dim
+        self.device = device
+        
+        # This is our "context memory" - what we're trying to understand/extract
+        # Initialize with small random values to break symmetry
+        self.context_memory = nn.Parameter(
+            torch.randn(context_dim, perceiver_latent_dim) * 0.02
+        )
+        
+        # Layer norm for the context memory to keep it well-behaved
+        self.context_norm = nn.LayerNorm(perceiver_latent_dim)
+        
+        # Cross-attention where context memory queries the Perceiver output
+        # This is where the "updating" happens
+        self.update_attention = nn.MultiheadAttention(
+            embed_dim=perceiver_latent_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # A gating mechanism to control how much the context changes
+        # This helps stability - we don't want context to change too drastically
+        self.update_gate = nn.Sequential(
+            nn.Linear(perceiver_latent_dim * 2, perceiver_latent_dim),
+            nn.Sigmoid()
+        )
+        
+        # Final projection to ensure we output exactly context_dim
+        # This also allows the model to learn a different "output representation"
+        # of the context if needed
+        self.output_projection = nn.Linear(perceiver_latent_dim, 1)
+        
+        self.to(device)
+    
+    def forward(self, perceiver_output):
+        """
+        Updates context memory based on Perceiver output.
+        
+        Args:
+            perceiver_output: [batch*seq_len, num_latents, perceiver_latent_dim]
+            
+        Returns:
+            context: [batch*seq_len, context_dim]
+        """
+        batch_size = perceiver_output.shape[0]
+        
+        # Normalize and expand context memory for each batch element
+        # Think of this as "preparing our questions"
+        context_queries = self.context_norm(self.context_memory)
+        context_queries = context_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # Query the Perceiver output with our context memory
+        # This asks: "Given what the Perceiver sees globally, how should we update our context understanding?"
+        updated_context, attention_weights = self.update_attention(
+            query=context_queries,     # What we want to know: [batch, context_dim, latent_dim]
+            key=perceiver_output,      # What's available: [batch, num_latents, latent_dim]
+            value=perceiver_output     # The information to extract
+        )
+        
+        # Optional: Apply gating to blend old and new context
+        # This prevents the context from changing too dramatically
+        gate_input = torch.cat([context_queries, updated_context], dim=-1)
+        gate = self.update_gate(gate_input)
+        gated_context = gate * updated_context + (1 - gate) * context_queries
+        
+        # Project to get final context values
+        # [batch, context_dim, latent_dim] -> [batch, context_dim, 1] -> [batch, context_dim]
+        context = self.output_projection(gated_context).squeeze(-1)
+        
+        return context, attention_weights 
+    
 
 class DPGMMVariationalRecurrentEncoder(nn.Module):
     """
@@ -666,7 +764,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         use_spectral_norm: bool= True,
         input_channels: int = 3,  # Number of input channels (e.g., RGB images)
         learning_rate: float = 1e-5,
-        grad_clip:float =0.5,
+        grad_clip:float =10.0,
         prior_alpha: float = 5.0,  # Add these parameters
         prior_beta: float = 1.0,
         weight_decay: float = 0.00001,
@@ -759,33 +857,32 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
     def _init_perceiver_context(self ):
         """Initialize Hierarchical Perceiver with architecture-aware dimensions"""
     
-        # Get variant configuration
-        variant_config = perceiver.VARIANTS[self.HiP_type]
         # Initialize perceiver
         mock_input = self.generate_mock_input()
+
         self.perceiver_model = generate_model('HiPClassBottleneck', self.HiP_type, mock_input)
         self.perceiver_model.to(self.device)
         self.out_keys = perceiver_helpers.ModelOutputKeys
         # Extract key dimensions from the processor block (middle block)
         with torch.no_grad():
+            # TODO: Can you check why we cut this from computing gradients?
             # Run a forward pass to get actual dimensions
             test_output = self.perceiver_model(mock_input, is_training=False)
             test_latents = test_output[self.out_keys.LATENTS]['image']
             
             # Get actual channel dimension
             perceiver_latent_dim = test_latents.shape[-1]  # [batch, index, channels]
-            
-        print(f"Detected Perceiver context output dimension: {perceiver_latent_dim}")
+            perceiver_index_dim = test_latents.shape[-2]   # Number of latent vectors
+        print(f"Detected Perceiver context output dimension: {perceiver_latent_dim}, {perceiver_index_dim} latent vectors")
    
 
     
         # Architecture-aware projection
-        self.perceiver_projection = nn.Sequential(
-                                                  nn.Conv1d(perceiver_latent_dim, perceiver_latent_dim // 2, kernel_size=1),
-                                                  nn.ReLU(),
-                                                  nn.Conv1d(perceiver_latent_dim // 2, 1, kernel_size=1),
-                                                  nn.AdaptiveAvgPool1d(self.context_dim)
-                                                  ).to(self.device)
+        self.perceiver_projection = PerceiverContextEmbedding(perceiver_latent_dim, 
+                                                              self.context_dim, 
+                                                              device= self.device)
+                
+        
         
         # Attention extractor remains the same
         self.attention_extractor = nn.Sequential(
@@ -1017,8 +1114,9 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         # Create main optimizer
         self.gen_optimizer = torch.optim.AdamW(
             param_groups,
-            betas=(0.9, 0.999),
-            eps=1e-8
+            betas=(0.9, 0.99),
+            eps=1e-7,
+            amsgrad=True,  # Use AMSGrad for stability
         )
     
         # Discriminator optimizers (separate for stability)
@@ -1102,14 +1200,14 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             scaler.unscale_(optimizer)
         
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(params, self._grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=self._grad_clip, norm_type=2.0)
         
             # Optimizer step
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(params, self._grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=self._grad_clip, norm_type=2.0)
             optimizer.step()
     
         # Learning rate scheduling
@@ -1301,6 +1399,12 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 logits=prior_dist.mixture_distribution.logits,
                 params=prior_params
             )
+            mixing_proportions=prior_params['pi'] 
+            mixing_entropy = -torch.sum(mixing_proportions * torch.log(mixing_proportions + torch.finfo(mixing_proportions.dtype).eps), dim=-1).mean()
+            entropy_t += mixing_entropy  # Add mixing entropy to cluster entropy
+            # Total entropy encourages both:
+            # 1. Uncertainty in cluster assignments (exploration)
+            # 2. Diversity in cluster usage (avoid mode collapse)
             outputs['cluster_entropies'].append(entropy_t)
             # 3. Attention dynamics KL
             if t > 0  :
@@ -1488,13 +1592,13 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             self.disc_scaler.scale(img_loss).backward()
             self.disc_scaler.unscale_(self.img_disc_optimizer)
             img_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.image_discriminator.parameters(), self._grad_clip
+                self.image_discriminator.parameters(), max_norm=self._grad_clip, norm_type=2.0
             )
             self.disc_scaler.step(self.img_disc_optimizer)
         else:
             img_loss.backward()
             img_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.image_discriminator.parameters(), self._grad_clip
+                self.image_discriminator.parameters(), max_norm=self._grad_clip, norm_type=2.0
             )
             self.img_disc_optimizer.step()
     
@@ -1506,14 +1610,14 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             self.disc_scaler.scale(latent_loss).backward()
             self.disc_scaler.unscale_(self.latent_disc_optimizer)
             latent_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.latent_discriminator.parameters(), self._grad_clip
+                self.latent_discriminator.parameters(), max_norm=self._grad_clip, norm_type=2.0
             )
             self.disc_scaler.step(self.latent_disc_optimizer)
             self.disc_scaler.update()
         else:
             latent_loss.backward()
             latent_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.latent_discriminator.parameters(), self._grad_clip
+                self.latent_discriminator.parameters(), max_norm=self._grad_clip, norm_type=2.0
             )
             self.latent_disc_optimizer.step()
     
@@ -2088,14 +2192,14 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         # Process through perceiver
         perceiver_output = self.perceiver_model({'image': obs_flat}, is_training=True)
         latents = perceiver_output[self.out_keys.LATENTS]['image']
-        
+        #Perceiver latents shape: torch.Size([50, 2048, 128]) [batch_size* seq_len, ?, ?]
         # Extract reconstruction for perceiver loss
         perceiver_recon = perceiver_output[self.out_keys.INPUT_RECONSTRUCTION]['image']
         
         # Project to context dimension
-        latents = latents.transpose(1, 2)
-        context = self.perceiver_projection(latents)
-        context = context.reshape(batch_size, seq_len, -1)
+        
+        context, weights = self.perceiver_projection(latents)
+        context = context.reshape(batch_size, seq_len, self.context_dim)
         
         # Extract cross-attention patterns for attention schema
         # Note: This would require modifying perceiver to expose attention weights
@@ -2385,20 +2489,13 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         total_gen_loss = (
             vae_losses['total_vae_loss'] +
             lambda_img * img_adv_loss +
-            0.1 * latent_adv_loss +      # Reduced weight for latent adversarial
-            0.1 * feat_match_loss        # Feature matching
+            latent_adv_loss +      # Reduced weight for latent adversarial
+            feat_match_loss        # Feature matching
         )
         
         
-        # 4. Total generator loss
-        total_gen_loss = (
-            vae_losses['elbo'] +
-            lambda_img * img_adv_loss +
-            latent_adv_loss +
-            feat_match_loss
-        )
         
-        # 5. Optimize generator
+        # 6. Optimize generator
         if self.has_optimizers:
             self.gen_optimizer.zero_grad()
             total_gen_loss.backward()
@@ -2414,7 +2511,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 self.gen_scheduler.step()
             self.current_step += 1
         
-        # 6. Prepare output dictionary
+        # 7. Prepare output dictionary
         return {
             **vae_losses,
             **avg_disc_losses,
