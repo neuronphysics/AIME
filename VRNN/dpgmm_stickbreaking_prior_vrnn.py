@@ -511,7 +511,7 @@ class DPGMMPrior(nn.Module):
         # Generate component parameters
         params = self.component_nn(h)
         means, log_vars = torch.split(params, self.latent_dim * self.max_K, dim=1)
-
+        log_vars = torch.clamp(log_vars, min=-10.0, max=2.0)
         # Reshape parameters
         means = means.view(batch_size, self.max_K, self.latent_dim)
         log_vars = log_vars.view(batch_size, self.max_K, self.latent_dim)
@@ -807,11 +807,9 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         self._init_self_model()
         self._init_discriminators( img_disc_layers, latent_disc_layers, use_spectral_norm)
 
-        
-
         # DP-GMM prior
         self.prior = DPGMMPrior(max_components, 
-                                latent_dim, 
+                                self.latent_dim, 
                                 hidden_dim + context_dim, #This is because that the input for the prior is the hidden state of recurrent model plus context which is coming from perceiver
                                 device, prior_alpha=prior_alpha,
                                 prior_beta=prior_beta)
@@ -884,14 +882,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                 
         
         
-        # Attention extractor remains the same
-        self.attention_extractor = nn.Sequential(
-                                                 nn.Linear(self.context_dim, self.attention_dim),
-                                                 nn.LayerNorm(self.attention_dim),
-                                                 nn.SiLU(),
-                                                 nn.Linear(self.attention_dim, self.attention_dim+self.hidden_dim//2 + 2),
-                                                 nn.LayerNorm(self.attention_dim+self.hidden_dim//2 + 2)
-                                                 ).to(self.device)
 
     def _init_discriminators(self, img_disc_layers, latent_disc_layers, use_spectral_norm: bool):
         # Initialize discriminators
@@ -918,24 +908,11 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
 
     def _init_vrnn_dynamics(self,use_orthogonal: bool = True, number_lstm_layer: int = 2):
         """Initialize VRNN components with context conditioning"""
-        # Feature extractors
-        self.phi_z = LinearResidual(self.latent_dim, self.hidden_dim)
-        self.phi_a = LinearResidual(self.action_dim, self.hidden_dim)
-        self.phi_c = LinearResidual(self.context_dim, self.hidden_dim)
-        
-        # Context-conditioned prior network
-        self.prior_net = nn.Sequential(
-            nn.Linear(self.hidden_dim + self.context_dim, self.hidden_dim * 2),
-            nn.LayerNorm(self.hidden_dim * 2),
-            nn.SiLU(),
-            LinearResidual(self.hidden_dim * 2, self.hidden_dim * 2),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim + self.context_dim),
-            nn.LayerNorm(self.hidden_dim + self.context_dim)
-        )
+        # Feature extractors        
         
         # VRNN recurrence: h_t = f(h_{t-1}, z_t, c_t, A_t, a_t)
         self._rnn = LSTMLayer(
-            input_size=self.hidden_dim * 4,  # phi_z + phi_c + phi_A + phi_a
+            input_size=self.latent_dim + self.action_dim + self.context_dim + self.hidden_dim,  # z_t + c_t + A_t + a_t
             hidden_size=self.hidden_dim,
             n_lstm_layers= number_lstm_layer,
             use_orthogonal=use_orthogonal
@@ -1039,8 +1016,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         # 1. Perceiver parameters (slow learning)
         perceiver_params = {
             'params': list(self.perceiver_model.parameters()) + 
-                      list(self.perceiver_projection.parameters()) + 
-                      list(self.attention_extractor.parameters()),
+                      list(self.perceiver_projection.parameters()),
             'lr': learning_rate * 0.5,
             'weight_decay': weight_decay,
             'name': 'perceiver'
@@ -1059,9 +1035,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
     
         # 3. Prior network parameters (fast learning)
         prior_params = {
-            'params': list(self.prior.parameters()) + 
-                      list(self.prior_net.parameters()),
-            'lr': learning_rate * 2.0,
+            'params': list(self.prior.parameters()),
+            'lr': learning_rate * 0.5,
             'weight_decay': weight_decay * 0.1,
             'name': 'prior'
         }
@@ -1071,9 +1046,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         vrnn_params = {
             'params': list(self._rnn.parameters()) + 
                       list(self.rnn_layer_norm.parameters()) +
-                      list(self.phi_z.parameters()) + 
-                      list(self.phi_a.parameters()) + 
-                      list(self.phi_c.parameters()) +
                       list(self.phi_attention.parameters()) +
                       [self.h0, self.c0],  # Don't forget initial states!
             'lr': learning_rate,
@@ -1348,10 +1320,9 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             
             # === Prior Network p(z_t|o_<t, z_<t) ===
             h_context = torch.cat([h[-1], c_t], dim=-1)
-            h_prior = self.prior_net(h_context)
             
             # Get DP-GMM prior distribution
-            prior_dist, prior_params = self.prior(h_prior)
+            prior_dist, prior_params = self.prior(h_context)
             outputs['prior_params'].append(prior_params)
             # 1. Reconstruction loss for this timestep
             reconstruction_t = self.decoder(z_t)
@@ -1369,7 +1340,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             kumar_beta_kl = self.prior.compute_kl_loss(
                 prior_params, 
                 prior_params['alpha'], 
-                h_prior
+                h_context,
             )
             # Stick-breaking KL
             outputs['kumaraswamy_kl_losses'].append(kumar_beta_kl)
@@ -1506,12 +1477,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             # Feature extraction
             
             # === Update recurrent state ===
-            phi_z_t = self.phi_z(z_t)
-            phi_c_t = self.phi_c(c_t)
-            phi_attention_t = attention_state
-            phi_a_t = self.phi_a(a_t)
             
-            rnn_input = torch.cat([phi_z_t, phi_c_t, phi_attention_t, phi_a_t], dim=-1)
+            rnn_input = torch.cat([z_t, c_t, attention_state, a_t], dim=-1)
             rnn_output, (h, c) = self._rnn(
                 rnn_input, h, c, 
                 torch.ones(batch_size).to(self.device)
@@ -1552,19 +1519,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             outputs['future_att_bonus'] = torch.tensor(0.0).to(self.device)
         
         
-        # Schema consistency (if using global context)
-        if self.use_global_context and context_sequence is not None:
-            perceiver_attention = self.attention_extractor(context_sequence)
-            attn_features = torch.stack(outputs['attention_features'], dim=1)
-            
-            outputs['schema_consistency_loss'] = F.mse_loss(
-                attn_features, 
-                perceiver_attention,
-                reduction='mean'
-            )
-            
-        else:
-            outputs['schema_consistency_loss'] = torch.tensor(0.0).to(self.device)
         
         # Perceiver loss
         obs_flat = observations.reshape(-1, self.image_size * self.image_size, self.input_channels)
@@ -1658,7 +1612,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
     
     def compute_total_loss(self, observations, actions=None, beta=1.0, 
                         entropy_weight=0.1, lambda_img=1.0, 
-                        lambda_pred=0.1, lambda_att=0.1, lambda_schema=0.1):
+                        lambda_pred=0.1, lambda_att=0.1):
         """
         Corrected loss computation recognizing that kumar_beta_kl already includes alpha prior KL
         """
@@ -1692,7 +1646,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         losses['attention_pred_bonus'] = outputs['future_att_bonus']
         
         # Auxiliary losses
-        losses['schema_consistency'] = outputs['schema_consistency_loss']
         losses['perceiver_loss'] = outputs['perceiver_loss']
         
         # === Total Loss (Minimizing Negative ELBO) ===
@@ -1707,7 +1660,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             beta * outputs['attention_dynamics_loss'] +  # Attention dynamics loss
             # Penalties (positive)
             losses['unused_penalty'] +
-            lambda_schema * losses['schema_consistency'] +
+            
             1.0 * losses['perceiver_loss'] +
             
             # Entropy (negative - we want to maximize diversity)
@@ -2094,8 +2047,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         # Combined latent adversarial loss
         total_latent_adv = (
             latent_adv_loss + 
-            0.2 * consistency_bonus + 
-            0.1 * sequence_bonus
+            0.9 * consistency_bonus + 
+            0.8 * sequence_bonus
         )
         
         # === Feature Matching Loss ===
@@ -2433,7 +2386,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                             lambda_img: float = 0.2,
                             lambda_pred: float = 0.1,
                             lambda_att: float = 0.1,
-                            lambda_schema: float = 0.1,
                             entropy_weight: float = 0.1) -> Dict[str, torch.Tensor]:
         """
         Complete training step for sequence data
@@ -2452,8 +2404,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         # 1. Forward pass and compute all VAE losses
         vae_losses, outputs = self.compute_total_loss(
             observations, actions, beta, entropy_weight, 
-            lambda_img, lambda_pred, lambda_att, lambda_schema
-        )
+            lambda_img, lambda_pred, lambda_att)
         
         # 2. Discriminator training
         
@@ -2617,11 +2568,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         # Combine hidden state and context for prior conditioning
         h_context = torch.cat([h_t, c_t], dim=-1)
         
-        # Transform through prior network
-        h_prior = self.prior_net(h_context)
-        
         # Get DPGMM prior distribution
-        prior_dist, prior_params = self.prior(h_prior)
+        prior_dist, prior_params = self.prior(h_context)
         
         # Sample from the mixture with temperature scaling
         if temperature > 0:
@@ -2748,17 +2696,16 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             generated_attention_coords.append(attention_coords)
             attention_features = torch.cat([attention_features, weighted_visual_features, attention_coords], dim=-1)
             # Feature extraction
-            phi_z = self.phi_z(z_0)
-            phi_c = self.phi_c(c_0)
+
             phi_attention = self.phi_attention(attention_features)
             phi_attention_mean, phi_attention_logvar = torch.chunk(phi_attention, 2, dim=-1)
             phi_attention_std = torch.exp(0.5 * phi_attention_logvar.clamp(min=-10, max=2))
             phi_attention = phi_attention_mean + phi_attention_std * torch.randn_like(phi_attention_std).to(device)
             attention_uncertainties.append(phi_attention_std.mean(dim=-1))
-            phi_a = self.phi_a(initial_action)
+
             
             # Update LSTM
-            rnn_input = torch.cat([phi_z, phi_c, phi_attention, phi_a], dim=-1)
+            rnn_input = torch.cat([z_0, c_0, phi_attention, initial_action], dim=-1)
             _, (h, c) = self._rnn(rnn_input, h, c, torch.ones(batch_size).to(device))
             
             current_h = h[-1]
@@ -2805,16 +2752,14 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                     attention_coords
                     ], dim=-1)
                 # Update VRNN state
-                phi_z = self.phi_z(z_next)
-                phi_c = self.phi_c(current_c_t)
                 phi_attention = self.phi_attention(attention_features)
                 phi_attention_mean, phi_attention_logvar = torch.chunk(phi_attention, 2, dim=-1)
                 phi_attention_std = torch.exp(0.5 * phi_attention_logvar.clamp(min=-10, max=2))
                 attention_uncertainties.append(phi_attention_std.mean(dim=-1))
                 phi_attention = phi_attention_mean + phi_attention_std * torch.randn_like(phi_attention_std).to(device)
-                phi_a = self.phi_a(current_action)
+
                 
-                rnn_input = torch.cat([phi_z, phi_c, phi_attention, phi_a], dim=-1)
+                rnn_input = torch.cat([z_next, current_c_t, phi_attention, current_action], dim=-1)
                 _, (h, c) = self._rnn(rnn_input, h, c, torch.ones(batch_size).to(device))
                 
                 current_h = h[-1]

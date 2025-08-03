@@ -564,7 +564,6 @@ class DMCVBTrainer:
                 lambda_img=self.config['lambda_img'],
                 lambda_pred=self.config['lambda_pred'],
                 lambda_att=self.config['lambda_att'],
-                lambda_schema=self.config['lambda_schema'],
                 entropy_weight=self.config['entropy_weight']
             )
             
@@ -916,11 +915,11 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 10,
-        'latent_dim': 24,
+        'max_components': 12,
+        'latent_dim': 28,
         'hidden_dim': 32, #mut be divisible by 8
         'context_dim': 20,
-        'attention_dim': 16,
+        'attention_dim': 20,
         'attention_resolution': 16,
         'input_channels': 3* 1,  # 3 stacked frames
         'HiP_type': 'Mini',
@@ -942,7 +941,6 @@ def main():
         'lambda_latent': 1.0,
         'lambda_pred': 2.0,
         'lambda_att': 2.0,
-        'lambda_schema': 1.0,
         'n_critic': 2,
         
         # Logging
