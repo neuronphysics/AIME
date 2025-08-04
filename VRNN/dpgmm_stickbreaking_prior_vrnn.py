@@ -1456,11 +1456,10 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                     movement_tensor = torch.stack([dx, dy], dim=1)
                     outputs['predicted_movements'].append(movement_tensor)
 
-                attention_kl = F.kl_div(
-                    F.log_softmax(attention_map.view(batch_size, -1), dim=-1),
-                    F.softmax(prior_attention.view(batch_size, -1), dim=-1),
-                    reduction='batchmean'
-                )
+                
+                q_dist = Categorical(probs=attention_map.view(batch_size, -1))
+                p_dist = Categorical(probs=prior_attention.view(batch_size, -1))
+                attention_kl = torch.distributions.kl_divergence(q_dist, p_dist).mean()
                 outputs['attention_losses'].append(attention_kl)
             
             # Total KL for this timestep
