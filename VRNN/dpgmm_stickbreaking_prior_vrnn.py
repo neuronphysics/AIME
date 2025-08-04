@@ -806,7 +806,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         self._init_attention_schema(attention_resolution)
         self._init_self_model()
         self._init_discriminators( img_disc_layers, latent_disc_layers, use_spectral_norm)
-
         # DP-GMM prior
         self.prior = DPGMMPrior(max_components, 
                                 self.latent_dim, 
@@ -880,8 +879,6 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
                                                               self.context_dim, 
                                                               device= self.device)
                 
-        
-        
 
     def _init_discriminators(self, img_disc_layers, latent_disc_layers, use_spectral_norm: bool):
         # Initialize discriminators
@@ -1005,6 +1002,74 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         elif isinstance(module, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
            nn.init.ones_(module.weight)
            nn.init.zeros_(module.bias)
+
+    def contrastive_loss(
+        self,
+        real_features: torch.Tensor,  # [B, T, D]
+        fake_features: torch.Tensor,   # [B, T, D]
+        temperature: float = 0.1,
+        alpha: float = 0.7,
+        temporal_margin: int = 5
+    ) -> torch.Tensor:
+        """
+        Combines:
+        1. Intra-video alignment: real_t with fake_t
+        2. Inter-video separation: keep videos from different batches apart
+        3. Temporal coherence with margin-based negatives
+        """
+        B, T, D = real_features.shape
+        if T < 2 or B < 2:
+            return torch.tensor(0.0, device=real_features.device)
+        
+        # 1. Normalize features
+        real_norm = F.normalize(real_features, p=2, dim=-1)
+        fake_norm = F.normalize(fake_features, p=2, dim=-1)
+        
+        # 2. Intra-video alignment (real_t to fake_t)
+        intra_sim = torch.einsum('btd,btd->bt', real_norm, fake_norm) / temperature
+        intra_loss = -intra_sim.mean()
+        
+        # 3. Inter-video separation - FIXED
+        # Average pool over time dimension
+        real_pooled = real_norm.mean(dim=1)  # [B, D]
+        fake_pooled = fake_norm.mean(dim=1)  # [B, D]
+        
+        # Compute similarity matrix between sequences
+        inter_sim = torch.matmul(real_pooled, fake_pooled.T) / temperature  # [B, B]
+        
+        # Diagonal should be high (same video), off-diagonal low (different videos)
+        inter_labels = torch.arange(B, device=real_features.device)
+        inter_loss = F.cross_entropy(inter_sim, inter_labels)
+        
+        # 4. Temporal coherence with margin-based negatives (THIS PART IS GOOD)
+        anchors = fake_norm[:, :-1]  # [B, T-1, D]
+        positives = fake_norm[:, 1:]  # [B, T-1, D]
+        
+        # Compute similarities
+        pos_sim = torch.sum(anchors * positives, dim=-1) / temperature  # [B, T-1]
+        neg_sim = torch.einsum('btd,bkd->btk', anchors, fake_norm) / temperature  # [B, T-1, T]
+        
+        # Mask negatives within temporal margin
+        time_indices = torch.arange(T, device=anchors.device)
+        time_diff = torch.abs(time_indices[:-1, None] - time_indices)  # [T-1, T]
+        mask = time_diff >= temporal_margin
+        mask = mask.unsqueeze(0).expand(B, -1, -1)  # [B, T-1, T]
+        
+        # Apply mask
+        neg_sim = neg_sim.masked_fill(~mask, -1e4)
+        
+        # Combine positive and negative logits
+        logits = torch.cat([pos_sim.unsqueeze(-1), neg_sim], dim=-1)  # [B, T-1, 1+T]
+        labels = torch.zeros(B, T-1, dtype=torch.long, device=logits.device)
+        
+        temporal_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), 
+            labels.view(-1)
+        )
+        
+        # Weighted combination
+        return alpha * (intra_loss + inter_loss) + (1 - alpha) * temporal_loss    
+
 
     def _setup_optimizers(self, learning_rate=1e-4, weight_decay=0.0001):
         """
@@ -1661,7 +1726,7 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
             # Penalties (positive)
             losses['unused_penalty'] +
             
-            1.0 * losses['perceiver_loss'] +
+            losses['perceiver_loss'] +
             
             # Entropy (negative - we want to maximize diversity)
             - entropy_weight * losses['cluster_entropy'] +
@@ -2014,22 +2079,20 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         fake_img_outputs = self.image_discriminator(reconstruction, return_features=True)
         img_adv_loss = -torch.mean(fake_img_outputs['final_score'])
         #reward for generating temporally consistent images
-        temporal_bonus = -fake_img_outputs['temporal_score'].mean()
-        
-        # Per-frame quality bonus
-        # Encourage consistent quality across all frames
-        per_frame_scores = fake_img_outputs['per_frame_scores'].squeeze(-1)  # [B, T]
-        frame_quality_bonus = -per_frame_scores.mean()
-        
-        # Variance penalty to encourage temporal smoothness
-        frame_variance_penalty = per_frame_scores.var(dim=1).mean()
+        #TODO:Fix this?
+        real_frame_features = x.reshape(x.shape[0], x.shape[1], -1)  # Flatten spatial dimensions
+        #TODO I want it to be fake image generated with size [B, T, C, H, W]
+        fake_frame_features = reconstruction.reshape(x.shape[0], x.shape[1], -1)
+
+        temporal_loss_frames =self.contrastive_loss(
+        real_features=real_frame_features,
+        fake_features=fake_frame_features
+        )
         
         # Combined image adversarial loss
         total_img_adv = (
-            img_adv_loss + 
-            0.2 * temporal_bonus + 
-            0.1 * frame_quality_bonus + 
-            0.1 * frame_variance_penalty
+            img_adv_loss +
+            temporal_loss_frames
         )
         
         # === Latent Adversarial Loss ===
@@ -2037,20 +2100,15 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         
         # Main adversarial loss
         latent_adv_loss = -fake_latent_outputs['final_score'].mean()
-        
-        # Temporal consistency bonus
-        consistency_bonus = -fake_latent_outputs['consistency_score'].mean()
-        
-        # Sequence quality bonus
-        sequence_bonus = -fake_latent_outputs['sequence_score'].mean()
-        
-        # Combined latent adversarial loss
-        total_latent_adv = (
-            latent_adv_loss + 
-            0.9 * consistency_bonus + 
-            0.8 * sequence_bonus
+        # Maximizes I(z_t; z_{t+1}) using contrastive predictive coding
+        temporal_loss_latents = self.contrastive_loss(
+        real_features=prior_z,  # [B, T, latent_dim]
+        fake_features=z,        # [B, T, latent_dim]
+        temperature=0.1,
+        alpha=0.5  # Balance between alignment and separation
         )
-        
+        # Add temporal consistency loss for latents
+        latent_adv_loss += temporal_loss_latents
         # === Feature Matching Loss ===
         # This helps stabilize training
         real_features = self.image_discriminator(x, return_features=True)['frame_features']
@@ -2058,8 +2116,8 @@ class DPGMMVariationalRecurrentEncoder(nn.Module):
         
         # L1 loss between feature statistics
         feature_match_loss = self.compute_feature_matching_loss(real_features, fake_features) 
-        
-        return total_img_adv, total_latent_adv, feature_match_loss    
+
+        return total_img_adv, latent_adv_loss, feature_match_loss
 
     def generator_step(
         self,
