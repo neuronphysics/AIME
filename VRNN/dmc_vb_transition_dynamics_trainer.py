@@ -1,4 +1,4 @@
-import torch
+import torch, torchvision
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -6,6 +6,7 @@ import numpy as np
 import h5py
 import random
 import os
+import gc
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 import wandb
@@ -16,7 +17,7 @@ import time
 import tensorflow as tf
 import zlib
 from torch.utils.tensorboard import SummaryWriter
-from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentEncoder
+from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoencoder
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
 
 class DMCVBInfo:
@@ -459,6 +460,79 @@ class DMCVBDataset(Dataset):
         
         return sample
 
+class GradientMonitor:
+    """Comprehensive gradient flow diagnostic system for hierarchical architectures"""
+    
+    def __init__(self, model, writer):
+        self.model = model
+        self.writer = writer
+        self.component_groups = self._define_component_hierarchy()
+        self.gradient_cache = {}
+        self.step_counter = 0
+        self.global_step = 0
+        
+    def _define_component_hierarchy(self):
+        """Establish semantic groupings for architectural components"""
+        return {
+            'encoder': ['encoder.net', 'encoder.proj'],
+            'decoder': ['decoder.net'],
+            'perceiver': ['perceiver_model', 'perceiver_projection'],
+            'prior_dynamics': ['prior.stick_breaking.kumar_net', 'prior.component_nn'],
+            'attention_schema': ['attention_prior_posterior'],
+            'vrnn_core': ['_rnn', 'rnn_layer_norm'],
+            'self_model': ['self_model'],
+            'discriminators': ['image_discriminator', 'latent_discriminator']
+        }
+    
+    def compute_component_gradients(self, update_global_step: bool = True) -> Dict[str, float]:
+        """Extract gradient magnitudes per architectural component"""
+        if update_global_step:
+            self.global_step += 1  
+        
+        component_grads = {}
+        for group_name, module_patterns in self.component_groups.items():
+            group_grad_norm = 0.0
+            param_count = 0
+            
+            for name, param in self.model.named_parameters():
+                if param.grad is not None and any(pattern in name for pattern in module_patterns):
+                    grad_norm = param.grad.data.norm(2).item()
+                    group_grad_norm += grad_norm ** 2
+                    param_count += 1
+                    
+                    # Track individual layer gradients for critical components
+                    if 'kumar' in name or 'attention' in name:
+                        if self.writer is not None:  
+                            self.writer.add_scalar(f'gradients/layers/{name}', grad_norm, self.global_step)
+            
+            if param_count > 0:
+                component_grads[group_name] = (group_grad_norm ** 0.5) / param_count
+        
+        return component_grads
+
+    def visualize_gradient_flow(self, component_grads, epoch):
+        """Generate comprehensive gradient flow visualization"""
+        # Create stacked bar chart for component contributions
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+        
+        components = list(component_grads.keys())
+        values = list(component_grads.values())
+        colors = plt.cm.viridis(np.linspace(0, 1, len(components)))
+        
+        # Gradient magnitude distribution
+        ax1.bar(components, values, color=colors)
+        ax1.set_ylabel('Gradient Norm (L2)')
+        ax1.set_title(f'Component-wise Gradient Distribution - Epoch {epoch}')
+        ax1.set_yscale('log')  # Log scale for better visibility
+        ax1.tick_params(axis='x', rotation=45)
+        # Relative contribution analysis
+        total_grad = sum(values)
+        percentages = [v/total_grad * 100 for v in values]
+        ax2.pie(percentages, labels=components, autopct='%1.1f%%', colors=colors)
+        ax2.set_title('Relative Gradient Contribution')
+        
+        self.writer.add_figure('gradient_analysis/component_distribution', fig, epoch)
+        plt.close()
 
 class DMCVBTrainer:
     """Trainer for DPGMM-VRNN on DMC Vision Benchmark"""
@@ -474,7 +548,6 @@ class DMCVBTrainer:
         self.device = device
         self.config = config
         self.data_dir = data_dir
-        
         # Setup datasets
         self.train_dataset = DMCVBDataset(
             data_dir=data_dir,
@@ -528,6 +601,7 @@ class DMCVBTrainer:
             print(f"TensorBoard logging to: {log_dir}")
         else:
             self.writer = None
+        self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
 
     def _try_init_wandb(self, config):
         """Attempt to initialize W&B, return success status"""
@@ -547,6 +621,9 @@ class DMCVBTrainer:
         """Train for one epoch"""
         self.model.train()
         epoch_metrics = defaultdict(list)
+        self.epoch_disc_losses = {'image': [], 'latent': []}
+
+        epoch_component_grads = defaultdict(list)
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch} [Train]')
         
@@ -566,7 +643,19 @@ class DMCVBTrainer:
                 lambda_att=self.config['lambda_att'],
                 entropy_weight=self.config['entropy_weight']
             )
-            
+            component_grads = self.grad_monitor.compute_component_gradients()
+            for component, grad_norm in component_grads.items():
+                epoch_component_grads[component].append(grad_norm)
+            if 'img_disc_loss' in losses:
+                self.epoch_disc_losses['image'].append(
+                losses['img_disc_loss'].item() if torch.is_tensor(losses['img_disc_loss']) 
+                else losses['img_disc_loss']
+                )
+            if 'latent_disc_loss' in losses:
+                self.epoch_disc_losses['latent'].append(
+                    losses['latent_disc_loss'].item() if torch.is_tensor(losses['latent_disc_loss']) 
+                    else losses['latent_disc_loss']
+                )
             # Track metrics
             for key, value in losses.items():
                 if isinstance(value, torch.Tensor):
@@ -582,7 +671,22 @@ class DMCVBTrainer:
         
         # Compute epoch averages
         avg_metrics = {f'train/{k}': np.mean(v) for k, v in epoch_metrics.items()}
-        
+        avg_img_disc_loss = np.mean(self.epoch_disc_losses['image']) 
+        self.model.img_disc_scheduler.step(avg_img_disc_loss)
+        avg_metrics['train/img_disc_lr'] = self.model.img_disc_optimizer.param_groups[0]['lr']
+        avg_latent_disc_loss = np.mean(self.epoch_disc_losses['latent']) 
+        self.model.latent_disc_scheduler.step(avg_latent_disc_loss)
+        avg_metrics['train/latent_disc_lr'] = self.model.latent_disc_optimizer.param_groups[0]['lr']
+        avg_component_grads = {
+                 component: np.mean(grads) 
+                 for component, grads in epoch_component_grads.items()
+       }
+        self.grad_monitor.visualize_gradient_flow(avg_component_grads, epoch)
+
+        # Log gradient norms to tensorboard
+        for component, grad_norm in avg_component_grads.items():
+            self.writer.add_scalar(f'gradients/components/{component}', grad_norm, epoch)
+
         return avg_metrics
     
     def evaluate(self, epoch: int) -> Dict[str, float]:
@@ -627,7 +731,18 @@ class DMCVBTrainer:
                 if 'self_predictions' in outputs:
                     pred_acc = self.compute_predictive_accuracy(outputs)
                     eval_metrics['predictive_accuracy'].append(pred_acc)
-        
+        if epoch %10 == 0:
+             with torch.no_grad():
+                 num_samples = 16
+                 samples =self.model.sample(num_samples)
+                 if self.use_wandb:
+                     wandb.log({
+                         'eval/samples': wandb.Image(
+                        torchvision.utils.make_grid(
+                            self.denormalize_image(samples), nrow=4, normalize=True, value_range=(0, 1)
+                        )
+                    )
+                     })
         # Compute averages
         avg_metrics = {f'eval/{k}': np.mean(v) for k, v in eval_metrics.items()}
         
@@ -852,7 +967,10 @@ class DMCVBTrainer:
         print(f"Starting training for {n_epochs} epochs...")
         print(f"Train dataset size: {len(self.train_dataset)}")
         print(f"Eval dataset size: {len(self.eval_dataset)}")
-        
+        # Register EMA model
+        #self.model.ema_encoder.register()
+        #self.model.ema_decoder.register()
+
         for epoch in range(n_epochs):
             # Update temperature
             self.model.update_temperature(epoch)
@@ -860,6 +978,7 @@ class DMCVBTrainer:
             
             # Train
             train_metrics = self.train_epoch(epoch)
+            
             
             # Evaluate
             eval_metrics = self.evaluate(epoch)
@@ -901,10 +1020,10 @@ class DMCVBTrainer:
 
 def main():
     """Main training script"""
+    torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')  # Enable TensorFloat32 cores
-    
+    torch.cuda.empty_cache()  
     # Additional foundational configurations
-    torch.backends.cudnn.benchmark = True  # Enable cuDNN autotuner
 
     # Configuration
     config = {
@@ -915,13 +1034,13 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 12,
-        'latent_dim': 28,
-        'hidden_dim': 32, #mut be divisible by 8
-        'context_dim': 20,
-        'attention_dim': 20,
+        'max_components': 10,
+        'latent_dim': 30,
+        'hidden_dim': 32, #must be divisible by 8
+        'context_dim': 36,
+        'attention_dim': 34,
         'attention_resolution': 16,
-        'input_channels': 3* 1,  # 3 stacked frames
+        'input_channels': 3*1,  # 3 stacked frames
         'HiP_type': 'Mini',
         
         # Training settings
@@ -930,17 +1049,18 @@ def main():
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
-        'learning_rate': 4e-5,
+        'learning_rate': 0.00008,
         'n_epochs': 400,
         'num_workers': 4,
         
         # Loss weights
         'beta': 1.0,
-        'entropy_weight': 0.8,
-        'lambda_img': 2.0,
-        'lambda_latent': 1.0,
-        'lambda_pred': 2.0,
-        'lambda_att': 2.0,
+        'entropy_weight': 1.0,
+        'lambda_img': 0.5,
+        'lambda_latent': 0.5,
+        'lambda_pred': 0.1,
+        'lambda_att': 0.1,
+        'grad_clip': 1.0,
         'n_critic': 2,
         
         # Logging
@@ -960,7 +1080,7 @@ def main():
     action_dim = DMCVBInfo.get_action_dim(config['domain_name'])
     
     # Initialize model
-    model = DPGMMVariationalRecurrentEncoder(
+    model = DPGMMVariationalRecurrentAutoencoder(
         max_components=config['max_components'],
         input_dim=config['img_height'],
         latent_dim=config['latent_dim'],
@@ -976,7 +1096,8 @@ def main():
         input_channels=config['input_channels'],
         learning_rate=config['learning_rate'],
         HiP_type=config['HiP_type'],
-        attention_resolution=config['attention_resolution']
+        attention_resolution=config['attention_resolution'],
+        grad_clip= config['grad_clip'],
     )
     
     # Initialize trainer

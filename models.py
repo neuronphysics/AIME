@@ -6,6 +6,11 @@ import logging
 import functools
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
+import numpy as np
+from einops import rearrange
+from torch.autograd import Function
+import collections.abc as abc
+
 class AddEpsilon(nn.Module):
     def __init__(self, eps):
         super().__init__()
@@ -77,7 +82,6 @@ class AttentionPosterior(nn.Module):
         input_channels: int = 3,
         feature_channels: int = 64,
         num_heads: int = 8,
-        use_dilated_conv: bool = True,
         device: Optional[torch.device] = torch.device("cpu" if not torch.cuda.is_available() else "cuda")
     ):
         super().__init__()
@@ -243,7 +247,7 @@ class AttentionPosterior(nn.Module):
         attention_logits = attention_logits.squeeze(-1)  # [B, H*W]
         
         # 9. Apply temperature and softmax
-        attention_logits = attention_logits / self.temperature
+        attention_logits = attention_logits / self.temperature.clamp(min=0.1, max=2.0)  # Clamp temperature for stability
         attention_probs = F.softmax(attention_logits, dim=-1)  # [B, H*W]
         
         # 10. Reshape back to 2D
@@ -521,6 +525,51 @@ class SaliencyAttentionBlock(nn.Module):
         x = x + self.layer_scale_2 * self.mlp(self.norm2(x))
         
         return x
+    
+
+class ConvGRUCell(nn.Module):
+
+    
+    def __init__(self,input_size,hidden_size,kernel_size,cuda_flag):
+        super(ConvGRUCell,self).__init__()
+        self.input_size  = input_size
+        self.cuda_flag   = cuda_flag
+        self.hidden_size = hidden_size
+        self.kernel_size = kernel_size
+        self.ConvGates   = nn.Conv2d(self.input_size + self.hidden_size,2 * self.hidden_size,kernel_size,padding=self.kernel_size//2)
+        self.Conv_ct     = nn.Conv2d(self.input_size + self.hidden_size,self.hidden_size,kernel_size,padding=self.kernel_size//2) 
+        dtype            = torch.FloatTensor
+        self.norm_gates = nn.GroupNorm(2, 2 * hidden_size)
+        self.norm_candidate = nn.GroupNorm(8, hidden_size)
+
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        # Xavier initialization for gates
+        nn.init.xavier_uniform_(self.ConvGates.weight, gain=0.5)
+        nn.init.xavier_uniform_(self.Conv_ct.weight, gain=0.5)
+
+        # Initialize biases to favor forgetting initially (stability)
+        nn.init.constant_(self.ConvGates.bias, 0.0)
+        nn.init.constant_(self.Conv_ct.bias, 0.0)
+
+    def forward(self,input: torch.Tensor, hidden: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if hidden is None:
+           size_h    = [input.data.size()[0],self.hidden_size] + list(input.data.size()[2:])
+           if self.cuda_flag  == True:
+              hidden    = torch.autograd.Variable(torch.zeros(size_h)).cuda() 
+           else:
+              hidden    = torch.autograd.Variable(torch.zeros(size_h))
+        c1           = self.norm_gates(self.ConvGates(torch.cat((input,hidden),1)))
+        (rt,ut)      = c1.chunk(2, 1)
+        reset_gate   = F.sigmoid(rt)
+        update_gate  = F.sigmoid(ut)
+        gated_hidden = torch.mul(reset_gate,hidden)
+        p1           = self.norm_candidate(self.Conv_ct(torch.cat((input,gated_hidden),1)))
+        ct           = F.tanh(p1)
+        next_h       = torch.mul(update_gate,hidden) + (1-update_gate)*ct
+        return next_h
+ 
 class AttentionPrior(nn.Module):
     """
     Attention-based spatial dynamics prediction using efficient self-attention
@@ -532,7 +581,6 @@ class AttentionPrior(nn.Module):
         hidden_dim: int = 256,
         latent_dim: int = 32,
         motion_kernels: int = 8,
-        use_separable_conv: bool = True,
         num_heads: int = 4,  # Reduced for efficiency
         feature_dim: int = 64,  # Internal feature dimension
         use_relative_position_bias: bool = True  # Whether to use relative position bias
@@ -549,37 +597,7 @@ class AttentionPrior(nn.Module):
         # === ORIGINAL COMPONENTS (PRESERVED) ===
         
         # Spatial attention dynamics modeling (kept for feature extraction)
-        if use_separable_conv:
-            self.spatial_dynamics = nn.Sequential(
-                # Depthwise convolution (spatial processing)
-                nn.Conv2d(1, 1, 5, padding=2, groups=1),
-                nn.GroupNorm(1, 1),
-                nn.SiLU(),
-                # Pointwise convolution (channel mixing)
-                nn.Conv2d(1, 16, 1),
-                nn.GroupNorm(4, 16),
-                nn.SiLU(),
-                # Another depthwise for larger receptive field
-                nn.Conv2d(16, 16, 5, padding=2, groups=16),
-                nn.GroupNorm(4, 16),
-                nn.SiLU(),
-                nn.Conv2d(16, 32, 1),
-                nn.GroupNorm(8, 32),
-                nn.SiLU()
-            )
-        else:
-            self.spatial_dynamics = nn.Sequential(
-                nn.Conv2d(1, 16, 3, padding=1),
-                nn.GroupNorm(4, 16),
-                nn.SiLU(),
-                nn.Conv2d(16, 32, 3, padding=1),
-                nn.GroupNorm(8, 32),
-                nn.SiLU(),
-                nn.Conv2d(32, 32, 3, padding=1),
-                nn.GroupNorm(8, 32),
-                nn.SiLU()
-            )
-        
+        self.spatial_dynamics = ConvGRUCell(input_size=1, hidden_size=32, kernel_size=5, cuda_flag=torch.cuda.is_available())
         # Motion prediction kernels (preserved)
         self.motion_kernels = nn.Parameter(
             torch.randn(motion_kernels, 1, 5, 5) * 0.01
@@ -652,9 +670,10 @@ class AttentionPrior(nn.Module):
         # FFN for processing attention output
         self.ffn = nn.Sequential(
             nn.Linear(feature_dim, feature_dim * 2),
+            nn.LayerNorm(feature_dim * 2),
             nn.SiLU(),
             nn.Dropout(0.1),
-            nn.Linear(feature_dim * 2, feature_dim)
+            nn.Linear(feature_dim * 2, feature_dim),
         )
         
         # Output projection to attention logits
@@ -776,6 +795,7 @@ class AttentionPrior(nn.Module):
             'predicted_movement': (dx, dy),
             'attention_logits': attention_logits.view(batch_size, H, W)
         }
+    
 class LinearResidual(nn.Module):
     def __init__(
         self,
@@ -852,159 +872,6 @@ class LinearResidual(nn.Module):
         residual = self.residual_projection(x)
         return self.fn(residual) + residual
 
-
-class ResidualBlock(nn.Module):
-    def __init__(
-        self,
-        n_channels,
-        *,
-        num_layers=2,
-        kernel_size=3,
-        dilation=1,
-        groups=1,
-        rezero=True,
-    ):
-        super().__init__()
-        ch = n_channels
-        assert kernel_size % 2 == 1
-        pad = kernel_size // 2
-        layers = []
-        for i in range(num_layers):
-            layers.extend(
-                [
-                    nn.SiLU(),
-                    nn.Conv2d(
-                        ch,
-                        ch,
-                        kernel_size=kernel_size,
-                        padding=pad,
-                        dilation=dilation,
-                        groups=groups,
-                    ),
-                    nn.GroupNorm(1, ch),  # <--- Insert norm here
-                ]
-            )
-        self.net = nn.Sequential(*layers)
-        if rezero:
-            self.gate = nn.Parameter(torch.tensor(0.0))
-        else:
-            self.gate = 1.0
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return inputs + self.net(inputs) * self.gate
-
-
-def log_residual_stack_structure(
-    channel_size_per_layer: List[int],
-    layers_per_block_per_layer: List[int],
-    downsample: int,
-    num_layers_per_resolution: List[int],
-    encoder: bool = True,
-) -> List[str]:
-    logging.debug(f"Creating structure with {downsample} downsamples.")
-    out = []
-
-    assert len(channel_size_per_layer) == sum(num_layers_per_resolution)
-    assert downsample <= len(num_layers_per_resolution)
-
-    layer = 0
-
-    for block_num, num_layers in enumerate(num_layers_per_resolution):
-        for _ in range(num_layers):
-            out.append(
-                "Residual Block with "
-                "{} channels and "
-                "{} layers.".format(
-                    channel_size_per_layer[layer], layers_per_block_per_layer[layer]
-                )
-            )
-            layer += 1
-            # if it's not the last layer, check if the next one has more channels and connect them
-            # using a conv layer
-            if layer < len(channel_size_per_layer):
-                if channel_size_per_layer[layer] != channel_size_per_layer[layer - 1]:
-                    out.append(
-                        "Con2d layer with "
-                        "{} input channels and "
-                        "{} output channels".format(
-                            channel_size_per_layer[layer - 1],
-                            channel_size_per_layer[layer],
-                        )
-                    )
-                    # safe_channel_change(channel_size_per_layer, layer, encoder)
-
-        # after the residual block, check if down-sampling (or up-sampling) is required
-        if encoder:
-            if downsample > 0:
-                out.append("Avg Pooling layer.")
-                downsample -= 1
-        else:
-            if block_num + downsample > (len(num_layers_per_resolution) - 1):
-                out.append("Interpolation layer.")
-
-    return out
-
-
-def build_residual_stack(
-    channel_size_per_layer: List[int],
-    layers_per_block_per_layer: List[int],
-    downsample: int,
-    num_layers_per_resolution: List[int],
-    encoder: bool = True,
-) -> List[nn.Module]:
-    logging.debug(
-        "\n".join(
-            log_residual_stack_structure(
-                channel_size_per_layer=channel_size_per_layer,
-                layers_per_block_per_layer=layers_per_block_per_layer,
-                downsample=downsample,
-                num_layers_per_resolution=num_layers_per_resolution,
-                encoder=encoder,
-            )
-        )
-    )
-    layers = []
-
-    assert len(channel_size_per_layer) == sum(num_layers_per_resolution)
-    assert downsample <= len(num_layers_per_resolution)
-
-    layer = 0
-
-    for block_num, num_layers in enumerate(num_layers_per_resolution):
-        for _ in range(num_layers):
-            # add a residual block with the required number of channels and layers
-            layers.append(
-                ResidualBlock(
-                    channel_size_per_layer[layer],
-                    num_layers=layers_per_block_per_layer[layer],
-                )
-            )
-            layers.append(nn.GroupNorm(1, channel_size_per_layer[layer]))
-            layer += 1
-            # if it's not the last layer, check if the next one has more channels and connect them
-            # using a conv layer
-            if layer < len(channel_size_per_layer):
-                if channel_size_per_layer[layer] != channel_size_per_layer[layer - 1]:
-                    # safe_channel_change(channel_size_per_layer, layer, encoder)
-
-                    in_channels = channel_size_per_layer[layer - 1]
-                    out_channels = channel_size_per_layer[layer]
-                    layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=1))
-
-        # after the residual blocks, check if down-sampling (or up-sampling) is required
-        if encoder:
-            if downsample > 0:
-                layers.append(
-                    nn.AvgPool2d(kernel_size=2, stride=2),
-                )
-                downsample -= 1
-        else:
-            if block_num + downsample > (len(num_layers_per_resolution) - 1):
-                layers.append(
-                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-                )
-
-    return layers
 
 class attentionBlock(nn.Module):
     def __init__(self, n_emb, n_heads=4):
@@ -1315,6 +1182,48 @@ class TransformerBlock(nn.Module):
         m = self.mlp
         x = x + m.dropout(m.c_proj(m.act(m.c_fc(self.ln_2(x)))))
         return x
+
+class EMA:
+    def __init__(self, model, decay=0.999, use_num_updates=True):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        self.num_updates = 0
+        self.use_num_updates = use_num_updates
+        self.register()
+    
+    def register(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self):
+        if self.use_num_updates:
+            self.num_updates += 1
+            decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        else:
+            decay = self.decay
+            
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - decay) * param.data + decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+    
+    def apply_shadow(self):
+        """Apply EMA parameters for evaluation"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+    
+    def restore(self):
+        """Restore original parameters after evaluation"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
 
 class TemporalDiscriminator(nn.Module):
     """
@@ -1665,6 +1574,340 @@ class TemporalLatentDiscriminator(nn.Module):
             outputs['features'] = features
 
         return outputs
+##########################################################################################
+# The following lines define the Variational Autoencoder (VAE) encoder and decoder for image data.
+##########################################################################################
+
+class UpFirDn2d(Function):
+    @staticmethod
+    def forward(ctx, input, kernel, up, down, pad):
+        up_x, up_y = up
+        down_x, down_y = down
+        pad_x0, pad_x1, pad_y0, pad_y1 = pad
+        kernel_h, kernel_w = kernel.shape
+        batch, channel, in_h, in_w = input.shape
+        ctx.in_size = input.shape
+        
+        input = input.reshape(-1, in_h, in_w, 1)
+        if not input.is_contiguous():
+            input = input.contiguous()
+            
+        ctx.save_for_backward(kernel, torch.flip(kernel, [0, 1]))
+        
+        out_h = (in_h * up_y + pad_y0 + pad_y1 - kernel_h + down_y) // down_y
+        out_w = (in_w * up_x + pad_x0 + pad_x1 - kernel_w + down_x) // down_x
+        ctx.out_size = (out_h, out_w)
+        ctx.up = (up_x, up_y)
+        ctx.down = (down_x, down_y)
+        ctx.pad = (pad_x0, pad_x1, pad_y0, pad_y1)
+        
+        # Use native implementation for both CPU and GPU
+        out = upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, 
+                              pad_x0, pad_x1, pad_y0, pad_y1)
+        out = out.view(-1, channel, out_h, out_w)
+        return out
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        kernel, grad_kernel = ctx.saved_tensors
+        grad_input = None
+        
+        if ctx.needs_input_grad[0]:
+            grad_output_reshaped = grad_output.reshape(-1, ctx.out_size[0], ctx.out_size[1], 1)
+            up_x, up_y = ctx.down  # Swap up and down for backward
+            down_x, down_y = ctx.up
+            pad_x0, pad_x1, pad_y0, pad_y1 = ctx.pad
+            kernel_h, kernel_w = grad_kernel.shape
+            
+            # Calculate padding for backward pass
+            g_pad_x0 = kernel_w - pad_x0 - 1
+            g_pad_y0 = kernel_h - pad_y0 - 1
+            g_pad_x1 = ctx.in_size[3] * ctx.up[0] - ctx.out_size[1] * ctx.down[0] + pad_x0 - ctx.up[0] + 1
+            g_pad_y1 = ctx.in_size[2] * ctx.up[1] - ctx.out_size[0] * ctx.down[1] + pad_y0 - ctx.up[1] + 1
+            
+            grad_input = upfirdn2d_native(grad_output_reshaped, grad_kernel, 
+                                         up_x, up_y, down_x, down_y,
+                                         g_pad_x0, g_pad_x1, g_pad_y0, g_pad_y1)
+            grad_input = grad_input.view(ctx.in_size[0], ctx.in_size[1], 
+                                        ctx.in_size[2], ctx.in_size[3])
+        
+        return grad_input, None, None, None, None
+
+def upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, 
+                     pad_x0, pad_x1, pad_y0, pad_y1):
+    """Native implementation of upfirdn2d"""
+    _, in_h, in_w, minor = input.shape
+    kernel_h, kernel_w = kernel.shape
+    
+    # Upsample by inserting zeros
+    out = input.view(-1, in_h, 1, in_w, 1, minor)
+    out = F.pad(out, [0, 0, 0, up_x - 1, 0, 0, 0, up_y - 1])
+    out = out.view(-1, in_h * up_y, in_w * up_x, minor)
+    
+    # Pad
+    out = F.pad(out, [0, 0, max(pad_x0, 0), max(pad_x1, 0), 
+                     max(pad_y0, 0), max(pad_y1, 0)])
+    out = out[:, 
+              max(-pad_y0, 0) : out.shape[1] - max(-pad_y1, 0),
+              max(-pad_x0, 0) : out.shape[2] - max(-pad_x1, 0), :]
+    
+    # Apply FIR filter (convolution)
+    out = out.permute(0, 3, 1, 2)
+    out = out.reshape([-1, 1, in_h * up_y + pad_y0 + pad_y1, 
+                      in_w * up_x + pad_x0 + pad_x1])
+    w = torch.flip(kernel, [0, 1]).view(1, 1, kernel_h, kernel_w)
+    out = F.conv2d(out, w)
+    
+    # Reshape
+    out = out.reshape(-1, minor,
+                     in_h * up_y + pad_y0 + pad_y1 - kernel_h + 1,
+                     in_w * up_x + pad_x0 + pad_x1 - kernel_w + 1)
+    out = out.permute(0, 2, 3, 1)
+    
+    # Downsample
+    out = out[:, ::down_y, ::down_x, :]
+    
+    out_h = (in_h * up_y + pad_y0 + pad_y1 - kernel_h + down_y) // down_y
+    out_w = (in_w * up_x + pad_x0 + pad_x1 - kernel_w + down_x) // down_x
+    
+    return out.view(-1, minor, out_h, out_w).permute(0, 2, 3, 1).reshape(-1, out_h, out_w, minor)
+
+def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
+    """Main interface for upfirdn2d operation"""
+    if not isinstance(up, abc.Iterable):
+        up = (up, up)
+    if not isinstance(down, abc.Iterable):
+        down = (down, down)
+    if len(pad) == 2:
+        pad = (pad[0], pad[1], pad[0], pad[1])
+    
+    # Use custom autograd Function
+    out = UpFirDn2d.apply(input, kernel, up, down, pad)
+    return out
+
+def get_haar_wavelet(in_channels):
+    """Generate Haar wavelet kernels"""
+    haar_wav_l = 1 / (2 ** 0.5) * torch.ones(1, 2)
+    haar_wav_h = 1 / (2 ** 0.5) * torch.ones(1, 2)
+    haar_wav_h[0, 0] = -1 * haar_wav_h[0, 0]
+    
+    haar_wav_ll = haar_wav_l.T * haar_wav_l
+    haar_wav_lh = haar_wav_h.T * haar_wav_l
+    haar_wav_hl = haar_wav_l.T * haar_wav_h
+    haar_wav_hh = haar_wav_h.T * haar_wav_h
+    
+    return haar_wav_ll, haar_wav_lh, haar_wav_hl, haar_wav_hh
+
+class HaarTransform(nn.Module):
+    """Haar wavelet transform for downsampling"""
+    def __init__(self, in_channels):
+        super().__init__()
+        
+        ll, lh, hl, hh = get_haar_wavelet(in_channels)
+        
+        self.register_buffer('ll', ll)
+        self.register_buffer('lh', lh)
+        self.register_buffer('hl', hl)
+        self.register_buffer('hh', hh)
+        
+    def forward(self, input):
+        ll = upfirdn2d(input, self.ll, down=2)
+        lh = upfirdn2d(input, self.lh, down=2)
+        hl = upfirdn2d(input, self.hl, down=2)
+        hh = upfirdn2d(input, self.hh, down=2)
+        
+        return torch.cat((ll, lh, hl, hh), 1)
+
+class InverseHaarTransform(nn.Module):
+    """Inverse Haar wavelet transform for upsampling"""
+    def __init__(self, in_channels):
+        super().__init__()
+        
+        ll, lh, hl, hh = get_haar_wavelet(in_channels)
+        self.register_buffer('ll', ll)
+        self.register_buffer('lh', -lh)
+        self.register_buffer('hl', -hl)
+        self.register_buffer('hh', hh)
+        
+    def forward(self, input):
+        ll, lh, hl, hh = input.chunk(4, 1)
+        ll = upfirdn2d(ll, self.ll, up=2, pad=(1, 0, 1, 0))
+        lh = upfirdn2d(lh, self.lh, up=2, pad=(1, 0, 1, 0))
+        hl = upfirdn2d(hl, self.hl, up=2, pad=(1, 0, 1, 0))
+        hh = upfirdn2d(hh, self.hh, up=2, pad=(1, 0, 1, 0))
+        
+        return ll + lh + hl + hh    
+    
+
+class ResidualBlock(nn.Module):
+    def __init__(
+        self,
+        n_channels,
+        *,
+        num_layers=2,
+        kernel_size=3,
+        dilation=1,
+        groups=1,
+        rezero=True,
+    ):
+        super().__init__()
+        ch = n_channels
+        assert kernel_size % 2 == 1
+        pad = kernel_size // 2
+        layers = []
+        for i in range(num_layers):
+            layers.extend(
+                [
+                    nn.Conv2d(
+                        ch,
+                        ch,
+                        kernel_size=kernel_size,
+                        padding=pad,
+                        dilation=dilation,
+                        groups=groups,
+                    ),
+                    nn.InstanceNorm2d(ch),  # <--- Insert norm here
+                ]
+            )
+            layers.append(nn.PReLU())
+        self.net = nn.Sequential(*layers)
+        if rezero:
+            self.gate = nn.Parameter(torch.tensor(0.9))
+        else:
+            self.gate = 1.0
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return inputs + self.net(inputs) * self.gate
+
+
+def log_residual_stack_structure(
+    channel_size_per_layer: List[int],
+    layers_per_block_per_layer: List[int],
+    downsample: int,
+    num_layers_per_resolution: List[int],
+    encoder: bool = True,
+) -> List[str]:
+    logging.debug(f"Creating structure with {downsample} downsamples.")
+    out = []
+
+    assert len(channel_size_per_layer) == sum(num_layers_per_resolution)
+    assert downsample <= len(num_layers_per_resolution)
+
+    layer = 0
+
+    for block_num, num_layers in enumerate(num_layers_per_resolution):
+        for _ in range(num_layers):
+            out.append(
+                "Residual Block with "
+                "{} channels and "
+                "{} layers.".format(
+                    channel_size_per_layer[layer], layers_per_block_per_layer[layer]
+                )
+            )
+            
+            layer += 1
+            # if it's not the last layer, check if the next one has more channels and connect them
+            # using a conv layer
+            if layer < len(channel_size_per_layer):
+                if channel_size_per_layer[layer] != channel_size_per_layer[layer - 1]:
+                    out.append(
+                        "Con2d layer with "
+                        "{} input channels and "
+                        "{} output channels".format(
+                            channel_size_per_layer[layer - 1],
+                            channel_size_per_layer[layer],
+                        )
+                    )
+                    # safe_channel_change(channel_size_per_layer, layer, encoder)
+
+        # after the residual block, check if down-sampling (or up-sampling) is required
+        if encoder:
+            if downsample > 0:
+                out.append("Avg Pooling layer.")
+                downsample -= 1
+        else:
+            if block_num + downsample > (len(num_layers_per_resolution) - 1):
+                out.append("Interpolation layer.")
+
+    return out
+
+    
+def build_residual_stack(
+    channel_size_per_layer: List[int],
+    layers_per_block_per_layer: List[int],
+    downsample: int,
+    num_layers_per_resolution: List[int],
+    encoder: bool = True,
+
+) -> List[nn.Module]:
+    logging.debug(
+        "\n".join(
+            log_residual_stack_structure(
+                channel_size_per_layer=channel_size_per_layer,
+                layers_per_block_per_layer=layers_per_block_per_layer,
+                downsample=downsample,
+                num_layers_per_resolution=num_layers_per_resolution,
+                encoder=encoder,
+            )
+        )
+    )
+    layers = []
+
+    assert len(channel_size_per_layer) == sum(num_layers_per_resolution)
+    assert downsample <= len(num_layers_per_resolution)
+
+    layer = 0
+
+    for block_num, num_layers in enumerate(num_layers_per_resolution):
+        for _ in range(num_layers):
+            # add a residual block with the required number of channels and layers
+            layers.append(
+                ResidualBlock(
+                    channel_size_per_layer[layer],
+                    num_layers=layers_per_block_per_layer[layer],
+                )
+            )
+            layers.append(nn.InstanceNorm2d(channel_size_per_layer[layer]))
+            block_end_channels = channel_size_per_layer[layer]
+            layer += 1
+            # if it's not the last layer, check if the next one has more channels and connect them
+            # using a conv layer
+            if layer < len(channel_size_per_layer):
+                if channel_size_per_layer[layer] != channel_size_per_layer[layer - 1]:
+                    # safe_channel_change(channel_size_per_layer, layer, encoder)
+
+                    in_channels = channel_size_per_layer[layer - 1]
+                    out_channels = channel_size_per_layer[layer]
+                    layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=1))
+                    block_end_channels = out_channels
+        # after the residual blocks, check if down-sampling (or up-sampling) is required
+        if encoder:
+            if downsample > 0:
+                current_channels = block_end_channels
+                layers.append(HaarTransform(current_channels))
+                next_channel = channel_size_per_layer[layer] if layer < len(channel_size_per_layer) else current_channels
+                # After wavelet, we have 4x channels, project back
+                layers.append(nn.Conv2d(current_channels * 4, next_channel, 1))
+                
+                #layers.append(nn.AvgPool2d(kernel_size=2, stride=2),)
+                downsample -= 1
+        else:
+            if block_num + downsample > (len(num_layers_per_resolution) - 1):
+                current_channels = block_end_channels
+                # Prepare for inverse wavelet (need 4x channels)
+            
+                if layer < len(channel_size_per_layer):
+                    next_channel = channel_size_per_layer[layer]
+                else:
+                    next_channel = current_channels
+                layers.append(nn.Conv2d(current_channels, current_channels * 4, 1))
+                layers.append(InverseHaarTransform(current_channels))
+                if next_channel != current_channels:
+
+                        layers.append(nn.Conv2d(current_channels, next_channel, kernel_size=1 ))
+                #layers.append(nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False))
+
+    return layers
 
 class VAEEncoder(torch.nn.Module):
     def __init__(
@@ -1690,6 +1933,7 @@ class VAEEncoder(torch.nn.Module):
         # conv layers
         layers = [
             nn.Conv2d(input_channels, channel_size, 5, padding=2, stride=2),
+            nn.InstanceNorm2d(channel_size),
             nn.GELU(),
         ]
         
@@ -1711,14 +1955,13 @@ class VAEEncoder(torch.nn.Module):
                 nn.Flatten(),
                 nn.GELU(),
                 nn.Linear(mlp_input_size, mlp_hidden_size),
-                nn.GELU(),
                 nn.LayerNorm(mlp_hidden_size),
+                nn.GELU(),
             ]
         )
 
         self.net = nn.Sequential(*layers)
-        self.mu  = nn.Linear(mlp_hidden_size, latent_size)
-        self.logvar = nn.Linear(mlp_hidden_size, latent_size)
+        self.proj  = nn.Linear(mlp_hidden_size, 2*latent_size)
         
     def gradient_checkpointing_enable(self):
         for module in self.net:
@@ -1727,11 +1970,11 @@ class VAEEncoder(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> dict:
         self.hlayer = self.net(x)
-        mean = self.mu(self.hlayer)
-        logvar = self.logvar(self.hlayer)
+        mean, logvar = self.proj(self.hlayer).chunk(2, dim=-1)
+        logvar = torch.clamp(logvar, -10.0, 2.0)  # numerical stability
         sigma = (logvar * 0.5).exp()
-        latent_normal = torch.distributions.Normal(mean, sigma)
-        z = latent_normal.rsample()  # [Batch size, Latent size]
+        eps= torch.randn_like(sigma)
+        z = mean + eps * sigma
         return z, mean, logvar
 
 
@@ -1751,8 +1994,7 @@ class VAEDecoder(torch.nn.Module):
     ):
         super().__init__()
         # Add memory-efficient settings
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
+        
         # compute final width and height of feature maps
         inner_width = width // (2**downsample)
         inner_height = height // (2**downsample)
@@ -1764,8 +2006,10 @@ class VAEDecoder(torch.nn.Module):
         layers.extend(
             [
                 nn.Linear(latent_size, mlp_hidden_size),
+                nn.LayerNorm(mlp_hidden_size),
                 nn.GELU(),
                 nn.Linear(mlp_hidden_size, mlp_input_size),
+                nn.LayerNorm(mlp_input_size),
                 nn.Unflatten(
                     1,
                     unflattened_size=(
@@ -1788,9 +2032,9 @@ class VAEDecoder(torch.nn.Module):
                 encoder=False,
             )
         )
-        layers.append(nn.BatchNorm2d(channel_size_per_layer[-1]))
+        layers.append(nn.InstanceNorm2d(channel_size_per_layer[-1]))
         layers.append(nn.GELU())
-        final_conv = nn.Conv2d(channel_size_per_layer[-1], input_channels, 5, padding=2)
+        final_conv = torch.nn.utils.spectral_norm(nn.Conv2d(channel_size_per_layer[-1], input_channels, 5, padding=2))
         
         layers.extend([
                         final_conv,
@@ -1804,19 +2048,41 @@ class VAEDecoder(torch.nn.Module):
             if hasattr(module, 'gradient_checkpointing_enable'):
                 module.gradient_checkpointing_enable()
                 
-    @torch.compile  # Add torch.compile for faster inference
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-def compute_feature_matching_loss( real_features, fake_features, lambda_feat=1.0):
-    """Compute feature matching loss between real and fake image features"""
-    feat_match_loss = 0.0
-    num_layers = len(real_features)
-    
-    # Match mean activations for each layer
-    for i in range(num_layers):
-        real_mean = real_features[i].mean(dim=[0,2,3]) # Average across batch and spatial dims
-        fake_mean = fake_features[i].mean(dim=[0,2,3])
-        feat_match_loss += torch.nn.functional.l1_loss(fake_mean, real_mean.detach())
+##### Self modeling Blocks #####
+class SelfModelTransformerBlock(nn.Module):
+    def __init__(self, z_dim, A_dim, a_dim, c_dim, h_dim, d=256, nhead=4, ff=512, dropout=0.2):
+        super().__init__()
+        def proj(in_dim): return nn.Sequential(nn.Linear(in_dim, d), nn.LayerNorm(d))
+        self.Pz, self.PA, self.Pa, self.Pc, self.Ph = map(proj, [z_dim, A_dim, a_dim, c_dim, h_dim])
+        #modality specific type embeddings
+        self.type_embed = nn.Parameter(torch.randn(5, d) * 0.02)
+        self.query_h = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        self.query_A = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         
-    return lambda_feat * feat_match_loss / num_layers
+        self.time_proj = nn.Sequential(
+                                       nn.Linear(1, d//2), 
+                                       nn.LayerNorm(d//2), 
+                                       nn.SiLU(), 
+                                       nn.Linear(d//2, d)
+                                       )  # optional Δt token
+        self.block = nn.TransformerEncoderLayer(d_model=d, nhead=nhead, dim_feedforward=ff,
+                                                dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
+        self.head_h = nn.Sequential(nn.Linear(d+ h_dim, d//2), nn.LayerNorm(d//2), nn.SiLU(), nn.Dropout(dropout), nn.Linear(d//2, 2*h_dim))
+        self.head_A = nn.Sequential(nn.Linear(d+ A_dim, d//2), nn.LayerNorm(d//2), nn.SiLU(), nn.Dropout(dropout), nn.Linear(d//2, 2*A_dim))
+
+    def forward(self, z_t, A_t, a_t, c_t, h_t, current_time=None):
+        toks = torch.stack([self.Pz(z_t), self.PA(A_t), self.Pa(a_t), self.Pc(c_t), self.Ph(h_t)], dim=1)
+        toks = toks + self.type_embed.unsqueeze(0)
+        qs = torch.cat([self.query_h.expand(z_t.size(0), -1, -1),
+                        self.query_A.expand(z_t.size(0), -1, -1)], dim=1)
+        if current_time is not None:
+            t_tok = self.time_proj(current_time.view(-1,1)).unsqueeze(1)   # time token
+            toks = torch.cat([toks, t_tok], dim=1)
+        y = self.block(torch.cat([toks, qs], dim=1))
+        Qh, QA = y[:, -2, :], y[:, -1, :]
+        mh, lvh = self.head_h(torch.cat([Qh, h_t], dim=-1)).chunk(2, -1)
+        mA, lvA = self.head_A(torch.cat([QA, A_t], dim=-1)).chunk(2, -1)
+        return mh, lvh.clamp(min=-8.0, max=2.0), mA, lvA.clamp(min=-8.0, max=2.0)

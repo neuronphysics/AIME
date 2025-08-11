@@ -28,7 +28,9 @@ def conv_1d(input_channels: int, output_channels: int, init_scale: float = 1.0, 
     layer = nn.Linear(in_features=input_channels, out_features=output_channels, bias=with_bias)
     # Initialize weights and biases
     # init.normal_(layer.weight, mean=0.0, std=init_scale)
-    nn.init.xavier_normal_(layer.weight)
+    init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='relu')
+    if init_scale != 1.0:
+        layer.weight.data *= init_scale
     if with_bias:
         init.zeros_(layer.bias)
     return layer
@@ -61,68 +63,44 @@ def get_activation(activation_name: str):
 
 
 def attend(q, k, v, dropout_prob=0.0, attention_mask=None):
-    """Computes multi-head attention using a query, key and value with linear time complexity.
+    """Computes multi-head attention using a query, key and value.
+
     ... indicates multiple batch / group dimensions.
-    
+
     Args:
       q: Query with shape [..., q_indices, num_heads, head_dim].
       k: Key with shape [..., kv_indices, num_heads, head_dim].
       v: Value with shape [..., kv_indices, num_heads, head_dim].
-      dropout_prob: dropout probability on the attention weights.
+        dropout_prob: dropout probability on the attention weights.
       attention_mask: Array of shape [..., q_indices, kv_indices] indicating
         which keys/vals each query can attend to.
-    
     Returns:
        Output of the attention with shape [..., q_indices, hiddens]
     """
-    # 1. Handle arbitrary batch dimensions
-    orig_shape = q.shape
-    batch_dims = orig_shape[:-3]
-    q_indices, num_heads, head_dim = orig_shape[-3:]
-    kv_indices = k.shape[-3]
-    
-    # Reshape to format expected by xFormers [batch, seq_len, heads, dim]
-    batch_size = math.prod(batch_dims) if batch_dims else 1
-    q_flat = q.reshape(batch_size, q_indices, num_heads, head_dim).contiguous()
-    k_flat = k.reshape(batch_size, kv_indices, num_heads, head_dim).contiguous()
-    v_flat = v.reshape(batch_size, kv_indices, num_heads, head_dim).contiguous()
-    
-    # 2. Handle attention mask
+    num_head_channels = q.size(-1)
+    attention = torch.einsum('...nhc,...mhc->...hnm', q, k)
+    attention *= 1. / math.sqrt(num_head_channels)
+
     if attention_mask is not None:
-        # Reshape mask to match flattened batch dimensions
-        mask_flat = attention_mask.reshape(batch_size, q_indices, kv_indices)
-        
-        # Create attention bias for xFormers (-inf for masked positions)
-        # In the original, 0 means "don't attend here", so we need to invert the mask
-        attn_bias = torch.zeros_like(mask_flat, dtype=q.dtype)
-        attn_bias = attn_bias.masked_fill(mask_flat == 0, float('-inf'))
-        
-        # Save wipe_attn for later use (queries with all positions masked)
-        wipe_attn = torch.all(mask_flat == 0, dim=-1, keepdim=True)
-    else:
-        attn_bias = None
-        wipe_attn = None
-    
-    # 3. Call xFormers memory_efficient_attention
-    # Scale is applied internally in memory_efficient_attention
-    scale = 1.0 / math.sqrt(head_dim)
-    output = memory_efficient_attention(
-        q_flat, k_flat, v_flat,
-        attn_bias=attn_bias,
-        p=dropout_prob,
-        scale=scale
-    )
-    
-    # 4. Reshape back to original format
-    output = output.reshape(*batch_dims, q_indices, num_heads * head_dim)
-    
-    # 5. Apply the wipe_attn logic (zero out queries with all positions masked)
-    # This matches the behavior in the original implementation
+        attention = attention.masked_fill(
+            attention_mask.unsqueeze(-3) == 0,  # 0 means mask
+            float('-inf')
+        )
+
+    normalized = func.softmax(attention, dim=-1)
+    if dropout_prob > 0:
+        dropout_layer = torch.nn.Dropout(dropout_prob)
+        normalized = dropout_layer(normalized)
+
+    summed = torch.einsum('...hnm,...mhd->...nhd', normalized, v)
+
+    # Concatenate heads
+    summed = summed.flatten(start_dim=-2)
+
     if attention_mask is not None:
-        wipe_attn = wipe_attn.reshape(*batch_dims, q_indices, 1)
-        output = torch.where(wipe_attn, torch.zeros_like(output), output)
-    
-    return output
+        wipe_attn = torch.all(attention_mask == 0, dim=-1, keepdim=True)
+        summed = torch.where(wipe_attn, torch.zeros_like(summed), summed)
+    return summed
 
 
 def assign_groups_to_modalities(

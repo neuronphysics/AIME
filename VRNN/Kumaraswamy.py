@@ -34,10 +34,10 @@ class KumaraswamyStableLogPDF(torch.autograd.Function):
             
             # HAZARD: The largest expressible number in float32 is ~3.41e38. Then if x below 1e-38, 1/x is 
             # above 1e38, producing inf. Simple fix: clamp 1/x to large representable number.
-            x_inv = (1 / x).clamp(max=1e12) # TODO: adjust for single vs double precision
+            x_inv = (1 / x).clamp(max=torch.finfo(x.dtype).max) # TODO: adjust for single vs double precision
 
             # HAZARD: The largest expressible number in float32 is ~3.41e38. if exp_arg is above 87, exp(exp_arg) is inf
-            exp_arg = torch.clamp(log_a + am1 * log_x - z, max=87.0) # TODO: adjust for single vs double precision
+            exp_arg = torch.clamp(log_a + am1 * log_x - z, min= -87.0, max=87.0) # TODO: adjust for single vs double precision
             
             grad_x_contrib = am1 * x_inv - bm1 * exp(exp_arg)
             grad_x = grad_output * grad_x_contrib
