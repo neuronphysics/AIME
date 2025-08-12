@@ -1108,21 +1108,21 @@ class LatentDiscriminator(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-
+###################################################################
+############ Image Temporal Discriminator Modules #################
+###################################################################
 
 class CausalSelfAttention(nn.Module):
     """
     Causal self-attention with proper masking for temporal discrimination
     """
-    def __init__(self, n_embd, n_head, attn_pdrop=0.1, resid_pdrop=0.1, 
-                 sequence_length=128):
+    def __init__(self, n_embd, n_head, attn_pdrop=0.1, resid_pdrop=0.1, max_sequence_length=128):
         super().__init__()
         assert n_embd % n_head == 0
         
         # Key, query, value projections for all heads
-        self.key = nn.Linear(n_embd, n_embd)
-        self.query = nn.Linear(n_embd, n_embd)
-        self.value = nn.Linear(n_embd, n_embd)
+        self.kqv = nn.Linear(n_embd, 3* n_embd)
+
         
         # Output projection
         self.proj = nn.Linear(n_embd, n_embd)
@@ -1132,24 +1132,34 @@ class CausalSelfAttention(nn.Module):
         self.resid_drop = nn.Dropout(resid_pdrop)
         
         # Causal mask to ensure attention only attends to the left
-        self.register_buffer("mask", 
-            torch.tril(torch.ones(sequence_length, sequence_length))
-            .view(1, 1, sequence_length, sequence_length))
-        
+        self.max_sequence_length = max_sequence_length
         self.n_head = n_head
         self.n_embd = n_embd
+        self.register_buffer('causal_mask', 
+                                torch.tril(torch.ones(max_sequence_length, max_sequence_length))
+                                .view(1, 1, max_sequence_length, max_sequence_length))
         
-    def forward(self, x):
+    def forward(self, x, padding_mask=None):
         B, T, C = x.size()  # batch, sequence length, embedding dim
-        
+        kqv = self.kqv(x)  # (B, T, 3 * C)
+        k, q, v = kqv.split(C, dim=2)  # each is (B, T, C)
         # Calculate query, key, values for all heads in batch
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
         # Causal self-attention
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
+
+        causal_mask = self.causal_mask[:, :, :T, :T]  # [1, 1, T, T]
+        att = att.masked_fill(causal_mask == 0, float('-inf'))
+        
+        # Apply padding mask if provided
+        if padding_mask is not None:
+            # padding_mask: [B, T] -> [B, 1, 1, T]
+            padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)
+            att = att.masked_fill(padding_mask == 0, float('-inf'))
+
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
         y = att @ v
@@ -1158,8 +1168,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         
         # Output projection
-        y = self.resid_drop(self.proj(y))
-        return y
+        return self.resid_drop(self.proj(y))
 
 class TransformerBlock(nn.Module):
     """Transformer block with causal attention"""
@@ -1177,59 +1186,64 @@ class TransformerBlock(nn.Module):
             dropout = nn.Dropout(resid_pdrop),
         ))
         
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, mask=None):
+        x = x + self.attn(self.ln_1(x), padding_mask=mask)
         m = self.mlp
         x = x + m.dropout(m.c_proj(m.act(m.c_fc(self.ln_2(x)))))
         return x
+    
+class SpatialTemporalTokenizer(nn.Module):
+    """
+    Tokenizes video into spatial-temporal patches while preserving structure
+    """
+    def __init__(self, input_channels, hidden_dim, patch_size=(4, 4), 
+                 temporal_stride=1):
+        super().__init__()
+        self.patch_size = patch_size
+        self.temporal_stride = temporal_stride
+        
+        # Patch embedding using Conv3D
+        self.patch_embed = nn.Conv3d(
+            input_channels,
+            hidden_dim,
+            kernel_size=(temporal_stride, *patch_size),
+            stride=(temporal_stride, *patch_size)
+        )
+        
+        self.norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: [B, T, C, H, W]
+        Returns:
+            tokens: [B, T', N, D] where N = (H/p)*(W/p) spatial patches
+            spatial_shape: (H', W') for reshaping
+        """
+        B, T, C, H, W = x.shape
+        
+        # Reshape for Conv3D: [B, C, T, H, W]
+        x = x.transpose(1, 2)
+        
+        # Extract patches
+        x = self.patch_embed(x)  # [B, D, T', H', W']
+        _, D, T_new, H_new, W_new = x.shape
+        
+        # Reshape to [B, T', H'*W', D]
+        x = x.permute(0, 2, 3, 4, 1)  # [B, T', H', W', D]
+        x = x.reshape(B, T_new, H_new * W_new, D)
+        
+        x = self.norm(x)
+        
+        return x, (H_new, W_new)
 
-class EMA:
-    def __init__(self, model, decay=0.999, use_num_updates=True):
-        self.model = model
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        self.num_updates = 0
-        self.use_num_updates = use_num_updates
-        self.register()
-    
-    def register(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-    
-    def update(self):
-        if self.use_num_updates:
-            self.num_updates += 1
-            decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
-        else:
-            decay = self.decay
-            
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                new_average = (1.0 - decay) * param.data + decay * self.shadow[name]
-                self.shadow[name] = new_average.clone()
-    
-    def apply_shadow(self):
-        """Apply EMA parameters for evaluation"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data
-                param.data = self.shadow[name]
-    
-    def restore(self):
-        """Restore original parameters after evaluation"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data = self.backup[name]
-        self.backup = {}
 
 class TemporalDiscriminator(nn.Module):
     """
-    Temporal Discriminator using Causal Transformer
-    
-    Evaluates sequence quality by processing temporal relationships
+    Temporal Discriminator with:
+    - Variable-length sequence support
+    - Preserved spatial structure
+    - Spatial-temporal token processing
     """
     def __init__(
         self,
@@ -1238,50 +1252,69 @@ class TemporalDiscriminator(nn.Module):
         hidden_dim: int = 512,
         n_layers: int = 6,
         n_heads: int = 8,
-        sequence_length: int = 16,
-        feature_extractor_channels: List[int] = [64, 128, 256, 512],
-        use_spectral_norm: bool = True,
+        max_sequence_length: int = 32,  # Maximum, not fixed
+        patch_size: int = 8,  # Spatial patch size
         device: torch.device = torch.device('cuda')
     ):
         super().__init__()
         self.image_size = image_size
-        self.sequence_length = sequence_length
+        self.max_sequence_length = max_sequence_length
         self.hidden_dim = hidden_dim
+        self.patch_size = patch_size
         self.device = device
         
-        # Frame-level feature extractor (CNN)
-        self.frame_encoder = self._build_frame_encoder(
-            input_channels, feature_extractor_channels, use_spectral_norm
+        # Calculate number of patches
+        self.num_patches = (image_size // patch_size) ** 2
+        
+        # Spatial-Temporal Tokenizer (replaces frame_encoder)
+        self.frame_encoder = SpatialTemporalTokenizer(
+            input_channels=input_channels,
+            hidden_dim=hidden_dim,
+            patch_size=(patch_size, patch_size),
+            temporal_stride=1
         )
         
-        # Calculate feature dimension after CNN
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, input_channels, image_size, image_size)
-            dummy_features = self.frame_encoder(dummy_input)
-            feature_dim = dummy_features.shape[1]
-        
-        # Project CNN features to transformer dimension
-        self.feature_projection = nn.Linear(feature_dim, hidden_dim)
-        
-        # Positional encoding
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, sequence_length, hidden_dim)
+        # Learnable spatial position embeddings
+        self.spatial_pos_embed = nn.Parameter(
+            torch.randn(1, 1, self.num_patches, hidden_dim) * 0.02
         )
-        self.drop = nn.Dropout(0.1)
         
-        # Transformer blocks
+        # Learnable temporal position embeddings (up to max_sequence_length)
+        self.temporal_pos_embed = nn.Parameter(
+            torch.randn(1, max_sequence_length, 1, hidden_dim) * 0.02
+        )
+        
+        # Spatial attention (preserves spatial structure)
+        self.spatial_attention = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=hidden_dim,
+                num_heads=n_heads // 2,  # Fewer heads for spatial
+                dropout=0.1,
+                batch_first=True
+            ) for _ in range(n_layers // 2)
+        ])
+        
+        # Temporal transformer blocks (with causal masking)
         self.blocks = nn.ModuleList([
             TransformerBlock(
-                hidden_dim, n_heads, 
-                sequence_length=sequence_length
+                hidden_dim, n_heads,
+                sequence_length=max_sequence_length * self.num_patches
             ) for _ in range(n_layers)
         ])
         
-        # Final normalization
+        # Layer norms
+        self.spatial_norm = nn.LayerNorm(hidden_dim)
+        self.temporal_norm = nn.LayerNorm(hidden_dim)
         self.ln_f = nn.LayerNorm(hidden_dim)
         
         # Discrimination heads
         self.temporal_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        self.spatial_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim // 2, 1)
@@ -1296,28 +1329,6 @@ class TemporalDiscriminator(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
         self.to(device)
-        
-    def _build_frame_encoder(self, input_channels, channels, use_spectral_norm):
-        """Build CNN for frame-level feature extraction"""
-        layers = []
-        in_channels = input_channels
-        
-        for out_channels in channels:
-            conv = nn.Conv2d(in_channels, out_channels, 4, 2, 1)
-            if use_spectral_norm:
-                conv = nn.utils.spectral_norm(conv)
-            
-            layers.extend([
-                conv,
-                nn.LeakyReLU(0.2, inplace=True)
-            ])
-            in_channels = out_channels
-        
-        # Global average pooling
-        layers.append(nn.AdaptiveAvgPool2d(1))
-        layers.append(nn.Flatten())
-        
-        return nn.Sequential(*layers)
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -1328,252 +1339,157 @@ class TemporalDiscriminator(nn.Module):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
     
-    def extract_features(self, x):
+    def create_padding_mask(self, sequence_lengths, max_length):
         """
-        Extract features for feature matching loss - SIMPLE VERSION
+        Create padding mask for variable-length sequences
         
         Args:
-            x: [batch_size, seq_len, channels, height, width]
+            sequence_lengths: [B] tensor of actual lengths
+            max_length: int, maximum sequence length in batch
         
         Returns:
-            List of feature tensors at different scales
+            mask: [B, max_length] where True = valid, False = padding
         """
-        B, T, C, H, W = x.shape
-        features = []
+        batch_size = len(sequence_lengths)
+        mask = torch.zeros(batch_size, max_length, dtype=torch.bool, device=self.device)
         
-        # 1. Get CNN features
-        x_flat = x.view(B * T, C, H, W)
-        h = x_flat
+        for i, length in enumerate(sequence_lengths):
+            mask[i, :length] = True
         
-        # Only save features after conv layers
-        for layer in self.frame_encoder:
-            h = layer(h)
-            if isinstance(layer, nn.Conv2d):
-                # Reshape to [B, T, C, H, W]
-                feat = h.view(B, T, *h.shape[1:])
-                features.append(feat)
-        
-        frame_feats = h.view(B, T, -1)  # [B, T, feature_dim]
-        frame_feats_projected = self.feature_projection(frame_feats)  # [B, T, hidden_dim]
-        features.append(frame_feats_projected)
-        
-        return features
-
-    def forward(self, x, return_features=False):
+        return mask
+    
+    def forward(self, x, sequence_lengths=None, return_features=False):
         """
-        Forward pass through temporal discriminator
+        Forward pass with variable-length support
         
         Args:
             x: [batch_size, seq_len, channels, height, width]
+            sequence_lengths: [batch_size] tensor of actual sequence lengths
             return_features: If True, return intermediate features
         
         Returns:
-            dict with discrimination scores and optionally features
+            dict with discrimination scores
         """
         B, T, C, H, W = x.shape
-        assert T <= self.sequence_length, f"Sequence length {T} exceeds maximum {self.sequence_length}"
         
-        # Extract frame features
-        frame_features = self.extract_features(x)
-        features = frame_features[-1]  # Get last feature tensor [B, T, hidden_dim]
-        # Add positional embeddings
-        features = features + self.pos_embed[:, :T, :]
-        features = self.drop(features)
+        # Handle variable lengths
+        if sequence_lengths is None:
+            sequence_lengths = torch.full((B,), T, device=self.device)
         
-        # Process through transformer
-        hidden = features
+        # Create padding mask for temporal dimension
+        temporal_mask = self.create_padding_mask(sequence_lengths, T)
+        
+        # 1. Extract spatial-temporal tokens
+        tokens, (H_patches, W_patches) = self.frame_encoder(x)
+        # tokens: [B, T, N, D] where N = num_patches
+        
+        # 2. Add positional embeddings
+        # Spatial position embedding (same for all timesteps)
+        tokens = tokens + self.spatial_pos_embed
+        
+        # Temporal position embedding (different for each timestep)
+        temporal_pos = self.temporal_pos_embed[:, :T, :, :]
+        tokens = tokens + temporal_pos
+        
+        # 3. Process spatial relationships within each frame
+        spatial_features = []
+        for t in range(T):
+            # Process spatial attention for each timestep
+            spatial_tokens = tokens[:, t]  # [B, N, D]
+            
+            for spatial_attn in self.spatial_attention:
+                spatial_tokens_norm = self.spatial_norm(spatial_tokens)
+                attn_out, _ = spatial_attn(
+                    spatial_tokens_norm, 
+                    spatial_tokens_norm, 
+                    spatial_tokens_norm
+                )
+                spatial_tokens = spatial_tokens + attn_out
+            
+            spatial_features.append(spatial_tokens)
+        
+        # Stack back to [B, T, N, D]
+        spatial_features = torch.stack(spatial_features, dim=1)
+        
+        # 4. Reshape for temporal processing
+        # Combine spatial and temporal dimensions
+        B, T, N, D = spatial_features.shape
+        features_flat = spatial_features.reshape(B, T * N, D)
+        
+        # Create combined mask for flattened sequence
+        # Each spatial token inherits the mask of its timestep
+        combined_mask = temporal_mask.unsqueeze(2).expand(-1, -1, N)
+        combined_mask = combined_mask.reshape(B, T * N)
+        
+        # 5. Process through temporal transformer
+        hidden = features_flat
         all_hidden_states = []
         
         for block in self.blocks:
-            hidden = block(hidden)
+            hidden = block(hidden, combined_mask)
             if return_features:
                 all_hidden_states.append(hidden)
         
         hidden = self.ln_f(hidden)
         
-        # Get discrimination scores
-        # 1. Temporal coherence score (from last timestep)
-        temporal_score = self.temporal_head(hidden[:, -1, :])
+        # 6. Reshape back to [B, T, N, D]
+        hidden = hidden.reshape(B, T, N, D)
         
-        # 2. Per-frame quality scores
-        per_frame_scores = self.per_frame_head(hidden)
+        # 7. Compute discrimination scores
+        
+        # Temporal score: aggregate across space, use last valid timestep
+        temporal_features = hidden.mean(dim=2)  # [B, T, D]
+        last_timesteps = sequence_lengths - 1
+        temporal_rep = temporal_features[torch.arange(B), last_timesteps]
+        temporal_score = self.temporal_head(temporal_rep)
+        
+        # Spatial score: aggregate across time for each spatial location
+        spatial_features = hidden.mean(dim=1)  # [B, N, D]
+        spatial_score = self.spatial_head(spatial_features.mean(dim=1))
+        
+        # Per-frame scores
+        per_frame_features = hidden.mean(dim=2)  # [B, T, D]
+        per_frame_scores = self.per_frame_head(per_frame_features)
+        
+        # Mask out invalid frames
+        per_frame_scores = per_frame_scores.masked_fill(
+            ~temporal_mask.unsqueeze(-1), 0.0
+        )
+        
+        # Compute valid frame average
+        valid_frames = temporal_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        per_frame_avg = per_frame_scores.sum(dim=1) / valid_frames
         
         outputs = {
             'temporal_score': temporal_score,  # [B, 1]
+            'spatial_score': spatial_score,    # [B, 1]
             'per_frame_scores': per_frame_scores,  # [B, T, 1]
-            'final_score': temporal_score + per_frame_scores.mean(dim=1)  # Combined
+            'final_score': temporal_score + spatial_score + per_frame_avg,
+            'sequence_lengths': sequence_lengths,
+            'spatial_shape': (H_patches, W_patches)
         }
         
         if return_features:
             outputs['features'] = all_hidden_states
-            outputs['frame_features'] = frame_features#multiscale features
+            outputs['spatial_features'] = spatial_features
+            outputs['hidden_3d'] = hidden  # [B, T, N, D] for visualization
         
         return outputs
+    
+    def extract_features(self, x):
+        """
+        Backward compatibility - extract features with spatial structure preserved
+        """
+        B, T, C, H, W = x.shape
+        tokens, spatial_shape = self.frame_encoder(x)
+        
+        # Add positional embeddings
+        tokens = tokens + self.spatial_pos_embed
+        temporal_pos = self.temporal_pos_embed[:, :T, :, :]
+        tokens = tokens + temporal_pos
+        
+        return tokens, spatial_shape
 
-class TemporalLatentDiscriminator(nn.Module):
-    """
-    Temporal Discriminator for Latent Sequences using Self-Attention
-    
-    Processes latent sequences to evaluate temporal coherence and quality
-    """
-    def __init__(
-        self,
-        latent_dim: int,
-        hidden_dim: int = 256,
-        n_layers: int = 4,
-        n_heads: int = 4,
-        sequence_length: int = 16,
-        use_spectral_norm: bool = True,
-        dropout: float = 0.1,
-        device: torch.device = torch.device('cuda')
-    ):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
-        self.sequence_length = sequence_length
-        self.device = device
-        
-        # Project latent to hidden dimension
-        self.input_projection = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.LeakyReLU(0.2)
-        )
-        
-        if use_spectral_norm:
-            self.input_projection[0] = nn.utils.spectral_norm(self.input_projection[0])
-        
-        # Positional encoding
-        self.pos_encoding = nn.Parameter(
-            torch.zeros(1, sequence_length, hidden_dim)
-        )
-        
-        # Temporal processing blocks
-        self.temporal_blocks = nn.ModuleList()
-        for _ in range(n_layers):
-            # Self-attention block
-            self.temporal_blocks.append(
-                nn.ModuleDict({
-                    'attention': nn.MultiheadAttention(
-                        hidden_dim, n_heads, 
-                        dropout=dropout, 
-                        batch_first=True
-                    ),
-                    'norm1': nn.LayerNorm(hidden_dim),
-                    'ffn': nn.Sequential(
-                        nn.Linear(hidden_dim, hidden_dim * 4),
-                        nn.GELU(),
-                        nn.Dropout(dropout),
-                        nn.Linear(hidden_dim * 4, hidden_dim),
-                        nn.Dropout(dropout)
-                    ),
-                    'norm2': nn.LayerNorm(hidden_dim)
-                })
-            )
-        
-        # Output heads
-        self.temporal_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        
-        self.sequence_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        
-        # Contrastive head for temporal consistency
-        self.consistency_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, 1)
-        )
-        
-        self.to(device)
-    
-    def compute_temporal_features(self, x):
-        """
-        Extract temporal features using self-attention
-        
-        Args:
-            x: [batch_size, seq_len, latent_dim]
-        
-        Returns:
-            features: [batch_size, seq_len, hidden_dim]
-        """
-        B, T, D = x.shape
-        
-        # Project to hidden dimension
-        h = self.input_projection(x)
-        
-        # Add positional encoding
-        h = h + self.pos_encoding[:, :T, :]
-        
-        # Process through temporal blocks
-        for block in self.temporal_blocks:
-            # Self-attention
-            h_norm = block['norm1'](h)
-            attn_out, _ = block['attention'](h_norm, h_norm, h_norm)
-            h = h + attn_out
-            
-            # FFN
-            h_norm = block['norm2'](h)
-            h = h + block['ffn'](h_norm)
-        
-        return h
-    
-    def forward(self, x, return_features=False):
-        """
-        Forward pass through temporal latent discriminator
-        
-        Args:
-            x: [batch_size, seq_len, latent_dim]
-            return_features: If True, return intermediate features
-        
-        Returns:
-            Dictionary with discrimination scores
-        """
-        B, T, D = x.shape
-        assert T <= self.sequence_length, f"Sequence length {T} exceeds maximum {self.sequence_length}"
-        
-        # Extract temporal features
-        features = self.compute_temporal_features(x)
-        
-        # Temporal coherence score (from last timestep)
-        temporal_score = self.temporal_head(features[:, -1, :])
-        
-        # Sequence quality score (average pooled)
-        sequence_score = self.sequence_head(features.mean(dim=1))
-        
-        # Temporal consistency score
-        # Compare adjacent timesteps
-        if T > 1:
-            # Compute differences between adjacent timesteps
-            diffs = features[:, 1:, :] - features[:, :-1, :]
-            diff_features = torch.cat([
-                diffs.mean(dim=1),  # Average temporal difference
-                diffs.std(dim=1)    # Temporal variance
-            ], dim=-1)
-            consistency_score = self.consistency_head(diff_features)
-        else:
-            consistency_score = torch.zeros(B, 1).to(x.device)
-        
-        outputs = {
-            'temporal_score': temporal_score,
-            'sequence_score': sequence_score,
-            'consistency_score': consistency_score,
-            'final_score': temporal_score + sequence_score + 0.5 * consistency_score
-        }
-        
-        if return_features:
-            outputs['features'] = features
-
-        return outputs
 ##########################################################################################
 # The following lines define the Variational Autoencoder (VAE) encoder and decoder for image data.
 ##########################################################################################
@@ -1909,6 +1825,48 @@ def build_residual_stack(
 
     return layers
 
+class EMA:
+    def __init__(self, model, decay=0.999, use_num_updates=True):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        self.num_updates = 0
+        self.use_num_updates = use_num_updates
+        self.register()
+    
+    def register(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self):
+        if self.use_num_updates:
+            self.num_updates += 1
+            decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        else:
+            decay = self.decay
+            
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - decay) * param.data + decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+    
+    def apply_shadow(self):
+        """Apply EMA parameters for evaluation"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+    
+    def restore(self):
+        """Restore original parameters after evaluation"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
 class VAEEncoder(torch.nn.Module):
     def __init__(
         self,
@@ -2052,37 +2010,144 @@ class VAEDecoder(torch.nn.Module):
         return self.net(x)
 
 ##### Self modeling Blocks #####
-class SelfModelTransformerBlock(nn.Module):
-    def __init__(self, z_dim, A_dim, a_dim, c_dim, h_dim, d=256, nhead=4, ff=512, dropout=0.2):
+
+class SelfModelBlock(nn.Module):
+    def __init__(self, z_dim, A_dim, a_dim, c_dim, h_dim, d=256, nhead=4, dropout=0.2):
         super().__init__()
-        def proj(in_dim): return nn.Sequential(nn.Linear(in_dim, d), nn.LayerNorm(d))
-        self.Pz, self.PA, self.Pa, self.Pc, self.Ph = map(proj, [z_dim, A_dim, a_dim, c_dim, h_dim])
-        #modality specific type embeddings
-        self.type_embed = nn.Parameter(torch.randn(5, d) * 0.02)
-        self.query_h = nn.Parameter(torch.randn(1, 1, d) * 0.02)
-        self.query_A = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         
+        # Project inputs to common dimension
+        self.input_projections = nn.ModuleDict({
+            'z': nn.Linear(z_dim, d),
+            'A': nn.Linear(A_dim, d),
+            'a': nn.Linear(a_dim, d),
+            'c': nn.Linear(c_dim, d),
+            'h': nn.Linear(h_dim, d)
+        })
         self.time_proj = nn.Sequential(
                                        nn.Linear(1, d//2), 
                                        nn.LayerNorm(d//2), 
                                        nn.SiLU(), 
                                        nn.Linear(d//2, d)
-                                       )  # optional Δt token
-        self.block = nn.TransformerEncoderLayer(d_model=d, nhead=nhead, dim_feedforward=ff,
-                                                dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
-        self.head_h = nn.Sequential(nn.Linear(d+ h_dim, d//2), nn.LayerNorm(d//2), nn.SiLU(), nn.Dropout(dropout), nn.Linear(d//2, 2*h_dim))
-        self.head_A = nn.Sequential(nn.Linear(d+ A_dim, d//2), nn.LayerNorm(d//2), nn.SiLU(), nn.Dropout(dropout), nn.Linear(d//2, 2*A_dim))
-
+                                       )
+        # Learnable query tokens for prediction
+        self.query_h = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        self.query_A = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        
+        # Type embeddings
+        self.type_embed = nn.Embedding(6, d)
+        
+        # EXPLICIT Cross-attention: queries attend to context
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=d,
+            num_heads=nhead,
+            batch_first=True,
+            dropout=dropout
+        )
+        
+        # Self-attention for context processing
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=d,
+            num_heads=nhead,
+            batch_first=True,
+            dropout=dropout
+        )
+        
+        # Layer norms
+        self.norm1 = nn.LayerNorm(d)
+        self.norm2 = nn.LayerNorm(d)
+        self.norm3 = nn.LayerNorm(d)
+        
+        self.activation = nn.Softplus()
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d, d * 4),
+            nn.LayerNorm(d * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d * 4, d)
+        )
+        
+        # Output heads
+        self.head_h = nn.Sequential(
+            nn.Linear(d, d//2),
+            nn.LayerNorm(d//2),
+            nn.SiLU(),
+            nn.Linear(d//2, 2*h_dim)
+        )
+        self.head_A = nn.Sequential(
+            nn.Linear(d, d//2),
+            nn.LayerNorm(d//2),
+            nn.SiLU(),
+            nn.Linear(d//2, 2*A_dim)
+        )
+    
     def forward(self, z_t, A_t, a_t, c_t, h_t, current_time=None):
-        toks = torch.stack([self.Pz(z_t), self.PA(A_t), self.Pa(a_t), self.Pc(c_t), self.Ph(h_t)], dim=1)
-        toks = toks + self.type_embed.unsqueeze(0)
-        qs = torch.cat([self.query_h.expand(z_t.size(0), -1, -1),
-                        self.query_A.expand(z_t.size(0), -1, -1)], dim=1)
+        batch_size = z_t.shape[0]
         if current_time is not None:
-            t_tok = self.time_proj(current_time.view(-1,1)).unsqueeze(1)   # time token
-            toks = torch.cat([toks, t_tok], dim=1)
-        y = self.block(torch.cat([toks, qs], dim=1))
-        Qh, QA = y[:, -2, :], y[:, -1, :]
-        mh, lvh = self.head_h(torch.cat([Qh, h_t], dim=-1)).chunk(2, -1)
-        mA, lvA = self.head_A(torch.cat([QA, A_t], dim=-1)).chunk(2, -1)
-        return mh, lvh.clamp(min=-8.0, max=2.0), mA, lvA.clamp(min=-8.0, max=2.0)
+            time_token = self.time_proj(current_time.view(-1, 1))
+        else:
+            time_token = self.time_proj(torch.zeros(batch_size, 1, device=z_t.device))
+        # 1. Project and create context tokens
+        context_tokens = torch.stack([
+            self.input_projections['z'](z_t),
+            self.input_projections['A'](A_t),
+            self.input_projections['a'](a_t),
+            self.input_projections['c'](c_t),
+            self.input_projections['h'](h_t),
+            time_token
+        ], dim=1)  # [B,  6, d]
+
+
+
+        # Add type embeddings
+        type_ids = torch.arange(6, device=z_t.device).unsqueeze(0).expand(batch_size, -1)  # [B, 6]
+        context_tokens = context_tokens + self.type_embed(type_ids)
+        
+        # 2. Process context with self-attention
+        context_normed = self.norm1(context_tokens)
+        context_attended, _ = self.self_attention(
+            context_normed, context_normed, context_normed
+        )
+        context_tokens = context_tokens + context_attended
+        
+        # 3. Create query tokens
+        queries = torch.cat([
+            self.query_h.expand(batch_size, -1, -1),
+            self.query_A.expand(batch_size, -1, -1)
+        ], dim=1)  # [B, 2, d]
+        
+        # 4. Cross-attention: Queries attend to processed context
+        # Q: What we want to predict (queries)
+        # K, V: Information available (context)
+        queries_normed = self.norm2(queries)
+        context_normed = self.norm2(context_tokens)
+        
+        attended_queries, attention_weights = self.cross_attention(
+            query=queries_normed,    # Queries ask about future
+            key=context_normed,      # Context provides information
+            value=context_normed,    # Context provides values
+            need_weights=True
+        )
+        queries = queries + attended_queries
+        
+        # 5. FFN on queries
+        queries = queries + self.ffn(self.norm3(queries))
+        
+        # 6. Extract predictions
+        pred_h = self.head_h(queries[:, 0])  # First query predicts h
+        pred_A = self.head_A(queries[:, 1])  # Second query predicts A
+        
+        # Split into mean and log variance
+        h_mean, h_logvar = pred_h.chunk(2, dim=-1)
+        A_mean, A_logvar = pred_A.chunk(2, dim=-1)
+
+        return h_mean, self.bounded_logvar(h_logvar), A_mean, self.bounded_logvar(A_logvar), attention_weights
+
+    def bounded_logvar(self, logvar):
+        """Range: [min_val, max_val]"""
+        min_val = -8.0
+        max_val = 2.0
+        
+        # Softplus for positivity, then scale and shift
+        positive = self.activation(logvar)
+        return positive.clamp(min=min_val, max=max_val)

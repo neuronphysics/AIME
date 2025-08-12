@@ -9,9 +9,9 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (
     EMA, VAEEncoder, VAEDecoder, 
-    TemporalDiscriminator, TemporalLatentDiscriminator,
+    TemporalDiscriminator,
     LinearResidual, AttentionPosterior, AttentionPrior,
-    AddEpsilon, check_tensor, SelfModelTransformerBlock
+    AddEpsilon, check_tensor, SelfModelBlock
 )
 import math
 from collections import OrderedDict
@@ -344,8 +344,8 @@ class AdaptiveStickBreaking(nn.Module):
         EULER_GAMMA = 0.5772156649
         assert a.shape == b.shape == alpha.shape == beta.shape
 
-        a = torch.clamp(a, min=eps, max=50)  # Ensure a is positive
-        b = torch.clamp(b, min=eps, max=50)  # Ensure b is positive
+        a = torch.clamp(a, min=eps, max=20)  # Ensure a is positive
+        b = torch.clamp(b, min=eps, max=20)  # Ensure b is positive
         alpha = torch.clamp(alpha, min=eps)
         beta = torch.clamp(beta, min=eps)
  
@@ -759,14 +759,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         sequence_length: int,
         img_disc_channels:int,
         img_disc_layers:int,
-        latent_disc_layers:int,
         device: torch.device= torch.device('cuda'),
-        use_spectral_norm: bool= True,
+        patch_size: int = 16,
         input_channels: int = 3,  # Number of input channels (e.g., RGB images)
         learning_rate: float = 1e-5,
         grad_clip:float =10.0,
-        prior_alpha: float = 5.0,  # Add these parameters
-        prior_beta: float = 1.0,
+        prior_alpha: float = 1.0,  # Add these parameters
+        prior_beta: float = 10.0,
         weight_decay: float = 0.00001,
         use_orthogonal: bool = True,  # Use orthogonal initialization for LSTM,
         number_lstm_layer: int = 2,  # Number of LSTM layers
@@ -807,7 +806,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self._init_vrnn_dynamics(use_orthogonal=use_orthogonal,number_lstm_layer=number_lstm_layer)
         self._init_attention_schema(attention_resolution)
         self._init_self_model()
-        self._init_discriminators( img_disc_layers, latent_disc_layers, use_spectral_norm)
+        self._init_discriminators( img_disc_layers, patch_size)
         # DP-GMM prior
         self.prior = DPGMMPrior(max_components, 
                                 self.latent_dim, 
@@ -887,7 +886,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                                               device= self.device)
                 
 
-    def _init_discriminators(self, img_disc_layers, latent_disc_layers, use_spectral_norm: bool):
+    def _init_discriminators(self, img_disc_layers:int, patch_size: int):
         # Initialize discriminators
         self.image_discriminator = TemporalDiscriminator(
             input_channels=self.input_channels,
@@ -895,20 +894,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             hidden_dim=self.hidden_dim,
             n_layers= img_disc_layers,
             n_heads= 4,
-            sequence_length=self.sequence_length,
-            use_spectral_norm= use_spectral_norm,
+            max_sequence_length=self.sequence_length,
+            patch_size= patch_size,
             device= self.device,
             )
+        
 
-        # Latent discriminator operates on flattened latent vectors
-        self.latent_discriminator = TemporalLatentDiscriminator(
-            latent_dim=self.latent_dim,
-            hidden_dim=self.hidden_dim,
-            n_layers= latent_disc_layers,
-            n_heads= 4,
-            sequence_length=self.sequence_length,
-            device=self.device,
-            )
         
 
     def _init_vrnn_dynamics(self,use_orthogonal: bool = True, number_lstm_layer: int = 2):
@@ -945,7 +936,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     def _init_self_model(self):
         """Initialize comprehensive self-modeling components"""
         # Hidden state predictor: p(h_{t+1}|h_t, z_t, a_t)
-        self.self_model = SelfModelTransformerBlock(
+        self.self_model = SelfModelBlock(
             z_dim =self.latent_dim,
             A_dim=self.hidden_dim,
             a_dim=self.action_dim,
@@ -953,7 +944,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             h_dim=self.hidden_dim,
             d=48,
             nhead=8,
-            ff=64
         )
 
 
@@ -1147,19 +1137,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Discriminator optimizers (separate for stability)
         self.img_disc_optimizer = torch.optim.AdamW(
             self.image_discriminator.parameters(),
-            lr=learning_rate * 2.0,  # Higher LR for discriminators
-            betas=(0.5, 0.999),  # Lower beta1 for GANs
+            lr=learning_rate * 0.5,  # Higher LR for discriminators
+            betas=(0.9, 0.999),  # Lower beta1 for GANs
             weight_decay=weight_decay,
             eps=1e-8
         )
     
-        self.latent_disc_optimizer = torch.optim.AdamW(
-            self.latent_discriminator.parameters(),
-            lr=learning_rate * 2.0,
-            betas=(0.5, 0.999),
-            weight_decay=weight_decay,
-            eps=1e-8
-        )
     
         # Setup schedulers
         self._setup_schedulers()
@@ -1194,14 +1177,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             verbose=True
         )
         
-        self.latent_disc_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.latent_disc_optimizer,
-            mode='min',
-            factor=0.5,
-            patience=10,
-            min_lr=1e-7,
-            verbose=True
-        )
         
         # 3. Initialize warmup tracking
         self.warmup_steps = 1000
@@ -1549,26 +1524,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             )
             self.img_disc_optimizer.step()
     
-        # Latent discriminator
-        self.latent_disc_optimizer.zero_grad()
-        latent_loss = loss_dict['latent_disc_loss']
-    
-        if hasattr(self, 'disc_scaler') and torch.cuda.is_available():
-            self.disc_scaler.scale(latent_loss).backward()
-            self.disc_scaler.unscale_(self.latent_disc_optimizer)
-            latent_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.latent_discriminator.parameters(), max_norm=self._grad_clip, norm_type=2.0
-            )
-            self.disc_scaler.step(self.latent_disc_optimizer)
-            self.disc_scaler.update()
-        else:
-            latent_loss.backward()
-            latent_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.latent_discriminator.parameters(), max_norm=self._grad_clip, norm_type=2.0
-            )
-            self.latent_disc_optimizer.step()
-    
-        return img_grad_norm, latent_grad_norm
+            
+        return img_grad_norm
     
     def generate_mock_input(self):
         return {
@@ -1749,7 +1706,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             only_inputs=True
         )[0]
 
-        gradients = gradients.view(gradients.size(0), -1)
+        gradients = gradients.reshape(gradients.size(0), -1)
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
         return gradient_penalty
@@ -1759,8 +1716,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self,
         real_images: torch.Tensor, #[B, T, C, H, W]
         fake_images: torch.Tensor, #[B, T, C, H, W]
-        real_latents: torch.Tensor, #[B, T, Z]
-        fake_latents: torch.Tensor #[B, T, Z]
     ) -> Dict[str, torch.Tensor]:
         """
         Training step for both discriminators
@@ -1788,62 +1743,31 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             10.0 * img_gp
         )
 
-        # Temporal Latent Discriminator
-        real_latent_outputs = self.latent_discriminator(real_latents)
-        fake_latent_outputs = self.latent_discriminator(fake_latents.detach())
-    
-        real_latent_score = real_latent_outputs['final_score']
-        fake_latent_score = fake_latent_outputs['final_score']
-
-        latent_gp = self.compute_gradient_penalty(
-            self.latent_discriminator,
-            real_latents,
-            fake_latents.detach(),
-            self.device
-        )
-
-        latent_disc_loss = (
-            torch.mean(fake_latent_score) - torch.mean(real_latent_score) +
-            10.0 * latent_gp
-        )
+        
         # Temporal consistency losses
         img_consistency_loss = torch.mean(
             fake_img_outputs['per_frame_scores'].std(dim=1)
         )
     
-        latent_consistency_loss = torch.mean(
-            torch.abs(fake_latent_outputs['consistency_score'])
-        )
+        
         result = {
             'img_disc_loss': img_disc_loss,
-            'latent_disc_loss': latent_disc_loss,
             'img_gp': img_gp,
-            'latent_gp': latent_gp,
             'real_img_score': real_img_score.mean(),
             'fake_img_score': fake_img_score.mean(),
-            'real_latent_score': real_latent_score.mean(),
-            'fake_latent_score': fake_latent_score.mean(),
             'img_temporal_score': real_img_outputs['temporal_score'].mean(),
-            'latent_temporal_score': real_latent_outputs['temporal_score'].mean(),
             'img_consistency_loss': img_consistency_loss,
-            'latent_consistency_loss': latent_consistency_loss
         }
     
         # Only perform optimization if optimizers exist and we're configured to use them
-        if self.has_optimizers and hasattr(self, 'img_disc_optimizer') and hasattr(self, 'latent_disc_optimizer'):
+        if self.has_optimizers and hasattr(self, 'img_disc_optimizer'):
             # Update image discriminator
             self.img_disc_optimizer.zero_grad()
             img_disc_loss.backward(retain_graph=True)
             torch.nn.utils.clip_grad_norm_(self.image_discriminator.parameters(), self._grad_clip)
             self.img_disc_optimizer.step()
 
-            # Update latent discriminator
-            self.latent_disc_optimizer.zero_grad()
-            latent_disc_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.latent_discriminator.parameters(), self._grad_clip)
-            self.latent_disc_optimizer.step()
-        
-                    
+                        
     
         return result
     
@@ -1853,7 +1777,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         Uses both mean and standard deviation matching for better stability
         """
-        feat_match_loss = 0.0
+        feat_match_loss = torch.tensor(0.0, device=self.device)
         num_features = len(real_features)
         
         for i in range(num_features):
@@ -1883,8 +1807,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self,
         x: torch.Tensor, #[B, T, C, H, W  ]
         reconstruction: torch.Tensor, #[B, T, C, H, W]
-        z: torch.Tensor, #[B, T, Z]
-        prior_z: torch.Tensor #[B, T, Z]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute adversarial losses for both image and latent space
@@ -1893,45 +1815,26 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         fake_img_outputs = self.image_discriminator(reconstruction, return_features=True)
         img_adv_loss = -torch.mean(fake_img_outputs['final_score'])
         #reward for generating temporally consistent images
-        #TODO:Fix this?
+    
         real_frame_features = x.reshape(x.shape[0], x.shape[1], -1)  # Flatten spatial dimensions
-        #TODO I want it to be fake image generated with size [B, T, C, H, W]
+        #I want it to be fake image generated with size [B, T, C, H, W]
         fake_frame_features = reconstruction.reshape(x.shape[0], x.shape[1], -1)
 
         temporal_loss_frames =self.contrastive_loss(
         real_features=real_frame_features,
         fake_features=fake_frame_features
         )
+            
         
-        # Combined image adversarial loss
-        total_img_adv = (
-            img_adv_loss +
-            temporal_loss_frames
-        )
-        
-        # === Latent Adversarial Loss ===
-        fake_latent_outputs = self.latent_discriminator(z)
-        
-        # Main adversarial loss
-        latent_adv_loss = -fake_latent_outputs['final_score'].mean()
-        # Maximizes I(z_t; z_{t+1}) using contrastive predictive coding
-        temporal_loss_latents = self.contrastive_loss(
-            real_features=prior_z,  # [B, T, latent_dim]
-            fake_features=z,        # [B, T, latent_dim]
-            temperature=0.1,
-            alpha=0.5  # Balance between alignment and separation
-        )
-        # Add temporal consistency loss for latents
-        latent_adv_loss += temporal_loss_latents
         # === Feature Matching Loss ===
         # This helps stabilize training
-        real_features = self.image_discriminator(x, return_features=True)['frame_features']
-        fake_features = fake_img_outputs['frame_features']
-        
+        real_features = self.image_discriminator(x, return_features=True)['spatial_features']
+        fake_features = fake_img_outputs['spatial_features']
+
         # L1 loss between feature statistics
         feature_match_loss = self.compute_feature_matching_loss(real_features, fake_features) 
 
-        return total_img_adv, latent_adv_loss, feature_match_loss
+        return img_adv_loss + temporal_loss_frames, feature_match_loss
       
     def compute_global_context(self, observations):
         """
@@ -2037,7 +1940,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         ).to(self.device).expand(h_t.shape[0], -1)
 
 
-        h_mean, h_logvar , attention_mean, attention_logvar = self.self_model(z_t, attention_t, a_t, c_t, h_t, t_normalized)
+        h_mean, h_logvar , attention_mean, attention_logvar, _ = self.self_model(z_t, attention_t, a_t, c_t, h_t, t_normalized)
         
         return {
             'h_mean': h_mean, 
@@ -2169,10 +2072,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         disc_losses_list = []
         for _ in range(n_critic):
             
-            real_latents = torch.randn_like(outputs['latents'])
             
             disc_loss = self.discriminator_step(
-                observations, outputs['reconstructions'], real_latents, outputs['latents']
+                observations, outputs['reconstructions']
             )
             disc_losses_list.append(disc_loss)
         
@@ -2184,18 +2086,15 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         # 4. Generator training with adversarial losses
         # Get fresh discriminator outputs (no detach)
-        img_adv_loss, latent_adv_loss, feat_match_loss = self.compute_adversarial_losses(
+        img_adv_loss, feat_match_loss = self.compute_adversarial_losses(
             observations,
             outputs['reconstructions'],
-            outputs['latents'],
-            real_latents
         )
         
         # 5. Total generator loss
         total_gen_loss = (
             vae_losses['total_vae_loss'] +
             lambda_img * img_adv_loss +
-            latent_adv_loss +      # Reduced weight for latent adversarial
             feat_match_loss        # Feature matching
         )
         
@@ -2218,7 +2117,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             **vae_losses,
             **avg_disc_losses,
             'img_adv_loss': img_adv_loss.item(),
-            'latent_adv_loss': latent_adv_loss.item(),
             'feat_match_loss': feat_match_loss.item(),
             'total_gen_loss': total_gen_loss.item(),
             'grad_norm': grad_norm.item() if self.has_optimizers else 0.0,

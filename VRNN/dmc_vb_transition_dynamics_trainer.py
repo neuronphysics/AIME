@@ -460,6 +460,101 @@ class DMCVBDataset(Dataset):
         
         return sample
 
+def count_parameters(model, print_details=True):
+    """
+    Count the number of parameters in a model
+    
+    Args:
+        model: PyTorch model
+        print_details: If True, print detailed breakdown
+    
+    Returns:
+        dict with parameter counts
+    """
+    
+    
+    # Count total parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
+    
+    # Count by module
+    module_params = defaultdict(int)
+    module_trainable = defaultdict(int)
+    
+    for name, module in model.named_modules():
+        if len(list(module.children())) == 0:  # Leaf modules only
+            module_params[module.__class__.__name__] += sum(
+                p.numel() for p in module.parameters()
+            )
+            module_trainable[module.__class__.__name__] += sum(
+                p.numel() for p in module.parameters() if p.requires_grad
+            )
+    
+    # Component-wise breakdown (for your specific model)
+    component_params = {}
+    component_map = {
+        'encoder': 'encoder',
+        'decoder': 'decoder',
+        'perceiver': 'perceiver_model',
+        'prior': 'prior',
+        'attention': 'attention_prior_posterior',
+        'self_model': 'self_model',
+        'rnn': '_rnn',
+        'discriminators': 'image_discriminator'
+    }
+    
+    for comp_name, attr_names in component_map.items():
+        if isinstance(attr_names, str):
+            attr_names = [attr_names]
+        
+        comp_total = 0
+        for attr_name in attr_names:
+            if hasattr(model, attr_name):
+                component = getattr(model, attr_name)
+                comp_total += sum(p.numel() for p in component.parameters())
+        
+        if comp_total > 0:
+            component_params[comp_name] = comp_total
+    
+    if print_details:
+        print("=" * 60)
+        print(f"{'MODEL PARAMETER COUNT':^60}")
+        print("=" * 60)
+        
+        # Total summary
+        print(f"\nTOTAL PARAMETERS OF MODEL")
+        print(f"  Total:         {total_params:,}")
+        print(f"  Trainable:     {trainable_params:,}")
+        print(f"  Non-trainable: {non_trainable_params:,}")
+        print(f"  Memory (MB):   {(total_params * 4) / (1024**2):.2f} (assuming float32)")
+        
+        # Component breakdown
+        if component_params:
+            print(f"\nCOMPONENT BREAKDOWN")
+            sorted_components = sorted(component_params.items(), key=lambda x: x[1], reverse=True)
+            for name, count in sorted_components:
+                percentage = (count / total_params) * 100
+                print(f"  {name:15s}: {count:12,} ({percentage:5.1f}%)")
+        
+        # Module type breakdown
+        print(f"\nMODULE TYPE BREAKDOWN")
+        sorted_modules = sorted(module_params.items(), key=lambda x: x[1], reverse=True)[:10]
+        for module_type, count in sorted_modules:
+            percentage = (count / total_params) * 100
+            trainable = module_trainable[module_type]
+            print(f"  {module_type:20s}: {count:12,} ({percentage:5.1f}%) [{trainable:,} trainable]")
+        
+        print("=" * 60)
+    
+    return {
+        'total': total_params,
+        'trainable': trainable_params,
+        'non_trainable': non_trainable_params,
+        'by_component': component_params,
+        'by_module': dict(module_params)
+    }
+
 class GradientMonitor:
     """Comprehensive gradient flow diagnostic system for hierarchical architectures"""
     
@@ -481,7 +576,7 @@ class GradientMonitor:
             'attention_schema': ['attention_prior_posterior'],
             'vrnn_core': ['_rnn', 'rnn_layer_norm'],
             'self_model': ['self_model'],
-            'discriminators': ['image_discriminator', 'latent_discriminator']
+            'discriminators': ['image_discriminator']
         }
     
     def compute_component_gradients(self, update_global_step: bool = True) -> Dict[str, float]:
@@ -665,8 +760,8 @@ class DMCVBTrainer:
             # Update progress bar
             pbar.set_postfix({
                 'total_loss': losses['total_gen_loss'],
-                'recon_loss': losses['recon_loss'],
-                'kl_z': losses['kl_z']
+                'recon_loss': losses['recon_loss'].item() if torch.is_tensor(losses['recon_loss']) else losses['recon_loss'],
+                'kl_z': losses['kl_z'].item() if torch.is_tensor(losses['kl_z']) else losses['kl_z']
             })
         
         # Compute epoch averages
@@ -674,9 +769,7 @@ class DMCVBTrainer:
         avg_img_disc_loss = np.mean(self.epoch_disc_losses['image']) 
         self.model.img_disc_scheduler.step(avg_img_disc_loss)
         avg_metrics['train/img_disc_lr'] = self.model.img_disc_optimizer.param_groups[0]['lr']
-        avg_latent_disc_loss = np.mean(self.epoch_disc_losses['latent']) 
-        self.model.latent_disc_scheduler.step(avg_latent_disc_loss)
-        avg_metrics['train/latent_disc_lr'] = self.model.latent_disc_optimizer.param_groups[0]['lr']
+        
         avg_component_grads = {
                  component: np.mean(grads) 
                  for component, grads in epoch_component_grads.items()
@@ -1034,14 +1127,16 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 10,
+        'max_components': 15,
         'latent_dim': 30,
-        'hidden_dim': 32, #must be divisible by 8
-        'context_dim': 36,
+        'hidden_dim': 48, #must be divisible by 8
+        'context_dim': 45,
         'attention_dim': 34,
-        'attention_resolution': 16,
+        'attention_resolution': 21,
         'input_channels': 3*1,  # 3 stacked frames
         'HiP_type': 'Mini',
+        'prior_alpha': 10.0,  # Hyperparameters for prior
+        'prior_beta': 2.0,
         
         # Training settings
         'batch_size': 5,
@@ -1090,16 +1185,18 @@ def main():
         action_dim=action_dim,
         sequence_length=config['sequence_length'],
         img_disc_channels=64,
-        img_disc_layers=3,
-        latent_disc_layers=3,
+        img_disc_layers=2,
         device=device,
         input_channels=config['input_channels'],
         learning_rate=config['learning_rate'],
         HiP_type=config['HiP_type'],
         attention_resolution=config['attention_resolution'],
         grad_clip= config['grad_clip'],
+        prior_alpha =config['prior_alpha'],
+        prior_beta = config['prior_beta'],
+        
     )
-    
+    outputs = count_parameters(model, print_details=True)
     # Initialize trainer
     trainer = DMCVBTrainer(
         model=model,
