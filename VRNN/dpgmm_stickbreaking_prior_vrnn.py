@@ -8,11 +8,11 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (
-    EMA, VAEEncoder, VAEDecoder, 
-    TemporalDiscriminator,
+    EMA, TemporalDiscriminator,
     LinearResidual, AttentionPosterior, AttentionPrior,
     AddEpsilon, check_tensor, SelfModelBlock
 )
+from nvae_architecture import VAEEncoder, VAEDecoder
 import math
 from collections import OrderedDict
 from VRNN.lstm import LSTMLayer
@@ -97,7 +97,7 @@ class GammaPosterior(nn.Module):
 
         term1 = a * torch.log(beta/b)
         term2 = -torch.lgamma(alpha) + torch.lgamma(a)
-        term3 = (a - alpha) * torch.digamma(a)
+        term3 = (alpha - a) * torch.digamma(alpha)
         term4 = -(beta - b) * (alpha/beta)
 
         kl = term1 + term2 + term3 + term4
@@ -235,50 +235,33 @@ class AdaptiveStickBreaking(nn.Module):
         return v, perm
 
 
+
     @staticmethod
-    def compute_stick_breaking_proportions( v: torch.Tensor, max_k:int, perm: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Convert samples to stick-breaking proportions with optional permutation inversion
-        # Compute stick-breaking proportions using vectorized operations
-        cumprod_one_minus_v = torch.cumprod(1 - v, dim=-1)  # [batch_size, K-1]
-        one_v = F.pad(v, (0, 1), value=1.0)  # [batch_size, K]
-        c_one = F.pad(cumprod_one_minus_v, (1, 0), value=1.0)  # [batch_size, K]
-        pi = one_v * c_one  # [batch_size, K]
-        """
+    def compute_stick_breaking_proportions(v: torch.Tensor,  
+                                        perm: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Your improved version - already perfect!
+        B = v.size(0)
+        K = v.size(-1) + 1
         
-        batch_size= v.shape[0]
-        check_tensor(v, "stick_breaking_v")
-        # Compute cumprod in log space for numerical stability
-        log_1minus_v = torch.log1p(-v)  # More stable than log(1-v)
-        cumsum_log_1minus = torch.cumsum(log_1minus_v, dim=-1)
-            
-        # Compute pi components in a numerically stable way
-        pi_components = []
-        # First component
-        pi_components.append(v[:, 0])
-    
-        # Middle components
-        for k in range(1, v.shape[1]):
-            pi_k = v[:, k] * torch.exp(cumsum_log_1minus[:, k-1])
-            pi_components.append(pi_k)
-    
-        # Last component
-        pi_components.append(torch.exp(cumsum_log_1minus[:, -1]))
-    
-        # Stack components
-        pi = torch.stack(pi_components, dim=1)
+        eps = torch.finfo(v.dtype).eps
+        v = v.clamp(min=eps, max=1 - eps)
         
-
-        # Apply inverse permutation if needed
+        log_prefix = torch.cumsum(torch.log1p(-v), dim=-1)
+        log_prefix = F.pad(log_prefix, (1, 0), value=0.)
+        
+        log_v_padded = torch.log(F.pad(v, (0, 1), value=1.0))
+        pi = torch.exp(log_v_padded + log_prefix)
+        
         if perm is not None:
-            # Create full permutation including last component
-            full_perm = torch.cat([perm, torch.full((batch_size, 1), max_k-1, device=perm.device)], dim=1)
-            inv_perm = torch.argsort(full_perm, dim=1)  # [batch_size, K]
+            if perm.size(0) != B or perm.size(-1) != K - 1:
+                raise ValueError("perm must be [B, K-1] and match v's batch/K.")
+            last_idx = torch.full((B, 1), K - 1, device=perm.device, dtype=perm.dtype)
+            full_perm = torch.cat([perm, last_idx], dim=1)
+            inv_perm = torch.argsort(full_perm, dim=1)
             pi = torch.gather(pi, 1, inv_perm)
-
-        pi = pi / (pi.sum(dim=-1, keepdim=True) + torch.finfo(torch.float32).eps)  # Normalize to sum to 1
         
+        pi = pi / (pi.sum(dim=-1, keepdim=True) + eps)
         return pi
-
     def forward(self, h: torch.Tensor, n_samples: int = 10, use_rand_perm: bool = True, truncation_threshold: float = 0.995) -> Tuple[torch.Tensor, Dict]:
         """
         Generate mixing proportions using stick-breaking process
@@ -301,7 +284,7 @@ class AdaptiveStickBreaking(nn.Module):
 
 
         # Initialize mixing proportions
-        pi = self.compute_stick_breaking_proportions(v, self.max_K, perm)
+        pi = self.compute_stick_breaking_proportions(v, perm)
         # Adaptive truncation: find where cumulative sum exceeds threshold
         pi_sorted, sort_idx = torch.sort(pi, dim=-1, descending=True)
         pi_cumsum = torch.cumsum(pi_sorted, dim=-1)
@@ -454,7 +437,7 @@ class DPGMMPrior(nn.Module):
             ((z_expanded - prior_means.unsqueeze(0)) ** 2 * 
             torch.exp(-prior_logvars.unsqueeze(0))).sum(dim=-1)
         )
-        log_prior_components = log_component_densities + torch.log(prior_weights.unsqueeze(0).clamp(min=eps))
+        log_prior_components = log_component_densities + torch.log(prior_weights.unsqueeze(0).clamp(min=eps)+eps)
         log_p = torch.logsumexp(log_prior_components, dim=2)  # (n_samples, B)
 
         # KL divergence: average over samples and batch
@@ -467,6 +450,8 @@ class DPGMMPrior(nn.Module):
         Compute KL divergence between Kumaraswamy and Beta distributions and prior gamma distributions
         """
         total_kl = 0.0
+        # Alpha is [batch_size, n_samples], we need [batch_size, 1]
+        alpha_scalar = alpha.mean(dim=1, keepdim=True) if alpha.dim() > 1 else alpha
         
         # For each stick-breaking weight
         for k in range(self.max_K - 1):
@@ -476,8 +461,8 @@ class DPGMMPrior(nn.Module):
             
             alpha_k = alpha[:, k:k+1] if k < alpha.shape[1] else alpha[:, -1:] # Get alpha for current stick
 
-            beta_alpha = torch.ones_like(alpha_k).squeeze(-1)  # Beta(1,α)
-            beta_beta = alpha_k.squeeze(-1)  # Current stick's α
+            beta_alpha = torch.ones_like(alpha_scalar).squeeze(-1)  # Beta(1,α)
+            beta_beta = alpha_scalar.squeeze(-1)  # Current stick's α
                         
                         
             assert kumar_a_k.shape == kumar_b_k.shape == beta_alpha.shape == beta_beta.shape, \
@@ -774,6 +759,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         use_global_context: bool = True,
         context_window_size: int = 10,
         attention_resolution: int = 21,  # Resolution for attention maps
+        warmup_epochs=25,
     ):
         super().__init__()
         #core dimensions
@@ -799,6 +785,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.attention_resolution = attention_resolution
         self.number_lstm_layer = number_lstm_layer
         self.temporal_attention_temp = nn.Parameter(torch.tensor(1.0))
+        self.warmup_epochs = warmup_epochs
         self.current_epoch = 0
         #initialization different parts of the model
         self._init_encoder_decoder()
@@ -825,33 +812,36 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     def _init_encoder_decoder(self):
         # Encoder network (can reuse your existing encoder architecture)
         self.encoder = VAEEncoder(
-                                  channel_size_per_layer=[64,64,128,128,128,128,256,256],
-                                  layers_per_block_per_layer=[2,2,2,2,2,2,2,2],
+                                  channel_size_per_layer=[64,64,96,128,128,192],
+                                  layers_per_block_per_layer=[1,1,2,1,1,1],
                                   latent_size=self.latent_dim,
                                   width=self.image_size,
                                   height=self.image_size,
-                                  num_layers_per_resolution=[2,2,2,2],
+                                  num_layers_per_resolution=[1,2,2,1],
                                   mlp_hidden_size=self.hidden_dim,
                                   channel_size=64,
                                   input_channels=self.input_channels,
-                                  downsample=4
+                                  downsample=4,
+                                  use_se=False,
+                                  dropout= 0.1,
                                   ).to(self.device)
         # Decoder network (can reuse your existing decoder architecture)
         self.decoder = VAEDecoder(
                                   latent_size=self.latent_dim,
                                   width=self.image_size,
                                   height= self.image_size,
-                                  channel_size_per_layer=[256,256,128,128,128,128,64,64],
-                                  layers_per_block_per_layer=[2,2,2,2,2,2,2,2],
-                                  num_layers_per_resolution=[2,2,2,2],
-                                  input_channels=self.input_channels,
+                                  channel_size_per_layer=[192,128,128,96,64,64],
+                                  layers_per_block_per_layer=[1,1,1,2,1,1],
+                                  num_layers_per_resolution=[1,2,2,1],
+                                  reconstruction_channels=self.input_channels,
                                   downsample=4,
-                                  mlp_hidden_size= self.hidden_dim
+                                  mlp_hidden_size= self.hidden_dim,
+                                  dropout= 0.1,
+                                  use_se=False,
                                   ).to(self.device)
+        
         self.encoder.gradient_checkpointing_enable()
         self.decoder.gradient_checkpointing_enable()
-        
-
         #self.ema_encoder = EMA(self.encoder, decay=0.995, use_num_updates=True)
         #self.ema_decoder = EMA(self.decoder, decay=0.995, use_num_updates=True)
 
@@ -1256,6 +1246,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         outputs = {
             'observations': observations,
             'reconstructions': [],
+            'mdl_params': [], 
             'latents': [],
             'z_means': [],
             'z_logvars': [],
@@ -1274,8 +1265,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'reconstruction_losses': [],
             'cluster_entropies': [],
             'self_h_prediction_loss': [],
-            'self_att_prediction_loss': [],
-            'unused_penalties': [],  
+            'self_att_prediction_loss': [], 
             'predicted_movements': [],
         }
         
@@ -1349,10 +1339,22 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             prior_dist, prior_params = self.prior(h_context)
             outputs['prior_params'].append(prior_params)
             # 1. Reconstruction loss for this timestep
-            reconstruction_t = self.decoder(z_t)
-            outputs['reconstructions'].append(reconstruction_t)
+            #reconstruction_t = self.decoder(z_t)
+            #outputs['reconstructions'].append(reconstruction_t)
 
-            outputs['reconstruction_losses'].append(F.mse_loss(reconstruction_t, o_t, reduction='mean'))
+            #outputs['reconstruction_losses'].append(F.mse_loss(reconstruction_t, o_t, reduction='mean'))
+            logit_probs, means, log_scales, coeffs =self.decoder(z_t)
+            outputs['mdl_params'].append({
+                    'logit_probs': logit_probs,
+                    'means': means,
+                    'log_scales': log_scales,
+                    'coeffs': coeffs
+                })
+            reconstruction_t = self.decoder.mdl_head.sample(logit_probs, means, log_scales, coeffs)
+            outputs['reconstructions'].append(reconstruction_t)
+                
+            # Compute NLL loss instead of MSE
+            outputs['reconstruction_losses'].append(self.decoder.mdl_head.nll(o_t, logit_probs, means, log_scales, coeffs).mean())
 
             # === KL Divergence Computation ===
             # 1. KL between posterior and DP-GMM prior
@@ -1372,20 +1374,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             # 4. Compute effective number of components and penalty for unused components
             K_eff = self.prior.get_effective_components(prior_params['pi'])
 
-            # Convert K_eff to integer for each batch element
-            unused_penalties = []
-            for i in range(prior_params['pi'].shape[0]):  # Loop over batch
-                k = int(K_eff[i].item())  # Convert to integer
-                # Calculate penalty for this batch element
-                if k < prior_params['pi'].shape[1]:  # Only if there are unused components
-                    unused_penalties.append(torch.sum(prior_params['pi'][i, k:]))
-                else:
-                    unused_penalties.append(torch.tensor(0.0, device=prior_params['pi'].device))
 
-            unused_penalty = torch.stack(unused_penalties).mean()  # Average over batch
-
-
-            outputs['unused_penalties'].append(unused_penalty)
             outputs['K_eff'] = K_eff.float().mean()
            # Negative for ELBO
 
@@ -1553,7 +1542,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         prior_dist, prior_params = self.prior(h)
 
         # Decode
-        reconstruction = self.decoder(z)
+         
+        logit_probs, means, log_scales, coeffs = self.decoder(z)
+    
+        # Sample reconstruction for visualization
+        reconstruction = self.decoder.mdl_head.sample(logit_probs, means, log_scales, coeffs)
+
 
         return reconstruction, {
             'z': z,
@@ -1564,7 +1558,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         }
     
     def compute_total_loss(self, observations, actions=None, beta=1.0, 
-                        entropy_weight=0.1, lambda_img=1.0, 
+                        entropy_weight=0.1, lambda_recon=1.0, 
                         lambda_pred=0.1, lambda_att=0.1):
         """
         Corrected loss computation recognizing that kumar_beta_kl already includes alpha prior KL
@@ -1591,7 +1585,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         losses['attention_kl'] = torch.stack(outputs['attention_losses']).mean() if outputs['attention_losses'] else torch.tensor(0.0).to(self.device)
         # === Other Terms ===
         losses['cluster_entropy'] = torch.stack(outputs['cluster_entropies']).mean() if outputs['cluster_entropies'] else torch.tensor(0.0).to(self.device)
-        losses['unused_penalty'] = torch.stack(outputs['unused_penalties']).mean() if outputs['unused_penalties'] else torch.tensor(0.0).to(self.device)
         
         
 
@@ -1601,7 +1594,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # === Total Loss (Minimizing Negative ELBO) ===
         losses['total_vae_loss'] = (
             # Reconstruction (positive - we want to minimize error)
-            lambda_img * losses['recon_loss'] +
+            lambda_recon * losses['recon_loss'] +
             
             # KL terms (positive - we want distributions to be close)
             beta * losses['kl_z'] +
@@ -1609,7 +1602,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             beta * losses['attention_kl'] +
             beta * outputs['attention_dynamics_loss'] +  # Attention dynamics loss
             # Penalties (positive)
-            losses['unused_penalty'] +
             
             losses['perceiver_loss'] +
             
@@ -1655,6 +1647,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             cluster_stats: Dictionary with clustering statistics
         """
         # Ensure temperature stays above minimum value
+        eps = torch.finfo(params['pi'].dtype).eps
         temperature = torch.clamp(self.temperature, min=self.min_temperature)
 
         # Computer cluster probabilities with temperature scaling
@@ -1662,22 +1655,28 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         log_probs = F.log_softmax(logits / temperature, dim=-1)
 
         # Compute entropy for each sample
-        eps = torch.finfo(torch.float32).eps
         entropy_per_sample = -torch.sum(probs * log_probs, dim=-1)
 
         # Compute mean entropy
         mean_entropy = entropy_per_sample.mean()
-
+        mixing_proportions = params['pi']
+        mixing_proportions_safe = mixing_proportions.clamp(min=eps)
+        #The entropy H(π) tells us how "spread out" or "diverse" the cluster usage is
+        mixing_entropy = -torch.sum(
+            mixing_proportions_safe * torch.log(mixing_proportions_safe), 
+            dim=-1
+        ).mean() 
         # Compute additional clustering statistics
         cluster_stats = {
             'temperature': temperature.item(),
             'mean_prob_per_cluster': probs.mean(0),
+            'mixing_entropy': mixing_entropy.item(),
             'max_prob_per_sample': probs.max(1)[0].mean(),
             'entropy_std': entropy_per_sample.std(),
             'active_clusters': (probs.mean(0) > eps).sum().item()
         }
 
-        return mean_entropy, cluster_stats
+        return mean_entropy + mixing_entropy, cluster_stats
 
     def compute_gradient_penalty(self, discriminator, real_samples, fake_samples, device):
         """
@@ -1907,8 +1906,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         return context
     
- 
-    
     def self_model_step(self, h_t, z_t, attention_t, a_t, current_time, context_t=None):
         """
         Predict next internal states using self-model
@@ -2045,6 +2042,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                             beta: float = 1.0,
                             n_critic: int = 3,
                             lambda_img: float = 0.2,
+                            lambda_recon: float = 1.0,
                             lambda_pred: float = 0.1,
                             lambda_att: float = 0.1,
                             entropy_weight: float = 0.1) -> Dict[str, torch.Tensor]:
@@ -2062,10 +2060,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Normalize observations if needed
         observations = self.prepare_images_for_training(observations)
         self.gen_optimizer.zero_grad()
+
+        warmup_factor = self.get_warmup_factor()
+
         # 1. Forward pass and compute all VAE losses
         vae_losses, outputs = self.compute_total_loss(
             observations, actions, beta, entropy_weight, 
-            lambda_img, lambda_pred, lambda_att)
+            lambda_recon, lambda_pred, lambda_att)
         
         # 2. Discriminator training
         
@@ -2090,12 +2091,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             observations,
             outputs['reconstructions'],
         )
-        
+        if warmup_factor >0 and warmup_factor < 1.0:
+            lambda_img *= warmup_factor
+
         # 5. Total generator loss
         total_gen_loss = (
             vae_losses['total_vae_loss'] +
-            lambda_img * img_adv_loss +
-            feat_match_loss        # Feature matching
+            lambda_img * (img_adv_loss +
+            feat_match_loss)      # Feature matching
         )
         
         total_gen_loss.backward()
@@ -2112,6 +2115,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self.gen_scheduler.step()
         self.current_step += 1
         
+        avg_max_prob = torch.stack([
+                p['logit_probs'].softmax(1).max(1)[0].mean() 
+                for p in outputs['mdl_params']
+            ]).mean()
         # 7. Prepare output dictionary
         return {
             **vae_losses,
@@ -2121,8 +2128,20 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'total_gen_loss': total_gen_loss.item(),
             'grad_norm': grad_norm.item() if self.has_optimizers else 0.0,
             'temperature': self.temperature.item(),
-            'effective_components': outputs['prior_params'][0]['pi'].max(1)[0].mean().item()  # Avg dominant component prob
+            'effective_components': outputs['prior_params'][0]['pi'].max(1)[0].mean().item(),  # Avg dominant component prob
+            'mdl_avg_max_mixture_prob': avg_max_prob.item(),
+            'mdl_effective_mixtures': (1.0 / avg_max_prob).item(),  # Approximate
         }
+    def set_epoch(self, epoch: int):
+        """Update current epoch for scheduling purposes"""
+        self.current_epoch = epoch
+    
+    def get_warmup_factor(self) -> float:
+        """Calculate warmup factor for adversarial losses"""
+        if self.current_epoch < self.warmup_epochs:
+            return self.current_epoch / self.warmup_epochs
+        return 1.0
+
     def sample(self, num_samples: int) -> torch.Tensor:
         """
         Generate samples from the model
@@ -2144,7 +2163,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         z = prior_dist.sample()
 
         # Decode
-        samples = self.decoder(z)
+        samples = self.decoder.decode(z, deterministic=False)
         #self.ema_encoder.restore()
         #self.ema_decoder.restore()
         return samples
@@ -2375,7 +2394,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 generated_latents.append(z_next)
                 
                 # Decode to observation
-                o_next = self.decoder(z_next)
+                o_next = self.decoder.decode(z_next, deterministic=False)
                 generated_observations.append(o_next)
                 
                 # Update attention using prior network

@@ -1079,6 +1079,37 @@ class DPGMMVariationalAutoencoder(nn.Module):
     
         return result
 
+    def compute_feature_matching_loss( self, real_features, fake_features):
+        """
+        Compute feature matching loss between real and fake features
+        
+        Uses both mean and standard deviation matching for better stability
+        """
+        feat_match_loss = torch.tensor(0.0, device=self.device)
+        num_features = len(real_features)
+        
+        for i in range(num_features):
+            real_feat = real_features[i]
+            fake_feat = fake_features[i]
+            
+            # For CNN features: [B, T, C, H, W]
+            if real_feat.dim() == 5:
+                # Match mean across spatial dimensions
+                real_mean = real_feat.mean(dim=[3, 4])  # [B, T, C]
+                fake_mean = fake_feat.mean(dim=[3, 4])
+                
+                feat_match_loss += F.l1_loss(fake_mean, real_mean.detach())
+                
+            # For feature vectors: [B, T, D]
+            elif real_feat.dim() == 3:
+                # Match mean and std across feature dimension
+                real_mean = real_feat.mean(dim=2)  # [B, T]
+                fake_mean = fake_feat.mean(dim=2)
+                
+                feat_match_loss += F.l1_loss(fake_mean, real_mean.detach())
+
+        return feat_match_loss / num_features  # Normalize by number of features
+
     def compute_adversarial_losses(
         self,
         x: torch.Tensor,
@@ -1098,7 +1129,7 @@ class DPGMMVariationalAutoencoder(nn.Module):
         img_adv_loss = -torch.mean(fake_img_score)
     
         # Feature matching loss
-        feat_match_loss = compute_feature_matching_loss(
+        feat_match_loss = self.compute_feature_matching_loss(
         real_features,
         fake_features
         )

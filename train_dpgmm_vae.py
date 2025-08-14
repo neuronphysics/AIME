@@ -373,7 +373,7 @@ def main():
         'max_components': 38,
         'latent_dim': 40,
         'hidden_dim': 35,
-        'batch_size': 25,
+        'batch_size': 15,
         'lr': 1e-4,
         'beta': 1.0,
         'lambda_img': 1.0,
@@ -391,7 +391,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     result_dir = Path('results')
     result_dir.mkdir(exist_ok=True)
-    writer = SummaryWriter(log_dir='run/dpgmm_vae_experiment')
+    writer = SummaryWriter(log_dir='runs/dpgmm_vae_experiment')
 
     # Load dataset
     train_dataset = OxfordIIITPetsAugmented(
