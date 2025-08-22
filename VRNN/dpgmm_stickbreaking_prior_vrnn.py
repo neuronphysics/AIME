@@ -10,9 +10,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (
     EMA, TemporalDiscriminator,
     LinearResidual, AttentionPosterior, AttentionPrior,
-    AddEpsilon, check_tensor, SelfModelBlock
+    AddEpsilon, check_tensor, SelfModelBlock, PerpetualOrthogonalProjectionLoss
 )
 from nvae_architecture import VAEEncoder, VAEDecoder
+from VRNN.mtl_optimizers import WeightClipping
 import math
 from collections import OrderedDict
 from VRNN.lstm import LSTMLayer
@@ -558,18 +559,6 @@ class AttentionSchema(nn.Module):
             latent_dim, motion_kernels=8
         )
         
-        # Attention state encoder (for RNN integration)
-        self.attention_encoder = nn.Sequential(
-            nn.Conv2d(1, 16, 3, stride=2, padding=1),  # Downsample
-            nn.GroupNorm(4, 16),
-            nn.SiLU(),
-            nn.Conv2d(16, 32, 3, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(32, attention_dim)
-        )
         self.to(device)
     
     def compute_attention_dynamics_loss(
@@ -823,7 +812,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                   input_channels=self.input_channels,
                                   downsample=4,
                                   use_se=False,
-                                  dropout= 0.1,
+                                  dropout= 0.2,
                                   ).to(self.device)
         # Decoder network (can reuse your existing decoder architecture)
         self.decoder = VAEDecoder(
@@ -836,7 +825,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                   reconstruction_channels=self.input_channels,
                                   downsample=4,
                                   mlp_hidden_size= self.hidden_dim,
-                                  dropout= 0.1,
+                                  dropout= 0.2,
                                   use_se=False,
                                   ).to(self.device)
         
@@ -872,7 +861,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     
         # Architecture-aware projection
         self.perceiver_projection = PerceiverContextEmbedding(perceiver_latent_dim, 
-                                                              self.context_dim, 
+                                                              self.context_dim,
+                                                              dropout=0.0, 
                                                               device= self.device)
                 
 
@@ -888,9 +878,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             patch_size= patch_size,
             device= self.device,
             )
-        
 
-        
 
     def _init_vrnn_dynamics(self,use_orthogonal: bool = True, number_lstm_layer: int = 2):
         """Initialize VRNN components with context conditioning"""
@@ -921,8 +909,19 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                                         input_channels=self.input_channels,
                                                         )
         # Feature extractor for attention
-        self.phi_attention = LinearResidual(self.attention_dim + self.hidden_dim//2 + 2, 2*self.hidden_dim)
-    
+        self.phi_attention = LinearResidual( self.hidden_dim//2 + 2, 2*self.hidden_dim)
+        K = self.attention_prior_posterior.posterior_net.num_semantic_slots
+        d = self.attention_prior_posterior.posterior_net.d
+        self.POPL = PerpetualOrthogonalProjectionLoss(
+            num_classes=K,
+            feat_dim=d,
+            no_norm=False,
+            use_attention=True,
+            orthogonality_weight=0.3,
+            slot_ortho_weight=0.2,
+            device=self.device,
+        )
+
     def _init_self_model(self):
         """Initialize comprehensive self-modeling components"""
         # Hidden state predictor: p(h_{t+1}|h_t, z_t, a_t)
@@ -1045,102 +1044,58 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         Fixed optimizer setup ensuring all components are properly included
         """
-        # Collect all model parameters by component
-        param_groups = []
-    
-        # 1. Perceiver parameters (slow learning)
-        perceiver_params = {
-            'params': list(self.perceiver_model.parameters()) + 
-                      list(self.perceiver_projection.parameters()),
-            'lr': learning_rate * 0.5,
-            'weight_decay': weight_decay,
-            'name': 'perceiver'
-        }
-        param_groups.append(perceiver_params)
-    
-        # 2. Encoder/Decoder parameters (normal learning)
-        encoder_decoder_params = {
-            'params': list(self.encoder.parameters()) + 
-                      list(self.decoder.parameters()),
-            'lr': learning_rate,
-            'weight_decay': weight_decay,
-            'name': 'encoder_decoder'
-        }
-        param_groups.append(encoder_decoder_params)
-    
-        # 3. Prior network parameters (fast learning)
-        prior_params = {
-            'params': list(self.prior.parameters()),
-            'lr': learning_rate * 0.5,
-            'weight_decay': weight_decay * 0.1,
-            'name': 'prior'
-        }
-        param_groups.append(prior_params)
-    
-        # 4. VRNN dynamics parameters
-        vrnn_params = {
-            'params': list(self._rnn.parameters()) + 
-                      list(self.rnn_layer_norm.parameters()) +
-                      list(self.phi_attention.parameters()) +
-                      [self.h0, self.c0],  # Don't forget initial states!
-            'lr': learning_rate,
-            'weight_decay': weight_decay,
-            'name': 'vrnn_dynamics'
-        }
-        param_groups.append(vrnn_params)
-    
-        # 5. Attention schema parameters (FIXED - was missing attention_computer)
-        attention_params = {
-            'params': list(self.attention_prior_posterior.parameters()),
-            'lr': learning_rate,
-            'weight_decay': weight_decay,
-            'name': 'attention_schema'
-        }
-        param_groups.append(attention_params)
-    
-        # 6. Self-model parameters
-        self_model_params = {
-            'params': list(self.self_model.parameters()),
-            'lr': learning_rate * 1.5,
-            'weight_decay': weight_decay * 0.5,
-            'name': 'self_model'
-        }
-        param_groups.append(self_model_params)
-    
-        # 7. Temperature parameter (special handling)
-        temp_params = {
-            'params': [self.temperature],
-            'lr': learning_rate * 0.1,  # Very slow learning for temperature
-            'weight_decay': 0.0,  # No weight decay for temperature
-            'name': 'temperature'
-        }
-        param_groups.append(temp_params)
-    
-        # Create main optimizer
-        self.gen_optimizer = torch.optim.AdamW(
+        
+        core_params = []
+        for module in [self.encoder, self.decoder, self.prior, self._rnn, self.rnn_layer_norm]:
+            core_params.extend(list(module.parameters()))
+        core_params.extend([self.h0, self.c0, self.temperature, self.temporal_attention_temp])
+        
+        # Perceiver gets its own group (it's critical but shouldn't dominate)
+        perceiver_params = []
+        for module in [self.perceiver_model, self.perceiver_projection]:
+            perceiver_params.extend(list(module.parameters()))
+        
+        # Task-specific heads
+        head_params = []
+        for module in [self.attention_prior_posterior, self.phi_attention, self.self_model]:
+            head_params.extend(list(module.parameters()))
+        
+        # Create parameter groups with different learning rates
+        param_groups = [
+            {'params': core_params, 'lr': learning_rate, 'weight_decay': weight_decay},
+            {'params': perceiver_params, 'lr': learning_rate * 1.25, 'weight_decay': weight_decay * 2},
+            {'params': head_params, 'lr': learning_rate * 1.2, 'weight_decay': weight_decay * 0.5}
+        ]
+        # Create base optimizer with WeightClipping
+        self.gen_optimizer = WeightClipping(
             param_groups,
-            betas=(0.9, 0.99),
-            eps=1e-7,
-            amsgrad=True,  # Use AMSGrad for stability
-        )
-    
-        # Discriminator optimizers (separate for stability)
-        self.img_disc_optimizer = torch.optim.AdamW(
-            self.image_discriminator.parameters(),
-            lr=learning_rate * 0.5,  # Higher LR for discriminators
-            betas=(0.9, 0.999),  # Lower beta1 for GANs
+            lr=learning_rate,
             weight_decay=weight_decay,
-            eps=1e-8
+            betas=(0.9, 0.999),
+            eps=1e-7,
+            max_grad_norm=self._grad_clip  # Gradient clipping
+        )
+        
+
+        # Discriminator optimizers (separate for stability)
+        self.img_disc_optimizer =  WeightClipping(
+            self.image_discriminator.parameters(),
+            beta= 0.8,
+            optimizer=torch.optim.Adam,
+            lr=learning_rate * 0.7,  # Higher LR for discriminators
+            betas=(0.9, 0.999),  # Lower beta1 for GANs
+            weight_decay=weight_decay*0.1,
+            eps=1e-6,
+            max_grad_norm= self._grad_clip*0.5  # Gradient clipping 
         )
     
     
         # Setup schedulers
         self._setup_schedulers()
     
-        print("Optimizer Setup Complete. Parameter groups:")
-        for group in param_groups:
-            param_count = sum(p.numel() for p in group['params'] if p.requires_grad)
-            print(f"  {group['name']}: {param_count:,} parameters, lr={group['lr']}")
+        print(f"  Core parameters: {sum(p.numel() for p in core_params):,}")
+        print(f"  Perceiver parameters: {sum(p.numel() for p in perceiver_params):,}")
+        print(f"  Head parameters: {sum(p.numel() for p in head_params):,}")
 
     def _setup_schedulers(self):
         """Setup learning rate schedulers for all optimizers"""
@@ -1172,47 +1127,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.warmup_steps = 1000
         self.current_step = 0
 
-    def optimizer_step(self, loss_dict, is_generator=True):
-        """Unified optimizer step with gradient clipping and mixed precision"""
-    
-        if is_generator:
-            optimizer = self.gen_optimizer
-            scaler = self.gen_scaler if hasattr(self, 'gen_scaler') else None
-            loss = loss_dict['total_loss']
-            params = [p for group in optimizer.param_groups for p in group['params']]
-        else:
-            # Handle discriminator updates
-            return self._discriminator_optimizer_step(loss_dict)
-    
-        # Mixed precision training
-        if scaler is not None and torch.cuda.is_available():
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-        
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=self._grad_clip, norm_type=2.0)
-        
-            # Optimizer step
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=self._grad_clip, norm_type=2.0)
-            optimizer.step()
-    
-        # Learning rate scheduling
-        if self.current_step < self.warmup_steps:
-            # Linear warmup
-            warmup_factor = self.current_step / self.warmup_steps
-            for group in optimizer.param_groups:
-                group['lr'] = group['initial_lr'] * warmup_factor
-        else:
-            self.gen_scheduler.step()
-    
-        self.current_step += 1
-    
-        return grad_norm
-    
     def forward_sequence(self, observations, actions=None):
         """
         Process entire sequence through VRNN with DP-GMM prior
@@ -1267,6 +1181,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'self_h_prediction_loss': [],
             'self_att_prediction_loss': [], 
             'predicted_movements': [],
+            'attention_diversity_losses': [],  # Collect per timestep
+            'attention_ortho_losses': [],      # Collect per timestep
         }
         
         # Process sequence step by step
@@ -1309,19 +1225,21 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             attention_map, attention_coords = self.attention_prior_posterior.posterior_net(
                 o_t, h[-1], c_t
             )
+            if self.training and self.attention_prior_posterior.posterior_net.enforce_diversity:
+                outputs['attention_diversity_losses'].append(
+                    self.attention_prior_posterior.posterior_net.diversity_loss
+                )
+                outputs['attention_ortho_losses'].append(
+                    self.attention_prior_posterior.posterior_net.ortho_loss
+                )
+
             outputs['attention_maps'].append(attention_map)
-            saliency_features = self.attention_prior_posterior.posterior_net.saliency_net(o_t)
-            weighted_visual_features = self.attention_prior_posterior.posterior_net.attention_weighted_features(
-            saliency_features, attention_map
-           )            
+            attention_feat = self.attention_prior_posterior.posterior_net.bottleneck_features         
             # Extract attention features
-            attention_feat = self.attention_prior_posterior.attention_encoder(
-                attention_map.unsqueeze(1)  # Add channel dimension
-            )
+            
             #print(f"Attention features shape: {attention_feat.shape}")  # Debugging shape [batch_size, attention_dim]
             attention_features = torch.cat([
-             attention_feat,      # Spatial statistics: [B, attention_dim//2]
-             weighted_visual_features,         # Content features: [B, hidden_dim//2]
+             attention_feat,      # Spatial statistics: [B, attention_dim//2]        # Content features: [B, hidden_dim//2]
              attention_coords      # Spatial coordinates: [B, 2]
             ], dim=-1)
      
@@ -1331,7 +1249,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             attention_state_logvar = torch.clamp(attention_state_logvar, min=-10.0, max=2.0)  # Stability
             attention_state= attention_state_mean + torch.exp(0.5 * attention_state_logvar) * torch.randn_like(attention_state_mean)
             outputs['attention_states'].append(attention_state)
-            
+            outputs['slot_attention_maps'] = self.attention_prior_posterior.posterior_net.slot_attention_maps
+            outputs['slot_centers'] = self.attention_prior_posterior.posterior_net.slot_centers
+            outputs['group_assignments'] = self.attention_prior_posterior.posterior_net.group_assignments
+            outputs['slot_features']       = self.attention_prior_posterior.posterior_net.slot_features
             # === Prior Network p(z_t|o_<t, z_<t) ===
             h_context = torch.cat([h[-1], c_t], dim=-1)
             
@@ -1479,11 +1400,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         else:
             outputs['future_att_bonus'] = torch.tensor(0.0).to(self.device)
         
-        
-        
         # Perceiver loss
         obs_flat = observations.reshape(-1, self.image_size * self.image_size, self.input_channels)
-        outputs['perceiver_loss'] = F.mse_loss(perceiver_recon, obs_flat, reduction='mean')
+        outputs['perceiver_loss'] = nn.MSELoss()(perceiver_recon, obs_flat)
         
         # Add auxiliary outputs
         outputs['context_sequence'] = context_sequence
@@ -1492,29 +1411,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         return outputs 
 
-    def _discriminator_optimizer_step(self, loss_dict):
-        """Separate handling for discriminator updates"""
-    
-        # Image discriminator
-        self.img_disc_optimizer.zero_grad()
-        img_loss = loss_dict['img_disc_loss']
-    
-        if hasattr(self, 'disc_scaler') and torch.cuda.is_available():
-            self.disc_scaler.scale(img_loss).backward()
-            self.disc_scaler.unscale_(self.img_disc_optimizer)
-            img_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.image_discriminator.parameters(), max_norm=self._grad_clip, norm_type=2.0
-            )
-            self.disc_scaler.step(self.img_disc_optimizer)
-        else:
-            img_loss.backward()
-            img_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.image_discriminator.parameters(), max_norm=self._grad_clip, norm_type=2.0
-            )
-            self.img_disc_optimizer.step()
-    
-            
-        return img_grad_norm
     
     def generate_mock_input(self):
         return {
@@ -1586,11 +1482,28 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # === Other Terms ===
         losses['cluster_entropy'] = torch.stack(outputs['cluster_entropies']).mean() if outputs['cluster_entropies'] else torch.tensor(0.0).to(self.device)
         
-        
-
         # Auxiliary losses
         losses['perceiver_loss'] = outputs['perceiver_loss'] 
+        losses['attention_ortho'] = (
+            torch.stack(outputs['attention_ortho_losses']).mean() 
+            if outputs['attention_ortho_losses'] 
+            else torch.tensor(0.0).to(self.device)
+        )
 
+        slot_features = outputs.get('slot_features', None)
+        if slot_features is not None:
+            B, K, d = slot_features.shape
+            features = slot_features.view(B * K, d)
+            labels = torch.arange(K, device=self.device).repeat(B)
+            losses['slot_ortho'] = self.POPL(features, labels)
+        else:
+            losses['slot_ortho'] = torch.tensor(0.0).to(self.device)
+        # Aggregate diversity losses collected during forward pass
+        losses['attention_diversity'] = (
+            torch.stack(outputs['attention_diversity_losses']).mean() 
+            if outputs['attention_diversity_losses'] 
+            else torch.tensor(0.0).to(self.device)
+        )
         # === Total Loss (Minimizing Negative ELBO) ===
         losses['total_vae_loss'] = (
             # Reconstruction (positive - we want to minimize error)
@@ -1764,9 +1677,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self.img_disc_optimizer.zero_grad()
             img_disc_loss.backward(retain_graph=True)
             torch.nn.utils.clip_grad_norm_(self.image_discriminator.parameters(), self._grad_clip)
-            self.img_disc_optimizer.step()
-
-                        
+            self.img_disc_optimizer.step()  
     
         return result
     
@@ -2035,7 +1946,148 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         Convert generated images from [-1, 1] back to [0, 1] for visualization
         """
         return (images + 1) / 2
-   
+    
+    def _gradnorm_pref_weights(self, task_losses, alpha=1.5, ema=0.0,
+                            normalize_by_size: bool = True):
+        """
+        GradNorm weights for 4 losses, using task-specific parameter sets.
+        Computes per-task gradient norms on the params each loss actually affects.
+        Optionally normalizes each norm by sqrt(#params) for comparability.
+
+        Returns:
+            w: detached tensor of shape [T] summing to T (GradNorm convention)
+        """
+        device = next(self.parameters()).device
+        eps = torch.finfo(torch.float32).eps
+        T = len(task_losses)
+
+        # --- Define per-task parameter sets (what actually receives gradients) ---
+        task_params = [
+            # ELBO = recon + KL_z + hierarchical_KL + attention_KL + dynamics - entropy
+            # Gradient flows through:
+            #   - encoder (q(z|x))
+            #   - decoder (p(x|z))  
+            #   - prior (p(z|h,c) - DPGMM components)
+            #   - RNN (provides h for prior conditioning)
+            #   - attention modules (attention KL term)
+            #   - scalar params (temperature affects entropy)
+
+            tuple(list(self.encoder.parameters()) +
+                list(self.decoder.parameters()) +
+                list(self.prior.parameters()) +
+                list(self._rnn.parameters()) +
+                list(self.rnn_layer_norm.parameters()) +
+                list(self.attention_prior_posterior.parameters()) +
+                list(self.phi_attention.parameters()) +
+                [self.h0, self.c0, self.temperature, self.temporal_attention_temp]),
+
+            # 1) Perceiver reconstruction (stays inside the perceiver pipeline)
+            # MSE(perceiver_recon, observations)
+            tuple(list(self.perceiver_model.parameters()) +
+                list(self.perceiver_projection.parameters())),
+
+            # 2) Adversarial generator (encoder→decoder path only)
+            # -D(G(z)) + feature_matching + temporal_contrastive
+            # Gradient flows through:
+            #   - decoder (generator that creates fake images)
+            #   - encoder (provides z for decoder, if end-to-end)
+            #   - RNN (if temporal consistency matters)
+
+            tuple(list(self.encoder.parameters()) +
+                list(self.decoder.parameters())),
+
+            # 3) Predictive/self-model (self_model + inputs that feed it)
+            # future_h_bonus + future_att_bonus (from self-model predictions)
+            # Gradient flows through:
+            #   - self_model (makes predictions)
+            #   - RNN (provides h states being predicted)
+            #   - attention modules (provides attention states)
+            #   - encoder (provides z for self-model input)
+
+            tuple(list(self.self_model.parameters()) +
+                list(self._rnn.parameters()) +
+                list(self.attention_prior_posterior.parameters()) +
+                list(self.phi_attention.parameters())),
+        ]
+
+        # --- Init baselines on first call or if task count changes ---
+        if (not hasattr(self, "_gradnorm_L0")) or (self._gradnorm_L0 is None) or (self._gradnorm_L0.numel() != T):
+            with torch.no_grad():
+                L0 = torch.tensor([L.detach().item() for L in task_losses], device=device)
+                self._gradnorm_L0 = torch.clamp(L0, min=eps)
+                self._gradnorm_w = torch.full((T,), 1.0 / T, device=device)
+
+        # --- Compute gradient norms per task on ITS OWN params (no graph) ---
+        G_vals = []
+        set_sizes = []
+        for L, params in zip(task_losses, task_params):
+            if len(params) == 0:
+                G_vals.append(torch.tensor(eps, device=device))
+                set_sizes.append(1.0)
+                continue
+
+            grads = torch.autograd.grad(
+                L, params,
+                retain_graph=True,   # we compute multiple grads before the final backward
+                create_graph=False,  # no higher-order
+                allow_unused=True
+            )
+
+            # Accumulate squared L2 without concatenating big vectors
+            g2 = torch.tensor(0.0, device=device)
+            n_params = 0
+            for p, g in zip(params, grads):
+                if g is None:
+                    continue
+                g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+                g2 = g2 + (g * g).sum()
+                n_params += p.numel()
+
+            if n_params == 0:
+                # no path -> tiny epsilon
+                G = torch.tensor(eps, device=device)
+                n_params = 1
+            else:
+                G = (g2 + eps).sqrt()
+
+            if normalize_by_size:
+                G = G / (float(n_params) ** 0.5)
+
+            G_vals.append(G)
+            set_sizes.append(float(n_params))
+
+        G = torch.stack(G_vals)                # [T]
+        G_avg = torch.clamp(G.mean(), min=eps)
+
+        # --- Compute relative training rates and update weights ---
+        with torch.no_grad():
+            L_now = torch.tensor([L.detach().item() for L in task_losses], device=device).clamp(min=eps)
+            r_i = L_now / self._gradnorm_L0
+            r_i = r_i / (r_i.mean() + eps)
+
+            target = G_avg * (r_i ** alpha)
+            ratio = G / (target + eps)
+            ratio = torch.clamp(ratio, 0.1, 10.0)  # Prevent extreme values
+            ratio = torch.nan_to_num(ratio, nan=1.0, posinf=1.0, neginf=1.0)
+
+            w_new = self._gradnorm_w * ratio
+            w_new = (T * w_new) / (w_new.sum() + eps)
+
+            if ema > 0:
+                self._gradnorm_w = ema * self._gradnorm_w + (1 - ema) * w_new
+            else:
+                self._gradnorm_w = w_new
+
+            # Clamp just in case extreme values appear
+            if not torch.isfinite(self._gradnorm_w).all():
+                self._gradnorm_w.fill_(1.0 / T)
+            # Ensure minimum weights (prevent starvation)
+            min_weight = 0.05  # Minimum 5% weight per task
+            self._gradnorm_w = torch.maximum(self._gradnorm_w, torch.tensor(min_weight, device=device))
+            self._gradnorm_w = (T * self._gradnorm_w) / self._gradnorm_w.sum()
+  
+        return self._gradnorm_w.detach()
+
     def training_step_sequence(self, 
                             observations: torch.Tensor,
                             actions: torch.Tensor = None,
@@ -2047,7 +2099,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                             lambda_att: float = 0.1,
                             entropy_weight: float = 0.1) -> Dict[str, torch.Tensor]:
         """
-        Complete training step for sequence data
+        Complete training step with PCGrad for multi-task optimization.
+        PCGrad handles zero_grad internally, so we don't call it explicitly.
         
         Args:
             observations: [batch_size, seq_len, channels, height, width]
@@ -2059,7 +2112,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """        
         # Normalize observations if needed
         observations = self.prepare_images_for_training(observations)
-        self.gen_optimizer.zero_grad()
+        
 
         warmup_factor = self.get_warmup_factor()
 
@@ -2073,7 +2126,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         disc_losses_list = []
         for _ in range(n_critic):
             
-            
             disc_loss = self.discriminator_step(
                 observations, outputs['reconstructions']
             )
@@ -2085,28 +2137,56 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             for k in disc_losses_list[0].keys()
         }
         
-        # 4. Generator training with adversarial losses
+        # 3. Generator training with adversarial losses
         # Get fresh discriminator outputs (no detach)
         img_adv_loss, feat_match_loss = self.compute_adversarial_losses(
             observations,
             outputs['reconstructions'],
         )
-        if warmup_factor >0 and warmup_factor < 1.0:
+        if warmup_factor > 0 and warmup_factor <= 1.0:
             lambda_img *= warmup_factor
 
-        # 5. Total generator loss
-        total_gen_loss = (
-            vae_losses['total_vae_loss'] +
-            lambda_img * (img_adv_loss +
-            feat_match_loss)      # Feature matching
+        # 4. Prepare ELBO loss
+        elbo_loss = (
+        lambda_recon * vae_losses['recon_loss'] +
+        beta * vae_losses['kl_z'] +
+        beta * vae_losses['hierarchical_kl'] +
+        beta * vae_losses['attention_kl'] +
+        beta * outputs['attention_dynamics_loss'] -
+        entropy_weight * vae_losses['cluster_entropy'] +
+        vae_losses['attention_diversity'] + vae_losses['attention_ortho'] + vae_losses['slot_ortho']
         )
         
-        total_gen_loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self._grad_clip, norm_type=2)
+        # Adversarial objective
+        adversarial_loss = lambda_img * (img_adv_loss + feat_match_loss)
+    
+        # Predictive objective (self-modeling)
+        predictive_loss = (
+          lambda_pred * outputs['future_h_bonus'] +
+          lambda_att * outputs['future_att_bonus']
+        )
+        task_losses = [elbo_loss, vae_losses['perceiver_loss'], adversarial_loss, predictive_loss]
+
+        w = self._gradnorm_pref_weights(task_losses, alpha=1.5)
+        self.gen_optimizer.zero_grad()
+
+        # 2) GradNorm-weighted multi-task loss
+        total_loss = sum(wi * Li for wi, Li in zip(w, task_losses))
+
+        # 3) backward
+        total_loss.backward()
+
+        # 5) step (plain optimizer)
         self.gen_optimizer.step()
-        #Update EMA
-        #self.ema_encoder.update()
-        #self.ema_decoder.update()
+        grad_norm = 0.0
+        for group in self.gen_optimizer.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    grad_norm += p.grad.data.norm(2).item() ** 2
+        grad_norm = grad_norm ** 0.5
+        # Update EMA
+        # self.ema_encoder.update()
+        # self.ema_decoder.update()
         # 6. Optimize generator
         self.update_temperature(self.current_epoch)
             
@@ -2119,19 +2199,25 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 p['logit_probs'].softmax(1).max(1)[0].mean() 
                 for p in outputs['mdl_params']
             ]).mean()
+        # Compute total loss for logging (not used for optimization)
+        total_gen_loss = sum([loss.item() if torch.is_tensor(loss) else loss 
+                         for loss in task_losses])
+        
         # 7. Prepare output dictionary
         return {
             **vae_losses,
             **avg_disc_losses,
             'img_adv_loss': img_adv_loss.item(),
             'feat_match_loss': feat_match_loss.item(),
-            'total_gen_loss': total_gen_loss.item(),
-            'grad_norm': grad_norm.item() if self.has_optimizers else 0.0,
+            'total_gen_loss': total_gen_loss,
+            'grad_norm': grad_norm if self.has_optimizers else 0.0,
             'temperature': self.temperature.item(),
             'effective_components': outputs['prior_params'][0]['pi'].max(1)[0].mean().item(),  # Avg dominant component prob
+            'Top 4 coverage': outputs['prior_params'][0]['pi'].topk(4, dim=-1)[0].sum(dim=-1).mean().item(),
             'mdl_avg_max_mixture_prob': avg_max_prob.item(),
             'mdl_effective_mixtures': (1.0 / avg_max_prob).item(),  # Approximate
-        }
+            }
+    
     def set_epoch(self, epoch: int):
         """Update current epoch for scheduling purposes"""
         self.current_epoch = epoch
@@ -2291,8 +2377,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         return z_next, prior_info
 
 
-    def generate_future_sequence(self, initial_obs, initial_action=None, horizon=10, 
-                            context_window=None, temperature=1.0):
+    def generate_future_sequence(self, 
+                                 initial_obs, 
+                                 initial_action=None, 
+                                 horizon=10, 
+                                 context_window=None, 
+                                 temperature=1.0):
         """
         Generate a complete future sequence of observations
         
@@ -2358,18 +2448,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 initial_obs, h[-1], c_0
             )            
             # Process initial step through VRNN
-            attention_feat = self.attention_prior_posterior.attention_encoder(
-                attention_map.unsqueeze(1)
-            )
-            saliency_features = self.attention_prior_posterior.posterior_net.saliency_net(
-                initial_obs
-            )
-            weighted_visual_features = self.attention_prior_posterior.posterior_net.attention_weighted_features(
-            saliency_features, attention_map
-           )
+            
+            weighted_visual_features = self.attention_prior_posterior.posterior_net.bottleneck_features
             #Get coordinates directly from posterior attention map
             generated_attention_coords.append(attention_coords)
-            attention_features = torch.cat([attention_feat, weighted_visual_features, attention_coords], dim=-1)
+            attention_features = torch.cat([ weighted_visual_features, attention_coords], dim=-1)
             # Feature extraction
 
             phi_attention = self.phi_attention(attention_features)
@@ -2404,9 +2487,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 generated_attentions.append(attention_map)
                 
                 # Extract attention features
-                attention_feat = self.attention_prior_posterior.attention_encoder(
-                    attention_map.unsqueeze(1)
-                )
+                
                 #TODO: is this correct? Should we use attention_features or attention_map?
                 if 'predicted_movement' in attention_info:
                     dx, dy = attention_info['predicted_movement']
@@ -2417,12 +2498,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     generated_attention_coords.append(new_coords)
                     attention_coords = new_coords
    
-                approx_saliency = self.attention_prior_posterior.posterior_net.saliency_net(o_next)
-                approx_weighted_features = self.attention_prior_posterior.posterior_net.attention_weighted_features(
-                approx_saliency, attention_map
-                )
+                approx_weighted_features = self.attention_prior_posterior.posterior_net.bottleneck_features
+                
                 attention_features = torch.cat([
-                    attention_feat,
                     approx_weighted_features,
                     attention_coords
                     ], dim=-1)

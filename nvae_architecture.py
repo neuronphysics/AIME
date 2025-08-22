@@ -206,13 +206,24 @@ class VAEEncoder(nn.Module):
         super().__init__()
         self.latent_size = latent_size
         self.downsample = downsample
-        
+
+        if channel_size % 32 == 0:
+            num_groups = 32
+        elif channel_size % 16 == 0:
+            num_groups = 16
+        elif channel_size % 8 == 0:
+            num_groups = 8
+        elif channel_size % 4 == 0:
+            num_groups = 4
+        else:
+            num_groups = 1  # Fall back to LayerNorm equivalent
+
         # Initial convolution
         self.stem = nn.Sequential(
             spectral_norm_conv(
                 nn.Conv2d(input_channels, channel_size, 7, padding=3, stride=1, bias=False)
             ),
-            nn.BatchNorm2d(channel_size),
+            nn.GroupNorm(num_groups, channel_size),
             Swish()
         )
         
@@ -304,9 +315,21 @@ class VAEEncoder(nn.Module):
         h = self.final_act(h)
         
         # MLP
-        self.hlayer = self.mlp(h)
+        if self.use_checkpoint and self.training:
+            # Checkpoint the MLP computation
+            self.hlayer = torch.utils.checkpoint.checkpoint(
+                self.mlp, h, use_reentrant=False
+            )
+            # Checkpoint the projection to mean/logvar
+            mean_logvar = torch.utils.checkpoint.checkpoint(
+                self.proj, self.hlayer, use_reentrant=False
+            )
+        else:
+            self.hlayer = self.mlp(h)
+            mean_logvar = self.proj(self.hlayer)
+
+        mean, logvar = mean_logvar.chunk(2, dim=-1)
         # Project to latent space
-        mean, logvar = self.proj(self.hlayer).chunk(2, dim=-1)
         logvar = torch.clamp(logvar, -10.0, 2.0)  # numerical stability
         sigma = (logvar * 0.5).exp()
         eps= torch.randn_like(sigma)
@@ -445,14 +468,14 @@ class VAEDecoder(nn.Module):
         
         self.mlp = nn.Sequential(
             nn.Linear(latent_size, mlp_hidden_size),
-            nn.BatchNorm1d(mlp_hidden_size),
+            nn.LayerNorm(mlp_hidden_size),  
             Swish(),
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden_size, mlp_hidden_size),
-            nn.BatchNorm1d(mlp_hidden_size),
+            nn.LayerNorm(mlp_hidden_size),  
             Swish(),
             nn.Linear(mlp_hidden_size, mlp_output_size),
-            nn.BatchNorm1d(mlp_output_size),
+            nn.LayerNorm(mlp_output_size),  
             Swish(),
         )
         
@@ -521,8 +544,18 @@ class VAEDecoder(nn.Module):
     
     def forward(self, z):
         # MLP
-        h = self.mlp(z)
-        h = self.unflatten(h)
+        if self.use_checkpoint and self.training:
+            # Checkpoint the MLP computation
+            h = torch.utils.checkpoint.checkpoint(
+                self.mlp, z, use_reentrant=False
+            )
+            # Checkpoint the unflatten operation (wrap in a lambda for checkpoint)
+            h = torch.utils.checkpoint.checkpoint(
+                lambda x: self.unflatten(x), h, use_reentrant=False
+            )
+        else:
+            h = self.mlp(z)
+            h = self.unflatten(h)
         
         # Progressive decoding
         for block in self.decoder_blocks:
@@ -530,16 +563,26 @@ class VAEDecoder(nn.Module):
                 h = torch.utils.checkpoint.checkpoint(block, h, use_reentrant=False)
             else:
                 h = block(h)
+        # Final processing with checkpointing
+        if self.use_checkpoint and self.training:
+            h = torch.utils.checkpoint.checkpoint(
+                lambda x: self.final_act(self.final_norm(x)), h, use_reentrant=False
+            )
+            # Checkpoint the pre_output and mdl_head
+            out = torch.utils.checkpoint.checkpoint(
+                self.pre_output, h, use_reentrant=False
+            )
+            result = torch.utils.checkpoint.checkpoint(
+                self.mdl_head, out, use_reentrant=False
+            )
+        else:
+            h = self.final_norm(h)
+            h = self.final_act(h)
+            out = self.pre_output(h)
+            result = self.mdl_head(out)
         
-        # Final processing
-        h = self.final_norm(h)
-        h = self.final_act(h)
-        
-        # Output
-        out = self.pre_output(h)
-        return self.mdl_head(out)
+        return result
     
-
     def decode(self, z, deterministic=False):
         """Decode latents to images for inference/visualization"""
         logit_probs, means, log_scales, coeffs = self.forward(z)

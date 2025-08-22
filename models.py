@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple, Dict, Union, List
+
 import logging
 import functools
 from torch.utils.checkpoint import checkpoint
@@ -53,480 +54,568 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
-class SoftSpatialRegularizer(nn.Module):
-    """Minimal differentiable spatial regularization"""
-    def __init__(self, device):
-        super().__init__()
-        self.temperature = nn.Parameter(torch.tensor(1.0))
-        self.device = device
-        self.to(device)
-        
-    def forward(self, coords):
-        return 0.995 * torch.tanh(coords / self.temperature)
-    
+
+
+
 class AttentionPosterior(nn.Module):
     """
-    attention-based spatial focus generation combining 
-    bottom-up saliency with top-down modulation.
-    Spatial positions are treated as a sequence with positional embeddings
-    Top-down modulation creates queries, bottom-up features create keys/values
-    Multi-scale processing now operates on attention outputs
+    Multi-object attention:
+    Efficient: linear in N * K. Suitable for video pipelines.
+
+    Returns:
+        attention_probs_2d: [B, H_att, W_att] fused attention map (probabilities)
+        regularized_coords: [B, 2] combined (x,y) in [-1,1] after light regularization
+
+    Side attributes you may use:
+        slot_attention_maps: [B, K, H_att, W_att] per-slot attention maps (probabilities)
+        slot_centers:       [B, K, 2] per-slot (x,y)
+        fusion_weights:     [B, K] (when attention_fusion_mode='weighted')
+        diversity_loss:     scalar (0.0 if disabled)
+        ortho_loss:         scalar (0.0 if disabled)
+        bottleneck_features:[B, hidden_dim//2]
     """
-    
+
     def __init__(
         self,
-        image_size: int,
-        attention_resolution: int,
-        hidden_dim: int,
-        context_dim: int,
+        image_size: int = 84,
+        attention_resolution: int = 21,
+        hidden_dim: int = 256,
+        context_dim: int = 128,
         input_channels: int = 3,
         feature_channels: int = 64,
-        num_heads: int = 8,
-        device: Optional[torch.device] = torch.device("cpu" if not torch.cuda.is_available() else "cuda")
+        num_semantic_slots: int = 4,
+        num_heads: int = 4,
+        attention_fusion_mode: str = "weighted",  # 'weighted' | 'max' | 'gated'
+        enforce_diversity: bool = True,
+        device: Optional[torch.device] = None,
     ):
         super().__init__()
+        assert feature_channels % num_heads == 0, "feature_channels must be divisible by num_heads"
+        assert attention_fusion_mode in {"weighted", "max", "gated"}
+
         self.image_size = image_size
         self.attention_resolution = attention_resolution
         self.feature_channels = feature_channels
+        self.hidden_dim = hidden_dim
+        self.num_semantic_slots = num_semantic_slots
         self.num_heads = num_heads
-        self.spatial_dim = attention_resolution * attention_resolution
-        self.device = device
-        
-        # Spatial regularizer from original
-        self.spatial_regularizer = SoftSpatialRegularizer(device)
-        
-        # Bottom-up saliency extraction (unchanged from original)
-        self.saliency_net = SaliencyModule(
-                image_size=image_size,
-                input_channels=input_channels,
-                feature_channels=feature_channels,
-                num_heads=4,  # Fewer heads for efficiency in early layers
-                patch_size=4,  # Small patches for fine-grained attention
-                num_layers=4,  # Matches the 4 conv layers we're replacing
-                device=device
-            )
-        
-        # Spatial adapter
-        self.spatial_adapter = nn.Sequential(
-            nn.AdaptiveAvgPool2d((attention_resolution, attention_resolution)),
-            nn.Conv2d(feature_channels, feature_channels, kernel_size=1),
+        self.attention_fusion_mode = attention_fusion_mode
+        self.enforce_diversity = enforce_diversity
+        self.device = device if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+        self.N = attention_resolution * attention_resolution
+        self.d = feature_channels
+        self.h = num_heads
+        self.d_head = self.d // self.h
+
+        # ========= Feature Pyramid (84 -> 42 -> 21) =========
+        self.pyramid_conv1 = nn.Sequential(
+            nn.Conv2d(input_channels, 32, 5, stride=2, padding=2),  # 84->42
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+        )
+        self.pyramid_conv2 = nn.Sequential(
+            nn.Conv2d(32, 48, 5, stride=2, padding=2),  # 42->21
+            nn.GroupNorm(12, 48),
+            nn.SiLU(),
+        )
+        self.pyramid_conv3 = nn.Sequential(
+            nn.Conv2d(48, feature_channels, 3, stride=1, padding=1),  # stay 21
             nn.GroupNorm(16, feature_channels),
-            nn.SiLU()
-        )
-        
-        # === ATTENTION COMPONENTS ===
-        # Learnable spatial position embeddings
-        self.spatial_pos_embed = nn.Parameter(
-            torch.randn(1, self.spatial_dim, feature_channels) * 0.02
-        )
-        
-                
-        # Top-down modulation (same architecture as original)
-        self.top_down_projection = nn.Sequential(
-            nn.Linear(hidden_dim + context_dim, feature_channels * 2),
-            nn.LayerNorm(feature_channels * 2),
             nn.SiLU(),
-            nn.Linear(feature_channels * 2, feature_channels),
-            nn.LayerNorm(feature_channels),
-            nn.SiLU()
         )
-        
-        # Multi-head attention for spatial focus
-        self.spatial_attention = nn.MultiheadAttention(
-            embed_dim=feature_channels,
-            num_heads=num_heads,
-            dropout=0.1,
-            batch_first=True
+        self.pyramid_fusion = nn.Conv2d(32 + 48 + feature_channels, feature_channels, 1)
+
+        # ========= GroupViT-style grouping =========
+        # Learnable group tokens that compete for features
+        self.group_tokens = nn.Parameter(torch.randn(1, num_semantic_slots, self.d) * 0.02)
+
+        # Slot prototypes (semantic specialization)
+        self.slot_specialization = nn.Parameter(torch.randn(num_semantic_slots, self.d) * 0.02)
+
+        # Temperature for grouping / diversity; guarded at use time
+        if enforce_diversity:
+            self.diversity_temp = nn.Parameter(torch.tensor(1.0))
+
+        # ========= Top-down modulation (per slot) =========
+        self.slot_modulator = nn.Sequential(
+            nn.Linear(hidden_dim + context_dim, self.d * num_semantic_slots),
+            nn.LayerNorm(self.d * num_semantic_slots),
+            nn.SiLU(),
+            nn.Linear(self.d * num_semantic_slots, self.d * num_semantic_slots),
         )
-        
-        # Multi-scale processing layers (preserving original multi-scale approach)
-        self.multi_scale_projections = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(feature_channels, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.SiLU()
-            ),
-            nn.Sequential(
-                nn.Linear(feature_channels, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.SiLU()
-            ),
-            nn.Sequential(
-                nn.Linear(feature_channels, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.SiLU()
+
+        # ========= Attention projections (shared K,V; per-slot Q) =========
+        self.q_proj = nn.Linear(self.d, self.d)
+        self.k_proj = nn.Linear(self.d, self.d)
+        self.v_proj = nn.Linear(self.d, self.d)
+
+        # ========= 2D positional encodings =========
+        self.row_embed = nn.Parameter(torch.randn(attention_resolution, self.d // 2) * 0.02)
+        self.col_embed = nn.Parameter(torch.randn(attention_resolution, self.d // 2) * 0.02)
+
+        # ========= Fusion heads =========
+        if self.attention_fusion_mode == "weighted":
+            self.fusion_weights_head = nn.Sequential(
+                nn.Linear(self.d * num_semantic_slots, num_semantic_slots),
+                nn.LayerNorm(num_semantic_slots),
+                nn.Softmax(dim=-1),
             )
-        ])
-        
-        # Attention fusion (adapted for sequence format)
-        self.attention_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim*2),
-            nn.LayerNorm(hidden_dim*2),
+        elif self.attention_fusion_mode == "gated":
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(hidden_dim + context_dim, num_semantic_slots),
+                nn.LayerNorm(num_semantic_slots),
+                nn.Sigmoid(),
+            )
+
+        # ========= Per-slot temperatures for attention sharpening =========
+        self.slot_temperatures = nn.Parameter(torch.ones(num_semantic_slots))
+
+        # ========= Coordinate regularizer (combine K centers -> 2) =========
+        self.spatial_regularizer = nn.Sequential(
+            nn.Linear(2 * num_semantic_slots, 16),
+            nn.LayerNorm(16),
             nn.SiLU(),
-            nn.Linear(hidden_dim*2, hidden_dim),
+            nn.Linear(16, 2),
+            nn.Tanh(),
+        )
+
+        # ========= Bottleneck from concatenated slot features =========
+        self.bottleneck_projector = nn.Sequential(
+            nn.Linear(self.d * num_semantic_slots, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 1)  # Output attention logits
+            nn.Linear(hidden_dim, hidden_dim // 2),
         )
-        
-        # Feature extraction for downstream processing (matching original)
-        self.attention_pool = nn.Sequential(
-            nn.Conv2d(feature_channels, hidden_dim//2, kernel_size=1),
-            nn.GroupNorm(8, hidden_dim//2),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten()
-        )
-        
-        # Temperature for attention sharpening
-        self.temperature = nn.Parameter(torch.ones(1))
-        
-        self.to(device)
-        
-    
+
+        # Bookkeeping
+        self.diversity_loss = torch.tensor(0.0)
+        self.ortho_loss = torch.tensor(0.0)
+
+        self.to(self.device)
+
+    # ---------- helpers ----------
+    def _positional_encoding_2d(self) -> torch.Tensor:
+        R, C, d = self.attention_resolution, self.attention_resolution, self.d
+        pos = torch.cat(
+            [
+                self.row_embed.unsqueeze(1).expand(-1, C, -1),  # [R, C, d/2]
+                self.col_embed.unsqueeze(0).expand(R, -1, -1),  # [R, C, d/2]
+            ],
+            dim=-1,
+        )  # [R, C, d]
+        return pos.flatten(0, 1).unsqueeze(0)  # [1, N, d]
+
+    @staticmethod
+    def _reshape_heads(x: torch.Tensor, B: int, seq_len: int, h: int, d_head: int) -> torch.Tensor:
+        # [B, seq_len, d] -> [B, h, seq_len, d_head]
+        return x.view(B, seq_len, h, d_head).permute(0, 2, 1, 3).contiguous()
+
+    @staticmethod
+    def _merge_heads(x: torch.Tensor) -> torch.Tensor:
+        # [B, h, seq_len, d_head] -> [B, seq_len, h*d_head]
+        B, h, L, d_head = x.shape
+        return x.permute(0, 2, 1, 3).reshape(B, L, h * d_head)
+
+    # ---------- diversity losses ----------
+    def _compute_diversity_losses(self, slot_maps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        slot_maps: [B, K, H, W] (logits or weights). We convert to probabilities.
+        Returns (diversity_loss, ortho_loss)
+        """
+        B, K, H, W = slot_maps.shape
+        # Normalize to probabilities over spatial dims
+        p = slot_maps.view(B, K, -1)
+        p = p.softmax(dim=-1)  # [B, K, N]
+        p = F.normalize(p, p=2, dim=-1)
+        corr = torch.bmm(p, p.transpose(1, 2))  # [B, K, K]
+        I = torch.eye(K, device=corr.device).unsqueeze(0)
+        div = ((corr - I) ** 2).sum() / (B * K * (K - 1) + 1e-8)
+
+        # Optional: orthogonality in slot specialization space
+        S = F.normalize(self.slot_specialization, dim=-1)  # [K, d]
+        ortho = ((S @ S.T - torch.eye(K, device=S.device)) ** 2).mean()
+
+        return div, ortho
+
+    # ---------- forward ----------
     def forward(
         self,
-        observation: torch.Tensor,
-        hidden_state: torch.Tensor,
-        context: torch.Tensor
+        observation: torch.Tensor,  # [B, 3, 84, 84]
+        hidden_state: torch.Tensor, # [B, hidden_dim]
+        context: torch.Tensor,      # [B, context_dim]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass maintaining exact interface of original AttentionPosterior
+
+        B = observation.size(0)
+        H_att = W_att = self.attention_resolution
+        device = observation.device
+
+        # === FPN ===
+        l1 = self.pyramid_conv1(observation)                       # [B, 32, 42, 42]
+        l2 = self.pyramid_conv2(l1)                                # [B, 48, 21, 21]
+        l3 = self.pyramid_conv3(l2)                                # [B, 64, 21, 21]
+
+        l1_up = F.interpolate(l1, size=(H_att, W_att), mode="bilinear", align_corners=False)
+        l2_up = F.interpolate(l2, size=(H_att, W_att), mode="bilinear", align_corners=False)
+        l3_up = F.interpolate(l3, size=(H_att, W_att), mode="bilinear", align_corners=False)
         
-        Returns:
-            attention_probs: [B, H, W] attention map
-            coords: [B, 2] regularized attention coordinates
-        """
-        batch_size = observation.shape[0]
-        
-        # 1. Extract bottom-up saliency features (preserves input resolution)
-        saliency_features = self.saliency_net(observation)  # [B, C, H, W]
-        
-        # Store for attention_weighted_features method
-        self._last_saliency_features = saliency_features
-        
-        # 2. Adapt to attention resolution
-        adapted_features = self.spatial_adapter(saliency_features)  # [B, C, att_res, att_res]
-        
-        # 3. Reshape to sequence format for attention
-        # [B, C, H, W] → [B, H*W, C]
-        feat_seq = adapted_features.permute(0, 2, 3, 1).reshape(batch_size, -1, self.feature_channels)
-        
-        # 4. Add positional embeddings
-        feat_seq = feat_seq + self.spatial_pos_embed
-        
-        # 5. Generate top-down modulation signal
-        top_down = torch.cat([hidden_state, context], dim=-1)
-        top_down_features = self.top_down_projection(top_down)  # [B, C]
-        
-        # Create query sequence: each spatial position gets the same top-down query
-        # but modulated by learned spatial embeddings
-        query_seq = top_down_features.unsqueeze(1).expand(-1, self.spatial_dim, -1)  # [B, H*W, C]
-        query_seq = query_seq + self.spatial_pos_embed  # Add spatial awareness to queries
-        
-        # 6. Apply multi-head attention
-        # Q: top-down modulated queries for each position
-        # K, V: bottom-up features at each position
-        attended_features, attention_weights = self.spatial_attention(
-            query=query_seq,
-            key=feat_seq,
-            value=feat_seq,
-            need_weights=True,
-            average_attn_weights=True  # Average across heads
-        )
-        
-        # 7. Multi-scale processing (adapted from original)
-        multi_scale_features = []
-        for projection in self.multi_scale_projections:
-            features = projection(attended_features)
-            multi_scale_features.append(features)
-        
-        # 8. Fuse multi-scale features
-        fused_features = torch.cat(multi_scale_features, dim=-1)  # [B, H*W, 64*3]
-        attention_logits = self.attention_fusion(fused_features)  # [B, H*W, 1]
-        attention_logits = attention_logits.squeeze(-1)  # [B, H*W]
-        
-        # 9. Apply temperature and softmax
-        attention_logits = attention_logits / self.temperature.clamp(min=0.1, max=2.0)  # Clamp temperature for stability
-        attention_probs = F.softmax(attention_logits, dim=-1)  # [B, H*W]
-        
-        # 10. Reshape back to 2D
-        attention_probs_2d = attention_probs.view(batch_size, self.attention_resolution, self.attention_resolution)
-        
-        # 11. Compute attention center (same as original)
-        y_coords = torch.linspace(-1, 1, self.attention_resolution, device=attention_logits.device)
-        x_coords = torch.linspace(-1, 1, self.attention_resolution, device=attention_logits.device)
-        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
-        
-        # Compute center of attention
-        y_center = (attention_probs_2d * y_grid).sum(dim=[1, 2])  # [B]
-        x_center = (attention_probs_2d * x_grid).sum(dim=[1, 2])  # [B]
-        
-        coords = torch.stack([x_center, y_center], dim=-1)  # [B, 2]
-        
-        # Apply spatial regularizer as in original
-        regularized_coords = self.spatial_regularizer(coords)
-        
+        fused = self.pyramid_fusion(torch.cat([l1_up, l2_up, l3_up], dim=1))
+        self._last_saliency_features = fused  # Save for visualization
+
+        # === sequence + positions ===
+        feat_seq = fused.flatten(2).transpose(1, 2)                # [B, N, d]
+        pos = self._positional_encoding_2d().to(device)            # [1, N, d]
+        feat_seq = feat_seq + pos                                  # [B, N, d]
+
+        # === grouping via dot-product similarity ===
+        group_tokens = self.group_tokens.expand(B, -1, -1)         # [B, K, d]
+        tau = self.diversity_temp if self.enforce_diversity else 1.0
+        assign_logits = torch.einsum("bnd,bkd->bnk", feat_seq, group_tokens) / float(tau)
+        group_assignments = assign_logits.softmax(dim=-1)          # [B, N, K]
+        # Save for visualization as [B, H, W, K]
+        self.group_assignments = group_assignments.view(B, H_att, W_att, self.num_semantic_slots)
+
+        # === per-slot queries (modulated) ===
+        top_down = torch.cat([hidden_state, context], dim=-1)      # [B, hidden+context]
+        modulation = self.slot_modulator(top_down).view(B, self.num_semantic_slots, self.d)  # [B,K,d]
+
+        # slots = specialization + learnable bias (optional)
+        slots = self.slot_specialization.unsqueeze(0).expand(B, -1, -1)  # [B,K,d]
+        modulated_slots = slots + modulation                                # [B,K,d]
+
+        # === shared K,V ===
+        K_lin = self.k_proj(feat_seq)                             # [B, N, d]
+        V_lin = self.v_proj(feat_seq)                             # [B, N, d]
+        Kh = self._reshape_heads(K_lin, B, self.N, self.h, self.d_head)    # [B,h,N,d_head]
+        Vh = self._reshape_heads(V_lin, B, self.N, self.h, self.d_head)    # [B,h,N,d_head]
+
+        slot_features = []
+        slot_maps = []
+
+        # Precompute grids for centers
+        y_coords = torch.linspace(-1, 1, H_att, device=device)
+        x_coords = torch.linspace(-1, 1, W_att, device=device)
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing="ij")  # [H,W]
+
+        eps = 1e-6
+        scale = 1.0 / math.sqrt(self.d_head)
+
+        for k in range(self.num_semantic_slots):
+            # Q
+            q_lin = self.q_proj(modulated_slots[:, k, :]).unsqueeze(1)     # [B, 1, d]
+            Qh = self._reshape_heads(q_lin, B, 1, self.h, self.d_head)     # [B,h,1,d_head]
+
+            # bias from assignments: log-prob preference per position
+            # group_assignments: [B, N, K] -> take slot k -> [B, N]
+            bias_k = (group_assignments[:, :, k].clamp_min(eps)).log()      # [B, N]
+            bias_k = bias_k.view(B, 1, 1, self.N)                           # [B,1,1,N] broadcast over heads
+
+            # attention logits: QK^T / sqrt(d) + bias
+            logits = torch.matmul(Qh, Kh.transpose(-2, -1)) * scale         # [B,h,1,N]
+            logits = logits + bias_k                                        # additive bias
+
+            # per-slot temperature (sharpening)
+            temp = self.slot_temperatures[k].clamp(min=0.1)
+            logits = logits / float(temp)
+
+            # weights & context
+            attn = logits.softmax(dim=-1)                                   # [B,h,1,N]
+            context = torch.matmul(attn, Vh)                                 # [B,h,1,d_head]
+            context = context.squeeze(2)                                     # [B,h,d_head]
+            context = context.transpose(1, 2).reshape(B, self.d)             # [B,d]
+
+            # save per-slot attention map (average heads)
+            attn_avg = attn.mean(dim=1).squeeze(1)                           # [B,N]
+            slot_map_2d = attn_avg.view(B, H_att, W_att)                     # [B,H,W]
+
+            slot_features.append(context)           # [B,d]
+            slot_maps.append(slot_map_2d)           # [B,H,W]
+
+        slot_features = torch.stack(slot_features, dim=1)   # [B,K,d]
+        slot_maps = torch.stack(slot_maps, dim=1)           # [B,K,H,W]
+        self.slot_attention_maps = slot_maps
+        self.slot_features = slot_features
+        # === fusion ===
+        if self.attention_fusion_mode == "weighted":
+            all_feat = slot_features.reshape(B, -1)                           # [B,K*d]
+            fusion_weights = self.fusion_weights_head(all_feat)               # [B,K], sums to 1
+            self.fusion_weights = fusion_weights
+            w = fusion_weights.view(B, self.num_semantic_slots, 1, 1)         # [B,K,1,1]
+            fused_map = (slot_maps * w).sum(dim=1)                            # [B,H,W]
+        elif self.attention_fusion_mode == "max":
+            fused_map, _ = slot_maps.max(dim=1)                               # [B,H,W]
+            self.fusion_weights = None
+        else:  # 'gated'
+            gates = self.fusion_gate(top_down).view(B, self.num_semantic_slots, 1, 1)  # [B,K,1,1]
+            fused_map = (slot_maps * gates).sum(dim=1)                         # [B,H,W]
+            self.fusion_weights = gates.squeeze(-1).squeeze(-1)               # [B,K]
+
+        # Normalize fused map to probabilities over spatial positions
+        attention_probs = fused_map.flatten(1).softmax(dim=-1)                # [B,N]
+        attention_probs_2d = attention_probs.view(B, H_att, W_att)            # [B,H,W]
+
+        # === per-slot centers & combined coords ===
+        slot_centers = []
+        for k in range(self.num_semantic_slots):
+            pk = slot_maps[:, k].flatten(1).softmax(dim=-1).view(B, H_att, W_att)  # [B,H,W]
+            y_c = (pk * y_grid).sum(dim=[1, 2])                                    # [B]
+            x_c = (pk * x_grid).sum(dim=[1, 2])                                    # [B]
+            slot_centers.append(torch.stack([x_c, y_c], dim=-1))                   # [B,2]
+        slot_centers = torch.stack(slot_centers, dim=1)                             # [B,K,2]
+        self.slot_centers = slot_centers
+
+        if self.attention_fusion_mode == "weighted":
+            w = self.fusion_weights  # [B,K]
+            coords = (slot_centers * w.unsqueeze(-1)).sum(dim=1)                   # [B,2]
+        else:
+            y_c = (attention_probs_2d * y_grid).sum(dim=[1, 2])
+            x_c = (attention_probs_2d * x_grid).sum(dim=[1, 2])
+            coords = torch.stack([x_c, y_c], dim=-1)                                # [B,2]
+
+        # Light reg to keep inside [-1,1] and stabilize
+        regularized_coords = self.spatial_regularizer(slot_centers.flatten(1)) * 0.995  # [B,2]
+
+        # === diversity losses (optional) ===
+        if self.enforce_diversity and self.training:
+            div, ortho = self._compute_diversity_losses(slot_maps)
+            self.diversity_loss = div
+            self.ortho_loss = ortho
+        else:
+            self.diversity_loss = torch.tensor(0.0, device=device)
+            self.ortho_loss = torch.tensor(0.0, device=device)
+
+        # === bottleneck features ===
+        self.bottleneck_features = self.bottleneck_projector(slot_features.reshape(B, -1))  # [B,hidden//2]
+
         return attention_probs_2d, regularized_coords
-    
-    def attention_weighted_features(
+
+
+    @torch.no_grad()
+    def visualize_multi_object_attention(
         self,
-        features: torch.Tensor,  # [B, C, H, W]
-        attention_probs: torch.Tensor  # [B, H_att, W_att]
-    ) -> torch.Tensor:
+        observation: torch.Tensor,                 # [B, 3, H, W] (RGB), in [0,1] or [-1,1]
+        slot_attention_maps: torch.Tensor,         # [B, K, H_att, W_att]
+        slot_centers: torch.Tensor,                # [B, K, 2]  ([-1,1] coords)
+        group_assignments: Optional[torch.Tensor] = None,  # [B, H_att, W_att, K] or [B, K, H_att, W_att]
+        return_mode: str = "all",                  # 'all' | 'combined' | 'slots' | 'groups'
+    ) -> Dict[str, torch.Tensor]:
         """
-        Extract attention-weighted features for downstream processing
-        Maintains exact interface of original method
+        Pure-PyTorch, stateless visualization.
+
+        Returns (all tensors on observation.device, observation.dtype):
+        - 'slot_overlays'         : [B*K, 3, H, W]  (per-slot colored overlays)
+        - 'semantic_segmentation' : [B,   3, H, W]  (argmax over slots; if no groups -> original)
+        - 'combined_with_contours': [B,   3, H, W]  (colored edges + centers if available)
         """
-        batch_size = features.shape[0]
-        
-        # Adapt attention map to feature resolution if needed
-        if attention_probs.shape[-2:] != features.shape[-2:]:
-            attention_probs = F.interpolate(
-                attention_probs.unsqueeze(1),
-                size=features.shape[-2:],
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1)
-        
-        # Apply attention weighting
-        attention_expanded = attention_probs.unsqueeze(1)  # [B, 1, H, W]
-        weighted_features = features * attention_expanded
-        
-        # Extract pooled features using the same architecture as original
-        pooled_features = self.attention_pool(weighted_features)
-        
-        return pooled_features  # [B, hidden_dim//2]
-    
-    def visualize_attention(
-        self,
-        attention_map: torch.Tensor,  # [B, H_att, W_att]
-        original_image: torch.Tensor,  # [B, C, H_img, W_img]
-        alpha: float = 0.5
-    ) -> torch.Tensor:
-        """
-        Create visualization by overlaying attention on original image
-        Exact copy from original AttentionPosterior
-        """
-        batch_size = attention_map.shape[0]
-        img_h, img_w = original_image.shape[-2:]
-        
-        # Upsample attention to image size
-        attention_upsampled = F.interpolate(
-            attention_map.unsqueeze(1),
-            size=(img_h, img_w),
-            mode='bilinear',
+        assert observation.ndim == 4, "observation must be [B,3,H,W]"
+        assert slot_attention_maps.ndim == 4, "slot_attention_maps must be [B,K,H_att,W_att]"
+        assert slot_centers.ndim == 3 and slot_centers.size(-1) == 2, "slot_centers must be [B,K,2]"
+
+        B, C, H, W = observation.shape
+        Bm, K, H_att, W_att = slot_attention_maps.shape
+        Bc, Kc, _ = slot_centers.shape
+        assert Bm == B and Bc == B and Kc == K, "Batch/slot mismatch among inputs"
+
+        device = observation.device
+        dtype  = observation.dtype
+
+        # --- normalize image to [0,1] ---
+        obs = observation
+        if obs.min() < 0:
+            obs = (obs + 1) * 0.5
+        obs = obs.clamp(0, 1)
+
+        # --- colors for slots (RGB in [0,1]) ---
+        base_colors = torch.tensor([
+            [1.0, 0.0, 0.0],  # R
+            [0.0, 1.0, 0.0],  # G
+            [0.0, 0.0, 1.0],  # B
+            [1.0, 1.0, 0.0],  # Y
+            [1.0, 0.0, 1.0],  # M
+            [0.0, 1.0, 1.0],  # C
+        ], device=device, dtype=dtype)
+        if K > base_colors.size(0):
+            # tile colors if more slots than palette
+            reps = (K + base_colors.size(0) - 1) // base_colors.size(0)
+            colors = base_colors.repeat(reps, 1)[:K]
+        else:
+            colors = base_colors[:K]
+        # shape helpers
+        colors_bk3 = colors.view(1, K, 3, 1, 1)  # [1,K,3,1,1]
+
+        # --- upsample slot maps to image size & normalize per (B,K) ---
+        # [B,K,H_att,W_att] -> [B,K,1,H_att,W_att] -> upsample -> [B,K,H,W]
+        slot_maps_up = F.interpolate(
+            slot_attention_maps.view(B * K, 1, H_att, W_att),
+            size=(H, W),
+            mode="bilinear",
             align_corners=False
-        )  # [B, 1, H_img, W_img]
-        
-        # Normalize attention for visualization
-        att_min = attention_upsampled.view(batch_size, -1).min(dim=1, keepdim=True)[0]
-        att_min = att_min.view(batch_size, 1, 1, 1)
-        att_max = attention_upsampled.view(batch_size, -1).max(dim=1, keepdim=True)[0]
-        att_max = att_max.view(batch_size, 1, 1, 1)
-        attention_normalized = (attention_upsampled - att_min) / (att_max - att_min + 1e-8)
-        
-        # Create heatmap (red channel intensified by attention)
-        heatmap = torch.zeros_like(original_image)
-        heatmap[:, 0, :, :] = attention_normalized.squeeze(1)  # Red channel
-        
-        # Optionally add some yellow/orange for high attention areas
-        heatmap[:, 1, :, :] = (attention_normalized.squeeze(1) > 0.5).float() * attention_normalized.squeeze(1) * 0.5
-        
-        # Blend with original image
-        visualization = alpha * heatmap + (1 - alpha) * original_image
-        
-        return visualization.clamp(0, 1)
+        ).view(B, K, H, W)
 
-class SaliencyModule(nn.Module):
-    """
-    Drop-in replacement for convolutional saliency extraction using attention.
-    Maintains the same interface: takes [B, C, H, W] and outputs [B, feature_channels, H, W]
-    but internally uses attention to determine saliency with global context.
-    """
-    
-    def __init__(
-        self,
-        image_size: int,
-        input_channels: int,
-        feature_channels: int,
-        num_heads: int,
-        patch_size: int,
-        num_layers: int,
-        device: torch.device
-    ):
-        super().__init__()
-        self.image_size = image_size
-        self.patch_size = patch_size
-        self.num_patches_per_dim = image_size // patch_size
-        self.num_patches = self.num_patches_per_dim ** 2
-        self.feature_channels = feature_channels
-        
-        # Patch embedding - this is our only "convolution"
-        # It converts image patches into feature vectors
-        self.patch_embed = nn.Conv2d(
-            input_channels, 
-            feature_channels, 
-            kernel_size=patch_size, 
-            stride=patch_size
-        )
-        
-        # Learnable position embeddings for spatial awareness
-        self.pos_embed = nn.Parameter(
-            torch.randn(1, self.num_patches, feature_channels) * 0.02
-        )
-        
-        # Global context token - learns to aggregate global information
-        self.global_token = nn.Parameter(
-            torch.randn(1, 1, feature_channels) * 0.02
-        )
-        
-        # Attention layers that progressively refine saliency
-        self.attention_blocks = nn.ModuleList([
-            SaliencyAttentionBlock(
-                dim=feature_channels,
-                num_heads=num_heads,
-                include_global=(i == 0),  # First layer establishes global context
-                layer_scale_init=0.1 if i < 2 else 1.0  # Gradual influence
-            )
-            for i in range(num_layers)
-        ])
-        
-        # Output projection to ensure we have exactly feature_channels
-        self.output_norm = nn.LayerNorm(feature_channels)
-        
-        # Reconstruction projection to convert back to spatial format
-        self.to_spatial = nn.ConvTranspose2d(
-            feature_channels,
-            feature_channels,
-            kernel_size=patch_size,
-            stride=patch_size
-        )
-        
-        self.to(device)
-    
-    def forward(self, x):
-        """
-        Extract saliency using attention mechanisms.
-        
-        This method converts the image to patches, applies self-attention
-        to find salient regions based on global context, then reconstructs
-        the spatial feature map.
-        """
-        B, C, H, W = x.shape
-        
-        # Convert image to patches
-        patches = self.patch_embed(x)  # [B, feature_channels, H/P, W/P]
-        patches = patches.flatten(2).transpose(1, 2)  # [B, num_patches, feature_channels]
-        
-        # Add positional embeddings
-        patches = patches + self.pos_embed
-        
-        # Prepend global context token
-        global_tokens = self.global_token.expand(B, -1, -1)
-        patches_with_global = torch.cat([global_tokens, patches], dim=1)  # [B, 1+num_patches, C]
-        
-        # Apply attention blocks
-        for i, block in enumerate(self.attention_blocks):
-            if i == 0:
-                # First block processes with global token
-                patches_with_global = block(patches_with_global, include_global=True)
-                # Extract updated global context
-                self.global_context = patches_with_global[:, 0]  # Store for potential use
-                # Continue with just patches
-                patches = patches_with_global[:, 1:]
-            else:
-                # Subsequent blocks refine saliency
-                patches = block(patches, include_global=False)
-        
-        # Final normalization
-        patches = self.output_norm(patches)
-        
-        # Reshape back to spatial format
-        patches_spatial = patches.transpose(1, 2).reshape(
-            B, self.feature_channels, self.num_patches_per_dim, self.num_patches_per_dim
-        )
-        
-        # Upsample to original resolution
-        saliency_features = self.to_spatial(patches_spatial)
-        
-        # Ensure output has correct spatial dimensions
-        if saliency_features.shape[-2:] != (H, W):
-            saliency_features = F.interpolate(
-                saliency_features, 
-                size=(H, W), 
-                mode='bilinear', 
-                align_corners=False
-            )
-        
-        return saliency_features
+        m_min = slot_maps_up.amin(dim=(2, 3), keepdim=True)
+        m_max = slot_maps_up.amax(dim=(2, 3), keepdim=True)
+        slot_maps_norm = (slot_maps_up - m_min) / (m_max - m_min + 1e-8)  # [B,K,H,W]
+
+        out: Dict[str, torch.Tensor] = {}
+
+        # ---------- 1) Per-slot overlays ----------
+        # Build [B,K,3,H,W]: colored layer = map * color; overlay with original
+        colored_layers = slot_maps_norm.unsqueeze(2) * colors_bk3              # [B,K,3,H,W]
+        overlays_bk = (0.6 * obs.unsqueeze(1) + 0.4 * colored_layers).clamp(0, 1)  # [B,K,3,H,W]
+        out["slot_overlays"] = overlays_bk.reshape(B * K, 3, H, W)             # [B*K,3,H,W]
+
+        # ---------- 2) Semantic segmentation (argmax over K) ----------
+        if group_assignments is not None:
+            ga = group_assignments
+            assert ga.dim() == 4 and ga.size(0) == B, "group_assignments must be [B,*,*,K] or [B,K,*,*]"
+            # convert to [B,K,H_att,W_att]
+            if ga.shape[1] == K:  # [B,K,H_att,W_att]
+                g_bkhw = ga
+            else:                 # [B,H_att,W_att,K]
+                assert ga.shape[-1] == K, "group_assignments last dim must be K"
+                g_bkhw = ga.permute(0, 3, 1, 2).contiguous()
+            # upsample to image and argmax
+            g_up = F.interpolate(g_bkhw.float(), size=(H, W), mode="nearest")  # [B,K,H,W]
+            dom = g_up.argmax(dim=1)                                           # [B,H,W]
+            # colorize via one-hot
+            one_hot = F.one_hot(dom, num_classes=K).permute(0, 3, 1, 2).to(dtype)  # [B,K,H,W]
+            seg = (one_hot.unsqueeze(2) * colors_bk3).sum(dim=1)                   # [B,3,H,W]
+            out["semantic_segmentation"] = (0.5 * obs + 0.5 * seg).clamp(0, 1)
+        else:
+            out["semantic_segmentation"] = obs.clone()
+
+        # ---------- 3) Combined with colored contours (+ centers) ----------
+        # Start from original; draw 1-px edges for each slot in its color
+        combined = obs.clone()
+        # Laplacian kernel
+        k = torch.tensor([[-1., -1., -1.],
+                        [-1.,  8., -1.],
+                        [-1., -1., -1.]], device=device, dtype=dtype).view(1, 1, 3, 3)
+        thr = (slot_maps_up > 0.30).to(dtype)                                   # [B,K,H,W]
+        # iterate slots to apply different colors
+        for s in range(K):
+            edges = F.conv2d(thr[:, s].unsqueeze(1), k, padding=1).squeeze(1)   # [B,H,W]
+            edges = (edges > 0.1)                                                # bool
+            col = colors[s].view(1, 3, 1, 1)                                     # [1,3,1,1]
+            combined = torch.where(edges.unsqueeze(1), col, combined)            # color edges
+
+        # draw centers if provided (convert from [-1,1] to pixels)
+        if slot_centers is not None:
+            xs = ((slot_centers[..., 0] + 1.0) * 0.5) * (W - 1)   # [B,K]
+            ys = ((slot_centers[..., 1] + 1.0) * 0.5) * (H - 1)   # [B,K]
+            for b in range(B):
+                for s in range(K):
+                    x = xs[b, s].round().long().clamp(0, W - 1)
+                    y = ys[b, s].round().long().clamp(0, H - 1)
+                    # small crosshair (3x3) in white, plus colored ring
+                    combined[b, :, y, x] = torch.tensor([1.0, 1.0, 1.0], device=device, dtype=dtype)
+                    for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                        yy = (y + dy).clamp(0, H - 1)
+                        xx = (x + dx).clamp(0, W - 1)
+                        combined[b, :, yy, xx] = torch.tensor([1.0, 1.0, 1.0], device=device, dtype=dtype)
+                    # crude colored ring (optional)
+                    for ry in range(-2, 3):
+                        for rx in range(-2, 3):
+                            if ry*ry + rx*rx in (4, 5):  # approximate circle
+                                yy = (y + ry).clamp(0, H - 1)
+                                xx = (x + rx).clamp(0, W - 1)
+                                combined[b, :, yy, xx] = colors[s]
+
+        out["combined_with_contours"] = combined.clamp(0, 1)
+
+        # ---------- return selection ----------
+        if return_mode == "all":
+            return out
+        return {return_mode: out[return_mode]}
 
 
-class SaliencyAttentionBlock(nn.Module):
-    """
-    A single attention block for saliency detection.
-    Uses self-attention to identify salient regions based on relationships
-    between different parts of the image.
-    """
-    
-    def __init__(
-        self, 
-        dim: int, 
-        num_heads: int, 
-        include_global: bool = False,
-        layer_scale_init: float = 1.0
-    ):
-        super().__init__()
-        self.include_global = include_global
-        
-        # Pre-norm architecture for stability
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(
-            dim, 
-            num_heads, 
-            dropout=0.1, 
-            batch_first=True
-        )
-        
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim * 4, dim),
-            nn.Dropout(0.1)
-        )
-        
-        # Layer scale for training stability
-        self.layer_scale_1 = nn.Parameter(
-            torch.ones(dim) * layer_scale_init
-        )
-        self.layer_scale_2 = nn.Parameter(
-            torch.ones(dim) * layer_scale_init
-        )
-    
-    def forward(self, x, include_global=None):
-        """
-        Apply self-attention to find salient relationships.
-        
-        The attention mechanism here asks: "Which patches should be 
-        considered salient based on their relationships to all other patches?"
-        """
-        # Override with parameter if specified
-        if include_global is None:
-            include_global = self.include_global
-        
-        # Self-attention with residual
-        normed = self.norm1(x)
-        attn_output, _ = self.attn(normed, normed, normed)
-        x = x + self.layer_scale_1 * attn_output
-        
-        # MLP with residual
-        x = x + self.layer_scale_2 * self.mlp(self.norm2(x))
-        
-        return x
-    
 
+class PerpetualOrthogonalProjectionLoss(nn.Module):
+    def __init__(self, 
+                 num_classes=10, 
+                 feat_dim=2048, 
+                 no_norm=False, 
+                 use_attention=True,  
+                 orthogonality_weight=0.3, 
+                 slot_ortho_weight=0.2, 
+                 device=None):
+        
+        super(PerpetualOrthogonalProjectionLoss, self).__init__()
+
+        self.num_classes = num_classes
+        self.feat_dim = feat_dim
+        self.no_norm = no_norm
+        self.use_attention = use_attention
+        self.orthogonality_weight = orthogonality_weight
+        self.slot_ortho_weight = slot_ortho_weight
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #learnable class centres
+        self.class_centres = nn.Parameter(torch.randn(self.num_classes, self.feat_dim, device=self.device))
+        # Apply orthogonal initialization (significantly better than random)
+        with torch.no_grad():
+            nn.init.orthogonal_(self.class_centres)
+            
+        
+        self.to(self.device)
+            
+    def orthogonal_center_loss(self, norm_centers):
+        """Enforce class centers remain orthogonal (key addition)"""
+        
+        # Compute how far they deviate from orthogonal
+        return torch.norm(torch.mm(norm_centers, norm_centers.t()) - torch.eye(self.num_classes, device=self.device), p='fro')**2  # Frobenius norm squared
+
+    def slot_loss(self, features):
+        """ Pushes slots from the same batch away from each other, preventing slot collapse"""
+        batch_size = features.size(0) // self.num_classes
+        features = features.view(batch_size, self.num_classes, -1)
+        slots = F.normalize(features, dim=-1)
+        # Compute share similarity matrix
+        sim_matrix = torch.einsum('bnd,bmd->bnm', slots, slots)
+        # Strict ortho loss
+        
+        return torch.norm(sim_matrix - torch.eye(self.num_classes, device=slots.device).unsqueeze(0), p='fro') / batch_size
+
+
+    def forward(self, features, labels=None):
+        device = features.device
+        total_loss=0
+
+        # 1. loss between slots
+        total_loss += self.slot_ortho_weight * self.slot_loss(features)
+
+        # 2. Orthogonal center regularization 
+        normalized_class_centres = F.normalize(self.class_centres, p=2, dim=1)
+        total_loss += self.orthogonality_weight * self.orthogonal_center_loss(normalized_class_centres)
+
+        # 3. Feature-to center alignment 
+        if self.use_attention:
+            features_weights = torch.matmul(features, features.T)
+            features_weights = F.gumbel_softmax(features_weights, dim=1)
+            features = torch.matmul(features_weights, features)
+
+        #  features are normalized
+        if not self.no_norm:
+            features = F.normalize(features, p=2, dim=1)
+        
+
+        #create mask for class assignment
+        
+        labels = labels[:, None]  # extend dim
+        class_range = torch.arange(self.num_classes, device=device).long()
+        class_range = class_range[:, None]  # extend dim
+        label_mask = torch.eq(labels, class_range.t()).float().to(device)
+        #calculate the feature centre loss
+        feature_centre_variance = torch.matmul(features, normalized_class_centres.t())
+        same_class_loss = (label_mask * feature_centre_variance).sum() / (label_mask.sum() + 1e-6)
+        diff_class_loss = torch.relu(0.2 + (1 - label_mask) * feature_centre_variance).mean()
+
+        total_loss += 0.5 * (1.0 - same_class_loss) + diff_class_loss
+        
+
+        return total_loss
+    
 class ConvGRUCell(nn.Module):
 
     

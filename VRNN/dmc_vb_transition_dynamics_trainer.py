@@ -4,9 +4,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import h5py
-import random
+import random, math
 import os
-import gc
+import cv2
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 import wandb
@@ -19,6 +19,218 @@ import zlib
 from torch.utils.tensorboard import SummaryWriter
 from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoencoder
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
+from torch.utils.data._utils.collate import default_collate
+
+def safe_collate(batch):
+    all_keys = set().union(*(b.keys() for b in batch))
+    out = {}
+    for k in all_keys:
+        vals = [b[k] for b in batch if k in b]
+        if len(vals) == len(batch):
+            out[k] = default_collate(vals)
+        else:
+            # keep as a list aligned with the batch (None where missing)
+            aligned = [(b[k] if k in b else None) for b in batch]
+            out[k] = aligned
+    return out
+
+
+
+class HumanoidAwareZoomTransform:
+    """
+    Zoom-crop augmentation for sequences shaped [T, C, H, W].
+
+    Goals:
+      - Apply the SAME crop to all frames (time-consistent).
+      - Keep the humanoid inside the crop.
+      - Position the humanoid near a CORNER of the crop (off-center), to reduce center bias.
+      - Resize back to the original (H, W) so downstream shapes stay unchanged.
+
+    Expected `sample` keys:
+      - sample["observations"]: torch.Tensor [T, C, H, W], dtype float/half/int.
+      - Optional: sample[center_key] containing humanoid center in normalized coords [-1, 1]
+          * Either shape [2], [T, 2], or [*, 2] (we'll mean-reduce over time if needed).
+
+    """
+
+    def __init__(
+        self,
+        zoom_prob: float = 0.5,
+        area_range: Tuple[float, float] = (0.6, 0.85),
+        center_key: Optional[str] = None,            # e.g., 'attn_center' (normalized [-1,1] xy)
+        interpolation: str = "cubic",
+        # Corner placement inside the crop (how close the humanoid should be to a corner)
+        corner_min: float = 0.70,                    # 0.70 -> 70% toward corner inside the crop
+        corner_max: float = 0.85,                    # 0.85 -> 85% toward corner inside the crop
+    ):
+        assert 0.0 <= zoom_prob <= 1.0
+        assert 0.0 < area_range[0] <= area_range[1] <= 1.0
+        assert 0.5 <= corner_min < corner_max <= 0.95, "Corner range should be inside (0.5, 1.0)"
+
+        self.zoom_prob = float(zoom_prob)
+        self.area_range = area_range
+        self.center_key = center_key
+        self.corner_min = float(corner_min)
+        self.corner_max = float(corner_max)
+
+        self._interp_map = {
+            "nearest": cv2.INTER_NEAREST,
+            "linear":  cv2.INTER_LINEAR,
+            "cubic":   cv2.INTER_CUBIC,
+            "area":    cv2.INTER_AREA,
+            "lanczos": cv2.INTER_LANCZOS4,
+        }
+        self._cv2_interp = self._interp_map.get(interpolation, cv2.INTER_CUBIC)
+
+
+    def __call__(self, sample: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if random.random() > self.zoom_prob:
+            return sample
+
+        imgs = sample["observations"]  # [T, C, H, W]
+        assert imgs.dim() == 4, f"`observations` must be [T,C,H,W], got {tuple(imgs.shape)}"
+        T, C, H, W = imgs.shape
+        device, orig_dtype = imgs.device, imgs.dtype
+
+        # 1) Choose crop size via area fraction
+        area_frac = random.uniform(*self.area_range)             # keep this fraction of the area
+        side_scale = math.sqrt(area_frac)                        # square crop
+        crop_h = max(1, int(round(H * side_scale)))
+        crop_w = max(1, int(round(W * side_scale)))
+        sx = crop_w / float(W)                                   # width kept (normalized)
+        sy = crop_h / float(H)                                   # height kept (normalized)
+
+        # 2) Get humanoid center (normalized xy in [-1,1]); default to (0,0) if missing
+        h_xy = self._extract_humanoid_center(sample)
+
+        # 3) Pick a crop center so the humanoid appears near a *corner* inside the crop
+        center_norm = self._choose_center_for_corner(h_xy, sx, sy)
+
+        # 4) Convert normalized center to pixel box; clamp to image bounds
+        x0, y0, x1, y1 = self._crop_box_from_center(center_norm, W, H, crop_w, crop_h)
+
+        # 5) Crop+resize the SAME box for all frames/channels (OpenCV path on CPU)
+        zoomed = self._crop_and_resize_sequence(imgs, T, C, H, W, x0, y0, x1, y1)
+
+        # 6) Back to torch with original dtype/device
+        sample["observations"] = torch.from_numpy(zoomed).to(device=device, dtype=orig_dtype)
+
+        # 7) Optional debug metadata
+        sample["zoom_meta"] = {
+            "area_frac": float(area_frac),
+            "humanoid_norm_xy": h_xy.clone(),
+            "center_norm_xy": center_norm.clone(),
+            "box_xyxy": torch.tensor([x0, y0, x1, y1]),
+        }
+        return sample
+
+
+    def _extract_humanoid_center(self, sample: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Returns tensor [2] in normalized coords [-1,1], best estimate of humanoid center.
+        """
+        if self.center_key and (self.center_key in sample):
+            ctr = sample[self.center_key]
+            # Accept [2], [T,2], or [...,2]; reduce over time/first dims if needed.
+            if ctr.ndim >= 2:
+                ctr = ctr.view(-1, 2).mean(0)
+            ctr = ctr.detach().to("cpu").float()
+            ctr = torch.clamp(ctr, -1.0, 1.0)
+        else:
+            ctr = torch.tensor([0.0, 0.0], dtype=torch.float32)   # assume near center if unknown
+        return ctr
+
+    def _choose_center_for_corner(
+        self,
+        humanoid_xy: torch.Tensor,  # [2], normalized
+        sx: float,
+        sy: float,
+    ) -> torch.Tensor:
+        """
+        Choose the CROP CENTER (normalized) so that the humanoid appears near a corner INSIDE the crop.
+
+        Idea:
+          - Inside the crop patch, we want the humanoid located at ~70-85% toward a corner.
+          - Convert that desired in-crop position into an offset in normalized units,
+            then subtract from the humanoid center to get the required crop center.
+          - Clamp crop center so the crop box stays fully inside the image.
+        """
+        # Pick a random corner and a target proximity within [corner_min, corner_max].
+        ux = random.uniform(self.corner_min, self.corner_max)
+        uy = random.uniform(self.corner_min, self.corner_max)
+        sign_x = random.choice([-1.0, 1.0])  # left/right
+        sign_y = random.choice([-1.0, 1.0])  # top/bottom
+
+        # Edge of crop along x corresponds to ±sx in normalized image coordinates.
+        # (Same for y with sy.) Map desired in-crop corner position to normalized offset.
+        dx = sign_x * (2.0 * ux - 1.0) * sx
+        dy = sign_y * (2.0 * uy - 1.0) * sy
+
+        # To place the humanoid near that corner inside the crop, shift the CROP center oppositely.
+        cx = float(humanoid_xy[0] - dx)
+        cy = float(humanoid_xy[1] - dy)
+
+        # Valid crop centers are within ±(1 - s) so the crop stays in bounds.
+        cx = max(-(1.0 - sx), min(1.0 - sx, cx))
+        cy = max(-(1.0 - sy), min(1.0 - sy, cy))
+
+        return torch.tensor([cx, cy], dtype=torch.float32)
+
+    @staticmethod
+    def _crop_box_from_center(
+        center_norm: torch.Tensor,
+        W: int,
+        H: int,
+        crop_w: int,
+        crop_h: int,
+    ) -> Tuple[int, int, int, int]:
+        """
+        Convert normalized center [-1,1] to pixel crop box, clamped to image bounds.
+        """
+        cx = int((center_norm[0].item() + 1.0) * 0.5 * (W - 1))
+        cy = int((center_norm[1].item() + 1.0) * 0.5 * (H - 1))
+
+        x0 = max(0, min(W - crop_w, cx - crop_w // 2))
+        y0 = max(0, min(H - crop_h, cy - crop_h // 2))
+        x1, y1 = x0 + crop_w, y0 + crop_h
+        return x0, y0, x1, y1
+
+    def _crop_and_resize_sequence(
+        self,
+        imgs: torch.Tensor,  # [T, C, H, W]
+        T: int,
+        C: int,
+        H: int,
+        W: int,
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+    ) -> np.ndarray:
+        """
+        Crop same box for all frames and resize back to (W, H). Uses cv2 on CPU.
+        """
+        imgs_np = imgs.detach().to("cpu")
+        # Convert to float32 for OpenCV; remember original dtype to restore later.
+        if imgs_np.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+            imgs_np = imgs_np.float()
+        imgs_np = imgs_np.numpy().astype(np.float32, copy=False)  # [T, C, H, W]
+
+        out = np.empty((T, C, H, W), dtype=np.float32)
+
+        if C in (1, 3):  # fast path for grayscale/RGB
+            for t in range(T):
+                hwc = np.ascontiguousarray(imgs_np[t].transpose(1, 2, 0))  # [H, W, C]
+                patch = hwc[y0:y1, x0:x1, :]
+                resized = cv2.resize(patch, (W, H), interpolation=self._cv2_interp)
+                out[t] = resized.transpose(2, 0, 1)
+        else:  # generic per-channel
+            for t in range(T):
+                for c in range(C):
+                    patch = np.ascontiguousarray(imgs_np[t, c, y0:y1, x0:x1])
+                    out[t, c] = cv2.resize(patch, (W, H), interpolation=self._cv2_interp)
+
+        return out
 
 class DMCVBInfo:
     """PyTorch version of DMC Vision Benchmark info"""
@@ -248,7 +460,7 @@ class DMCVBDataset(Dataset):
         print(f"Total sequences available: {len(self.sequence_indices)}")
         
 
-    def _load_episode_paths(self) -> List[Path]:
+    def _load_episode_paths(self, training_percent: float =0.7) -> List[Path]:
         """Load all episode file paths"""
         all_episode_files = []
         policy_levels = ['expert', 'medium']
@@ -282,7 +494,7 @@ class DMCVBDataset(Dataset):
         
         # Split into train/eval
         n_episodes = len(all_episode_files)
-        n_train = int(0.95 * n_episodes)
+        n_train = int(training_percent * n_episodes) # 70% for training
         
         if self.split == 'train':
             return all_episode_files[:n_train]
@@ -629,6 +841,18 @@ class GradientMonitor:
         self.writer.add_figure('gradient_analysis/component_distribution', fig, epoch)
         plt.close()
 
+
+def pick_bt(x, i, t):
+    if x is None: 
+        return None
+    if x.ndim == 5:     # [B, T, K, H, W] or [B, T, H, W, K]
+        return x[i:i+1, t]
+    if x.ndim == 4:     # [B, K, H, W] or [B, H, W, K]
+        return x[i:i+1]
+    if x.ndim == 3:     # [B, K, 2] (centers)
+        return x[i:i+1]
+    return x  # fall back
+
 class DMCVBTrainer:
     """Trainer for DPGMM-VRNN on DMC Vision Benchmark"""
     
@@ -652,7 +876,15 @@ class DMCVBTrainer:
             frame_stack=config['frame_stack'],
             img_height=config['img_height'],
             img_width=config['img_width'],
-            add_state= False
+            add_state= False,
+            transform = HumanoidAwareZoomTransform(
+                    zoom_prob=0.6,
+                    area_range=(0.6, 0.85),
+                    center_key="attn_center",  # optional; must be normalized [-1,1] xy
+                    interpolation="lanczos",
+                    corner_min=0.70,
+                    corner_max=0.85,
+                )
         )
         
         self.eval_dataset = DMCVBDataset(
@@ -672,6 +904,7 @@ class DMCVBTrainer:
             batch_size=config['batch_size'],
             shuffle=True,
             num_workers=config.get('num_workers', 4),
+            collate_fn=safe_collate,
             pin_memory=True
         )
         
@@ -680,6 +913,7 @@ class DMCVBTrainer:
             batch_size=config['batch_size'],
             shuffle=False,
             num_workers=config.get('num_workers', 4),
+            collate_fn=safe_collate,
             pin_memory=True
         )
         
@@ -899,118 +1133,291 @@ class DMCVBTrainer:
         
         return np.mean(accuracies) if accuracies else 0.0
 
-    
     def visualize_results(self, epoch: int):
+        """
+        Enhanced visualization using OpenCV-based attention panels:
+        Cols = [Original, Recon, Perceiver, Heat, Slots, Segmentation, Contours]
+        """
         self.model.eval()
-        
-        # Get training batch
+
+        # ---- fetch small train/eval minibatches ----
         train_batch = next(iter(self.train_loader))
-        train_obs = train_batch['observations'].to(self.device)
-        train_actions = train_batch['actions'].to(self.device)
-        
-        # Get eval batch (with randomization)
+        train_obs    = train_batch['observations'].to(self.device)
+        train_actions= train_batch['actions'].to(self.device)
+
+        # random eval minibatch
         batch_idx = random.randint(0, len(self.eval_loader) - 1)
         for i, eval_batch in enumerate(self.eval_loader):
-            if i == batch_idx:
-                break
-        eval_obs = eval_batch['observations'].to(self.device)
+            if i == batch_idx: break
+        eval_obs     = eval_batch['observations'].to(self.device)
         eval_actions = eval_batch['actions'].to(self.device)
-        
-        # Use actual batch size from the data
-        batch_size = min(train_obs.shape[0], eval_obs.shape[0], 4)  # Cap at 4 for visualization
-        subplot_size = 4
-        fig_width = 5 * subplot_size  # 5 columns for each type of visualization
-        fig_height = 2 * batch_size * 4
 
-        fig, axes = plt.subplots(2 * batch_size, 5, figsize=(fig_width, fig_height))
-        
+        batch_size = min(train_obs.shape[0], eval_obs.shape[0], 4)  # cap at 4 rows per split
+        n_cols = 7
+        fig, axes = plt.subplots(2 * batch_size, n_cols, figsize=(3.2 * n_cols, 3.2 * (2 * batch_size)))
+        if axes.ndim == 1:
+            axes = axes.reshape(1, -1)
+
+        def bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
+            return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
         with torch.no_grad():
-            # Process both batches
-            out=[]
-            for dataset_idx, (observations, actions, dataset_name) in enumerate([
+            for split_idx, (observations, actions, split_name) in enumerate([
                 (train_obs[:batch_size], train_actions[:batch_size], "Train"),
-                (eval_obs[:batch_size], eval_actions[:batch_size], "Eval")
+                (eval_obs[:batch_size],  eval_actions[:batch_size],  "Eval")
             ]):
-                _, outputs = self.model.compute_total_loss(
-                    observations=observations,
-                    actions=actions
-                )
-                out.append(outputs)
-                perceiver_reconst= outputs['perceiver_recon']
+                # run model once to populate outputs and the posterior's slot maps/assignments
+                _, outputs = self.model.compute_total_loss(observations=observations, actions=actions)
+                perceiver_reconst = outputs.get('perceiver_recon', None)
+
+                # convenience
+                H, W = self.model.image_size, self.model.image_size
+                seq_len = observations.shape[1]
+
                 for i in range(batch_size):
-                    row_idx = dataset_idx * batch_size + i
-                    
-                    # Extract first RGB frame from stacked frames
-                    # observations shape: [batch, seq, channels, H, W]
-                    # For 3 stacked frames with 3 channels each: channels = 9
-                    # Get first frame's RGB channels (indices 0, 1, 2)
-                    orig_img = observations[i, 0, :3]  # [3, H, W]
-                    
-                    # Original
-                    axes[row_idx, 0].imshow(self.denormalize_image(orig_img))
-                    axes[row_idx, 0].set_title(f'{dataset_name} Original')
-                    axes[row_idx, 0].set_aspect('equal')
-                    axes[row_idx, 0].axis('off')
-                    
-                    # Reconstruction - also extract first RGB frame
-                    recon_img = outputs['reconstructions'][i, 0, :3]  # [3, H, W]
-                    axes[row_idx, 1].imshow(self.denormalize_image(recon_img))
-                    axes[row_idx, 1].set_title(f'{dataset_name} Reconstruction')
-                    axes[row_idx, 1].set_aspect('equal')
-                    axes[row_idx, 1].axis('off')
-                    seq_len = observations.shape[1]
-                    perceiver_idx = i * seq_len + 0  # First timestep
-                    
-                    # Extract and reshape perceiver reconstruction
-                    perceiver_img = perceiver_reconst[perceiver_idx]  # [H*W, C]
-                    H, W = self.model.image_size, self.model.image_size
-                    perceiver_img = perceiver_img.reshape(H, W, -1)  # [H, W, C]
-                    perceiver_img = perceiver_img[:,:, :3]  # Keep only RGB channels
-                    
-                    # Convert to [C, H, W] for denormalization
-                    perceiver_img = torch.from_numpy(perceiver_img.cpu().numpy()).permute(2, 0, 1)
-                    
-                    axes[row_idx, 2].imshow(self.denormalize_image(perceiver_img))
-                    axes[row_idx, 2].set_title(f'{dataset_name} Perceiver Recon')
-                    axes[row_idx, 2].set_aspect('equal')
-                    axes[row_idx, 2].axis('off')
-                                 
-                    # Attention map
-                    if 'attention_maps' in outputs and outputs['attention_maps'] is not None:
-                        att_map = outputs['attention_maps'][i, 0].cpu().numpy()
-                        axes[row_idx, 3].imshow(att_map, cmap='hot')
-                        axes[row_idx, 3].set_title(f'{dataset_name} Attention')
-                        axes[row_idx, 3].set_aspect('equal')
-                        axes[row_idx, 3].axis('off')
+                    row = split_idx * batch_size + i
+                    t = 0  # visualize first timestep; change if you want a different frame
 
-                    # Cluster weights
-                    if 'prior_params' in outputs and len(outputs['prior_params']) > 0:
-                        pi = outputs['prior_params'][0]['pi'][i].cpu().numpy()
-                        axes[row_idx, 4].bar(range(len(pi)), pi)
-                        axes[row_idx, 4].set_title(f'{dataset_name} Clusters')
-                        axes[row_idx, 4].set_xlabel('Component')
-                        axes[row_idx, 4].set_ylabel('Weight')
-                        axes[row_idx, 4].set_box_aspect(1)  # Make it square
-                    
-                        # Set reasonable limits
-                        axes[row_idx, 4].set_xlim(-0.5, len(pi)-0.5)
-                        axes[row_idx, 4].set_ylim(0, 1.0)  # Assuming weights are normalized
-                    
-                        # Adjust tick labels for readability
-                        axes[row_idx, 4].tick_params(axis='both', which='major', labelsize=8)
+                    # ---------- 1) Original ----------
+                    orig_img = observations[i, t, :3]  # [3,H,W]
+                    axes[row, 0].imshow(self.denormalize_image(orig_img))
+                    axes[row, 0].set_title(f'{split_name} Original'); axes[row, 0].axis('off')
 
-        # Ensure tight layout with consistent spacing
-        plt.tight_layout(pad=1.0, h_pad=1.5, w_pad=1.5)
-        plt.rcParams["figure.dpi"] = 250
+                    # ---------- 2) VAE Reconstruction ----------
+                    recon_img = outputs['reconstructions'][i, t, :3]  # [3,H,W]
+                    axes[row, 1].imshow(self.denormalize_image(recon_img))
+                    axes[row, 1].set_title('VAE Recon'); axes[row, 1].axis('off')
 
+                    # ---------- 3) Perceiver Recon (if present) ----------
+                    if perceiver_reconst is not None:
+                        idx = i * seq_len + t
+                        pc = perceiver_reconst[idx]                        # [H*W, C]
+                        pc = pc.reshape(H, W, -1)[..., :3]                 # [H,W,3]
+                        
+                        pc = pc.permute(2, 0, 1)  # [C,H,W] for imshow
+                        axes[row, 2].imshow(self.denormalize_image(pc))
+                        axes[row, 2].set_title('Perceiver'); axes[row, 2].axis('off')
+                    else:
+                        axes[row, 2].set_title('No Perceiver'); axes[row, 2].axis('off')
+
+                    # ---------- 4–7) OpenCV attention visualizations ----------
+                    # The posterior is attached to the model; pass the single image with batch dim
+                    att_post = self.model.attention_prior_posterior.posterior_net
+
+                    # Extract data (this part is correct)
+                    slot_maps_bt = pick_bt(outputs['slot_attention_maps'], i, t)   # expects [1,K,H,W]
+                    slot_cent_bt = pick_bt(outputs['slot_centers'],        i, t)   # expects [1,K,2]
+                    group_bt     = pick_bt(outputs.get('group_assignments'), i, t) # [1,H,W,K] or None
+
+
+                    # Call the PyTorch-based visualization method
+                    vis = att_post.visualize_multi_object_attention(
+                        observation=orig_img.unsqueeze(0),
+                        slot_attention_maps=slot_maps_bt,
+                        slot_centers=slot_cent_bt,
+                        group_assignments=group_bt,
+                        return_mode='all'
+                    )
+
+                    # Helper to convert PyTorch tensor to numpy for matplotlib
+                    def tensor_to_numpy(tensor):
+                        """Convert [B, C, H, W] tensor to [H, W, C] numpy"""
+                        return tensor[0].permute(1, 2, 0).cpu().numpy()
+
+                    # 4) Combined visualization with contours
+                    combined = tensor_to_numpy(vis['combined_with_contours'])
+                    axes[row, 3].imshow(combined)
+                    axes[row, 3].set_title('Attention + Centers')
+                    axes[row, 3].axis('off')
+
+                    # 5) Slot overlays - average all slots
+                    slots = vis['slot_overlays']  # [B*K, 3, H, W]
+                    K = self.model.attention_prior_posterior.posterior_net.num_semantic_slots
+                    slots_reshaped = slots.view(1, K, 3, H, W)[0]  # [K, 3, H, W]
+                    # Average across slots and convert to numpy
+                    slot_avg = tensor_to_numpy(slots_reshaped.mean(dim=0, keepdim=True))
+                    axes[row, 4].imshow(slot_avg)
+                    axes[row, 4].set_title('Slots Overlay')
+                    axes[row, 4].axis('off')
+
+                    # 6) Semantic segmentation
+                    segmentation = tensor_to_numpy(vis['semantic_segmentation'])
+                    axes[row, 5].imshow(segmentation)
+                    axes[row, 5].set_title('Slot Segmentation')
+                    axes[row, 5].axis('off')
+
+                    # 7) Hide unused column
+                    axes[row, 6].axis('off')
+
+        plt.tight_layout()
         if self.use_wandb:
-            wandb.log({f'train_eval_viz/epoch_{epoch}': wandb.Image(fig)})
+            import wandb
+            # Convert figure to image for wandb
+            wandb.log({
+                f'visualizations/train_eval_epoch_{epoch}': wandb.Image(fig),
+                'epoch': epoch
+            })
         elif self.writer:
-            self.writer.add_figure(f'train_eval_viz/epoch_{epoch}', fig, epoch)
+            # Add figure to TensorBoard
+            self.writer.add_figure(f'visualizations/train_eval_epoch_{epoch}', fig, epoch)
         else:
-            plt.savefig(f'train_eval_viz_epoch_{epoch}.png')
-        
-        plt.close()
+            if not os.path.exists('visualizations'):
+                os.makedirs('visualizations')
+            plt.savefig(f'visualizations/train_eval_epoch_{epoch}.png', dpi=150, bbox_inches='tight')    
+
+        plt.close(fig)
+
+    @torch.no_grad()
+    def visualize_multi_object_attention(
+        self,
+        observation: torch.Tensor,
+        return_mode: str = "all",  # 'all' | 'combined' | 'slots' | 'groups'
+    ) -> Dict[str, np.ndarray]:
+        """
+        OpenCV-based multi-object attention visualization.
+
+        Inputs
+        -------
+        observation : torch.Tensor
+            [B, C, H, W], RGB, in [0,1] or [-1,1].
+            NOTE: Call a forward pass first so that:
+            - self.slot_attention_maps: [B, K, H_att, W_att]
+            - self.group_assignments:  [B, H_att, W_att, K]   (optional)
+            - self.slot_centers:       [B, K, 2] in [-1,1]    (optional)
+            are populated.
+
+        Returns
+        -------
+        Dict[str, np.ndarray] with BGR uint8 images:
+        - 'overlay_heat_bgr'          : [B, H, W, 3]
+        - 'overlay_contours_bgr'      : [B, H, W, 3] (centers drawn if available)
+        - 'slot_overlays_bgr'         : [B, K, H, W, 3]
+        - 'semantic_segmentation_bgr' : [B, H, W, 3]
+        (If return_mode != 'all', you still get a dict with the selected key(s).)
+        """
+
+        assert observation.ndim == 4, "observation must be [B,C,H,W]"
+        B, C, H, W = observation.shape
+        device = observation.device
+
+        # ----- cheap converters -----
+        def torch_chw_to_bgr_u8(img_chw: torch.Tensor) -> np.ndarray:
+            x = img_chw.detach().to("cpu").float()
+            if x.min() < 0:
+                x = (x + 1.0) * 0.5
+            x = x.clamp(0, 1)
+            rgb = (x * 255.0 + 0.5).byte().permute(1, 2, 0).numpy()  # [H,W,3] RGB u8
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+        def to_float_np(hw: torch.Tensor) -> np.ndarray:
+            return hw.detach().to("cpu").float().numpy()
+
+        # ----- colors (BGR) for slots -----
+        palette = [
+            (0, 0, 255),     # red
+            (0, 255, 0),     # green
+            (255, 0, 0),     # blue
+            (0, 255, 255),   # yellow
+            (255, 0, 255),   # magenta
+            (255, 255, 0),   # cyan
+        ][: self.num_semantic_slots]
+
+        # ----- inputs prepared -----
+        imgs_bgr = [torch_chw_to_bgr_u8(observation[b]) for b in range(B)]
+
+        slot_maps_t = getattr(self, "slot_attention_maps", None)  # [B,K,h,w]
+        assert slot_maps_t is not None, "Run a forward pass first (slot_attention_maps missing)."
+        slot_maps = to_float_np(slot_maps_t)  # np [B,K,h,w]
+        B_chk, K, h_att, w_att = slot_maps.shape
+        assert B_chk == B, "Batch mismatch between observation and slot maps."
+
+        groups_t = getattr(self, "group_assignments", None)  # [B,h,w,K] or None
+
+        # fused attention map for heat/contours (simple sum; for viz this is fine)
+        fused = slot_maps.sum(axis=1)  # [B,h,w]
+
+        # ----- outputs to build -----
+        want = lambda key: (return_mode == "all") or (key == return_mode)
+        out: Dict[str, np.ndarray] = {}
+
+        # pre-alloc containers
+        if want("overlay_heat_bgr"):          heat_list = []
+        if want("overlay_contours_bgr"):      contours_list = []
+        if want("slot_overlays_bgr"):         slots_list = []
+        if want("semantic_segmentation_bgr"): seg_list = []
+
+        for b in range(B):
+            base = imgs_bgr[b]
+            # === heat overlay ===
+            if want("overlay_heat_bgr"):
+                att = cv2.resize(fused[b], (W, H), interpolation=cv2.INTER_LINEAR)
+                att_u8 = cv2.normalize(att, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                heat = cv2.applyColorMap(att_u8, cv2.COLORMAP_TURBO)
+                heat_vis = cv2.addWeighted(base, 0.55, heat, 0.45, 0.0)
+                heat_list.append(heat_vis)
+
+            # === contour overlay (plus slot centers if available) ===
+            if want("overlay_contours_bgr"):
+                cont = base.copy()
+                # edges from fused mask via morphological gradient
+                att = cv2.resize(fused[b], (W, H), interpolation=cv2.INTER_LINEAR)
+                mask = (cv2.normalize(att, None, 0, 1, cv2.NORM_MINMAX) >= 0.30).astype(np.uint8) * 255
+                edge = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))  # 0/255
+                yx = np.where(edge > 0)
+                cont[yx[0], yx[1]] = (255, 255, 255)  # white contour
+
+                # draw per-slot centers (if available)
+                if hasattr(self, "slot_centers"):
+                    centers = self.slot_centers[b].detach().to("cpu").numpy()  # [K,2] in [-1,1]
+                    px = ((centers[:, 0] + 1.0) * 0.5 * (W - 1)).astype(int)
+                    py = ((centers[:, 1] + 1.0) * 0.5 * (H - 1)).astype(int)
+                    for k in range(min(K, len(palette))):
+                        cv2.drawMarker(
+                            cont,
+                            (int(px[k]), int(py[k])),
+                            (255, 255, 255),
+                            markerType=cv2.MARKER_TILTED_CROSS,
+                            markerSize=10,
+                            thickness=2,
+                            line_type=cv2.LINE_AA,
+                        )
+                        cv2.circle(cont, (int(px[k]), int(py[k])), 3, palette[k], thickness=2, lineType=cv2.LINE_AA)
+                contours_list.append(cont)
+
+            # === per-slot overlays ===
+            if want("slot_overlays_bgr"):
+                per_slot_imgs = []
+                for k in range(K):
+                    m = cv2.resize(slot_maps[b, k], (W, H), interpolation=cv2.INTER_LINEAR)
+                    m_u8 = cv2.normalize(m, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                    color_img = np.full_like(base, palette[k])
+                    gray3 = cv2.merge([m_u8, m_u8, m_u8])
+                    color_layer = (gray3.astype(np.float32) / 255.0 * color_img).astype(np.uint8)
+                    per_slot_imgs.append(cv2.addWeighted(base, 1.0, color_layer, 0.35, 0.0))
+                slots_list.append(np.stack(per_slot_imgs, axis=0))  # [K,H,W,3]
+
+            # === semantic segmentation from group assignments ===
+            if want("semantic_segmentation_bgr"):
+                if groups_t is not None:
+                    g = to_float_np(groups_t[b])  # [h,w,K]
+                    labels = np.argmax(g, axis=-1).astype(np.int32)  # [h,w]
+                    labels = cv2.resize(labels, (W, H), interpolation=cv2.INTER_NEAREST)
+                    seg = np.zeros_like(base)
+                    for k in range(K):
+                        seg[labels == k] = palette[k]
+                    seg_vis = cv2.addWeighted(base, 0.5, seg, 0.5, 0.0)
+                else:
+                    seg_vis = base.copy()
+                seg_list.append(seg_vis)
+
+        # pack outputs
+        if want("overlay_heat_bgr"):          out["overlay_heat_bgr"] = np.stack(heat_list, axis=0)
+        if want("overlay_contours_bgr"):      out["overlay_contours_bgr"] = np.stack(contours_list, axis=0)
+        if want("slot_overlays_bgr"):         out["slot_overlays_bgr"] = np.stack(slots_list, axis=0)         # [B,K,H,W,3]
+        if want("semantic_segmentation_bgr"): out["semantic_segmentation_bgr"] = np.stack(seg_list, axis=0)
+
+        return out if return_mode == "all" else {return_mode: out[return_mode]}
+
 
     def denormalize_image(self, img: torch.Tensor) -> np.ndarray:
         """Convert from [-1, 1] to [0, 1] for visualization
@@ -1097,6 +1504,7 @@ class DMCVBTrainer:
             print(f"  Eval Loss: {eval_metrics.get('eval/total_vae_loss', 0):.4f}")
             print(f"  PSNR: {eval_metrics.get('eval/psnr', 0):.2f}")
             print(f"  Active Components: {train_metrics.get('train/effective_components', 0):.2f}")
+            print(f"  Top 4 components: {train_metrics.get('train/Top 4 coverage', 0):.3f}")
             
             # Visualize periodically
             if epoch % self.config['visualize_every'] == 0:
@@ -1128,15 +1536,15 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 25,
+        'max_components': 20,
         'latent_dim': 35,
         'hidden_dim': 48, #must be divisible by 8
-        'context_dim': 42,
-        'attention_dim': 36,
+        'context_dim': 40,
+        'attention_dim': 44,
         'attention_resolution': 21,
         'input_channels': 3*1,  # 3 stacked frames
         'HiP_type': 'Mini',
-        'prior_alpha': 10.0,  # Hyperparameters for prior
+        'prior_alpha': 5.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
         
         # Training settings
