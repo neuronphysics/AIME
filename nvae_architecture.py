@@ -336,7 +336,82 @@ class VAEEncoder(nn.Module):
         z = mean + eps * sigma
 
         return z, mean, logvar
+    #-------------- Fuse Features from different layers ---------------
+    def extract_pyramid(self, x: torch.Tensor, levels=None):
+        """Return dict of multi-scale features tapped from the encoder backbone.
+        Levels can be an int (keep last N scales) or an iterable of names (e.g., ("C2","C3","C4")).
+        This method *does not* change the encoder's latent path.
+        """
+        feats = {}
+        cur = x
+        level = 0
+        prev_hw = cur.shape[-2:]
+        if hasattr(self, 'stem') and callable(getattr(self, 'stem')):
+            cur = self.stem(x)
+            prev_hw = cur.shape[-2:]
+            feats[f"C{level+1}"] = cur
+        for block in self.encoder_blocks:
+            cur = block(cur)
+            hw = cur.shape[-2:]
+            if hw != prev_hw:
+                level += 1
+                prev_hw = hw
+            feats[f"C{level+1}"] = cur
+        if levels is None:
+            keys = sorted(feats.keys(), key=lambda k: int(k[1:]))
+            sel = keys[-3:]
+        elif isinstance(levels, int):
+            keys = sorted(feats.keys(), key=lambda k: int(k[1:]))
+            sel = keys[-levels:]
+        else:
+            sel = [k for k in levels if k in feats]
+        return {k: feats[k] for k in sel}
+    
+    def build_attention_fuser(self, 
+                              sample_input: torch.Tensor,
+                              out_hw=(21, 21),
+                              source=None,
+                              d: int = 64):
+        """
+        Prebuild the 1x1 projection used by fused_attention_features(..., fuse='concat+1x1').
+        """
+       
+        with torch.no_grad():
+            feats = self.extract_pyramid(sample_input, levels=source)  # same taps you’ll use at train time
+            ups = [F.interpolate(f, size=out_hw, mode='bilinear', align_corners=False) for f in feats.values()]
+            fused = torch.cat(ups, dim=1)                               # C_in = sum(C_level)
+            in_ch = fused.shape[1]
 
+        # Create or replace 1x1 projection
+        self.attn_fuse_proj = nn.Conv2d(in_ch, d, kernel_size=1, bias=True).to(sample_input.device)
+
+
+    def fused_attention_features(self, 
+                                 x: torch.Tensor, 
+                                 out_hw=(21, 21),
+                                 source=None, 
+                                 fuse='concat', 
+                                 d=None,
+                                 detach=False,
+                                 ):
+        """Produce a single fused feature map for the AttentionPosterior.
+        See README for details."""
+        feats = self.extract_pyramid(x, levels=source)
+        ups = []
+        for k in feats:
+            t = feats[k].detach() if detach else feats[k]
+            t = F.interpolate(t, size=out_hw, mode='bilinear', align_corners=False)
+            ups.append(t)
+        fused = torch.cat(ups, dim=1)
+        if fuse == 'concat':
+            return fused
+        elif fuse == 'concat+1x1':
+            
+            return self.attn_fuse_proj(fused)
+        else:
+            raise ValueError(f"Unknown fuse mode: {fuse}")
+            
+# ============= Mixture of Discretized Logistics =============
 class MDLHead(nn.Module):
     """RGB mixture of discretized logistics (PixelCNN++ style)."""
     def __init__(self, in_ch, out_ch, n_mix=10):

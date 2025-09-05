@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.optim import Optimizer
-
+from math import inf
 import math
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Union
@@ -1164,3 +1164,283 @@ class WeightClipping(torch.optim.Optimizer):
                 total_sum += p.data.numel()
                 p.data.clamp_(-group["beta"] * bound, group["beta"] * bound)
         return (clipped_sum / total_sum).item()
+
+# --------------------------------------------------------------
+# RiemannianMGDA — GPU two-pass, bias-corrected metric, low VRAM
+# --------------------------------------------------------------
+
+
+class RiemannianMGDA:
+    """
+    Multi-objective combiner for Geoopt-style Riemannian optimizers.
+
+    Design:
+      • Pass 1: Build Gram H_ij = <g_i/v, g_j/v> over *shared params* using autograd.grad
+                (no .grad pollution, no full list of grads kept; only previous row vectors).
+      • Solve entropy-regularized MGDA on GPU to get alphas.
+      • Pass 2: Do ONE backward of sum(alpha' * loss_i) to realize g* = Σ alpha' g_i
+                (alpha' optionally blends with uniform, and/or uses EMA smoothing).
+
+    Benefits:
+      • All-GPU, AMP-safe (fp32 math for whitening & dots; final backward uses your AMP state)
+      • Bias-corrected Riemannian Adam metric (+ AMSGrad if enabled)
+      • Minimal memory: stores at most (m-1) whitened P-vectors transiently
+      • Optional periodic alpha refresh to cut Pass-1 overhead
+
+    Typical usage:
+        optimizer = RiemannianAdam(model.parameters(), lr=..., amsgrad=True)
+        mgda = RiemannianMGDA(optimizer,
+                              warmup_steps=150,
+                              cache_metric_every=20,
+                              entropy_reg=0.05,
+                              blend=0.1,
+                              alpha_update_period=1,   # set >1 to reuse alphas between refreshes
+                              alpha_ema=0.2,
+                              restrict_to_shared=False)
+        mgda.device = next(model.parameters()).device
+        mgda.get_share_params = lambda: tuple(shared_params)
+
+        optimizer.zero_grad(set_to_none=True)
+        alphas = mgda.backward([loss1, loss2, loss3, loss4])
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        optimizer.step()
+
+    Notes:
+      • Define `self.get_share_params()` to return the tensors considered *shared* across tasks.
+      • If `restrict_to_shared=True`, non-shared grads are zeroed after the combined backward.
+        Otherwise, heads update normally with the α-weighted scalarized loss.
+      • `alpha_update_period > 1` reuses the last α for in-between steps (saves ~m backward calls).
+    """
+    # Public knobs (set in __init__)
+    def __init__(self,
+                 optimizer: Optimizer,
+                 eps: float = 1e-12,
+                 warmup_steps: int = 100,
+                 cache_metric_every: int = 10,
+                 entropy_reg: float = 0.0,
+                 blend: float = 0.0,
+                 max_pgd_iters: int = 12,
+                 pgd_lr: float = 0.3,
+                 pgd_tol: float = 1e-6,
+                 alpha_update_period: int = 1,
+                 alpha_ema: float = 0.0,
+                 restrict_to_shared: bool = False,
+                 profile: bool = False):
+        self.optimizer = optimizer
+        self.eps = float(eps)
+        self.warmup_steps = int(warmup_steps)
+        self.cache_metric_every = int(cache_metric_every)
+        self.entropy_reg = float(entropy_reg)
+        self.blend = float(blend)
+        self.max_pgd_iters = int(max_pgd_iters)
+        self.pgd_lr = float(pgd_lr)
+        self.pgd_tol = float(pgd_tol)
+        self.alpha_update_period = max(1, int(alpha_update_period))
+        self.alpha_ema = float(alpha_ema)
+        self.restrict_to_shared = bool(restrict_to_shared)
+        self.profile = bool(profile)
+
+        # Will be set by caller:
+        self.device = None
+        self.get_share_params = None  # must be set to a callable returning iterable of shared params
+
+        # Internal state
+        self._step = 0
+        self._metric_cache = None   # flat GPU diag (float32)
+        self._alpha_cache = None    # last α (torch float32 on device)
+        self.last_profile = {}
+
+    # ---------- helpers: bias-corrected diag metric from optimizer state ----------
+    @torch.no_grad()
+    def _compute_diag_from_optimizer(self, share, device):
+        chunks = []
+        for p in share:
+            st = self.optimizer.state.get(p, {})
+            if not st:
+                diag = torch.ones_like(p, device=device, dtype=torch.float32)
+                chunks.append(diag.reshape(-1)); continue
+
+            # find param group
+            group = None
+            for g in self.optimizer.param_groups:
+                if p in g['params']:
+                    group = g; break
+            beta2 = group['betas'][1] if group and 'betas' in group else 0.999
+            amsgrad = bool(group.get('amsgrad', False)) if group else False
+
+            v = st.get('max_exp_avg_sq', None) if amsgrad else st.get('exp_avg_sq', None)
+            if v is None:
+                diag = torch.ones_like(p, device=device, dtype=torch.float32)
+                chunks.append(diag.reshape(-1)); continue
+
+            step = int(st.get('step', 0))
+            bc2 = 1.0 - (beta2 ** step) if step > 0 else 1.0
+            vhat = (v.detach().to(device=device, dtype=torch.float32)) / max(bc2, 1e-16)
+            diag = vhat.sqrt_().add_((self.eps))
+            chunks.append(diag.reshape(-1))
+
+        return torch.cat(chunks) if chunks else torch.tensor([], device=device, dtype=torch.float32)
+
+    @torch.no_grad()
+    def _riemann_diag(self, share, device):
+        total = sum(p.numel() for p in share)
+        if total == 0:
+            return torch.tensor([], device=device, dtype=torch.float32)
+        # warmup with identity
+        if self._step < self.warmup_steps:
+            if (self._metric_cache is None) or (self._metric_cache.numel() != total):
+                self._metric_cache = torch.ones(total, device=device, dtype=torch.float32)
+            return self._metric_cache
+        # cache every K steps
+        if (self._metric_cache is None) or (self._step % self.cache_metric_every == 0):
+            self._metric_cache = self._compute_diag_from_optimizer(share, device)
+        return self._metric_cache
+
+    # ---------- simplex optimization (entropy-regularized MGDA) ----------
+    @torch.no_grad()
+    def _project_to_simplex_(self, a):
+        if a.numel() == 1:
+            a.fill_(1.); return a
+        u, _ = torch.sort(a, descending=True)
+        cssv = torch.cumsum(u, 0) - 1
+        ind = torch.arange(1, a.numel() + 1, device=a.device)
+        cond = u - cssv / ind > 0
+        rho = ind[cond][-1]
+        theta = cssv[rho - 1] / rho
+        a.sub_(theta).clamp_(min=0)
+        s = a.sum()
+        if s.abs() > 1e-6: a.div_(s)
+        return a
+
+    @torch.no_grad()
+    def _solve_alphas_from_H(self, H):
+        m = H.size(0)
+        if m == 1:
+            return torch.ones(1, device=H.device, dtype=torch.float32)
+        lam = self.entropy_reg
+
+        # closed-form for m=2, lam=0
+        if m == 2 and lam <= 0:
+            g1g1, g1g2, g2g2 = H[0,0], H[0,1], H[1,1]
+            den = (g1g1 - 2*g1g2 + g2g2).clamp_min(self.eps)
+            a1 = torch.clamp((g1g1 - g1g2) / den, 0.0, 1.0)
+            return torch.stack([a1, 1. - a1])
+
+        # PGD on simplex, entropy-regularized if lam>0
+        a = torch.full((m,), 1.0/m, device=H.device, dtype=torch.float32)
+        last_obj = inf
+        for _ in range(self.max_pgd_iters):
+            grad = H @ a
+            if lam > 0:
+                grad = grad - lam * (1.0 + torch.log(a.clamp_min(1e-12)))
+            a = a - self.pgd_lr * grad
+            self._project_to_simplex_(a)
+            obj = 0.5 * (a @ (H @ a))
+            if lam > 0:
+                obj = obj - lam * torch.sum(torch.log(a.clamp_min(1e-12)))
+            rel = abs((obj - last_obj) / (abs(last_obj) + 1e-12))
+            if rel < self.pgd_tol: break
+            last_obj = obj
+        return a
+
+    @torch.no_grad()
+    def _ema_on_simplex(self, a_new, a_old, beta):
+        """EMA on simplex, then re-project to simplex to avoid drift."""
+        if a_old is None or beta <= 0: return a_new
+        a = beta * a_old + (1.0 - beta) * a_new
+        return self._project_to_simplex_(a)
+
+    # ---------- main entry ----------
+    def backward(self, losses, shared_params_fn=None, alpha_prior: torch.Tensor = None):
+        """
+        Compute/refresh α if needed (Pass 1), then do a single backward of
+        Σ alpha' * L_i (Pass 2). Returns α (pre-blend, post-EMA) as numpy.
+
+        alpha_prior (optional): length-m tensor on self.device with nonnegative entries;
+        it will be combined as: a <- project_to_simplex( (1-λ)a + λ * prior_normalized ).
+        For most use cases, prefer 'entropy_reg' and/or 'blend' first.
+        """
+        assert self.device is not None, "Set `mgda.device = model.device`"
+        assert callable(self.get_share_params) or callable(shared_params_fn), \
+            "Provide mgda.get_share_params or pass shared_params_fn"
+        get_shared = shared_params_fn if shared_params_fn is not None else self.get_share_params
+
+        self._step += 1
+        device = self.device
+        share = list(get_shared())
+        m = len(losses)
+
+        # trivial case
+        if not share or m == 0:
+            combined = sum(losses) if m > 0 else 0.0
+            if torch.is_tensor(combined):
+                combined.backward()
+            return np.ones(m, dtype=np.float32) / max(1, m)
+
+        # Decide if we refresh alphas this step
+        refresh_alpha = (self._alpha_cache is None) or (self._step % self.alpha_update_period == 1)
+
+        if refresh_alpha:
+            # ---- Pass 1: build H on GPU without keeping all grads ----
+            vflat = self._riemann_diag(share, device)  # [P] float32
+            H = torch.zeros(m, m, device=device, dtype=torch.float32)
+            ghat_prev = []  # keep at most (i) whitened vectors
+
+            for i, loss in enumerate(losses):
+                grads = torch.autograd.grad(loss, share, retain_graph=True,
+                                            create_graph=False, allow_unused=True)
+                flat = []
+                for p, g in zip(share, grads):
+                    if g is None: g = torch.zeros_like(p)
+                    flat.append(g.reshape(-1).to(torch.float32))
+                gflat = torch.cat(flat) if flat else torch.tensor([], device=device, dtype=torch.float32)
+                ghat_i = gflat / vflat
+
+                H[i, i] = torch.dot(ghat_i, ghat_i)
+                for j in range(i):
+                    hij = torch.dot(ghat_i, ghat_prev[j])
+                    H[i, j] = hij
+                    H[j, i] = hij
+                ghat_prev.append(ghat_i)
+
+            # Solve MGDA (entropy-regularized if entropy_reg>0)
+            a = self._solve_alphas_from_H(H)
+
+            # Optional prior bias on simplex (small λ recommended)
+            if alpha_prior is not None:
+                prior = alpha_prior.to(device=device, dtype=torch.float32).clamp_min(0)
+                if prior.sum() > 0:
+                    prior = prior / prior.sum()
+                    # small blend toward prior (use entropy_reg first; keep this weak)
+                    lam_prior = min(0.1, self.entropy_reg + 1e-8)  # safe default
+                    a = self._project_to_simplex_( (1.0 - lam_prior) * a + lam_prior * prior )
+
+            # EMA smooth across steps (on simplex)
+            a = self._ema_on_simplex(a, self._alpha_cache, self.alpha_ema)
+            self._alpha_cache = a.detach()  # cache on device (float32)
+
+        # ---- Pass 2: single scalarized backward with blend safeguard ----
+        a_used = self._alpha_cache
+        if self.blend > 0.0:
+            a_used = (1.0 - self.blend) * a_used + self.blend * (1.0 / m)
+            self._project_to_simplex_(a_used)  # keep on simplex after blend
+
+        # zero grads on shared only (avoid mixing from prior calls)
+        for p in share:
+            if p.grad is not None:
+                p.grad = None
+
+        combined = torch.zeros((), device=device, dtype=torch.float32)
+        for ai, li in zip(a_used, losses):
+            combined = combined + (ai * li)
+        combined.backward()
+
+        # optionally zero non-shared grads (keep only shared updates)
+        if self.restrict_to_shared:
+            shared_ids = {id(p) for p in share}
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    if id(p) not in shared_ids and p.grad is not None:
+                        p.grad.zero_()
+
+        return self._alpha_cache.detach().float().cpu().numpy()

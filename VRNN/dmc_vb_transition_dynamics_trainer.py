@@ -945,18 +945,33 @@ class DMCVBTrainer:
         except:
             print("W&B initialization failed, falling back to TensorBoard")
             return False
+
+    def anneal_beta(self, epoch: int) -> float:
+        import math
+        beta_min = self.config.get('beta_min', 0.0)
+        beta_max = self.config.get('beta_max', 1.0)
+        T = max(1, int(self.config.get('beta_warmup_epochs', 40)))
+        # progress in [0,1]
+        p = min(1.0, max(0.0, (epoch + 1) / T))
+        # cosine ramp-up: 0 -> 1
+        ramp = 0.5 * (1.0 - math.cos(math.pi * p))
+        return beta_min + (beta_max - beta_min) * ramp
+
         
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
         self.model.train()
+        # Calculate alpha for gradient normalization this epoch
+        
         epoch_metrics = defaultdict(list)
         self.epoch_disc_losses = {'image': [], 'latent': []}
 
         epoch_component_grads = defaultdict(list)
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch} [Train]')
-        
+        beta_t = self.anneal_beta(epoch)
         for batch_idx, batch in enumerate(pbar):
+            
             # Move batch to device
             observations = batch['observations'].to(self.device)
             actions = batch['actions'].to(self.device)
@@ -965,13 +980,13 @@ class DMCVBTrainer:
             losses = self.model.training_step_sequence(
                 observations=observations,
                 actions=actions,
-                beta=self.config['beta'],
+                beta=beta_t,
                 n_critic=self.config['n_critic'],
                 lambda_img=self.config['lambda_img'],
                 lambda_recon=self.config['lambda_recon'],
-                lambda_pred=self.config['lambda_pred'],
+                lambda_att_dyn=self.config['lambda_att_dyn'],
                 lambda_att=self.config['lambda_att'],
-                entropy_weight=self.config['entropy_weight']
+                entropy_weight=self.config['entropy_weight'],
             )
             component_grads = self.grad_monitor.compute_component_gradients()
             for component, grad_norm in component_grads.items():
@@ -996,7 +1011,8 @@ class DMCVBTrainer:
             pbar.set_postfix({
                 'total_loss': losses['total_gen_loss'],
                 'recon_loss': losses['recon_loss'].item() if torch.is_tensor(losses['recon_loss']) else losses['recon_loss'],
-                'kl_z': losses['kl_z'].item() if torch.is_tensor(losses['kl_z']) else losses['kl_z']
+                'kl_z': losses['kl_z'].item() if torch.is_tensor(losses['kl_z']) else losses['kl_z'],
+                'beta': f'{beta_t:.3f}',
             })
         
         # Compute epoch averages
@@ -1033,7 +1049,7 @@ class DMCVBTrainer:
                 vae_losses, outputs = self.model.compute_total_loss(
                     observations=observations,
                     actions=actions,
-                    beta=self.config['beta'],
+                    beta=self.config.get('beta_eval', self.config.get('beta_max', 1.0)),
                     entropy_weight=self.config['entropy_weight']
                 )
                 
@@ -1536,15 +1552,15 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 20,
-        'latent_dim': 35,
+        'max_components': 25,
+        'latent_dim': 40,
         'hidden_dim': 48, #must be divisible by 8
         'context_dim': 40,
-        'attention_dim': 44,
+        'attention_dim': 48,
         'attention_resolution': 21,
         'input_channels': 3*1,  # 3 stacked frames
         'HiP_type': 'Mini',
-        'prior_alpha': 5.0,  # Hyperparameters for prior
+        'prior_alpha': 6.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
         
         # Training settings
@@ -1553,19 +1569,24 @@ def main():
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
-        'learning_rate': 0.00008,
+        'learning_rate': 0.0002,
         'n_epochs': 400,
         'num_workers': 4,
+
+        'beta_min': 0.5,
+        'beta_max': 1.0,
+        'beta_warmup_epochs': 25,  # 20–50 is common
+        'beta_eval': 1.0,          # force eval to use full KL (recommended)
         
         # Loss weights
         'beta': 1.0,
-        'entropy_weight': 1.0,
+        'entropy_weight': 0.6,
         'lambda_img': 0.75,
         'lambda_recon': 1.0,
-        'lambda_pred': 0.1,
-        'lambda_att': 0.1,
+        'lambda_att_dyn': 0.5,
+        'lambda_att': 0.5,
         'grad_clip': 1.0,
-        'n_critic': 2,
+        'n_critic': 1,
         
         # Logging
         'use_wandb': False,

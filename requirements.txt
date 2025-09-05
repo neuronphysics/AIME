@@ -30,6 +30,7 @@ flatbuffers
 fonttools
 fsspec
 gast
+geoopt
 gin
 gin-config
 glfw
