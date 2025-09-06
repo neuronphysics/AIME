@@ -8,7 +8,6 @@ import abc
 import math
 
 
-# ============= Utility Functions =============
 
 def swish(x):
     """Swish activation function"""
@@ -20,7 +19,6 @@ class Swish(nn.Module):
         return swish(x)
 
 
-# ============= Squeeze and Excitation =============
 
 class SqueezeExcitation(nn.Module):
     """Squeeze-and-Excitation layer from NVAE"""
@@ -39,7 +37,6 @@ class SqueezeExcitation(nn.Module):
         return x * self.se(x)
 
 
-# ============= Spectral Normalization =============
 
 def spectral_norm_conv(conv_layer):
     """Apply spectral normalization to conv layers"""
@@ -366,7 +363,20 @@ class VAEEncoder(nn.Module):
         else:
             sel = [k for k in levels if k in feats]
         return {k: feats[k] for k in sel}
-    
+
+    def get_unet_skips(self, x, levels=None, detach: bool = False):
+        """
+        Build a dict of encoder feature maps keyed by spatial size like "HxW".
+        Convenience wrapper around extract_pyramid(...) for UNet-style decoding.
+        """
+        feats = self.extract_pyramid(x, levels=levels)
+        out = {}
+        for k, v in feats.items():
+            t = v.detach() if detach else v
+            H, W = t.shape[-2:]
+            out[f"{H}x{W}"] = t
+        return out
+
     def build_attention_fuser(self, 
                               sample_input: torch.Tensor,
                               out_hw=(21, 21),
@@ -603,6 +613,10 @@ class VAEDecoder(nn.Module):
                     # MDL head
         self.mdl_head = MDLHead(current_channels // 2, out_ch=reconstruction_channels, n_mix=10)
         self.use_checkpoint = False
+        self.enable_unet: bool = False
+        self._pending_skips = None               # dict[str, Tensor], set via set_unet_skips(...)
+        self._unet_mode: str = "concat"          # currently only "concat" is implemented
+        self.post_concat_adapters = nn.ModuleDict()  # 1x1 convs to map cat(C_in+skip) -> C_in
 
     def gradient_checkpointing_disable(self):
         """
@@ -616,7 +630,48 @@ class VAEDecoder(nn.Module):
         This will trade compute for memory by recomputing activations during backward pass.
         """
         self.use_checkpoint = True
-    
+    def set_unet_skips(self, skips: dict, mode: str = "concat"):
+        """
+        Provide encoder feature maps for UNet-style skip fusion.
+        Call this right before forward(z). Public API of forward/ctor remains unchanged.
+        Args:
+            skips: mapping of {"HxW": Tensor} or arbitrary keys -> Tensor[B,C,H,W].
+                   If keys are not "HxW", we will match by the tensor spatial size.
+            mode: currently only "concat" is implemented.
+        """
+        self.enable_unet = True
+        self._unet_mode = mode
+        self._pending_skips = dict(skips) if skips is not None else None
+
+    def _pick_and_prep_skip(self, h):
+        """
+        Find a pending skip that best matches h's spatial size. If none exactly matches,
+        pick the first available and interpolate to match. Returns a Tensor or None.
+        """
+        if not isinstance(self._pending_skips, dict) or len(self._pending_skips) == 0:
+            return None
+        H, W = h.shape[-2:]
+        key_exact = f"{H}x{W}"
+        if key_exact in self._pending_skips:
+            skip = self._pending_skips.pop(key_exact)
+        else:
+            # same-size tensor search
+            match_key = None
+            for k, v in self._pending_skips.items():
+                if hasattr(v, "shape") and v.shape[-2:] == (H, W):
+                    match_key = k
+                    break
+            if match_key is not None:
+                skip = self._pending_skips.pop(match_key)
+            else:
+                # fallback: take an arbitrary one
+                k, skip = self._pending_skips.popitem()
+        skip = skip.to(h.device, dtype=h.dtype)
+        if skip.shape[-2:] != (H, W):
+            skip = F.interpolate(skip, size=(H, W), mode='bilinear', align_corners=False)
+        return skip
+
+        
     def forward(self, z):
         # MLP
         if self.use_checkpoint and self.training:
@@ -634,10 +689,25 @@ class VAEDecoder(nn.Module):
         
         # Progressive decoding
         for block in self.decoder_blocks:
+            prev_hw = h.shape[-2:]
             if self.use_checkpoint and self.training:  
                 h = torch.utils.checkpoint.checkpoint(block, h, use_reentrant=False)
             else:
                 h = block(h)
+            if self.enable_unet and isinstance(self._pending_skips, dict):
+                # size change indicates an upsample happened in this block
+                if h.shape[-2:] != prev_hw:
+                    skip = self._pick_and_prep_skip(h)
+                    if skip is not None and self._unet_mode == "concat":
+                        cat = torch.cat([h, skip], dim=1)
+                        in_ch = cat.shape[1]
+                        out_ch = h.shape[1]
+                        H, W = h.shape[-2:]
+                        adapter_key = f"cat_{in_ch}->{out_ch}@{H}x{W}"
+                        if adapter_key not in self.post_concat_adapters:
+                            self.post_concat_adapters[adapter_key] = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=True).to(h.device)
+                        h = self.post_concat_adapters[adapter_key](cat)
+            
         # Final processing with checkpointing
         if self.use_checkpoint and self.training:
             h = torch.utils.checkpoint.checkpoint(
@@ -655,7 +725,7 @@ class VAEDecoder(nn.Module):
             h = self.final_act(h)
             out = self.pre_output(h)
             result = self.mdl_head(out)
-        
+        self._pending_skips = None
         return result
     
     def decode(self, z, deterministic=False):

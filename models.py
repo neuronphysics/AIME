@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from typing import Optional, Tuple, Dict, Union, List
+from VRNN.perceiver.Utils import RopePositionEmbedding  # spatial RoPE
 
 import logging
 import functools
@@ -1288,19 +1289,72 @@ class CausalConv3d(nn.Module):
         x = F.pad(x, self._pad, mode=self.pad_mode)
         return self.conv(x)
 
+#----------------Using RoPE for positional encoding-------------------
+class RoPEMHA(nn.Module):
+    """MHA that applies 2D RoPE (from RopePositionEmbedding) to Q/K before attention."""
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.h = num_heads
+        self.d = embed_dim // num_heads
+        assert (self.d % 2) == 0, "RoPE requires even head dim (d_head % 2 == 0)"
 
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+        self.out = nn.Linear(embed_dim, embed_dim)
+        self.drop = nn.Dropout(dropout)
+
+    @staticmethod
+    def _rotate_half(x):
+        d2 = x.size(-1) // 2
+        x1, x2 = x[..., :d2], x[..., d2:]
+        return torch.cat([-x2, x1], dim=-1)
+
+    @staticmethod
+    def _apply_rope(x, sin, cos):
+        # x: [B, h, N, d], sin/cos: [N, d] -> broadcast to [1,1,N,d]
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        return (x * cos) + (RoPEMHA._rotate_half(x) * sin)
+
+    def forward(self, x, sin_spatial=None, cos_spatial=None):
+        B, N, C = x.shape
+        qkv = self.qkv(x).view(B, N, 3, self.h, self.d).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B,h,N,d]
+
+        if (sin_spatial is not None) and (cos_spatial is not None):
+            q = self._apply_rope(q, sin_spatial, cos_spatial)
+            k = self._apply_rope(k, sin_spatial, cos_spatial)
+
+        att = (q @ k.transpose(-2, -1)) * (self.d ** -0.5)
+        att = att.softmax(dim=-1)
+        att = self.drop(att)
+
+        y = (att @ v).transpose(1, 2).reshape(B, N, C)
+        return self.out(y)
 
 class CausalSelfAttention(nn.Module):
     """
-    Causal self-attention over sequences (no batching over heads here).
-    Correctly handles causal + padding masks and zeros outputs for padded queries.
+    Causal self-attention over sequences with optional 1D RoPE on time.
+    Handles causal + padding masks and zeros outputs for padded queries.
     """
-    def __init__(self, n_embd: int, n_head: int, attn_pdrop: float = 0.1, resid_pdrop: float = 0.1, max_seq_len: int = 512):
+    def __init__(
+        self,
+        n_embd: int,
+        n_head: int,
+        attn_pdrop: float = 0.1,
+        resid_pdrop: float = 0.1,
+        max_seq_len: int = 512,
+        use_rope_time: bool = False,
+        rope_base: float = 10000.0,
+    ):
         super().__init__()
         assert n_embd % n_head == 0
         self.n_head = n_head
         self.d_head = n_embd // n_head
         self.max_seq_len = max_seq_len
+        assert (self.d_head % 2) == 0, "RoPE requires even head dim (d_head % 2 == 0)"
+        self.use_rope_time = use_rope_time
+        self.rope_base = rope_base
 
         self.kqv = nn.Linear(n_embd, 3 * n_embd)
         self.proj = nn.Linear(n_embd, n_embd)
@@ -1309,6 +1363,27 @@ class CausalSelfAttention(nn.Module):
         self.resid_drop = nn.Dropout(resid_pdrop)
 
         self.register_buffer("causal", tri_causal_mask(max_seq_len, device=torch.device("cpu")), persistent=False)
+
+    @staticmethod
+    def _rotate_half(x):
+        d2 = x.size(-1) // 2
+        x1, x2 = x[..., :d2], x[..., d2:]
+        return torch.cat([-x2, x1], dim=-1)
+
+    def _rope_time(self, T: int, device, dtype):
+        # Build standard 1D RoPE for time: sin/cos with shape [T, d_head]
+        d = self.d_head
+        half = d // 2
+        # Frequencies like base^{-(0..half-1)/half}; robust & standard
+        inv_freq = (self.rope_base ** (-(torch.arange(half, device=device, dtype=dtype) / half))).view(1, half)
+        t = torch.arange(T, device=device, dtype=dtype).view(T, 1)
+        angles = t * inv_freq                                 # [T, half]
+        sin = torch.sin(angles)
+        cos = torch.cos(angles)
+        # Duplicate to match "rotate_half" style (split into two equal halves)
+        sin = torch.cat([sin, sin], dim=-1)                   # [T, d]
+        cos = torch.cat([cos, cos], dim=-1)                   # [T, d]
+        return sin, cos
 
     def forward(self, x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -1321,24 +1396,31 @@ class CausalSelfAttention(nn.Module):
         qkv = self.kqv(x)                                 # (B, T, 3C)
         k, q, v = qkv.chunk(3, dim=-1)
 
-        # shape: (B, h, T, d)
         def split_heads(t):
-            return t.view(B, T, self.n_head, self.d_head).transpose(1, 2)
+            return t.view(B, T, self.n_head, self.d_head).transpose(1, 2)  # (B, h, T, d)
 
         q = split_heads(q)
         k = split_heads(k)
         v = split_heads(v)
 
-        # (B, h, T, T)
+        # Optional temporal RoPE (rotate Q/K along time)
+        if self.use_rope_time:
+            sin_t, cos_t = self._rope_time(T, q.device, q.dtype)       # [T, d]
+            sin_t = sin_t[None, None, :, :]                             # [1,1,T,d]
+            cos_t = cos_t[None, None, :, :]
+            q = (q * cos_t) + (self._rotate_half(q) * sin_t)
+            k = (k * cos_t) + (self._rotate_half(k) * sin_t)
+
+        # Attention logits
         att = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
 
-        # causal mask (keys columns)
+        # causal mask on keys (columns)
         causal = self.causal[:, :, :T, :T].to(att.dtype)
         att = att.masked_fill(causal == 0, float("-inf"))
 
+        # padding mask on keys (columns)
         if padding_mask is not None:
-            # key-side columns: broadcast to (B, 1, 1, T)
-            key_mask = padding_mask[:, None, None, :].to(att.dtype)
+            key_mask = padding_mask[:, None, None, :].to(att.dtype)  # (B,1,1,T)
             att = att.masked_fill(key_mask == 0, float("-inf"))
 
         # numerically stable softmax
@@ -1356,15 +1438,24 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)   # (B, T, C)
         return self.resid_drop(self.proj(y))
 
-
 class TransformerBlock(nn.Module):
-    """
-    Pre-LN Transformer block with residual gates for stability.
-    """
-    def __init__(self, n_embd: int, n_head: int, attn_pdrop: float = 0.1, resid_pdrop: float = 0.1, max_seq_len: int = 512):
+    """Pre-LN Transformer block with residual gates for stability."""
+    def __init__(
+        self,
+        n_embd: int,
+        n_head: int,
+        attn_pdrop: float = 0.1,
+        resid_pdrop: float = 0.1,
+        max_seq_len: int = 512,
+        use_rope_time: bool = False,
+        rope_base: float = 10000.0,
+    ):
         super().__init__()
         self.ln_1 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, attn_pdrop, resid_pdrop, max_seq_len)
+        self.attn = CausalSelfAttention(
+            n_embd, n_head, attn_pdrop, resid_pdrop, max_seq_len,
+            use_rope_time=use_rope_time, rope_base=rope_base
+        )
         self.ln_2 = nn.LayerNorm(n_embd)
 
         self.mlp = nn.Sequential(
@@ -1383,6 +1474,7 @@ class TransformerBlock(nn.Module):
         x = x + self.res_scale_attn * self.attn(self.ln_1(x), padding_mask=mask)
         x = x + self.res_scale_mlp  * self.mlp(self.ln_2(x))
         return x
+
 
 
 # -----------------------------
@@ -1430,7 +1522,6 @@ class SpatialTemporalTokenizer(nn.Module):
         x = self.norm(x)
         return x, (Hn, Wn)
 
-
 class TemporalDiscriminator(nn.Module):
     """
     Temporal discriminator conditioned on latent z_t (per-timestep).
@@ -1451,9 +1542,11 @@ class TemporalDiscriminator(nn.Module):
         n_heads: int = 8,
         max_sequence_length: int = 32,
         patch_size: int = 8,
-        z_dim: int = 32,                      # <— NEW: latent dimension
-        film_scale: float = 0.5,              # gentle FiLM scaling for stability
+        z_dim: int = 32,
+        film_scale: float = 0.5,
         device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+        use_rope_temporal: bool = True,
+        rope_base: float = 10000.0,
     ):
         super().__init__()
         self.image_size = image_size
@@ -1463,6 +1556,8 @@ class TemporalDiscriminator(nn.Module):
         self.device = device
         self.z_dim = z_dim
         self.num_patches = (image_size // patch_size) ** 2
+        self.use_rope_temporal = use_rope_temporal
+        self.rope_base = rope_base
 
         # Spatial–temporal tokenizer (Conv3D patches)
         self.frame_encoder = SpatialTemporalTokenizer(
@@ -1473,19 +1568,37 @@ class TemporalDiscriminator(nn.Module):
             stride_t=1,
         )
 
-        # Positional embeddings
+        # (keep your learnable positional embeddings; RoPE augments them)
         self.spatial_pos_embed  = nn.Parameter(torch.randn(1, 1, self.num_patches, hidden_dim) * 0.02)
         self.temporal_pos_embed = nn.Parameter(torch.randn(1, max_sequence_length, 1, hidden_dim) * 0.02)
 
-        # Spatial self-attention (per frame)
+        # ---- RoPE for spatial positions (computed once per call) ----
+        rope_heads_spatial = max(1, n_heads // 2)
+        self.spatial_rope = RopePositionEmbedding(
+            embed_dim=hidden_dim,
+            num_heads=rope_heads_spatial,
+            base=rope_base,
+            normalize_coords="separate",
+            shift_coords=0.01,
+            jitter_coords=1.02,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        # Spatial attention (now RoPE-aware)
         self.spatial_attention = nn.ModuleList([
-            nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=max(1, n_heads // 2), dropout=0.1, batch_first=True)
+            RoPEMHA(embed_dim=hidden_dim, num_heads=rope_heads_spatial, dropout=0.1)
             for _ in range(max(1, n_layers // 2))
         ])
 
-        # Temporal transformer (causal)
+        # Temporal transformer (causal) — pass temporal RoPE flag
         self.blocks = nn.ModuleList([
-            TransformerBlock(hidden_dim, n_heads, max_seq_len=max_sequence_length * self.num_patches)
+            TransformerBlock(
+                hidden_dim, n_heads,
+                max_seq_len=max_sequence_length * self.num_patches,
+                use_rope_time=use_rope_temporal,
+                rope_base=rope_base,
+            )
             for _ in range(n_layers)
         ])
 
@@ -1495,7 +1608,6 @@ class TemporalDiscriminator(nn.Module):
         self.ln_f = nn.LayerNorm(hidden_dim)
 
         # -------- Conditioning modules --------
-        # FiLM from z_t → (gamma_t, beta_t) in R^D (one set per timestep)
         self.film = nn.Sequential(
             nn.LayerNorm(z_dim),
             nn.Linear(z_dim, 2 * hidden_dim)
@@ -1507,7 +1619,7 @@ class TemporalDiscriminator(nn.Module):
         self.head_spatial_cond  = nn.Sequential(nn.LayerNorm(z_dim), nn.Linear(z_dim, hidden_dim))
         self.head_frame_cond    = nn.Sequential(nn.LayerNorm(z_dim), nn.Linear(z_dim, hidden_dim))
 
-        # -------- Heads --------
+        # Heads 
         self.temporal_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LeakyReLU(0.2, inplace=True),
@@ -1524,71 +1636,49 @@ class TemporalDiscriminator(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
 
-        self.apply(self._init_weights)
         self.to(device)
 
-    # --- utils ---
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None: nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight); nn.init.zeros_(module.bias)
-
-    def create_padding_mask(self, sequence_lengths, max_length):
-        B = len(sequence_lengths)
-        mask = torch.zeros(B, max_length, dtype=torch.bool, device=self.device)
-        for i, L in enumerate(sequence_lengths):
-            mask[i, :int(L)] = True
-        return mask
-
-    # --- forward ---
     def forward(self, x, z=None, sequence_lengths=None, return_features=False):
-        """
-        x: [B, T, C, H, W]
-        z: [B, T, Z] or [B, Z] or None
-        """
         B, T, C, H, W = x.shape
         if sequence_lengths is None:
             sequence_lengths = torch.full((B,), T, device=self.device)
-        temporal_mask = self.create_padding_mask(sequence_lengths, T)
+        temporal_mask = make_temporal_padding_mask(sequence_lengths, T)  # (B,T)
 
-        # Prepare z per timestep
         if z is None:
             z = torch.zeros(B, T, self.z_dim, device=self.device)
         elif z.dim() == 2:
-            z = z.unsqueeze(1).expand(-1, T, -1)  # broadcast [B, Z] → [B, T, Z]
+            z = z.unsqueeze(1).expand(-1, T, -1)
 
-        # 1) tokenize frames → [B, T', N, D]
-        tokens, (Hp, Wp) = self.frame_encoder(x)    # T' should equal T with temporal_stride=1
-        T_tok, N, D = tokens.size(1), tokens.size(2), tokens.size(3)
-        assert T_tok == T, f"Tokenizer changed T from {T} to {T_tok}"
+        # 1) Tokenize
+        tokens, (Hp, Wp) = self.frame_encoder(x)  # [B, T, N, D]
+        B, Tn, N, D = tokens.shape
+        assert Tn == T, f"Tokenizer changed T from {T} to {Tn}"
 
-        # 2) add positions
+        # 2) Add learned pos (kept for backward-compat)
         tokens = tokens + self.spatial_pos_embed + self.temporal_pos_embed[:, :T, :, :]
 
-        # 3) FiLM conditioning on tokens with z_t
-        film_params = self.film(z)                          # [B, T, 2D]
-        gamma, beta = film_params.chunk(2, dim=-1)          # [B, T, D] each
-        gamma = torch.tanh(gamma) * self.film_scale         # keep stable
-        gamma = gamma.unsqueeze(2)                          # [B, T, 1, D]
-        beta  = beta.unsqueeze(2)                           # [B, T, 1, D]
-        tokens = tokens * (1.0 + gamma) + beta              # broadcast over patches
+        # 3) FiLM conditioning
+        film_params = self.film(z)                   # [B, T, 2D]
+        gamma, beta = film_params.chunk(2, dim=-1)   # [B, T, D] each
+        gamma = torch.tanh(gamma) * self.film_scale  # stability
+        gamma = gamma.unsqueeze(2)                   # [B, T, 1, D]
+        beta  = beta.unsqueeze(2)
+        tokens = tokens * (1.0 + gamma) + beta
 
-        # 4) spatial attention per frame (preserve spatial structure)
+        # 4) Spatial attention per frame (RoPE on Q/K)
+        sin_sp, cos_sp = self.spatial_rope(H=Hp, W=Wp)  # [N, D]
         spatial_feats = []
         for t in range(T):
             s = tokens[:, t]  # [B, N, D]
             for attn in self.spatial_attention:
                 s_norm = self.spatial_norm(s)
-                out, _ = attn(s_norm, s_norm, s_norm)
-                s = s + out
+                s = s + attn(s_norm, sin_sp, cos_sp)
             spatial_feats.append(s)
-        spatial_feats = torch.stack(spatial_feats, dim=1)   # [B, T, N, D]
+        spatial_feats = torch.stack(spatial_feats, dim=1)  # [B, T, N, D]
 
-        # 5) temporal processing over flattened sequence (with padding mask tiled over N)
-        flat = spatial_feats.reshape(B, T * N, D)           # [B, T*N, D]
-        flat_mask = temporal_mask.unsqueeze(2).expand(-1, -1, N).reshape(B, T * N)  # [B, T*N]
+        # 5) Temporal processing (flattened sequence, causal + padding masks)
+        flat = spatial_feats.reshape(B, T * N, D)
+        flat_mask = temporal_mask.unsqueeze(2).expand(-1, -1, N).reshape(B, T * N)
 
         h = flat
         all_hidden = []
@@ -1599,26 +1689,21 @@ class TemporalDiscriminator(nn.Module):
         h = self.ln_f(h)
         h_4d = h.reshape(B, T, N, D)
 
-        # 6) scores (with small conditional residuals)
-        # temporal score: last valid timestep pooled over space
-        temporal_tokens = h_4d.mean(dim=2)                  # [B, T, D]
+        # 6) Heads (unchanged)
+        temporal_tokens = h_4d.mean(dim=2)  # [B, T, D]
         last_idx = (sequence_lengths - 1).clamp(min=0)
         idx = torch.arange(B, device=self.device)
-        temporal_rep = temporal_tokens[idx, last_idx]       # [B, D]
-        temporal_rep = temporal_rep + self.head_temporal_cond(z[idx, last_idx])
-        temporal_score = self.temporal_head(temporal_rep)   # [B, 1]
+        temporal_rep = temporal_tokens[idx, last_idx] + self.head_temporal_cond(z[idx, last_idx])
+        temporal_score = self.temporal_head(temporal_rep)
 
-        # spatial score: pool over time then space
-        spatial_rep = h_4d.mean(dim=1).mean(dim=1)          # [B, D]
-        spatial_rep = spatial_rep + self.head_spatial_cond(z.mean(dim=1))
-        spatial_score = self.spatial_head(spatial_rep)      # [B, 1]
+        spatial_rep = h_4d.mean(dim=1).mean(dim=1) + self.head_spatial_cond(z.mean(dim=1))
+        spatial_score = self.spatial_head(spatial_rep)
 
-        # per-frame scores with masking
-        per_frame_rep = temporal_tokens + self.head_frame_cond(z)   # [B, T, D]
-        per_frame_scores = self.per_frame_head(per_frame_rep)       # [B, T, 1]
+        per_frame_rep = temporal_tokens + self.head_frame_cond(z)
+        per_frame_scores = self.per_frame_head(per_frame_rep)
         per_frame_scores = per_frame_scores.masked_fill(~temporal_mask.unsqueeze(-1), 0.0)
         valid = temporal_mask.sum(dim=1, keepdim=True).clamp(min=1)
-        per_frame_avg = per_frame_scores.sum(dim=1) / valid        # [B, 1]
+        per_frame_avg = per_frame_scores.sum(dim=1) / valid
 
         out = {
             "temporal_score": temporal_score,

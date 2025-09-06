@@ -138,10 +138,9 @@ class HiPCrossAttention(nn.Module):
             assert self.output_num_channels is not None
 
             # Define index_dim dynamically based on inputs
-            # index_dim = num_groups * self.output_index_dim_eval
-            # self.trainable_position_encoding.update_index_dim(index_dim)
-
-            query_inputs = self.trainable_position_encoding(batch_size=batch_size)
+            
+            gm_eval = int(num_groups) * int(self.output_index_dim_eval) 
+            query_inputs = self.trainable_position_encoding(batch_size=batch_size, index_dim=gm_eval)
             # query_inputs = einshape('b(gm)c->bgmc', query_inputs, g=num_groups)
 
             b, gm, c = query_inputs.shape
@@ -327,7 +326,15 @@ class PerceiverBlock(nn.Module):
             inputs = regroup(inputs, self.num_output_groups, self.regroup_type)
         else:
             assert inputs.shape[1] == self.num_output_groups, "Number of input and output groups must match."
-
+        if pre_attention_residual is not None:
+            if pre_attention_residual.dim() != 4:
+                raise ValueError("pre_attention_residual must be 4D [B, G, M, C].")
+            if pre_attention_residual.shape[1] != self.num_output_groups:
+                pre_attention_residual = regroup(
+                    pre_attention_residual,
+                    num_output_groups=self.num_output_groups,
+                    regroup_type=self.regroup_type
+                )
         z = self.projector(inputs, pre_attention_residual=pre_attention_residual,
                            is_training=is_training, attention_mask=attention_mask)
 
@@ -451,7 +458,7 @@ class PositionEncoder(nn.Module):
 
         for modality_name, value in inputs.items():
             batch_size, index_dim, num_channels = value.shape
-            pos_encodings_i = self.position_encodings[modality_name](batch_size)
+            pos_encodings_i = self.position_encodings[modality_name](batch_size, index_dim=index_dim)
 
             pos_encodings[modality_name] = pos_encodings_i
             out[modality_name] = value + pos_encodings[modality_name]

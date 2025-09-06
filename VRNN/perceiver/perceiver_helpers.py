@@ -136,17 +136,42 @@ class TrainablePositionEncoding(nn.Module):
                  num_channels: int = 128,
                  init_scale: float = 1.0):
         super().__init__()
-        self._index_dim = index_dim
+        self._index_dim = index_dim                  # initial (max) length
         self._num_channels = num_channels
         self._init_scale = init_scale
-        self.pos_embs = nn.Parameter(torch.randn(index_dim, num_channels).to(device) * init_scale, requires_grad=True)
+        self.pos_embs = nn.Parameter(
+            torch.randn(index_dim, num_channels, device=device) * init_scale,
+            requires_grad=True,
+        )
 
-    def forward(self, batch_size=None):
-        pos_embs = self.pos_embs
+    @torch.no_grad()
+    def _grow_to(self, new_len: int):
+        """Grow the parameter to at least new_len, preserving existing weights."""
+        old_len, d = self.pos_embs.shape
+        if new_len <= old_len:
+            return
+        extra = torch.randn(new_len - old_len, d, device=self.pos_embs.device) * self._init_scale
+        new_param = torch.empty(new_len, d, device=self.pos_embs.device, dtype=self.pos_embs.dtype)
+        new_param[:old_len].copy_(self.pos_embs)
+        new_param[old_len:].copy_(extra)
+        self.pos_embs = nn.Parameter(new_param, requires_grad=True)
+        self._index_dim = new_len
+
+    def forward(self, batch_size: int | None = None, index_dim: int | None = None):
+        """
+        If index_dim is given, slice (or grow and then slice) to that length.
+        Otherwise, return the full table (backward compatible).
+        """
+        if index_dim is not None:
+            if index_dim > self.pos_embs.size(0):
+                self._grow_to(index_dim)
+            pos = self.pos_embs[:index_dim]
+        else:
+            pos = self.pos_embs
+
         if batch_size is not None:
-            pos_embs = pos_embs.unsqueeze(0).expand(batch_size, -1, -1)
-        return pos_embs
-
+            pos = pos.unsqueeze(0).expand(batch_size, -1, -1)
+        return pos
 
 class StochasticDepth(nn.Module):
     """Batch wise Dropout used in EfficientNet/NfNet, optionally sans rescaling."""
