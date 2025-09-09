@@ -1485,8 +1485,8 @@ class DMCVBTrainer:
         print(f"Train dataset size: {len(self.train_dataset)}")
         print(f"Eval dataset size: {len(self.eval_dataset)}")
         # Register EMA model
-        #self.model.ema_encoder.register()
-        #self.model.ema_decoder.register()
+        self.model.ema_encoder.register()
+        self.model.ema_decoder.register()
 
         for epoch in range(n_epochs):
             # Update temperature
@@ -1552,11 +1552,11 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 25,
-        'latent_dim': 40,
-        'hidden_dim': 48, #must be divisible by 8
-        'context_dim': 40,
-        'attention_dim': 48,
+        'max_components': 20,
+        'latent_dim': 32,
+        'hidden_dim': 40, #must be divisible by 8
+        'context_dim': 36,
+        'attention_dim': 36,
         'attention_resolution': 21,
         'input_channels': 3*1,  # 3 stacked frames
         'HiP_type': 'Mini',

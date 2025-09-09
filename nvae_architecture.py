@@ -428,12 +428,20 @@ class MDLHead(nn.Module):
         super().__init__()
         self.n_mix = n_mix
         self.out_ch = out_ch
+        self.use_checkpoint = False
         if out_ch != 3:
             self.params_pre_mix =1+2*out_ch
         else:
             self.params_pre_mix = 10 # 1 logit + 3 means + 3 log_scales + 3 coeffs
         # logits + means(3) + log_scales(3) + coeffs(3) = 10 per mixture
         self.proj = nn.Conv2d(in_ch, n_mix * self.params_pre_mix, 1, bias=True)
+
+    def gradient_checkpointing_enable(self): 
+
+        self.use_checkpoint = True
+    def gradient_checkpointing_disable(self): 
+
+        self.use_checkpoint = False
 
     def _split(self, y):
         B, _, H, W = y.shape
@@ -455,24 +463,58 @@ class MDLHead(nn.Module):
         return self._split(self.proj(h))
     
     @torch.no_grad()
-    def sample(self, logit_probs, means, log_scales, coeffs):
-        # Select mixture per pixel
+    def sample(self, logit_probs, means, log_scales, coeffs,
+            scale_temp: float = 1.0, mode: str = "sample"):
+        """
+        scale_temp (0<τ<=1): shrink logistic scales at sampling time (s' = τ * s).
+        mode: "sample" (stochastic) | "mean" (deterministic, per-component mean with RGB coupling)
+        """
         B, K, H, W = logit_probs.shape
-        mix = torch.distributions.Categorical(logits=logit_probs.permute(0,2,3,1)).sample()  # [B,H,W]
-        sel = mix.unsqueeze(1).unsqueeze(1)  # [B,1,1,H,W]
-        m  = means.gather(1, sel.expand(-1,1,3,-1,-1)).squeeze(1)        # [B,3,H,W]
-        ls = log_scales.gather(1, sel.expand(-1,1,3,-1,-1)).squeeze(1)   # [B,3,H,W]
-        cs = coeffs.gather(1, sel.expand(-1,1,3,-1,-1)).squeeze(1)       # [B,3,H,W]
-        
-        # Sample autoregressively with logistic noise
+
+        # one helper for both branches
         def samp(mu, log_s):
-            u = torch.rand_like(mu).clamp_(1e-5, 1-1e-5)
+            u = torch.rand_like(mu).clamp_(1e-5, 1 - 1e-5)
             return mu + torch.exp(log_s) * (torch.log(u) - torch.log1p(-u))
-        
-        x_r = samp(m[:,0], ls[:,0])
-        x_g = samp(m[:,1] + cs[:,0]*x_r, ls[:,1])
-        x_b = samp(m[:,2] + cs[:,1]*x_r + cs[:,2]*x_g, ls[:,2])
-        x = torch.stack([x_r, x_g, x_b], dim=1)
+
+        # pick mixture component per pixel
+        mix = torch.distributions.Categorical(logits=logit_probs.permute(0, 2, 3, 1)).sample()
+        sel = mix.unsqueeze(1).unsqueeze(1)  # shape align for gather
+
+        if self.out_ch == 3:
+            # gather selected component params for RGB
+            m  = means.gather(1, sel.expand(-1, 1, 3, -1, -1)).squeeze(1)       # [B,3,H,W]
+            ls = log_scales.gather(1, sel.expand(-1, 1, 3, -1, -1)).squeeze(1)   # [B,3,H,W]
+            cs = coeffs.gather(1, sel.expand(-1, 1, 3, -1, -1)).squeeze(1)       # [B,3,H,W]
+
+            if mode == "mean":
+                # deterministic RGB with PixelCNN++-style linear couplings
+                x_r = m[:, 0]
+                x_g = m[:, 1] + cs[:, 0] * x_r
+                x_b = m[:, 2] + cs[:, 1] * x_r + cs[:, 2] * x_g
+                x = torch.stack([x_r, x_g, x_b], dim=1)
+                return x.clamp_(-1, 1)
+
+            # shrink scales for sampling
+            ls = ls + math.log(max(scale_temp, 1e-6))
+
+            # sample with couplings
+            x_r = samp(m[:, 0], ls[:, 0])
+            x_g = samp(m[:, 1] + cs[:, 0] * x_r, ls[:, 1])
+            x_b = samp(m[:, 2] + cs[:, 1] * x_r + cs[:, 2] * x_g, ls[:, 2])
+            x = torch.stack([x_r, x_g, x_b], dim=1)
+
+        else:
+            # generic C-channel case (no cross-channel coupling)
+            C = self.out_ch
+            m  = means.gather(1, sel.expand(-1, 1, C, -1, -1)).squeeze(1)        # [B,C,H,W]
+            ls = log_scales.gather(1, sel.expand(-1, 1, C, -1, -1)).squeeze(1)   # [B,C,H,W]
+
+            if mode == "mean":
+                return m.clamp_(-1, 1)
+
+            ls = ls + math.log(max(scale_temp, 1e-6))
+            x  = samp(m, ls)  # elementwise
+
         return x.clamp_(-1, 1)
     
     def nll(self, x, logit_probs, means, log_scales, coeffs):
@@ -480,49 +522,64 @@ class MDLHead(nn.Module):
         x: [B,3,H,W] in [-1,1]
         returns per-image NLL (mean over pixels & channels).
         """
-        B, _, H, W = x.shape
-        K = self.n_mix
-        bin_size = 2.0 / 255.0
-        
-        # Expand x to [B,K,3,H,W]
-        xk = x.unsqueeze(1).expand(-1, K, -1, -1, -1)
-        
-        # Coupled means per channel
-        mu_r = means[:, :, 0]
-        mu_g = means[:, :, 1] + coeffs[:, :, 0] * xk[:, :, 0]
-        mu_b = means[:, :, 2] + coeffs[:, :, 1] * xk[:, :, 0] + coeffs[:, :, 2] * xk[:, :, 1]
-        mu = torch.stack([mu_r, mu_g, mu_b], dim=2)  # [B,K,3,H,W]
-        inv_s = torch.exp(-log_scales)               # [B,K,3,H,W]
-        
-        # CDF at bin edges
-        x_lo = (xk - bin_size/2) * inv_s + (-mu)*inv_s
-        x_hi = (xk + bin_size/2) * inv_s + (-mu)*inv_s
-        cdf_lo = torch.sigmoid(x_lo)
-        cdf_hi = torch.sigmoid(x_hi)
-        
-        # For edge bins
-        log_cdf_hi = torch.log(cdf_hi.clamp_min(1e-12))
-        log_one_minus_cdf_lo = torch.log((1 - cdf_lo).clamp_min(1e-12))
-        
-        # Probability mass for discretized logistic
-        p = torch.where(
-            xk < -0.999,                               # near -1
-            torch.exp(log_cdf_hi),
-            torch.where(
-                xk > 0.999,                            # near +1
-                torch.exp(log_one_minus_cdf_lo),
-                (cdf_hi - cdf_lo).clamp_min(1e-12)
+        def _nll_core(x, logit_probs, means, log_scales, coeffs):
+            B, _, H, W = x.shape
+            K = self.n_mix
+            n_bits=8
+            bin_size = 1/(2**n_bits-1)
+            
+            # Expand x to [B,K,3,H,W]
+            xk = x.unsqueeze(1).expand(-1, K, -1, -1, -1)
+            
+            if self.out_ch == 3:
+                # Coupled means per channel
+                mu_r = means[:, :, 0]
+                mu_g = means[:, :, 1] + coeffs[:, :, 0] * xk[:, :, 0]
+                mu_b = means[:, :, 2] + coeffs[:, :, 1] * xk[:, :, 0] + coeffs[:, :, 2] * xk[:, :, 1]
+                mu = torch.stack([mu_r, mu_g, mu_b], dim=2)          # [B,K,3,H,W]
+            else:
+                mu = means                                            # [B,K,C,H,W]
+
+            inv_s = torch.exp(-log_scales)                            # [B,K,C,H,W]
+
+            # CDF at bin edges
+            x_lo = (xk - bin_size/2 - mu) * inv_s
+            x_hi = (xk + bin_size/2 - mu) * inv_s
+            cdf_lo = torch.sigmoid(x_lo)
+            cdf_hi = torch.sigmoid(x_hi)
+
+            # Edge bins
+            log_cdf_hi = (cdf_hi.clamp_min(1e-12)).log()
+            log_one_minus_cdf_lo = (1 - cdf_lo).clamp_min(1e-12).log()
+
+            # Discretized logistic mass
+            p = torch.where(
+                xk < -0.999,                       # near -1
+                torch.exp(log_cdf_hi),
+                torch.where(
+                    xk > 0.999,                    # near +1
+                    torch.exp(log_one_minus_cdf_lo),
+                    (cdf_hi - cdf_lo).clamp_min(1e-12)
+                )
             )
-        )
-        
-        # Sum over channels, then mix with logits
-        log_p = torch.log(p.clamp_min(1e-12)).sum(dim=2)           # [B,K,H,W]
-        log_mix = log_p + F.log_softmax(logit_probs, dim=1)        # [B,K,H,W]
-        log_px = torch.logsumexp(log_mix, dim=1)                   # [B,H,W]
-        
-        # Return mean NLL per image
-        nll = -log_px.mean(dim=(1,2))                              # [B]
-        return nll
+
+            # Mix across channels, then across components
+            log_p   = p.clamp_min(1e-12).log().sum(dim=2)            # [B,K,H,W]
+            log_mix = log_p + F.log_softmax(logit_probs, dim=1)      # [B,K,H,W]
+            log_px  = torch.logsumexp(log_mix, dim=1)                # [B,H,W]
+
+            # Mean NLL per image
+            return -log_px.mean(dim=(1,2))                           # [B]
+
+        if self.use_checkpoint and self.training:
+            # checkpoint recomputes _nll_core in backward; at least one arg must require grad
+            return torch.utils.checkpoint.checkpoint(
+                _nll_core, x, logit_probs, means, log_scales, 
+                torch.zeros(1, device=x.device) if coeffs is None else coeffs,
+                use_reentrant=False
+            )
+        else:
+            return _nll_core(x, logit_probs, means, log_scales, coeffs)
 
 class VAEDecoder(nn.Module):
     """NVAE-style decoder with nearest neighbor upsampling"""
@@ -612,6 +669,7 @@ class VAEDecoder(nn.Module):
                     )
                     # MDL head
         self.mdl_head = MDLHead(current_channels // 2, out_ch=reconstruction_channels, n_mix=10)
+        self.mdl_head.gradient_checkpointing_enable()
         self.use_checkpoint = False
         self.enable_unet: bool = False
         self._pending_skips = None               # dict[str, Tensor], set via set_unet_skips(...)
@@ -728,12 +786,90 @@ class VAEDecoder(nn.Module):
         self._pending_skips = None
         return result
     
-    def decode(self, z, deterministic=False):
+    def decode(self, z, deterministic=False, scale_temp: float = 1.0):
         """Decode latents to images for inference/visualization"""
         logit_probs, means, log_scales, coeffs = self.forward(z)
         if deterministic:
             # Use the mean of the most likely mixture component
             return means.gather(1, logit_probs.argmax(1, keepdim=True).unsqueeze(2).expand(-1, -1, 3, -1, -1)).squeeze(1)
         else:
-            return self.mdl_head.sample(logit_probs, means, log_scales, coeffs)
+            return self.mdl_head.sample(logit_probs, means, log_scales, coeffs, scale_temp=scale_temp, mode="sample")
 
+#  DINOv3 #
+
+
+
+class GramLoss(nn.Module):
+    """Implementation of the gram loss"""
+
+    def __init__(
+        self,
+        apply_norm=True,
+        img_level=True,
+        remove_neg=True,
+        remove_only_teacher_neg=False,
+    ):
+        super().__init__()
+
+        # Loss
+        self.mse_loss = torch.nn.MSELoss()
+
+        # Parameters
+        self.apply_norm = apply_norm
+        self.remove_neg = remove_neg
+        self.remove_only_teacher_neg = remove_only_teacher_neg
+
+        if self.remove_neg or self.remove_only_teacher_neg:
+            assert self.remove_neg != self.remove_only_teacher_neg
+
+    def forward(self, output_feats, target_feats, img_level=True):
+        """Compute the MSE loss between the gram matrix of the input and target features.
+
+        Args:
+            output_feats: Pytorch tensor (B, N, dim) or (B*N, dim) if img_level == False
+            target_feats: Pytorch tensor (B, N, dim) or (B*N, dim) if img_level == False
+            img_level: bool, if true gram computed at the image level only else over the entire batch
+        Returns:
+            loss: scalar
+        """
+
+        # Dimensions of the tensor should be (B, N, dim)
+        if img_level:
+            assert len(target_feats.shape) == 3 and len(output_feats.shape) == 3
+
+        # Float casting
+        output_feats = output_feats.float()
+        target_feats = target_feats.float()
+
+        # SSL correlation
+        if self.apply_norm:
+            target_feats = F.normalize(target_feats, dim=-1)
+
+        if not img_level and len(target_feats.shape) == 3:
+            # Flatten (B, N, D) into  (B*N, D)
+            target_feats = target_feats.flatten(0, 1)
+
+        # Compute similarities
+        target_sim = torch.matmul(target_feats, target_feats.transpose(-1, -2))
+
+        # Patch correlation
+        if self.apply_norm:
+            output_feats = F.normalize(output_feats, dim=-1)
+
+        if not img_level and len(output_feats.shape) == 3:
+            # Flatten (B, N, D) into  (B*N, D)
+            output_feats = output_feats.flatten(0, 1)
+
+        # Compute similarities
+        student_sim = torch.matmul(output_feats, output_feats.transpose(-1, -2))
+
+        if self.remove_neg:
+            target_sim[target_sim < 0] = 0.0
+            student_sim[student_sim < 0] = 0.0
+
+        elif self.remove_only_teacher_neg:
+            # Remove only the negative sim values of the teacher
+            target_sim[target_sim < 0] = 0.0
+            student_sim[(student_sim < 0) & (target_sim < 0)] = 0.0
+
+        return self.mse_loss(student_sim, target_sim)

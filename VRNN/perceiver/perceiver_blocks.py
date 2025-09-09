@@ -1,4 +1,4 @@
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple, Any
 import torch.nn.functional as func
 from VRNN.perceiver.perceiver_helpers import *
 
@@ -343,6 +343,109 @@ class PerceiverBlock(nn.Module):
 
         return z
 
+class UNetAdapter(nn.Module):
+    """
+     UNet that preserves token shape [B, I, C].
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        base_ch: int = 32,
+        num_down: int = 2,
+        norm: str = "group",          # "group" | "batch"
+        gn_target_groups: int = 8,    # target #groups for GroupNorm; auto-adjusted to divide channels
+        bn_momentum: float = 0.1,
+    ):
+        super().__init__()
+        self.in_ch = in_ch
+        self.num_down = max(0, int(num_down))
+        self.norm = norm
+        self.gn_target_groups = gn_target_groups
+        self.bn_momentum = bn_momentum
+
+        def best_num_groups(C: int, target: int) -> int:
+            # choose a divisor of C, falling back to 1 if needed
+            for g in (target, 16, 8, 4, 2, 1):
+                if C % g == 0:
+                    return g
+            return 1
+
+        def norm2d(C: int) -> nn.Module:
+            if self.norm == "group":
+                return nn.GroupNorm(best_num_groups(C, self.gn_target_groups), C)
+            else:
+                return nn.BatchNorm2d(C, momentum=self.bn_momentum)
+
+        def dw_sep(cin, cout):
+            return nn.Sequential(
+                nn.Conv2d(cin, cin, 3, padding=1, groups=cin, bias=False),
+                norm2d(cin),
+                nn.GELU(),
+                nn.Conv2d(cin, cout, 1, bias=False),
+                norm2d(cout),
+                nn.GELU(),
+            )
+
+        ch1 = min(max(base_ch, 16), 128)
+        ch2 = min(ch1 * 2, 256)
+
+        self.enc1 = dw_sep(in_ch, ch1)
+        self.down1 = nn.Conv2d(ch1, ch1, 3, stride=2, padding=1)
+
+        if self.num_down >= 2:
+            self.enc2 = dw_sep(ch1, ch2)
+            self.down2 = nn.Conv2d(ch2, ch2, 3, stride=2, padding=1)
+            self.mid  = dw_sep(ch2, ch2)
+            self.up2  = nn.Upsample(scale_factor=2, mode='nearest')
+            self.dec2 = dw_sep(ch2 + ch2, ch1)
+        else:
+            self.mid = dw_sep(ch1, ch1)
+
+        self.up1  = nn.Upsample(scale_factor=2, mode='nearest')
+        self.dec1 = dw_sep(in_ch + ch1, in_ch)  # back to input channels
+
+    @torch.no_grad()
+    def _infer_hw(self, I: int) -> tuple[int, int] | None:
+        # Try square; otherwise fail gracefully
+        s = int(round(I ** 0.5))
+        if s * s == I:
+            return (s, s)
+        return None
+
+    def forward(self, x_tokens: torch.Tensor, hw: tuple[int, int] | None) -> torch.Tensor:
+        # x_tokens: [B, I, C]
+        if self.num_down == 0:
+            return x_tokens  # early out if disabled
+
+        B, I, C = x_tokens.shape
+        if hw is None:
+            hw = self._infer_hw(I)
+            if hw is None:
+                # Cannot interpret as 2D: safely no-op
+                return x_tokens
+        H, W = hw
+        if H * W != I:
+            # Mismatch: safely no-op
+            return x_tokens
+
+        x = x_tokens.transpose(1, 2).reshape(B, C, H, W)  # [B,C,H,W]
+
+        e1 = self.enc1(x)          # [B,ch1,H,W]
+        d1 = self.down1(e1)        # [B,ch1,H/2,W/2]
+
+        if self.num_down >= 2:
+            e2 = self.enc2(d1)     # [B,ch2,H/2,W/2]
+            d2 = self.down2(e2)    # [B,ch2,H/4,W/4]
+            mid = self.mid(d2)     # [B,ch2,H/4,W/4]
+            u2  = self.up2(mid)    # [B,ch2,H/2,W/2]
+            x2  = self.dec2(torch.cat([u2, e2], dim=1))  # [B,ch1,H/2,W/2]
+        else:
+            x2 = self.mid(d1)      # [B,ch1,H/2,W/2]
+
+        u1  = self.up1(x2)         # [B,ch1,H,W]
+        out = self.dec1(torch.cat([u1, x], dim=1))  # [B,in_ch,H,W]
+
+        return out.reshape(B, C, H * W).transpose(1, 2)  # [B,I,C]
 
 class Embedder(nn.Module):
     """
@@ -359,7 +462,8 @@ class Embedder(nn.Module):
     def __init__(self,
                  modalities: Mapping[str, torch.Tensor],
                  num_embedding_channels: int,
-                 with_bias: bool = True):
+                 with_bias: bool = True,
+                 unet_adapter_cfg: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.num_embedding_channels = num_embedding_channels
         self.modalities = modalities
@@ -378,8 +482,90 @@ class Embedder(nn.Module):
                                 bias=with_bias)
             for modality, data in modalities.items()
         })
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        self.to(device)
+        self.unet_adapters = nn.ModuleDict()
+        self.dec_unet_adapters = nn.ModuleDict()
+        self._unet_hw: Dict[str, tuple[int, int]] = {} #per modality H,W
+        self.enable_decode_unet = bool(unet_adapter_cfg and unet_adapter_cfg.get('enable_decode_unet', False))
+
+        if unet_adapter_cfg:
+            # cfg knobs (all optional)
+            target_modalities = set(unet_adapter_cfg.get('modalities', ['image', 'rgb', 'pixels']))
+            base_ch = int(unet_adapter_cfg.get('base_channels', 32))
+            num_down = unet_adapter_cfg.get('num_down', None)  # int | None
+            auto_depth = bool(unet_adapter_cfg.get('auto_depth', True))
+            image_hw = unet_adapter_cfg.get('image_hw', None)  # (H, W) | None
+            norm = unet_adapter_cfg.get('norm', 'group')       # 'group' | 'batch'
+            gn_groups = int(unet_adapter_cfg.get('gn_groups', 8))
+            bn_momentum = float(unet_adapter_cfg.get('bn_momentum', 0.1))
+
+            def choose_depth(H: int, W: int) -> int:
+                if not auto_depth:
+                    return int(num_down) if num_down is not None else 2
+                m = min(H, W)
+                # simple heuristic: deeper for larger inputs
+                if m >= 128: return 2
+                if m >= 64:  return 2
+                return 1
+            #Add gating UNet adapters for selected modalities
+            self.unet_gates = nn.ParameterDict()
+            self.max_gate = float(unet_adapter_cfg.get('max_gate', 0.1))  # cap influence early
+
+            for name, data in modalities.items():
+                if name not in target_modalities:
+                    continue
+
+                C = int(data.shape[CHANNELS_DIM])
+                I = int(data.shape[INDEX_DIM])
+
+                if image_hw is not None:
+                    H, W = int(image_hw[0]), int(image_hw[1])
+                else:
+                    s = int(round(float(I) ** 0.5))
+                    if s * s != I:
+                        # cannot infer spatial grid -> skip UNet for this modality
+                        continue
+                    H, W = s, s
+
+                self._unet_hw[name] = (H, W)
+                depth = choose_depth(H, W)
+
+                self.unet_adapters[name] = UNetAdapter(
+                    in_ch=C, base_ch=base_ch, num_down=depth,
+                    norm=norm, gn_target_groups=gn_groups, bn_momentum=bn_momentum
+                )
+                gate_init = float(unet_adapter_cfg.get('gate_init', -3.0))
+                self.unet_gates[name] = nn.Parameter(torch.tensor(gate_init, dtype=torch.float32))
+                if self.enable_decode_unet:
+                    # symmetric tiny UNet on decode path (off by default)
+                    self.dec_unet_adapters[name] = UNetAdapter(
+                        in_ch=C, base_ch=base_ch, num_down=depth,
+                        norm=norm, gn_target_groups=gn_groups, bn_momentum=bn_momentum
+                    )
+                    
+    def _to_tokens(self, x: torch.Tensor, modality: str) -> Tuple[torch.Tensor, Optional[Tuple[int, int]]]:
+        """
+        Accept [B, I, C] or [B, C, H, W]. Return tokens [B, I, C] and (H,W) if known.
+        """
+        if x.dim() == 3:
+            # [B, I, C]
+            I = x.shape[INDEX_DIM]
+            # Use cached or inferred HW if available
+            hw = self._unet_hw.get(modality, None)
+            if hw is None:
+                s = int(round(float(I) ** 0.5))
+                if s * s == I:
+                    hw = (s, s)
+            return x, hw
+
+        if x.dim() == 4:
+            # [B, C, H, W] -> tokens [B, H*W, C]
+            B, C, H, W = x.shape
+            self._unet_hw[modality] = (H, W)  # cache
+            x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
+            return x, (H, W)
+
+        raise ValueError(f"Embedder only supports [B,I,C] or [B,C,H,W], got {x.shape}")
+
 
     def forward(self, inputs: Mapping[str, torch.Tensor], un_embed: bool = False) -> Dict[str, torch.Tensor]:
         """
@@ -406,14 +592,36 @@ class Embedder(nn.Module):
             assert_input_shapes(inputs, expected_rank=3, constant_channels=True)
         else:
             assert_input_shapes(inputs, expected_rank=3)
-        out = {}
+        out :Dict[str, torch.Tensor] = {}
         layers = self.un_embed_layers if un_embed else self.embed_layers
 
-        for modality_name, value in inputs.items():
-            layer = layers[modality_name]
-            out[modality_name] = layer(value)
+        for name, x in inputs.items():
+            # Convert BCHW to tokens if needed; remember HW if we can
+            x_tokens, hw = self._to_tokens(x, name)
+
+            # ENCODE-SIDE UNet (on tokens BEFORE linear to E)
+            if not un_embed and name in self.unet_adapters:
+                # UNetAdapter expects tokens [B, I, C] and an (H,W). If hw is None and the
+                # adapter can't infer a square from I, it will safely no-op internally.
+                adapter_out = self.unet_adapters[name](x_tokens, hw)
+                gate_val = torch.sigmoid(self.unet_gates[name])*self.max_gate
+                x_tokens = x_tokens + gate_val * adapter_out
+                
+
+            # Linear projection (either C->E on encode, or E->C on decode)
+            x_tokens = layers[name](x_tokens)
+
+            # DECODE-SIDE UNet (optional; on tokens AFTER un-embed back to C)
+            if un_embed and name in self.dec_unet_adapters:
+                adapter_out = self.dec_unet_adapters[name](x_tokens, hw)
+                gate_val = torch.sigmoid(self.unet_gates[name])*self.max_gate
+                x_tokens = x_tokens + gate_val * adapter_out
+                
+
+            out[name] = x_tokens
 
         return out
+
 
 
 class PositionEncoder(nn.Module):

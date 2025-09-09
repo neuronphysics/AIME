@@ -15,6 +15,17 @@ VARIANTS = {
         'self_attend_widening_factor': (4, 4, 4),
         'num_embedding_channels': 32,
     },
+    '16x3_lite': {
+    'num_groups': (16, 1, 16),
+    'num_self_attends_per_block': (1, 6, 1),
+    'z_index_dim': (128, 512, 128),
+    'num_z_channels': (128, 384, 128),       # narrower than your current 1024 processor
+    'num_cross_attend_heads': (1, 1, 1),
+    'num_self_attend_heads': (4, 16, 4),
+    'cross_attend_widening_factor': (1, 1, 1),
+    'self_attend_widening_factor': (4, 4, 4),
+    'num_embedding_channels': 64,            # <— key upgrade from 32
+    },
     '16': {
         'num_groups': (16, 4, 1, 1, 1, 4, 16),
         'num_self_attends_per_block': (2, 2, 18, 2, 1, 1, 1),
@@ -111,7 +122,8 @@ class HiPClassBottleneck(nn.Module):
                  processor_index_dim_eval: Optional[int] = None,
                  dropout_prob: float = 0.0,
                  drop_path_rate: float = 0.0,
-                 task_type="classification"):
+                 task_type="classification",
+                 unet_adapter_cfg: Optional[Dict[str, Any]] = None):
         super(HiPClassBottleneck, self).__init__()
         self.num_blocks = len(num_groups)
         assert self.num_blocks >= 3, 'At least 3 blocks are needed for U-Net residuals.'
@@ -126,16 +138,19 @@ class HiPClassBottleneck(nn.Module):
         self.grouper = ConstNumGrouper(num_groups=num_groups[0])
         self.embedder = Embedder(
             num_embedding_channels=num_embedding_channels,
-            modalities=input_data
+            modalities=input_data,
+            unet_adapter_cfg=unet_adapter_cfg,
         )
         self.position_encoder = PositionEncoder(
             modalities=input_data,
             num_position_encoding_channels=num_position_encoding_channels,
             embed_out_channel=num_embedding_channels
         )
-        self.reconstruction_head = ReconstructionHead(num_groups=num_groups[-1], input_num_channel=num_z_channels[-1],
+        self.reconstruction_head = ReconstructionHead(num_groups=num_groups[-1], 
+                                                      input_num_channel=num_z_channels[-1],
                                                       output_num_channels=num_embedding_channels,
-                                                      output_index_dim_eval=1, drop_probs=dropout_prob)
+                                                      output_index_dim_eval=int(input_data['image'].shape[1]),  # one query per pixel
+                                                      drop_probs=dropout_prob)
 
         # Initialize Perceiver blocks for each level in the HiP hierarchy
         self.blocks = nn.ModuleList()

@@ -15,19 +15,35 @@ DEFAULT_MODEL_KWARGS = config_dict.ConfigDict({
         'num_position_encoding_channels': 512,
         'regroup_type': 'reshape',
         'activation_name': 'sq_relu',
-        'dropout_prob': 0.3,
+        'dropout_prob': 0.1,
         'drop_path_rate': 0.0,
         'label_modalities': {}
     },
 })
 
 
-def generate_model(model_base_name, model_variant_name, mock_data):
+def generate_model(model_base_name, model_variant_name, mock_data, extra_kwargs=None):
+    base_kwargs = dict(DEFAULT_MODEL_KWARGS[model_base_name])  
+    if extra_kwargs:
+        base_kwargs.update(extra_kwargs)  # allow overriding/adding top-level keys
+
+    base_kwargs.setdefault("unet_adapter_cfg", {
+        "modalities": ["image"],
+        "base_channels": 32,
+        "auto_depth": True,
+        # "num_down": 2,             # (optional) force a depth
+        # "image_hw": (H, W),        # (optional) if tokens are not square
+        "norm": "group",
+        "gn_groups": 8,
+        "enable_decode_unet": True
+    })
+
     return perceiver.build_perceiver(
         input_data=mock_data,
         model_base_name=model_base_name,
         model_variant_name=model_variant_name,
-        model_kwargs=DEFAULT_MODEL_KWARGS[model_base_name])
+        model_kwargs=base_kwargs
+    )
 
 
 def imshow(img):

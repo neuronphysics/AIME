@@ -27,12 +27,12 @@ def conv_1d(input_channels: int, output_channels: int, init_scale: float = 1.0, 
     """A 1D convolution (fully connected layer) in PyTorch."""
     layer = nn.Linear(in_features=input_channels, out_features=output_channels, bias=with_bias)
     # Initialize weights and biases
-    # init.normal_(layer.weight, mean=0.0, std=init_scale)
-    init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='relu')
-    if init_scale != 1.0:
-        layer.weight.data *= init_scale
+    fan_in, fan_out = input_channels, output_channels
+    fan_avg = 0.5 * (fan_in + fan_out)
+    std = (init_scale / math.sqrt(fan_avg))
+    nn.init.normal_(layer.weight, mean=0.0, std=std)
     if with_bias:
-        init.zeros_(layer.bias)
+        nn.init.zeros_(layer.bias)
     return layer
 
 

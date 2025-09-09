@@ -16,7 +16,7 @@ from models import (
     LinearResidual, AttentionPosterior, AttentionPrior,
     AddEpsilon, check_tensor, SelfModelBlock, PerpetualOrthogonalProjectionLoss
 )
-from nvae_architecture import VAEEncoder, VAEDecoder
+from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
 from VRNN.mtl_optimizers import RiemannianMGDA
 import math
 from collections import OrderedDict
@@ -786,7 +786,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         weight_decay: float = 0.00001,
         use_orthogonal: bool = True,  # Use orthogonal initialization for LSTM,
         number_lstm_layer: int = 2,  # Number of LSTM layers
-        HiP_type: str = 'Mini',  # Type of perceiver model
+        HiP_type: str = '16x3_lite',  # Type of perceiver model
         self_model_weight: float = 0.5,
         use_global_context: bool = True,
         context_window_size: int = 10,
@@ -857,7 +857,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
         with torch.no_grad(), _temporarily_disable_ckpt(self.encoder, self.decoder):
             z, _, _ = self.encoder(x_dummy)
-            skips = self.encoder.get_unet_skips(x_dummy, levels=("C2","C3","C4","C5"), detach=True)  # just shapes/features
+            skips = self.encoder.get_unet_skips(x_dummy, levels=("C2","C3","C4","C5","C6"), detach=True)  # just shapes/features
             self.decoder.set_unet_skips(skips, mode="concat")
             _ = self.decoder(z)  # <-- creates & caches the 1×1 adapters
             # leave decoder clean for real training calls
@@ -894,6 +894,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                   dropout= 0.2,
                                   use_se=False,
                                   ).to(self.device)
+        
+        self.gram_loss = GramLoss(
+            apply_norm=True,
+            img_level=True,             # compute per-image Grams like your code
+            remove_neg=True,           # set True to match DINOv3’s “positives-only” option
+            remove_only_teacher_neg=False,
+        )
         # Warm-build UNet adapters before creating optimizer
         self._warm_build_unet_adapters(batch_size=1)
         if getattr(self, "attention_prior_posterior", None) is not None:
@@ -917,38 +924,56 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 )
         self.encoder.gradient_checkpointing_enable()
         self.decoder.gradient_checkpointing_enable()
-        #self.ema_encoder = EMA(self.encoder, decay=0.995, use_num_updates=True)
-        #self.ema_decoder = EMA(self.decoder, decay=0.995, use_num_updates=True)
+        self.ema_encoder = EMA(self.encoder, decay=0.995, use_num_updates=True)
+        self.ema_decoder = EMA(self.decoder, decay=0.995, use_num_updates=True)
 
         self.apply(self.init_weights)
 
-    def _init_perceiver_context(self ):
+    def _init_perceiver_context(self):
         """Initialize Hierarchical Perceiver with architecture-aware dimensions"""
-    
-        # Initialize perceiver
-        mock_input = self.generate_mock_input()
 
-        self.perceiver_model = generate_model('HiPClassBottleneck', self.HiP_type, mock_input)
+        # 1) Build mock input ON THE SAME DEVICE as the model
+        mock_input = self.generate_mock_input() 
+
+        # 2) Configure the tiny UNet adapter (valid dict syntax)
+        extra_kwargs = {
+            "unet_adapter_cfg": {
+                "modalities": ["image"],   # must match your Perceiver input key
+                "base_channels": 32,
+                "auto_depth": True,
+                # "image_hw": (H, W),      # only if I!=H*W or not square
+                "norm": "group",
+                "gn_groups": 8,
+                "enable_decode_unet": True,
+            }
+        }
+
+        # 3) Create the Perceiver with your Utils.generate_model
+        self.perceiver_model = generate_model(
+            'HiPClassBottleneck', self.HiP_type, mock_input, extra_kwargs=extra_kwargs
+        )
         self.perceiver_model.to(self.device)
-        self.out_keys = perceiver_helpers.ModelOutputKeys
-        # Extract key dimensions from the processor block (middle block)
-        with torch.no_grad():
-            # Run a forward pass to get actual dimensions
-            test_output = self.perceiver_model(mock_input, is_training=False)
-            test_latents = test_output[self.out_keys.LATENTS]['image']
-            
-            # Get actual channel dimension
-            perceiver_latent_dim = test_latents.shape[-1]  # [batch, index, channels]
-            perceiver_index_dim = test_latents.shape[-2]   # Number of latent vectors
-        print(f"Detected Perceiver context output dimension: {perceiver_latent_dim}, {perceiver_index_dim} latent vectors")
-   
 
-    
-        # Architecture-aware projection
-        self.perceiver_projection = PerceiverContextEmbedding(perceiver_latent_dim, 
-                                                              self.context_dim,
-                                                              dropout=0.0, 
-                                                              device= self.device)
+        # 4) Probe latents to get actual dims (eval mode, no grad)
+        self.out_keys = perceiver_helpers.ModelOutputKeys  # enum with LATENTS/INPUT_RECONSTRUCTION :contentReference[oaicite:1]{index=1}
+        was_training = self.perceiver_model.training
+        self.perceiver_model.eval()
+        with torch.no_grad():
+            test_output = self.perceiver_model(mock_input, is_training=False)  # forward returns dict with LATENTS & recon :contentReference[oaicite:2]{index=2}
+            latents_dict = test_output[self.out_keys.LATENTS]
+            mod_key = 'image' if 'image' in latents_dict else next(iter(latents_dict))
+            test_latents = latents_dict[mod_key]
+            perceiver_latent_dim = test_latents.shape[-1]
+            perceiver_index_dim = test_latents.shape[-2]
+        self.perceiver_model.train(was_training)
+
+        print(f"Detected Perceiver context output dimension: {perceiver_latent_dim}, "
+            f"{perceiver_index_dim} latent vectors")
+
+        # 5) Projection on top of Perceiver latents
+        self.perceiver_projection = PerceiverContextEmbedding(
+            perceiver_latent_dim, self.context_dim, dropout=0.0, device=self.device
+        )
                 
 
     def _init_discriminators(self, img_disc_layers:int, patch_size: int):
@@ -1318,6 +1343,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'self_att_prediction_loss': [], 
             'predicted_movements': [],
             'attention_diversity_losses': [],  # Collect per timestep
+            'gram_enc': [],
         }
         
         # Process sequence step by step
@@ -1336,12 +1362,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             
             # === Inference Network q(z_t|o_≤t, z_<t) ===
             z_t, z_mean_t, z_logvar_t = self.encoder(o_t)
-            skips = self.encoder.get_unet_skips(o_t, levels=("C2","C3","C4","C5"))        # or encoder.get_unet_skips(x, levels=("C3","C4","C5"))
+            skips = self.encoder.get_unet_skips(o_t, levels=("C2","C3","C4","C5","C6"))        # or encoder.get_unet_skips(x, levels=("C3","C4","C5"))
             self.decoder.set_unet_skips(skips, mode="concat")
 
             q_params = {'mean': z_mean_t, 'logvar': z_logvar_t}
             outputs['posterior_params'].append(q_params)
-            
+            # store gram matrix for encoder decoder features
+            outputs['gram_enc'].append( self.encoder_gram_loss_student_teacher(o_t, levels=("C2","C3","C4","C5","C6")) )
+
             # Store latent statistics
             outputs['latents'].append(z_t)
             outputs['z_means'].append(z_mean_t)
@@ -1403,7 +1431,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     'log_scales': log_scales,
                     'coeffs': coeffs
                 })
-            reconstruction_t = self.decoder.mdl_head.sample(logit_probs, means, log_scales, coeffs)
+            reconstruction_t = self.decoder.mdl_head.sample(logit_probs, means, log_scales, coeffs, scale_temp=0.3)
             outputs['reconstructions'].append(reconstruction_t)
                 
             # Compute NLL loss instead of MSE
@@ -1521,8 +1549,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             outputs['future_att_bonus'] = torch.tensor(0.0).to(self.device)
         
         # Perceiver loss
-        obs_flat = observations.reshape(-1, self.image_size * self.image_size, self.input_channels)
-        outputs['perceiver_loss'] = nn.MSELoss()(perceiver_recon, obs_flat)
+        B, T, C, H, W = observations.shape
+        obs_flat = observations.permute(0, 1, 3, 4, 2).contiguous().reshape(B*T, H*W, C)  # [(B*T), (H*W), C]
+        mse_all = F.mse_loss(perceiver_recon, obs_flat, reduction="none")  # [(B*T), (H*W), C]
+        per_frame = mse_all.mean(dim=(1, 2))                                                 # [(B*T)]
+        per_episode = per_frame.view(B, T).mean(dim=1)                                       # [B]  (episode-wise MSE)
+    
+        outputs['perceiver_loss'] = per_episode.mean() # scalar for optimization
         
         # Add auxiliary outputs
         outputs['context_sequence'] = context_sequence
@@ -1533,11 +1566,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
     
     def generate_mock_input(self):
+        # Change to match [-1, 1] range used in actual training
         return {
-            'image':
-                torch.from_numpy(
-                    np.random.random((1, self.image_size*self.image_size, self.input_channels)).astype(np.float32)).to(
-                    self.device),
+            'image': torch.from_numpy(
+                # Change to match [-1, 1] range used in actual training
+                (np.random.random((1, self.image_size*self.image_size, self.input_channels)) * 2 - 1)
+                .astype(np.float32)
+            ).to(self.device),
         }
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
         """
@@ -1556,14 +1591,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # Get prior distribution and parameters
         prior_dist, prior_params = self.prior(h)
-        skips = self.encoder.get_unet_skips(x, levels=("C2","C3","C4","C5"))        # or encoder.get_unet_skips(x, levels=("C3","C4","C5"))
+        skips = self.encoder.get_unet_skips(x, levels=("C2","C3","C4","C5","C6"))        # or encoder.get_unet_skips(x, levels=("C3","C4","C5"))
         self.decoder.set_unet_skips(skips, mode="concat")
         # Decode
          
         logit_probs, means, log_scales, coeffs = self.decoder(z)
     
         # Sample reconstruction for visualization
-        reconstruction = self.decoder.mdl_head.sample(logit_probs, means, log_scales, coeffs)
+        reconstruction = self.decoder.mdl_head.sample(logit_probs, means, log_scales, coeffs, scale_temp=0.3)
 
 
         return reconstruction, {
@@ -1574,9 +1609,15 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             **prior_params
         }
     
-    def compute_total_loss(self, observations, actions=None, beta=1.0, 
-                        entropy_weight=0.1, lambda_recon=1.0, 
-                        lambda_att_dyn=0.1, lambda_att=0.1):
+    def compute_total_loss(self, 
+                           observations, 
+                           actions=None, 
+                           beta=1.0, 
+                           entropy_weight=0.1, 
+                           lambda_recon=1.0, 
+                           lambda_att_dyn=0.1, 
+                           lambda_att=0.1, 
+                           lambda_gram=0.05):
         """
         Corrected loss computation recognizing that kumar_beta_kl already includes alpha prior KL
         """
@@ -1584,9 +1625,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         losses = {}
         
         # === Reconstruction Term (Positive in Loss) ===
-        # This is -E_q[log p(x|z)] under Gaussian assumption
+        # This is already negative value -E_q[log p(x|z)] under Gaussian assumption
         losses['recon_loss'] = torch.stack(outputs['reconstruction_losses']).mean()  if outputs['reconstruction_losses'] else torch.tensor(0.0).to(self.device)
-        
+        losses['gram_enc_loss'] = torch.stack(outputs['gram_enc']).mean() if outputs['gram_enc'] else torch.tensor(0.0).to(self.device)
         # === KL Divergence Terms ===
         
         # 1. Latent KL: KL[q(z|x) || p(z|h,c)]
@@ -1626,13 +1667,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             lambda_recon * losses['recon_loss'] +
             # KL terms 
             beta * losses['kl_z'] +
-            beta * losses['hierarchical_kl'] +  # This includes both Kumar-Beta AND Alpha-Gamma KL!
-            beta * losses['attention_kl'] -
+            beta * losses['hierarchical_kl'] -  # This includes both Kumar-Beta AND Alpha-Gamma KL!
             # Entropy 
-            entropy_weight * losses['cluster_entropy']
+            entropy_weight * losses['cluster_entropy']+
+            lambda_gram * losses['gram_enc_loss'] 
         )
-        #Maximizing ELBO: -recon - KL + entropy 
-        
+        losses['attention_loss'] =  lambda_att * outputs['future_att_bonus'] + beta * losses['attention_kl'] + lambda_att_dyn * outputs['attention_dynamics_loss']
         return losses, outputs
 
     def update_temperature(self, epoch: int, anneal_rate: float = 0.003):
@@ -1694,6 +1734,30 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         }
 
         return mean_entropy + mixing_entropy, cluster_stats
+
+
+    def encoder_gram_loss_student_teacher(self, x, levels=('C3','C4'), pool=2):
+        # Student encoder features
+        enc_s = self.encoder.get_unet_skips(x, levels=levels, detach=False)  # dict { 'HxW': Tensor[B,C,H,W] }
+
+        # Teacher (EMA) encoder features
+        self.ema_encoder.apply_shadow()
+        with torch.no_grad():
+            enc_t = self.encoder.get_unet_skips(x, levels=levels, detach=True)
+        self.ema_encoder.restore()
+
+        loss = 0.0
+        for k in enc_s.keys():
+            Fs, Ft = enc_s[k], enc_t[k]              # [B,C,H,W]
+            if pool and (Fs.shape[-1] % pool == 0):  # optional downsample like your code
+                Fs = torch.nn.functional.avg_pool2d(Fs, pool)
+                Ft = torch.nn.functional.avg_pool2d(Ft, pool)
+            # reshape to (B, N, D) = (B, HW, C)
+            s = Fs.flatten(2).transpose(1, 2).contiguous()
+            t = Ft.flatten(2).transpose(1, 2).contiguous()
+            # call the DINOv3 loss (it normalizes internally when apply_norm=True)
+            loss +=  self.gram_loss(s, t, img_level=True)
+        return loss
 
     def compute_gradient_penalty(self, discriminator, real_x, fake_x, z, device):
         """
@@ -1838,8 +1902,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         batch_size, seq_len, channels, H, W = observations.shape
         
         # Flatten observations for perceiver
-        obs_flat = observations.reshape(batch_size * seq_len, H*W, self.input_channels)
-        
+        obs_flat = observations.permute(0, 1, 3, 4, 2).reshape(batch_size * seq_len, H * W, channels)
+
         # Process through perceiver
         perceiver_output = self.perceiver_model({'image': obs_flat}, is_training=True)
         latents = perceiver_output[self.out_keys.LATENTS]['image']
@@ -1876,8 +1940,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         window_end = min(seq_len, t + self.context_window_size // 2 + 1)
         
         # Extract local observations
-        local_obs_flat = observations[:, window_start:window_end].reshape(batch_size * (window_end - window_start), -1, 1)
-
+        local_obs = observations[:, window_start:window_end]  # [batch_size, window_size, C, H, W]
+        B, Wlen, C, H, W = local_obs.shape
+        local_obs_flat = local_obs.permute(0, 1, 3, 4, 2).reshape(B * Wlen, H * W, C)  # [batch_size*window_size, H*W, C]
         # Process through perceiver
         perceiver_output = self.perceiver_model({'image': local_obs_flat}, is_training=True)
         latents = perceiver_output[self.out_keys.LATENTS]['image']
@@ -1999,22 +2064,33 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     
     def prepare_images_for_training(self, images):
         """
-        Normalize images to [-1, 1] range for tanh decoder output
-        
-        Args:
-            images: Input images in [0, 255] or [0, 1] range
-        
-        Returns:
-            Normalized images in [-1, 1] range
+        Ensure images are in [-1, 1] range for model processing.
+        This is defensive - dataset should already provide [-1, 1] images.
         """
-        # If images are in [0, 255] range (uint8)
-        if images.dtype == torch.uint8 or images.max() > 1.0:
-            images = images.float() / 255.0
-        
-        # Convert from [0, 1] to [-1, 1]
-        images = 2 * images - 1
-        
-        return images
+        with torch.no_grad():
+            # Quick check if already normalized
+            img_min, img_max = images.min().item(), images.max().item()
+            
+            # If already in [-1, 1] range (with small tolerance), return as-is
+            if img_min >= -1.1 and img_max <= 1.1:
+                return images
+            
+            # If uint8, convert to float [0, 1] first
+            if images.dtype == torch.uint8:
+                images = images.float() / 255.0
+            # If in [0, 255] range
+            elif img_max > 1.5:
+                images = images / 255.0
+            
+            # Now images should be in [0, 1], convert to [-1, 1]
+            # Check again to be sure
+            img_min, img_max = images.min().item(), images.max().item()
+            if img_min >= -0.01 and img_max <= 1.01:
+                return images * 2.0 - 1.0
+            
+            # Something unexpected - clamp and warn
+            print(f"Warning: Unexpected image range [{img_min:.3f}, {img_max:.3f}], clamping to [-1, 1]")
+            return images.clamp(min=-1.0, max=1.0)
 
     def denormalize_generated_images(self, images):
         """
@@ -2172,7 +2248,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                             lambda_recon: float = 1.0,
                             lambda_att_dyn: float = 0.1,
                             lambda_att: float = 0.1,
-                            entropy_weight: float = 0.1) -> Dict[str, torch.Tensor]:
+                            entropy_weight: float = 0.1,
+                            lambda_gram: float = 0.05) -> Dict[str, torch.Tensor]:
         """
         Complete training step with MGDA for multi-task optimization.
         MGDA handles zero_grad internally, so we don't call it explicitly.
@@ -2195,7 +2272,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # 1. Forward pass and compute all VAE losses
         vae_losses, outputs = self.compute_total_loss(
             observations, actions, beta, entropy_weight, 
-            lambda_recon, lambda_att_dyn, lambda_att)
+            lambda_recon, lambda_att_dyn, lambda_att, lambda_gram)
         
         # 2. Discriminator training
         
@@ -2230,14 +2307,15 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         lambda_recon * vae_losses['recon_loss'] +
         beta * vae_losses['kl_z'] +
         beta * vae_losses['hierarchical_kl'] -
-        entropy_weight * vae_losses['cluster_entropy'] 
+        entropy_weight * vae_losses['cluster_entropy'] +
+        lambda_gram * vae_losses['gram_enc_loss']
         )
         
         # Adversarial objective
         adversarial_loss = lambda_img * (img_adv_loss + feat_match_loss)
     
         # Predictive objective (self-modeling)
-        predictive_loss = lambda_att * outputs['future_att_bonus'] + beta * vae_losses['attention_kl'] + lambda_att_dyn * outputs['attention_dynamics_loss']
+        predictive_loss = -lambda_att * outputs['future_att_bonus'] + beta * vae_losses['attention_kl'] + lambda_att_dyn * outputs['attention_dynamics_loss']
         #orthogonalization loss on slots
         orth_loss = vae_losses['attention_diversity'] + vae_losses['slot_ortho']
         task_losses = [elbo_loss, vae_losses['perceiver_loss'], adversarial_loss, predictive_loss, orth_loss]
@@ -2262,8 +2340,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
         self.gen_optimizer.step()
         # Update EMA
-        # self.ema_encoder.update()
-        # self.ema_decoder.update()
+        self.ema_encoder.update()
+        self.ema_decoder.update()
         # 6. Optimize generator
         self.update_temperature(self.current_epoch)
             
@@ -2319,8 +2397,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         Returns:
             Generated samples
         """
-        #self.ema_encoder.apply_shadow()
-        #self.ema_decoder.apply_shadow()
+        self.ema_encoder.apply_shadow()
+        self.ema_decoder.apply_shadow()
         # Sample hidden representation
         h = torch.randn(num_samples, self.hidden_dim + self.context_dim, device=self.device)
         # Get prior distribution
@@ -2331,8 +2409,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # Decode
         samples = self.decoder.decode(z, deterministic=False)
-        #self.ema_encoder.restore()
-        #self.ema_decoder.restore()
+        self.ema_encoder.restore()
+        self.ema_decoder.restore()
         return samples
 
     def get_cluster_statistics(self, x: torch.Tensor) -> Dict[str, Union[float, torch.Tensor]]:
