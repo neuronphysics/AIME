@@ -486,6 +486,11 @@ class Embedder(nn.Module):
         self.dec_unet_adapters = nn.ModuleDict()
         self._unet_hw: Dict[str, tuple[int, int]] = {} #per modality H,W
         self.enable_decode_unet = bool(unet_adapter_cfg and unet_adapter_cfg.get('enable_decode_unet', False))
+        image_like_modalities = {'image', 'rgb', 'pixels'}
+        self.decode_activations = nn.ModuleDict({
+            name: nn.Tanh() if name in image_like_modalities else nn.Identity()
+            for name in modalities.keys()
+        })
 
         if unet_adapter_cfg:
             # cfg knobs (all optional)
@@ -508,7 +513,7 @@ class Embedder(nn.Module):
                 return 1
             #Add gating UNet adapters for selected modalities
             self.unet_gates = nn.ParameterDict()
-            self.max_gate = float(unet_adapter_cfg.get('max_gate', 0.1))  # cap influence early
+            self.max_gate = float(unet_adapter_cfg.get('max_gate', 1.0))  # cap influence early
 
             for name, data in modalities.items():
                 if name not in target_modalities:
@@ -533,7 +538,7 @@ class Embedder(nn.Module):
                     in_ch=C, base_ch=base_ch, num_down=depth,
                     norm=norm, gn_target_groups=gn_groups, bn_momentum=bn_momentum
                 )
-                gate_init = float(unet_adapter_cfg.get('gate_init', -3.0))
+                gate_init = float(unet_adapter_cfg.get('gate_init', 0.0))
                 self.unet_gates[name] = nn.Parameter(torch.tensor(gate_init, dtype=torch.float32))
                 if self.enable_decode_unet:
                     # symmetric tiny UNet on decode path (off by default)
@@ -616,6 +621,9 @@ class Embedder(nn.Module):
                 adapter_out = self.dec_unet_adapters[name](x_tokens, hw)
                 gate_val = torch.sigmoid(self.unet_gates[name])*self.max_gate
                 x_tokens = x_tokens + gate_val * adapter_out
+            
+            if un_embed:
+                x_tokens = self.decode_activations[name](x_tokens)
                 
 
             out[name] = x_tokens

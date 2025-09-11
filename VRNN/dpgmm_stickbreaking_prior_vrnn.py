@@ -1180,11 +1180,19 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         core_params.extend([self.h0, self.c0, self.temperature, self.temporal_attention_temp])
 
-        perceiver_params = []
-        for module in [self.perceiver_model, self.perceiver_projection]:
-            if module is not None:
-               perceiver_params.extend(list(module.parameters()))
+        perceiver_rest_params = []
+        perceiver_trunk_params = []  # embedder + reconstruction head
 
+        if self.perceiver_model is not None:
+            for name, p in self.perceiver_model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if name.startswith("embedder.") or \
+                name.startswith("reconstruction_head."):  # in case constant not imported
+                    perceiver_trunk_params.append(p)   # <-- goes to trunk/shared
+                else:
+                    perceiver_rest_params.append(p)    # <-- stays as "perceiver_params"
+        perceiver_proj_params = list(self.perceiver_projection.parameters()) if self.perceiver_projection is not None else []
         head_params = []
         for module in [self.attention_prior_posterior, self.phi_attention, self.self_model]:
             if module is not None:
@@ -1205,6 +1213,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "prior.component_nn", "perceiver_model.blocks", "rnn_layer_norm.", "perceiver_projection."
             ]):
                 shared_params.append(p)
+        shared_params.extend(perceiver_trunk_params)
 
         # Stash for train_step usage if needed
         self._shared_params = tuple(shared_params)
@@ -1213,10 +1222,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # -----------------------------
         # 2) Base optimizer(s)
         # -----------------------------
-
+        core_params += perceiver_trunk_params + perceiver_proj_params
         param_groups = [
             {"params": core_params,     "lr": learning_rate,         "weight_decay": weight_decay},
-            {"params": perceiver_params,"lr": learning_rate * 1.25,  "weight_decay": weight_decay * 2.0},
+            {"params": perceiver_rest_params,"lr": learning_rate * 1.25,  "weight_decay": weight_decay * 2.0},
             {"params": head_params,     "lr": learning_rate * 1.20,  "weight_decay": weight_decay * 0.5},
         ]
 
@@ -1264,7 +1273,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # 6) Diagnostics
         # -----------------------------
         print(f"  Core parameters: {sum(p.numel() for p in core_params):,}")
-        print(f"  Perceiver parameters: {sum(p.numel() for p in perceiver_params):,}")
+        print(f"  Perceiver parameters: {sum(p.numel() for p in perceiver_rest_params):,}")
         print(f"  Head parameters: {sum(p.numel() for p in head_params):,}")
         print(f"  Shared (trunk) parameters (by prefix): {sum(p.numel() for p in self._shared_params):,}")
 
@@ -1550,9 +1559,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         # Perceiver loss
         B, T, C, H, W = observations.shape
-        obs_flat = observations.permute(0, 1, 3, 4, 2).contiguous().reshape(B*T, H*W, C)  # [(B*T), (H*W), C]
-        mse_all = F.mse_loss(perceiver_recon, obs_flat, reduction="none")  # [(B*T), (H*W), C]
-        per_frame = mse_all.mean(dim=(1, 2))                                                 # [(B*T)]
+        obs_flat = observations.permute(0, 1, 3, 4, 2).contiguous().reshape(B, T, H*W, C)  # [B, T, (H*W), C]
+        mse_all = (perceiver_recon, obs_flat).pow(2)  # [(B*T), (H*W), C]
+        per_frame = mse_all.mean(dim=(2, 3))                                                 # [(B,T)]
         per_episode = per_frame.view(B, T).mean(dim=1)                                       # [B]  (episode-wise MSE)
     
         outputs['perceiver_loss'] = per_episode.mean() # scalar for optimization
@@ -1910,7 +1919,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         #Perceiver latents shape: torch.Size([50, 2048, 128]) [batch_size* seq_len, ?, ?]
         # Extract reconstruction for perceiver loss
         perceiver_recon = perceiver_output[self.out_keys.INPUT_RECONSTRUCTION]['image']
-        
+
+        perceiver_recon = perceiver_recon.reshape(batch_size, seq_len, H * W, channels)
         # Project to context dimension
         
         context, _ = self.perceiver_projection(latents)
