@@ -1560,7 +1560,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Perceiver loss
         B, T, C, H, W = observations.shape
         obs_flat = observations.permute(0, 1, 3, 4, 2).contiguous().reshape(B, T, H*W, C)  # [B, T, (H*W), C]
-        mse_all = (perceiver_recon, obs_flat).pow(2)  # [(B*T), (H*W), C]
+        mse_all = (perceiver_recon - obs_flat).pow(2)  # [(B*T), (H*W), C]
         per_frame = mse_all.mean(dim=(2, 3))                                                 # [(B,T)]
         per_episode = per_frame.view(B, T).mean(dim=1)                                       # [B]  (episode-wise MSE)
     
