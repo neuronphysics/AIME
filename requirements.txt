@@ -51,6 +51,7 @@ importlib_metadata
 importlib_resources
 Jinja2
 joblib
+jsbeautifier
 keras
 kiwisolver
 labmaze

@@ -20,7 +20,10 @@ from torch.utils.tensorboard import SummaryWriter
 from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoencoder
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
 from torch.utils.data._utils.collate import default_collate
-
+os.environ["MPLBACKEND"] = "Agg"  # must be set before importing matplotlib.pyplot
+import matplotlib
+matplotlib.use("Agg", force=True)
+plt.ioff()
 def safe_collate(batch):
     all_keys = set().union(*(b.keys() for b in batch))
     out = {}
@@ -1520,8 +1523,8 @@ class DMCVBTrainer:
             print(f"  Eval Loss: {eval_metrics.get('eval/total_vae_loss', 0):.4f}")
             print(f"  PSNR: {eval_metrics.get('eval/psnr', 0):.2f}")
             print(f"  Active Components: {train_metrics.get('train/effective_components', 0):.2f}")
-            print(f"  Top 4 components: {train_metrics.get('train/Top 4 coverage', 0):.3f}")
-            
+            print(f"  Top 6 components: {train_metrics.get('train/Top 6 coverage', 0):.3f}")
+
             # Visualize periodically
             if epoch % self.config['visualize_every'] == 0:
                 self.visualize_results(epoch)
@@ -1552,11 +1555,11 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 20,
-        'latent_dim': 32,
-        'hidden_dim': 40, #must be divisible by 8
-        'context_dim': 36,
-        'attention_dim': 36,
+        'max_components': 15,
+        'latent_dim': 30,
+        'hidden_dim': 24, #must be divisible by 8
+        'context_dim': 20,
+        'attention_dim': 20,
         'attention_resolution': 21,
         'input_channels': 3*1,  # 3 stacked frames
         'HiP_type': 'Mini',
@@ -1564,7 +1567,7 @@ def main():
         'prior_beta': 2.0,
         
         # Training settings
-        'batch_size': 5,
+        'batch_size': 4,
         'sequence_length': 10,
         'frame_stack': 1,
         'img_height': 64,
@@ -1581,10 +1584,10 @@ def main():
         # Loss weights
         'beta': 1.0,
         'entropy_weight': 0.6,
-        'lambda_img': 0.75,
+        'lambda_img': 0.5,
         'lambda_recon': 1.0,
-        'lambda_att_dyn': 0.5,
-        'lambda_att': 0.5,
+        'lambda_att_dyn': 0.95,
+        'lambda_att': 0.95,
         'grad_clip': 1.0,
         'n_critic': 1,
         

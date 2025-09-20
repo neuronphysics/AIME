@@ -8,13 +8,21 @@ from torch import nn
 from torch.optim import Optimizer
 from math import inf
 import math
+import datetime
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple, Union
-
-from typing import Callable, Dict, Iterable, Literal, Optional, Tuple, Type, Union, Sequence
-
+import json
+import tempfile
+import jsbeautifier
+import time
+import logging
+import sys
+from typing import Callable, Dict, Iterable, Literal, Optional, Tuple, Type, Union, Sequence, List, Any
+import easydict as edict
+import os
+import queue
+import threading
 from torch.optim.lr_scheduler import LRScheduler
-
+from dataclasses import is_dataclass, asdict
 CLOSURE = Optional[Callable[[], float]]
 LOSS = Optional[float]
 BETAS = Union[Tuple[float, float], Tuple[float, float, float], Tuple[None, float]]
@@ -605,338 +613,903 @@ class PCGrad(BaseOptimizer):
 
 
 # ----------------------------- Core math: Aligned-MTL ----------------------------- #
-@torch.no_grad()
-def _force_symmetric(M: torch.Tensor) -> torch.Tensor:
-    """Make matrix explicitly symmetric (lower numerical noise)."""
-    return 0.5 * (M + M.transpose(0, 1))
 
-@torch.no_grad()
-def _is_finite(x: torch.Tensor) -> bool:
-    return torch.isfinite(x).all().item()
-
-
-@torch.no_grad()
-def _balance_transform_task_space(
-    M: torch.Tensor,
-    eps: float = torch.finfo(torch.float32).eps,
-    max_tries: int = 3,
-    jitter_scale: float = 1e-6,
-    use_svd_fallback: bool = True,
-) -> torch.Tensor:
-    """
-    Robust computation of the balance transform B in task space.
+def semideepcopy(obj: Any) -> Any:
+    """A version of deepcopy that preserves PyTorch parameters.
 
     Args:
-        M: [T,T] symmetric PSD Gram matrix (J J^T or Z Z^T)
-        eps: absolute floor for eigenvalue thresholding
-        max_tries: how many retries with increased diagonal jitter if eigh fails
-        jitter_scale: diagonal jitter factor relative to trace(M)
-        use_svd_fallback: fallback to SVD if eigh does not converge
+        obj: The object to copy
 
     Returns:
-        B: [T,T] transform; alpha = B @ w
+        A deep copy of the object, but with PyTorch parameters preserved as references
     """
-    T = M.shape[0]
-    device, dtype = M.device, M.dtype
+    if isinstance(obj, (torch.nn.Parameter, edict.EasyDict)):
+        return obj
+    elif isinstance(obj, dict):
+        return {key: semideepcopy(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [semideepcopy(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(semideepcopy(item) for item in obj)
+    else:
+        return deepcopy(obj)
 
-    # 1) sanitize and upcast to float64 for decomposition
-    M = _force_symmetric(M)
-    if not _is_finite(M):
-        M = torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
 
-    M64 = M.to(torch.float64)
-
-    # 2) scale-aware jitter: trace gives us a magnitude proxy
-    tr = torch.trace(M64).abs()
-    jitter = (tr / (T + torch.finfo(torch.float64).eps)) * jitter_scale + eps
-
-    # 3) attempt eigh with progressive jitter
-    evals = None
-    V = None
-    for i in range(max_tries):
-        try:
-            Mreg = M64 + jitter * torch.eye(T, device=device, dtype=torch.float64)
-            evals, V = torch.linalg.eigh(Mreg, UPLO='U')   # ascending
-            break
-        except RuntimeError:
-            jitter = jitter * 10.0
-
-    if evals is None and use_svd_fallback:
-        # final fallback: SVD
-        U, S, _ = torch.linalg.svd(M64 + jitter * torch.eye(T, device=device, dtype=torch.float64), full_matrices=False)
-        evals, V = S, U
-
-    if evals is None:
-        # give up: identity transform (no alignment, but safe)
-        return torch.eye(T, device=device, dtype=dtype)
-
-    # 4) keep positive spectrum with a relative threshold
-    rel = evals.max() * T * torch.finfo(torch.float64).eps
-    thresh = max(float(eps), float(rel))
-    mask = evals > thresh
-
-    if mask.sum() == 0:
-        return torch.eye(T, device=device, dtype=dtype)
-
-    # order descending within positive subspace
-    pos_vals = evals[mask]
-    pos_vecs = V[:, mask]
-    order = torch.argsort(pos_vals, descending=True)
-    lam = pos_vals[order]               # [R]
-    Vpos = pos_vecs[:, order]           # [T,R]
-
-    lam_R = lam[-1]                     # smallest positive eigenvalue
-    sigma_inv = torch.diag(1.0 / torch.sqrt(torch.clamp(lam, min=eps)))
-    B64 = torch.sqrt(lam_R) * (Vpos @ sigma_inv @ Vpos.transpose(0, 1))
-
-    return B64.to(dtype=dtype)
-
-@torch.no_grad()
-def aligned_mtl_weights(
-    J: torch.Tensor,
-    pref: Optional[torch.Tensor] = None,
-    normalize_task_grads: bool = True,
-    alpha_blend: float = 0.5,
-    eps: float = 1e-8,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute safe task coefficients and aggregate gradient in parameter space.
+def build_from_config(config: Any, **kwargs) -> Any:
+    """This function recursively builds objects provided by the config.
 
     Args:
-        J: [T,P] per-task flattened grads wrt shared params
-        pref: [T] preference vector (defaults to uniform)
-        normalize_task_grads: if True, row-normalize J to equalize task scales
-        alpha_blend: convex blend with uniform weights (0=no blend, 1=only aligned)
-        eps: small constant for numerical stability
-
-    Returns:
-        g_flat: [P] aggregated gradient
-        alpha:  [T] task coefficients
+        config (Any): A config dict for building objects or any built object.
+        kwargs: keyword arguments only used for building objects from `config`.
     """
-    T, P = J.shape
-    device, dtype = J.device, J.dtype
+    if isinstance(config, edict.EasyDict):
+        return config
+    if isinstance(config, dict) and config.keys() == {'class', 'args'}:
+        # Create a deep copy to avoid modifying input, but preserve parameters
+        config_copy = semideepcopy(config)
 
-    if not _is_finite(J):
-        J = torch.nan_to_num(J, nan=0.0, posinf=0.0, neginf=0.0)
+        # merge args
+        assert type(kwargs) == dict, f"{type(kwargs)=}"
+        assert set(config_copy.keys()) & set(kwargs.keys()) == set(), f"{config_copy.keys()=}, {kwargs.keys()=}"
+        config_copy['args'].update(kwargs)
 
-    # optional row-normalization (preconditioning) to avoid one task dominating
-    if normalize_task_grads:
-        norms = J.norm(dim=1, keepdim=True).clamp_min(eps)
-        Jn = J / norms
+        # build args
+        for key in config_copy['args']:
+            config_copy['args'][key] = build_from_config(config_copy['args'][key])
+
+        # build self
+        return config_copy['class'](**config_copy['args'])
+    elif isinstance(config, dict):
+        return {key: build_from_config(val) for key, val in config.items()}
+    elif isinstance(config, list):
+        return [build_from_config(item) for item in config]
+    elif isinstance(config, tuple):
+        return tuple(build_from_config(item) for item in config)
     else:
-        Jn = J
+        return config
 
-    # preferences
-    if pref is None:
-        w = torch.full((T,), 1.0 / T, device=device, dtype=dtype)
+
+def apply_tensor_op(
+    func: Callable[[torch.Tensor], torch.Tensor],
+    inputs: Union[tuple, list, dict, torch.Tensor, float],
+) -> Any:
+    if type(inputs) == torch.Tensor:
+        return func(inputs)
+    elif type(inputs) == tuple:
+        return tuple(apply_tensor_op(func=func, inputs=tuple_elem) for tuple_elem in inputs)
+    elif type(inputs) == list:
+        return list(apply_tensor_op(func=func, inputs=list_elem) for list_elem in inputs)
+    elif type(inputs) == dict:
+        return {key: apply_tensor_op(func=func, inputs=inputs[key]) for key in inputs.keys()}
     else:
-        w = pref.to(device=device, dtype=dtype)
-        w = w / (w.sum() + eps)
-
-    # Gramian in task space + robust B
-    M = Jn @ Jn.t()  # [T,T]
-    B = _balance_transform_task_space(M, eps=eps)
-
-    alpha_aligned = B @ w  # [T]
-
-    # blend with uniform to avoid starvation of any task
-    if alpha_blend is not None and alpha_blend > 0.0:
-        alpha = (1.0 - alpha_blend) * w + alpha_blend * alpha_aligned
-    else:
-        alpha = alpha_aligned
-
-    # safety: clip extremely large |alpha| to avoid explosions
-    alpha = torch.clamp(alpha, min=-10.0, max=10.0)
-
-    # aggregate back to parameter space
-    g_flat = J.transpose(0, 1) @ alpha
-
-    # if something went wrong, fall back to simple average
-    if not _is_finite(g_flat):
-        g_flat = J.mean(dim=0)
-        alpha = w
-
-    return g_flat, alpha
+        return inputs
 
 
-# ---------------------- Optional UB variant (representation-space) ---------------------- #
+def serialize_tensor(obj: Any) -> Any:
+    """Serialize torch tensors to lists (backward compatibility)."""
+    return apply_tensor_op(func=lambda x: x.detach().tolist(), inputs=obj)
 
-@torch.no_grad()
-def aligned_mtl_ub_weights(
-    Z: torch.Tensor,
-    pref: Optional[torch.Tensor] = None,
-    normalize_task_grads: bool = True,
-    alpha_blend: float = 0.5,
-    eps: float = 1e-8,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+
+def check_write_file(path: Any) -> str:
+    assert type(path) == str, f"{type(path)=}"
+    assert os.path.isdir(os.path.dirname(path)), f"{path=}"
+    return path
+
+class BaseLogger(ABC):
     """
-    Upper-bound variant in representation space.
-
-    Args:
-        Z: [T,D] per-task grads wrt a shared representation H
-        pref: [T] preference vector (defaults to uniform)
-        normalize_task_grads: row-normalize Z
-        alpha_blend: convex blend with uniform weights
-        eps: small constant
+    Base class for all loggers.
     """
-    T, D = Z.shape
-    device, dtype = Z.device, Z.dtype
 
-    if not _is_finite(Z):
-        Z = torch.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+    def __init__(self, filepath: Optional[str] = None) -> None:
+        """
+        Initialize the base logger.
 
-    if normalize_task_grads:
-        norms = Z.norm(dim=1, keepdim=True).clamp_min(eps)
-        Zn = Z / norms
-    else:
-        Zn = Z
+        Args:
+            filepath: Optional filepath to write logs to
+        """
+        self.filepath = check_write_file(filepath) if filepath is not None else None
+        self.buffer = {}
+        self._buffer_lock = threading.Lock()
+        self._write_queue = queue.Queue()
+        self._write_thread = threading.Thread(target=self._write_worker, daemon=True)
+        self._write_thread.start()
 
-    if pref is None:
-        w = torch.full((T,), 1.0 / T, device=device, dtype=dtype)
-    else:
-        w = pref.to(device=device, dtype=dtype)
-        w = w / (w.sum() + eps)
+    def _write_worker(self) -> None:
+        """Background thread to handle write operations."""
+        while True:
+            try:
+                data = self._write_queue.get()
+                self._process_write(data)
+                self._write_queue.task_done()
+            except Exception as e:
+                print(f"Write worker error: {e}")
 
-    M = Zn @ Zn.t()
-    B = _balance_transform_task_space(M, eps=eps)
-    alpha_aligned = B @ w
-    if alpha_blend is not None and alpha_blend > 0.0:
-        alpha = (1.0 - alpha_blend) * w + alpha_blend * alpha_aligned
-    else:
-        alpha = alpha_aligned
-    alpha = torch.clamp(alpha, min=-10.0, max=10.0)
+    @abstractmethod
+    def _process_write(self, data: Tuple[str, Any]) -> None:
+        """Process a write operation."""
+        pass
 
-    gH = Z.transpose(0, 1) @ alpha
-    if not _is_finite(gH):
-        gH = Z.mean(dim=0)
-        alpha = w
-    return gH, alpha
+    def update_buffer(self, data: Dict[str, Any]) -> None:
+        """
+        Update the buffer with new data.
 
-# ---------------------- grad flatten / scatter ---------------------
+        Args:
+            data: Dictionary of data to update the buffer with
+        """
+        self._write_queue.put(("UPDATE_BUFFER", data))
 
-def _flatten_grads_per_task(loss: torch.Tensor, params: Sequence[nn.Parameter]) -> torch.Tensor:
+    def flush(self, prefix: Optional[str] = "") -> None:
+        """
+        Flush the buffer to the output.
+
+        Args:
+            prefix: Optional prefix to display before the data
+        """
+        self._write_queue.put(("FLUSH", prefix))
+
+    def info(self, message: str) -> None:
+        """
+        Log an info message.
+
+        Args:
+            message: The message to log
+        """
+        self._write_queue.put(("INFO", message))
+
+    def warning(self, message: str) -> None:
+        """
+        Log a warning message.
+
+        Args:
+            message: The message to log
+        """
+        self._write_queue.put(("WARNING", message))
+
+    def error(self, message: str) -> None:
+        """
+        Log an error message.
+
+        Args:
+            message: The message to log
+        """
+        self._write_queue.put(("ERROR", message))
+
+    def page_break(self) -> None:
+        """Add a page break to the log."""
+        self._write_queue.put(("PAGE_BREAK", None))
+
+class TextLogger(BaseLogger):
     """
-    Per-task gradient wrt 'params' (no graph creation).
-    Returns a flat vector [P].
+    A text-based logger that writes to both a file and the console.
     """
-    grads = torch.autograd.grad(
-        loss, params, retain_graph=True, create_graph=False, allow_unused=True
+
+    formatter = logging.Formatter(
+        fmt=f"[%(levelname)s] %(asctime)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    flat = []
-    for p, g in zip(params, grads):
-        if g is None:
-            flat.append(torch.zeros_like(p).reshape(-1))
-        else:
-            flat.append(g.reshape(-1))
-    return torch.cat(flat, dim=0)
 
-def _assign_flat_grad_to_params(flat: torch.Tensor, params: Sequence[nn.Parameter]) -> None:
-    """Scatter a flat gradient vector back into param .grad buffers (in-place)."""
-    assert torch.isfinite(flat).all(), "Aggregated gradient contains NaN/Inf."
-    offset = 0
-    for p in params:
-        n = p.numel()
-        g_slice = flat[offset:offset + n].view_as(p)
-        offset += n
-        if p.grad is None:
-            p.grad = g_slice.detach().clone()
-        else:
-            p.grad.copy_(g_slice)
+    # A more complete version of formatter
+    # formatter = logging.Formatter(
+    #     fmt=f"%(levelname)s %(asctime)s (%(relativeCreated)d) %(pathname)s F%(funcName)s L%(lineno)s - %(message)s",
+    #     datefmt="%Y-%m-%d %H:%M:%S",
+    # )
 
-# ---------------------------- optimizer ----------------------------
+    # ====================================================================================================
+    # init methods
+    # ====================================================================================================
 
-class AlignedMTLOptimizer:
-    """
-    Memory-conscious wrapper around a base optimizer.
+    def __init__(self, filepath: Optional[str] = None) -> None:
+        super(TextLogger, self).__init__(filepath=filepath)
+        self._init_core_logger_()
+        if not self.core_logger.handlers:
+            self._init_file_handler_()
+            self._init_stream_handler_()
 
-    - Applies robust Aligned-MTL to 'shared_params'
-    - Updates non-shared 'head' params by a single autograd.grad on a weighted sum
+    def _init_core_logger_(self) -> None:
+        self.core_logger = logging.getLogger(name=self.filepath)
+        self.core_logger.setLevel(level=logging.INFO)
+        self.core_logger.propagate = False
+
+    def _init_file_handler_(self) -> None:
+        if self.filepath is None:
+            return
+        f_handler = logging.FileHandler(filename=self.filepath)
+        f_handler.setFormatter(self.formatter)
+        f_handler.setLevel(level=logging.INFO)
+        self.core_logger.addHandler(f_handler)
+
+    def _init_stream_handler_(self) -> None:
+        s_handler = logging.StreamHandler(stream=sys.stdout)
+        s_handler.setFormatter(self.formatter)
+        s_handler.setLevel(level=logging.INFO)
+        self.core_logger.addHandler(s_handler)
+
+    # ====================================================================================================
+    # logging methods
+    # ====================================================================================================
+
+    def _process_write(self, data: Tuple[str, Any]) -> None:
+        """Process a write operation."""
+        msg_type, content = data
+        if msg_type == "INFO":
+            self.core_logger.info(content)
+        elif msg_type == "WARNING":
+            self.core_logger.warning(content)
+        elif msg_type == "ERROR":
+            self.core_logger.error(content)
+        elif msg_type == "PAGE_BREAK":
+            self.core_logger.info("")
+            self.core_logger.info('=' * 100)
+            self.core_logger.info('=' * 100)
+            self.core_logger.info("")
+        elif msg_type == "UPDATE_BUFFER":
+            with self._buffer_lock:
+                self.buffer.update(serialize_tensor(content))
+        elif msg_type == "FLUSH":
+            with self._buffer_lock:
+                string = content + " " + ", ".join([f"{key}: {val}" for key, val in self.buffer.items()])
+                self.core_logger.info(string)
+                self.buffer = {}
+
+    def train(self) -> None:
+        """Switch to training mode (no-op for TextLogger)."""
+        pass
+
+    def eval(self) -> None:
+        """Switch to evaluation mode (no-op for TextLogger)."""
+        pass
+
+
+
+class BaseOptim(ABC):
+
+    optimizer: torch.optim.Optimizer
+
+    def __init__(self) -> None:
+        self.reset_buffer()
+
+    def reset_buffer(self) -> None:
+        self.buffer: List[Any] = []
+
+    @abstractmethod
+    def backward(self, *args, **kwargs) -> Any:
+        raise NotImplementedError("Abstract method BaseOptimizer.backward not implemented.")
+
+    # ====================================================================================================
+    # ====================================================================================================
+
+    def zero_grad(self, *args: Any, **kwargs: Any) -> None:
+        return self.optimizer.zero_grad(*args, **kwargs)
+
+    def step(self, *args: Any, **kwargs: Any) -> Any:
+        return self.optimizer.step(*args, **kwargs)
+
+    def state_dict(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return self.optimizer.state_dict(*args, **kwargs)
+
+    def load_state_dict(self, *args: Any, **kwargs: Any) -> None:
+        self.optimizer.load_state_dict(*args, **kwargs)
+
+    # ====================================================================================================
+    # ====================================================================================================
+
+    def summarize(self, output_path: Optional[str] = None) -> Any:
+        r"""Default summarize method, assuming nothing has been logged to buffer.
+        """
+        assert len(self.buffer) == 0
+        if output_path is not None:
+            check_write_file(path=output_path)
+            save_json(obj=self.buffer, filepath=output_path)
+        return self.buffer
+    
+
+class MTLOptimizer(BaseOptim):
+    __doc__ = r"""A hook contains custom operations for the optimizer.
     """
 
     def __init__(
         self,
-        model: nn.Module,
-        shared_params: Sequence[nn.Parameter],
-        base_optim: Optimizer,
-        head_update: str = 'pref',
-        normalize_task_grads: bool = True,
-        alpha_blend: float = 0.5,
+        optimizer_config: dict,
+        losses: Dict[str, torch.Tensor],
+        shared_rep: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        logger: Optional[TextLogger] = None,
+        **kwargs,
     ):
-        self.model = model
-        self.shared_params = tuple(shared_params)
-        self.base_optim = base_optim
-        self.head_update = head_update
-        self.normalize_task_grads = normalize_task_grads
-        self.alpha_blend = alpha_blend
+        r"""
+        Args:
+            optimizer_config (dict): a config dict for building the core optimizer.
+            losses (Dict[str, torch.Tensor]): a dummy loss dictionary for initialization purpose.
+            shared_rep (Union[torch.Tensor, Tuple[torch.Tensor, ...]]): a dummy shared representation for initialization purpose.
+            logger (utils.logging.logger.TextLogger).
+            kwargs (dict): other unused arguments. e.g., wrt_rep and per_layer for gradient balancing methods.
+        """
+        super(MTLOptimizer, self).__init__()
+        self.optimizer = build_from_config(config=optimizer_config)
+        self.logger = logger if logger is not None else TextLogger()
+        self._init_shared_params_mask_(loss_dict=losses, shared_rep=shared_rep)
+        self._init_shared_params_shapes_()
+        self.num_tasks: int = len(losses)
 
-        shared_ids = {id(p) for p in self.shared_params}
-        self.head_params = tuple(p for p in self.model.parameters() if id(p) not in shared_ids)
+    # ====================================================================================================
+    # shared parameters related methods
+    # ====================================================================================================
 
-    def zero_grad(self) -> None:
-        self.base_optim.zero_grad(set_to_none=True)
-
-    @torch.no_grad()
-    def _pref_weights(self, T: int, device, dtype, pref_vector: Optional[torch.Tensor]) -> torch.Tensor:
-        if pref_vector is None:
-            w = torch.full((T,), 1.0 / T, device=device, dtype=dtype)
-        else:
-            w = pref_vector.to(device=device, dtype=dtype)
-            w = w / (w.sum() + 1e-12)
-        return w
-
-    def step(
+    def _init_shared_params_mask_(
         self,
-        task_losses: Sequence[torch.Tensor],
-        pref_vector: Optional[torch.Tensor] = None,
-        use_upper_bound: bool = False,
-        rep_grads: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        self.zero_grad()
-        device = next(self.model.parameters()).device
-        dtype = next(self.model.parameters()).dtype
-        T = len(task_losses)
-        w = self._pref_weights(T, device, dtype, pref_vector)
+        loss_dict: Dict[str, torch.Tensor],
+        shared_rep: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    ) -> torch.Tensor:
+        r"""This method initializes `self.shared_params_mask`, a 1D boolean tensor where 1 means the
+        current parameters are shared. Order is defined by the double for loop
+        "for group in self.optimizer.param_groups for p in group['params']".
+        """
+        # input checks
+        assert type(loss_dict) == dict, f"{type(loss_dict)=}"
+        assert all(type(key) == str for key in loss_dict.keys())
+        assert all([
+            type(value) == torch.Tensor and value.ndim == 0 and value.requires_grad
+            for value in loss_dict.values()
+        ])
+        if type(shared_rep) == torch.Tensor:
+            shared_rep = (shared_rep,)
+        assert type(shared_rep) == tuple
+        assert all(type(elem) == torch.Tensor for elem in shared_rep)
+        shared_rep = torch.cat([g.flatten() for g in shared_rep])
+        assert shared_rep.ndim == 1, f"{shared_rep.shape=}"
+        # compute gradients with method 1
+        self.optimizer.zero_grad(set_to_none=True)
+        dummy_gradient = torch.zeros_like(shared_rep)
+        shared_rep.backward(gradient=dummy_gradient, retain_graph=True)
+        shared_params_mask_v1 = torch.tensor([
+            p.requires_grad and p.grad is not None
+            for group in self.optimizer.param_groups for p in group['params']
+        ], dtype=torch.bool, device=shared_rep.device)
+        # compute gradients with method 2
+        masks: List[torch.Tensor] = []
+        for loss in loss_dict.values():
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward(retain_graph=True)
+            masks.append(torch.tensor([
+                p.requires_grad and p.grad is not None
+                for group in self.optimizer.param_groups for p in group['params']
+            ], dtype=torch.bool, device=torch.device('cuda')))
+        shared_params_mask_v2 = torch.prod(torch.stack(masks).type(torch.int64), dim=0).type(torch.bool)
+        # sanity check
+        assert torch.equal(shared_params_mask_v1, shared_params_mask_v2)
+        # assign to class attribute
+        self.shared_params_mask: torch.Tensor = shared_params_mask_v1
 
-        if use_upper_bound:
-            assert rep_grads is not None, "Pass rep_grads=[T,D] for UB variant."
-            gH, alpha = aligned_mtl_ub_weights(
-                rep_grads, w, normalize_task_grads=self.normalize_task_grads, alpha_blend=self.alpha_blend
-            )
-            raise NotImplementedError("Hook your representation H and call H.backward(gH).")
+    def _get_shared_params_(self):
+        r"""Generator function for the shared parameters.
+        """
+        idx = 0
+        for group in self.optimizer.param_groups:
+            #if len(group['params']) == 1:
+            #    continue
+            for p in group['params']:
+                if self.shared_params_mask[idx]:
+                    yield p
+                idx += 1
+        assert idx == len(self.shared_params_mask), f"{idx=}, {len(self.shared_params_mask)=}"
+
+    def _init_shared_params_shapes_(self) -> None:
+        r"""This method initializes `self.shared_params_shapes`, a list of `torch.Size` for the shapes
+        of the shared parameters.
+        """
+        shapes: List[torch.Size] = [p.shape for p in self._get_shared_params_()]
+        # sanity check on mask and shapes
+        assert hasattr(self, 'shared_params_mask') and type(self.shared_params_mask) == torch.Tensor
+        shared_count = self.shared_params_mask.type(torch.int64).sum()
+        assert shared_count == len(shapes), f"{shared_count=}, {len(shapes)=}"
+        # assign to class attribute
+        self.shared_params_shapes: List[torch.Size] = shapes
+
+    # ====================================================================================================
+    # gradient computation methods
+    # ====================================================================================================
+
+    def _get_grad_par_(self, loss: torch.Tensor, per_layer: bool) -> Union[torch.Tensor, List[torch.Tensor]]:
+        r"""Get gradient of the given (single) loss w.r.t. shared parameters.
+
+        Args:
+            loss (torch.Tensor): the value of the (single) loss function at the current iteration.
+            per_layer (bool): if True, gradient w.r.t. each parameter group will not be concatenated.
+        Returns:
+            grad (torch.Tensor or List[torch.Tensor]): the gradient of loss w.r.t. shared parameters.
+        """
+        # compute gradients
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward(retain_graph=True)
+        grad: List[torch.Tensor] = [
+            p.grad if p.grad is not None else torch.zeros_like(p)
+            for p in self._get_shared_params_()
+        ]
+        assert len(grad) == len(self.shared_params_shapes)
+        grad = [g.flatten() for g in grad]
+        if not per_layer:
+            grad = torch.cat(grad, dim=0)
+            assert grad.ndim == 1, f"{grad.shape=}"
+        return grad
+
+    @staticmethod
+    def _get_grad_rep_(
+        loss: torch.Tensor,
+        shared_rep: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    ) -> torch.Tensor:
+        r"""Get gradient of the given (single) loss w.r.t. shared representation.
+
+        Args:
+            loss (torch.Tensor): the value of the (single) loss function at the current iteration.
+        Returns:
+            grad (torch.Tensor): the gradient of loss w.r.t. shared representation.
+        """
+        # initialization
+        if type(shared_rep) == torch.Tensor:
+            shared_rep = (shared_rep,)
+        # compute gradients
+        grad_seq: Tuple[torch.Tensor, ...] = torch.autograd.grad(
+            outputs=[loss], inputs=shared_rep, allow_unused=True, retain_graph=True,
+        )
+        assert type(grad_seq) == tuple, f"{type(grad_seq)=}"
+        assert len(grad_seq) == len(shared_rep), f"{len(grad_seq)=}, {len(shared_rep)=}"
+        grad_seq: List[torch.Tensor] = list(grad_seq)
+        for idx in range(len(grad_seq)):
+            if grad_seq[idx] is None:
+                grad_seq[idx] = torch.zeros_like(shared_rep[idx])
+            assert type(grad_seq[idx]) == torch.Tensor, f"{idx=}, {type(grad_seq[idx])=}"
+            assert grad_seq[idx].shape == shared_rep[idx].shape, f"{grad_seq[idx].shape=}, {shared_rep[idx].shape=}"
+        grad: torch.Tensor = torch.cat([g.flatten() for g in grad_seq], dim=0)
+        assert grad.ndim == 1, f"{grad.shape=}"
+        return grad
+
+    def _get_grads_all_tasks_(
+        self,
+        loss_dict: Dict[str, torch.Tensor],
+        shared_rep: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+        wrt_rep: Optional[bool] = False,
+        per_layer: Optional[bool] = False,
+    ) -> Union[Dict[str, torch.Tensor], Dict[str, List[torch.Tensor]]]:
+        r"""This method computes the gradients for all losses.
+        """
+        # input checks
+        assert type(loss_dict) == dict, f"{type(loss_dict)=}"
+        assert all(type(key) == str for key in loss_dict.keys())
+        assert all([
+            type(value) == torch.Tensor and value.ndim == 0 and value.requires_grad
+            for value in loss_dict.values()
+        ])
+        assert type(wrt_rep) == bool, f"{type(wrt_rep)=}"
+        assert type(per_layer) == bool, f"{type(per_layer)=}"
+        if wrt_rep:
+            assert shared_rep is not None
+            if type(shared_rep) != torch.Tensor:
+                assert type(shared_rep) == tuple, f"{type(shared_rep)=}"
+                assert all(type(elem) == torch.Tensor for elem in shared_rep)
+        # initialize time
+        grad_time = time.time()
+        if wrt_rep:
+            grads_dict = {
+                name: self._get_grad_rep_(loss=loss_dict[name], shared_rep=shared_rep)
+                for name in loss_dict
+            }
         else:
-            flats = []
-            for L in task_losses:
-                flats.append(_flatten_grads_per_task(L, self.shared_params))
-            J = torch.stack(flats, dim=0)
+            grads_dict = {
+                name: self._get_grad_par_(loss=loss_dict[name], per_layer=per_layer)
+                for name in loss_dict
+            }
+        self.logger.update_buffer({'grad_time': time.time() - grad_time})
+        return grads_dict
 
-            g_flat, alpha = aligned_mtl_weights(
-                J, w, normalize_task_grads=self.normalize_task_grads, alpha_blend=self.alpha_blend
-            )
+    # ====================================================================================================
+    # ====================================================================================================
 
-            _assign_flat_grad_to_params(g_flat, self.shared_params)
+    def backward(
+        self,
+        losses: Dict[str, torch.Tensor],
+        shared_rep: Union[torch.Tensor, Tuple],
+    ) -> None:
+        r"""The default backward method.
 
-        if self.head_params and self.head_update != 'none':
-            if self.head_update == 'pref':
-                head_loss = sum(w[i] * task_losses[i] for i in range(T))
-            elif self.head_update == 'sum':
-                head_loss = sum(task_losses)
+        Args:
+            shared_rep (Union[torch.Tensor, Tuple]): unused argument.
+        """
+        self.optimizer.zero_grad(set_to_none=True)
+        losses_tensor = torch.stack(list(losses.values()))
+        avg_loss = losses_tensor.mean()
+        avg_loss.backward()
+
+class GradientManipulationBaseOptimizer(MTLOptimizer, ABC):
+
+    def __init__(
+        self,
+        wrt_rep: Optional[bool] = False,
+        per_layer: Optional[bool] = False,
+        **kwargs,
+    ) -> None:
+        super(GradientManipulationBaseOptimizer, self).__init__(**kwargs)
+        assert type(wrt_rep) == bool, f"{type(wrt_rep)=}"
+        self.wrt_rep = wrt_rep
+        assert type(per_layer) == bool, f"{type(per_layer)=}"
+        self.per_layer = per_layer
+
+    @abstractmethod
+    def _gradient_manipulation_(
+        self,
+        grads_list: List[torch.Tensor],
+        shared_rep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        r"""Each gradient manipulation method will implement its own.
+        """
+        raise NotImplementedError("_gradient_manipulation_ not implemented for abstract base class.")
+
+    def backward(
+        self,
+        losses: Dict[str, torch.Tensor],
+        shared_rep: Union[torch.Tensor, Tuple],
+    ) -> None:
+        # input checks
+        assert type(losses) == dict, f"{type(losses)=}"
+        assert type(shared_rep) in [torch.Tensor, tuple], f"{type(shared_rep)=}"
+        # initialization
+        grads_dict: Union[Dict[str, torch.Tensor], Dict[str, List[torch.Tensor]]] = self._get_grads_all_tasks_(
+            loss_dict=losses, shared_rep=shared_rep, wrt_rep=self.wrt_rep, per_layer=self.per_layer,
+        )
+        if type(shared_rep) == tuple:
+            shared_rep = torch.cat([g.flatten() for g in shared_rep])
+        else:
+            shared_rep = shared_rep.flatten()
+        # compute gradients
+        with torch.no_grad():
+            if self.per_layer:
+                num_layers = len(list(grads_dict.values())[0])
+                assert all(len(grads_dict[name]) == num_layers for name in grads_dict)
+                manipulated_grad: List[torch.Tensor] = [self._gradient_manipulation_(
+                    grads_list=[grads_dict[name][idx] for name in grads_dict], shared_rep=shared_rep,
+                ) for idx in range(num_layers)]
+                manipulated_grad: torch.Tensor = torch.cat(manipulated_grad, dim=0)
             else:
-                raise ValueError(f"Unknown head_update={self.head_update}")
+                manipulated_grad: torch.Tensor = self._gradient_manipulation_(
+                    grads_list=list(grads_dict.values()), shared_rep=shared_rep,
+                )
+        assert manipulated_grad.ndim == 1, f"{manipulated_grad.shape=}"
+        # populate gradients for task-specific parameters
+        self.optimizer.zero_grad(set_to_none=True)
+        for p in self._get_shared_params_():
+            assert p.requires_grad
+            assert p.grad is None
+            p.requires_grad = False
+        multi_task_loss = list(losses.values())
+        avg_loss = sum(multi_task_loss) / len(multi_task_loss)
+        avg_loss.backward(retain_graph=self.wrt_rep)
+        for p in self._get_shared_params_():
+            assert not p.requires_grad
+            assert p.grad is None
+            p.requires_grad = True
+        # populate gradients for shared parameters
+        if self.wrt_rep:
+            shared_rep.backward(gradient=manipulated_grad)
+        else:
+            self._set_grad_(grad=manipulated_grad)
 
-            head_grads = torch.autograd.grad(
-                head_loss, self.head_params, retain_graph=False, create_graph=False, allow_unused=True
+    def _set_grad_(self, grad: torch.Tensor) -> None:
+        r"""This function sets the gradients of the shared parameters in the model.
+
+        Returns:
+            None
+        """
+        # input checks
+        assert type(grad) == torch.Tensor, f"{type(grad)=}"
+        assert grad.ndim == 1, f"{grad.shape=}"
+        # populate gradient
+        idx = 0
+        for p, shape in zip(self._get_shared_params_(), self.shared_params_shapes):
+            length = int(torch.prod(torch.tensor(shape)))
+            assert p.requires_grad
+            assert p.grad is None
+            p.grad = grad[idx:idx+length].view(shape)
+            idx += length
+        assert idx == len(grad), f"{idx=}, {grad.shape=}"
+
+def get_gram_matrix(
+    grad_list: List[torch.Tensor],
+    other: List[torch.Tensor] = None
+) -> torch.Tensor:
+    r"""This function computes a matrix whose (i, j)-th entry is torch.dot(grad_list[i], other[j]).
+    other is default to grad_list so the output would be the true Gram matrix of grad_list.
+    """
+    # input checks
+    assert type(grad_list) == list
+    for g in grad_list:
+        assert type(g) == torch.Tensor, f"{type(g)=}"
+        assert len(g.shape) == 1
+    if other is not None:
+        assert type(other) == list and len(other) == len(grad_list)
+    # initialization
+    num_tasks = len(grad_list)
+    # compute result
+    result = torch.zeros(size=(num_tasks, num_tasks), dtype=torch.float32, device=torch.device('cuda'))
+    for i in range(num_tasks):
+        loop = range(i, num_tasks) if other is None else range(num_tasks)
+        for j in loop:
+            if other is None:
+                dot_prod = torch.dot(grad_list[i], grad_list[j])
+                result[i, j] = dot_prod
+                result[j, i] = dot_prod
+            else:
+                dot_prod = torch.dot(grad_list[i], other[j])
+                result[i, j] = dot_prod
+    return result
+
+
+def serialize_tensor(obj: Any) -> Any:
+    """Serialize torch tensors to lists (backward compatibility)."""
+    return apply_tensor_op(func=lambda x: x.detach().tolist(), inputs=obj)
+
+
+def apply_op(
+    func: Callable[[Any], Any],
+    inputs: Any,
+) -> Any:
+    """Apply a function recursively to nested data structures.
+    
+    Recursively applies func to all non-container elements in nested
+    tuples, lists, and dictionaries. If the input is not a container
+    (tuple, list, dict), applies func directly to it.
+    
+    Args:
+        func: Function to apply to non-container elements
+        inputs: Input data structure (can be nested)
+        
+    Returns:
+        Data structure with same nesting as inputs, but with func applied
+        to all non-container elements
+    """
+    if type(inputs) == tuple:
+        return tuple(apply_op(func=func, inputs=tuple_elem) for tuple_elem in inputs)
+    elif type(inputs) == list:
+        return list(apply_op(func=func, inputs=list_elem) for list_elem in inputs)
+    elif type(inputs) == dict:
+        return {key: apply_op(func=func, inputs=inputs[key]) for key in inputs.keys()}
+    else:
+        return func(inputs)
+
+
+
+def serialize_object(obj: Any) -> Any:
+    """Serialize any nested object containing various data types to JSON-compatible format.
+    
+    Handles:
+    - torch.Tensor -> list (via .detach().tolist())
+    - numpy.ndarray -> list (via .tolist())
+    - datetime -> ISO format string
+    - dataclass -> dict (via asdict())
+    - All other types -> unchanged (assumes JSON-serializable)
+    
+    Args:
+        obj: Object to serialize (can be nested in tuples, lists, dicts)
+        
+    Returns:
+        JSON-serializable version of the object
+    """
+    def _serialize_item(item: Any) -> Any:
+        # Handle torch tensors
+        if isinstance(item, torch.Tensor):
+            return item.detach().tolist()
+        
+        # Handle numpy arrays
+        elif isinstance(item, np.ndarray):
+            return item.tolist()
+        
+        # Handle datetime objects
+        elif isinstance(item, datetime):
+            return item.isoformat()
+        
+        # Handle dataclass objects
+        elif is_dataclass(item):
+            # Recursively serialize the dict representation
+            return serialize_object(asdict(item))
+        
+        # All other types pass through unchanged (assumes JSON-serializable)
+        else:
+            return item
+    
+    return apply_op(func=_serialize_item, inputs=obj)
+
+def save_json(obj: Any, filepath: str) -> None:
+    """Save object to JSON file using atomic writes and automatic serialization.
+    
+    Uses atomic writes (temp file + rename) to prevent race conditions between processes
+    and threads. The rename operation is atomic at the filesystem level, ensuring readers 
+    never see partially written files.
+    
+    Automatically handles dataclasses, torch.Tensor, numpy.ndarray, datetime,
+    and all nested data structures without requiring manual conversion.
+    
+    Args:
+        obj: Object to save (dataclasses are automatically converted)
+        filepath: Path to save JSON file
+        
+    Raises:
+        RuntimeError: If directory doesn't exist or write operation fails
+    """
+    try:
+        # Auto-create directory if it doesn't exist
+        target_dir = os.path.dirname(filepath)
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
+        
+        # Atomic write using temp file + rename
+        temp_fd = None
+        temp_filepath = None
+        
+        try:
+            # Create temp file in same directory as target file
+            # (rename is only atomic within the same filesystem)
+            temp_fd, temp_filepath = tempfile.mkstemp(
+                suffix='.tmp', 
+                prefix='json_', 
+                dir=target_dir or '.'
             )
-            for p, g in zip(self.head_params, head_grads):
-                if g is None:
-                    continue
-                if p.grad is None:
-                    p.grad = g.detach().clone()
-                else:
-                    p.grad.copy_(g)
+            
+            # Close the file descriptor - we'll use our own file operations
+            os.close(temp_fd)
+            temp_fd = None
+            
+            # Serialize and write to temporary file
+            serialized_obj = serialize_object(obj)
+            with open(temp_filepath, 'w') as f:
+                f.write(jsbeautifier.beautify(
+                    json.dumps(serialized_obj), 
+                    jsbeautifier.default_options()
+                ))
+            
+            # Atomic rename - this prevents race conditions
+            os.rename(temp_filepath, filepath)
+            temp_filepath = None  # Success - no cleanup needed
+            
+        except Exception as e:
+            # Cleanup temp file if something went wrong
+            if temp_fd is not None:
+                try:
+                    os.close(temp_fd)
+                except:
+                    pass
+            if temp_filepath is not None and os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except:
+                    pass
+            raise
+            
+    except Exception as e:
+        # Re-raise with filepath context for all errors
+        raise RuntimeError(f"Error saving JSON to {filepath}: {e}") from e
 
-        self.base_optim.step()
-        return {"alpha": alpha.detach(), "g_norm": (g_flat.norm().detach() if not use_upper_bound else torch.tensor(float('nan'), device=device))}
+class MultiPartOptimizer(BaseOptim):
 
+    def __init__(self, optimizer_cfgs: dict) -> None:
+        self.optimizers = {
+            name: build_from_config(optimizer_cfgs[name])
+            for name in optimizer_cfgs
+        }
+        super(MultiPartOptimizer, self).__init__()
+
+    def reset_buffer(self) -> None:
+        for name in self.optimizers:
+            self.optimizers[name].reset_buffer()
+
+    def backward(self, *args, **kwargs) -> Any:
+        raise NotImplementedError("MultiPartOptimizer.backward is unused and should not be called.")
+
+    # ====================================================================================================
+    # ====================================================================================================
+
+    def state_dict(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            name: self.optimizers[name].state_dict()
+            for name in self.optimizers
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Dict[str, Any]]) -> None:
+        for name in self.optimizers:
+            self.optimizers[name].load_state_dict(state_dict[name])
+
+    # ====================================================================================================
+    # ====================================================================================================
+
+    def summarize(self, output_path: Optional[str] = None) -> Dict[str, Any]:
+        r"""Summarize each optimizer.
+        """
+        result = {
+            name: self.optimizers[name].summarize(output_path=None)
+            for name in self.optimizers
+        }
+        if output_path is not None:
+            check_write_file(path=output_path)
+            save_json(obj=result, filepath=output_path)
+        return result
+
+
+
+class ProcrustesSolver:
+    @staticmethod
+    def apply(grads, scale_mode="min"):
+        assert (
+            len(grads.shape) == 3
+        ), f"Invalid shape of 'grads': {grads.shape}. Only 3D tensors are applicable"
+
+        with torch.no_grad():
+            cov_grad_matrix_e = grads.permute(0, 2, 1) @ grads
+            cov_grad_matrix_e = cov_grad_matrix_e.mean(0)
+
+            # singulars, basis = torch.symeig(cov_grad_matrix_e, eigenvectors=True) ***DEPRECATED***
+            singulars, basis = torch.linalg.eigh(
+                cov_grad_matrix_e
+            )  # singular is eigenvalue landa and basis is eigenvector V
+
+            tol = (
+                torch.max(singulars)
+                * max(cov_grad_matrix_e.shape[-2:])
+                * torch.finfo().eps
+            )
+
+            rank = sum(singulars > tol)
+            if rank == 0:
+                rank = 1
+
+            order = torch.argsort(singulars, dim=-1, descending=True)
+            singulars, basis = singulars[order][:rank], basis[:, order][:, :rank]
+
+            if scale_mode == "min":
+                weights = basis * torch.sqrt(singulars[-1]).view(1, -1)
+            elif scale_mode == "median":
+                weights = basis * torch.sqrt(torch.median(singulars)).view(1, -1)
+            elif scale_mode == "rmse":
+                weights = basis * torch.sqrt(singulars.mean())
+
+            weights = weights / torch.sqrt(singulars).view(1, -1)
+            weights = weights @ basis.T
+            grads = grads @ weights.unsqueeze(0)
+
+            return grads, weights, singulars
+
+class AlignedMTLOptimizer(GradientManipulationBaseOptimizer):
+    __doc__ = r"""Paper: Independent Component Alignment for Multi-Task Learning (https://arxiv.org/pdf/2305.19000.pdf)
+    """
+
+    def _gradient_manipulation_(
+        self,
+        grads_list: List[torch.Tensor],
+        shared_rep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            grads_list (List[torch.Tensor]): the list of 1D gradient tensors of each objective.
+            shared_rep (torch.Tensor): unused argument.
+        Returns:
+            result (torch.Tensor): the 1D manipulated gradient tensor.
+        """
+        # input checks
+        assert len(grads_list) == self.num_tasks, f"{len(grads_list)=}, {self.num_tasks=}"
+        # compute Gram matrix
+        gram_matrix = get_gram_matrix(grads_list)
+        # compute eigenvalues and eigenvectors
+        L, V = torch.linalg.eig(gram_matrix)
+        assert L.dtype == V.dtype == torch.complex64, f"{L.dtype=}, {V.dtype=}"
+        assert torch.all(L.imag == 0) and torch.all(V.imag == 0)
+        L = L.real
+        V = V.real
+        eps = 1e-10
+        L = torch.clamp(L, min=eps)
+        # compute balance matrix
+        sigma_min = L.min().sqrt()
+        balance_matrix = sigma_min * torch.matmul(V, torch.matmul(torch.diag(1/L.sqrt()), V.t()))
+        # compute final gradient
+        alpha = balance_matrix.mean(dim=1)
+        assert alpha.shape == (self.num_tasks,), f"{alpha.shape=}"
+        result = sum([grads_list[i] * alpha[i] for i in range(self.num_tasks)])
+        return result
+    
 # ---------------------------- Base Optimizer ----------------------------
 
 class AbsWeighting(nn.Module):
@@ -1165,282 +1738,800 @@ class WeightClipping(torch.optim.Optimizer):
                 p.data.clamp_(-group["beta"] * bound, group["beta"] * bound)
         return (clipped_sum / total_sum).item()
 
-# --------------------------------------------------------------
-# RiemannianMGDA — GPU two-pass, bias-corrected metric, low VRAM
-# --------------------------------------------------------------
 
+
+# ------------------------------- Metric --------------------------------------
+
+class EFDiagonalMetric:
+    """
+    EF-diagonal metric with a low-rank correction on the current task-gradient
+    subspace (LoRA-flavored). Uses Woodbury to apply inverse in O(P·r + r^2).
+    U is built on-the-fly from per-task grads J (no long-term memory).
+    """
+    def __init__(
+        self, params, beta=0.95, damping=1e-3, power=1.0, bias_correction=True,
+        tau=1.0, rank_cap=None, exclude_fn=None,
+        store_device=None, store_dtype=None
+    ):
+        self.params = [p for p in params if p.requires_grad and (exclude_fn is None or not exclude_fn(p))]
+        self.beta, self.damping, self.power = beta, damping, power
+        self.bias_correction, self.tau, self.rank_cap = bias_correction, tau, rank_cap
+        with torch.no_grad():
+            self._sizes = [p.numel() for p in self.params]
+            self._device = (self.params[0].device if self.params else torch.device('cpu'))
+            self._dtype  = (self.params[0].dtype  if self.params else torch.float32)
+            self.v = torch.zeros(sum(self._sizes), device=self._device, dtype=self._dtype)
+        self.t = 0
+        self._U = {}  # per-parameter {idx: U[n_i, r_i]}
+        self._U_device = store_device or self._device
+        self._U_dtype  = store_dtype or self._dtype
+
+    def _flatten_grads(self):
+        flats = []
+        for p in self.params:
+            g = p.grad
+            flats.append((torch.zeros_like(p) if g is None else g).reshape(-1))
+        return torch.cat(flats) if flats else torch.tensor([], device=self._device, dtype=self._dtype)
+
+    @torch.no_grad()
+    def update_from_grads(self):
+        g = self._flatten_grads()
+        if g.numel() == 0:
+            return
+        self.v.mul_(self.beta).addcmul_(g, g, value=(1.0 - self.beta))
+
+    def _vhat(self):
+        if not self.bias_correction or self.t == 0:
+            return self.v
+        bc = 1.0 - (self.beta ** self.t)
+        return self.v / bc
+
+    @torch.no_grad()
+    def update_task_subspace(self, J: torch.Tensor):
+        """
+        J: [T, P] per-task Euclidean grads, already computed by MGDA.
+        Build per-parameter U from columns of J (orthonormalized).
+        """
+        if J.numel() == 0:
+            self._U.clear()
+            return
+        T, P = J.shape
+        r_global = T if (self.rank_cap is None) else min(T, self.rank_cap)
+        # bias-correction clock tick for consistent denom
+        self.t += 1
+        vhat = self._vhat()
+        denom_full = (vhat + self.damping).clamp_min(1e-12)
+        if self.power != 1.0:
+            denom_full = denom_full.pow(self.power)
+
+        self._U.clear()
+        off = 0
+        for idx, p in enumerate(self.params):
+            n = p.numel()
+            Ji = J[:, off:off+n].T.contiguous()  # [n, T]
+            off += n
+            if n == 0:
+                continue
+            r = min(r_global, n, T)
+            if r == 0:
+                continue
+            Ji32 = Ji.to(dtype=torch.float32)
+            colnorm = torch.linalg.norm(Ji32, dim=0)
+            keep = (colnorm > 1e-12)
+            if keep.sum() == 0:
+                continue
+            Ji32 = Ji32[:, keep]
+            Q, _ = torch.linalg.qr(Ji32, mode='reduced')  # [n, <=T]
+            if Q.shape[1] == 0:
+                continue
+            U = Q[:, :r].to(device=self._U_device, dtype=self._U_dtype)  # [n, r]
+            self._U[idx] = U
+
+    # Fast flat inverse for MGDA (handles all params in one go)
+    def apply_inverse_flat(self, flat: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            vhat = self._vhat()
+            denom_full = (vhat + self.damping).clamp_min(1e-12)
+            if self.power != 1.0:
+                denom_full = denom_full.pow(self.power)
+
+        if flat.numel() == 0:
+            return flat
+
+        out = []
+        off_full = 0
+        off_d = 0
+        for idx, p in enumerate(self.params):
+            n = p.numel()
+            v = flat[off_full:off_full+n]
+            off_full += n
+            d = denom_full[off_d:off_d+n]
+            off_d += n
+
+            Dinvv = v / d
+            U = self._U.get(idx, None)
+            if U is None or U.numel() == 0 or self.tau == 0.0:
+                out.append(Dinvv)
+                continue
+
+            DinvU = U / d.reshape(-1, 1)                 # [n, r]
+            UtDinvU = U.T @ DinvU                        # [r, r]
+            UtDinvv = (U.T @ (v / d))                    # [r]
+            K = (1.0 / self.tau) * torch.eye(UtDinvU.shape[0], device=UtDinvU.device, dtype=UtDinvU.dtype) + UtDinvU
+            try:
+                sol = torch.linalg.solve(K, UtDinvv.unsqueeze(-1)).squeeze(-1)  # [r]
+            except RuntimeError:
+                sol = torch.linalg.lstsq(K, UtDinvv.unsqueeze(-1)).solution.squeeze(-1)
+            corr = DinvU @ sol
+            out.append(Dinvv - corr)
+
+        return torch.cat(out, dim=0)
+
+# ----------------------------- Utilities -------------------------------------
+
+def _gather_params(model: nn.Module) -> List[nn.Parameter]:
+    return [p for p in model.parameters() if p.requires_grad]
+
+
+def _flatten(vecs: Sequence[torch.Tensor]) -> torch.Tensor:
+    return torch.cat([v.reshape(-1) for v in vecs]) if vecs else torch.tensor([])
+
+
+def _split_like(flat: torch.Tensor, like: Sequence[nn.Parameter]) -> List[torch.Tensor]:
+    out, off = [], 0
+    for p in like:
+        n = p.numel()
+        out.append(flat[off:off+n].view_as(p))
+        off += n
+    return out
+
+
+def _egrad2rgrad(params: Sequence[nn.Parameter], grads: Sequence[torch.Tensor]) -> List[torch.Tensor]:
+    out = []
+    for p, g in zip(params, grads):
+        if hasattr(p, 'manifold') and hasattr(p.manifold, 'egrad2rgrad'):
+            out.append(p.manifold.egrad2rgrad(p.data, g))
+        else:
+            out.append(g)
+    return out
+
+
+def _retract(params: Sequence[nn.Parameter], step: Sequence[torch.Tensor], step_size: float):
+    for p, d in zip(params, step):
+        if hasattr(p, 'manifold') and hasattr(p.manifold, 'retr'):
+            p.data = p.manifold.retr(p.data, -step_size * d)
+        else:
+            p.data.add_(-step_size * d)
+
+# -------------------------- Implicit FW QP -----------------------------------
+class _FWImplicit:
+    """Frank–Wolfe for min_{α∈Δ} α^T M α using implicit Mα products.
+    Mα is computed by: t = Σ_j α_j g_j ; tn = M^{-1} t ; (Mα)_i = g_i^T tn.
+    Each FW iteration: O(T·P) time, O(P+T) memory.
+    """
+    def __init__(self, task_grads_flat: torch.Tensor, apply_minv: Callable[[torch.Tensor], torch.Tensor]):
+        """
+        task_grads_flat: Tensor of shape [T, P]
+        apply_minv: function that maps flat vector → M^{-1} * vector
+        """
+        self.Gs = task_grads_flat  # [T, P]
+        self.apply_minv = apply_minv
+        self.T, self.P = task_grads_flat.shape
+
+    def _M_alpha(self, alpha: torch.Tensor) -> torch.Tensor:
+        # t = Σ α_j g_j
+        t = alpha @ self.Gs  # [P]
+        tn = self.apply_minv(t)  # [P]
+        # (Mα)_i = g_i^T tn
+        return (self.Gs @ tn)  # [T]
+
+    def solve(self, alpha0: Optional[torch.Tensor] = None, max_iter: int = 50, tol: float = 1e-7) -> Tuple[torch.Tensor, Dict]:
+        device = self.Gs.device
+        if alpha0 is None:
+            alpha = torch.full((self.T,), 1.0 / self.T, device=device)
+        else:
+            alpha = (alpha0 / (alpha0.sum() + 1e-12)).clamp_min(0)
+        info = {'converged': False, 'iterations': 0, 'final_gap': None}
+        for k in range(max_iter):
+            Malpha = self._M_alpha(alpha)   # [T]
+            grad = 2.0 * Malpha            # ∇f(α) with f=α^T M α
+            kmin = int(torch.argmin(grad).item())
+            s = torch.zeros_like(alpha); s[kmin] = 1.0
+            d = s - alpha
+            # Dual gap ≈ -⟨grad, d⟩
+            gap = -(grad @ d)
+            if gap.abs().item() < tol:
+                info.update({'converged': True, 'iterations': k+1, 'final_gap': gap.item()})
+                break
+            # Exact line-search for quadratic: γ* = clip( - d^T M α / (d^T M d), [0,1] )
+            num = (d @ Malpha)
+            Md = self._M_alpha(d)
+            den = (d @ Md).clamp_min(1e-12)
+            gamma = (-num / den).clamp(0.0, 1.0)
+            alpha = (1 - gamma) * alpha + gamma * s
+            info['iterations'] = k+1
+            info['final_gap'] = gap.item()
+        # sanitize
+        alpha = alpha.clamp_min(0); alpha = alpha / (alpha.sum() + 1e-12)
+        return alpha, info
+
+# ----------------------------- Main Optimizer --------------------------------
+# ======================================================================
+# Module-level helper (SINGLE definition): Low-rank tangent subspace
+# ======================================================================
+
+class _LowRankTangentSubspace:
+    """
+    Maintain a per-parameter rank-r orthonormal tangent basis {B_p}.
+    Enables MGDA in rD without ever materializing J [T×P].
+    Memory ~ sum_p |p|·r + O(r^2), with r << min{T,P}.
+    """
+    def __init__(self, params: List[nn.Parameter], rank: int):
+        self.params = [p for p in params if p.requires_grad]
+        self.r = int(rank)
+        self.B: List[torch.Tensor] = []
+        for p in self.params:
+            Bp = torch.randn(*p.shape, self.r if p.numel() >= self.r else p.numel(),
+                 device=p.device, dtype=p.dtype)
+
+            self.B.append(self._orth(Bp, p))
+
+    @torch.no_grad()
+    def _orth(self, Bp: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        # Build an orthonormal basis with up to min(P, r) columns and pad to r
+        P = p.numel()
+        r = self.r
+        dim = min(P, r)
+        # Orthonormalize only the feasible block
+        Q, _ = torch.linalg.qr(Bp.reshape(P, dim), mode="reduced")  # [P, dim]
+        if dim < r:
+            Q_full = torch.zeros(P, r, device=Bp.device, dtype=Bp.dtype)
+            Q_full[:, :dim] = Q
+            return Q_full.reshape(*p.shape, r)
+        return Q.reshape_as(Bp)
+
+    @torch.no_grad()
+    def oja_update(self, avg_rgrads_per_param: List[torch.Tensor], eta: float = 0.05):
+        """
+        Streaming Oja: B_p += eta * ḡ_p * <ḡ_p, B_p>, then re-orthonormalize.
+        avg_rgrads_per_param aligned with self.params; each is a *tangent* grad.
+        """
+        for i, (p, Bp, gp) in enumerate(zip(self.params, self.B, avg_rgrads_per_param)):
+            if gp is None:
+                continue
+            coef = (gp.unsqueeze(-1) * Bp).reshape(-1, self.r).sum(dim=0)  # [r] = <ḡ_p, B_{p,·}>
+            Bp.add_(eta * gp.unsqueeze(-1) * coef.view(*([1] * gp.dim()), -1))
+            self.B[i] = self._orth(Bp, p)
+
+
+# ======================================================================
+# Clean RiemannianMGDA (memory-efficient)
+# ======================================================================
 
 class RiemannianMGDA:
     """
-    Multi-objective combiner for Geoopt-style Riemannian optimizers.
+    Memory-efficient Riemannian MGDA with EF-diag metric and optional low-rank tangent subspace.
 
-    Design:
-      • Pass 1: Build Gram H_ij = <g_i/v, g_j/v> over *shared params* using autograd.grad
-                (no .grad pollution, no full list of grads kept; only previous row vectors).
-      • Solve entropy-regularized MGDA on GPU to get alphas.
-      • Pass 2: Do ONE backward of sum(alpha' * loss_i) to realize g* = Σ alpha' g_i
-                (alpha' optionally blends with uniform, and/or uses EMA smoothing).
-
-    Benefits:
-      • All-GPU, AMP-safe (fp32 math for whitening & dots; final backward uses your AMP state)
-      • Bias-corrected Riemannian Adam metric (+ AMSGrad if enabled)
-      • Minimal memory: stores at most (m-1) whitened P-vectors transiently
-      • Optional periodic alpha refresh to cut Pass-1 overhead
-
-    Typical usage:
-        optimizer = RiemannianAdam(model.parameters(), lr=..., amsgrad=True)
-        mgda = RiemannianMGDA(optimizer,
-                              warmup_steps=150,
-                              cache_metric_every=20,
-                              entropy_reg=0.05,
-                              blend=0.1,
-                              alpha_update_period=1,   # set >1 to reuse alphas between refreshes
-                              alpha_ema=0.2,
-                              restrict_to_shared=False)
-        mgda.device = next(model.parameters()).device
-        mgda.get_share_params = lambda: tuple(shared_params)
-
-        optimizer.zero_grad(set_to_none=True)
-        alphas = mgda.backward([loss1, loss2, loss3, loss4])
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-        optimizer.step()
-
-    Notes:
-      • Define `self.get_share_params()` to return the tensors considered *shared* across tasks.
-      • If `restrict_to_shared=True`, non-shared grads are zeroed after the combined backward.
-        Otherwise, heads update normally with the α-weighted scalarized loss.
-      • `alpha_update_period > 1` reuses the last α for in-between steps (saves ~m backward calls).
+    • Subspace mode (subspace_rank>0): no T×P buffers; projects tasks to rD on the fly.
+    • EF-diagonal M^{-1} (cheap curvature), then Armijo along Retr (fast) or Exp (exact).
+    • Full-J path (subspace_rank=0) retained for exactness/compatibility.
+    • Armijo snapshot policy controls memory: 'full' (default), 'fp16', 'cpu', or 'none' (delta-tracking).
     """
-    # Public knobs (set in __init__)
-    def __init__(self,
-                 optimizer: Optimizer,
-                 eps: float = 1e-12,
-                 warmup_steps: int = 100,
-                 cache_metric_every: int = 10,
-                 entropy_reg: float = 0.0,
-                 blend: float = 0.0,
-                 max_pgd_iters: int = 12,
-                 pgd_lr: float = 0.3,
-                 pgd_tol: float = 1e-6,
-                 alpha_update_period: int = 1,
-                 alpha_ema: float = 0.0,
-                 restrict_to_shared: bool = False,
-                 profile: bool = False):
-        self.optimizer = optimizer
-        self.eps = float(eps)
-        self.warmup_steps = int(warmup_steps)
-        self.cache_metric_every = int(cache_metric_every)
-        self.entropy_reg = float(entropy_reg)
-        self.blend = float(blend)
-        self.max_pgd_iters = int(max_pgd_iters)
-        self.pgd_lr = float(pgd_lr)
-        self.pgd_tol = float(pgd_tol)
-        self.alpha_update_period = max(1, int(alpha_update_period))
-        self.alpha_ema = float(alpha_ema)
-        self.restrict_to_shared = bool(restrict_to_shared)
-        self.profile = bool(profile)
 
-        # Will be set by caller:
-        self.device = None
-        self.get_share_params = None  # must be set to a callable returning iterable of shared params
+    def __init__(
+        self,
+        model: nn.Module,
+        base_optim: Optional[torch.optim.Optimizer] = None,
+        *,
+        metric: Optional[EFDiagonalMetric] = None,
+        fw_max_iter: int = 50,
+        fw_tol: float = 1e-7,
+        armijo_enabled: bool = True,
+        armijo_c: float = 1e-4,
+        armijo_beta: float = 0.5,
+        armijo_max_tries: int = 10,
+        normalize_task_grads: bool = False,
+        max_nat_grad_norm: Optional[float] = None,
+        verbose: bool = False,
+        subspace_rank: int = 0,
+        subspace_oja_eta: float = 0.05,
+        use_expmap: bool = False,
+        armijo_snapshot_policy: str = "full",  # 'full' | 'fp16' | 'cpu' | 'none' (delta)
+        use_minv_in_subspace: bool = False,    # whiten FW in rD by B^T M^{-1} B (Cholesky)
+        rank_adapt_enabled: bool = False,
+        rank_variance_threshold: float = 0.95,   # explained variance target
+        rank_hysteresis: int = 2,                # min Δr to trigger a resize
+        rank_cooldown: int = 20,                 # steps between resize attempts
+        rank_min: int = 8,
+        rank_max: int = 128,
+        ewma_decay: float = 0.9
+    ):
+        self.model = model
+        self.params: List[nn.Parameter] = _gather_params(model)
+        self.base_optim = base_optim
+        self.metric = metric if metric is not None else EFDiagonalMetric(self.params)
 
-        # Internal state
-        self._step = 0
-        self._metric_cache = None   # flat GPU diag (float32)
-        self._alpha_cache = None    # last α (torch float32 on device)
-        self.last_profile = {}
+        self.fw_max_iter = fw_max_iter
+        self.fw_tol = fw_tol
 
-    # ---------- helpers: bias-corrected diag metric from optimizer state ----------
-    @torch.no_grad()
-    def _compute_diag_from_optimizer(self, share, device):
-        chunks = []
-        for p in share:
-            st = self.optimizer.state.get(p, {})
-            if not st:
-                diag = torch.ones_like(p, device=device, dtype=torch.float32)
-                chunks.append(diag.reshape(-1)); continue
+        self.armijo_enabled = armijo_enabled
+        self.armijo_c = armijo_c
+        self.armijo_beta = armijo_beta
+        self.armijo_max_tries = armijo_max_tries
 
-            # find param group
-            group = None
-            for g in self.optimizer.param_groups:
-                if p in g['params']:
-                    group = g; break
-            beta2 = group['betas'][1] if group and 'betas' in group else 0.999
-            amsgrad = bool(group.get('amsgrad', False)) if group else False
+        self.normalize_task_grads = normalize_task_grads
+        self.max_nat_grad_norm = max_nat_grad_norm
+        self.verbose = verbose
 
-            v = st.get('max_exp_avg_sq', None) if amsgrad else st.get('exp_avg_sq', None)
-            if v is None:
-                diag = torch.ones_like(p, device=device, dtype=torch.float32)
-                chunks.append(diag.reshape(-1)); continue
+        self._alpha_prev: Optional[torch.Tensor] = None
 
-            step = int(st.get('step', 0))
-            bc2 = 1.0 - (beta2 ** step) if step > 0 else 1.0
-            vhat = (v.detach().to(device=device, dtype=torch.float32)) / max(bc2, 1e-16)
-            diag = vhat.sqrt_().add_((self.eps))
-            chunks.append(diag.reshape(-1))
+        # Subspace controls
+        self.subspace_rank = int(subspace_rank)
+        self.subspace_oja_eta = float(subspace_oja_eta)
+        self.use_expmap = bool(use_expmap)
+        self.armijo_snapshot_policy = str(armijo_snapshot_policy)
+        self.use_minv_in_subspace = bool(use_minv_in_subspace)
 
-        return torch.cat(chunks) if chunks else torch.tensor([], device=device, dtype=torch.float32)
+        self.rank_adapt_enabled = bool(rank_adapt_enabled)
+        self.rank_variance_threshold = float(rank_variance_threshold)
+        self.rank_hysteresis = int(rank_hysteresis)
+        self.rank_cooldown = int(rank_cooldown)
+        self.rank_min = int(rank_min)
+        self.rank_max = int(rank_max)
+        self.ewma_decay = float(ewma_decay)
 
-    @torch.no_grad()
-    def _riemann_diag(self, share, device):
-        total = sum(p.numel() for p in share)
-        if total == 0:
-            return torch.tensor([], device=device, dtype=torch.float32)
-        # warmup with identity
-        if self._step < self.warmup_steps:
-            if (self._metric_cache is None) or (self._metric_cache.numel() != total):
-                self._metric_cache = torch.ones(total, device=device, dtype=torch.float32)
-            return self._metric_cache
-        # cache every K steps
-        if (self._metric_cache is None) or (self._step % self.cache_metric_every == 0):
-            self._metric_cache = self._compute_diag_from_optimizer(share, device)
-        return self._metric_cache
+        self._step_idx = 0
+        self._rank_cooldown_left = 0
+        self._Cr = None
+        self._subspace: Optional[_LowRankTangentSubspace] = (
+            _LowRankTangentSubspace(self.params, self.subspace_rank) if self.subspace_rank > 0 else None
+        )
 
-    # ---------- simplex optimization (entropy-regularized MGDA) ----------
-    @torch.no_grad()
-    def _project_to_simplex_(self, a):
-        if a.numel() == 1:
-            a.fill_(1.); return a
-        u, _ = torch.sort(a, descending=True)
-        cssv = torch.cumsum(u, 0) - 1
-        ind = torch.arange(1, a.numel() + 1, device=a.device)
-        cond = u - cssv / ind > 0
-        rho = ind[cond][-1]
-        theta = cssv[rho - 1] / rho
-        a.sub_(theta).clamp_(min=0)
-        s = a.sum()
-        if s.abs() > 1e-6: a.div_(s)
-        return a
+        # internal state for delta-tracking Armijo
+        self._armijo_gamma_acc: float = 0.0  # only used when snapshot_policy == 'none'
+
+        # Telemetry for rank adaptation
+        self._last_rank_stats = {}
 
     @torch.no_grad()
-    def _solve_alphas_from_H(self, H):
-        m = H.size(0)
-        if m == 1:
-            return torch.ones(1, device=H.device, dtype=torch.float32)
-        lam = self.entropy_reg
-
-        # closed-form for m=2, lam=0
-        if m == 2 and lam <= 0:
-            g1g1, g1g2, g2g2 = H[0,0], H[0,1], H[1,1]
-            den = (g1g1 - 2*g1g2 + g2g2).clamp_min(self.eps)
-            a1 = torch.clamp((g1g1 - g1g2) / den, 0.0, 1.0)
-            return torch.stack([a1, 1. - a1])
-
-        # PGD on simplex, entropy-regularized if lam>0
-        a = torch.full((m,), 1.0/m, device=H.device, dtype=torch.float32)
-        last_obj = inf
-        for _ in range(self.max_pgd_iters):
-            grad = H @ a
-            if lam > 0:
-                grad = grad - lam * (1.0 + torch.log(a.clamp_min(1e-12)))
-            a = a - self.pgd_lr * grad
-            self._project_to_simplex_(a)
-            obj = 0.5 * (a @ (H @ a))
-            if lam > 0:
-                obj = obj - lam * torch.sum(torch.log(a.clamp_min(1e-12)))
-            rel = abs((obj - last_obj) / (abs(last_obj) + 1e-12))
-            if rel < self.pgd_tol: break
-            last_obj = obj
-        return a
-
-    @torch.no_grad()
-    def _ema_on_simplex(self, a_new, a_old, beta):
-        """EMA on simplex, then re-project to simplex to avoid drift."""
-        if a_old is None or beta <= 0: return a_new
-        a = beta * a_old + (1.0 - beta) * a_new
-        return self._project_to_simplex_(a)
-
-    # ---------- main entry ----------
-    def backward(self, losses, shared_params_fn=None, alpha_prior: torch.Tensor = None):
+    def _rank_adapt_update_cov(self, tilde_G: torch.Tensor):
         """
-        Compute/refresh α if needed (Pass 1), then do a single backward of
-        Σ alpha' * L_i (Pass 2). Returns α (pre-blend, post-EMA) as numpy.
-
-        alpha_prior (optional): length-m tensor on self.device with nonnegative entries;
-        it will be combined as: a <- project_to_simplex( (1-λ)a + λ * prior_normalized ).
-        For most use cases, prefer 'entropy_reg' and/or 'blend' first.
+        Update EWMA covariance in rD: C_r ← ρ C_r + (1-ρ) * cov(tilde_G).
+        tilde_G: [T, r]
         """
-        assert self.device is not None, "Set `mgda.device = model.device`"
-        assert callable(self.get_share_params) or callable(shared_params_fn), \
-            "Provide mgda.get_share_params or pass shared_params_fn"
-        get_shared = shared_params_fn if shared_params_fn is not None else self.get_share_params
+        if not self.rank_adapt_enabled or self._subspace is None:
+            return
+        r = self._subspace.r
+        if tilde_G.numel() == 0:
+            return
+        # Use zero-mean covariance in rD (cheap, stable)
+        Z = tilde_G - tilde_G.mean(dim=0, keepdim=True)          # [T, r]
+        C = (Z.T @ Z) / max(1, Z.shape[0])                       # [r, r]
+        if self._Cr is None or self._Cr.shape != C.shape:
+            self._Cr = C.clone()
+        else:
+            self._Cr.mul_(self.ewma_decay).add_((1.0 - self.ewma_decay) * C)
 
-        self._step += 1
-        device = self.device
-        share = list(get_shared())
-        m = len(losses)
+    @torch.no_grad()
+    def _maybe_rank_adapt(self):
+        """
+        Decide whether to resize the subspace this step, using EWMA covariance _Cr.
+        Applies hysteresis + cooldown. Resize happens at the END of step (affects next step).
+        """
+        if not self.rank_adapt_enabled or self._subspace is None or self._Cr is None:
+            return
+        if self._rank_cooldown_left > 0:
+            self._rank_cooldown_left -= 1
+            return
 
-        # trivial case
-        if not share or m == 0:
-            combined = sum(losses) if m > 0 else 0.0
-            if torch.is_tensor(combined):
-                combined.backward()
-            return np.ones(m, dtype=np.float32) / max(1, m)
+        # eigenvalues in descending order
+        evals, evecs = torch.linalg.eigh(self._Cr)
+        idx = torch.argsort(evals, descending=True)
+        evals = evals[idx].clamp_min(0)
+        evecs = evecs[:, idx]  # r×r
 
-        # Decide if we refresh alphas this step
-        refresh_alpha = (self._alpha_cache is None) or (self._step % self.alpha_update_period == 1)
+        total = evals.sum().clamp_min(1e-12)
+        csum = torch.cumsum(evals, dim=0) / total
+        new_r = int((csum < self.rank_variance_threshold).sum().item()) + 1
+        new_r = int(max(self.rank_min, min(self.rank_max, new_r)))
+        old_r = self._subspace.r
 
-        if refresh_alpha:
-            # ---- Pass 1: build H on GPU without keeping all grads ----
-            vflat = self._riemann_diag(share, device)  # [P] float32
-            H = torch.zeros(m, m, device=device, dtype=torch.float32)
-            ghat_prev = []  # keep at most (i) whitened vectors
+        if abs(new_r - old_r) < self.rank_hysteresis:
+            return  # ignore tiny oscillations
 
-            for i, loss in enumerate(losses):
-                grads = torch.autograd.grad(loss, share, retain_graph=True,
-                                            create_graph=False, allow_unused=True)
-                flat = []
-                for p, g in zip(share, grads):
-                    if g is None: g = torch.zeros_like(p)
-                    flat.append(g.reshape(-1).to(torch.float32))
-                gflat = torch.cat(flat) if flat else torch.tensor([], device=device, dtype=torch.float32)
-                ghat_i = gflat / vflat
+        # Resize basis: rotate by evecs then crop/extend
+        self._resize_subspace(new_r, evecs)
+        # Reset EWMA to the new size
+        self._Cr = None
+        self._rank_cooldown_left = self.rank_cooldown
+        self._last_rank_stats = {'old_r': old_r, 'new_r': new_r, 'trace': float(total), 'r_eff': int((csum < self.rank_variance_threshold).sum().item()+1), 'cooldown_left': int(self._rank_cooldown_left)}
+        self._rank_cooldown_left = self.rank_cooldown
 
-                H[i, i] = torch.dot(ghat_i, ghat_i)
-                for j in range(i):
-                    hij = torch.dot(ghat_i, ghat_prev[j])
-                    H[i, j] = hij
-                    H[j, i] = hij
-                ghat_prev.append(ghat_i)
+    @torch.no_grad()
+    def _resize_subspace(self, new_r: int, evecs: torch.Tensor):
+        """
+        Rotate current basis B by evecs (align to principal dirs) and resize to new_r.
+        evecs: [r_old, r_old] from _Cr eigendecomposition.
+        """
+        sub = self._subspace
+        r_old = sub.r
+        assert evecs.shape[0] == r_old
+        # rotate existing basis: Bp ← Bp @ evecs
+        for i, Bp in enumerate(sub.B):
+            sub.B[i] = (Bp @ evecs).contiguous()  # [..., r_old]
+        if new_r < r_old:
+            # shrink: drop trailing columns, then re-orth for safety
+            for i, Bp in enumerate(sub.B):
+                sub.B[i] = self._orth_columns(Bp[..., :new_r])
+        elif new_r > r_old:
+            extra = new_r - r_old
+            for i, Bp in enumerate(sub.B):
+                sub.B[i] = self._extend_with_orth(Bp, extra)  # add orthonormal complement
+        sub.r = new_r
 
-            # Solve MGDA (entropy-regularized if entropy_reg>0)
-            a = self._solve_alphas_from_H(H)
+    @torch.no_grad()
+    def _orth_columns(self, Bp: torch.Tensor) -> torch.Tensor:
+        # Orthonormalize last-dim columns; robust when last-dim > P
+        P = Bp.numel() // Bp.shape[-1]
+        r = Bp.shape[-1]
+        dim = min(P, r)
+        Q, _ = torch.linalg.qr(Bp[..., :dim].reshape(P, dim), mode="reduced")  # [P, dim]
+        if dim < r:
+            Q_full = torch.zeros(P, r, device=Bp.device, dtype=Bp.dtype)
+            Q_full[:, :dim] = Q
+            return Q_full.reshape_as(Bp)
+        return Q.reshape_as(Bp)
 
-            # Optional prior bias on simplex (small λ recommended)
-            if alpha_prior is not None:
-                prior = alpha_prior.to(device=device, dtype=torch.float32).clamp_min(0)
-                if prior.sum() > 0:
-                    prior = prior / prior.sum()
-                    # small blend toward prior (use entropy_reg first; keep this weak)
-                    lam_prior = min(0.1, self.entropy_reg + 1e-8)  # safe default
-                    a = self._project_to_simplex_( (1.0 - lam_prior) * a + lam_prior * prior )
+    @torch.no_grad()
+    def _extend_with_orth(self, Bp: torch.Tensor, k: int) -> torch.Tensor:
+        """
+        Extend basis with k columns, respecting the ambient limit P.
+        When P < desired columns, pad remaining with zeros to keep shape consistent.
+        """
+        shape = list(Bp.shape); r = shape[-1]
+        P = Bp.numel() // r
+        # Existing orth block
+        r_eff = min(P, r)
+        Q, _ = torch.linalg.qr(Bp[..., :r_eff].reshape(P, r_eff), mode="reduced")  # [P, r_eff]
+        # How many *new* orth dirs can the space actually hold?
+        k_eff = max(min(k, P - r_eff), 0)
+        Q_add = torch.zeros(P, 0, device=Bp.device, dtype=Bp.dtype)
+        if k_eff > 0:
+            R_add = torch.randn(P, k_eff, device=Bp.device, dtype=Bp.dtype)
+            R_add = R_add - Q @ (Q.T @ R_add)                      # project out current span
+            Q_add, _ = torch.linalg.qr(R_add, mode="reduced")      # [P, k_eff]
+        # Assemble full (possibly zero-padded) block to reach r + k columns
+        B_full = torch.zeros(P, r + k, device=Bp.device, dtype=Bp.dtype)
+        B_full[:, :r_eff] = Q
+        if k_eff > 0:
+            B_full[:, r_eff:r_eff + k_eff] = Q_add
+        return B_full.reshape(*shape[:-1], r + k)
 
-            # EMA smooth across steps (on simplex)
-            a = self._ema_on_simplex(a, self._alpha_cache, self.alpha_ema)
-            self._alpha_cache = a.detach()  # cache on device (float32)
 
-        # ---- Pass 2: single scalarized backward with blend safeguard ----
-        a_used = self._alpha_cache
-        if self.blend > 0.0:
-            a_used = (1.0 - self.blend) * a_used + self.blend * (1.0 / m)
-            self._project_to_simplex_(a_used)  # keep on simplex after blend
+    # -------------------- Metric inverse & grad assignment --------------------
 
-        # zero grads on shared only (avoid mixing from prior calls)
-        for p in share:
-            if p.grad is not None:
-                p.grad = None
+    def _apply_minv_flat(self, flat: torch.Tensor) -> torch.Tensor:
+        """
+        Apply M^{-1} to a flattened vector (EF-diag or fallback metric).
+        Optionally clip nat-grad norm.
+        """
+        if hasattr(self.metric, "apply_inverse_flat"):
+            v = self.metric.apply_inverse_flat(flat)
+        else:
+            pieces, off = [], 0
+            for p in self.params:
+                n = p.numel()
+                v_p = flat[off:off+n].view_as(p)
+                off += n
+                pieces.append(self.metric.apply_inverse(v_p))
+            v = _flatten(pieces)
 
-        combined = torch.zeros((), device=device, dtype=torch.float32)
-        for ai, li in zip(a_used, losses):
-            combined = combined + (ai * li)
-        combined.backward()
+        if self.max_nat_grad_norm is not None and self.max_nat_grad_norm > 0:
+            nrm = torch.norm(v)
+            if float(nrm) > self.max_nat_grad_norm:
+                v = v * (self.max_nat_grad_norm / (nrm + 1e-12))
+        return v
 
-        # optionally zero non-shared grads (keep only shared updates)
-        if self.restrict_to_shared:
-            shared_ids = {id(p) for p in share}
-            for group in self.optimizer.param_groups:
-                for p in group['params']:
-                    if id(p) not in shared_ids and p.grad is not None:
-                        p.grad.zero_()
+    def _assign_grad(self, flat_nat: torch.Tensor):
+        off = 0
+        for p in self.params:
+            n = p.numel()
+            p.grad = flat_nat[off:off+n].view_as(p).clone()
+            off += n
 
-        return self._alpha_cache.detach().float().cpu().numpy()
+    # -------------------- rD Frank–Wolfe (quadratic) --------------------
+
+    @staticmethod
+    def _fw_mgda_rd(tilde_G: torch.Tensor, alpha0: Optional[torch.Tensor], iters: int = 10, tol: float = 1e-7):
+        """
+        Solve:  min_{alpha in Δ_T} || tilde_G^T alpha ||^2
+        tilde_G: [T, r] (task grads projected into rD subspace).
+        """
+        device, T = tilde_G.device, tilde_G.shape[0]
+        G = tilde_G
+        gnorm2 = (G**2).sum(dim=1)
+
+        if alpha0 is None or alpha0.numel() != T:
+            i0 = torch.argmin(gnorm2)
+            alpha = torch.zeros(T, device=device, dtype=G.dtype); alpha[i0] = 1.0
+        else:
+            alpha = alpha0.clone().to(device)
+
+        v = alpha @ G  # current combination in rD
+        for _ in range(iters):
+            dot = G @ v          # [T], entries = <g_t, v>
+            j = torch.argmin(dot)
+            s = torch.zeros_like(alpha); s[j] = 1.0
+            d = (s - alpha) @ G  # FW direction in rD
+            denom = (d*d).sum()
+            if float(denom) <= 1e-16:
+                break
+            numer = (v * d).sum()
+            gamma = torch.clamp(numer / denom, 0.0, 1.0)
+            if float(gamma) <= tol:
+                break
+            alpha = (1 - gamma) * alpha + gamma * s
+            v = (1 - gamma) * v + gamma * (G[j])
+        return alpha, {'converged': True, 'final_gap': float((G @ v).min())}
+
+    # -------------------- Subspace mass (optional whitening) --------------------
+
+    def _subspace_mass_minv(self) -> torch.Tensor:
+        """
+        Build B^T M^{-1} B (r×r), applying EF-diag inverse to each basis column.
+        """
+        assert self._subspace is not None
+        r = self._subspace.r
+        cols_nat = []
+        for j in range(r):
+            # collect j-th column per param, flatten and apply M^{-1}
+            col_p = [(Bp[..., j]) for Bp in self._subspace.B]
+            col_flat = _flatten(col_p)
+            cols_nat.append(self._apply_minv_flat(col_flat))
+        # Stack nat-space columns and form Gram
+        Mnat = torch.stack(cols_nat, dim=1)     # [P, r]
+        return Mnat.t().contiguous() @ Mnat     # [r, r]
+
+    # -------------------- Streaming projection (no T×P buffers) --------------------
+
+    def _project_tasks_streaming(self, task_losses: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Returns:
+          tilde_G: [T, r] task projections onto current basis
+          avg_rgrads: list (per-param) average tangent grads for Oja
+
+        Per-task grads are computed once, projected immediately, and released.
+        Peak memory: O(P + rT). No J [T×P] ever.
+        """
+        assert self._subspace is not None
+        T, r = len(task_losses), self._subspace.r
+        device = self.params[0].device
+        dtype = self.params[0].dtype
+
+        tilde_G = torch.zeros(T, r, device=device, dtype=dtype)
+        sum_rgrads = [torch.zeros_like(p) for p in self._subspace.params]
+
+        for t, Li in enumerate(task_losses):
+            grads = torch.autograd.grad(Li, self.params, retain_graph=(t < T-1), create_graph=False, allow_unused=True)
+            rgrads = _egrad2rgrad(self.params, [(g if g is not None else torch.zeros_like(p))
+                                                for g, p in zip(grads, self.params)])
+
+            if self.normalize_task_grads:
+                denom = (torch.cat([g.reshape(-1) for g in rgrads]).norm() + 1e-12)
+                if float(denom) > 0:
+                    rgrads = [g / denom for g in rgrads]
+
+            acc = torch.zeros(r, device=device, dtype=dtype)
+            for Bp, gp in zip(self._subspace.B, rgrads):
+                acc += (gp.unsqueeze(-1) * Bp).reshape(-1, r).sum(dim=0)
+            tilde_G[t] = acc
+
+            for i in range(len(sum_rgrads)):
+                sum_rgrads[i].add_(rgrads[i])
+
+            del grads, rgrads  # free ASAP
+
+        avg_rgrads = [g / max(T, 1) for g in sum_rgrads]
+        return tilde_G, avg_rgrads
+
+    # -------------------- Full-J path (kept for exactness) --------------------
+
+    def _collect_task_grads_flat(self, task_losses: Sequence[torch.Tensor]) -> torch.Tensor:
+        flats = []
+        T = len(task_losses)
+        for i, Li in enumerate(task_losses):
+            grads = torch.autograd.grad(Li, self.params, retain_graph=(i < T-1), create_graph=False, allow_unused=True)
+            g = [(gi if gi is not None else torch.zeros_like(p)) for gi, p in zip(grads, self.params)]
+            flats.append(_flatten(_egrad2rgrad(self.params, g)))
+        return torch.stack(flats, dim=0)  # [T, P]
+
+    # -------------------- Armijo snapshot helpers --------------------
+
+    def _make_snapshot(self):
+        pol = self.armijo_snapshot_policy.lower()
+        if pol == "none":     # delta-tracking (approximate)
+            return None
+        if pol == "cpu":
+            return [p.data.detach().cpu().clone() for p in self.params]
+        if pol == "fp16":
+            return [p.data.detach().to(dtype=torch.float16).clone() for p in self.params]
+        # default full-precision GPU
+        return [p.data.detach().clone() for p in self.params]
+
+    def _restore_snapshot(self, saved):
+        if saved is None:
+            return
+        for p, s in zip(self.params, saved):
+            if s.device.type != p.data.device.type or s.dtype != p.data.dtype:
+                p.data.copy_(s.to(device=p.data.device, dtype=p.data.dtype))
+            else:
+                p.data.copy_(s)
+
+    # -------------------- Curve stepping (Retr or Exp) --------------------
+
+    def _apply_curve_step(self, tangent_list: List[torch.Tensor], gamma: float):
+        """
+        Apply θ ← curve(θ, -γ d) for each param:
+          - if use_expmap and manifold.expmap exists → Exp
+          - else → Retraction
+        """
+        if self.use_expmap:
+            for p, d in zip(self.params, tangent_list):
+                if hasattr(p, 'manifold') and hasattr(p.manifold, 'expmap'):
+                    p.data = p.manifold.expmap(p.data, -gamma * d)
+                else:
+                    p.data.add_(-gamma * d)  # Euclidean fallback
+        else:
+            _retract(self.params, tangent_list, gamma)
+
+    # -------------------- One MGDA step --------------------
+
+    def step(
+        self,
+        task_losses: Sequence[torch.Tensor],
+        closure: Optional[Callable[[], Sequence[torch.Tensor]]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        T = len(task_losses)
+        losses_vec = torch.stack([li.detach() for li in task_losses])
+
+
+        avg_rgrads = None  # for Oja update if subspace is active
+# === A) Build MGDA system either in rD (subspace) or full P ===
+        if self._subspace is not None:
+            tilde_G, avg_rgrads = self._project_tasks_streaming(task_losses)
+
+
+
+            # Update EWMA covariance for rank adaptation
+            if self.rank_adapt_enabled:
+                self._rank_adapt_update_cov(tilde_G)
+# Optional: whiten subspace by B^T M^{-1} B for faithful rD geometry
+            if self.use_minv_in_subspace:
+                S = self._subspace_mass_minv()  # r×r
+                R = torch.linalg.cholesky(S + 1e-8 * torch.eye(S.shape[0], device=S.device, dtype=S.dtype))
+                RinvT = torch.cholesky_inverse(R).t()  # (R^T)^{-1}
+                G_hat = tilde_G @ RinvT            # [T, r]
+                alpha0 = self._alpha_prev if (self._alpha_prev is not None and self._alpha_prev.numel()==T) else None
+                alpha, fw_info = self._fw_mgda_rd(G_hat, alpha0, iters=self.fw_max_iter, tol=self.fw_tol)
+                self._alpha_prev = alpha.detach().clone()
+                v_r = alpha @ G_hat
+                v_r = torch.linalg.solve(R.t(), v_r)  # back to original subspace
+            else:
+                alpha0 = self._alpha_prev if (self._alpha_prev is not None and self._alpha_prev.numel()==T) else None
+                alpha, fw_info = self._fw_mgda_rd(tilde_G, alpha0, iters=self.fw_max_iter, tol=self.fw_tol)
+                self._alpha_prev = alpha.detach().clone()
+                v_r = alpha @ tilde_G
+
+            # Lift to full tangent direction and apply M^{-1}
+            d_tangent = [(Bp * v_r.view(*([1]*(Bp.dim()-1)), -1)).sum(dim=-1) for Bp in self._subspace.B]
+            g_euc = _flatten(d_tangent)
+            g_nat = self._apply_minv_flat(g_euc)
+            self._assign_grad(g_nat)
+        else:
+            # Exact, full-J branch (kept for parity)
+            J = self._collect_task_grads_flat(task_losses)  # [T, P]
+            if hasattr(self.metric, "update_task_subspace"):
+                self.metric.update_task_subspace(J)
+            fw = _FWImplicit(J, self._apply_minv_flat)
+            alpha0 = self._alpha_prev if (self._alpha_prev is not None and self._alpha_prev.numel()==T) else None
+            alpha, fw_info = fw.solve(alpha0, max_iter=self.fw_max_iter, tol=self.fw_tol)
+            self._alpha_prev = alpha.detach().clone()
+            g_euc = alpha @ J
+            g_nat = self._apply_minv_flat(g_euc)
+            self._assign_grad(g_nat)
+
+        # === B) Armijo line search along Retr/Exp on f(θ)=Σ α_i ℓ_i(θ) ===
+        logs: Dict[str, torch.Tensor] = {}
+        if self.armijo_enabled and (closure is not None):
+            f0 = float((alpha * losses_vec).sum())
+            # directional derivative with natural direction; sign for -d step
+            dirderiv = float(g_euc @ g_nat)  # <∇f, d>
+            if dirderiv <= 0:  # already descent-violating; take tiny step
+                gamma = 1e-3
+                tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
+                self._apply_curve_step(tangent, gamma)
+            else:
+                gamma = 1.0
+                saved = self._make_snapshot()
+                ok = False
+                self._armijo_gamma_acc = 0.0  # for delta mode
+
+                for _ in range(self.armijo_max_tries):
+                    if saved is not None:
+                        # restore baseline (exact) then try step
+                        self._restore_snapshot(saved)
+                        tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
+                        self._apply_curve_step(tangent, gamma)
+                    else:
+                        # delta-tracking (approximate): apply delta from current accumulated gamma
+                        delta = gamma - self._armijo_gamma_acc
+                        tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
+                        self._apply_curve_step(tangent, delta)
+                        self._armijo_gamma_acc = gamma
+
+                    new_losses = torch.stack([li.detach() for li in closure()])
+                    f_new = float((alpha * new_losses).sum())
+                    # Armijo: f(new) <= f0 - c*gamma*dirderiv
+                    if f_new <= f0 - self.armijo_c * gamma * dirderiv:
+                        losses_vec = new_losses
+                        ok = True
+                        break
+
+                    # backtrack
+                    if saved is None:
+                        # delta mode: revert delta approximately
+                        tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
+                        self._apply_curve_step(tangent, - (gamma - self._armijo_gamma_acc))
+                        # (armijo_gamma_acc already equals gamma; set after revert)
+                        self._armijo_gamma_acc = 0.0
+                    gamma *= self.armijo_beta
+
+                if not ok:
+                    # final tiny step from exact baseline
+                    if saved is not None:
+                        self._restore_snapshot(saved)
+                    tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
+                    self._apply_curve_step(tangent, 1e-3)
+
+            logs['armijo_gamma'] = torch.tensor(gamma)
+        else:
+            # No line-search: base optimizer or unit retraction
+            if self.base_optim is not None:
+                self.base_optim.step()
+            else:
+                tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
+                self._apply_curve_step(tangent, 1.0)
+
+        # === C) Update EF-diag stats from current .grad ===
+        if hasattr(self.metric, "update_from_grads"):
+            self.metric.update_from_grads()
+
+        # === D) Rank adaptation and Oja update (after parameter update) ===
+        if self.rank_adapt_enabled:
+            self._maybe_rank_adapt()
+        if self._subspace is not None and avg_rgrads is not None:
+            # Refresh Oja basis with averaged tangent grads (respects any new r)
+            try:
+                self._subspace.oja_update(avg_rgrads, eta=self.subspace_oja_eta)
+            except Exception:
+                pass
+
+        # Logs
+
+        # Attach rank telemetry if available
+        if self._subspace is not None:
+            logs['rank'] = torch.tensor(int(self._subspace.r))
+        if getattr(self, '_last_rank_stats', None):
+            for k, v in self._last_rank_stats.items():
+                # Use tensors for numeric values for consistency
+                if isinstance(v, (int, float)):
+                    logs[f'rank_{k}'] = torch.tensor(v)
+        logs.update({
+            'alpha': alpha.detach().cpu(),
+            'losses': losses_vec.detach().cpu(),
+            'agg_grad_norm_euc': torch.norm(g_euc).detach().cpu(),
+            'agg_grad_norm_nat': torch.norm(g_nat).detach().cpu(),
+            'fw_converged': torch.tensor(1 if fw_info.get('converged', False) else 0),
+            'fw_gap': torch.tensor(fw_info.get('final_gap', float('inf'))),
+        })
+        return logs

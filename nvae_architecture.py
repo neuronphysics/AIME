@@ -162,7 +162,10 @@ class DecoderResidualBlock(nn.Module):
                     nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
                 )
             )
-            blocks.append(nn.BatchNorm2d(out_channels))
+            #blocks.append(nn.BatchNorm2d(out_channels))
+            num_groups = min(32, out_channels) if out_channels % 8 == 0 else out_channels // 4 if out_channels > 4 else 1
+            blocks.append(nn.GroupNorm(num_groups, out_channels))
+ 
             blocks.append(Swish())
             current_channels = out_channels
         else:
@@ -302,7 +305,7 @@ class VAEEncoder(nn.Module):
         skip_connections = []
         for block in self.encoder_blocks:
             if self.use_checkpoint and self.training:
-                h = torch.utils.checkpoint.checkpoint(block, h, use_reentrant=False)
+                h = torch.utils.checkpoint.checkpoint(block, h, use_reentrant=False, preserve_rng_state=True)
             else:
                 h = block(h)
             skip_connections.append(h)
@@ -315,11 +318,11 @@ class VAEEncoder(nn.Module):
         if self.use_checkpoint and self.training:
             # Checkpoint the MLP computation
             self.hlayer = torch.utils.checkpoint.checkpoint(
-                self.mlp, h, use_reentrant=False
+                self.mlp, h, use_reentrant=False, preserve_rng_state=True
             )
             # Checkpoint the projection to mean/logvar
             mean_logvar = torch.utils.checkpoint.checkpoint(
-                self.proj, self.hlayer, use_reentrant=False
+                self.proj, self.hlayer, use_reentrant=False, preserve_rng_state=True
             )
         else:
             self.hlayer = self.mlp(h)
@@ -576,7 +579,7 @@ class MDLHead(nn.Module):
             return torch.utils.checkpoint.checkpoint(
                 _nll_core, x, logit_probs, means, log_scales, 
                 torch.zeros(1, device=x.device) if coeffs is None else coeffs,
-                use_reentrant=False
+                use_reentrant=False, preserve_rng_state=True
             )
         else:
             return _nll_core(x, logit_probs, means, log_scales, coeffs)
@@ -599,7 +602,7 @@ class VAEDecoder(nn.Module):
     ):
         super().__init__()
         self.downsample = downsample
-        
+        self.use_checkpoint : bool = False
         # Compute initial spatial dimensions
         initial_h = height // (2 ** downsample)
         initial_w = width // (2 ** downsample)
@@ -660,7 +663,10 @@ class VAEDecoder(nn.Module):
         self.decoder_blocks = nn.ModuleList(decoder_blocks)
         
         # Final layers
-        self.final_norm = nn.BatchNorm2d(current_channels)
+        #self.final_norm = nn.BatchNorm2d(current_channels)
+        num_groups = min(32, current_channels) if current_channels % 8 == 0 else current_channels // 4 if current_channels > 4 else 1
+        self.final_norm = nn.GroupNorm(num_groups, current_channels)
+
         self.final_act = Swish()
         
         self.pre_output = nn.Sequential(
@@ -669,10 +675,11 @@ class VAEDecoder(nn.Module):
                     )
                     # MDL head
         self.mdl_head = MDLHead(current_channels // 2, out_ch=reconstruction_channels, n_mix=10)
-        self.mdl_head.gradient_checkpointing_enable()
-        self.use_checkpoint = False
-        self.enable_unet: bool = False
-        self._pending_skips = None               # dict[str, Tensor], set via set_unet_skips(...)
+        if hasattr(self.mdl_head, 'gradient_checkpointing_enable'):
+           self.mdl_head.gradient_checkpointing_enable()
+        
+        
+        self._pending_skips: Optional[dict]= None               # dict[str, Tensor], set via set_unet_skips(...)
         self._unet_mode: str = "concat"          # currently only "concat" is implemented
         self.post_concat_adapters = nn.ModuleDict()  # 1x1 convs to map cat(C_in+skip) -> C_in
 
@@ -688,115 +695,157 @@ class VAEDecoder(nn.Module):
         This will trade compute for memory by recomputing activations during backward pass.
         """
         self.use_checkpoint = True
-    def set_unet_skips(self, skips: dict, mode: str = "concat"):
-        """
-        Provide encoder feature maps for UNet-style skip fusion.
-        Call this right before forward(z). Public API of forward/ctor remains unchanged.
+
+    def set_unet_skips(self, skips: Optional[dict], mode: str = "concat"):
+        """Provide encoder feature maps for UNet-style fusion. Call right before forward(z).
         Args:
-            skips: mapping of {"HxW": Tensor} or arbitrary keys -> Tensor[B,C,H,W].
-                   If keys are not "HxW", we will match by the tensor spatial size.
-            mode: currently only "concat" is implemented.
+            skips: dict of {"HxW": Tensor[B,C,H,W]} or arbitrary keys -> Tensor[B,C,H,W].
+                   If keys aren't 'HxW', we'll match by tensor spatial size.
+            mode:  currently only 'concat' is supported.
         """
-        self.enable_unet = True
+        
         self._unet_mode = mode
+        # Store as a plain dict; do NOT consume/mutate this inside forward (checkpoint-safety).
         self._pending_skips = dict(skips) if skips is not None else None
 
-    def _pick_and_prep_skip(self, h):
+    # --------------------------------
+    # Internal: skip selection (pure)
+    # --------------------------------
+    @staticmethod
+    def _pick_and_prep_skip_from(pool: dict, target: torch.Tensor) -> Optional[torch.Tensor]:
+        """Pick a skip from a *local copy* of the pool that best matches target HxW.
+        This method is pure w.r.t module state and safe under checkpoint recomputation.
+        Mutates only the provided local 'pool' dict.
         """
-        Find a pending skip that best matches h's spatial size. If none exactly matches,
-        pick the first available and interpolate to match. Returns a Tensor or None.
-        """
-        if not isinstance(self._pending_skips, dict) or len(self._pending_skips) == 0:
+        if not isinstance(pool, dict) or len(pool) == 0:
             return None
-        H, W = h.shape[-2:]
+        H, W = target.shape[-2:]
         key_exact = f"{H}x{W}"
-        if key_exact in self._pending_skips:
-            skip = self._pending_skips.pop(key_exact)
+        if key_exact in pool:
+            skip = pool.pop(key_exact)
         else:
-            # same-size tensor search
             match_key = None
-            for k, v in self._pending_skips.items():
+            for k, v in pool.items():
                 if hasattr(v, "shape") and v.shape[-2:] == (H, W):
                     match_key = k
                     break
             if match_key is not None:
-                skip = self._pending_skips.pop(match_key)
+                skip = pool.pop(match_key)
             else:
                 # fallback: take an arbitrary one
-                k, skip = self._pending_skips.popitem()
-        skip = skip.to(h.device, dtype=h.dtype)
+                _, skip = pool.popitem()
+        skip = skip.to(target.device, dtype=target.dtype)
         if skip.shape[-2:] != (H, W):
-            skip = F.interpolate(skip, size=(H, W), mode='bilinear', align_corners=False)
+            skip = F.interpolate(skip, size=(H, W), mode="bilinear", align_corners=False)
         return skip
 
+    def _fuse_unet_skip_if_needed(
+        self,
+        h: torch.Tensor,
+        prev_hw: Tuple[int, int],
+        local_skip_pool: Optional[dict],
+        mode: str = "concat",
+    ) -> torch.Tensor:
+        """Fuse a skip feature when resolution changed (after upsample). Pure wrt module state
+        except possibly creating a 1x1 adapter (idempotent across recomputations)."""
+        if not isinstance(local_skip_pool, dict) or len(local_skip_pool) == 0:
+            return h
+        # Trigger only on resolution change (i.e., after an upsample)
+        if h.shape[-2:] == prev_hw:
+            return h
+
+        if mode != "concat":
+            return h  # (future: support 'add', etc.)
+
+        skip = self._pick_and_prep_skip_from(local_skip_pool, h)
+        if skip is None:
+            return h
+
+        cat = torch.cat([h, skip], dim=1)
+        in_ch = cat.shape[1]
+        out_ch = h.shape[1]
+        H, W  = h.shape[-2:]
+        adapter_key = f"cat_{in_ch}->{out_ch}@{H}x{W}"
+        # Lazily create adapter once; harmless on recomputation since key already exists.
+        if adapter_key not in self.post_concat_adapters:
+            self.post_concat_adapters[adapter_key] = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=True).to(h.device)
+        return self.post_concat_adapters[adapter_key](cat)
+
+    # -------------
+    # Forward pass
+    # -------------
+    def forward(self, z: torch.Tensor, skips: Optional[dict] = None):
+        """
+        Forward pass with optional skip connections.
         
-    def forward(self, z):
-        # MLP
+        Args:
+            z: Latent tensor
+            skips: Optional dict of skip connections. If not provided, uses self._pending_skips
+                   (for backward compatibility with set_unet_skips API)
+        
+        Returns:
+            Output from MDL head (logit_probs, means, log_scales, coeffs)
+        """
+        # Determine skip source - prefer explicitly passed skips for checkpoint safety
+        skip_source = skips if skips is not None else self._pending_skips
+        
+        # Create a local working copy that can be safely mutated
+        local_skip_pool = dict(skip_source) if skip_source is not None else {}
+        
+        # Determine mode - use passed skips' implied mode or fall back to stored mode
+        mode = self._unet_mode if skips is None else "concat"
+        
+        # Track whether we're using skips for this forward pass
+        enable_unet = bool(local_skip_pool)
+
+        # 1) Latent projection
         if self.use_checkpoint and self.training:
-            # Checkpoint the MLP computation
-            h = torch.utils.checkpoint.checkpoint(
-                self.mlp, z, use_reentrant=False
-            )
-            # Checkpoint the unflatten operation (wrap in a lambda for checkpoint)
-            h = torch.utils.checkpoint.checkpoint(
-                lambda x: self.unflatten(x), h, use_reentrant=False
-            )
+            h = torch.utils.checkpoint.checkpoint(self.mlp, z, use_reentrant=False, preserve_rng_state=True)
+            h = torch.utils.checkpoint.checkpoint(lambda x: self.unflatten(x), h, use_reentrant=False, preserve_rng_state=True)
         else:
-            h = self.mlp(z)
-            h = self.unflatten(h)
-        
-        # Progressive decoding
+            h = self.unflatten(self.mlp(z))
+
+        # 2) Progressive decoding with optional skip fusion
         for block in self.decoder_blocks:
             prev_hw = h.shape[-2:]
-            if self.use_checkpoint and self.training:  
-                h = torch.utils.checkpoint.checkpoint(block, h, use_reentrant=False)
+            if self.use_checkpoint and self.training:
+                h = torch.utils.checkpoint.checkpoint(block, h, use_reentrant=False, preserve_rng_state=True)
             else:
                 h = block(h)
-            if self.enable_unet and isinstance(self._pending_skips, dict):
-                # size change indicates an upsample happened in this block
-                if h.shape[-2:] != prev_hw:
-                    skip = self._pick_and_prep_skip(h)
-                    if skip is not None and self._unet_mode == "concat":
-                        cat = torch.cat([h, skip], dim=1)
-                        in_ch = cat.shape[1]
-                        out_ch = h.shape[1]
-                        H, W = h.shape[-2:]
-                        adapter_key = f"cat_{in_ch}->{out_ch}@{H}x{W}"
-                        if adapter_key not in self.post_concat_adapters:
-                            self.post_concat_adapters[adapter_key] = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=True).to(h.device)
-                        h = self.post_concat_adapters[adapter_key](cat)
-            
-        # Final processing with checkpointing
+            # fuse skip only if spatial size changed (i.e., just upsampled)
+            if enable_unet:
+                h = self._fuse_unet_skip_if_needed(h, prev_hw, local_skip_pool, mode)
+
+        # 3) Final head
         if self.use_checkpoint and self.training:
             h = torch.utils.checkpoint.checkpoint(
-                lambda x: self.final_act(self.final_norm(x)), h, use_reentrant=False
+                lambda x: self.final_act(self.final_norm(x)), h, use_reentrant=False, preserve_rng_state=True
             )
-            # Checkpoint the pre_output and mdl_head
-            out = torch.utils.checkpoint.checkpoint(
-                self.pre_output, h, use_reentrant=False
-            )
-            result = torch.utils.checkpoint.checkpoint(
-                self.mdl_head, out, use_reentrant=False
-            )
+            h_half = torch.utils.checkpoint.checkpoint(self.pre_output, h, use_reentrant=False, preserve_rng_state=True)
+            out = torch.utils.checkpoint.checkpoint(self.mdl_head, h_half, use_reentrant=False, preserve_rng_state=True)
         else:
-            h = self.final_norm(h)
-            h = self.final_act(h)
-            out = self.pre_output(h)
-            result = self.mdl_head(out)
-        self._pending_skips = None
-        return result
-    
-    def decode(self, z, deterministic=False, scale_temp: float = 1.0):
-        """Decode latents to images for inference/visualization"""
+            h = self.final_act(self.final_norm(h))
+            out = self.mdl_head(self.pre_output(h))
+
+        return out  # typically (logit_probs, means, log_scales, coeffs)
+
+    # ------------------------
+    # Convenience for sampling
+    # ------------------------
+    def decode(self, z: torch.Tensor, deterministic: bool = False, scale_temp: float = 1.0):
+        """Decode latents to images for inference/visualization."""
         logit_probs, means, log_scales, coeffs = self.forward(z)
         if deterministic:
-            # Use the mean of the most likely mixture component
-            return means.gather(1, logit_probs.argmax(1, keepdim=True).unsqueeze(2).expand(-1, -1, 3, -1, -1)).squeeze(1)
+            # Use the mean from the most likely mixture component
+            k = logit_probs.argmax(1, keepdim=True)  # [B,1,H,W]
+            idx = k.expand(-1, means.size(2), -1, -1)  # [B,C,H,W]
+            return means.gather(1, idx)  # [B,C,H,W]
         else:
-            return self.mdl_head.sample(logit_probs, means, log_scales, coeffs, scale_temp=scale_temp, mode="sample")
+            # Sample from discretized logistic mixture (simple temperature scaling on logits)
+            return self.mdl_head.sample_from_mixture(logit_probs / scale_temp, means, log_scales, coeffs)
 
-#  DINOv3 #
 
+#  DINOv3 style
 
 
 class GramLoss(nn.Module):

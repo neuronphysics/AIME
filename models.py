@@ -6,7 +6,7 @@ from VRNN.perceiver.Utils import RopePositionEmbedding  # spatial RoPE
 
 import logging
 import functools
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint as _ckpt
 import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
@@ -407,7 +407,7 @@ class AttentionPosterior(nn.Module):
 
         # === bottleneck features ===
         self.bottleneck_features = self.bottleneck_projector(slot_features.reshape(B, -1))  # [B,hidden//2]
-
+        
         return attention_probs_2d, regularized_coords
 
 
@@ -691,7 +691,8 @@ class AttentionPrior(nn.Module):
         motion_kernels: int = 8,
         num_heads: int = 4,  # Reduced for efficiency
         feature_dim: int = 64,  # Internal feature dimension
-        use_relative_position_bias: bool = True  # Whether to use relative position bias
+        use_relative_position_bias: bool = True,  # Whether to use relative position bias
+        use_checkpoint: bool = True,  # Gradient checkpointing for memory efficiency
     ):
         super().__init__()
         self.attention_resolution = attention_resolution
@@ -701,7 +702,7 @@ class AttentionPrior(nn.Module):
         self.num_heads = num_heads
         self.spatial_dim = attention_resolution * attention_resolution
         self.use_relative_position_bias = use_relative_position_bias
-        
+        self.use_checkpoint = use_checkpoint
         # === ORIGINAL COMPONENTS (PRESERVED) ===
         
         # Spatial attention dynamics modeling (kept for feature extraction)
@@ -814,6 +815,22 @@ class AttentionPrior(nn.Module):
         motion_features = torch.cat(motion_responses, dim=1)  # [B, K, H, W]
         return motion_features
     
+    def _maybe_ckpt(self, fn, *tensors, reentrant: bool = False):
+        """
+        Checkpoint `fn(*tensors)` during training if enabled.
+        - Only Tensor args are allowed (put non-tensor args in the closure).
+        - Returns whatever `fn` returns (must be Tensor or tuple of Tensors).
+        """
+        if self.training and self.use_checkpoint :
+            # Torch versions prior to 2.0 don't support use_reentrant/preserve_rng_state kwargs;
+            # fall back gracefully.
+            try:
+                return _ckpt(fn, *tensors, use_reentrant=reentrant, preserve_rng_state=False)
+            except TypeError:
+                return _ckpt(fn, *tensors)
+        else:
+            return fn(*tensors)
+    
     def forward(
         self,
         prev_attention: torch.Tensor,  # [B, H, W]
@@ -836,8 +853,18 @@ class AttentionPrior(nn.Module):
         motion_features = self.compute_motion_features(prev_attention)
         
         # 3. Project features to attention dimension
-        spatial_feat_proj = self.spatial_downsampler(spatial_features)  # [B, feature_dim, H, W]
-        motion_feat_proj = self.motion_projection(motion_features)  # [B, feature_dim//2, H, W]
+        if self.training and self.use_checkpoint:
+            spatial_feat_proj = self._maybe_ckpt(
+                self.spatial_downsampler,
+                spatial_features
+            )  # [B, feature_dim, H, W]
+            motion_feat_proj = self._maybe_ckpt(
+                self.motion_projection,
+                motion_features
+            )  # [B, feature_dim//2, H, W]
+        else:
+            spatial_feat_proj = self.spatial_downsampler(spatial_features)  # [B, feature_dim, H, W]
+            motion_feat_proj = self.motion_projection(motion_features)  # [B, feature_dim//2, H, W]
         
         # Combine spatial and motion features
         motion_feat_proj = F.interpolate(
@@ -859,27 +886,54 @@ class AttentionPrior(nn.Module):
         combined_seq = combined_seq + self.pos_embed
         
         # 6. Get context features
-        context = torch.cat([hidden_state, latent_state], dim=-1)
-        context_features = self.context_projection(context)  # [B, feature_dim]
+        if self.training and self.use_checkpoint:
+            context_features = self._maybe_ckpt(
+                self.context_projection,
+                torch.cat([hidden_state, latent_state], dim=-1)
+            )  # [B, feature_dim]
+        else:
+            context_features = self.context_projection(torch.cat([hidden_state, latent_state], dim=-1))  # [B, feature_dim]
         context_seq = context_features.unsqueeze(1)  # [B, 1, feature_dim]
         
         # 7. Self-attention with relative position bias (GLOBAL attention)
         normed_seq = self.norm1(combined_seq)
+
+        def _self_attn(q, k, v):
+            return self.self_attention(q, k, v)[0]
         
-        self_attn_out, _ = self.self_attention(
-            normed_seq, normed_seq, normed_seq
-        )
-        
+        if self.training and self.use_checkpoint:
+            self_attn_out = self._maybe_ckpt(
+                _self_attn,
+                normed_seq,
+                normed_seq,
+                normed_seq
+            )
+        else:
+            self_attn_out, _ = self.self_attention(
+                normed_seq, normed_seq, normed_seq
+            )
+            
         combined_seq = combined_seq + self_attn_out
         
         # 8. Cross-attention with context
         normed_seq = self.norm2(combined_seq)
         context_expanded = context_seq.expand(-1, self.spatial_dim, -1)
-        cross_attn_out, _ = self.context_attention(
-            query=normed_seq,
-            key=context_expanded,
-            value=context_expanded
-        )
+        def _context_attn(q, k, v):
+            return self.context_attention(q, k, v)[0]
+
+        if self.training and self.use_checkpoint:
+            cross_attn_out = self._maybe_ckpt(
+                _context_attn,
+                normed_seq,
+                context_expanded,
+                context_expanded
+            )
+        else:   
+            cross_attn_out, _ = self.context_attention(
+                query=normed_seq,
+                key=context_expanded,
+                value=context_expanded
+            )
         combined_seq = combined_seq + cross_attn_out
         
         # 9. FFN
@@ -2250,7 +2304,9 @@ class VAEDecoder(torch.nn.Module):
 ##### Self modeling Blocks #####
 
 class SelfModelBlock(nn.Module):
-    def __init__(self, z_dim, A_dim, a_dim, c_dim, h_dim, d=256, nhead=4, dropout=0.2):
+    def __init__(self, z_dim, A_dim, a_dim, c_dim, h_dim, d=256, nhead=4, dropout=0.2,
+                 use_checkpoint: bool = False,
+                 checkpoint_segments: tuple = ("self_attn", "cross_attn", "ffn")):
         super().__init__()
         
         # Project inputs to common dimension
@@ -2262,11 +2318,11 @@ class SelfModelBlock(nn.Module):
             'h': nn.Linear(h_dim, d)
         })
         self.time_proj = nn.Sequential(
-                                       nn.Linear(1, d//2), 
-                                       nn.LayerNorm(d//2), 
-                                       nn.SiLU(), 
-                                       nn.Linear(d//2, d)
-                                       )
+            nn.Linear(1, d//2), 
+            nn.LayerNorm(d//2), 
+            nn.SiLU(), 
+            nn.Linear(d//2, d)
+        )
         # Learnable query tokens for prediction
         self.query_h = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         self.query_A = nn.Parameter(torch.randn(1, 1, d) * 0.02)
@@ -2274,25 +2330,18 @@ class SelfModelBlock(nn.Module):
         # Type embeddings
         self.type_embed = nn.Embedding(6, d)
         
-        # EXPLICIT Cross-attention: queries attend to context
+        # Cross-attention: queries attend to context
         self.cross_attention = nn.MultiheadAttention(
-            embed_dim=d,
-            num_heads=nhead,
-            batch_first=True,
-            dropout=dropout
+            embed_dim=d, num_heads=nhead, batch_first=True, dropout=dropout
         )
-        
         # Self-attention for context processing
         self.self_attention = nn.MultiheadAttention(
-            embed_dim=d,
-            num_heads=nhead,
-            batch_first=True,
-            dropout=dropout
+            embed_dim=d, num_heads=nhead, batch_first=True, dropout=dropout
         )
         
         # Layer norms
         self.norm1 = nn.LayerNorm(d)
-        self.norm2 = nn.LayerNorm(d)
+        self.norm2 = nn.LayerNorm(d)  # deliberately shared for queries & context (as in your code)
         self.norm3 = nn.LayerNorm(d)
         
         self.activation = nn.Softplus()
@@ -2311,14 +2360,26 @@ class SelfModelBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(d//2, 2*A_dim)
         )
-    
+
+        # ---- checkpointing controls ----
+        self.use_checkpoint = bool(use_checkpoint)
+        self.checkpoint_segments = set(checkpoint_segments)
+
+    # small helper: only checkpoint if enabled AND some input requires grad
+    def _maybe_ckpt(self, seg_name, fn, *tensors):
+        if self.use_checkpoint and (seg_name in self.checkpoint_segments):
+            return _ckpt(fn, *tensors, use_reentrant=False, preserve_rng_state=True)
+        else:
+            return fn(*tensors)
+
     def forward(self, z_t, A_t, a_t, c_t, h_t, current_time=None):
         batch_size = z_t.shape[0]
         if current_time is not None:
             time_token = self.time_proj(current_time.view(-1, 1))
         else:
             time_token = self.time_proj(torch.zeros(batch_size, 1, device=z_t.device))
-        # 1. Project and create context tokens
+
+        # 1) Project & create context tokens: [B, 6, d]
         context_tokens = torch.stack([
             self.input_projections['z'](z_t),
             self.input_projections['A'](A_t),
@@ -2326,58 +2387,65 @@ class SelfModelBlock(nn.Module):
             self.input_projections['c'](c_t),
             self.input_projections['h'](h_t),
             time_token
-        ], dim=1)  # [B,  6, d]
-
-
+        ], dim=1)
 
         # Add type embeddings
         type_ids = torch.arange(6, device=z_t.device).unsqueeze(0).expand(batch_size, -1)  # [B, 6]
         context_tokens = context_tokens + self.type_embed(type_ids)
         
-        # 2. Process context with self-attention
+        # 2) Self-attention over context (checkpointed)
         context_normed = self.norm1(context_tokens)
-        context_attended, _ = self.self_attention(
-            context_normed, context_normed, context_normed
-        )
+
+        def _self_attn(x):
+            # return only the tensor (we don't need weights here)
+            out, _ = self.self_attention(x, x, x, need_weights=False)
+            return out
+
+        context_attended = self._maybe_ckpt("self_attn", _self_attn, context_normed)
         context_tokens = context_tokens + context_attended
         
-        # 3. Create query tokens
+        # 3) Build query tokens (2 queries): [B, 2, d]
         queries = torch.cat([
             self.query_h.expand(batch_size, -1, -1),
             self.query_A.expand(batch_size, -1, -1)
-        ], dim=1)  # [B, 2, d]
-        
-        # 4. Cross-attention: Queries attend to processed context
-        # Q: What we want to predict (queries)
-        # K, V: Information available (context)
+        ], dim=1)
+
+        # 4) Cross-attention: queries attend to processed context (checkpointed)
         queries_normed = self.norm2(queries)
-        context_normed = self.norm2(context_tokens)
-        
-        attended_queries, attention_weights = self.cross_attention(
-            query=queries_normed,    # Queries ask about future
-            key=context_normed,      # Context provides information
-            value=context_normed,    # Context provides values
-            need_weights=True
+        context_normed2 = self.norm2(context_tokens)
+
+        def _cross_attn(q, k, v):
+            out, att = self.cross_attention(query=q, key=k, value=v, need_weights=True)
+            # return both as tensors (checkpoint supports tuple of tensors)
+            return out, att
+
+        attended_queries, attention_weights = self._maybe_ckpt(
+            "cross_attn", _cross_attn, queries_normed, context_normed2, context_normed2
         )
         queries = queries + attended_queries
         
-        # 5. FFN on queries
-        queries = queries + self.ffn(self.norm3(queries))
+        # 5) FFN on queries (checkpointed)
+        def _ffn_block(x):
+            return self.ffn(self.norm3(x))
+        ffn_out = self._maybe_ckpt("ffn", _ffn_block, queries)
+        queries = queries + ffn_out
         
-        # 6. Extract predictions
-    
-        pred_A = self.head_A(queries[:, 1])  # Second query predicts A
-        
-        # Split into mean and log variance
+        # 6) Heads
+        pred_A = self.head_A(queries[:, 1])  # second query predicts A
         A_mean, A_logvar = pred_A.chunk(2, dim=-1)
 
         return A_mean, self.bounded_logvar(A_logvar), attention_weights
 
     def bounded_logvar(self, logvar):
-        """Range: [min_val, max_val]"""
         min_val = -8.0
         max_val = 2.0
-        
-        # Softplus for positivity, then scale and shift
         positive = self.activation(logvar)
         return positive.clamp(min=min_val, max=max_val)
+
+    # convenience toggles
+    def enable_checkpointing(self, segments=("self_attn","cross_attn","ffn")):
+        self.use_checkpoint = True
+        self.checkpoint_segments = set(segments)
+
+    def disable_checkpointing(self):
+        self.use_checkpoint = False

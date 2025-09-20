@@ -15,17 +15,6 @@ VARIANTS = {
         'self_attend_widening_factor': (4, 4, 4),
         'num_embedding_channels': 32,
     },
-    '16x3_lite': {
-    'num_groups': (16, 1, 16),
-    'num_self_attends_per_block': (1, 6, 1),
-    'z_index_dim': (128, 512, 128),
-    'num_z_channels': (128, 384, 128),       # narrower than your current 1024 processor
-    'num_cross_attend_heads': (1, 1, 1),
-    'num_self_attend_heads': (4, 16, 4),
-    'cross_attend_widening_factor': (1, 1, 1),
-    'self_attend_widening_factor': (4, 4, 4),
-    'num_embedding_channels': 64,            # <— key upgrade from 32
-    },
     '16': {
         'num_groups': (16, 4, 1, 1, 1, 4, 16),
         'num_self_attends_per_block': (2, 2, 18, 2, 1, 1, 1),
@@ -47,6 +36,17 @@ VARIANTS = {
         'cross_attend_widening_factor': (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
         'self_attend_widening_factor': (4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4),
         'num_embedding_channels': 16,
+    },
+    '16x3_lite': {
+    'num_groups': (16, 1, 16),
+    'num_self_attends_per_block': (1, 6, 1),
+    'z_index_dim': (128, 512, 128),
+    'num_z_channels': (128, 384, 128),       # narrower than your current 1024 processor
+    'num_cross_attend_heads': (1, 1, 1),
+    'num_self_attend_heads': (4, 16, 4),
+    'cross_attend_widening_factor': (1, 1, 1),
+    'self_attend_widening_factor': (4, 4, 4),
+    'num_embedding_channels': 64,            # <— key upgrade from 32
     },
     '16x3': {
         'num_groups': (16, 1, 16),

@@ -1,7 +1,7 @@
 from typing import Dict, List, Mapping, Optional, Tuple, Any
 import torch.nn.functional as func
 from VRNN.perceiver.perceiver_helpers import *
-
+from torch.utils.checkpoint import checkpoint as _ckpt
 BATCH_DIM = 0
 GROUPS_DIM = 1
 INDEX_DIM = -2
@@ -281,7 +281,8 @@ class PerceiverBlock(nn.Module):
                  output_index_dim_train: Optional[int] = None,
                  output_index_dim_eval: Optional[int] = None,
                  dropout_prob: float = 0.0,
-                 drop_path_rate: float = 0.0):
+                 drop_path_rate: float = 0.0,
+                 use_checkpoint: bool = False):
         super(PerceiverBlock, self).__init__()
 
         self.num_output_groups = num_output_groups
@@ -290,7 +291,7 @@ class PerceiverBlock(nn.Module):
         self.regroup_type = regroup_type
         self.output_index_dim_train = output_index_dim_train or output_index_dim
         self.output_index_dim_eval = output_index_dim_eval or output_index_dim
-
+        self.use_checkpoint = use_checkpoint
         self.projector = HiPCrossAttention(
             input_num_channel=input_num_channel, num_groups=num_output_groups,
             output_index_dim_train=self.output_index_dim_train,
@@ -335,11 +336,27 @@ class PerceiverBlock(nn.Module):
                     num_output_groups=self.num_output_groups,
                     regroup_type=self.regroup_type
                 )
-        z = self.projector(inputs, pre_attention_residual=pre_attention_residual,
-                           is_training=is_training, attention_mask=attention_mask)
+        if self.use_checkpoint and self.training:
+            def _proj(x):
+                return self.projector(
+                    x, pre_attention_residual=pre_attention_residual,
+                    is_training=is_training, attention_mask=attention_mask
+                )
+            z = _ckpt(_proj, inputs, use_reentrant=False, preserve_rng_state=True)
+        else:
+            z = self.projector(inputs, pre_attention_residual=pre_attention_residual,
+                               is_training=is_training, attention_mask=attention_mask)
+
+
 
         for self_attend in self.self_attentions:
-            z = self_attend(z, is_training=is_training)
+            if self.use_checkpoint and self.training:
+                # Wrap to pass only tensors; capture is_training via closure
+                z = _ckpt(lambda x, sa=self_attend: sa(x, is_training=is_training),
+                          z, use_reentrant=False, preserve_rng_state=True)
+            else:
+                z = self_attend(z, is_training=is_training)
+
 
         return z
 
@@ -447,6 +464,14 @@ class UNetAdapter(nn.Module):
 
         return out.reshape(B, C, H * W).transpose(1, 2)  # [B,I,C]
 
+class ScaledTanh(nn.Module):
+    def __init__(self, init_gain: float = 1.0, learnable: bool = True):
+        super().__init__()
+        self.gain = nn.Parameter(torch.tensor(init_gain)) if learnable else torch.tensor(init_gain)
+    def forward(self, x):
+        # start near-linear; training can increase/decrease the gain
+        return torch.tanh(self.gain * x)
+
 class Embedder(nn.Module):
     """
     Projects inputs to the target number of channels.
@@ -488,7 +513,10 @@ class Embedder(nn.Module):
         self.enable_decode_unet = bool(unet_adapter_cfg and unet_adapter_cfg.get('enable_decode_unet', False))
         image_like_modalities = {'image', 'rgb', 'pixels'}
         self.decode_activations = nn.ModuleDict({
-            name: nn.Tanh() if name in image_like_modalities else nn.Identity()
+            name: nn.Sequential(
+                #nn.LayerNorm(self.modalities[name].shape[CHANNELS_DIM]),
+                ScaledTanh(init_gain=1.0, learnable=True)
+            ) if name in image_like_modalities else nn.Identity()
             for name in modalities.keys()
         })
 
