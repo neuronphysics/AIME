@@ -167,7 +167,9 @@ class HiPClassBottleneck(nn.Module):
                 regroup_type=regroup_type, activation_name=activation_name,
                 output_index_dim_train=processor_index_dim_train if i == self.processor_block_idx else None,
                 output_index_dim_eval=processor_index_dim_eval if i == self.processor_block_idx else None,
-                dropout_prob=dropout_prob, drop_path_rate=drop_path_rate, use_checkpoint=False)
+                dropout_prob=dropout_prob,
+                drop_path_rate=drop_path_rate, 
+                use_checkpoint=False)
             self.blocks.append(block)
 
     def forward(self, inputs: Dict[str, torch.Tensor], is_training: bool) -> Dict[str, torch.Tensor]:

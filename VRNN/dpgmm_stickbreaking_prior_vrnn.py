@@ -2237,6 +2237,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             orth_loss = vae_losses['attention_diversity'] + vae_losses['slot_ortho']
             perceiver_loss = vae_losses['perceiver_loss']
             adv_loss = lambda_img_eff * (img_adv_loss + temporal_adv_loss + feat_match_loss)
+            
+
             loss_batches.append(torch.stack([elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]))
         # ---- 2) Discriminator updates (their optimizer stepped inside) ----
         disc_losses_list = []
@@ -2262,9 +2264,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             SDMGrad_lamda=self.sdmgrad_lamda,
             SDMGrad_niter=self.sdmgrad_niter
         )
-        del loss_batches
         
-
         # Standard optimization step
         torch.nn.utils.clip_grad_norm_(list(self.sdmgrad_wrapper.model.shared_parameters()), max_norm=self._grad_clip)
         self.gen_optimizer.step()

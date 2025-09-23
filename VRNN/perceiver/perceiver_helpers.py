@@ -7,8 +7,16 @@ import torch.nn.init as init
 from typing import List, Sequence, Tuple, Optional
 import torch.nn.functional as func
 from torch import einsum
-from xformers.ops.fmha import memory_efficient_attention
-#from xformers.ops.fmha.attn_bias import AttentionBias
+
+
+# Optional xFormers import
+try:
+    import xformers.ops as xops
+    _XFORMERS_AVAILABLE = True
+except Exception:
+    xops = None
+    _XFORMERS_AVAILABLE = False
+
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
@@ -129,49 +137,111 @@ def assign_groups_to_modalities(
 
 
 class TrainablePositionEncoding(nn.Module):
-    """Trainable position encoding."""
+    """Trainable position encoding with a sinusoidal base + learnable delta (same API).
 
-    def __init__(self,
-                 index_dim: int,
-                 num_channels: int = 128,
-                 init_scale: float = 1.0):
+    Returns:
+      [index_dim, num_channels] or [B, index_dim, num_channels] if batch_size is given.
+    """
+
+    def __init__(self, index_dim: int, num_channels: int = 128, init_scale: float = 1.0):
         super().__init__()
-        self._index_dim = index_dim                  # initial (max) length
-        self._num_channels = num_channels
-        self._init_scale = init_scale
+        self._index_dim = int(index_dim)
+        self._num_channels = int(num_channels)
+        self._init_scale = float(init_scale)
+
+        # Learnable delta table; start small so sinusoidal base dominates early.
+        # (zeros is a safe default; small noise also works)
         self.pos_embs = nn.Parameter(
-            torch.randn(index_dim, num_channels, device=device) * init_scale,
-            requires_grad=True,
+            torch.zeros(self._index_dim, self._num_channels)
         )
+
+        # A single learnable gate to modulate the delta strength; helps stability.
+        self.gamma = nn.Parameter(torch.tensor(1.0))
+
+        # Cache for base encodings to avoid recompute when the requested length repeats.
+        self.register_buffer("_cached_base", torch.empty(0, 0), persistent=False)
+        self._cached_len = 0
+        self._cached_dim = 0
+
+        # Optional: small init to the delta (kept tiny)
+        if self._init_scale > 0:
+            with torch.no_grad():
+                self.pos_embs.add_(torch.randn_like(self.pos_embs) * (self._init_scale * 1e-3))
 
     @torch.no_grad()
     def _grow_to(self, new_len: int):
-        """Grow the parameter to at least new_len, preserving existing weights."""
+        """Grow learnable delta to new_len; initialize extras near the sinusoidal base."""
         old_len, d = self.pos_embs.shape
         if new_len <= old_len:
             return
-        extra = torch.randn(new_len - old_len, d, device=self.pos_embs.device) * self._init_scale
-        new_param = torch.empty(new_len, d, device=self.pos_embs.device, dtype=self.pos_embs.dtype)
+
+        device, dtype = self.pos_embs.device, self.pos_embs.dtype
+        # Create new parameter and copy old part
+        new_param = torch.empty(new_len, d, device=device, dtype=dtype)
         new_param[:old_len].copy_(self.pos_embs)
-        new_param[old_len:].copy_(extra)
+
+        # Initialize the tail close to zero (so base dominates), with tiny noise
+        tail = torch.zeros(new_len - old_len, d, device=device, dtype=dtype)
+        if self._init_scale > 0:
+            tail.add_(torch.randn_like(tail) * (self._init_scale * 1e-3))
+        new_param[old_len:].copy_(tail)
+
         self.pos_embs = nn.Parameter(new_param, requires_grad=True)
         self._index_dim = new_len
+        # Invalidate cache (base encodings length changed)
+        self._cached_len = 0
+        self._cached_dim = 0
+        self._cached_base = torch.empty(0, 0, device=device, dtype=dtype)
+
+    def _sinusoidal_base(self, length: int, dim: int, device, dtype):
+        """Standard sin/cos positional encoding, cached per (length, dim, device, dtype)."""
+        # Reuse cache if possible
+        if (self._cached_len == length and self._cached_dim == dim
+                and self._cached_base.device == device and self._cached_base.dtype == dtype):
+            return self._cached_base
+
+        # positions: [L, 1]
+        positions = torch.arange(length, device=device, dtype=dtype).unsqueeze(1)  # [L,1]
+        # half-dim (pairs of sin/cos)
+        half = dim // 2
+        # inv_freq: [half]
+        inv_freq = torch.exp(
+            torch.arange(0, half, device=device, dtype=dtype)
+            * (-math.log(10000.0) / max(1, half))
+        )  # like 1 / (10000^{2k/d})
+
+        # angles: [L, half]
+        angles = positions * inv_freq.unsqueeze(0)
+        sin = torch.sin(angles)
+        cos = torch.cos(angles)
+
+        base = torch.cat([sin, cos], dim=1)  # [L, 2*half]
+        if base.shape[1] < dim:
+            # pad one column if odd dim
+            pad = torch.zeros(length, dim - base.shape[1], device=device, dtype=dtype)
+            base = torch.cat([base, pad], dim=1)
+
+        # Cache
+        self._cached_base = base
+        self._cached_len = length
+        self._cached_dim = dim
+        return base
 
     def forward(self, batch_size: int | None = None, index_dim: int | None = None):
-        """
-        If index_dim is given, slice (or grow and then slice) to that length.
-        Otherwise, return the full table (backward compatible).
-        """
-        if index_dim is not None:
-            if index_dim > self.pos_embs.size(0):
-                self._grow_to(index_dim)
-            pos = self.pos_embs[:index_dim]
-        else:
-            pos = self.pos_embs
+        # Resolve requested length
+        L = int(index_dim) if index_dim is not None else self._index_dim
+        if L > self.pos_embs.size(0):
+            self._grow_to(L)
+
+        # Build base on the fly (cached) and add learnable delta
+        device, dtype = self.pos_embs.device, self.pos_embs.dtype
+        base = self._sinusoidal_base(L, self._num_channels, device, dtype)  # [L, C]
+        pos = base + self.gamma * self.pos_embs[:L]                         # [L, C]
 
         if batch_size is not None:
-            pos = pos.unsqueeze(0).expand(batch_size, -1, -1)
+            pos = pos.unsqueeze(0).expand(int(batch_size), -1, -1)          # [B, L, C]
         return pos
+
 
 class StochasticDepth(nn.Module):
     """Batch wise Dropout used in EfficientNet/NfNet, optionally sans rescaling."""
@@ -231,119 +301,150 @@ class Dense(nn.Module):
             x = func.dropout(x, p=self.dropout_prob, training=is_training)
         return x
 
-class Attention(nn.Module):
-    """Multi-headed {cross, self}-attention using xFormers for optimization."""
 
+
+
+class Attention(nn.Module):
+    """
+    Multi-headed cross/self-attention with optional xFormers memory-efficient path.
+
+    Inputs:
+        inputs_q: [B, G, Q_len, C_q_in]
+        inputs_kv: [B, G, KV_len, C_kv_in]
+        attention_mask (optional): broadcastable to [B, G, Q_len, KV_len], 1=keep, 0=mask
+
+    Returns:
+        (attn_output, attn_probs)
+          - attn_output: [B, G, Q_len, C_out]
+          - attn_probs: [B, G, H, Q_len, KV_len] (PyTorch path), or
+                        None on xFormers path unless return_attn_probs=True
+    """
     def __init__(self,
                  num_heads: int = 8,
                  init_scale: float = 1.0,
                  with_final_bias: bool = True,
-                 dropout_prob: float = 0.0,
+                 dropout_prob: float = 0.1,
                  input_q_channel: int = 1,
                  input_k_channel: int = 1,
                  input_v_channel: int = 1,
                  qk_channels: int = 1,
                  v_channels: int = 1,
-                 output_channels: int = 1):
+                 output_channels: int = 1,
+                 use_xformers: bool = False,
+                 return_attn_probs: bool = True):
         super().__init__()
         self.num_heads = num_heads
-        self._init_scale = init_scale
-        self.with_final_bias = with_final_bias
         self.dropout_prob = dropout_prob
 
-        # Initialize channel sizes
+        # xFormers toggle (and availability)
+        self.use_xformers = bool(use_xformers) and _XFORMERS_AVAILABLE
+        self.return_attn_probs = bool(return_attn_probs)
+
+        # Store channel sizes
+        assert qk_channels % num_heads == 0, "qk_channels must be divisible by num_heads"
+        assert v_channels  % num_heads == 0, "v_channels must be divisible by num_heads"
         self.qk_channels = qk_channels
-        self.v_channels = v_channels
-        self.output_channels = output_channels
-        self.input_q_channel = input_q_channel
-        self.input_k_channel = input_k_channel
-        self.input_v_channel = input_v_channel
-        self.output_index_dim = None
+        self.v_channels  = v_channels
+        self.qk_channels_per_head = qk_channels // num_heads
+        self.v_channels_per_head  = v_channels  // num_heads
 
-        assert self.qk_channels % self.num_heads == 0, "qk_channels must be divisible by num_heads"
-        assert self.v_channels % self.num_heads == 0, "v_channels must be divisible by num_heads"
+        # Projections
+        self.query_linear  = conv_1d(input_q_channel, qk_channels, init_scale=init_scale)
+        self.key_linear    = conv_1d(input_k_channel, qk_channels, init_scale=init_scale)
+        self.value_linear  = conv_1d(input_v_channel, v_channels,  init_scale=init_scale)
+        self.attention_output_linear = conv_1d(
+            v_channels, output_channels, init_scale=init_scale, with_bias=with_final_bias
+        )
 
-        # Linear transformations for queries, keys, and values
-        self.query_linear = conv_1d(input_q_channel, self.qk_channels, init_scale=self._init_scale)
-        self.key_linear = conv_1d(input_k_channel, self.qk_channels, init_scale=self._init_scale)
-        self.value_linear = conv_1d(input_v_channel, self.v_channels, init_scale=self._init_scale)
-        self.attention_output_linear = conv_1d(self.v_channels, self.output_channels, init_scale=self._init_scale)
-
-        # Channel sizes per head
-        self.qk_channels_per_head = self.qk_channels // self.num_heads
-        self.v_channels_per_head = self.v_channels // self.num_heads
         self.dropout = nn.Dropout(dropout_prob)
 
-    def reshape_for_heads(self, x, channels_per_head):
-        b, g, i, c = x.size()
-        return torch.reshape(x, (b, g, i, self.num_heads, channels_per_head))
+
+    def _prepare_mask_for_xformers(self, attention_mask, b, g, q_len, kv_len, dtype, device):
+        """Convert {1,0} mask to additive bias of shape [B*G, 1, Q, K] for xFormers."""
+        if attention_mask is None:
+            return None
+
+        if attention_mask.dim() == 3:      # [B, Q, K] -> [B, G, Q, K]
+            attention_mask = attention_mask.unsqueeze(1).expand(b, g, q_len, kv_len)
+        elif attention_mask.dim() != 4:    # must be [B, G, Q, K]
+            raise ValueError(f"Unexpected attention_mask dimension: {attention_mask.dim()}")
+
+        
+        # Build bias in desired dtype/device
+        bias = torch.zeros_like(attention_mask, dtype=dtype, device=device)
+        bias = bias.masked_fill(attention_mask == 0, float('-inf'))
+        # [B, G, Q, K] -> [B*G, 1, Q, K]
+        return bias.reshape(b * g, 1, q_len, kv_len)
 
     def forward(self, inputs_q, inputs_kv, attention_mask=None):
-        # Linear projections
-        q = self.query_linear(inputs_q)
-        k = self.key_linear(inputs_kv)
-        v = self.value_linear(inputs_kv)
-        
-        # Get dimensions
+        attn_probs = None
+
+        # 1) Projections
+        q = self.query_linear(inputs_q)   # [B, G, Q, C_qk]
+        k = self.key_linear(inputs_kv)    # [B, G, K, C_qk]
+        v = self.value_linear(inputs_kv)  # [B, G, K, C_v]
+
         b, g, q_len, _ = q.shape
         _, _, kv_len, _ = k.shape
-        
-        # Reshape for multi-head attention
-        q = self.reshape_for_heads(q, self.qk_channels_per_head)
-        k = self.reshape_for_heads(k, self.qk_channels_per_head)
-        v = self.reshape_for_heads(v, self.v_channels_per_head)
-        """
-        # Prepare for xFormers: merge batch and group dims, move heads dim
-        # [b, g, len, h, d] -> [b*g, len, h, d]
-        q_flat = q.reshape(-1, q_len, self.num_heads, self.qk_channels_per_head).contiguous()
-        k_flat = k.reshape(-1, kv_len, self.num_heads, self.qk_channels_per_head).contiguous()
-        v_flat = v.reshape(-1, kv_len, self.num_heads, self.v_channels_per_head).contiguous()
-        
-        # Process attention mask if provided
-        if attention_mask is not None:
-            # Reshape mask: [b, g, q_len, kv_len] -> [b*g, q_len, kv_len]
-            if len(attention_mask.shape) == 4:  # Mask is [b, g, q_len, kv_len]
-                mask_flat = attention_mask.reshape(-1, q_len, kv_len)
-            else:  # Need to broadcast if mask is [b, q_len, kv_len]
-                mask_flat = attention_mask.unsqueeze(1).expand(b, g, q_len, kv_len)
-                mask_flat = mask_flat.reshape(-1, q_len, kv_len)
-            
-            # Convert to attention bias format (-inf for masked positions)
-            attn_bias = torch.zeros_like(mask_flat, dtype=q.dtype)
-            attn_bias = attn_bias.masked_fill(mask_flat == 0, float('-inf'))
+
+        # 2) Reshape to heads: [B,G,L,C] -> [B,G,L,H,D]
+        q = q.reshape(b, g, q_len, self.num_heads, self.qk_channels_per_head)
+        k = k.reshape(b, g, kv_len, self.num_heads, self.qk_channels_per_head)
+        v = v.reshape(b, g, kv_len, self.num_heads, self.v_channels_per_head)
+
+        scale = 1.0 / math.sqrt(self.qk_channels_per_head)
+
+        if self.use_xformers:
+            # --- xFormers memory-efficient attention ---
+            q_flat = q.reshape(b * g, q_len, self.num_heads, self.qk_channels_per_head).contiguous()
+            k_flat = k.reshape(b * g, kv_len, self.num_heads, self.qk_channels_per_head).contiguous()
+            v_flat = v.reshape(b * g, kv_len, self.num_heads, self.v_channels_per_head).contiguous()
+
+            attn_bias = self._prepare_mask_for_xformers(
+                attention_mask, b, g, q_len, kv_len, dtype=q_flat.dtype, device=q_flat.device
+            )
+
+            out = xops.memory_efficient_attention(
+                q_flat, k_flat, v_flat,
+                attn_bias=attn_bias,
+                p=self.dropout_prob if self.training else 0.0,
+                scale=scale,
+            )  # [B*G, Q, H, Dv]
+
+            result = out.reshape(b, g, q_len, self.num_heads * self.v_channels_per_head)
+
+            if self.return_attn_probs:
+                # Secondary pass to compute probabilities (optional)
+                scores = einsum('bgqhd,bgkhd->bghqk', q, k) * scale
+                if attention_mask is not None:
+                    if attention_mask.dim() == 3:
+                        mask = attention_mask.unsqueeze(1).expand(b, g, q_len, kv_len)
+                    else:
+                        mask = attention_mask
+                    scores = scores.masked_fill(mask.unsqueeze(2) == 0, float('-inf'))
+                attn_probs = func.softmax(scores, dim=-1)
+                if self.training and self.dropout_prob > 0.0:
+                    attn_probs = self.dropout(attn_probs)
         else:
-            attn_bias = None
-        
-        # Scale factor for attention
-        scale = 1.0 / math.sqrt(self.qk_channels_per_head)
-        
-        # Call xFormers memory_efficient_attention
-        output = memory_efficient_attention(
-                                            q_flat, k_flat, v_flat,
-                                            attn_bias=attn_bias,
-                                            p=self.dropout_prob if self.training else 0.0,
-                                            scale=scale,
-                                            )
-        
-        # Reshape back to original format: [b*g, q_len, h*d] -> [b, g, q_len, h*d]
-        result = output.reshape(b, g, q_len, self.num_heads * self.v_channels_per_head)
-        """
+           
+            scores = einsum('bgqhd,bgkhd->bghqk', q, k) * scale
+            if attention_mask is not None:
+                # [B, G, Q, K] or [B, Q, K] -> broadcast to [B, G, 1, Q, K]
+                if attention_mask.dim() == 3:
+                    mask = attention_mask.unsqueeze(1).expand(b, g, q_len, kv_len)
+                elif attention_mask.dim() == 4:
+                    mask = attention_mask
+                else:
+                    raise ValueError("attention_mask must be [B, Q, K] or [B, G, Q, K]")
+                scores = scores.masked_fill(mask.unsqueeze(2) == 0, float('-inf'))
 
+            attn_probs = func.softmax(scores, dim=-1)
+            attn_probs = self.dropout(attn_probs)
 
-        # Scaled dot-product attention
-        scale = 1.0 / math.sqrt(self.qk_channels_per_head)
-        attn_scores = einsum('bgnhc,bgmhc->bghnm', q, k) * scale
+            # [B,G,H,Q,K] x [B,G,K,H,Dv] -> [B,G,Q,H,Dv] -> [B,G,Q,C_v]
+            out = einsum('bghqk,bgkhd->bgqhd', attn_probs, v)
+            result = out.reshape(b, g, q_len, self.num_heads * self.v_channels_per_head)
 
-        if attention_mask is not None:
-            attn_scores = attn_scores.masked_fill(attention_mask == 0, float('-inf'))
-        attn_probs = func.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
-
-        # Combine heads
-        result = einsum('bghnm,bgmhd->bgnhd', attn_probs, v)
-        b, g, i, h, c = result.shape
-        result = torch.reshape(result, (b, g, i, h * c))
-
-        # Final linear projection
-        return self.attention_output_linear(result), attn_probs
-    
+        # 4) Final projection
+        final_output = self.attention_output_linear(result)
+        return final_output, attn_probs

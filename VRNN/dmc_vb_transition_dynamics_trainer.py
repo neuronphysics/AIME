@@ -1555,11 +1555,11 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 10,
-        'latent_dim': 20,
+        'max_components': 15,
+        'latent_dim': 30,
         'hidden_dim': 32, #must be divisible by 8
-        'context_dim': 16,
-        'attention_dim': 16,
+        'context_dim': 25,
+        'attention_dim': 25,
         'attention_resolution': 16,
         'input_channels': 3*1,  # 3 stacked frames
         'HiP_type': 'Mini',
@@ -1567,7 +1567,7 @@ def main():
         'prior_beta': 2.0,
         
         # Training settings
-        'batch_size': 4,
+        'batch_size': 6,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
