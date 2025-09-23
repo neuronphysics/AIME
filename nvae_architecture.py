@@ -317,16 +317,16 @@ class VAEEncoder(nn.Module):
         # MLP
         if self.use_checkpoint and self.training:
             # Checkpoint the MLP computation
-            self.hlayer = torch.utils.checkpoint.checkpoint(
+            hlayer = torch.utils.checkpoint.checkpoint(
                 self.mlp, h, use_reentrant=False, preserve_rng_state=True
             )
             # Checkpoint the projection to mean/logvar
             mean_logvar = torch.utils.checkpoint.checkpoint(
-                self.proj, self.hlayer, use_reentrant=False, preserve_rng_state=True
+                self.proj, hlayer, use_reentrant=False, preserve_rng_state=True
             )
         else:
-            self.hlayer = self.mlp(h)
-            mean_logvar = self.proj(self.hlayer)
+            hlayer = self.mlp(h)
+            mean_logvar = self.proj(hlayer)
 
         mean, logvar = mean_logvar.chunk(2, dim=-1)
         # Project to latent space
@@ -335,7 +335,7 @@ class VAEEncoder(nn.Module):
         eps= torch.randn_like(sigma)
         z = mean + eps * sigma
 
-        return z, mean, logvar
+        return z, mean, logvar, hlayer
     #-------------- Fuse Features from different layers ---------------
     def extract_pyramid(self, x: torch.Tensor, levels=None):
         """Return dict of multi-scale features tapped from the encoder backbone.
@@ -842,7 +842,7 @@ class VAEDecoder(nn.Module):
             return means.gather(1, idx)  # [B,C,H,W]
         else:
             # Sample from discretized logistic mixture (simple temperature scaling on logits)
-            return self.mdl_head.sample_from_mixture(logit_probs / scale_temp, means, log_scales, coeffs)
+            return self.mdl_head.sample(logit_probs / scale_temp, means, log_scales, coeffs)
 
 
 #  DINOv3 style

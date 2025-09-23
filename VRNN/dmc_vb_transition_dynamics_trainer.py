@@ -1556,18 +1556,18 @@ def main():
         
         # Model settings
         'max_components': 15,
-        'latent_dim': 30,
+        'latent_dim': 36,
         'hidden_dim': 24, #must be divisible by 8
         'context_dim': 20,
         'attention_dim': 20,
-        'attention_resolution': 21,
+        'attention_resolution': 16,
         'input_channels': 3*1,  # 3 stacked frames
         'HiP_type': 'Mini',
         'prior_alpha': 6.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
         
         # Training settings
-        'batch_size': 4,
+        'batch_size': 5,
         'sequence_length': 10,
         'frame_stack': 1,
         'img_height': 64,
@@ -1596,7 +1596,7 @@ def main():
         'wandb_project': 'dpgmm-vrnn-dmc',
         'wandb_entity': 'zahrasheikh',
         'experiment_name': 'humanoid_walk_expert',
-        'visualize_every': 5,
+        'visualize_every': 4,
         'checkpoint_every': 10
     }
     

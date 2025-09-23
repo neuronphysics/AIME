@@ -17,7 +17,7 @@ from models import (
     AddEpsilon, check_tensor, SelfModelBlock, PerpetualOrthogonalProjectionLoss
 )
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
-from VRNN.mtl_optimizers import RiemannianMGDA, EFDiagonalMetric, WeightClipping
+from VRNN.mtl_optimizers import SDMGrad, WeightClipping
 
 import math
 from collections import OrderedDict
@@ -586,7 +586,7 @@ class AttentionSchema(nn.Module):
             latent_dim=latent_dim,
             motion_kernels=8
         )
-        
+        self.prior_net.gradient_checkpointing_disable()
         self.to(device)
     
     def compute_attention_dynamics_loss(
@@ -859,28 +859,48 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.has_optimizers = True
         self._setup_optimizers(learning_rate, weight_decay)
 
-    def _warm_build_unet_adapters(self, batch_size: int = 1):
+    def _warm_build_unet_adapters(self, batch_size: int = 1, dtype: torch.dtype | None = None):
         """
         Force-create UNet concat adapters before the optimizer is built.
-        Uses a synthetic batch that matches training shapes.
+        Runs a single synthetic forward with the same spatial shape as training
+        without touching BN/Dropout stats or autograd graphs.
         """
+        if dtype is None:
+            # If you use AMP (bf16/fp16), pass that here to match real runs.
+            dtype = torch.float32
+
         x_dummy = torch.zeros(
             batch_size,
             self.input_channels,
             self.image_size,
             self.image_size,
             device=self.device,
-            dtype=torch.float32,
+            dtype=dtype,
         )
-        with torch.no_grad(), _temporarily_disable_ckpt(self.encoder, self.decoder):
-            z, _, _ = self.encoder(x_dummy)
-            skips = self.encoder.get_unet_skips(x_dummy, levels=("C2","C3","C4","C5","C6"), detach=True)  # just shapes/features
 
-            _ = self.decoder(z, skips=skips)  # <-- creates & caches the 1×1 adapters
-            # leave decoder clean for real training calls
-            if hasattr(self.decoder, "_pending_skips"):
-                self.decoder._pending_skips = None
-            
+        # Save/restore training modes to avoid BN/Dropout state updates.
+        enc_was_training = self.encoder.training
+        dec_was_training = self.decoder.training
+        self.encoder.eval()
+        self.decoder.eval()
+
+        try:
+            # Inference mode is stricter than no_grad and avoids version counter bumps.
+            with torch.no_grad(), _temporarily_disable_ckpt(self.encoder, self.decoder):
+                z, _, _, _ = self.encoder(x_dummy)
+                skips = self.encoder.get_unet_skips(
+                    x_dummy, levels=("C2","C3","C4","C5","C6"), detach=True
+                )
+                _ = self.decoder(z, skips=skips)  # materializes/caches 1×1 adapters
+
+                # Only needed if legacy code still reads this; otherwise remove.
+                if hasattr(self.decoder, "_pending_skips"):
+                    self.decoder._pending_skips = None
+        finally:
+            # Restore prior train/eval state.
+            if enc_was_training: self.encoder.train()
+            if dec_was_training: self.decoder.train()
+                
     def _init_encoder_decoder(self):
         # Encoder network 
         self.encoder = VAEEncoder(
@@ -939,8 +959,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     source=("C3", "C4", "C5"),  # or ("C3","C4","C5") if one wants to tap specific levels
                     d=d,  # must match
                 )
-        self.encoder.gradient_checkpointing_enable()
-        self.decoder.gradient_checkpointing_enable()
+        #self.encoder.gradient_checkpointing_enable()
+        #self.decoder.gradient_checkpointing_enable()
        
         self.ema_encoder = EMA(self.encoder, decay=0.995, use_num_updates=True)
         self.ema_decoder = EMA(self.decoder, decay=0.995, use_num_updates=True)
@@ -990,7 +1010,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # 5) Projection on top of Perceiver latents
         self.perceiver_projection = PerceiverContextEmbedding(
-            perceiver_latent_dim, self.context_dim, dropout=0.0, device=self.device
+            perceiver_latent_dim, self.context_dim, dropout=0.2, device=self.device
         )
                 
 
@@ -1060,10 +1080,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             a_dim=self.action_dim,
             c_dim=self.context_dim,
             h_dim=self.hidden_dim,
-            d=48,
+            d=40,
             nhead=8,
         )
-        self.self_model.enable_checkpointing()
+        #self.self_model.enable_checkpointing()
 
     def init_weights(self, module: nn.Module):
         """Initialize the weights using the typical initialization schemes """
@@ -1170,124 +1190,167 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
     def _setup_optimizers(self, learning_rate: float, weight_decay: float) -> None:
         """
-        Build optimizers and RiemannianMGDA controller.
-
-        We separate parameters into:
-        - TRUNK: encoder/decoder/DPGMM prior/LSTM (+ layer norm) + Perceiver stack (+ projection)
-        - HEADS: attention posterior/prior heads and self model block (lightweight)
-        Trunk is optimized with geoopt.RiemannianAdam under MGDA; heads get a plain AdamW step.
+        Build optimizers with SDMGrad multi-task optimization.
         """
-        # ---- helpers
-        def params_of(*modules):
+        # Helper to get parameters from modules
+        def get_params(*modules):
+            params = []
             for m in modules:
                 if m is None:
                     continue
-                for p in m.parameters():
-                    if p.requires_grad:
-                        yield p
+                if isinstance(m, nn.Module):
+                    params.extend([p for p in m.parameters() if p.requires_grad])
+                elif isinstance(m, nn.Parameter) and m.requires_grad:
+                    params.append(m)
+            return params
 
-        def split_wd(param_iter, wd):
-            wd_params, nowd_params = [], []
-            for p in param_iter:
-                (wd_params if p.dim() > 1 else nowd_params).append(p)
-            return (
-                [{"params": wd_params,  "lr": learning_rate, "weight_decay": wd},
-                {"params": nowd_params, "lr": learning_rate, "weight_decay": 0.0}]
-                if (wd_params or nowd_params) else []
-            )
+        def split_by_weight_decay(params, wd):
+            """Split parameters into those with and without weight decay"""
+            decay = []
+            no_decay = []
+            for p in params:
+                if p.ndim >= 2:  # weights
+                    decay.append(p)
+                else:  # biases, norms
+                    no_decay.append(p)
+            
+            groups = []
+            if decay:
+                groups.append({"params": decay, "weight_decay": wd})
+            if no_decay:
+                groups.append({"params": no_decay, "weight_decay": 0.0})
+            return groups
 
-        # ---- TRUNK modules (core VRNN + Perceiver) 
-        # encoder/decoder/prior/RNN & layernorm show up in your forward; Perceiver stack is your global context trunk
-        trunk_core = [self.encoder, self.decoder, self.prior, self._rnn, self.rnn_layer_norm]
-        trunk_perceiver = [self.perceiver_model, self.perceiver_projection]
-        trunk_scalar = [self.h0, self.c0, self.temperature, self.temporal_attention_temp]  # keep scalar param if present
+        # Organize all modules by category
+        trunk_modules = [
+            self.encoder, 
+            self.decoder, 
+            self.prior,  # This includes all DPGMM components
+            self._rnn, 
+            self.rnn_layer_norm,
+            self.perceiver_model,
+            self.perceiver_projection,
+        ]
+        
+        head_modules = [
+            self.attention_prior_posterior,  # Attention schema
+            self.phi_attention,
+            self.self_model,
+        ]
+        
+        scalar_params = [
+            self.h0, 
+            self.c0, 
+            self.temperature,
+            self.temporal_attention_temp
+        ]
+        
+        # Build parameter groups
+        param_groups = []
+        
+        # Trunk parameters
+        trunk_params = get_params(*trunk_modules)
+        param_groups.extend(split_by_weight_decay(trunk_params, weight_decay))
+        
+        # Head parameters (higher LR, lower WD)
+        head_params = get_params(*head_modules)
+        for group in split_by_weight_decay(head_params, weight_decay * 0.5):
+            group["lr"] = learning_rate * 1.2
+            param_groups.append(group)
+        
+        # Scalar parameters (lower LR, no WD)
+        scalar_params_filtered = [p for p in scalar_params if isinstance(p, nn.Parameter) and p.requires_grad]
+        if scalar_params_filtered:
+            param_groups.append({
+                "params": scalar_params_filtered,
+                "lr": learning_rate * 0.1,
+                "weight_decay": 0.0
+            })
+        popl_params = [self.POPL.class_centres]
+        param_groups.append({"params": popl_params, "lr": learning_rate * 0.5, "weight_decay": 0.0})
 
-        trunk_groups  = []
-        trunk_groups += split_wd(params_of(*trunk_core), wd=weight_decay)                                # core WD/nWD
-        trunk_groups += split_wd(params_of(*trunk_perceiver), wd=weight_decay * 0.5)                     # perceiver has softer WD
-        if trunk_scalar and isinstance(trunk_scalar[0], torch.nn.Parameter):
-            trunk_groups.append({"params": [trunk_scalar[0]], "lr": learning_rate * 0.1, "weight_decay": 0.0})
-
-        # ---- HEAD modules (lightweight task heads)
-        heads = [self.attention_prior_posterior, self.phi_attention, self.self_model]
-        head_groups = []
-        # follow your prior convention: slightly higher LR, small WD
-        for g in split_wd(params_of(*heads), wd=weight_decay * 0.5):
-            g["lr"] = learning_rate * 1.20
-            head_groups.append(g)
-
-        # ---- Build trunk optimizer (geoopt Riemannian Adam)
+        
+        # Store all parameters for SDMGrad bookkeeping
         self.gen_optimizer = geoopt.optim.RiemannianAdam(
-            trunk_groups, lr=learning_rate, betas=(0.9, 0.999), eps=1e-8
+            param_groups, 
+            lr=learning_rate, 
+            betas=(0.9, 0.999), 
+            eps=1e-8
         )
+        def get_params(*modules):
+            params = []
+            for m in modules:
+                if m is None:
+                    continue
+                if isinstance(m, nn.Module):
+                    params.extend([p for p in m.parameters() if p.requires_grad])
+                elif isinstance(m, nn.Parameter) and m.requires_grad:
+                    params.append(m)
+            return params
 
-        # ---- Build heads optimizer (plain AdamW)
-        self.head_optimizer = torch.optim.AdamW(
-            head_groups, betas=(0.9, 0.999), eps=1e-8
-        )
+        # Define shared modules (everything except discriminators)
+        shared_modules = [
+            self.encoder, 
+            self.decoder, 
+            self.prior,  # Including all DPGMM components
+            self._rnn, 
+            self.rnn_layer_norm,
+            self.perceiver_model,
+            self.perceiver_projection,
+            self.attention_prior_posterior,
+            self.phi_attention,
+            self.self_model,
+            self.h0, 
+            self.c0, 
+            self.temperature,
+            self.temporal_attention_temp
+        ]
+        
+        # Get shared parameters
+        shared_params = get_params(*shared_modules)
+        
+        # Initialize SDMGrad wrapper with shared parameters
+        self.sdmgrad_wrapper = SDMGrad()
+        self.sdmgrad_wrapper.num_tasks = 5  # Your 5 task losses
+        self.sdmgrad_wrapper.device = self.device
+        self.sdmgrad_wrapper.rep_grad = False
+        
+        # Critical: Set the model interface for SDMGrad
+        class SharedParamWrapper:
+            """Wrapper to provide SDMGrad with shared parameter access"""
+            def __init__(self, params):
+                self.params = list(params)
+            
+            def shared_parameters(self):
+                return self.params
+            
+            def reset(self):
+                for p in self.params:
+                    if p.grad is not None:
+                        p.grad = None
+        
+        self.sdmgrad_wrapper.model = SharedParamWrapper(shared_params)
+        self.sdmgrad_wrapper.init_param()
 
-        # ---- Wrap the "trunk only" parameters for MGDA (share same Parameter objects)
-        class _Trunk(nn.Module):
-            def __init__(self, parent):
-                super().__init__()
-                # Register the exact submodules we want MGDA to control
-                self.encoder = parent.encoder
-                self.decoder = parent.decoder
-                self.prior = parent.prior
-                self._rnn = parent._rnn
-                if hasattr(parent, "rnn_layer_norm"):
-                    self.rnn_layer_norm = parent.rnn_layer_norm
-                if hasattr(parent, "perceiver_model"):
-                    self.perceiver_model = parent.perceiver_model
-                if hasattr(parent, "perceiver_projection"):
-                    self.perceiver_projection = parent.perceiver_projection
-                if hasattr(parent, "temperature"):
-                    # register as a param so .parameters() sees it
-                    self.temperature = parent.temperature
-                if hasattr(parent, "temporal_attention_temp"):
-                    self.temporal_attention_temp = parent.temporal_attention_temp
-                if hasattr(parent, "h0"):
-                    self.h0 = parent.h0
-                if hasattr(parent, "c0"):
-                    self.c0 = parent.c0
+        # Hyperparameters
+        self.sdmgrad_lamda = 0.3
+        self.sdmgrad_niter = 20
 
-        trunk_view = _Trunk(self)
-
-        # ---- EF-diagonal metric on trunk params (cheap curvature)
-        trunk_params = [p for g in self.gen_optimizer.param_groups for p in g["params"]]
-        metric = EFDiagonalMetric(params=trunk_params, beta=0.95, damping=1e-6)
-
-        # ---- Instantiate RiemannianMGDA on trunk
-        self.mgda = RiemannianMGDA(
-            model=trunk_view,
-            base_optim=self.gen_optimizer,       # MGDA can call .step() on the trunk optimizer
-            metric=metric,
-            fw_max_iter=25,
-            fw_tol=1e-6,
-            subspace_rank=32,
-            rank_adapt_enabled=False,            # keep deterministic unless you want auto-rank
-            use_minv_in_subspace=True,           # faithful geometry in rD via B^T M^{-1} B
-            armijo_enabled=True,
-            armijo_snapshot_policy="fp16",       # light snapshot; good trade-off
-            armijo_c=1e-4,
-            armijo_beta=0.5,
-            use_expmap=False                     # retraction is fine here
-        )
-
-        # ---- Discriminator optimizer stays identical to your previous setup
-        if getattr(self, "image_discriminator", None) is not None:
+        # Discriminator optimizer (separate)
+        if hasattr(self, 'image_discriminator'):
+            disc_params = [p for p in self.image_discriminator.parameters() if p.requires_grad]
             self.img_disc_optimizer = WeightClipping(
-                params=[p for p in self.image_discriminator.parameters() if p.requires_grad],
+                params=disc_params,
                 beta=1.0,
                 optimizer=torch.optim.AdamW,
-                lr=learning_rate * 0.3, betas=(0.8, 0.999),
+                lr=learning_rate * 0.08,
+                betas=(0.8, 0.999),
                 clip_last_layer=True,
-                max_grad_norm=self._grad_clip,
+                max_grad_norm=self._grad_clip
             )
-
-        # ---- Schedulers / warmup (leave API the same; scheduler attached to trunk/gen optimizer)
+        
+        # Setup schedulers
         self._setup_schedulers()
-
 
     def _setup_schedulers(self):
         """Setup learning-rate schedulers for all optimizers (Option B)."""
@@ -1382,7 +1445,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             outputs['context_states'].append(c_t)
             
             # === Inference Network q(z_t|o_≤t, z_<t) ===
-            z_t, z_mean_t, z_logvar_t = self.encoder(o_t)
+            z_t, z_mean_t, z_logvar_t, _ = self.encoder(o_t)
             skips = self.encoder.get_unet_skips(o_t, levels=("C2","C3","C4","C5","C6"))        # or encoder.get_unet_skips(x, levels=("C3","C4","C5"))
             #self.decoder.set_unet_skips(skips, mode="concat")
             logit_probs, means, log_scales, coeffs = self.decoder(z_t, skips=skips)
@@ -1606,8 +1669,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             params: Dictionary containing model parameters and latents
         """
         # Encode
-        z, z_mean, z_logvar = self.encoder(x)
-        h = self.encoder.hlayer  # Get hidden representation
+        z, z_mean, z_logvar, h = self.encoder(x)
+        
 
         # Get prior distribution and parameters
         prior_dist, prior_params = self.prior(h)
@@ -2143,13 +2206,34 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # ---- 0) Prep / warmup ----
         observations = self.prepare_images_for_training(observations)
         warmup_factor = self.get_warmup_factor()
+        loss_batches = []
+        for _ in range(3):
+            # ---- 1) Forward & base losses (no steps yet) ----
+            vae_losses, outputs = self.compute_total_loss(
+                observations, actions, beta, entropy_weight,
+                lambda_recon, lambda_att_dyn, lambda_att, lambda_gram
+            )
+            # ---- 3) Adversarial generator losses ----
+            img_adv_loss, temporal_adv_loss, feat_match_loss = self.compute_adversarial_losses(
+                x=observations,
+                reconstruction=outputs['reconstructions'],
+                z_seq=outputs['latents'],
+            )
+            lambda_img_eff = (lambda_img * warmup_factor) if warmup_factor > 0.0 else 0.0
 
-        # ---- 1) Forward & base losses (no steps yet) ----
-        vae_losses, outputs = self.compute_total_loss(
-            observations, actions, beta, entropy_weight,
-            lambda_recon, lambda_att_dyn, lambda_att, lambda_gram
-        )
-
+            # ---- 4) Compose task losses for MGDA (5 tasks) ----
+            elbo_loss = (
+                lambda_recon * vae_losses['recon_loss']
+                + beta * vae_losses['kl_z']
+                + beta * vae_losses['hierarchical_kl']
+                - entropy_weight * vae_losses['cluster_entropy']
+                + lambda_gram * vae_losses['gram_enc_loss']
+            )
+            predictive_loss = vae_losses['attention_loss']
+            orth_loss = vae_losses['attention_diversity'] + vae_losses['slot_ortho']
+            perceiver_loss = vae_losses['perceiver_loss']
+            adv_loss = lambda_img_eff * (img_adv_loss + temporal_adv_loss + feat_match_loss)
+            loss_batches.append(torch.stack([elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]))
         # ---- 2) Discriminator updates (their optimizer stepped inside) ----
         disc_losses_list = []
         for _ in range(n_critic):
@@ -2167,72 +2251,27 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 for k in disc_losses_list[0].keys()
             }
 
-        # ---- 3) Adversarial generator losses ----
-        img_adv_loss, temporal_adv_loss, feat_match_loss = self.compute_adversarial_losses(
-            x=observations,
-            reconstruction=outputs['reconstructions'],
-            z_seq=outputs['latents'],
-        )
-        lambda_img_eff = (lambda_img * warmup_factor) if warmup_factor > 0.0 else 0.0
 
-        # ---- 4) Compose task losses for MGDA (5 tasks) ----
-        elbo_loss = (
-            lambda_recon * vae_losses['recon_loss']
-            + beta * vae_losses['kl_z']
-            + beta * vae_losses['hierarchical_kl']
-            - entropy_weight * vae_losses['cluster_entropy']
-            + lambda_gram * vae_losses['gram_enc_loss']
+        self.gen_optimizer.zero_grad(set_to_none=True)
+        self.sdmgrad_wrapper.backward(
+            losses=torch.stack(loss_batches),  # [3, 5]
+            SDMGrad_lamda=self.sdmgrad_lamda,
+            SDMGrad_niter=self.sdmgrad_niter
         )
-        predictive_loss = vae_losses['attention_loss']
-        orth_loss = vae_losses['attention_diversity'] + vae_losses['slot_ortho']
-        perceiver_loss = vae_losses['perceiver_loss']
-        adv_loss = lambda_img_eff * (img_adv_loss + temporal_adv_loss + feat_match_loss)
+
+        # Standard optimization step
+        torch.nn.utils.clip_grad_norm_(list(self.sdmgrad_wrapper.model.shared_parameters()), max_norm=self._grad_clip)
+        self.gen_optimizer.step()
+            
+    
         
-        task_losses = [elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]
-
-        # 5) MGDA TRUNK STEP
-        #    - freeze heads so their grads stay zero while MGDA sets trunk grads & steps geoopt.RAdam
-        for m in (self.attention_prior_posterior, self.phi_attention, self.self_model):
-            if m is not None:
-                for p in m.parameters():
-                    p.requires_grad_(False)
-
-        def _armijo_closure():
-            with torch.no_grad():
-                v2, out2 = self.compute_total_loss(
-                    observations, actions, beta, entropy_weight,
-                    lambda_recon, lambda_att_dyn, lambda_att, lambda_gram
-                )
-                i2, t2, f2 = self.compute_adversarial_losses(
-                    x=observations, reconstruction=out2['reconstructions'], z_seq=out2['latents']
-                )
-                adv2 = lambda_img_eff * (i2 + t2 + f2)
-                return [v2['total_vae_loss'], v2['perceiver_loss'], v2['attention_loss'],
-                        v2['attention_diversity'] + v2['slot_ortho'], adv2]
-
-        mgda_logs = self.mgda.step(task_losses, closure=_armijo_closure)  # Frank–Wolfe + Armijo in Riemannian space :contentReference[oaicite:7]{index=7}
-
-        # 6) HEADS STEP (scalarized) — update heads with the simple average loss,
-        #    holding trunk fixed (to avoid overwriting trunk MGDA grads/step)
-        for group in self.head_optimizer.param_groups:
-            for p in group["params"]:
-                p.grad = None
-        # Temporarily block trunk grads while we backprop to heads
-        trunk_params = [p for g in self.gen_optimizer.param_groups for p in g["params"]]
-        for p in trunk_params:
-            p.requires_grad_(False)
-
-        head_scalar = (sum(task_losses) / len(task_losses))
-        head_scalar.backward()
-
-        torch.nn.utils.clip_grad_norm_(
-            [p for g in self.head_optimizer.param_groups for p in g["params"] if p.grad is not None],
-            max_norm=getattr(self, "_grad_clip", 1.0)
-        )
-        self.head_optimizer.step()
-
-        for p in trunk_params:
-            p.requires_grad_(True)
+        # ---- Amortized update of task weights ----
+        
+        task_names = ['elbo', 'perceiver', 'predictive', 'orthogonal', 'adversarial']
+        
+        # Add to return dictionary
+        weight_dict = {f'weight_{name}': weight.item()
+                       for name, weight in zip(task_names, self.sdmgrad_wrapper.w.detach().cpu())}
 
         # (Optional) log natural-grad norm assigned by MGDA (note: grads may be None if impl changes)
         grad_norm_sq = 0.0
@@ -2276,6 +2315,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             **vae_losses,
             # Discriminators
             **avg_disc_losses,
+            **weight_dict,
             # Adversarial gen
             'img_adv_loss': float(img_adv_loss.item()),
             'temporal_adv_loss': float(temporal_adv_loss.item()),
@@ -2288,9 +2328,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'Top 6 coverage': top6_cov,
             'mdl_avg_max_mixture_prob': avg_max_prob.item(),
             'mdl_effective_mixtures': (1.0 / avg_max_prob).item(),
-            **{f"mgda_{k}": (v if isinstance(v, (float, int)) else (v.mean().item() if torch.is_tensor(v) else v))
-            for k, v in mgda_logs.items()}
-
         }
 
     
@@ -2498,7 +2535,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         with torch.no_grad():
             # 1. Encode initial observation
-            z_0, _, _ = self.encoder(initial_obs)
+            z_0, _, _, _ = self.encoder(initial_obs)
             generated_latents.append(z_0)
             
             # 2. Get initial context

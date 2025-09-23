@@ -5,6 +5,7 @@ from typing import Iterable, List, Tuple
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.optim import Optimizer
 from math import inf
 import math
@@ -22,6 +23,7 @@ import os
 import queue
 import threading
 from torch.optim.lr_scheduler import LRScheduler
+from collections import defaultdict
 from dataclasses import is_dataclass, asdict
 CLOSURE = Optional[Callable[[], float]]
 LOSS = Optional[float]
@@ -1512,22 +1514,43 @@ class AlignedMTLOptimizer(GradientManipulationBaseOptimizer):
     
 # ---------------------------- Base Optimizer ----------------------------
 
+
 class AbsWeighting(nn.Module):
     r"""An abstract class for weighting strategies.
     """
-    def __init__(self):
+    def __init__(self, 
+                 model: nn.Module,
+                 num_tasks: int=None,
+                 device: str='cuda'):
         super(AbsWeighting, self).__init__()
-        
+        self.rep_grad = False
+        self.model = model
+
+        self.num_tasks = num_tasks
+        self.device = device
+        self.to(device)
+
+    def get_share_params(self):
+        r"""Return the shared parameters of the model."""
+        return self.model.shared_parameters()
+
+    def zero_grad_share_params(self):
+        r"""Set gradients of the shared parameters to zero."""
+        self.model.reset()
+
     def init_param(self):
         r"""Define and initialize some trainable parameters required by specific weighting methods. 
         """
         pass
 
     def _compute_grad_dim(self):
-        self.grad_index = []
-        for param in self.get_share_params():
-            self.grad_index.append(param.data.numel())
-        self.grad_dim = sum(self.grad_index)
+        if hasattr(self, "grad_index"):
+            pass
+        else:
+            self.grad_index = []
+            for param in self.get_share_params():
+                self.grad_index.append(param.data.numel())
+            self.grad_dim = sum(self.grad_index)
 
     def _grad2vec(self):
         grad = torch.zeros(self.grad_dim)
@@ -1545,10 +1568,13 @@ class AbsWeighting(nn.Module):
         mode: backward, autograd
         '''
         if not rep_grad:
-            grads = torch.zeros(self.task_num, self.grad_dim).to(self.device)
-            for tn in range(self.task_num):
+            grads = torch.zeros(self.num_tasks, self.grad_dim).to(self.device)
+            for tn in range(self.num_tasks):
                 if mode == 'backward':
-                    losses[tn].backward(retain_graph=True) if (tn+1)!=self.task_num else losses[tn].backward()
+                    if 'MoDo' in [base.__name__ for base in self.__class__.__bases__] or 'SDMGrad' in [base.__name__ for base in self.__class__.__bases__]:
+                        losses[tn].backward(retain_graph=True)
+                    else:
+                        losses[tn].backward(retain_graph=True) if (tn+1)!=self.num_tasks else losses[tn].backward()
                     grads[tn] = self._grad2vec()
                 elif mode == 'autograd':
                     grad = list(torch.autograd.grad(losses[tn], self.get_share_params(), retain_graph=True))
@@ -1558,12 +1584,12 @@ class AbsWeighting(nn.Module):
                 self.zero_grad_share_params()
         else:
             if not isinstance(self.rep, dict):
-                grads = torch.zeros(self.task_num, *self.rep.size()).to(self.device)
+                grads = torch.zeros(self.num_tasks, *self.rep.size()).to(self.device)
             else:
                 grads = [torch.zeros(*self.rep[task].size()) for task in self.task_name]
             for tn, task in enumerate(self.task_name):
                 if mode == 'backward':
-                    losses[tn].backward(retain_graph=True) if (tn+1)!=self.task_num else losses[tn].backward()
+                    losses[tn].backward(retain_graph=True) if (tn+1)!=self.num_tasks else losses[tn].backward()
                     grads[tn] = self.rep_tasks[task].grad.data.clone()
         return grads
 
@@ -1590,10 +1616,10 @@ class AbsWeighting(nn.Module):
         if self.rep_grad:
             per_grads = self._compute_grad(losses, mode, rep_grad=True)
             if not isinstance(self.rep, dict):
-                grads = per_grads.reshape(self.task_num, self.rep.size()[0], -1).sum(1)
+                grads = per_grads.reshape(self.num_tasks, self.rep.size()[0], -1).sum(1)
             else:
                 try:
-                    grads = torch.stack(per_grads).sum(1).view(self.task_num, -1)
+                    grads = torch.stack(per_grads).sum(1).view(self.num_tasks, -1)
                 except:
                     raise ValueError('The representation dimensions of different tasks must be consistent')
             return [per_grads, grads]
@@ -1613,15 +1639,15 @@ class AbsWeighting(nn.Module):
         if self.rep_grad:
             if not isinstance(self.rep, dict):
                 # transformed_grad = torch.einsum('i, i... -> ...', batch_weight, per_grads)
-                transformed_grad = sum([batch_weight[i] * per_grads[i] for i in range(self.task_num)])
+                transformed_grad = sum([batch_weight[i] * per_grads[i] for i in range(self.num_tasks)])
                 self.rep.backward(transformed_grad)
             else:
                 for tn, task in enumerate(self.task_name):
-                    rg = True if (tn+1)!=self.task_num else False
+                    rg = True if (tn+1)!=self.num_tasks else False
                     self.rep[task].backward(batch_weight[tn]*per_grads[tn], retain_graph=rg)
         else:
             # new_grads = torch.einsum('i, i... -> ...', batch_weight, grads)
-            new_grads = sum([batch_weight[i] * grads[i] for i in range(self.task_num)])
+            new_grads = sum([batch_weight[i] * grads[i] for i in range(self.num_tasks)])
             self._reset_grad(new_grads)
     
     @property
@@ -1633,50 +1659,75 @@ class AbsWeighting(nn.Module):
         """
         pass
 
-class GradNorm(AbsWeighting):
-    r"""Gradient Normalization (GradNorm).
+
+
+class SDMGrad(AbsWeighting):
+    r"""Stochastic Direction-oriented Multi-objective Gradient descent (SDMGrad).
     
-    This method is proposed in `GradNorm: Gradient Normalization for Adaptive Loss Balancing in Deep Multitask Networks (ICML 2018) <http://proceedings.mlr.press/v80/chen18a/chen18a.pdf>`_ \
-    and implemented by us.
+    This method is proposed in `Direction-oriented Multi-objective Learning: Simple and Provable Stochastic Algorithms (NeurIPS 2023) <https://openreview.net/forum?id=4Ks8RPcXd9>`_ \
+    and implemented by modifying from the `official PyTorch implementation <https://github.com/OptMN-Lab/sdmgrad>`_. 
 
     Args:
-        alpha (float, default=1.5): The strength of the restoring force which pulls tasks back to a common training rate.
+        SDMGrad_lamda (float, default=0.3): The regularization hyperparameter.
+        SDMGrad_niter (int, default=20): The update iteration of loss weights.
 
     """
-    def __init__(self):
-        super(GradNorm, self).__init__()
-        
+    def __init__(self, model: nn.Module, num_tasks: int, device: str = 'cuda'):
+        super().__init__(model=model, num_tasks=num_tasks, device=device)
+   
     def init_param(self):
-        self.loss_scale = nn.Parameter(torch.tensor([1.0]*self.task_num, device=self.device))
+        self.w = 1/self.num_tasks*torch.ones(self.num_tasks).to(self.device)
+        self.w_opt = torch.optim.SGD([self.w], lr=5, momentum=0.5)
+
+    def euclidean_proj_simplex(self, v, s=1):
+        assert s > 0, "Radius s must be strictly positive (%d <= 0)" % s
+        v = v.astype(np.float64)
+        n, = v.shape  
+        if v.sum() == s and np.alltrue(v >= 0):
+            return v
+        u = np.sort(v)[::-1]
+        cssv = np.cumsum(u)
+        rho = np.nonzero(u * np.arange(1, n + 1) > (cssv - s))[0][-1]
+        theta = float(cssv[rho] - s) / (rho + 1)
+        w = (v - theta).clip(min=0)
+        return w
         
     def backward(self, losses, **kwargs):
-        alpha = kwargs['alpha']
-        if self.epoch >= 1:
-            loss_scale = self.task_num * F.softmax(self.loss_scale, dim=-1)
-            grads = self._get_grads(losses, mode='backward')
-            if self.rep_grad:
-                per_grads, grads = grads[0], grads[1]
-                
-            G_per_loss = torch.norm(loss_scale.unsqueeze(1)*grads, p=2, dim=-1)
-            G = G_per_loss.mean(0)
-            L_i = torch.Tensor([losses[tn].item()/self.train_loss_buffer[tn, 0] for tn in range(self.task_num)]).to(self.device)
-            r_i = L_i/L_i.mean()
-            constant_term = (G*(r_i**alpha)).detach()
-            L_grad = (G_per_loss-constant_term).abs().sum(0)
-            L_grad.backward()
-            loss_weight = loss_scale.detach().clone()
+        # losses: [3, num_tasks] in SDMGrad
+        assert self.rep_grad == False, "No support method SDMGrad with representation gradients (rep_grad=True)"
+
+        SDMGrad_lamda, SDMGrad_niter = kwargs['SDMGrad_lamda'], kwargs['SDMGrad_niter']
+
+        grads = []
+        for i in range(3):
+            grads.append(self._get_grads(losses[i], mode='backward'))
+
+        zeta_grads, xi_grads1, xi_grads2 = grads
+        GG = torch.mm(xi_grads1, xi_grads2.t())
+        GG_diag = torch.diag(GG)
+        GG_diag = torch.where(GG_diag < 0, torch.zeros_like(GG_diag), GG_diag)
+        scale = torch.mean(torch.sqrt(GG_diag))
+        GG = GG / (scale.pow(2) + 1e-8)
+        Gg = torch.mean(GG, dim=1)
+        gg = torch.mean(Gg)
+        self.w.requires_grad = True
+        
+        for i in range(SDMGrad_niter):
+            self.w_opt.zero_grad()
             
-            if self.rep_grad:
-                self._backward_new_grads(loss_weight, per_grads=per_grads)
-            else:
-                self._backward_new_grads(loss_weight, grads=grads)
-            return loss_weight.cpu().numpy()
-        else:
-            loss = torch.mul(losses, torch.ones_like(losses).to(self.device)).sum()
-            loss.backward()
-            return np.ones(self.task_num)
-        
-        
+            obj = 0.5 * torch.dot(self.w, torch.mv(GG, self.w)) + SDMGrad_lamda * torch.dot(self.w, Gg) + 0.5 * SDMGrad_lamda**2 * gg
+            obj.backward()
+            self.w_opt.step()
+            proj = self.euclidean_proj_simplex(self.w.data.cpu().numpy())
+            self.w.data.copy_(torch.from_numpy(proj).data)
+        self.w.requires_grad = False
+
+        g0 = torch.mean(zeta_grads, dim=0)
+        gw = (zeta_grads * self.w.view(-1, 1)).sum(0)
+        g = (gw + SDMGrad_lamda * g0) / (1 + SDMGrad_lamda)
+
+        self._reset_grad(g)
+        return None
 # ---------------------------- weight clipping ----------------------------
 class InitBounds:
     '''
@@ -1740,798 +1791,214 @@ class WeightClipping(torch.optim.Optimizer):
 
 
 
-# ------------------------------- Metric --------------------------------------
 
-class EFDiagonalMetric:
+# ---------------- Fisher–Rao geometry on the simplex ----------------
+
+
+class DynamicWeightAverage:
     """
-    EF-diagonal metric with a low-rank correction on the current task-gradient
-    subspace (LoRA-flavored). Uses Woodbury to apply inverse in O(P·r + r^2).
-    U is built on-the-fly from per-task grads J (no long-term memory).
+    Dynamic Weight Average for multi-task learning
+    Based on "End-to-End Multi-Task Learning with Attention"
     """
-    def __init__(
-        self, params, beta=0.95, damping=1e-3, power=1.0, bias_correction=True,
-        tau=1.0, rank_cap=None, exclude_fn=None,
-        store_device=None, store_dtype=None
-    ):
-        self.params = [p for p in params if p.requires_grad and (exclude_fn is None or not exclude_fn(p))]
-        self.beta, self.damping, self.power = beta, damping, power
-        self.bias_correction, self.tau, self.rank_cap = bias_correction, tau, rank_cap
-        with torch.no_grad():
-            self._sizes = [p.numel() for p in self.params]
-            self._device = (self.params[0].device if self.params else torch.device('cpu'))
-            self._dtype  = (self.params[0].dtype  if self.params else torch.float32)
-            self.v = torch.zeros(sum(self._sizes), device=self._device, dtype=self._dtype)
-        self.t = 0
-        self._U = {}  # per-parameter {idx: U[n_i, r_i]}
-        self._U_device = store_device or self._device
-        self._U_dtype  = store_dtype or self._dtype
-
-    def _flatten_grads(self):
-        flats = []
-        for p in self.params:
-            g = p.grad
-            flats.append((torch.zeros_like(p) if g is None else g).reshape(-1))
-        return torch.cat(flats) if flats else torch.tensor([], device=self._device, dtype=self._dtype)
-
-    @torch.no_grad()
-    def update_from_grads(self):
-        g = self._flatten_grads()
-        if g.numel() == 0:
-            return
-        self.v.mul_(self.beta).addcmul_(g, g, value=(1.0 - self.beta))
-
-    def _vhat(self):
-        if not self.bias_correction or self.t == 0:
-            return self.v
-        bc = 1.0 - (self.beta ** self.t)
-        return self.v / bc
-
-    @torch.no_grad()
-    def update_task_subspace(self, J: torch.Tensor):
-        """
-        J: [T, P] per-task Euclidean grads, already computed by MGDA.
-        Build per-parameter U from columns of J (orthonormalized).
-        """
-        if J.numel() == 0:
-            self._U.clear()
-            return
-        T, P = J.shape
-        r_global = T if (self.rank_cap is None) else min(T, self.rank_cap)
-        # bias-correction clock tick for consistent denom
-        self.t += 1
-        vhat = self._vhat()
-        denom_full = (vhat + self.damping).clamp_min(1e-12)
-        if self.power != 1.0:
-            denom_full = denom_full.pow(self.power)
-
-        self._U.clear()
-        off = 0
-        for idx, p in enumerate(self.params):
-            n = p.numel()
-            Ji = J[:, off:off+n].T.contiguous()  # [n, T]
-            off += n
-            if n == 0:
-                continue
-            r = min(r_global, n, T)
-            if r == 0:
-                continue
-            Ji32 = Ji.to(dtype=torch.float32)
-            colnorm = torch.linalg.norm(Ji32, dim=0)
-            keep = (colnorm > 1e-12)
-            if keep.sum() == 0:
-                continue
-            Ji32 = Ji32[:, keep]
-            Q, _ = torch.linalg.qr(Ji32, mode='reduced')  # [n, <=T]
-            if Q.shape[1] == 0:
-                continue
-            U = Q[:, :r].to(device=self._U_device, dtype=self._U_dtype)  # [n, r]
-            self._U[idx] = U
-
-    # Fast flat inverse for MGDA (handles all params in one go)
-    def apply_inverse_flat(self, flat: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            vhat = self._vhat()
-            denom_full = (vhat + self.damping).clamp_min(1e-12)
-            if self.power != 1.0:
-                denom_full = denom_full.pow(self.power)
-
-        if flat.numel() == 0:
-            return flat
-
-        out = []
-        off_full = 0
-        off_d = 0
-        for idx, p in enumerate(self.params):
-            n = p.numel()
-            v = flat[off_full:off_full+n]
-            off_full += n
-            d = denom_full[off_d:off_d+n]
-            off_d += n
-
-            Dinvv = v / d
-            U = self._U.get(idx, None)
-            if U is None or U.numel() == 0 or self.tau == 0.0:
-                out.append(Dinvv)
-                continue
-
-            DinvU = U / d.reshape(-1, 1)                 # [n, r]
-            UtDinvU = U.T @ DinvU                        # [r, r]
-            UtDinvv = (U.T @ (v / d))                    # [r]
-            K = (1.0 / self.tau) * torch.eye(UtDinvU.shape[0], device=UtDinvU.device, dtype=UtDinvU.dtype) + UtDinvU
-            try:
-                sol = torch.linalg.solve(K, UtDinvv.unsqueeze(-1)).squeeze(-1)  # [r]
-            except RuntimeError:
-                sol = torch.linalg.lstsq(K, UtDinvv.unsqueeze(-1)).solution.squeeze(-1)
-            corr = DinvU @ sol
-            out.append(Dinvv - corr)
-
-        return torch.cat(out, dim=0)
-
-# ----------------------------- Utilities -------------------------------------
-
-def _gather_params(model: nn.Module) -> List[nn.Parameter]:
-    return [p for p in model.parameters() if p.requires_grad]
-
-
-def _flatten(vecs: Sequence[torch.Tensor]) -> torch.Tensor:
-    return torch.cat([v.reshape(-1) for v in vecs]) if vecs else torch.tensor([])
-
-
-def _split_like(flat: torch.Tensor, like: Sequence[nn.Parameter]) -> List[torch.Tensor]:
-    out, off = [], 0
-    for p in like:
-        n = p.numel()
-        out.append(flat[off:off+n].view_as(p))
-        off += n
-    return out
-
-
-def _egrad2rgrad(params: Sequence[nn.Parameter], grads: Sequence[torch.Tensor]) -> List[torch.Tensor]:
-    out = []
-    for p, g in zip(params, grads):
-        if hasattr(p, 'manifold') and hasattr(p.manifold, 'egrad2rgrad'):
-            out.append(p.manifold.egrad2rgrad(p.data, g))
-        else:
-            out.append(g)
-    return out
-
-
-def _retract(params: Sequence[nn.Parameter], step: Sequence[torch.Tensor], step_size: float):
-    for p, d in zip(params, step):
-        if hasattr(p, 'manifold') and hasattr(p.manifold, 'retr'):
-            p.data = p.manifold.retr(p.data, -step_size * d)
-        else:
-            p.data.add_(-step_size * d)
-
-# -------------------------- Implicit FW QP -----------------------------------
-class _FWImplicit:
-    """Frank–Wolfe for min_{α∈Δ} α^T M α using implicit Mα products.
-    Mα is computed by: t = Σ_j α_j g_j ; tn = M^{-1} t ; (Mα)_i = g_i^T tn.
-    Each FW iteration: O(T·P) time, O(P+T) memory.
-    """
-    def __init__(self, task_grads_flat: torch.Tensor, apply_minv: Callable[[torch.Tensor], torch.Tensor]):
-        """
-        task_grads_flat: Tensor of shape [T, P]
-        apply_minv: function that maps flat vector → M^{-1} * vector
-        """
-        self.Gs = task_grads_flat  # [T, P]
-        self.apply_minv = apply_minv
-        self.T, self.P = task_grads_flat.shape
-
-    def _M_alpha(self, alpha: torch.Tensor) -> torch.Tensor:
-        # t = Σ α_j g_j
-        t = alpha @ self.Gs  # [P]
-        tn = self.apply_minv(t)  # [P]
-        # (Mα)_i = g_i^T tn
-        return (self.Gs @ tn)  # [T]
-
-    def solve(self, alpha0: Optional[torch.Tensor] = None, max_iter: int = 50, tol: float = 1e-7) -> Tuple[torch.Tensor, Dict]:
-        device = self.Gs.device
-        if alpha0 is None:
-            alpha = torch.full((self.T,), 1.0 / self.T, device=device)
-        else:
-            alpha = (alpha0 / (alpha0.sum() + 1e-12)).clamp_min(0)
-        info = {'converged': False, 'iterations': 0, 'final_gap': None}
-        for k in range(max_iter):
-            Malpha = self._M_alpha(alpha)   # [T]
-            grad = 2.0 * Malpha            # ∇f(α) with f=α^T M α
-            kmin = int(torch.argmin(grad).item())
-            s = torch.zeros_like(alpha); s[kmin] = 1.0
-            d = s - alpha
-            # Dual gap ≈ -⟨grad, d⟩
-            gap = -(grad @ d)
-            if gap.abs().item() < tol:
-                info.update({'converged': True, 'iterations': k+1, 'final_gap': gap.item()})
-                break
-            # Exact line-search for quadratic: γ* = clip( - d^T M α / (d^T M d), [0,1] )
-            num = (d @ Malpha)
-            Md = self._M_alpha(d)
-            den = (d @ Md).clamp_min(1e-12)
-            gamma = (-num / den).clamp(0.0, 1.0)
-            alpha = (1 - gamma) * alpha + gamma * s
-            info['iterations'] = k+1
-            info['final_gap'] = gap.item()
-        # sanitize
-        alpha = alpha.clamp_min(0); alpha = alpha / (alpha.sum() + 1e-12)
-        return alpha, info
-
-# ----------------------------- Main Optimizer --------------------------------
-# ======================================================================
-# Module-level helper (SINGLE definition): Low-rank tangent subspace
-# ======================================================================
-
-class _LowRankTangentSubspace:
-    """
-    Maintain a per-parameter rank-r orthonormal tangent basis {B_p}.
-    Enables MGDA in rD without ever materializing J [T×P].
-    Memory ~ sum_p |p|·r + O(r^2), with r << min{T,P}.
-    """
-    def __init__(self, params: List[nn.Parameter], rank: int):
-        self.params = [p for p in params if p.requires_grad]
-        self.r = int(rank)
-        self.B: List[torch.Tensor] = []
-        for p in self.params:
-            Bp = torch.randn(*p.shape, self.r if p.numel() >= self.r else p.numel(),
-                 device=p.device, dtype=p.dtype)
-
-            self.B.append(self._orth(Bp, p))
-
-    @torch.no_grad()
-    def _orth(self, Bp: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        # Build an orthonormal basis with up to min(P, r) columns and pad to r
-        P = p.numel()
-        r = self.r
-        dim = min(P, r)
-        # Orthonormalize only the feasible block
-        Q, _ = torch.linalg.qr(Bp.reshape(P, dim), mode="reduced")  # [P, dim]
-        if dim < r:
-            Q_full = torch.zeros(P, r, device=Bp.device, dtype=Bp.dtype)
-            Q_full[:, :dim] = Q
-            return Q_full.reshape(*p.shape, r)
-        return Q.reshape_as(Bp)
-
-    @torch.no_grad()
-    def oja_update(self, avg_rgrads_per_param: List[torch.Tensor], eta: float = 0.05):
-        """
-        Streaming Oja: B_p += eta * ḡ_p * <ḡ_p, B_p>, then re-orthonormalize.
-        avg_rgrads_per_param aligned with self.params; each is a *tangent* grad.
-        """
-        for i, (p, Bp, gp) in enumerate(zip(self.params, self.B, avg_rgrads_per_param)):
-            if gp is None:
-                continue
-            coef = (gp.unsqueeze(-1) * Bp).reshape(-1, self.r).sum(dim=0)  # [r] = <ḡ_p, B_{p,·}>
-            Bp.add_(eta * gp.unsqueeze(-1) * coef.view(*([1] * gp.dim()), -1))
-            self.B[i] = self._orth(Bp, p)
-
-
-# ======================================================================
-# Clean RiemannianMGDA (memory-efficient)
-# ======================================================================
-
-class RiemannianMGDA:
-    """
-    Memory-efficient Riemannian MGDA with EF-diag metric and optional low-rank tangent subspace.
-
-    • Subspace mode (subspace_rank>0): no T×P buffers; projects tasks to rD on the fly.
-    • EF-diagonal M^{-1} (cheap curvature), then Armijo along Retr (fast) or Exp (exact).
-    • Full-J path (subspace_rank=0) retained for exactness/compatibility.
-    • Armijo snapshot policy controls memory: 'full' (default), 'fp16', 'cpu', or 'none' (delta-tracking).
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        base_optim: Optional[torch.optim.Optimizer] = None,
-        *,
-        metric: Optional[EFDiagonalMetric] = None,
-        fw_max_iter: int = 50,
-        fw_tol: float = 1e-7,
-        armijo_enabled: bool = True,
-        armijo_c: float = 1e-4,
-        armijo_beta: float = 0.5,
-        armijo_max_tries: int = 10,
-        normalize_task_grads: bool = False,
-        max_nat_grad_norm: Optional[float] = None,
-        verbose: bool = False,
-        subspace_rank: int = 0,
-        subspace_oja_eta: float = 0.05,
-        use_expmap: bool = False,
-        armijo_snapshot_policy: str = "full",  # 'full' | 'fp16' | 'cpu' | 'none' (delta)
-        use_minv_in_subspace: bool = False,    # whiten FW in rD by B^T M^{-1} B (Cholesky)
-        rank_adapt_enabled: bool = False,
-        rank_variance_threshold: float = 0.95,   # explained variance target
-        rank_hysteresis: int = 2,                # min Δr to trigger a resize
-        rank_cooldown: int = 20,                 # steps between resize attempts
-        rank_min: int = 8,
-        rank_max: int = 128,
-        ewma_decay: float = 0.9
-    ):
-        self.model = model
-        self.params: List[nn.Parameter] = _gather_params(model)
-        self.base_optim = base_optim
-        self.metric = metric if metric is not None else EFDiagonalMetric(self.params)
-
-        self.fw_max_iter = fw_max_iter
-        self.fw_tol = fw_tol
-
-        self.armijo_enabled = armijo_enabled
-        self.armijo_c = armijo_c
-        self.armijo_beta = armijo_beta
-        self.armijo_max_tries = armijo_max_tries
-
-        self.normalize_task_grads = normalize_task_grads
-        self.max_nat_grad_norm = max_nat_grad_norm
-        self.verbose = verbose
-
-        self._alpha_prev: Optional[torch.Tensor] = None
-
-        # Subspace controls
-        self.subspace_rank = int(subspace_rank)
-        self.subspace_oja_eta = float(subspace_oja_eta)
-        self.use_expmap = bool(use_expmap)
-        self.armijo_snapshot_policy = str(armijo_snapshot_policy)
-        self.use_minv_in_subspace = bool(use_minv_in_subspace)
-
-        self.rank_adapt_enabled = bool(rank_adapt_enabled)
-        self.rank_variance_threshold = float(rank_variance_threshold)
-        self.rank_hysteresis = int(rank_hysteresis)
-        self.rank_cooldown = int(rank_cooldown)
-        self.rank_min = int(rank_min)
-        self.rank_max = int(rank_max)
-        self.ewma_decay = float(ewma_decay)
-
-        self._step_idx = 0
-        self._rank_cooldown_left = 0
-        self._Cr = None
-        self._subspace: Optional[_LowRankTangentSubspace] = (
-            _LowRankTangentSubspace(self.params, self.subspace_rank) if self.subspace_rank > 0 else None
-        )
-
-        # internal state for delta-tracking Armijo
-        self._armijo_gamma_acc: float = 0.0  # only used when snapshot_policy == 'none'
-
-        # Telemetry for rank adaptation
-        self._last_rank_stats = {}
-
-    @torch.no_grad()
-    def _rank_adapt_update_cov(self, tilde_G: torch.Tensor):
-        """
-        Update EWMA covariance in rD: C_r ← ρ C_r + (1-ρ) * cov(tilde_G).
-        tilde_G: [T, r]
-        """
-        if not self.rank_adapt_enabled or self._subspace is None:
-            return
-        r = self._subspace.r
-        if tilde_G.numel() == 0:
-            return
-        # Use zero-mean covariance in rD (cheap, stable)
-        Z = tilde_G - tilde_G.mean(dim=0, keepdim=True)          # [T, r]
-        C = (Z.T @ Z) / max(1, Z.shape[0])                       # [r, r]
-        if self._Cr is None or self._Cr.shape != C.shape:
-            self._Cr = C.clone()
-        else:
-            self._Cr.mul_(self.ewma_decay).add_((1.0 - self.ewma_decay) * C)
-
-    @torch.no_grad()
-    def _maybe_rank_adapt(self):
-        """
-        Decide whether to resize the subspace this step, using EWMA covariance _Cr.
-        Applies hysteresis + cooldown. Resize happens at the END of step (affects next step).
-        """
-        if not self.rank_adapt_enabled or self._subspace is None or self._Cr is None:
-            return
-        if self._rank_cooldown_left > 0:
-            self._rank_cooldown_left -= 1
-            return
-
-        # eigenvalues in descending order
-        evals, evecs = torch.linalg.eigh(self._Cr)
-        idx = torch.argsort(evals, descending=True)
-        evals = evals[idx].clamp_min(0)
-        evecs = evecs[:, idx]  # r×r
-
-        total = evals.sum().clamp_min(1e-12)
-        csum = torch.cumsum(evals, dim=0) / total
-        new_r = int((csum < self.rank_variance_threshold).sum().item()) + 1
-        new_r = int(max(self.rank_min, min(self.rank_max, new_r)))
-        old_r = self._subspace.r
-
-        if abs(new_r - old_r) < self.rank_hysteresis:
-            return  # ignore tiny oscillations
-
-        # Resize basis: rotate by evecs then crop/extend
-        self._resize_subspace(new_r, evecs)
-        # Reset EWMA to the new size
-        self._Cr = None
-        self._rank_cooldown_left = self.rank_cooldown
-        self._last_rank_stats = {'old_r': old_r, 'new_r': new_r, 'trace': float(total), 'r_eff': int((csum < self.rank_variance_threshold).sum().item()+1), 'cooldown_left': int(self._rank_cooldown_left)}
-        self._rank_cooldown_left = self.rank_cooldown
-
-    @torch.no_grad()
-    def _resize_subspace(self, new_r: int, evecs: torch.Tensor):
-        """
-        Rotate current basis B by evecs (align to principal dirs) and resize to new_r.
-        evecs: [r_old, r_old] from _Cr eigendecomposition.
-        """
-        sub = self._subspace
-        r_old = sub.r
-        assert evecs.shape[0] == r_old
-        # rotate existing basis: Bp ← Bp @ evecs
-        for i, Bp in enumerate(sub.B):
-            sub.B[i] = (Bp @ evecs).contiguous()  # [..., r_old]
-        if new_r < r_old:
-            # shrink: drop trailing columns, then re-orth for safety
-            for i, Bp in enumerate(sub.B):
-                sub.B[i] = self._orth_columns(Bp[..., :new_r])
-        elif new_r > r_old:
-            extra = new_r - r_old
-            for i, Bp in enumerate(sub.B):
-                sub.B[i] = self._extend_with_orth(Bp, extra)  # add orthonormal complement
-        sub.r = new_r
-
-    @torch.no_grad()
-    def _orth_columns(self, Bp: torch.Tensor) -> torch.Tensor:
-        # Orthonormalize last-dim columns; robust when last-dim > P
-        P = Bp.numel() // Bp.shape[-1]
-        r = Bp.shape[-1]
-        dim = min(P, r)
-        Q, _ = torch.linalg.qr(Bp[..., :dim].reshape(P, dim), mode="reduced")  # [P, dim]
-        if dim < r:
-            Q_full = torch.zeros(P, r, device=Bp.device, dtype=Bp.dtype)
-            Q_full[:, :dim] = Q
-            return Q_full.reshape_as(Bp)
-        return Q.reshape_as(Bp)
-
-    @torch.no_grad()
-    def _extend_with_orth(self, Bp: torch.Tensor, k: int) -> torch.Tensor:
-        """
-        Extend basis with k columns, respecting the ambient limit P.
-        When P < desired columns, pad remaining with zeros to keep shape consistent.
-        """
-        shape = list(Bp.shape); r = shape[-1]
-        P = Bp.numel() // r
-        # Existing orth block
-        r_eff = min(P, r)
-        Q, _ = torch.linalg.qr(Bp[..., :r_eff].reshape(P, r_eff), mode="reduced")  # [P, r_eff]
-        # How many *new* orth dirs can the space actually hold?
-        k_eff = max(min(k, P - r_eff), 0)
-        Q_add = torch.zeros(P, 0, device=Bp.device, dtype=Bp.dtype)
-        if k_eff > 0:
-            R_add = torch.randn(P, k_eff, device=Bp.device, dtype=Bp.dtype)
-            R_add = R_add - Q @ (Q.T @ R_add)                      # project out current span
-            Q_add, _ = torch.linalg.qr(R_add, mode="reduced")      # [P, k_eff]
-        # Assemble full (possibly zero-padded) block to reach r + k columns
-        B_full = torch.zeros(P, r + k, device=Bp.device, dtype=Bp.dtype)
-        B_full[:, :r_eff] = Q
-        if k_eff > 0:
-            B_full[:, r_eff:r_eff + k_eff] = Q_add
-        return B_full.reshape(*shape[:-1], r + k)
-
-
-    # -------------------- Metric inverse & grad assignment --------------------
-
-    def _apply_minv_flat(self, flat: torch.Tensor) -> torch.Tensor:
-        """
-        Apply M^{-1} to a flattened vector (EF-diag or fallback metric).
-        Optionally clip nat-grad norm.
-        """
-        if hasattr(self.metric, "apply_inverse_flat"):
-            v = self.metric.apply_inverse_flat(flat)
-        else:
-            pieces, off = [], 0
-            for p in self.params:
-                n = p.numel()
-                v_p = flat[off:off+n].view_as(p)
-                off += n
-                pieces.append(self.metric.apply_inverse(v_p))
-            v = _flatten(pieces)
-
-        if self.max_nat_grad_norm is not None and self.max_nat_grad_norm > 0:
-            nrm = torch.norm(v)
-            if float(nrm) > self.max_nat_grad_norm:
-                v = v * (self.max_nat_grad_norm / (nrm + 1e-12))
-        return v
-
-    def _assign_grad(self, flat_nat: torch.Tensor):
-        off = 0
-        for p in self.params:
-            n = p.numel()
-            p.grad = flat_nat[off:off+n].view_as(p).clone()
-            off += n
-
-    # -------------------- rD Frank–Wolfe (quadratic) --------------------
-
-    @staticmethod
-    def _fw_mgda_rd(tilde_G: torch.Tensor, alpha0: Optional[torch.Tensor], iters: int = 10, tol: float = 1e-7):
-        """
-        Solve:  min_{alpha in Δ_T} || tilde_G^T alpha ||^2
-        tilde_G: [T, r] (task grads projected into rD subspace).
-        """
-        device, T = tilde_G.device, tilde_G.shape[0]
-        G = tilde_G
-        gnorm2 = (G**2).sum(dim=1)
-
-        if alpha0 is None or alpha0.numel() != T:
-            i0 = torch.argmin(gnorm2)
-            alpha = torch.zeros(T, device=device, dtype=G.dtype); alpha[i0] = 1.0
-        else:
-            alpha = alpha0.clone().to(device)
-
-        v = alpha @ G  # current combination in rD
-        for _ in range(iters):
-            dot = G @ v          # [T], entries = <g_t, v>
-            j = torch.argmin(dot)
-            s = torch.zeros_like(alpha); s[j] = 1.0
-            d = (s - alpha) @ G  # FW direction in rD
-            denom = (d*d).sum()
-            if float(denom) <= 1e-16:
-                break
-            numer = (v * d).sum()
-            gamma = torch.clamp(numer / denom, 0.0, 1.0)
-            if float(gamma) <= tol:
-                break
-            alpha = (1 - gamma) * alpha + gamma * s
-            v = (1 - gamma) * v + gamma * (G[j])
-        return alpha, {'converged': True, 'final_gap': float((G @ v).min())}
-
-    # -------------------- Subspace mass (optional whitening) --------------------
-
-    def _subspace_mass_minv(self) -> torch.Tensor:
-        """
-        Build B^T M^{-1} B (r×r), applying EF-diag inverse to each basis column.
-        """
-        assert self._subspace is not None
-        r = self._subspace.r
-        cols_nat = []
-        for j in range(r):
-            # collect j-th column per param, flatten and apply M^{-1}
-            col_p = [(Bp[..., j]) for Bp in self._subspace.B]
-            col_flat = _flatten(col_p)
-            cols_nat.append(self._apply_minv_flat(col_flat))
-        # Stack nat-space columns and form Gram
-        Mnat = torch.stack(cols_nat, dim=1)     # [P, r]
-        return Mnat.t().contiguous() @ Mnat     # [r, r]
-
-    # -------------------- Streaming projection (no T×P buffers) --------------------
-
-    def _project_tasks_streaming(self, task_losses: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """
-        Returns:
-          tilde_G: [T, r] task projections onto current basis
-          avg_rgrads: list (per-param) average tangent grads for Oja
-
-        Per-task grads are computed once, projected immediately, and released.
-        Peak memory: O(P + rT). No J [T×P] ever.
-        """
-        assert self._subspace is not None
-        T, r = len(task_losses), self._subspace.r
-        device = self.params[0].device
-        dtype = self.params[0].dtype
-
-        tilde_G = torch.zeros(T, r, device=device, dtype=dtype)
-        sum_rgrads = [torch.zeros_like(p) for p in self._subspace.params]
-
-        for t, Li in enumerate(task_losses):
-            grads = torch.autograd.grad(Li, self.params, retain_graph=(t < T-1), create_graph=False, allow_unused=True)
-            rgrads = _egrad2rgrad(self.params, [(g if g is not None else torch.zeros_like(p))
-                                                for g, p in zip(grads, self.params)])
-
-            if self.normalize_task_grads:
-                denom = (torch.cat([g.reshape(-1) for g in rgrads]).norm() + 1e-12)
-                if float(denom) > 0:
-                    rgrads = [g / denom for g in rgrads]
-
-            acc = torch.zeros(r, device=device, dtype=dtype)
-            for Bp, gp in zip(self._subspace.B, rgrads):
-                acc += (gp.unsqueeze(-1) * Bp).reshape(-1, r).sum(dim=0)
-            tilde_G[t] = acc
-
-            for i in range(len(sum_rgrads)):
-                sum_rgrads[i].add_(rgrads[i])
-
-            del grads, rgrads  # free ASAP
-
-        avg_rgrads = [g / max(T, 1) for g in sum_rgrads]
-        return tilde_G, avg_rgrads
-
-    # -------------------- Full-J path (kept for exactness) --------------------
-
-    def _collect_task_grads_flat(self, task_losses: Sequence[torch.Tensor]) -> torch.Tensor:
-        flats = []
-        T = len(task_losses)
-        for i, Li in enumerate(task_losses):
-            grads = torch.autograd.grad(Li, self.params, retain_graph=(i < T-1), create_graph=False, allow_unused=True)
-            g = [(gi if gi is not None else torch.zeros_like(p)) for gi, p in zip(grads, self.params)]
-            flats.append(_flatten(_egrad2rgrad(self.params, g)))
-        return torch.stack(flats, dim=0)  # [T, P]
-
-    # -------------------- Armijo snapshot helpers --------------------
-
-    def _make_snapshot(self):
-        pol = self.armijo_snapshot_policy.lower()
-        if pol == "none":     # delta-tracking (approximate)
-            return None
-        if pol == "cpu":
-            return [p.data.detach().cpu().clone() for p in self.params]
-        if pol == "fp16":
-            return [p.data.detach().to(dtype=torch.float16).clone() for p in self.params]
-        # default full-precision GPU
-        return [p.data.detach().clone() for p in self.params]
-
-    def _restore_snapshot(self, saved):
-        if saved is None:
-            return
-        for p, s in zip(self.params, saved):
-            if s.device.type != p.data.device.type or s.dtype != p.data.dtype:
-                p.data.copy_(s.to(device=p.data.device, dtype=p.data.dtype))
+    
+    def __init__(self, num_tasks: int, temperature: float = 2.0):
+        self.num_tasks = num_tasks
+        self.temperature = temperature
+        self.prev_losses = None
+        self.weights = torch.ones(num_tasks) / num_tasks
+        
+    def update_weights(self, current_losses: List[float]) -> List[float]:
+        """Update task weights based on loss decrease rates"""
+        if self.prev_losses is None:
+            self.prev_losses = current_losses
+            return self.weights.tolist()
+            
+        # Calculate relative loss decrease
+        loss_ratios = []
+        for i in range(self.num_tasks):
+            if self.prev_losses[i] > 0:
+                ratio = current_losses[i] / self.prev_losses[i]
+                loss_ratios.append(ratio)
             else:
-                p.data.copy_(s)
+                loss_ratios.append(1.0)
+                
+        loss_ratios = torch.tensor(loss_ratios)
+        
+        # Apply temperature and softmax
+        weights = torch.nn.functional.softmax(loss_ratios / self.temperature, dim=0)
+        self.weights = weights * self.num_tasks  # Scale to maintain total weight
+        
+        self.prev_losses = current_losses
+        return self.weights.tolist()
 
-    # -------------------- Curve stepping (Retr or Exp) --------------------
 
-    def _apply_curve_step(self, tangent_list: List[torch.Tensor], gamma: float):
-        """
-        Apply θ ← curve(θ, -γ d) for each param:
-          - if use_expmap and manifold.expmap exists → Exp
-          - else → Retraction
-        """
-        if self.use_expmap:
-            for p, d in zip(self.params, tangent_list):
-                if hasattr(p, 'manifold') and hasattr(p.manifold, 'expmap'):
-                    p.data = p.manifold.expmap(p.data, -gamma * d)
+
+
+class GradientNormalizer:
+    """Normalizes gradients across multiple loss components for balanced training"""
+    
+    def __init__(self, alpha: float = 0.99, eps: float = 1e-8):
+        self.alpha = alpha
+        self.eps = eps
+        self.gradient_norms = defaultdict(lambda: 1.0)
+        self.gradient_history = defaultdict(list)
+        
+    def compute_gradient_norms(self, losses: Dict[str, torch.Tensor], 
+                              model: nn.Module) -> Dict[str, float]:
+        """Compute gradient norms for each loss component"""
+        grad_norms = {}
+        
+        for name, loss in losses.items():
+            if loss.requires_grad and loss.grad_fn is not None:
+                # Compute gradients for this loss only
+                grads = torch.autograd.grad(
+                    loss, 
+                    model.parameters(), 
+                    retain_graph=True,
+                    allow_unused=True
+                )
+                
+                # Calculate gradient norm
+                total_norm = 0.0
+                for grad in grads:
+                    if grad is not None:
+                        total_norm += grad.norm(2).item() ** 2
+                grad_norm = np.sqrt(total_norm)
+                
+                # Update running average
+                self.gradient_norms[name] = (
+                    self.alpha * self.gradient_norms[name] + 
+                    (1 - self.alpha) * grad_norm
+                )
+                grad_norms[name] = self.gradient_norms[name]
+                
+                # Store history for analysis
+                self.gradient_history[name].append(grad_norm)
+                if len(self.gradient_history[name]) > 1000:
+                    self.gradient_history[name].pop(0)
+        
+        return grad_norms
+    
+    def get_balanced_weights(self, grad_norms: Dict[str, float], 
+                           base_weights: Dict[str, float]) -> Dict[str, float]:
+        """Calculate balanced weights based on gradient norms"""
+        if not grad_norms:
+            return base_weights
+            
+        # Use the first loss as reference (typically the main loss)
+        ref_norm = list(grad_norms.values())[0]
+        
+        balanced_weights = {}
+        for name, base_weight in base_weights.items():
+            if name in grad_norms and grad_norms[name] > self.eps:
+                # Scale weight inversely proportional to gradient norm
+                scale = ref_norm / (grad_norms[name] + self.eps)
+                balanced_weights[name] = base_weight * scale
+            else:
+                balanced_weights[name] = base_weight
+                
+        return balanced_weights
+
+class AdaptiveLossBalancer:
+    """Combines multiple loss balancing strategies"""
+    
+    def __init__(self, 
+                 method: str = "grad_norm",
+                 alpha: float = 0.99,
+                 temperature: float = 2.0,
+                 min_weight: float = 0.01,
+                 max_weight: float = 10.0):
+        self.method = method
+        self.alpha = alpha
+        self.temperature = temperature
+        self.min_weight = min_weight
+        self.max_weight = max_weight
+        
+        # Initialize specific balancers
+        self.gradient_normalizer = GradientNormalizer(alpha=alpha)
+        self.dynamic_average = None
+        self.loss_history = defaultdict(list)
+        
+    def balance_losses(self, 
+                      losses: Dict[str, torch.Tensor],
+                      base_weights: Dict[str, float],
+                      model: Optional[nn.Module] = None) -> Dict[str, float]:
+        """Balance losses using the specified method"""
+        
+        # Update loss history
+        for name, loss in losses.items():
+            self.loss_history[name].append(loss.item())
+            if len(self.loss_history[name]) > 100:
+                self.loss_history[name].pop(0)
+                
+        if self.method == "grad_norm" and model is not None:
+            # Gradient norm balancing
+            grad_norms = self.gradient_normalizer.compute_gradient_norms(losses, model)
+            weights = self.gradient_normalizer.get_balanced_weights(grad_norms, base_weights)
+            
+        elif self.method == "magnitude":
+            # Magnitude-based balancing
+            weights = {}
+            loss_values = {name: loss.item() for name, loss in losses.items()}
+            
+            # Use exponential moving average of losses
+            avg_losses = {}
+            for name in base_weights:
+                if name in self.loss_history and self.loss_history[name]:
+                    avg_losses[name] = np.mean(self.loss_history[name][-20:])
                 else:
-                    p.data.add_(-gamma * d)  # Euclidean fallback
+                    avg_losses[name] = loss_values.get(name, 1.0)
+                    
+            # Calculate inverse scaling
+            ref_loss = list(avg_losses.values())[0]
+            for name, base_weight in base_weights.items():
+                if name in avg_losses and avg_losses[name] > 0:
+                    scale = ref_loss / avg_losses[name]
+                    weights[name] = base_weight * scale
+                else:
+                    weights[name] = base_weight
+                    
+        elif self.method == "dynamic":
+            # Dynamic weight averaging
+            if self.dynamic_average is None:
+                self.dynamic_average = DynamicWeightAverage(len(losses), self.temperature)
+                
+            loss_list = [losses[name].item() for name in sorted(losses.keys())]
+            dynamic_weights = self.dynamic_average.update_weights(loss_list)
+            
+            weights = {}
+            for i, name in enumerate(sorted(base_weights.keys())):
+                weights[name] = base_weights[name] * dynamic_weights[i]
+                
         else:
-            _retract(self.params, tangent_list, gamma)
+            # Default: use base weights
+            weights = base_weights.copy()
+            
+        # Clip weights to reasonable range
+        for name in weights:
+            weights[name] = np.clip(weights[name], self.min_weight, self.max_weight)
+            
+        return weights
+    
+    def get_statistics(self) -> Dict[str, Dict[str, float]]:
+        """Get balancing statistics for monitoring"""
+        stats = {}
+        
+        # Loss statistics
+        for name, history in self.loss_history.items():
+            if history:
+                stats[f"{name}_loss"] = {
+                    "mean": np.mean(history),
+                    "std": np.std(history),
+                    "min": np.min(history),
+                    "max": np.max(history),
+                    "recent": history[-1]
+                }
+                
+        # Gradient statistics
+        if hasattr(self, 'gradient_normalizer'):
+            for name, norm in self.gradient_normalizer.gradient_norms.items():
+                stats[f"{name}_grad_norm"] = {"value": norm}
+                
+        return stats
 
-    # -------------------- One MGDA step --------------------
-
-    def step(
-        self,
-        task_losses: Sequence[torch.Tensor],
-        closure: Optional[Callable[[], Sequence[torch.Tensor]]] = None,
-    ) -> Dict[str, torch.Tensor]:
-        T = len(task_losses)
-        losses_vec = torch.stack([li.detach() for li in task_losses])
-
-
-        avg_rgrads = None  # for Oja update if subspace is active
-# === A) Build MGDA system either in rD (subspace) or full P ===
-        if self._subspace is not None:
-            tilde_G, avg_rgrads = self._project_tasks_streaming(task_losses)
-
-
-
-            # Update EWMA covariance for rank adaptation
-            if self.rank_adapt_enabled:
-                self._rank_adapt_update_cov(tilde_G)
-# Optional: whiten subspace by B^T M^{-1} B for faithful rD geometry
-            if self.use_minv_in_subspace:
-                S = self._subspace_mass_minv()  # r×r
-                R = torch.linalg.cholesky(S + 1e-8 * torch.eye(S.shape[0], device=S.device, dtype=S.dtype))
-                RinvT = torch.cholesky_inverse(R).t()  # (R^T)^{-1}
-                G_hat = tilde_G @ RinvT            # [T, r]
-                alpha0 = self._alpha_prev if (self._alpha_prev is not None and self._alpha_prev.numel()==T) else None
-                alpha, fw_info = self._fw_mgda_rd(G_hat, alpha0, iters=self.fw_max_iter, tol=self.fw_tol)
-                self._alpha_prev = alpha.detach().clone()
-                v_r = alpha @ G_hat
-                v_r = torch.linalg.solve(R.t(), v_r)  # back to original subspace
-            else:
-                alpha0 = self._alpha_prev if (self._alpha_prev is not None and self._alpha_prev.numel()==T) else None
-                alpha, fw_info = self._fw_mgda_rd(tilde_G, alpha0, iters=self.fw_max_iter, tol=self.fw_tol)
-                self._alpha_prev = alpha.detach().clone()
-                v_r = alpha @ tilde_G
-
-            # Lift to full tangent direction and apply M^{-1}
-            d_tangent = [(Bp * v_r.view(*([1]*(Bp.dim()-1)), -1)).sum(dim=-1) for Bp in self._subspace.B]
-            g_euc = _flatten(d_tangent)
-            g_nat = self._apply_minv_flat(g_euc)
-            self._assign_grad(g_nat)
-        else:
-            # Exact, full-J branch (kept for parity)
-            J = self._collect_task_grads_flat(task_losses)  # [T, P]
-            if hasattr(self.metric, "update_task_subspace"):
-                self.metric.update_task_subspace(J)
-            fw = _FWImplicit(J, self._apply_minv_flat)
-            alpha0 = self._alpha_prev if (self._alpha_prev is not None and self._alpha_prev.numel()==T) else None
-            alpha, fw_info = fw.solve(alpha0, max_iter=self.fw_max_iter, tol=self.fw_tol)
-            self._alpha_prev = alpha.detach().clone()
-            g_euc = alpha @ J
-            g_nat = self._apply_minv_flat(g_euc)
-            self._assign_grad(g_nat)
-
-        # === B) Armijo line search along Retr/Exp on f(θ)=Σ α_i ℓ_i(θ) ===
-        logs: Dict[str, torch.Tensor] = {}
-        if self.armijo_enabled and (closure is not None):
-            f0 = float((alpha * losses_vec).sum())
-            # directional derivative with natural direction; sign for -d step
-            dirderiv = float(g_euc @ g_nat)  # <∇f, d>
-            if dirderiv <= 0:  # already descent-violating; take tiny step
-                gamma = 1e-3
-                tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
-                self._apply_curve_step(tangent, gamma)
-            else:
-                gamma = 1.0
-                saved = self._make_snapshot()
-                ok = False
-                self._armijo_gamma_acc = 0.0  # for delta mode
-
-                for _ in range(self.armijo_max_tries):
-                    if saved is not None:
-                        # restore baseline (exact) then try step
-                        self._restore_snapshot(saved)
-                        tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
-                        self._apply_curve_step(tangent, gamma)
-                    else:
-                        # delta-tracking (approximate): apply delta from current accumulated gamma
-                        delta = gamma - self._armijo_gamma_acc
-                        tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
-                        self._apply_curve_step(tangent, delta)
-                        self._armijo_gamma_acc = gamma
-
-                    new_losses = torch.stack([li.detach() for li in closure()])
-                    f_new = float((alpha * new_losses).sum())
-                    # Armijo: f(new) <= f0 - c*gamma*dirderiv
-                    if f_new <= f0 - self.armijo_c * gamma * dirderiv:
-                        losses_vec = new_losses
-                        ok = True
-                        break
-
-                    # backtrack
-                    if saved is None:
-                        # delta mode: revert delta approximately
-                        tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
-                        self._apply_curve_step(tangent, - (gamma - self._armijo_gamma_acc))
-                        # (armijo_gamma_acc already equals gamma; set after revert)
-                        self._armijo_gamma_acc = 0.0
-                    gamma *= self.armijo_beta
-
-                if not ok:
-                    # final tiny step from exact baseline
-                    if saved is not None:
-                        self._restore_snapshot(saved)
-                    tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
-                    self._apply_curve_step(tangent, 1e-3)
-
-            logs['armijo_gamma'] = torch.tensor(gamma)
-        else:
-            # No line-search: base optimizer or unit retraction
-            if self.base_optim is not None:
-                self.base_optim.step()
-            else:
-                tangent = _egrad2rgrad(self.params, _split_like(g_nat, self.params))
-                self._apply_curve_step(tangent, 1.0)
-
-        # === C) Update EF-diag stats from current .grad ===
-        if hasattr(self.metric, "update_from_grads"):
-            self.metric.update_from_grads()
-
-        # === D) Rank adaptation and Oja update (after parameter update) ===
-        if self.rank_adapt_enabled:
-            self._maybe_rank_adapt()
-        if self._subspace is not None and avg_rgrads is not None:
-            # Refresh Oja basis with averaged tangent grads (respects any new r)
-            try:
-                self._subspace.oja_update(avg_rgrads, eta=self.subspace_oja_eta)
-            except Exception:
-                pass
-
-        # Logs
-
-        # Attach rank telemetry if available
-        if self._subspace is not None:
-            logs['rank'] = torch.tensor(int(self._subspace.r))
-        if getattr(self, '_last_rank_stats', None):
-            for k, v in self._last_rank_stats.items():
-                # Use tensors for numeric values for consistency
-                if isinstance(v, (int, float)):
-                    logs[f'rank_{k}'] = torch.tensor(v)
-        logs.update({
-            'alpha': alpha.detach().cpu(),
-            'losses': losses_vec.detach().cpu(),
-            'agg_grad_norm_euc': torch.norm(g_euc).detach().cpu(),
-            'agg_grad_norm_nat': torch.norm(g_nat).detach().cpu(),
-            'fw_converged': torch.tensor(1 if fw_info.get('converged', False) else 0),
-            'fw_gap': torch.tensor(fw_info.get('final_gap', float('inf'))),
-        })
-        return logs

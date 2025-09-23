@@ -693,6 +693,7 @@ class AttentionPrior(nn.Module):
         feature_dim: int = 64,  # Internal feature dimension
         use_relative_position_bias: bool = True,  # Whether to use relative position bias
         use_checkpoint: bool = True,  # Gradient checkpointing for memory efficiency
+        dropout: float = 0.1,  # Dropout rate for attention and FFN
     ):
         super().__init__()
         self.attention_resolution = attention_resolution
@@ -759,7 +760,7 @@ class AttentionPrior(nn.Module):
         self.self_attention = nn.MultiheadAttention(
             embed_dim=feature_dim,
             num_heads=num_heads,
-            dropout=0.1,
+            dropout=dropout,
             batch_first=True
         )
         
@@ -767,7 +768,7 @@ class AttentionPrior(nn.Module):
         self.context_attention = nn.MultiheadAttention(
             embed_dim=feature_dim,
             num_heads=num_heads,
-            dropout=0.1,
+            dropout=dropout,
             batch_first=True
         )
         
@@ -781,7 +782,7 @@ class AttentionPrior(nn.Module):
             nn.Linear(feature_dim, feature_dim * 2),
             nn.LayerNorm(feature_dim * 2),
             nn.SiLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(feature_dim * 2, feature_dim),
         )
         
@@ -795,7 +796,7 @@ class AttentionPrior(nn.Module):
         
         # Movement predictor (preserved from original)
         self.movement_predictor = nn.Conv2d(1, 2, 3, padding=1)
-    
+        self.use_checkpoint = False
     
     def compute_motion_features(self, prev_attention: torch.Tensor) -> torch.Tensor:
         """Extract motion-relevant features from previous attention (unchanged)"""
@@ -815,6 +816,19 @@ class AttentionPrior(nn.Module):
         motion_features = torch.cat(motion_responses, dim=1)  # [B, K, H, W]
         return motion_features
     
+    def gradient_checkpointing_disable(self):
+        """
+        Disable gradient checkpointing.
+        """
+        self.use_checkpoint = False
+
+    def gradient_checkpointing_enable(self):
+        """
+        Enable gradient checkpointing for memory-efficient training.
+        This will trade compute for memory by recomputing activations during backward pass.
+        """
+        self.use_checkpoint = True
+    
     def _maybe_ckpt(self, fn, *tensors, reentrant: bool = False):
         """
         Checkpoint `fn(*tensors)` during training if enabled.
@@ -822,12 +836,7 @@ class AttentionPrior(nn.Module):
         - Returns whatever `fn` returns (must be Tensor or tuple of Tensors).
         """
         if self.training and self.use_checkpoint :
-            # Torch versions prior to 2.0 don't support use_reentrant/preserve_rng_state kwargs;
-            # fall back gracefully.
-            try:
-                return _ckpt(fn, *tensors, use_reentrant=reentrant, preserve_rng_state=False)
-            except TypeError:
-                return _ckpt(fn, *tensors)
+            return _ckpt(fn, *tensors, use_reentrant=reentrant, preserve_rng_state=False)
         else:
             return fn(*tensors)
     
