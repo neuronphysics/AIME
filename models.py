@@ -165,6 +165,11 @@ class AttentionPosterior(nn.Module):
         enforce_diversity: bool = True,
         device: Optional[torch.device] = None,
         expected_fused: bool = False,  # whether to expect fused attention maps (for visualization)
+        use_checkpoint: bool = True,
+        ckpt_preserve_rng: bool = True, 
+        ckpt_use_reentrant: bool = False, # PyTorch 2.x recommended
+        dropout_p: float = 0.2, # dropout on slot_features & bottleneck
+        coord_noise_std: float = 0.0, # Gaussian noise added to coords before regularizer
     ):
         super().__init__()
         assert feature_channels % num_heads == 0, "feature_channels must be divisible by num_heads"
@@ -174,6 +179,7 @@ class AttentionPosterior(nn.Module):
         self.attention_resolution = attention_resolution
         self.feature_channels = feature_channels
         self.hidden_dim = hidden_dim
+        self.context_dim = context_dim
         self.num_semantic_slots = num_semantic_slots
         self.num_heads = num_heads
         self.attention_fusion_mode = attention_fusion_mode
@@ -182,7 +188,11 @@ class AttentionPosterior(nn.Module):
         self.device = device if device is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
-
+        self.use_checkpoint = use_checkpoint
+        self.ckpt_preserve_rng = ckpt_preserve_rng
+        self.ckpt_use_reentrant = ckpt_use_reentrant
+        self.dropout_p = float(dropout_p)
+        self.coord_noise_std = float(coord_noise_std)
         self.N = attention_resolution * attention_resolution
         self.d = feature_channels
         self.h = num_heads
@@ -207,7 +217,11 @@ class AttentionPosterior(nn.Module):
             )
             self.pyramid_fusion = nn.Conv2d(32 + 48 + feature_channels, feature_channels, 1)
         else:
-            pass
+            self.pyramid_conv1 = None
+            self.pyramid_conv2 = None
+            self.pyramid_conv3 = None
+            self.pyramid_fusion = None
+
         # ========= GroupViT-style grouping =========
 
         # Slot prototypes (semantic specialization)
@@ -245,20 +259,24 @@ class AttentionPosterior(nn.Module):
                 nn.LayerNorm(num_semantic_slots),
                 nn.Sigmoid(),
             )
+        else:
+            self.fusion_weights_head = None
+            self.fusion_gate = None
 
         # ========= Per-slot temperatures for attention sharpening =========
         self.slot_temperatures = nn.Parameter(torch.ones(num_semantic_slots))
 
         # ========= Coordinate regularizer (combine K centers -> 2) =========
         self.spatial_regularizer = nn.Sequential(
-            nn.Linear(2 * num_semantic_slots, 16),
-            nn.LayerNorm(16),
+            nn.Linear(2 * num_semantic_slots, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.SiLU(),
-            nn.Linear(16, 2),
+            nn.Linear(hidden_dim // 2, 2),
             nn.Tanh(),
         )
 
         # ========= Bottleneck from concatenated slot features =========
+        self.dropout = nn.Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
         self.bottleneck_projector = nn.Sequential(
             nn.Linear(self.d * num_semantic_slots, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -302,6 +320,90 @@ class AttentionPosterior(nn.Module):
         ortho = torch.zeros((), device=slot_maps.device)
         return div, ortho
 
+    def _maybe_ckpt(self, fn, *args):
+        if not self.use_checkpoint:
+            return fn(*args)
+        return torch.utils.checkpoint.checkpoint(fn, *args, preserve_rng_state=self.ckpt_preserve_rng, use_reentrant=self.ckpt_use_reentrant)
+
+    # Basic FPN to fused feature map [B, C, H_att, W_att]
+    def _fpn_forward(self, observation: torch.Tensor, H_att: int, W_att: int) -> torch.Tensor:
+        if self.expected_fused:
+            raise RuntimeError("_fpn_forward should not be called when expected_fused=True")
+
+
+        def _fn(x: torch.Tensor) -> torch.Tensor:
+            l1 = self.pyramid_conv1(x)
+            l2 = self.pyramid_conv2(l1)
+            l3 = self.pyramid_conv3(l2)
+            l1_up = F.interpolate(l1, size=(H_att, W_att), mode="bilinear", align_corners=False)
+            l2_up = F.interpolate(l2, size=(H_att, W_att), mode="bilinear", align_corners=False)
+            l3_up = F.interpolate(l3, size=(H_att, W_att), mode="bilinear", align_corners=False)
+            fused = self.pyramid_fusion(torch.cat([l1_up, l2_up, l3_up], dim=1))
+            return fused
+
+
+        return self._maybe_ckpt(_fn, observation)
+
+
+    def _slot_forward(self, feat_seq: torch.Tensor, modulation: torch.Tensor):
+        def _fn(x: torch.Tensor, seed: torch.Tensor):
+            slots, attn = self.slot_attn(x, seed_slots=seed)
+            return slots, attn
+        return self._maybe_ckpt(_fn, feat_seq, modulation)
+
+
+    def _fusion_forward(self, slot_maps: torch.Tensor, slot_features: torch.Tensor, top_down: torch.Tensor):
+        B = slot_maps.size(0)
+        K = slot_maps.size(1)
+
+        def _fn(maps: torch.Tensor, feats: torch.Tensor, td: torch.Tensor):
+            if self.attention_fusion_mode == "weighted":
+                all_feat = feats.reshape(B, -1)
+                fusion_weights = self.fusion_weights_head(all_feat) # [B,K]
+                w = fusion_weights.view(B, K, 1, 1)
+                fused_map = (maps * w).sum(dim=1)
+                return fused_map, fusion_weights
+            elif self.attention_fusion_mode == "max":
+                fused_map, _ = maps.max(dim=1)
+                return fused_map, torch.empty(B, K, device=maps.device)
+            else:  # gated
+                gates = self.fusion_gate(td).view(B, K, 1, 1)
+                fused_map = (maps * gates).sum(dim=1)
+                return fused_map, gates.squeeze(-1).squeeze(-1)
+
+
+        return self._maybe_ckpt(_fn, slot_maps, slot_features, top_down)
+
+
+    def _centers_forward(self, slot_maps: torch.Tensor, fused_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, K, H, W = slot_maps.shape
+        device = slot_maps.device
+        # grids
+        y_coords = torch.linspace(-1, 1, H, device=device)
+        x_coords = torch.linspace(-1, 1, W, device=device)
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing="ij") # [H,W]
+        x_vec = x_grid.reshape(1, 1, H * W)
+        y_vec = y_grid.reshape(1, 1, H * W)
+
+
+        def _fn(maps: torch.Tensor, fused: torch.Tensor):
+            # Per-slot probabilities [B,K,N]
+            p = maps.view(B, K, -1).softmax(dim=-1)
+            # Centers per slot
+            x_c = (p * x_vec).sum(dim=-1)
+            y_c = (p * y_vec).sum(dim=-1)
+            slot_centers = torch.stack([x_c, y_c], dim=-1) # [B,K,2]
+
+
+            # Fused-map expectation for raw coords
+            attn_p = fused.flatten(1).softmax(dim=-1) # [B,N]
+            x_r = (attn_p * x_vec.view(1, H * W)).sum(dim=-1)
+            y_r = (attn_p * y_vec.view(1, H * W)).sum(dim=-1)
+            coords_raw = torch.stack([x_r, y_r], dim=-1) # [B,2]
+            return slot_centers, coords_raw, p
+
+
+        return self._maybe_ckpt(_fn, slot_maps, fused_map)
     def forward(
         self,
         observation: torch.Tensor,  # [B, 3, 84, 84]
@@ -318,15 +420,7 @@ class AttentionPosterior(nn.Module):
         if self.expected_fused and (fused_feat is not None):
             fused = F.interpolate(fused_feat, size=(H_att, W_att), mode="bilinear", align_corners=False)
         else:
-            l1 = self.pyramid_conv1(observation)                       # [B, 32, 42, 42]
-            l2 = self.pyramid_conv2(l1)                                # [B, 48, 21, 21]
-            l3 = self.pyramid_conv3(l2)                                # [B, 64, 21, 21]
-
-            l1_up = F.interpolate(l1, size=(H_att, W_att), mode="bilinear", align_corners=False)
-            l2_up = F.interpolate(l2, size=(H_att, W_att), mode="bilinear", align_corners=False)
-            l3_up = F.interpolate(l3, size=(H_att, W_att), mode="bilinear", align_corners=False)
-        
-            fused = self.pyramid_fusion(torch.cat([l1_up, l2_up, l3_up], dim=1))
+            fused = self._fpn_forward(observation, H_att, W_att)        
         self._last_saliency_features = fused  # Save for visualization
 
         # === sequence + positions ===
@@ -339,11 +433,11 @@ class AttentionPosterior(nn.Module):
         modulation = self.slot_modulator(top_down).view(B, self.num_semantic_slots, self.d)  # [B,K,d]
 
         # slots = specialization + learnable bias (optional)
-        slots, attn = self.slot_attn(feat_seq, seed_slots=modulation)    # slots [B,K,d], attn [B,K,N]
+        slots, attn = self._slot_forward(feat_seq, modulation)    # slots [B,K,d], attn [B,K,N]
 
         # Save per-slot attention maps (reshape responsibilities)
         slot_maps = attn.view(B, self.num_semantic_slots, H_att, W_att)       # [B,K,H,W]
-        slot_features = slots                                                 # [B,K,d]
+        slot_features = self.dropout(slots)                                               # [B,K,d]
         self.slot_attention_maps = slot_maps
         self.slot_features = slot_features
 
@@ -352,49 +446,31 @@ class AttentionPosterior(nn.Module):
 
         
         # === fusion ===
-        if self.attention_fusion_mode == "weighted":
-            all_feat = slot_features.reshape(B, -1)                           # [B,K*d]
-            fusion_weights = self.fusion_weights_head(all_feat)               # [B,K], sums to 1
-            self.fusion_weights = fusion_weights
-            w = fusion_weights.view(B, self.num_semantic_slots, 1, 1)         # [B,K,1,1]
-            fused_map = (slot_maps * w).sum(dim=1)                            # [B,H,W]
-        elif self.attention_fusion_mode == "max":
-            fused_map, _ = slot_maps.max(dim=1)                               # [B,H,W]
-            self.fusion_weights = None
-        else:  # 'gated'
-            gates = self.fusion_gate(top_down).view(B, self.num_semantic_slots, 1, 1)  # [B,K,1,1]
-            fused_map = (slot_maps * gates).sum(dim=1)                         # [B,H,W]
-            self.fusion_weights = gates.squeeze(-1).squeeze(-1)               # [B,K]
+        fused_map, fusion_weights = self._fusion_forward(slot_maps, slot_features, top_down)
+        self.fusion_weights = fusion_weights if self.attention_fusion_mode != "max" else None
 
-        # Normalize fused map to probabilities over spatial positions
-        attention_probs = fused_map.flatten(1).softmax(dim=-1)                # [B,N]
-        attention_probs_2d = attention_probs.view(B, H_att, W_att)            # [B,H,W]
 
-        # === per-slot centers & combined coords ===
-        # Precompute grids for centers
-        y_coords = torch.linspace(-1, 1, H_att, device=device)
-        x_coords = torch.linspace(-1, 1, W_att, device=device)
-        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing="ij")  # [H,W]
+        # Normalize fused map to probabilities
+        attention_probs = fused_map.flatten(1).softmax(dim=-1) # [B,N]
+        attention_probs_2d = attention_probs.view(B, H_att, W_att) # [B,H,W]
 
-        slot_centers = []
-        for k in range(self.num_semantic_slots):
-            pk = slot_maps[:, k].flatten(1).softmax(dim=-1).view(B, H_att, W_att)  # [B,H,W]
-            y_c = (pk * y_grid).sum(dim=[1, 2])                                    # [B]
-            x_c = (pk * x_grid).sum(dim=[1, 2])                                    # [B]
-            slot_centers.append(torch.stack([x_c, y_c], dim=-1))                   # [B,2]
-        slot_centers = torch.stack(slot_centers, dim=1)                             # [B,K,2]
+
+        # === per-slot centers & raw coords ===
+        slot_centers, coords_raw, _p = self._centers_forward(slot_maps, fused_map)
         self.slot_centers = slot_centers
+        self.coords_raw = coords_raw
 
-        if self.attention_fusion_mode == "weighted":
-            w = self.fusion_weights  # [B,K]
-            coords = (slot_centers * w.unsqueeze(-1)).sum(dim=1)                   # [B,2]
+
+        # Optional noise before regularization (RNG preserved by checkpoint if enabled)
+        if self.coord_noise_std > 0.0 and self.training:
+            coords_noisy = coords_raw + self.coord_noise_std * torch.randn_like(coords_raw)
         else:
-            y_c = (attention_probs_2d * y_grid).sum(dim=[1, 2])
-            x_c = (attention_probs_2d * x_grid).sum(dim=[1, 2])
-            coords = torch.stack([x_c, y_c], dim=-1)                                # [B,2]
+            coords_noisy = coords_raw
 
-        # Light reg to keep inside [-1,1] and stabilize
-        regularized_coords = self.spatial_regularizer(slot_centers.flatten(1)) * 0.995  # [B,2]
+
+        # Light reg to keep inside [-1,1] and stabilize; also allows fusing K centers
+        regularized_coords = self.spatial_regularizer(slot_centers.flatten(1)) * 0.995 # [B,2]
+        self.regularized_coords = regularized_coords
 
         # === diversity losses (optional) ===
         if self.enforce_diversity and self.training:
@@ -405,8 +481,10 @@ class AttentionPosterior(nn.Module):
             self.diversity_loss = torch.tensor(0.0, device=device)
             self.ortho_loss = torch.tensor(0.0, device=device)
 
+
         # === bottleneck features ===
-        self.bottleneck_features = self.bottleneck_projector(slot_features.reshape(B, -1))  # [B,hidden//2]
+        self.bottleneck_features = self.bottleneck_projector(self.dropout(slot_features.reshape(B, -1)))
+
         
         return attention_probs_2d, regularized_coords
 

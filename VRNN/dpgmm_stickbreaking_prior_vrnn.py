@@ -584,9 +584,10 @@ class AttentionSchema(nn.Module):
             attention_resolution=attention_resolution,
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
-            motion_kernels=8
+            motion_kernels=8,
+            feature_dim=hidden_dim
         )
-        self.prior_net.gradient_checkpointing_disable()
+        self.prior_net.gradient_checkpointing_enable()
         self.to(device)
     
     def compute_attention_dynamics_loss(
@@ -793,6 +794,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         sequence_length: int,
         img_disc_channels:int,
         img_disc_layers:int,
+        disc_num_heads:int,
         device: torch.device= torch.device('cuda'),
         patch_size: int = 16,
         input_channels: int = 3,  # Number of input channels (e.g., RGB images)
@@ -802,7 +804,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         prior_beta: float = 10.0,
         weight_decay: float = 0.00001,
         use_orthogonal: bool = True,  # Use orthogonal initialization for LSTM,
-        number_lstm_layer: int = 2,  # Number of LSTM layers
+        number_lstm_layer: int = 3,  # Number of LSTM layers
         HiP_type: str = '16x3',  # Type of perceiver model
         self_model_weight: float = 0.5,
         use_global_context: bool = True,
@@ -843,7 +845,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self._init_attention_schema(attention_resolution)
         self._init_encoder_decoder()
         self._init_self_model()
-        self._init_discriminators( img_disc_layers, patch_size)
+        self._init_discriminators( img_disc_layers, patch_size, num_heads= disc_num_heads)
         # DP-GMM prior
         self.prior = DPGMMPrior(max_components, 
                                 self.latent_dim, 
@@ -959,8 +961,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     source=("C3", "C4", "C5"),  # or ("C3","C4","C5") if one wants to tap specific levels
                     d=d,  # must match
                 )
-        #self.encoder.gradient_checkpointing_enable()
-        #self.decoder.gradient_checkpointing_enable()
+        self.encoder.gradient_checkpointing_enable()
+        self.decoder.gradient_checkpointing_enable()
        
         self.ema_encoder = EMA(self.encoder, decay=0.995, use_num_updates=True)
         self.ema_decoder = EMA(self.decoder, decay=0.995, use_num_updates=True)
@@ -1014,21 +1016,21 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
                 
 
-    def _init_discriminators(self, img_disc_layers:int, patch_size: int):
+    def _init_discriminators(self, img_disc_layers:int, patch_size: int, num_heads: int = 4):
         # Initialize discriminators
         self.image_discriminator = TemporalDiscriminator(
                 input_channels=self.input_channels,
                 image_size=self.image_size,
                 hidden_dim=self.hidden_dim,
                 n_layers=img_disc_layers,
-                n_heads=4,
+                n_heads=num_heads,
                 max_sequence_length=self.sequence_length,
                 patch_size=patch_size,
                 z_dim=self.latent_dim,         
                 device=self.device,
             )
 
-    def _init_vrnn_dynamics(self,use_orthogonal: bool = True, number_lstm_layer: int = 2):
+    def _init_vrnn_dynamics(self,use_orthogonal: bool = True, number_lstm_layer: int = 1):
         """Initialize VRNN components with context conditioning"""
         # Feature extractors        
         
@@ -1041,9 +1043,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
         self.rnn_layer_norm = nn.LayerNorm(self.hidden_dim)
         # Initialize hidden states
-        self.h0 = nn.Parameter(torch.zeros(2, 1, self.hidden_dim))
-        self.c0 = nn.Parameter(torch.zeros(2, 1, self.hidden_dim))
-    
+        self.h0 = nn.Parameter(torch.zeros(self.number_lstm_layer, 1, self.hidden_dim))
+        self.c0 = nn.Parameter(torch.zeros(self.number_lstm_layer, 1, self.hidden_dim))
+
     def _init_attention_schema(self, attention_resolution: int = 21):
         """Initialize attention schema components"""
         # Compute attention state from h, c, z
@@ -1083,7 +1085,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             d=40,
             nhead=8,
         )
-        #self.self_model.enable_checkpointing()
+        self.self_model.enable_checkpointing()
 
     def init_weights(self, module: nn.Module):
         """Initialize the weights using the typical initialization schemes """
@@ -1189,168 +1191,170 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         return alpha * (intra_loss + inter_loss) + (1 - alpha) * temporal_loss    
 
     def _setup_optimizers(self, learning_rate: float, weight_decay: float) -> None:
-        """
-        Build optimizers with SDMGrad multi-task optimization.
-        """
-        # Helper to get parameters from modules
-        def get_params(*modules):
-            params = []
-            for m in modules:
-                if m is None:
-                    continue
-                if isinstance(m, nn.Module):
-                    params.extend([p for p in m.parameters() if p.requires_grad])
-                elif isinstance(m, nn.Parameter) and m.requires_grad:
-                    params.append(m)
-            return params
+            """
+            Build optimizers with SDMGrad multi-task optimization.
+            """
+            # Helper to get parameters from modules
+            def get_params(*modules):
+                params = []
+                for m in modules:
+                    if m is None:
+                        continue
+                    if isinstance(m, nn.Module):
+                        params.extend([p for p in m.parameters() if p.requires_grad])
+                    elif isinstance(m, nn.Parameter) and m.requires_grad:
+                        params.append(m)
+                return params
 
-        def split_by_weight_decay(params, wd):
-            """Split parameters into those with and without weight decay"""
-            decay = []
-            no_decay = []
-            for p in params:
-                if p.ndim >= 2:  # weights
-                    decay.append(p)
-                else:  # biases, norms
-                    no_decay.append(p)
+            def split_by_weight_decay(params, wd):
+                """Split parameters into those with and without weight decay"""
+                decay = []
+                no_decay = []
+                for p in params:
+                    if p.ndim >= 2:  # weights
+                        decay.append(p)
+                    else:  # biases, norms
+                        no_decay.append(p)
+                
+                groups = []
+                if decay:
+                    groups.append({"params": decay, "weight_decay": wd})
+                if no_decay:
+                    groups.append({"params": no_decay, "weight_decay": 0.0})
+                return groups
+
+            # Organize all modules by category
+            trunk_modules = [
+                self.encoder, 
+                self.decoder, 
+                self.prior,  # This includes all DPGMM components
+                self._rnn, 
+                self.rnn_layer_norm,
+                self.perceiver_model,
+                self.perceiver_projection,
+            ]
             
-            groups = []
-            if decay:
-                groups.append({"params": decay, "weight_decay": wd})
-            if no_decay:
-                groups.append({"params": no_decay, "weight_decay": 0.0})
-            return groups
-
-        # Organize all modules by category
-        trunk_modules = [
-            self.encoder, 
-            self.decoder, 
-            self.prior,  # This includes all DPGMM components
-            self._rnn, 
-            self.rnn_layer_norm,
-            self.perceiver_model,
-            self.perceiver_projection,
-        ]
-        
-        head_modules = [
-            self.attention_prior_posterior,  # Attention schema
-            self.phi_attention,
-            self.self_model,
-        ]
-        
-        scalar_params = [
-            self.h0, 
-            self.c0, 
-            self.temperature,
-            self.temporal_attention_temp
-        ]
-        
-        # Build parameter groups
-        param_groups = []
-        
-        # Trunk parameters
-        trunk_params = get_params(*trunk_modules)
-        param_groups.extend(split_by_weight_decay(trunk_params, weight_decay))
-        
-        # Head parameters (higher LR, lower WD)
-        head_params = get_params(*head_modules)
-        for group in split_by_weight_decay(head_params, weight_decay * 0.5):
-            group["lr"] = learning_rate * 1.2
-            param_groups.append(group)
-        
-        # Scalar parameters (lower LR, no WD)
-        scalar_params_filtered = [p for p in scalar_params if isinstance(p, nn.Parameter) and p.requires_grad]
-        if scalar_params_filtered:
-            param_groups.append({
-                "params": scalar_params_filtered,
-                "lr": learning_rate * 0.1,
-                "weight_decay": 0.0
-            })
-        popl_params = [self.POPL.class_centres]
-        param_groups.append({"params": popl_params, "lr": learning_rate * 0.5, "weight_decay": 0.0})
-
-        
-        # Store all parameters for SDMGrad bookkeeping
-        self.gen_optimizer = geoopt.optim.RiemannianAdam(
-            param_groups, 
-            lr=learning_rate, 
-            betas=(0.9, 0.999), 
-            eps=1e-8
-        )
-        def get_params(*modules):
-            params = []
-            for m in modules:
-                if m is None:
-                    continue
-                if isinstance(m, nn.Module):
-                    params.extend([p for p in m.parameters() if p.requires_grad])
-                elif isinstance(m, nn.Parameter) and m.requires_grad:
-                    params.append(m)
-            return params
-
-        # Define shared modules (everything except discriminators)
-        shared_modules = [
-            self.encoder, 
-            self.decoder, 
-            self.prior,  # Including all DPGMM components
-            self._rnn, 
-            self.rnn_layer_norm,
-            self.perceiver_model,
-            self.perceiver_projection,
-            self.attention_prior_posterior,
-            self.phi_attention,
-            self.self_model,
-            self.h0, 
-            self.c0, 
-            self.temperature,
-            self.temporal_attention_temp
-        ]
-        
-        # Get shared parameters
-        shared_params = get_params(*shared_modules)
-        
-        # Initialize SDMGrad wrapper with shared parameters
-        self.sdmgrad_wrapper = SDMGrad()
-        self.sdmgrad_wrapper.num_tasks = 5  # Your 5 task losses
-        self.sdmgrad_wrapper.device = self.device
-        self.sdmgrad_wrapper.rep_grad = False
-        
-        # Critical: Set the model interface for SDMGrad
-        class SharedParamWrapper:
-            """Wrapper to provide SDMGrad with shared parameter access"""
-            def __init__(self, params):
-                self.params = list(params)
+            head_modules = [
+                self.attention_prior_posterior,  # Attention schema
+                self.phi_attention,
+                self.self_model,
+            ]
             
-            def shared_parameters(self):
-                return self.params
+            scalar_params = [
+                self.h0, 
+                self.c0, 
+                self.temperature,
+                self.temporal_attention_temp
+            ]
             
-            def reset(self):
-                for p in self.params:
-                    if p.grad is not None:
-                        p.grad = None
-        
-        self.sdmgrad_wrapper.model = SharedParamWrapper(shared_params)
-        self.sdmgrad_wrapper.init_param()
+            # Build parameter groups
+            param_groups = []
+            
+            # Trunk parameters
+            trunk_params = get_params(*trunk_modules)
+            param_groups.extend(split_by_weight_decay(trunk_params, weight_decay))
+            
+            # Head parameters (higher LR, lower WD)
+            head_params = get_params(*head_modules)
+            for group in split_by_weight_decay(head_params, weight_decay * 0.5):
+                group["lr"] = learning_rate * 1.2
+                param_groups.append(group)
+            
+            # Scalar parameters (lower LR, no WD)
+            scalar_params_filtered = [p for p in scalar_params if isinstance(p, nn.Parameter) and p.requires_grad]
+            if scalar_params_filtered:
+                param_groups.append({
+                    "params": scalar_params_filtered,
+                    "lr": learning_rate * 0.1,
+                    "weight_decay": 0.0
+                })
+            popl_params = [self.POPL.class_centres]
+            param_groups.append({"params": popl_params, "lr": learning_rate * 0.5, "weight_decay": 0.0})
 
-        # Hyperparameters
-        self.sdmgrad_lamda = 0.3
-        self.sdmgrad_niter = 20
-
-        # Discriminator optimizer (separate)
-        if hasattr(self, 'image_discriminator'):
-            disc_params = [p for p in self.image_discriminator.parameters() if p.requires_grad]
-            self.img_disc_optimizer = WeightClipping(
-                params=disc_params,
-                beta=1.0,
-                optimizer=torch.optim.AdamW,
-                lr=learning_rate * 0.08,
-                betas=(0.8, 0.999),
-                clip_last_layer=True,
-                max_grad_norm=self._grad_clip
+            
+            # Store all parameters for SDMGrad bookkeeping
+            self.gen_optimizer = geoopt.optim.RiemannianAdam(
+                param_groups, 
+                lr=learning_rate, 
+                betas=(0.9, 0.999), 
+                eps=1e-8
             )
-        
-        # Setup schedulers
-        self._setup_schedulers()
+            def get_params(*modules):
+                params = []
+                for m in modules:
+                    if m is None:
+                        continue
+                    if isinstance(m, nn.Module):
+                        params.extend([p for p in m.parameters() if p.requires_grad])
+                    elif isinstance(m, nn.Parameter) and m.requires_grad:
+                        params.append(m)
+                return params
+
+            # Define shared modules (everything except discriminators)
+            shared_modules = [
+                self.encoder, 
+                self.decoder, 
+                self.prior,  # Including all DPGMM components
+                self._rnn, 
+                self.rnn_layer_norm,
+                self.perceiver_model,
+                self.perceiver_projection,
+                self.attention_prior_posterior,
+                self.phi_attention,
+                self.self_model,
+                self.h0, 
+                self.c0, 
+                self.temperature,
+                self.temporal_attention_temp
+            ]
+            
+            # Get shared parameters
+            shared_params = get_params(*shared_modules)
+            
+            # Critical: Set the model interface for SDMGrad
+            class SharedParamWrapper:
+                """Wrapper to provide SDMGrad with shared parameter access"""
+                def __init__(self, params):
+                    self.params = list(params)
+                
+                def shared_parameters(self):
+                    return self.params
+                
+                def reset(self):
+                    for p in self.params:
+                        if p.grad is not None:
+                            p.grad = None
+
+            # Create an instance of the wrapper to pass to SDMGrad
+            sdmgrad_model_wrapper = SharedParamWrapper(shared_params)
+
+            # Initialize SDMGrad wrapper with the required arguments
+            self.sdmgrad_wrapper = SDMGrad(
+                model=sdmgrad_model_wrapper,
+                num_tasks=5,  # Your 5 task losses
+                device=self.device
+            )
+            self.sdmgrad_wrapper.init_param()
+
+            # Hyperparameters
+            self.sdmgrad_lamda = 0.3
+            self.sdmgrad_niter = 20
+
+            # Discriminator optimizer (separate)
+            if hasattr(self, 'image_discriminator'):
+                disc_params = [p for p in self.image_discriminator.parameters() if p.requires_grad]
+                self.img_disc_optimizer = WeightClipping(
+                    params=disc_params,
+                    beta=1.0,
+                    optimizer=torch.optim.AdamW,
+                    lr=learning_rate * 0.08,
+                    betas=(0.8, 0.999),
+                    clip_last_layer=True,
+                    max_grad_norm=self._grad_clip
+                )
+            
+            # Setup schedulers
+            self._setup_schedulers()
 
     def _setup_schedulers(self):
         """Setup learning-rate schedulers for all optimizers (Option B)."""
@@ -2258,12 +2262,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             SDMGrad_lamda=self.sdmgrad_lamda,
             SDMGrad_niter=self.sdmgrad_niter
         )
+        del loss_batches
+        
 
         # Standard optimization step
         torch.nn.utils.clip_grad_norm_(list(self.sdmgrad_wrapper.model.shared_parameters()), max_norm=self._grad_clip)
         self.gen_optimizer.step()
-            
-    
         
         # ---- Amortized update of task weights ----
         
