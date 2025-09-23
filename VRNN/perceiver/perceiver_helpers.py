@@ -51,11 +51,6 @@ def f32_softmax(x: torch.Tensor) -> torch.Tensor:
         return func.softmax(x, dim=-1)
 
 
-# def layer_norm(x: torch.Tensor, name: Optional[str] = None) -> torch.Tensor:
-# Note: In PyTorch, LayerNorm is usually used as a module, not a function.
-# Hence, you might need to include this in a nn.Module class.
-# layer_norm_module = nn.LayerNorm(x.size(-1), elementwise_affine=True).to(device)
-# return layer_norm_module(x)
 
 
 def get_activation(activation_name: str):
@@ -73,7 +68,6 @@ def get_activation(activation_name: str):
 def attend(q, k, v, dropout_prob=0.0, attention_mask=None):
     """Computes multi-head attention using a query, key and value.
 
-    ... indicates multiple batch / group dimensions.
 
     Args:
       q: Query with shape [..., q_indices, num_heads, head_dim].
@@ -128,7 +122,7 @@ def assign_groups_to_modalities(
 
     for _ in range(extra_groups):
         modality = torch.argmax(index_dim_per_group).item()
-        num_groups_per_modality[modality] += 1
+        num_groups_per_modality[modality] = num_groups_per_modality[modality] + 1
         index_dim_per_group[modality] = (
                 index_dim_per_modality[modality] / num_groups_per_modality[modality])
 
@@ -137,11 +131,6 @@ def assign_groups_to_modalities(
 
 
 class TrainablePositionEncoding(nn.Module):
-    """Trainable position encoding with a sinusoidal base + learnable delta (same API).
-
-    Returns:
-      [index_dim, num_channels] or [B, index_dim, num_channels] if batch_size is given.
-    """
 
     def __init__(self, index_dim: int, num_channels: int = 128, init_scale: float = 1.0):
         super().__init__()
@@ -166,7 +155,8 @@ class TrainablePositionEncoding(nn.Module):
         # Optional: small init to the delta (kept tiny)
         if self._init_scale > 0:
             with torch.no_grad():
-                self.pos_embs.add_(torch.randn_like(self.pos_embs) * (self._init_scale * 1e-3))
+                
+                self.pos_embs = nn.Parameter(self.pos_embs + torch.randn_like(self.pos_embs) * self._init_scale)
 
     @torch.no_grad()
     def _grow_to(self, new_len: int):
@@ -177,16 +167,19 @@ class TrainablePositionEncoding(nn.Module):
 
         device, dtype = self.pos_embs.device, self.pos_embs.dtype
         # Create new parameter and copy old part
-        new_param = torch.empty(new_len, d, device=device, dtype=dtype)
-        new_param[:old_len].copy_(self.pos_embs)
+    
 
         # Initialize the tail close to zero (so base dominates), with tiny noise
         tail = torch.zeros(new_len - old_len, d, device=device, dtype=dtype)
         if self._init_scale > 0:
-            tail.add_(torch.randn_like(tail) * (self._init_scale * 1e-3))
-        new_param[old_len:].copy_(tail)
-
+            
+            tail = tail + torch.randn_like(tail) * (self._init_scale * 1e-3)
+        
+        new_param = torch.cat([self.pos_embs, tail], dim=0)
+    
         self.pos_embs = nn.Parameter(new_param, requires_grad=True)
+
+        
         self._index_dim = new_len
         # Invalidate cache (base encodings length changed)
         self._cached_len = 0
@@ -308,16 +301,6 @@ class Attention(nn.Module):
     """
     Multi-headed cross/self-attention with optional xFormers memory-efficient path.
 
-    Inputs:
-        inputs_q: [B, G, Q_len, C_q_in]
-        inputs_kv: [B, G, KV_len, C_kv_in]
-        attention_mask (optional): broadcastable to [B, G, Q_len, KV_len], 1=keep, 0=mask
-
-    Returns:
-        (attn_output, attn_probs)
-          - attn_output: [B, G, Q_len, C_out]
-          - attn_probs: [B, G, H, Q_len, KV_len] (PyTorch path), or
-                        None on xFormers path unless return_attn_probs=True
     """
     def __init__(self,
                  num_heads: int = 8,

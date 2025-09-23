@@ -51,8 +51,8 @@ class AverageMeter(object):
 
     def update(self, val, n=1):
         self.val = val
-        self.sum += val * n
-        self.count += n
+        self.sum = self.sum + val * n
+        self.count = self.count + n
         self.avg = self.sum / self.count
 
 
@@ -680,11 +680,11 @@ class PerpetualOrthogonalProjectionLoss(nn.Module):
         total_loss=0
 
         # 1. loss between slots
-        total_loss += self.slot_ortho_weight * self.slot_loss(features)
+        total_loss = total_loss + self.slot_ortho_weight * self.slot_loss(features)
 
         # 2. Orthogonal center regularization 
         normalized_class_centres = F.normalize(self.class_centres, p=2, dim=1)
-        total_loss += self.orthogonality_weight * self.orthogonal_center_loss(normalized_class_centres)
+        total_loss = total_loss + self.orthogonality_weight * self.orthogonal_center_loss(normalized_class_centres)
 
         # 3. Feature-to center alignment 
         if self.use_attention:
@@ -708,8 +708,7 @@ class PerpetualOrthogonalProjectionLoss(nn.Module):
         same_class_loss = (label_mask * feature_centre_variance).sum() / (label_mask.sum() + 1e-6)
         diff_class_loss = torch.relu(0.2 + (1 - label_mask) * feature_centre_variance).mean()
 
-        total_loss += 0.5 * (1.0 - same_class_loss) + diff_class_loss
-        
+        total_loss = total_loss + 0.5 * (1.0 - same_class_loss) + diff_class_loss
 
         return total_loss
     
@@ -829,9 +828,10 @@ class AttentionPrior(nn.Module):
             # Compute relative coordinates
             relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, H*W, H*W
             relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # H*W, H*W, 2
-            relative_coords[:, :, 0] += attention_resolution - 1  # Shift to start from 0
-            relative_coords[:, :, 1] += attention_resolution - 1
-            
+            rc_0 = relative_coords[:, :, 0] + attention_resolution - 1
+            rc_1 = relative_coords[:, :, 1] + attention_resolution - 1
+            relative_coords = torch.stack([rc_0, rc_1], dim=-1)
+
             self.register_buffer("relative_position_index", relative_coords)
         
         # Efficient self-attention layer
@@ -1170,9 +1170,9 @@ class ActNorm(nn.Module):
                 .unsqueeze(3)
                 .permute(1, 0, 2, 3)
             )
-
-            self.loc.data.copy_(-mean)
-            self.scale.data.copy_(1 / (std + 1e-6))
+            self.loc = nn.Parameter(-mean)
+            self.scale = nn.Parameter(1 / (std + 1e-6))
+            
 
     def forward(self, input, reverse=False):
         if reverse:
@@ -1231,13 +1231,7 @@ class ImageDiscriminator(nn.Module):
         --> see https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/models/networks.py
     """
     def __init__(self, input_nc=3, ndf=16, n_layers=5, use_actnorm=False, device= torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
-        """Construct a PatchGAN discriminator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            ndf (int)       -- the number of filters in the last conv layer
-            n_layers (int)  -- the number of conv layers in the discriminator
-            norm_layer      -- normalization layer
-        """
+
         super(ImageDiscriminator, self).__init__()
         if not use_actnorm:
             norm_layer = nn.BatchNorm2d
@@ -1256,17 +1250,17 @@ class ImageDiscriminator(nn.Module):
         self.layers.append(
             nn.Sequential(
                 nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw),
-                nn.LeakyReLU(0.2, True))
+                nn.LeakyReLU(0.2, inplace=False))
         )
         nf_mult = 1
         nf_mult_prev = 1
-        for n in range(1, n_layers):  # gradually increase the number of filters
+        for n in range(1, n_layers):  
             nf_mult_prev = nf_mult
             nf_mult = min(2 ** n, 8)
             layer=nn.Sequential(
                 nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
                 norm_layer(ndf * nf_mult),
-                nn.LeakyReLU(0.2, True)
+                nn.LeakyReLU(0.2, inplace=False)
             )
             if n==(n_layers-1):
                layer.append(attentionBlock(ndf* nf_mult))
@@ -1278,13 +1272,11 @@ class ImageDiscriminator(nn.Module):
             nn.Sequential(
                 nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
                 norm_layer(ndf * nf_mult),
-                nn.LeakyReLU(0.2, True)
+                nn.LeakyReLU(0.2, inplace=False)
             )
         )
         self.layers.append(
             nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw))
-
-        # output 1 channel prediction map
         
         self.to(device)
 
@@ -1357,10 +1349,6 @@ class LatentDiscriminator(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-###################################################################
-############ Image Temporal Discriminator Modules #################
-###################################################################
-
 
 def make_temporal_padding_mask(lengths: torch.Tensor, T: int) -> torch.Tensor:
     """
@@ -1378,14 +1366,9 @@ def tri_causal_mask(T: int, device) -> torch.Tensor:
     return m.view(1, 1, T, T)
 
 
-# -----------------------------
-# Causal 3D stem for tokenization
-# -----------------------------
-
 class CausalConv3d(nn.Module):
     """
     3D convolution that is causal along time: pads only on the "past" side in time,
-    symmetric 'same' padding in H,W (requires odd spatial kernels).
     """
     def __init__(
         self,
@@ -1402,7 +1385,7 @@ class CausalConv3d(nn.Module):
         kt, kh, kw = kernel_size
 
         self.pad_mode = pad_mode
-        time_pad = dilation_t * (kt - 1)       # left-only time padding
+        time_pad = dilation_t * (kt - 1)       
         if spatial_padding is not None:
             h_pad = int(spatial_padding)
             w_pad = int(spatial_padding)
@@ -1420,7 +1403,7 @@ class CausalConv3d(nn.Module):
             chan_in,
             chan_out,
             kernel_size=(kt, kh, kw),
-            stride=(stride_t, kh, kw),  # stride spatially by kernel -> non-overlap patches
+            stride=(stride_t, kh, kw),  
             dilation=(dilation_t, 1, 1),
             bias=bias,
         )
@@ -1430,7 +1413,6 @@ class CausalConv3d(nn.Module):
         x = F.pad(x, self._pad, mode=self.pad_mode)
         return self.conv(x)
 
-#----------------Using RoPE for positional encoding-------------------
 class RoPEMHA(nn.Module):
     """MHA that applies 2D RoPE (from RopePositionEmbedding) to Q/K before attention."""
     def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.1):
@@ -1474,10 +1456,7 @@ class RoPEMHA(nn.Module):
         return self.out(y)
 
 class CausalSelfAttention(nn.Module):
-    """
-    Causal self-attention over sequences with optional 1D RoPE on time.
-    Handles causal + padding masks and zeros outputs for padded queries.
-    """
+
     def __init__(
         self,
         n_embd: int,
@@ -1493,7 +1472,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = n_head
         self.d_head = n_embd // n_head
         self.max_seq_len = max_seq_len
-        assert (self.d_head % 2) == 0, "RoPE requires even head dim (d_head % 2 == 0)"
+        assert (self.d_head % 2) == 0,  "RoPE requires even head dim (d_head % 2 == 0)"
         self.use_rope_time = use_rope_time
         self.rope_base = rope_base
 
@@ -1515,7 +1494,7 @@ class CausalSelfAttention(nn.Module):
         # Build standard 1D RoPE for time: sin/cos with shape [T, d_head]
         d = self.d_head
         half = d // 2
-        # Frequencies like base^{-(0..half-1)/half}; robust & standard
+        
         inv_freq = (self.rope_base ** (-(torch.arange(half, device=device, dtype=dtype) / half))).view(1, half)
         t = torch.arange(T, device=device, dtype=dtype).view(T, 1)
         angles = t * inv_freq                                 # [T, half]
@@ -1580,7 +1559,6 @@ class CausalSelfAttention(nn.Module):
         return self.resid_drop(self.proj(y))
 
 class TransformerBlock(nn.Module):
-    """Pre-LN Transformer block with residual gates for stability."""
     def __init__(
         self,
         n_embd: int,
@@ -1618,16 +1596,8 @@ class TransformerBlock(nn.Module):
 
 
 
-# -----------------------------
-# Spatial-temporal tokenizer (causal in time)
-# -----------------------------
-
 class SpatialTemporalTokenizer(nn.Module):
-    """
-    Causal temporal patching + spatial patching.
-    Input:  [B, T, C, H, W]
-    Output: tokens [B, T', N, D] where N = (H/p)*(W/p)
-    """
+
     def __init__(
         self,
         input_channels: int,
@@ -1667,12 +1637,7 @@ class TemporalDiscriminator(nn.Module):
     """
     Temporal discriminator conditioned on latent z_t (per-timestep).
 
-    Conditioning:
-      - FiLM on spatial-temporal tokens: tokens = (1 + gamma_t) ⊙ tokens + beta_t
-      - Small conditional residuals on scoring heads.
-    Shapes:
-      x: [B, T, C, H, W]
-      z: [B, T, Z]  (or [B, Z] -> broadcast to T)
+
     """
     def __init__(
         self,
@@ -1763,17 +1728,17 @@ class TemporalDiscriminator(nn.Module):
         # Heads 
         self.temporal_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Linear(hidden_dim // 2, 1)
         )
         self.spatial_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Linear(hidden_dim // 2, 1)
         )
         self.per_frame_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Linear(hidden_dim // 2, 1)
         )
 
@@ -2099,8 +2064,8 @@ def log_residual_stack_structure(
                     channel_size_per_layer[layer], layers_per_block_per_layer[layer]
                 )
             )
-            
-            layer += 1
+
+            layer = layer + 1
             # if it's not the last layer, check if the next one has more channels and connect them
             # using a conv layer
             if layer < len(channel_size_per_layer):
@@ -2164,7 +2129,7 @@ def build_residual_stack(
             )
             layers.append(nn.InstanceNorm2d(channel_size_per_layer[layer]))
             block_end_channels = channel_size_per_layer[layer]
-            layer += 1
+            layer = layer + 1
             # if it's not the last layer, check if the next one has more channels and connect them
             # using a conv layer
             if layer < len(channel_size_per_layer):
@@ -2221,7 +2186,7 @@ class EMA:
     
     def update(self):
         if self.use_num_updates:
-            self.num_updates += 1
+            self.num_updates = self.num_updates + 1
             decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
         else:
             decay = self.decay
@@ -2387,8 +2352,6 @@ class VAEDecoder(torch.nn.Module):
                 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
-
-##### Self modeling Blocks #####
 
 class SelfModelBlock(nn.Module):
     def __init__(self, z_dim, A_dim, a_dim, c_dim, h_dim, d=256, nhead=4, dropout=0.2,

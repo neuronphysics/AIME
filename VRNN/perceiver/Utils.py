@@ -287,7 +287,7 @@ class RopePositionEmbedding(nn.Module):
         # Shift coords by adding a uniform value in [-shift, shift]
         if self.training and self.shift_coords is not None:
             shift_hw = torch.empty(2, **dd).uniform_(-self.shift_coords, self.shift_coords)
-            coords += shift_hw[None, :]
+            coords = coords + shift_hw[None, :]
 
         # Jitter coords by multiplying the range [-1, 1] by a log-uniform value in [1/jitter, jitter]
         if self.training and self.jitter_coords is not None:

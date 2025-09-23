@@ -7,8 +7,6 @@ import logging
 import abc
 import math
 
-
-
 def swish(x):
     """Swish activation function"""
     return x * torch.sigmoid(x)
@@ -17,7 +15,6 @@ def swish(x):
 class Swish(nn.Module):
     def forward(self, x):
         return swish(x)
-
 
 
 class SqueezeExcitation(nn.Module):
@@ -42,8 +39,6 @@ def spectral_norm_conv(conv_layer):
     """Apply spectral normalization to conv layers"""
     return nn.utils.spectral_norm(conv_layer)
 
-
-# ============= NVAE-style Residual Blocks =============
 
 class NVAEResidualBlock(nn.Module):
     """NVAE-style residual block with SE and BN"""
@@ -184,7 +179,6 @@ class DecoderResidualBlock(nn.Module):
         return self.blocks(x)
 
 
-# ============= Main VAE Components =============
 
 class VAEEncoder(nn.Module):
     """NVAE-style encoder with progressive downsampling"""
@@ -254,8 +248,8 @@ class VAEEncoder(nn.Module):
                     )
                 )
                 current_channels = out_channels
-                layer_idx += 1
-        
+                layer_idx = layer_idx + 1
+
         self.encoder_blocks = nn.ModuleList(encoder_blocks)
         
         # Final processing
@@ -291,10 +285,7 @@ class VAEEncoder(nn.Module):
         self.use_checkpoint = False
 
     def gradient_checkpointing_enable(self):
-        """
-        Enable gradient checkpointing for memory-efficient training.
-        This will trade compute for memory by recomputing activations during backward pass.
-        """
+
         self.use_checkpoint = True
     
     def forward(self, x):
@@ -336,7 +327,6 @@ class VAEEncoder(nn.Module):
         z = mean + eps * sigma
 
         return z, mean, logvar, hlayer
-    #-------------- Fuse Features from different layers ---------------
     def extract_pyramid(self, x: torch.Tensor, levels=None):
         """Return dict of multi-scale features tapped from the encoder backbone.
         Levels can be an int (keep last N scales) or an iterable of names (e.g., ("C2","C3","C4")).
@@ -354,7 +344,7 @@ class VAEEncoder(nn.Module):
             cur = block(cur)
             hw = cur.shape[-2:]
             if hw != prev_hw:
-                level += 1
+                level = level + 1
                 prev_hw = hw
             feats[f"C{level+1}"] = cur
         if levels is None:
@@ -368,10 +358,7 @@ class VAEEncoder(nn.Module):
         return {k: feats[k] for k in sel}
 
     def get_unet_skips(self, x, levels=None, detach: bool = False):
-        """
-        Build a dict of encoder feature maps keyed by spatial size like "HxW".
-        Convenience wrapper around extract_pyramid(...) for UNet-style decoding.
-        """
+
         feats = self.extract_pyramid(x, levels=levels)
         out = {}
         for k, v in feats.items():
@@ -390,7 +377,7 @@ class VAEEncoder(nn.Module):
         """
        
         with torch.no_grad():
-            feats = self.extract_pyramid(sample_input, levels=source)  # same taps you’ll use at train time
+            feats = self.extract_pyramid(sample_input, levels=source)  
             ups = [F.interpolate(f, size=out_hw, mode='bilinear', align_corners=False) for f in feats.values()]
             fused = torch.cat(ups, dim=1)                               # C_in = sum(C_level)
             in_ch = fused.shape[1]
@@ -424,7 +411,7 @@ class VAEEncoder(nn.Module):
         else:
             raise ValueError(f"Unknown fuse mode: {fuse}")
             
-# ============= Mixture of Discretized Logistics =============
+# Mixture of Discretized Logistics 
 class MDLHead(nn.Module):
     """RGB mixture of discretized logistics (PixelCNN++ style)."""
     def __init__(self, in_ch, out_ch, n_mix=10):
@@ -468,15 +455,12 @@ class MDLHead(nn.Module):
     @torch.no_grad()
     def sample(self, logit_probs, means, log_scales, coeffs,
             scale_temp: float = 1.0, mode: str = "sample"):
-        """
-        scale_temp (0<τ<=1): shrink logistic scales at sampling time (s' = τ * s).
-        mode: "sample" (stochastic) | "mean" (deterministic, per-component mean with RGB coupling)
-        """
+
         B, K, H, W = logit_probs.shape
 
         # one helper for both branches
         def samp(mu, log_s):
-            u = torch.rand_like(mu).clamp_(1e-5, 1 - 1e-5)
+            u = torch.rand_like(mu).clamp(1e-5, 1 - 1e-5)
             return mu + torch.exp(log_s) * (torch.log(u) - torch.log1p(-u))
 
         # pick mixture component per pixel
@@ -495,7 +479,7 @@ class MDLHead(nn.Module):
                 x_g = m[:, 1] + cs[:, 0] * x_r
                 x_b = m[:, 2] + cs[:, 1] * x_r + cs[:, 2] * x_g
                 x = torch.stack([x_r, x_g, x_b], dim=1)
-                return x.clamp_(-1, 1)
+                return x.clamp(-1, 1)
 
             # shrink scales for sampling
             ls = ls + math.log(max(scale_temp, 1e-6))
@@ -513,12 +497,12 @@ class MDLHead(nn.Module):
             ls = log_scales.gather(1, sel.expand(-1, 1, C, -1, -1)).squeeze(1)   # [B,C,H,W]
 
             if mode == "mean":
-                return m.clamp_(-1, 1)
+                return m.clamp(-1, 1)
 
             ls = ls + math.log(max(scale_temp, 1e-6))
             x  = samp(m, ls)  # elementwise
 
-        return x.clamp_(-1, 1)
+        return x.clamp(-1, 1)
     
     def nll(self, x, logit_probs, means, log_scales, coeffs):
         """
@@ -645,8 +629,8 @@ class VAEDecoder(nn.Module):
                 # Only upsample on first block of each resolution level
                 upsample = should_upsample and block_idx == 0
                 if upsample:
-                    upsample_count += 1
-                
+                    upsample_count = upsample_count + 1
+
                 decoder_blocks.append(
                     DecoderResidualBlock(
                         current_channels,
@@ -658,8 +642,8 @@ class VAEDecoder(nn.Module):
                     )
                 )
                 current_channels = out_channels
-                layer_idx += 1
-        
+                layer_idx = layer_idx + 1
+
         self.decoder_blocks = nn.ModuleList(decoder_blocks)
         
         # Final layers
@@ -684,39 +668,27 @@ class VAEDecoder(nn.Module):
         self.post_concat_adapters = nn.ModuleDict()  # 1x1 convs to map cat(C_in+skip) -> C_in
 
     def gradient_checkpointing_disable(self):
-        """
-        Disable gradient checkpointing.
-        """
+
         self.use_checkpoint = False
 
     def gradient_checkpointing_enable(self):
-        """
-        Enable gradient checkpointing for memory-efficient training.
-        This will trade compute for memory by recomputing activations during backward pass.
-        """
+
         self.use_checkpoint = True
 
     def set_unet_skips(self, skips: Optional[dict], mode: str = "concat"):
-        """Provide encoder feature maps for UNet-style fusion. Call right before forward(z).
-        Args:
-            skips: dict of {"HxW": Tensor[B,C,H,W]} or arbitrary keys -> Tensor[B,C,H,W].
-                   If keys aren't 'HxW', we'll match by tensor spatial size.
-            mode:  currently only 'concat' is supported.
+        """
+        Provide encoder feature maps for UNet-style fusion. Call right before forward(z).
+
         """
         
         self._unet_mode = mode
         # Store as a plain dict; do NOT consume/mutate this inside forward (checkpoint-safety).
         self._pending_skips = dict(skips) if skips is not None else None
 
-    # --------------------------------
-    # Internal: skip selection (pure)
-    # --------------------------------
+
     @staticmethod
     def _pick_and_prep_skip_from(pool: dict, target: torch.Tensor) -> Optional[torch.Tensor]:
-        """Pick a skip from a *local copy* of the pool that best matches target HxW.
-        This method is pure w.r.t module state and safe under checkpoint recomputation.
-        Mutates only the provided local 'pool' dict.
-        """
+
         if not isinstance(pool, dict) or len(pool) == 0:
             return None
         H, W = target.shape[-2:]
@@ -746,8 +718,7 @@ class VAEDecoder(nn.Module):
         local_skip_pool: Optional[dict],
         mode: str = "concat",
     ) -> torch.Tensor:
-        """Fuse a skip feature when resolution changed (after upsample). Pure wrt module state
-        except possibly creating a 1x1 adapter (idempotent across recomputations)."""
+        
         if not isinstance(local_skip_pool, dict) or len(local_skip_pool) == 0:
             return h
         # Trigger only on resolution change (i.e., after an upsample)
@@ -771,21 +742,7 @@ class VAEDecoder(nn.Module):
             self.post_concat_adapters[adapter_key] = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=True).to(h.device)
         return self.post_concat_adapters[adapter_key](cat)
 
-    # -------------
-    # Forward pass
-    # -------------
     def forward(self, z: torch.Tensor, skips: Optional[dict] = None):
-        """
-        Forward pass with optional skip connections.
-        
-        Args:
-            z: Latent tensor
-            skips: Optional dict of skip connections. If not provided, uses self._pending_skips
-                   (for backward compatibility with set_unet_skips API)
-        
-        Returns:
-            Output from MDL head (logit_probs, means, log_scales, coeffs)
-        """
         # Determine skip source - prefer explicitly passed skips for checkpoint safety
         skip_source = skips if skips is not None else self._pending_skips
         
@@ -829,9 +786,6 @@ class VAEDecoder(nn.Module):
 
         return out  # typically (logit_probs, means, log_scales, coeffs)
 
-    # ------------------------
-    # Convenience for sampling
-    # ------------------------
     def decode(self, z: torch.Tensor, deterministic: bool = False, scale_temp: float = 1.0):
         """Decode latents to images for inference/visualization."""
         logit_probs, means, log_scales, coeffs = self.forward(z)
@@ -872,15 +826,7 @@ class GramLoss(nn.Module):
             assert self.remove_neg != self.remove_only_teacher_neg
 
     def forward(self, output_feats, target_feats, img_level=True):
-        """Compute the MSE loss between the gram matrix of the input and target features.
 
-        Args:
-            output_feats: Pytorch tensor (B, N, dim) or (B*N, dim) if img_level == False
-            target_feats: Pytorch tensor (B, N, dim) or (B*N, dim) if img_level == False
-            img_level: bool, if true gram computed at the image level only else over the entire batch
-        Returns:
-            loss: scalar
-        """
 
         # Dimensions of the tensor should be (B, N, dim)
         if img_level:
@@ -913,12 +859,17 @@ class GramLoss(nn.Module):
         student_sim = torch.matmul(output_feats, output_feats.transpose(-1, -2))
 
         if self.remove_neg:
-            target_sim[target_sim < 0] = 0.0
-            student_sim[student_sim < 0] = 0.0
+            target_sim  = torch.where(target_sim  < 0, torch.zeros_like(target_sim),  target_sim)
+            student_sim = torch.where(student_sim < 0, torch.zeros_like(student_sim), student_sim)
 
         elif self.remove_only_teacher_neg:
             # Remove only the negative sim values of the teacher
-            target_sim[target_sim < 0] = 0.0
-            student_sim[(student_sim < 0) & (target_sim < 0)] = 0.0
+            tneg = target_sim < 0
+            sneg = student_sim < 0
+
+            # zero where target is negative
+            target_sim  = torch.where(tneg, torch.zeros_like(target_sim), target_sim)
+            # zero where both were negative
+            student_sim = torch.where(sneg & tneg, torch.zeros_like(student_sim), student_sim)
 
         return self.mse_loss(student_sim, target_sim)

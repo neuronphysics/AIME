@@ -1514,30 +1514,15 @@ class AlignedMTLOptimizer(GradientManipulationBaseOptimizer):
     
 # ---------------------------- Base Optimizer ----------------------------
 
+# === MGDA-FA (fast approximation) ==========================================
+
 
 class AbsWeighting(nn.Module):
     r"""An abstract class for weighting strategies.
     """
-    def __init__(self, 
-                 model: nn.Module,
-                 num_tasks: int=None,
-                 device: str='cuda'):
+    def __init__(self):
         super(AbsWeighting, self).__init__()
-        self.rep_grad = False
-        self.model = model
-
-        self.num_tasks = num_tasks
-        self.device = device
-        self.to(device)
-
-    def get_share_params(self):
-        r"""Return the shared parameters of the model."""
-        return self.model.shared_parameters()
-
-    def zero_grad_share_params(self):
-        r"""Set gradients of the shared parameters to zero."""
-        self.model.reset()
-
+        
     def init_param(self):
         r"""Define and initialize some trainable parameters required by specific weighting methods. 
         """
@@ -1559,7 +1544,7 @@ class AbsWeighting(nn.Module):
             if param.grad is not None:
                 beg = 0 if count == 0 else sum(self.grad_index[:count])
                 end = sum(self.grad_index[:(count+1)])
-                grad[beg:end] = param.grad.data.view(-1)
+                grad[beg:end] = param.grad.view(-1).detach()
             count += 1
         return grad
 
@@ -1568,28 +1553,39 @@ class AbsWeighting(nn.Module):
         mode: backward, autograd
         '''
         if not rep_grad:
-            grads = torch.zeros(self.num_tasks, self.grad_dim).to(self.device)
-            for tn in range(self.num_tasks):
+            grads = torch.zeros(self.task_num, self.grad_dim).to(self.device)
+            for tn in range(self.task_num):
                 if mode == 'backward':
                     if 'MoDo' in [base.__name__ for base in self.__class__.__bases__] or 'SDMGrad' in [base.__name__ for base in self.__class__.__bases__]:
                         losses[tn].backward(retain_graph=True)
                     else:
-                        losses[tn].backward(retain_graph=True) if (tn+1)!=self.num_tasks else losses[tn].backward()
+                        losses[tn].backward(retain_graph=True) if (tn+1)!=self.task_num else losses[tn].backward()
                     grads[tn] = self._grad2vec()
                 elif mode == 'autograd':
-                    grad = list(torch.autograd.grad(losses[tn], self.get_share_params(), retain_graph=True))
-                    grads[tn] = torch.cat([g.view(-1) for g in grad])
+                    params = list(self.get_share_params())
+                    grad_list = torch.autograd.grad(
+                        losses[tn], params,
+                        retain_graph=True,
+                        allow_unused=True,   # <— key: avoid errors when a task doesn’t touch a param
+                    )
+                    flat = []
+                    for g, p in zip(grad_list, params):
+                        if g is None:
+                            flat.append(torch.zeros_like(p, device=p.device).view(-1))
+                        else:
+                            flat.append(g.contiguous().view(-1))
+                    grads[tn] = torch.cat(flat)
                 else:
                     raise ValueError('No support {} mode for gradient computation')
                 self.zero_grad_share_params()
         else:
             if not isinstance(self.rep, dict):
-                grads = torch.zeros(self.num_tasks, *self.rep.size()).to(self.device)
+                grads = torch.zeros(self.task_num, *self.rep.size()).to(self.device)
             else:
                 grads = [torch.zeros(*self.rep[task].size()) for task in self.task_name]
             for tn, task in enumerate(self.task_name):
                 if mode == 'backward':
-                    losses[tn].backward(retain_graph=True) if (tn+1)!=self.num_tasks else losses[tn].backward()
+                    losses[tn].backward(retain_graph=True) if (tn+1)!=self.task_num else losses[tn].backward()
                     grads[tn] = self.rep_tasks[task].grad.data.clone()
         return grads
 
@@ -1599,7 +1595,7 @@ class AbsWeighting(nn.Module):
             if param.grad is not None:
                 beg = 0 if count == 0 else sum(self.grad_index[:count])
                 end = sum(self.grad_index[:(count+1)])
-                param.grad.data = new_grads[beg:end].contiguous().view(param.data.size()).data.clone()
+                param.grad = new_grads[beg:end].contiguous().view_as(param).detach().clone()
             count += 1
             
     def _get_grads(self, losses, mode='backward'):
@@ -1616,10 +1612,10 @@ class AbsWeighting(nn.Module):
         if self.rep_grad:
             per_grads = self._compute_grad(losses, mode, rep_grad=True)
             if not isinstance(self.rep, dict):
-                grads = per_grads.reshape(self.num_tasks, self.rep.size()[0], -1).sum(1)
+                grads = per_grads.reshape(self.task_num, self.rep.size()[0], -1).sum(1)
             else:
                 try:
-                    grads = torch.stack(per_grads).sum(1).view(self.num_tasks, -1)
+                    grads = torch.stack(per_grads).sum(1).view(self.task_num, -1)
                 except:
                     raise ValueError('The representation dimensions of different tasks must be consistent')
             return [per_grads, grads]
@@ -1639,15 +1635,15 @@ class AbsWeighting(nn.Module):
         if self.rep_grad:
             if not isinstance(self.rep, dict):
                 # transformed_grad = torch.einsum('i, i... -> ...', batch_weight, per_grads)
-                transformed_grad = sum([batch_weight[i] * per_grads[i] for i in range(self.num_tasks)])
+                transformed_grad = sum([batch_weight[i] * per_grads[i] for i in range(self.task_num)])
                 self.rep.backward(transformed_grad)
             else:
                 for tn, task in enumerate(self.task_name):
-                    rg = True if (tn+1)!=self.num_tasks else False
+                    rg = True if (tn+1)!=self.task_num else False
                     self.rep[task].backward(batch_weight[tn]*per_grads[tn], retain_graph=rg)
         else:
             # new_grads = torch.einsum('i, i... -> ...', batch_weight, grads)
-            new_grads = sum([batch_weight[i] * grads[i] for i in range(self.num_tasks)])
+            new_grads = sum([batch_weight[i] * grads[i] for i in range(self.task_num)])
             self._reset_grad(new_grads)
     
     @property
@@ -1659,76 +1655,137 @@ class AbsWeighting(nn.Module):
         """
         pass
 
-
-
-class SDMGrad(AbsWeighting):
-    r"""Stochastic Direction-oriented Multi-objective Gradient descent (SDMGrad).
+class MGDA(AbsWeighting):
+    r"""Multiple Gradient Descent Algorithm (MGDA).
     
-    This method is proposed in `Direction-oriented Multi-objective Learning: Simple and Provable Stochastic Algorithms (NeurIPS 2023) <https://openreview.net/forum?id=4Ks8RPcXd9>`_ \
-    and implemented by modifying from the `official PyTorch implementation <https://github.com/OptMN-Lab/sdmgrad>`_. 
+    This method is proposed in `Multi-Task Learning as Multi-Objective Optimization (NeurIPS 2018) <https://papers.nips.cc/paper/2018/hash/432aca3a1e345e339f35a30c8f65edce-Abstract.html>`_ \
+    and implemented by modifying from the `official PyTorch implementation <https://github.com/isl-org/MultiObjectiveOptimization>`_. 
 
     Args:
-        SDMGrad_lamda (float, default=0.3): The regularization hyperparameter.
-        SDMGrad_niter (int, default=20): The update iteration of loss weights.
+        mgda_gn ({'none', 'l2', 'loss', 'loss+'}, default='none'): The type of gradient normalization.
 
     """
-    def __init__(self, model: nn.Module, num_tasks: int, device: str = 'cuda'):
-        super().__init__(model=model, num_tasks=num_tasks, device=device)
-   
-    def init_param(self):
-        self.w = 1/self.num_tasks*torch.ones(self.num_tasks).to(self.device)
-        self.w_opt = torch.optim.SGD([self.w], lr=5, momentum=0.5)
+    def __init__(self):
+        super(MGDA, self).__init__()
+    
+    def _find_min_norm_element(self, grads):
 
-    def euclidean_proj_simplex(self, v, s=1):
-        assert s > 0, "Radius s must be strictly positive (%d <= 0)" % s
-        v = v.astype(np.float64)
-        n, = v.shape  
-        if v.sum() == s and np.alltrue(v >= 0):
-            return v
-        u = np.sort(v)[::-1]
-        cssv = np.cumsum(u)
-        rho = np.nonzero(u * np.arange(1, n + 1) > (cssv - s))[0][-1]
-        theta = float(cssv[rho] - s) / (rho + 1)
-        w = (v - theta).clip(min=0)
-        return w
+        def _min_norm_element_from2(v1v1, v1v2, v2v2):
+            if v1v2 >= v1v1:
+                gamma = 0.999
+                cost = v1v1
+                return gamma, cost
+            if v1v2 >= v2v2:
+                gamma = 0.001
+                cost = v2v2
+                return gamma, cost
+            gamma = -1.0 * ( (v1v2 - v2v2) / (v1v1+v2v2 - 2*v1v2) )
+            cost = v2v2 + gamma*(v1v2 - v2v2)
+            return gamma, cost
+
+        def _min_norm_2d(grad_mat):
+            dmin = 1e8
+            for i in range(grad_mat.size()[0]):
+                for j in range(i+1, grad_mat.size()[0]):
+                    c,d = _min_norm_element_from2(grad_mat[i,i], grad_mat[i,j], grad_mat[j,j])
+                    if d < dmin:
+                        dmin = d
+                        sol = [(i,j),c,d]
+            return sol
+
+        def _projection2simplex(y):
+            m = len(y)
+            sorted_y = torch.sort(y, descending=True)[0]
+            tmpsum = 0.0
+            tmax_f = (torch.sum(y) - 1.0)/m
+            for i in range(m-1):
+                tmpsum+= sorted_y[i]
+                tmax = (tmpsum - 1)/ (i+1.0)
+                if tmax > sorted_y[i+1]:
+                    tmax_f = tmax
+                    break
+            return torch.max(y - tmax_f, torch.zeros(m).to(y.device))
+
+        def _next_point(cur_val, grad, n):
+            proj_grad = grad - ( torch.sum(grad) / n )
+            tm1 = -1.0*cur_val[proj_grad<0]/proj_grad[proj_grad<0]
+            tm2 = (1.0 - cur_val[proj_grad>0])/(proj_grad[proj_grad>0])
+
+            skippers = torch.sum(tm1<1e-7) + torch.sum(tm2<1e-7)
+            t = torch.ones(1).to(grad.device)
+            if (tm1>1e-7).sum() > 0:
+                t = torch.min(tm1[tm1>1e-7])
+            if (tm2>1e-7).sum() > 0:
+                t = torch.min(t, torch.min(tm2[tm2>1e-7]))
+
+            next_point = proj_grad*t + cur_val
+            next_point = _projection2simplex(next_point)
+            return next_point
+
+        MAX_ITER = 50
+        STOP_CRIT = 1e-5
+    
+        grad_mat = grads.mm(grads.t())
+        init_sol = _min_norm_2d(grad_mat)
         
+        n = grads.size()[0]
+        sol_vec = torch.zeros(n).to(grads.device)
+        sol_vec[init_sol[0][0]] = init_sol[1]
+        sol_vec[init_sol[0][1]] = 1 - init_sol[1]
+
+        if n < 3:
+            # This is optimal for n=2, so return the solution
+            return sol_vec
+    
+        iter_count = 0
+
+        while iter_count < MAX_ITER:
+            grad_dir = -1.0 * torch.matmul(grad_mat, sol_vec)
+            new_point = _next_point(sol_vec, grad_dir, n)
+
+            v1v1 = torch.sum(sol_vec.unsqueeze(1).repeat(1, n)*sol_vec.unsqueeze(0).repeat(n, 1)*grad_mat)
+            v1v2 = torch.sum(sol_vec.unsqueeze(1).repeat(1, n)*new_point.unsqueeze(0).repeat(n, 1)*grad_mat)
+            v2v2 = torch.sum(new_point.unsqueeze(1).repeat(1, n)*new_point.unsqueeze(0).repeat(n, 1)*grad_mat)
+    
+            nc, nd = _min_norm_element_from2(v1v1, v1v2, v2v2)
+            new_sol_vec = nc*sol_vec + (1-nc)*new_point
+            change = new_sol_vec - sol_vec
+            if torch.sum(torch.abs(change)) < STOP_CRIT:
+                return sol_vec
+            sol_vec = new_sol_vec
+            iter_count += 1
+        return sol_vec
+    
+    def _gradient_normalizers(self, grads, loss_data, ntype):
+        if ntype == 'l2':
+            gn = grads.pow(2).sum(-1).sqrt()
+        elif ntype == 'loss':
+            gn = loss_data
+        elif ntype == 'loss+':
+            gn = loss_data * grads.pow(2).sum(-1).sqrt()
+        elif ntype == 'none':
+            gn = torch.ones_like(loss_data).to(self.device)
+        else:
+            raise ValueError('No support normalization type {} for MGDA'.format(ntype))
+        grads = grads / gn.unsqueeze(1).repeat(1, grads.size()[1])
+        return grads
+    
     def backward(self, losses, **kwargs):
-        # losses: [3, num_tasks] in SDMGrad
-        assert self.rep_grad == False, "No support method SDMGrad with representation gradients (rep_grad=True)"
-
-        SDMGrad_lamda, SDMGrad_niter = kwargs['SDMGrad_lamda'], kwargs['SDMGrad_niter']
-
-        grads = []
-        for i in range(3):
-            grads.append(self._get_grads(losses[i], mode='backward'))
-
-        zeta_grads, xi_grads1, xi_grads2 = grads
-        GG = torch.mm(xi_grads1, xi_grads2.t())
-        GG_diag = torch.diag(GG)
-        GG_diag = torch.where(GG_diag < 0, torch.zeros_like(GG_diag), GG_diag)
-        scale = torch.mean(torch.sqrt(GG_diag))
-        GG = GG / (scale.pow(2) + 1e-8)
-        Gg = torch.mean(GG, dim=1)
-        gg = torch.mean(Gg)
-        self.w.requires_grad = True
-        
-        for i in range(SDMGrad_niter):
-            self.w_opt.zero_grad()
-            
-            obj = 0.5 * torch.dot(self.w, torch.mv(GG, self.w)) + SDMGrad_lamda * torch.dot(self.w, Gg) + 0.5 * SDMGrad_lamda**2 * gg
-            obj.backward()
-            self.w_opt.step()
-            proj = self.euclidean_proj_simplex(self.w.data.cpu().numpy())
-            self.w.data.copy_(torch.from_numpy(proj).data)
-        self.w.requires_grad = False
-
-        g0 = torch.mean(zeta_grads, dim=0)
-        gw = (zeta_grads * self.w.view(-1, 1)).sum(0)
-        g = (gw + SDMGrad_lamda * g0) / (1 + SDMGrad_lamda)
-
-        self._reset_grad(g)
-        return None
-# ---------------------------- weight clipping ----------------------------
+        mgda_gn = kwargs['mgda_gn']
+        mode = kwargs.get('mode', 'backward')
+        grads = self._get_grads(losses, mode=mode)
+        if self.rep_grad:
+            per_grads, grads = grads[0], grads[1]
+        loss_data = torch.tensor([loss.item() for loss in losses]).to(self.device)
+        grads = self._gradient_normalizers(grads, loss_data, ntype=mgda_gn) # l2, loss, loss+, none
+        grads = grads.contiguous()
+        sol = self._find_min_norm_element(grads)
+        if self.rep_grad:
+            self._backward_new_grads(sol, per_grads=per_grads)
+        else:
+            self._backward_new_grads(sol, grads=grads)
+        return sol.detach().cpu().numpy()
+# --------------------------- weight clipping ----------------------------
 class InitBounds:
     '''
     A class to calculate the initial bounds for weight clipping.

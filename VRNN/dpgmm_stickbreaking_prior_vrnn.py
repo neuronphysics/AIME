@@ -9,7 +9,9 @@ import os
 import geoopt
 from contextlib import contextmanager
 from itertools import chain
-
+import numpy as np
+import math
+from collections import OrderedDict
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (
     EMA, TemporalDiscriminator,
@@ -17,12 +19,11 @@ from models import (
     AddEpsilon, check_tensor, SelfModelBlock, PerpetualOrthogonalProjectionLoss
 )
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
-from VRNN.mtl_optimizers import SDMGrad, WeightClipping
+from VRNN.mtl_optimizers import MGDA, WeightClipping
 
-import math
-from collections import OrderedDict
+
 from VRNN.lstm import LSTMLayer
-import numpy as np
+
 from VRNN.perceiver.Utils import generate_model
 from VRNN.perceiver import perceiver_helpers
 import VRNN.perceiver.perceiver as perceiver
@@ -160,11 +161,6 @@ class KumaraswamyNetwork(nn.Module):
         """
         Generate Kumaraswamy parameters from hidden representation
 
-        Args:
-            h: Hidden representation [batch_size, hidden_dim]
-
-        Returns:
-            a, b: Kumaraswamy parameters [batch_size, K-1]
         """
         # Add small epsilon to ensure strictly positive parameters
         min_val = -5.0
@@ -285,17 +281,7 @@ class AdaptiveStickBreaking(nn.Module):
         pi = pi / (pi.sum(dim=-1, keepdim=True) + eps)
         return pi
     def forward(self, h: torch.Tensor, n_samples: int = 10, use_rand_perm: bool = True, truncation_threshold: float = 0.995) -> Tuple[torch.Tensor, Dict]:
-        """
-        Generate mixing proportions using stick-breaking process
-
-        Args:
-            h: Hidden representation from encoder [batch_size, hidden_dim]
-
-        Returns:
-            pi: Mixing proportions [batch_size, max_components]
-            alpha: Concentration parameter
-        """
-        
+       
         
         # Generate stick-breaking proportions
         # Get Kumaraswamy parameters
@@ -339,11 +325,6 @@ class AdaptiveStickBreaking(nn.Module):
     def compute_kumar2beta_kl( a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor, n_approx: int, eps: float=100*torch.finfo(torch.float32).eps) -> torch.Tensor:
         """
         Compute KL divergence between Kumaraswamy(a,b) and Beta(alpha,beta)
-        KL(K(a,b) || B(α,β)) = 
-            (a-α)/a * (-γ - ψ(b) - 1/b) +     # First part
-            ln(a*b) + ln(B(α,β)) -      # Log terms
-            (b-1)/b +                         # Additional term
-            (β-1)b * E[ln(1-v)]               # Taylor expansion term
         https://arxiv.org/pdf/1905.12052
         """
         EULER_GAMMA = 0.5772156649
@@ -366,8 +347,8 @@ class AdaptiveStickBreaking(nn.Module):
         psi_b = torch.digamma(b + eps)
         term1 = torch.mul(torch.div(a - alpha, a + eps), -EULER_GAMMA - psi_b - b_inv)
         term2 = torch.log(ab + eps) + beta_fn(alpha, beta)
-        term2 += torch.div(-(b - 1), b + eps)
-        kl += term1 + term2
+        term2 = term2 + torch.div(-(b - 1), b + eps)
+        kl = kl + term1 + term2
         if torch.any(kl > 1000):
             print(f"WARNING: Large Kumar-Beta KL detected: max={kl.max().item()}, mean={kl.mean().item()}")
             print(f"  a range: ({a.min().item()}, {a.max().item()})")
@@ -412,7 +393,7 @@ class DPGMMPrior(nn.Module):
         self.component_nn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.LeakyReLU(),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Linear(hidden_dim, 2 * latent_dim * max_components),
             nn.LayerNorm(2 * latent_dim * max_components),
         )
@@ -426,10 +407,7 @@ class DPGMMPrior(nn.Module):
         n_samples: int = 10  # Add n_samples argument
     ) -> torch.Tensor:
         """
-        Computes KL[ q(z|x) || p(z) ] where:
-            p(z) = GMM(prior_weights, prior_means, prior_log_vars)
-            q(z|x) = Gaussian(posterior_means, posterior_log_vars)
-    
+   
         Uses Monte Carlo sampling with reparameterization.
         """
 
@@ -499,7 +477,7 @@ class DPGMMPrior(nn.Module):
                                                            beta_beta,
                                                            self.stick_breaking.M
                                                            )
-            total_kl += kl
+            total_kl = total_kl + kl
 
         # Add KL for hierarchical prior over alpha (positive or negative?)
         alpha_kl = self.stick_breaking.compute_gamma2gamma_kl(h)
@@ -681,13 +659,7 @@ class AttentionSchema(nn.Module):
         )    
     
 class PerceiverContextEmbedding(nn.Module):
-    """
-    Maintains a learnable context memory that gets updated by attending to Perceiver outputs.
-    
-    Think of this as having a persistent "understanding" of context that gets
-    refined based on global information from the Perceiver, rather than 
-    regenerating context from scratch each time.
-    """
+
     def __init__(self, perceiver_latent_dim, context_dim, num_heads=4, dropout=0.1, device='cuda'):
         super().__init__()
         self.perceiver_latent_dim = perceiver_latent_dim
@@ -727,15 +699,6 @@ class PerceiverContextEmbedding(nn.Module):
         self.to(device)
     
     def forward(self, perceiver_output):
-        """
-        Updates context memory based on Perceiver output.
-        
-        Args:
-            perceiver_output: [batch*seq_len, num_latents, perceiver_latent_dim]
-            
-        Returns:
-            context: [batch*seq_len, context_dim]
-        """
         batch_size = perceiver_output.shape[0]
         
         # Normalize and expand context memory for each batch element
@@ -862,11 +825,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self._setup_optimizers(learning_rate, weight_decay)
 
     def _warm_build_unet_adapters(self, batch_size: int = 1, dtype: torch.dtype | None = None):
-        """
-        Force-create UNet concat adapters before the optimizer is built.
-        Runs a single synthetic forward with the same spatial shape as training
-        without touching BN/Dropout stats or autograd graphs.
-        """
         if dtype is None:
             # If you use AMP (bf16/fp16), pass that here to match real runs.
             dtype = torch.float32
@@ -975,13 +933,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # 1) Build mock input ON THE SAME DEVICE as the model
         mock_input = self.generate_mock_input() 
 
-        # 2) Configure the tiny UNet adapter (valid dict syntax)
         extra_kwargs = {
             "unet_adapter_cfg": {
                 "modalities": ["image"],   # must match your Perceiver input key
                 "base_channels": 32,
                 "auto_depth": True,
-                # "image_hw": (H, W),      # only if I!=H*W or not square
                 "norm": "group",
                 "gn_groups": 8,
                 "enable_decode_unet": True,
@@ -1132,10 +1088,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         temporal_margin: int = 5
     ) -> torch.Tensor:
         """
-        Combines:
-        1. Intra-video alignment: real_t with fake_t
-        2. Inter-video separation: keep videos from different batches apart
-        3. Temporal coherence with margin-based negatives
+        Temporal coherence 
         """
         B, T, D = real_features.shape
         if T < 2 or B < 2:
@@ -1191,170 +1144,98 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         return alpha * (intra_loss + inter_loss) + (1 - alpha) * temporal_loss    
 
     def _setup_optimizers(self, learning_rate: float, weight_decay: float) -> None:
-            """
-            Build optimizers with SDMGrad multi-task optimization.
-            """
-            # Helper to get parameters from modules
-            def get_params(*modules):
-                params = []
-                for m in modules:
-                    if m is None:
-                        continue
-                    if isinstance(m, nn.Module):
-                        params.extend([p for p in m.parameters() if p.requires_grad])
-                    elif isinstance(m, nn.Parameter) and m.requires_grad:
-                        params.append(m)
-                return params
+        
+        def get_params(*modules):
+            params = []
+            for m in modules:
+                if m is None:
+                    continue
+                if isinstance(m, nn.Module):
+                    params.extend([p for p in m.parameters() if p.requires_grad])
+                elif isinstance(m, nn.Parameter) and m.requires_grad:
+                    params.append(m)
+            return params
 
-            def split_by_weight_decay(params, wd):
-                """Split parameters into those with and without weight decay"""
-                decay = []
-                no_decay = []
-                for p in params:
-                    if p.ndim >= 2:  # weights
-                        decay.append(p)
-                    else:  # biases, norms
-                        no_decay.append(p)
-                
-                groups = []
-                if decay:
-                    groups.append({"params": decay, "weight_decay": wd})
-                if no_decay:
-                    groups.append({"params": no_decay, "weight_decay": 0.0})
-                return groups
+        def split_by_weight_decay(params, wd):
+            decay, no_decay = [], []
+            for p in params:
+                (decay if p.ndim >= 2 else no_decay).append(p)
+            groups = []
+            if decay:    groups.append({"params": decay,    "weight_decay": wd})
+            if no_decay: groups.append({"params": no_decay, "weight_decay": 0.0})
+            return groups
 
-            # Organize all modules by category
-            trunk_modules = [
-                self.encoder, 
-                self.decoder, 
-                self.prior,  # This includes all DPGMM components
-                self._rnn, 
-                self.rnn_layer_norm,
-                self.perceiver_model,
-                self.perceiver_projection,
-            ]
-            
-            head_modules = [
-                self.attention_prior_posterior,  # Attention schema
-                self.phi_attention,
-                self.self_model,
-            ]
-            
-            scalar_params = [
-                self.h0, 
-                self.c0, 
-                self.temperature,
-                self.temporal_attention_temp
-            ]
-            
-            # Build parameter groups
-            param_groups = []
-            
-            # Trunk parameters
-            trunk_params = get_params(*trunk_modules)
-            param_groups.extend(split_by_weight_decay(trunk_params, weight_decay))
-            
-            # Head parameters (higher LR, lower WD)
-            head_params = get_params(*head_modules)
-            for group in split_by_weight_decay(head_params, weight_decay * 0.5):
-                group["lr"] = learning_rate * 1.2
-                param_groups.append(group)
-            
-            # Scalar parameters (lower LR, no WD)
-            scalar_params_filtered = [p for p in scalar_params if isinstance(p, nn.Parameter) and p.requires_grad]
-            if scalar_params_filtered:
-                param_groups.append({
-                    "params": scalar_params_filtered,
-                    "lr": learning_rate * 0.1,
-                    "weight_decay": 0.0
-                })
-            popl_params = [self.POPL.class_centres]
-            param_groups.append({"params": popl_params, "lr": learning_rate * 0.5, "weight_decay": 0.0})
+        trunk_modules = [
+            self.encoder, self.decoder, self.prior, self._rnn,
+            self.rnn_layer_norm, self.perceiver_model, self.perceiver_projection,
+        ]
 
-            
-            # Store all parameters for SDMGrad bookkeeping
-            self.gen_optimizer = geoopt.optim.RiemannianAdam(
-                param_groups, 
-                lr=learning_rate, 
-                betas=(0.9, 0.999), 
-                eps=1e-8
+        head_modules = [
+            self.attention_prior_posterior, self.phi_attention, self.self_model,
+        ]
+
+        scalar_params = [self.h0, self.c0, self.temperature, self.temporal_attention_temp]
+
+        param_groups = []
+        param_groups.extend(split_by_weight_decay(get_params(*trunk_modules), weight_decay))
+
+        for g in split_by_weight_decay(get_params(*head_modules), weight_decay * 0.5):
+            g["lr"] = learning_rate * 1.2
+            param_groups.append(g)
+
+        scalars = [p for p in scalar_params if isinstance(p, nn.Parameter) and p.requires_grad]
+        if scalars:
+            param_groups.append({"params": scalars, "lr": learning_rate * 0.1, "weight_decay": 0.0})
+
+        # Optional: POPL centres at a smaller LR, no WD
+        if hasattr(self, "POPL") and hasattr(self.POPL, "class_centres"):
+            param_groups.append({"params": [self.POPL.class_centres], "lr": learning_rate * 0.5, "weight_decay": 0.0})
+
+        self.gen_optimizer = torch.optim.AdamW(
+            param_groups, lr=learning_rate, betas=(0.9, 0.999), eps=1e-8
+        )
+
+        # Shared modules = generator stack (enc/dec/prior/RNN/perceiver/attention/self_model + scalar knobs)
+        shared_modules = [
+            self.encoder, self.decoder, self.prior, self._rnn, self.rnn_layer_norm,
+            self.perceiver_model, self.perceiver_projection,
+            self.attention_prior_posterior, self.phi_attention, self.self_model,
+            self.h0, self.c0, self.temperature, self.temporal_attention_temp,
+        ]
+        self._mgda_shared_params = list(get_params(*shared_modules))
+
+        # Create MGDA and provide the required hooks
+        self.mgda = MGDA()
+        self.mgda.device = self.device
+        self.mgda.task_num = 5                  # (elbo, perceiver, predictive, orth, adversarial)
+        self.mgda.rep_grad = False              # work on shared-parameter gradients
+        self.mgda.task_name = ['elbo', 'perceiver', 'predictive', 'orthogonal', 'adversarial']
+
+        # MGDA expects these two callables:
+        self.mgda.get_share_params = lambda: (p for p in self._mgda_shared_params)
+        def _zero_grad_share_params():
+            for p in self._mgda_shared_params:
+                if p.grad is not None:
+                    p.grad.zero_()
+        self.mgda.zero_grad_share_params = _zero_grad_share_params
+
+        self.mgda_gn = getattr(self, "mgda_gn", "loss+")
+
+        # Discriminator optimizer (separate)
+        if hasattr(self, 'image_discriminator'):
+            disc_params = [p for p in self.image_discriminator.parameters() if p.requires_grad]
+            self.img_disc_optimizer = WeightClipping(
+                params=disc_params,
+                beta=1.0,
+                optimizer=torch.optim.AdamW,
+                lr=learning_rate * 0.08,
+                betas=(0.8, 0.999),
+                clip_last_layer=True,
+                max_grad_norm=self._grad_clip
             )
-            def get_params(*modules):
-                params = []
-                for m in modules:
-                    if m is None:
-                        continue
-                    if isinstance(m, nn.Module):
-                        params.extend([p for p in m.parameters() if p.requires_grad])
-                    elif isinstance(m, nn.Parameter) and m.requires_grad:
-                        params.append(m)
-                return params
-
-            # Define shared modules (everything except discriminators)
-            shared_modules = [
-                self.encoder, 
-                self.decoder, 
-                self.prior,  # Including all DPGMM components
-                self._rnn, 
-                self.rnn_layer_norm,
-                self.perceiver_model,
-                self.perceiver_projection,
-                self.attention_prior_posterior,
-                self.phi_attention,
-                self.self_model,
-                self.h0, 
-                self.c0, 
-                self.temperature,
-                self.temporal_attention_temp
-            ]
-            
-            # Get shared parameters
-            shared_params = get_params(*shared_modules)
-            
-            # Critical: Set the model interface for SDMGrad
-            class SharedParamWrapper:
-                """Wrapper to provide SDMGrad with shared parameter access"""
-                def __init__(self, params):
-                    self.params = list(params)
-                
-                def shared_parameters(self):
-                    return self.params
-                
-                def reset(self):
-                    for p in self.params:
-                        if p.grad is not None:
-                            p.grad = None
-
-            # Create an instance of the wrapper to pass to SDMGrad
-            sdmgrad_model_wrapper = SharedParamWrapper(shared_params)
-
-            # Initialize SDMGrad wrapper with the required arguments
-            self.sdmgrad_wrapper = SDMGrad(
-                model=sdmgrad_model_wrapper,
-                num_tasks=5,  # Your 5 task losses
-                device=self.device
-            )
-            self.sdmgrad_wrapper.init_param()
-
-            # Hyperparameters
-            self.sdmgrad_lamda = 0.3
-            self.sdmgrad_niter = 20
-
-            # Discriminator optimizer (separate)
-            if hasattr(self, 'image_discriminator'):
-                disc_params = [p for p in self.image_discriminator.parameters() if p.requires_grad]
-                self.img_disc_optimizer = WeightClipping(
-                    params=disc_params,
-                    beta=1.0,
-                    optimizer=torch.optim.AdamW,
-                    lr=learning_rate * 0.08,
-                    betas=(0.8, 0.999),
-                    clip_last_layer=True,
-                    max_grad_norm=self._grad_clip
-                )
-            
-            # Setup schedulers
-            self._setup_schedulers()
+        
+        # Setup schedulers
+        self._setup_schedulers()
 
     def _setup_schedulers(self):
         """Setup learning-rate schedulers for all optimizers (Option B)."""
@@ -1378,16 +1259,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.current_step = 0
 
     def forward_sequence(self, observations, actions=None):
-        """
-        Process entire sequence through VRNN with DP-GMM prior
-        
-        Args:
-            observations: [batch_size, seq_len, channels, height, width]
-            actions: [batch_size, seq_len, action_dim] (optional)
-        
-        Returns:
-            Dictionary containing all outputs, latents, and losses
-        """
+
         batch_size, seq_len = observations.shape[:2]
         
         # Default actions if not provided
@@ -1448,7 +1320,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             
             outputs['context_states'].append(c_t)
             
-            # === Inference Network q(z_t|o_≤t, z_<t) ===
+            #Inference Network q(z_t|o_≤t, z_<t) 
             z_t, z_mean_t, z_logvar_t, _ = self.encoder(o_t)
             skips = self.encoder.get_unet_skips(o_t, levels=("C2","C3","C4","C5","C6"))        # or encoder.get_unet_skips(x, levels=("C3","C4","C5"))
             #self.decoder.set_unet_skips(skips, mode="concat")
@@ -1553,7 +1425,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             )
             mixing_proportions=prior_params['pi'] 
             mixing_entropy = -torch.sum(mixing_proportions * torch.log(mixing_proportions + torch.finfo(mixing_proportions.dtype).eps), dim=-1).mean()
-            entropy_t += mixing_entropy  # Add mixing entropy to cluster entropy
+            entropy_t = entropy_t + mixing_entropy  # Add mixing entropy to cluster entropy
             # Total entropy encourages both:
             # 1. Uncertainty in cluster assignments (exploration)
             # 2. Diversity in cluster usage (avoid mode collapse)
@@ -1662,16 +1534,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             ).to(self.device),
         }
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        """
-        Forward pass through VAE with DP-GMM prior
-
-        Args:
-            x: Input data [batch_size, channels, height, width]
-
-        Returns:
-            reconstruction: Reconstructed input
-            params: Dictionary containing model parameters and latents
-        """
         # Encode
         z, z_mean, z_logvar, h = self.encoder(x)
         
@@ -1762,14 +1624,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         return losses, outputs
 
     def update_temperature(self, epoch: int, anneal_rate: float = 0.003):
-        """
-         Update temperature parameter with cosine annealing schedule
-    
-         Args:
-            epoch: Current epoch number
-            min_temp: Minimum temperature value
-            anneal_rate: Rate of temperature annealing
-        """
         self.temperature.data = torch.tensor(
             max(
                 self.min_temperature,
@@ -1781,13 +1635,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         Compute conditional entropy of cluster assignments with temperature scaling.
         H(C|Z) = -E[log P(C|Z)]
 
-        Args:
-            logits: Raw logits for cluster assignments [batch_size, n_clusters]
-            params: Dictionary containing model parameters and variables
-
-        Returns:
-            entropy: Mean conditional entropy
-            cluster_stats: Dictionary with clustering statistics
         """
         # Ensure temperature stays above minimum value
         eps = torch.finfo(params['pi'].dtype).eps
@@ -1842,7 +1689,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             s = Fs.flatten(2).transpose(1, 2).contiguous()
             t = Ft.flatten(2).transpose(1, 2).contiguous()
             # call the DINOv3 loss (it normalizes internally when apply_norm=True)
-            loss +=  self.gram_loss(s, t, img_level=True)
+            loss = loss + self.gram_loss(s, t, img_level=True)
         return loss
 
     def compute_gradient_penalty(self, discriminator, real_x, fake_x, z, device):
@@ -1928,11 +1775,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         }
     
     def compute_feature_matching_loss(self, real_features, fake_features):
-        """
-        Compute feature matching loss between real and fake features
-        
-        Uses both mean and standard deviation matching for better stability
-        """
         
         real_mean = real_features.mean(dim=2)  # [B, T, D]
         fake_mean = fake_features.mean(dim=2)
@@ -2051,7 +1893,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         Predict next internal states using self-model
         
-        This implements the predictive components:
         - p(A_{t+1}|h_t, z_t, A_t, a_t, c_t)
         
         Args:
@@ -2060,9 +1901,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             attention_t: Current attention state [batch_size, attention_dim]
             a_t: Current action [batch_size, action_dim]
             c_t: current context (for z prediction) [batch_size, context_dim]
-        
-        Returns:
-            Dictionary with predicted distributions for next timestep
         """
         # 1. Predict A_{t+1} ~ p(A_{t+1}|h_t, z_t, a_t, c_t, A_t)
         # The hidden state evolution depends on current hidden state, latent, and action
@@ -2091,9 +1929,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     def _extract_perceiver_attention(self, perceiver_output):
         """
         Extract cross-attention weights from perceiver blocks
-        
-        The Perceiver uses cross-attention between latent arrays and inputs.
-        We need to access the attention weights from the HiPCrossAttention modules.
         """
         attention_maps = []
         
@@ -2195,52 +2030,33 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                 lambda_att_dyn: float = 0.75,
                                 lambda_att: float = 0.95,
                                 entropy_weight: float = 0.5,
-                                lambda_gram: float = 0.25) -> Dict[str, torch.Tensor]:
-        """
-        One training step over a sequence with:
-        - MGDA multi-task backward for trunk 
-        - Adversarial generator backward (trunk only)
-        - Discriminator updates (inside discriminator_step)
-        Returns a dict of scalar logs/tensors.
-        """
+                                lambda_gram: float = 0.25,
+                                mgda_gn: str | None = None,  # {'none','l2','loss','loss+'}; defaults to self.mgda_gn
+                                ) -> Dict[str, torch.Tensor]:
         self.train()
         if getattr(self, "image_discriminator", None) is not None:
             self.image_discriminator.train()
 
-        # ---- 0) Prep / warmup ----
         observations = self.prepare_images_for_training(observations)
         warmup_factor = self.get_warmup_factor()
-        loss_batches = []
-        for _ in range(3):
-            # ---- 1) Forward & base losses (no steps yet) ----
-            vae_losses, outputs = self.compute_total_loss(
-                observations, actions, beta, entropy_weight,
-                lambda_recon, lambda_att_dyn, lambda_att, lambda_gram
-            )
-            # ---- 3) Adversarial generator losses ----
-            img_adv_loss, temporal_adv_loss, feat_match_loss = self.compute_adversarial_losses(
-                x=observations,
-                reconstruction=outputs['reconstructions'],
-                z_seq=outputs['latents'],
-            )
-            lambda_img_eff = (lambda_img * warmup_factor) if warmup_factor > 0.0 else 0.0
+        
+        vae_losses, outputs = self.compute_total_loss(
+            observations, actions, beta, entropy_weight,
+            lambda_recon, lambda_att_dyn, lambda_att, lambda_gram
+        )
+        lambda_img_eff = (lambda_img * warmup_factor) if warmup_factor > 0.0 else 0.0
 
-            # ---- 4) Compose task losses for MGDA (5 tasks) ----
-            elbo_loss = (
-                lambda_recon * vae_losses['recon_loss']
-                + beta * vae_losses['kl_z']
-                + beta * vae_losses['hierarchical_kl']
-                - entropy_weight * vae_losses['cluster_entropy']
-                + lambda_gram * vae_losses['gram_enc_loss']
-            )
-            predictive_loss = vae_losses['attention_loss']
-            orth_loss = vae_losses['attention_diversity'] + vae_losses['slot_ortho']
-            perceiver_loss = vae_losses['perceiver_loss']
-            adv_loss = lambda_img_eff * (img_adv_loss + temporal_adv_loss + feat_match_loss)
-            
-
-            loss_batches.append(torch.stack([elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]))
-        # ---- 2) Discriminator updates (their optimizer stepped inside) ----
+        # ---- 4) Compose task losses for MGDA (5 tasks) ----
+        elbo_loss = (
+            lambda_recon * vae_losses['recon_loss']
+            + beta * vae_losses['kl_z']
+            + beta * vae_losses['hierarchical_kl']
+            - entropy_weight * vae_losses['cluster_entropy']
+            + lambda_gram * vae_losses['gram_enc_loss']
+        )
+        predictive_loss = vae_losses['attention_loss']
+        orth_loss = vae_losses['attention_diversity'] + vae_losses['slot_ortho']
+        perceiver_loss = vae_losses['perceiver_loss']
         disc_losses_list = []
         for _ in range(n_critic):
             disc_loss = self.discriminator_step(
@@ -2256,46 +2072,42 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 k: sum(d[k] for d in disc_losses_list) / len(disc_losses_list)
                 for k in disc_losses_list[0].keys()
             }
-
-
-        self.gen_optimizer.zero_grad(set_to_none=True)
-        self.sdmgrad_wrapper.backward(
-            losses=torch.stack(loss_batches),  # [3, 5]
-            SDMGrad_lamda=self.sdmgrad_lamda,
-            SDMGrad_niter=self.sdmgrad_niter
+        img_adv_loss, temporal_adv_loss, feat_match_loss = self.compute_adversarial_losses(
+            x=observations,
+            reconstruction=outputs['reconstructions'],
+            z_seq=outputs['latents'],
         )
+
+        adv_loss = lambda_img_eff * (img_adv_loss + temporal_adv_loss + feat_match_loss)
         
-        # Standard optimization step
-        torch.nn.utils.clip_grad_norm_(list(self.sdmgrad_wrapper.model.shared_parameters()), max_norm=self._grad_clip)
-        self.gen_optimizer.step()
+
+        task_losses = [elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]
         
-        # ---- Amortized update of task weights ----
+        self.gen_optimizer.zero_grad(set_to_none=True)
+        sol = self.mgda.backward(task_losses, mgda_gn=(self.mgda_gn if mgda_gn is None else mgda_gn))
+        # 'sol' is the optimal simplex weight vector returned by MGDA (numpy array)
+        torch.nn.utils.clip_grad_norm_(list(self._mgda_shared_params), max_norm=self._grad_clip)
+        self.gen_optimizer.step()        
         
         task_names = ['elbo', 'perceiver', 'predictive', 'orthogonal', 'adversarial']
-        
-        # Add to return dictionary
-        weight_dict = {f'weight_{name}': weight.item()
-                       for name, weight in zip(task_names, self.sdmgrad_wrapper.w.detach().cpu())}
+        weight_dict = {f'weight_{name}': float(sol[i]) for i, name in enumerate(task_names)}
 
-        # (Optional) log natural-grad norm assigned by MGDA (note: grads may be None if impl changes)
         grad_norm_sq = 0.0
         for group in self.gen_optimizer.param_groups:
             for p in group['params']:
                 if p.grad is not None:
                     g = p.grad.data
-                    grad_norm_sq += float((g.norm(2)).item() ** 2)
+                    grad_norm_sq = grad_norm_sq + float((g.norm(2)).item() ** 2)
         grad_norm = (grad_norm_sq ** 0.5) if grad_norm_sq > 0 else 0.0
 
-        # ---- 7) EMA, schedulers, temp ----
         with torch.no_grad():
             if hasattr(self, "ema_encoder"): self.ema_encoder.update()
             if hasattr(self, "ema_decoder"): self.ema_decoder.update()
         self.update_temperature(self.current_epoch)
         if self.current_step >= self.warmup_steps:
             self.gen_scheduler.step()
-        self.current_step += 1
+        self.current_step = self.current_step + 1
 
-        # ---- 8) Diagnostics / extras ----
         avg_max_prob = torch.stack(
             [p["logit_probs"].softmax(1).max(1)[0].mean() for p in outputs["mdl_params"]]
         ).mean()
@@ -2312,8 +2124,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         eff_comp = outputs['prior_params'][0]['pi'].max(1)[0].mean().item()
         top6_cov = outputs['prior_params'][0]['pi'].topk(6, dim=-1)[0].sum(dim=-1).mean().item()
 
-
-        # ---- 9) Return the same kinds of metrics you already log ----
         return {
             # VAE & auxiliaries
             **vae_losses,
@@ -2349,11 +2159,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         Generate samples from the model
 
-        Args:
-            num_samples: Number of samples to generate
-
-        Returns:
-            Generated samples
         """
         self.ema_encoder.apply_shadow()
         self.ema_decoder.apply_shadow()
@@ -2375,19 +2180,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         Get detailed clustering statistics for a batch of data.
 
-        Args:
-           x (torch.Tensor): Input batch with shape [batch_size, channels, height, width]
-
-        Returns:
-           Dict[str, Union[float, torch.Tensor]]: Dictionary containing clustering statistics:
-               - temperature (float): Current temperature parameter
-               - mean_prob_per_cluster (torch.Tensor): Average probability for each cluster
-               - max_prob_per_sample (float): Average maximum probability across samples
-               - entropy_std (float): Standard deviation of entropy values
-               - active_clusters (int): Number of active clusters
-               - reconstruction_error (float): MSE between input and reconstruction
-               - cluster_assignments (torch.Tensor): Cluster assignments for each sample
-               - cluster_proportions (torch.Tensor): Average mixing proportions
         """
         with torch.no_grad():
             # Forward pass
@@ -2429,17 +2221,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         Sample z_{t+1} from the DPGMM prior given current hidden state and context
         
-        This follows the generative process:
-        p(z_{t+1}|h_t, c_t, π_t) = Σ_k π_{t,k} N(z; μ_k(h_t, c_t), Σ_k(h_t, c_t))
-        
-        Args:
-            h_t: Current hidden state [batch_size, hidden_dim]
-            c_t: Current context [batch_size, context_dim]
-            temperature: Sampling temperature for stochasticity control
-        
-        Returns:
-            z_next: Sampled next latent state [batch_size, latent_dim]
-            prior_info: Dictionary with prior parameters and selected components
         """
         batch_size = h_t.shape[0]
         
@@ -2503,21 +2284,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         Generate a complete future sequence of observations
         
-        This method generates future observations by:
-        1. Encoding initial observation to get starting state
-        2. Using VRNN dynamics to evolve hidden states
-        3. Sampling from DPGMM prior for latent states
-        4. Decoding latent states to generate observations
-        
-        Args:
-            initial_obs: Starting observation [batch_size, C, H, W]
-            initial_action: Initial action [batch_size, action_dim]
-            horizon: Number of future steps to generate
-            context_window: Previous observations for context [batch_size, window_size, C, H, W]
-            temperature: Sampling temperature
-        
-        Returns:
-            Dictionary with generated sequence and intermediate states
         """
         batch_size = initial_obs.shape[0]
         device = initial_obs.device
@@ -2659,16 +2425,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     def visualize_attention_comparison(self, observations, predicted_attention, 
                                     true_attention=None, alpha=0.5):
         """
-        Enhanced attention visualization with comparison capability
-        
+        Attention visualization with comparison capability
+
         Args:
             observations: Original images [B, C, H, W]
             predicted_attention: Model predictions [B, H_att, W_att]
             true_attention: Ground truth if available [B, H_att, W_att]
             alpha: Blending factor for overlay
-        
-        Returns:
-            Dictionary with visualization tensors
         """
         batch_size = observations.shape[0]
         

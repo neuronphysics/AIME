@@ -765,7 +765,7 @@ class ConstNumGrouper(nn.Module):
         for (name, value), num_modality_groups in zip(inputs.items(), num_groups_per_modality):
             index_dim = value.shape[1]
             assigned_groups = list(range(next_group_id, next_group_id + num_modality_groups))
-            next_group_id += num_modality_groups
+            next_group_id = next_group_id + num_modality_groups
 
             final_padding = padding_to_make_divisible(index_dim, num_modality_groups)
             local_index_dim_per_group = (index_dim + final_padding) // num_modality_groups
@@ -781,18 +781,6 @@ class ConstNumGrouper(nn.Module):
         self._group_map = group_map
 
     def group(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Groups a given input with the appropriate padding.
-
-        This method can be called multiple times on inputs that require similar
-        grouping and padding (e.g., a sample and its attention mask).
-
-        Args:
-        inputs: A dict of modality names and (batch, index, channel) values.
-
-        Returns:
-        A tensor of shape (batch, group, index, channel).
-        """
         assert_input_shapes(inputs, expected_rank=3, constant_channels=True)
         self._build_group_map(inputs)
 
@@ -833,18 +821,6 @@ class ConstNumGrouper(nn.Module):
 
 
 class ConcatenateGrouper(nn.Module):
-    """
-    Concatenates inputs into a single group, shared across all modalities.
-
-    Inputs should be a dictionary of {modality_name:
-    (batch_size, index_dim, num_channels)}. The output format will be (batch_size,
-    num_groups, total_index_dim, num_channels), where
-    total_index_dim = sum_{modality_i} index_dim_i.
-
-    Notes: Inputs will be ordered based on the insertion order of the dict. Make
-    sure this is consistent across calls. batch_size and num_channels must be
-    constant across modalities
-    """
 
     def __init__(self):
         super().__init__()
@@ -938,18 +914,6 @@ class ReconstructionHead(nn.Module):
 def assert_input_shapes(inputs: Mapping[str, torch.Tensor],
                         expected_rank: int,
                         constant_channels: bool = False):
-    """
-    Given an inputs dictionary, asserts all shapes are correct.
-
-    Args:
-        inputs: A dictionary of tensors with modality names as keys.
-        expected_rank: Expected number of dimensions in each tensor.
-        constant_channels: If True, asserts that the number of channels is the same for all inputs.
-
-    Returns:
-        batch_size: The common batch size across all inputs.
-        num_channels: The common number of channels, if constant_channels is True; otherwise, None.
-    """
     batch_size = None
     num_channels = None
 

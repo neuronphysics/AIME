@@ -1567,7 +1567,7 @@ def main():
         'prior_beta': 2.0,
         
         # Training settings
-        'batch_size': 6,
+        'batch_size': 3,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
