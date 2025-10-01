@@ -1541,6 +1541,9 @@ class DMCVBTrainer:
 
 def main():
     """Main training script"""
+    torch.autograd.set_detect_anomaly(True) #check issues with gradients
+    
+
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')  # Enable TensorFloat32 cores
     torch.cuda.empty_cache()  
@@ -1567,7 +1570,7 @@ def main():
         'prior_beta': 2.0,
         
         # Training settings
-        'batch_size': 3,
+        'batch_size': 2,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
@@ -1585,11 +1588,11 @@ def main():
         # Loss weights
         'beta': 1.0,
         'entropy_weight': 0.6,
-        'lambda_img': 0.5,
+        'lambda_img': 0.2,
         'lambda_recon': 1.0,
         'lambda_att_dyn': 0.95,
         'lambda_att': 0.95,
-        'grad_clip': 1.0,
+        'grad_clip': 5,
         'n_critic': 1,
         
         # Logging

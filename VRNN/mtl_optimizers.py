@@ -1757,12 +1757,13 @@ class MGDA(AbsWeighting):
         return sol_vec
     
     def _gradient_normalizers(self, grads, loss_data, ntype):
+        eps= torch.finfo(torch.float32).eps
         if ntype == 'l2':
-            gn = grads.pow(2).sum(-1).sqrt()
+            gn = grads.pow(2).sum(-1).sqrt()+eps
         elif ntype == 'loss':
-            gn = loss_data
+            gn = loss_data+eps
         elif ntype == 'loss+':
-            gn = loss_data * grads.pow(2).sum(-1).sqrt()
+            gn = (loss_data+eps) * (grads.pow(2).sum(-1).sqrt()+eps)
         elif ntype == 'none':
             gn = torch.ones_like(loss_data).to(self.device)
         else:

@@ -61,12 +61,12 @@ class GammaPosterior(nn.Module):
         # Network for generating Gamma parameters from hidden states
         # Give unique names to each layer
         self.param_net = nn.Sequential(OrderedDict([
-            ('gamma_fc', nn.Linear(hidden_dim, hidden_dim)),
+            ('gamma_fc', nn.utils.spectral_norm(nn.Linear(hidden_dim, hidden_dim))),
             ('gamma_ln', nn.LayerNorm(hidden_dim)),
             ('gamma_relu', nn.GELU()),
-            ('gamma_out', nn.Linear(hidden_dim, 2)),
-            ('gamma_ln_out', nn.LayerNorm(2)),
-            ('gamma_softplus', nn.Softplus(beta=0.5)), 
+            ('gamma_out', nn.utils.spectral_norm(nn.Linear(hidden_dim, 2))),
+            ('gamma_ln_out', nn.LayerNorm(2, eps=1e-6)),
+            ('gamma_softplus', nn.Softplus(beta=0.5)),
             ('gamma_eps', AddEpsilon(eps))  # Ensure positive parameters
         ]))
         self.eps = eps
@@ -77,9 +77,14 @@ class GammaPosterior(nn.Module):
         """
         Generate Gamma parameters from hidden representation
         """
-        
+        if torch.isnan(h).any() or torch.isinf(h).any():
+            print(f"Warning: NaN/Inf in GammaPosterior input, replacing with safe values")
+            mean_h = torch.nanmean(h)
+            h = torch.where(torch.isnan(h)| torch.isinf(h), mean_h, h)
+
         params = self.param_net(h)
         concentration, rate = params.split(1, dim=-1)
+
         concentration = torch.clamp(concentration.squeeze(-1), min=self.eps)
         rate = torch.clamp(rate.squeeze(-1), min=self.eps)
         return concentration, rate
@@ -99,6 +104,7 @@ class GammaPosterior(nn.Module):
 
         KL(Gamma(α₁,β₁)||Gamma(α₂,β₂)) = α₂log(β₁/β₂) - logΓ(α₁) + logΓ(α₂) + (α₁-α₂)ψ(α₁) - (β₁-β₂)(α₁/β₁)
         """
+        
         alpha, beta = self.forward(h)  # posterior parameters
         a, b = prior_concentration, prior_rate  # prior parameters
 
@@ -123,24 +129,24 @@ class KumaraswamyNetwork(nn.Module):
         self.eps = torch.tensor(torch.finfo(torch.float32).eps, device=self.device)
         kumar_a_fc = nn.Linear(hidden_dim, hidden_dim)
         nn.init.xavier_uniform_(kumar_a_fc.weight, gain=0.5)
-        nn.init.constant_(kumar_a_fc.bias, 0.5)
+        nn.init.constant_(kumar_a_fc.bias, 0.0)
         
         kumar_a_out = nn.Linear(hidden_dim, self.K - 1)
         nn.init.normal_(kumar_a_out.weight, 0, 0.01)
-        nn.init.constant_(kumar_a_out.bias, 0.5)
+        nn.init.constant_(kumar_a_out.bias, 0.0)
 
         kumar_b_fc = nn.Linear(hidden_dim, hidden_dim)
         nn.init.xavier_uniform_(kumar_b_fc.weight, gain=0.5)
-        nn.init.constant_(kumar_b_fc.bias, 0.5)
+        nn.init.constant_(kumar_b_fc.bias, 0.0)
 
         kumar_b_out = nn.Linear(hidden_dim, self.K - 1)
         nn.init.normal_(kumar_b_out.weight, 0, 0.01)
-        nn.init.constant_(kumar_b_out.bias, 0.5)
-      
+        nn.init.constant_(kumar_b_out.bias, 0.0)
+
         # Then apply spectral norm and build sequential
         self.net_a = nn.Sequential(OrderedDict([
             ('kumar_a_fc', nn.utils.spectral_norm(kumar_a_fc)),
-            ('kumar_a_ln', nn.LayerNorm(hidden_dim)),
+            ('kumar_a_ln', nn.LayerNorm(hidden_dim, eps=1e-6)),
             ('kumar_a_relu', nn.GELU()),
             ('kumar_a_out', nn.utils.spectral_norm(kumar_a_out)),
             ('kumar_a_ln_out', nn.LayerNorm(self.K - 1)),
@@ -149,7 +155,7 @@ class KumaraswamyNetwork(nn.Module):
 
         self.net_b = nn.Sequential(OrderedDict([
             ('kumar_b_fc', nn.utils.spectral_norm(kumar_b_fc)),
-            ('kumar_b_ln', nn.LayerNorm(hidden_dim)),
+            ('kumar_b_ln', nn.LayerNorm(hidden_dim, eps=1e-6)),
             ('kumar_b_relu', nn.GELU()),
             ('kumar_b_out', nn.utils.spectral_norm(kumar_b_out)),
             ('kumar_b_ln_out', nn.LayerNorm(self.K - 1)),
@@ -162,17 +168,23 @@ class KumaraswamyNetwork(nn.Module):
         Generate Kumaraswamy parameters from hidden representation
 
         """
-        # Add small epsilon to ensure strictly positive parameters
+        if torch.isnan(h).any() or torch.isinf(h).any():
+            print(f"Warning: NaN/Inf in KumaraswamyNetwork input, replacing with safe values")
+            mean_h = torch.nanmean(h)
+            h = torch.where(torch.isnan(h)| torch.isinf(h), mean_h, h)
         min_val = -5.0
         max_val = 5.0
         log_a = torch.clamp(self.net_a(h) , min=min_val, max=max_val)
         log_b = torch.clamp(self.net_b(h) , min=min_val, max=max_val)
+        log_a = torch.nan_to_num(log_a, nan=0.0, posinf=5.0, neginf=-5.0)
+        log_b = torch.nan_to_num(log_b, nan=0.0, posinf=5.0, neginf=-5.0)
         if torch.isnan(log_a).any() or torch.isnan(log_b).any():
             print(f"Warning: NaN in Kumaraswamy parameters: h_range= ({h.min()}, {h.max()})a_range=({log_a.min()}, {log_a.max()}), b_range=({log_b.min()}, {log_b.max()})")
             mean_a = torch.nanmean(log_a)  # Compute mean with ignoring NaNs
             log_a = torch.where(torch.isnan(log_a)| torch.isinf(log_a), mean_a, log_a)
             mean_b = torch.nanmean(log_b)  
             log_b = torch.where(torch.isnan(log_b)| torch.isinf(log_b), mean_b, log_b)
+
 
         return log_a, log_b
 
@@ -1001,7 +1013,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Initialize hidden states
         self.h0 = nn.Parameter(torch.zeros(self.number_lstm_layer, 1, self.hidden_dim))
         self.c0 = nn.Parameter(torch.zeros(self.number_lstm_layer, 1, self.hidden_dim))
-
+        
     def _init_attention_schema(self, attention_resolution: int = 21):
         """Initialize attention schema components"""
         # Compute attention state from h, c, z
