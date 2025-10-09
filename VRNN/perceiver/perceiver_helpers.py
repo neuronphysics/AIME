@@ -431,3 +431,15 @@ class Attention(nn.Module):
         # 4) Final projection
         final_output = self.attention_output_linear(result)
         return final_output, attn_probs
+
+def sinusoidal_time_embedding(T: int, C: int, device):
+    # C even is best; if odd, we’ll pad one dim
+    half = C // 2
+    t = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(1)     # [T,1]
+    freqs = torch.exp(torch.arange(half, device=device, dtype=torch.float32)
+                      * (-math.log(10000.0) / max(1, half)))
+    angles = t * freqs.unsqueeze(0)                                          # [T, half]
+    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)          # [T, 2*half]
+    if emb.shape[1] < C:
+        emb = torch.cat([emb, torch.zeros(T, C - emb.shape[1], device=device)], dim=-1)
+    return emb

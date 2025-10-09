@@ -2194,7 +2194,7 @@ class EMA:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 assert name in self.shadow
-                new_average = (1.0 - decay) * param.data + decay * self.shadow[name]
+                new_average = (1.0 - decay) * param.data + decay * self.shadow[name].to(param.data.device, dtype=param.data.dtype)
                 self.shadow[name] = new_average.clone()
     
     def apply_shadow(self):
@@ -2202,7 +2202,9 @@ class EMA:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.backup[name] = param.data
-                param.data = self.shadow[name]
+                #param.data = self.shadow[name]
+                param.data.copy_(self.shadow[name].to(param.data.device, dtype=param.data.dtype))
+
     
     def restore(self):
         """Restore original parameters after evaluation"""

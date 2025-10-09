@@ -506,112 +506,6 @@ def un_flatten_grad(grads: torch.Tensor, shapes: List[int]) -> List[torch.Tensor
     return un_flatten_grads
 
 
-class PCGrad(BaseOptimizer):
-    r"""Gradient Surgery for Multi-Task Learning.
-
-    :param optimizer: Optimizer: optimizer instance.
-    :param reduction: str. reduction method.
-    """
-
-    def __init__(self, optimizer: Optimizer, reduction: str = 'mean'):
-        self.validate_options(reduction, 'reduction', ['mean', 'sum'])
-
-        self.optimizer = optimizer
-        self.reduction = reduction
-
-    @torch.no_grad()
-    def init_group(self):
-        self.zero_grad()
-
-    def zero_grad(self):
-        return self.optimizer.zero_grad(set_to_none=True)
-
-    def step(self):
-        return self.optimizer.step()
-
-    def set_grad(self, grads: List[torch.Tensor]) -> None:
-        idx: int = 0
-        for group in self.optimizer.param_groups:
-            for p in group['params']:
-                p.grad = grads[idx]
-                idx += 1
-
-    def retrieve_grad(self) -> Tuple[List[torch.Tensor], List[int], List[torch.Tensor]]:
-        r"""Get the gradient of the parameters of the network with specific objective."""
-        grad, shape, has_grad = [], [], []
-        for group in self.optimizer.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    shape.append(p.shape)
-                    grad.append(torch.zeros_like(p, device=p.device))
-                    has_grad.append(torch.zeros_like(p, device=p.device))
-                    continue
-
-                shape.append(p.grad.shape)
-                grad.append(p.grad.clone())
-                has_grad.append(torch.ones_like(p, device=p.device))
-
-        return grad, shape, has_grad
-
-    def pack_grad(self, objectives: Iterable) -> Tuple[List[torch.Tensor], List[List[int]], List[torch.Tensor]]:
-        r"""Pack the gradient of the parameters of the network for each objective.
-
-        :param objectives: Iterable[nn.Module]. a list of objectives.
-        :return: torch.Tensor. packed gradients.
-        """
-        grads, shapes, has_grads = [], [], []
-        for objective in objectives:
-            self.optimizer.zero_grad(set_to_none=True)
-            objective.backward(retain_graph=True)
-
-            grad, shape, has_grad = self.retrieve_grad()
-
-            grads.append(flatten_grad(grad))
-            has_grads.append(flatten_grad(has_grad))
-            shapes.append(shape)
-
-        return grads, shapes, has_grads
-
-    def project_conflicting(self, grads: List[torch.Tensor], has_grads: List[torch.Tensor]) -> torch.Tensor:
-        r"""Project conflicting.
-
-        :param grads: a list of the gradient of the parameters.
-        :param has_grads: a list of mask represent whether the parameter has gradient.
-        :return: torch.Tensor. merged gradients.
-        """
-        shared: torch.Tensor = torch.stack(has_grads).prod(0).bool()
-
-        pc_grad: List[torch.Tensor] = deepcopy(grads)
-        for i, g_i in enumerate(pc_grad):
-            random.shuffle(grads)
-            for g_j in grads:
-                g_i_g_j: torch.Tensor = torch.dot(g_i, g_j)
-                if g_i_g_j < 0:
-                    pc_grad[i] -= g_i_g_j * g_j / (g_j.norm() ** 2)
-
-        merged_grad: torch.Tensor = torch.zeros_like(grads[0])
-
-        shared_pc_gradients: torch.Tensor = torch.stack([g[shared] for g in pc_grad])
-        if self.reduction == 'mean':
-            merged_grad[shared] = shared_pc_gradients.mean(dim=0)
-        else:
-            merged_grad[shared] = shared_pc_gradients.sum(dim=0)
-
-        merged_grad[~shared] = torch.stack([g[~shared] for g in pc_grad]).sum(dim=0)
-
-        return merged_grad
-
-    def pc_backward(self, objectives: Iterable[nn.Module]) -> None:
-        r"""Calculate the gradient of the parameters.
-
-        :param objectives: Iterable[nn.Module]. a list of objectives.
-        """
-        grads, shapes, has_grads = self.pack_grad(objectives)
-
-        pc_grad = self.project_conflicting(grads, has_grads)
-        pc_grad = un_flatten_grad(pc_grad, shapes[0])
-
-        self.set_grad(pc_grad)
 
 
 # ----------------------------- Core math: Aligned-MTL ----------------------------- #
@@ -1655,6 +1549,7 @@ class AbsWeighting(nn.Module):
         """
         pass
 
+
 class MGDA(AbsWeighting):
     r"""Multiple Gradient Descent Algorithm (MGDA).
     
@@ -1684,7 +1579,8 @@ class MGDA(AbsWeighting):
             return gamma, cost
 
         def _min_norm_2d(grad_mat):
-            dmin = 1e8
+            dmin = torch.tensor(1e8, dtype=grad_mat.dtype, device=grad_mat.device)  
+            sol = None
             for i in range(grad_mat.size()[0]):
                 for j in range(i+1, grad_mat.size()[0]):
                     c,d = _min_norm_element_from2(grad_mat[i,i], grad_mat[i,j], grad_mat[j,j])
@@ -1696,7 +1592,7 @@ class MGDA(AbsWeighting):
         def _projection2simplex(y):
             m = len(y)
             sorted_y = torch.sort(y, descending=True)[0]
-            tmpsum = 0.0
+            tmpsum = y.new_zeros(()).to(y.device)
             tmax_f = (torch.sum(y) - 1.0)/m
             for i in range(m-1):
                 tmpsum+= sorted_y[i]
@@ -1704,7 +1600,7 @@ class MGDA(AbsWeighting):
                 if tmax > sorted_y[i+1]:
                     tmax_f = tmax
                     break
-            return torch.max(y - tmax_f, torch.zeros(m).to(y.device))
+            return torch.max(y - tmax_f, torch.zeros(m).to(y.device).to(y.dtype))
 
         def _next_point(cur_val, grad, n):
             proj_grad = grad - ( torch.sum(grad) / n )
@@ -1724,12 +1620,11 @@ class MGDA(AbsWeighting):
 
         MAX_ITER = 50
         STOP_CRIT = 1e-5
-    
-        grad_mat = grads.mm(grads.t())
+        grad_mat = grads.mm(grads.t())  # keep original Gram path
         init_sol = _min_norm_2d(grad_mat)
         
         n = grads.size()[0]
-        sol_vec = torch.zeros(n).to(grads.device)
+        sol_vec = torch.zeros(n).to(grads.device).to(grad_mat.dtype)
         sol_vec[init_sol[0][0]] = init_sol[1]
         sol_vec[init_sol[0][1]] = 1 - init_sol[1]
 
@@ -1774,18 +1669,298 @@ class MGDA(AbsWeighting):
     def backward(self, losses, **kwargs):
         mgda_gn = kwargs['mgda_gn']
         mode = kwargs.get('mode', 'backward')
+        use_bf16 = kwargs.get('use_bf16', False)
         grads = self._get_grads(losses, mode=mode)
         if self.rep_grad:
             per_grads, grads = grads[0], grads[1]
-        loss_data = torch.tensor([loss.item() for loss in losses]).to(self.device)
-        grads = self._gradient_normalizers(grads, loss_data, ntype=mgda_gn) # l2, loss, loss+, none
-        grads = grads.contiguous()
+
+        if use_bf16:
+            grads = grads.to(torch.bfloat16)
+            loss_data = torch.tensor([loss.item() for loss in losses], device=self.device, dtype=torch.float32)
+            grads = self._gradient_normalizers(grads, loss_data, ntype=mgda_gn) # l2, loss, loss+, none
+            grads = grads.contiguous()
+        else:
+            loss_data = torch.tensor([loss.item() for loss in losses], device=self.device, dtype=torch.float32)
+            grads = self._gradient_normalizers(grads, loss_data, ntype=mgda_gn)
+            grads = grads.contiguous().to(torch.float32)
         sol = self._find_min_norm_element(grads)
+        sol = sol.to(grads.device).to(dtype=grads.dtype)
         if self.rep_grad:
             self._backward_new_grads(sol, per_grads=per_grads)
         else:
             self._backward_new_grads(sol, grads=grads)
+        del grads, loss_data
         return sol.detach().cpu().numpy()
+    
+
+
+class MTLOptim:
+    """
+    Implements basic operations for customized MTL Optimizers.
+    Note that while the optimizer's parameters can be a list of tensors, internally everything is flattened into a
+    single vector (see _pack_grad and _flatten_grad).
+    """
+    def __init__(self, optimizer, scheduler=None):
+        self._optim = optimizer
+        self._sched = scheduler
+        return
+
+    @property
+    def optimizer(self):
+        return self._optim
+
+    def do_store_norm_sum_grads(self):
+        self.store_norm_sum_grads = True
+
+    def compute_norm_sum_grads(self, objectives):
+        # NOTE: involves an additional backward pass per task, but it's just for logging (done less frequently)
+        # return l2 norm of sum of original grads on the shared parameters (requires additional backward)
+        if objectives[0].dim() > 0 and objectives[0].shape[0] > 1:
+            objectives = [obj.mean(dim=0) for obj in objectives]
+        grad, _, shared = self._pack_grad(objectives, retain_graph=True)
+        norm_sum_grads = torch.sqrt(sum([g_i[shared] for g_i in grad]).pow(2).sum())
+        self.zero_grad()
+        return norm_sum_grads, shared
+
+    def zero_grad(self):
+        '''
+        clear the gradient of the parameters
+        '''
+        return self._optim.zero_grad(set_to_none=True)
+
+    def step(self):
+        '''
+        update the parameters with the gradient
+        '''
+        self._optim.step()
+        if self._sched is not None:
+            self._sched.step()
+
+    def iterate(self, objectives, **kwargs):
+        '''
+        compute the new customized update direction, apply it, zero the gradients
+        '''
+        self.set_auxiliaries(**kwargs)
+        self.custom_backwards(objectives)
+        self.step()
+        self.zero_grad()
+
+    def set_auxiliaries(self, **kwargs):
+        # Pass any auxiliary parameter.
+        pass
+
+    def custom_backwards(self, objectives):
+        '''
+        Calculate the gradient of the parameters with a MTL algorithm that computes a custom update direction.
+        The direction is stored as gradient within the variables over which to optimize.
+
+        input:
+        - objectives: a list of objectives
+        '''
+
+        # If the loss hasn't been averaged for the mini-batch, do it now.
+        if objectives[0].dim() > 0 and objectives[0].shape[0] > 1:
+            objectives = [obj.mean(dim=0) for obj in objectives]
+
+        custom_grad, shapes, shared = self._pack_grad(objectives)
+        custom_grad = self._get_update_direction(custom_grad, shared, objectives)
+        custom_grad = self._unflatten_grad(custom_grad, shapes[0])
+        self._set_grad(custom_grad)
+        return
+
+    def _get_update_direction(self, grads, shared, objectives, shapes=None):
+        # algorithm-dependent method to compute the update direction for MTL
+        raise NotImplementedError("children classes of MTLOptimizer need to implement _get_update_direction")
+
+    def _set_grad(self, grads):
+        '''
+        set the modified gradients to the network
+        '''
+        idx = 0
+        for group in self._optim.param_groups:
+            for p in group['params']:
+                # if p.grad is None: continue
+                p.grad = grads[idx]
+                idx += 1
+        return
+
+    def _pack_grad(self, objectives, retain_graph=False):
+        '''
+        pack the gradient of the parameters of the network for each objective
+
+        output:
+        - grad: a list of the gradient of the parameters
+        - shape: a list of the shape of the parameters
+        - has_grad: a list of mask represent whether the parameter has gradient
+        '''
+        grads, shapes = [], []
+        shared = None
+        m = len(objectives)
+        for idx, obj in enumerate(objectives):
+            self._optim.zero_grad(set_to_none=True)
+            obj.backward(retain_graph=(idx < (m-1)) or retain_graph)
+            grad, shape, has_grad = self._retrieve_grad()
+            grads.append(self._flatten_grad(grad, shape))
+            # Infer which parameters are shared and which aren't
+            if shared is None:
+                shared = self._flatten_grad(has_grad, shape)
+            else:
+                shared = shared * self._flatten_grad(has_grad, shape)
+            shapes.append(shape)
+        self._optim.zero_grad(set_to_none=True)
+        return grads, shapes, shared.bool()
+
+    def _unflatten_grad(self, grads, shapes):
+        unflatten_grad, idx = [], 0
+        for shape in shapes:
+            length = int(np.prod(shape))
+            unflatten_grad.append(grads[idx:idx + length].view(shape).clone())
+            idx += length
+        return unflatten_grad
+
+    def _flatten_grad(self, grads, shapes):
+        flatten_grad = torch.cat([g.flatten() for g in grads])
+        return flatten_grad
+
+    def _retrieve_grad(self):
+        '''
+        get the gradient of the parameters of the network with specific
+        objective
+
+        output:
+        - grad: a list of the gradient of the parameters
+        - shape: a list of the shape of the parameters
+        - has_grad: a list of mask represent whether the parameter has gradient
+        '''
+
+        grad, shape, has_grad = [], [], []
+        for group in self._optim.param_groups:
+            for p in group['params']:
+                # if p.grad is None: continue
+                # tackle the multi-head scenario
+                if p.grad is None:
+                    shape.append(p.shape)
+                    grad.append(torch.zeros_like(p).to(p.device))
+                    has_grad.append(torch.zeros_like(p).to(p.device))
+                    continue
+                shape.append(p.grad.shape)
+                grad.append(p.grad.clone())
+                has_grad.append(torch.ones_like(p).to(p.device))
+        return grad, shape, has_grad
+
+
+def standard_head_backward(objectives, specialized_params):
+    # Perform standard backward pass (of unit scalarization) over the specialized parameters.
+    # Overwrites any existing grad on these parameters.
+    spec_grad = torch.autograd.grad(sum(objectives), specialized_params, only_inputs=True)
+    for idx, sparam in enumerate(specialized_params):
+        sparam.grad = spec_grad[idx]
+
+
+def batch_average(objectives):
+    # If the loss hasn't been averaged for the mini-batch, do it now.
+    if objectives[0].dim() > 0 and objectives[0].shape[0] > 1:
+        objectives = [obj.mean(dim=0) for obj in objectives]
+    return objectives
+
+class IMTL(MTLOptim):
+    # IMTL: https://openreview.net/forum?id=IMPnRXEWpvr
+    def __init__(self, optimizer, specialized_parameters=None, scheduler=None, ub=True, learn_scaling=True, numerical_eps=1e-6):
+        # UB=True means that the IMTL-G part of the algorithm is applied on the gradient of the shared representation
+        # (analogously to MGDA-UB)
+        # learn_scaling=False disables IMTL-L
+        super().__init__(optimizer, scheduler=scheduler)
+        self.ub = ub
+        self.shared_repr = None
+        self.st = None
+        self.learn_scaling = learn_scaling
+        self.st_optimizer = None
+        self.specialized_params = specialized_parameters
+        self.numerical_eps = numerical_eps
+        self._alpha_to_log = None
+
+    def _get_update_direction(self, grads, shared, objectives, shapes=None, return_alpha=False):
+        if not return_alpha:
+            merged_grad = torch.zeros_like(grads[0]).to(grads[0].device)
+            for idx in range(len(grads)):
+                # Use plain gradients for task-specific parameters
+                merged_grad[~shared] += grads[idx][~shared].clone()
+            shared_grads = [g_i[shared] for g_i in grads]
+        else:
+            shared_grads = grads
+
+        # Build matrices of gradient differences.
+        D = (shared_grads[0] - shared_grads[1]).unsqueeze(-1)
+        u_0 = shared_grads[0]/shared_grads[0].norm()
+        U = (u_0 - shared_grads[1]/shared_grads[1].norm()).unsqueeze(-1)
+        for g_i in shared_grads[2:]:
+            D = torch.cat([D, (shared_grads[0] - g_i).unsqueeze(-1)], -1)
+            U = torch.cat([U, (u_0 - g_i/g_i.norm()).unsqueeze(-1)], -1)
+
+        # Compute minimal-norm affine combination coefficients.
+        A = D.transpose(-2, -1) @ U
+        A += self.numerical_eps * torch.eye(A.shape[-1], device=A.device)   # avoid singularity
+        alpha = torch.inverse(A) @ torch.mv(U.transpose(-2, -1), shared_grads[0])
+        alpha = torch.cat([1 - alpha.sum().unsqueeze(-1), alpha], 0)
+        self._alpha_to_log = alpha
+        if torch.isnan(alpha).any():
+            # Some gradient was 0: the solution of the minimal-norm affine combination is 0.
+            alpha = torch.zeros_like(alpha)
+        if return_alpha:
+            return alpha
+
+        for idx in range(len(grads)):
+            # Compute the affine combination for shared parameters
+            merged_grad[shared] += shared_grads[idx].mul_(alpha[idx])
+        return merged_grad
+
+    def custom_backwards(self, objectives):
+        objectives = batch_average(objectives)
+
+        if self.learn_scaling:
+            # IMTL-L part.
+            # using the initial step size of the optimizer as step size for vanilla SGD: detail not specified in paper
+            if self.st == None:
+                self.st = torch.zeros((len(objectives),) + tuple(objectives[0].shape), requires_grad=True,
+                                      device=objectives[0].device)
+                self.st_optimizer = torch.optim.Adam([self.st], lr=self._optim.defaults['lr'])
+            scaled_losses = [torch.exp(self.st[idx]) * objectives[idx] - self.st[idx] for idx in range(len(objectives))]
+        else:
+            scaled_losses = objectives
+
+        if not self.ub:
+            # Apply IMTL-G on the gradient of the shared parameters (tasks-specific parameters, including self.st,
+            # are updated using the scaled objective sum)
+            MTLOptim.custom_backwards(self, scaled_losses)
+        else:
+            # Apply IMTL-G on the gradient of the shared representation
+            # (tasks-specific parameters, including self.st, are updated using the scaled objective sum)
+            # Use approximation given by the gradient of the loss w.r.t. shared parameters to find convex combination
+            # coefficients, then backward on the scaled sum
+            z_grads = []
+            for obj in scaled_losses:
+                # the z_grads are different for each batch entry: this dimension is linearized as suggested
+                # by the MGDA authors (detail not specified in the IMTL paper)
+                z_grads.append(
+                    torch.autograd.grad(obj, self.shared_repr, only_inputs=True, retain_graph=True)[0].view(-1))
+            self.shared_repr = None
+            alpha = self._get_update_direction(z_grads, None, scaled_losses, return_alpha=True)
+            del z_grads
+            objective = sum([obj * alpha[idx] for idx, obj in enumerate(scaled_losses)])
+            objective.backward(retain_graph=True)
+
+            # standard_head_backward is called on the specialized parameters as well as on self.st (if learning it)
+            standard_sgd_params = self.specialized_params + [self.st] if self.learn_scaling else self.specialized_params
+            standard_head_backward(scaled_losses, specialized_params=standard_sgd_params)
+
+        if self.learn_scaling:
+            self.st_optimizer.step()  # the grad is accumulated above
+            self.st_optimizer.zero_grad()
+
+    def set_auxiliaries(self, **kwargs):
+        # Pass any auxiliary parameter.
+        if self.ub:
+            self.shared_repr = kwargs["shared_repr"]
 # --------------------------- weight clipping ----------------------------
 class InitBounds:
     '''

@@ -3,23 +3,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import h5py
-import random, math
-import os
-import cv2
+import random, math, cv2, gc, os, h5py
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 import wandb
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from collections import defaultdict
-import time
+import time, contextlib
 import tensorflow as tf
 import zlib
 from torch.utils.tensorboard import SummaryWriter
 from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoencoder
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
 from torch.utils.data._utils.collate import default_collate
+from VRNN.grad_diagnostics import GradDiagnosticsAggregator  
 os.environ["MPLBACKEND"] = "Agg"  # must be set before importing matplotlib.pyplot
 import matplotlib
 matplotlib.use("Agg", force=True)
@@ -52,7 +50,7 @@ class HumanoidAwareZoomTransform:
     Expected `sample` keys:
       - sample["observations"]: torch.Tensor [T, C, H, W], dtype float/half/int.
       - Optional: sample[center_key] containing humanoid center in normalized coords [-1, 1]
-          * Either shape [2], [T, 2], or [*, 2] (we'll mean-reduce over time if needed).
+          * Either shape [2], [T, 2], or [*, 2] .
 
     """
 
@@ -265,7 +263,6 @@ class TFRecordConverter:
     @staticmethod
     def decode_zlib_observation(obs_bytes: bytes, target_shape=(64, 64, 3)) -> Optional[np.ndarray]:
         """
-        Decompress zlib-encoded raw pixel observations
         
         This implementation embodies principles of information recovery through
         reversible compression transforms, revealing the underlying visual manifold.
@@ -706,7 +703,6 @@ def count_parameters(model, print_details=True):
                 p.numel() for p in module.parameters() if p.requires_grad
             )
     
-    # Component-wise breakdown (for your specific model)
     component_params = {}
     component_map = {
         'encoder': 'encoder',
@@ -923,7 +919,7 @@ class DMCVBTrainer:
         # Initialize metrics tracking
         self.metrics_history = defaultdict(list)
         self.best_eval_loss = float('inf')
-        
+        self.episode_length = self.train_dataset.min_episode_length
         # Setup wandb if configured
         
         self.use_wandb = config.get('use_wandb', False) and self._try_init_wandb(config)
@@ -934,6 +930,10 @@ class DMCVBTrainer:
         else:
             self.writer = None
         self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
+        task_names = ['elbo','perceiver','predictive','orthogonal','adversarial']  
+        self._agg = GradDiagnosticsAggregator(task_names, 
+                                              component_groups=self.grad_monitor.component_groups,
+                                              average_component_norms=True)
 
     def _try_init_wandb(self, config):
         """Attempt to initialize W&B, return success status"""
@@ -1100,6 +1100,111 @@ class DMCVBTrainer:
             self.save_checkpoint(epoch, is_best=True)
         
         return avg_metrics
+ 
+    def run_grad_diag(
+        self,
+        max_B: int = 1,
+        max_T: int = 4,
+        disable_perceiver_grad: bool = True,
+        include_adv_in_diag: bool = True,
+        use_amp: bool = True,
+    ):
+        """
+        One-shot gradient diagnostics on a tiny (B,T) slice to avoid OOM.
+        """
+        # Keep most modules in eval(), but force the RNN to train() so cuDNN allows backward
+
+        self.model.eval()
+
+        if hasattr(self.model, "_rnn") and isinstance(getattr(self.model, "_rnn"), torch.nn.Module):
+            self.model._rnn.train()   
+
+        torch.cuda.empty_cache()
+
+        batch = next(iter(self.eval_loader))
+
+        # Slice to tiny B,T to keep Perceiver + RNN tiny
+        obs = batch["observations"][:max_B, :max_T].contiguous().to(self.device, non_blocking=True)
+        act = batch["actions"][:max_B, :max_T].contiguous().to(self.device, non_blocking=True)
+
+        # Optionally prevent backprop through Perceiver to save memory
+        
+        was_global_ctx = getattr(self.model, "use_global_context", True)
+        if disable_perceiver_grad:
+            self.model.use_global_context = False  # skip compute_global_context() during forward
+
+        amp_ctx = (torch.amp.autocast('cuda',dtype=torch.bfloat16) if use_amp else contextlib.nullcontext())
+        with torch.set_grad_enabled(True), amp_ctx:
+            vae_losses, outputs = self.model.compute_total_loss(
+                obs, act,
+                beta=self.config['beta'],                  
+                entropy_weight=self.config['entropy_weight'],
+                lambda_recon=self.config['lambda_recon'],
+                lambda_att_dyn=self.config['lambda_att_dyn'],
+                lambda_att=self.config['lambda_att'],
+                lambda_gram=self.config.get('lambda_gram', 0.0),
+            )
+
+            elbo_loss = (
+                self.config['lambda_recon'] * vae_losses['recon_loss']
+                + self.config['beta'] * vae_losses['kl_z']
+                + self.config['beta'] * vae_losses['hierarchical_kl']
+                - self.config['entropy_weight'] * vae_losses['cluster_entropy']
+                + self.config.get('lambda_gram', 0.0) * vae_losses['gram_enc_loss']
+            )
+            perceiver_loss   = vae_losses['perceiver_loss']
+            predictive_loss  = vae_losses['attention_loss']
+            orth_loss        = vae_losses['attention_diversity'] + vae_losses['slot_ortho']
+
+            if include_adv_in_diag and hasattr(self.model, "image_discriminator"):
+                recon = outputs["reconstructions"]       # [B,T,C,H,W]
+                z_seq = outputs["latents"]              # or outputs["z_seq"] 
+                D = self.model.image_discriminator
+
+                for p in D.parameters():
+                    p.requires_grad_(False)
+
+                fake = D(recon, z=z_seq, return_features=True)
+                adv_loss = -fake["final_score"].mean()  
+
+                # restore
+                for p in D.parameters():
+                    p.requires_grad_(True)
+            else:
+                adv_loss = torch.zeros((), device=obs.device)
+
+            task_losses      = [elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]
+
+            assert len(task_losses) == 5, f"Expected 5 losses, got {len(task_losses)}"
+            named_params = list(self.model.named_parameters())
+
+            self._agg.update(
+                self.model,
+                shared_repr=None,
+                task_losses=task_losses,
+                named_params=named_params,
+                param_patterns=None,  # or None to include ALL trainable params
+            )
+
+        # Restore model global-context flag
+        if disable_perceiver_grad:
+            self.model.use_global_context = was_global_ctx
+
+        # Log the figures once (cosine heatmap, etc.)
+        self._agg.tensorboard_log(self.writer, tag_prefix="diag/grads", global_step=getattr(self.grad_monitor, "global_step", 0))  # :contentReference[oaicite:5]{index=5}
+        for k, v in list(outputs.items()):
+            if isinstance(v, torch.Tensor):
+                outputs[k] = v.detach().cpu()   # sever graph + move off GPU
+            elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                outputs[k] = [t.detach().cpu() for t in v]
+
+        # Clean up computation graph to free VRAM immediately
+        del vae_losses, outputs, task_losses
+        self.model.zero_grad(set_to_none=True)
+        self.model.train()
+
+        gc.collect()
+        torch.cuda.empty_cache()
     
     def compute_psnr(self, original: torch.Tensor, reconstructed: torch.Tensor) -> torch.Tensor:
         """Compute Peak Signal-to-Noise Ratio"""
@@ -1195,7 +1300,7 @@ class DMCVBTrainer:
 
                 for i in range(batch_size):
                     row = split_idx * batch_size + i
-                    t = 0  # visualize first timestep; change if you want a different frame
+                    t = 0  # visualize first timestep
 
                     # ---------- 1) Original ----------
                     orig_img = observations[i, t, :3]  # [3,H,W]
@@ -1293,7 +1398,6 @@ class DMCVBTrainer:
         return_mode: str = "all",  # 'all' | 'combined' | 'slots' | 'groups'
     ) -> Dict[str, np.ndarray]:
         """
-        OpenCV-based multi-object attention visualization.
 
         Inputs
         -------
@@ -1312,7 +1416,7 @@ class DMCVBTrainer:
         - 'overlay_contours_bgr'      : [B, H, W, 3] (centers drawn if available)
         - 'slot_overlays_bgr'         : [B, K, H, W, 3]
         - 'semantic_segmentation_bgr' : [B, H, W, 3]
-        (If return_mode != 'all', you still get a dict with the selected key(s).)
+        
         """
 
         assert observation.ndim == 4, "observation must be [B,C,H,W]"
@@ -1331,7 +1435,7 @@ class DMCVBTrainer:
         def to_float_np(hw: torch.Tensor) -> np.ndarray:
             return hw.detach().to("cpu").float().numpy()
 
-        # ----- colors (BGR) for slots -----
+        # ----- colors for slots -----
         palette = [
             (0, 0, 255),     # red
             (0, 255, 0),     # green
@@ -1355,7 +1459,6 @@ class DMCVBTrainer:
         # fused attention map for heat/contours (simple sum; for viz this is fine)
         fused = slot_maps.sum(axis=1)  # [B,h,w]
 
-        # ----- outputs to build -----
         want = lambda key: (return_mode == "all") or (key == return_mode)
         out: Dict[str, np.ndarray] = {}
 
@@ -1375,7 +1478,7 @@ class DMCVBTrainer:
                 heat_vis = cv2.addWeighted(base, 0.55, heat, 0.45, 0.0)
                 heat_list.append(heat_vis)
 
-            # === contour overlay (plus slot centers if available) ===
+            # === contour overlay (plus slot centers) ===
             if want("overlay_contours_bgr"):
                 cont = base.copy()
                 # edges from fused mask via morphological gradient
@@ -1492,8 +1595,7 @@ class DMCVBTrainer:
         self.model.ema_decoder.register()
 
         for epoch in range(n_epochs):
-            # Update temperature
-            self.model.update_temperature(epoch)
+            
             self.model.current_epoch = epoch
             
             # Train
@@ -1502,7 +1604,7 @@ class DMCVBTrainer:
             
             # Evaluate
             eval_metrics = self.evaluate(epoch)
-            
+            self.run_grad_diag(max_B=1, max_T=self.episode_length, disable_perceiver_grad=False, use_amp=True)            
             # Combine metrics
             all_metrics = {**train_metrics, **eval_metrics}
             
@@ -1559,18 +1661,19 @@ def main():
         
         # Model settings
         'max_components': 15,
-        'latent_dim': 30,
+        'latent_dim': 28,
         'hidden_dim': 32, #must be divisible by 8
-        'context_dim': 25,
-        'attention_dim': 25,
+        'context_dim': 36,
+        'attention_dim': 20,
         'attention_resolution': 16,
         'input_channels': 3*1,  # 3 stacked frames
         'HiP_type': 'Mini',
         'prior_alpha': 6.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
-        
+        'dropout': 0.1,
+
         # Training settings
-        'batch_size': 2,
+        'batch_size': 6,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
@@ -1588,7 +1691,7 @@ def main():
         # Loss weights
         'beta': 1.0,
         'entropy_weight': 0.6,
-        'lambda_img': 0.2,
+        'lambda_img': 1.0,
         'lambda_recon': 1.0,
         'lambda_att_dyn': 0.95,
         'lambda_att': 0.95,
@@ -1632,7 +1735,7 @@ def main():
         grad_clip= config['grad_clip'],
         prior_alpha =config['prior_alpha'],
         prior_beta = config['prior_beta'],
-        
+        dropout=config['dropout']
     )
     outputs = count_parameters(model, print_details=True)
     # Initialize trainer

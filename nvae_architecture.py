@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
 from typing import List, Optional, Tuple
-import logging
+from contextlib import contextmanager
 import abc
 import math
 
@@ -200,6 +200,9 @@ class VAEEncoder(nn.Module):
         super().__init__()
         self.latent_size = latent_size
         self.downsample = downsample
+        self._cached_levels = None   # dict like {"C2": Tensor, ...}
+        self._cached_hw = None       # dict like {"H×W": Tensor, ...}
+        self._forward_count = 0      # 
 
         if channel_size % 32 == 0:
             num_groups = 32
@@ -287,10 +290,25 @@ class VAEEncoder(nn.Module):
     def gradient_checkpointing_enable(self):
 
         self.use_checkpoint = True
+
+    @contextmanager
+    def enable_caching(self):
+        """
+        Context manager that enables one-pass feature caching for decoder/aux losses.
+        """
+        try:
+            self._cached_levels = {}
+            self._cached_hw = {}
+            yield
+        finally:
+            self._cached_levels = None
+            self._cached_hw = None
+
     
     def forward(self, x):
         # Stem
         h = self.stem(x)
+        stem_out = h  # for potential skip connections
         
         # Progressive encoding
         skip_connections = []
@@ -300,6 +318,22 @@ class VAEEncoder(nn.Module):
             else:
                 h = block(h)
             skip_connections.append(h)
+
+        if self._cached_levels is not None and self._cached_hw is not None:
+            # Mirror extract_pyramid's level semantics
+            prev_hw = stem_out.shape[-2:]  # resolution right after stem
+            level = 1
+            self._cached_levels["C1"] = stem_out
+            self._cached_hw[f"{prev_hw[0]}x{prev_hw[1]}"] = stem_out
+
+            for feat in skip_connections:
+                hw = feat.shape[-2:]
+                if hw != prev_hw:
+                    level += 1
+                    prev_hw = hw
+                # last block at a resolution wins (same as extract_pyramid)
+                self._cached_levels[f"C{level}"] = feat
+                self._cached_hw[f"{hw[0]}x{hw[1]}"] = feat
         
         # Final processing
         h = self.final_norm(h)
@@ -325,8 +359,8 @@ class VAEEncoder(nn.Module):
         sigma = (logvar * 0.5).exp()
         eps= torch.randn_like(sigma)
         z = mean + eps * sigma
-
         return z, mean, logvar, hlayer
+    
     def extract_pyramid(self, x: torch.Tensor, levels=None):
         """Return dict of multi-scale features tapped from the encoder backbone.
         Levels can be an int (keep last N scales) or an iterable of names (e.g., ("C2","C3","C4")).
@@ -358,6 +392,22 @@ class VAEEncoder(nn.Module):
         return {k: feats[k] for k in sel}
 
     def get_unet_skips(self, x, levels=None, detach: bool = False):
+        if x is None and (self._cached_levels is not None) and (self._cached_hw is not None):
+            # Decide which levels to serve (mirror extract_pyramid)
+            if levels is None:
+                keys = sorted(self._cached_levels.keys(), key=lambda k: int(k[1:]))[-3:]
+            elif isinstance(levels, int):
+                keys = sorted(self._cached_levels.keys(), key=lambda k: int(k[1:]))[-levels:]
+            else:
+                keys = [k for k in levels if k in self._cached_levels]
+
+            out = {}
+            for k in keys:
+                t = self._cached_levels[k]
+                t = t.detach() if detach else t
+                H, W = t.shape[-2:]
+                out[f"{H}x{W}"] = t
+            return out
 
         feats = self.extract_pyramid(x, levels=levels)
         out = {}
@@ -758,7 +808,7 @@ class VAEDecoder(nn.Module):
         # 1) Latent projection
         if self.use_checkpoint and self.training:
             h = torch.utils.checkpoint.checkpoint(self.mlp, z, use_reentrant=False, preserve_rng_state=True)
-            h = torch.utils.checkpoint.checkpoint(lambda x: self.unflatten(x), h, use_reentrant=False, preserve_rng_state=True)
+            h =  self.unflatten(h)
         else:
             h = self.unflatten(self.mlp(z))
 
