@@ -846,7 +846,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
     def _warm_build_unet_adapters(self, batch_size: int = 1, dtype: torch.dtype | None = None):
         if dtype is None:
-            # If you use AMP (bf16/fp16), pass that here to match real runs.
+            
             dtype = torch.float32
 
         x_dummy = torch.zeros(
@@ -914,7 +914,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         self.gram_loss = GramLoss(
             apply_norm=True,
-            img_level=True,             # compute per-image Grams like your code
+            img_level=True,             
             remove_neg=True,           # set True to match DINOv3’s “positives-only” option
             remove_only_teacher_neg=False,
         )
@@ -955,7 +955,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         extra_kwargs = {
             "unet_adapter_cfg": {
-                "modalities": ["image"],   # must match your Perceiver input key
+                "modalities": ["image"],   
                 "base_channels": 32,
                 "auto_depth": True,
                 "norm": "group",
@@ -964,7 +964,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             }
         }
 
-        # 3) Create the Perceiver with your Utils.generate_model
+        # 3) Create the Perceiver with Utils.generate_model
         self.perceiver_model = generate_model(
             'HiPClassBottleneck', self.HiP_type, mock_input, extra_kwargs=extra_kwargs
         )
@@ -1339,7 +1339,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 # Inference Network q(z_t | o_<=t, z_<t)
                 z_t, z_mean_t, z_logvar_t, _ = self.encoder(o_t)
 
-                # Use cached skips (no recompute). Keep your level choice.
+                # Use cached skips (no recompute). 
                 skips = self.encoder.get_unet_skips(
                     x=None, levels=("C2","C3","C4","C5","C6"), detach=False
                 )
@@ -1699,7 +1699,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         common = set(enc_s.keys()) & set(enc_t.keys())
         for k in common:
             Fs, Ft = enc_s[k], enc_t[k]              # [B,C,H,W]
-            if pool and (Fs.shape[-1] % pool == 0):  # optional downsample like your code
+            if pool and (Fs.shape[-1] % pool == 0):  # optional downsample 
                 Fs = torch.nn.functional.avg_pool2d(Fs, pool)
                 Ft = torch.nn.functional.avg_pool2d(Ft, pool)
             # reshape to (B, N, D) = (B, HW, C)
@@ -2126,7 +2126,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         alpha = getattr(self.imtl, "_alpha_to_log", None)
         if alpha is not None:
-            sol = alpha.detach().float().cpu().numpy()       # keeps your existing logging code happy
+            sol = alpha.detach().float().cpu().numpy()       
 
         torch.nn.utils.clip_grad_norm_(list(self._imtl_shared_params), max_norm=self._grad_clip)
         self.gen_optimizer.step()
