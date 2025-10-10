@@ -19,7 +19,7 @@ from models import (
     AddEpsilon, check_tensor, SelfModelBlock, PerpetualOrthogonalProjectionLoss
 )
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
-from VRNN.mtl_optimizers import IMTL, WeightClipping
+from VRNN.mtl_optimizers import LOG_MGDA, WeightClipping
 
 
 from VRNN.lstm import LSTMLayer
@@ -971,6 +971,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.perceiver_model.to(self.device)
 
         # 4) Probe latents to get actual dims (eval mode, no grad)
+        self.perceiver_lr_multiplier= getattr(self, 'perceiver_lr_multiplier', 2.0)
         self.out_keys = perceiver_helpers.ModelOutputKeys  # enum with LATENTS/INPUT_RECONSTRUCTION :contentReference[oaicite:1]{index=1}
         was_training = self.perceiver_model.training
         self.perceiver_model.eval()
@@ -1183,19 +1184,26 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if decay:    groups.append({"params": decay,    "weight_decay": wd})
             if no_decay: groups.append({"params": no_decay, "weight_decay": 0.0})
             return groups
+        perceiver_params = get_params(self.perceiver_model, self.perceiver_projection)
+        param_groups = []
+        if perceiver_params:  # guard empty
+            perceiver_groups = split_by_weight_decay(perceiver_params, weight_decay)
+            for g in perceiver_groups:
+                g["lr"] = learning_rate * self.perceiver_lr_multiplier
+                # Optional: slightly less WD on perceiver
+                if g.get("weight_decay", 0.0) > 0: g["weight_decay"] *= 0.5
+            param_groups.extend(perceiver_groups)
 
-        trunk_modules = [
-            self.encoder, self.decoder, self.prior, self._rnn,
-            self.rnn_layer_norm, self.perceiver_model, self.perceiver_projection,
-        ]
+        trunk_modules = [self.encoder, self.decoder, self.prior, self._rnn, self.rnn_layer_norm]
 
         head_modules = [
             self.attention_prior_posterior, self.phi_attention, self.self_model,
         ]
+        self.head_params = [p for m in head_modules for p in m.parameters() if p.requires_grad]
 
         scalar_params = [self.h0, self.c0, self.temporal_attention_temp]
 
-        param_groups = []
+        
         param_groups.extend(split_by_weight_decay(get_params(*trunk_modules), weight_decay))
 
         for g in split_by_weight_decay(get_params(*head_modules), weight_decay * 0.5):
@@ -1221,17 +1229,23 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self.attention_prior_posterior, self.phi_attention, self.self_model,
             self.h0, self.c0, self.temporal_attention_temp,
         ]
-        self._imtl_shared_params = list(get_params(*shared_modules))
 
-        self.imtl = IMTL(                   
-            optimizer=self.gen_optimizer,
-            specialized_parameters=[
-                *list(self.attention_prior_posterior.parameters()),
-                *list(self.phi_attention.parameters()),
-                *list(self.self_model.parameters()),
-            ],
-            ub=False,
-            learn_scaling=True
+        self.log_mgda_share_params = []
+        for module in shared_modules:
+            if module is None:
+                continue
+            if isinstance(module, nn.Module):
+                self.log_mgda_share_params.extend([p for p in module.parameters() if p.requires_grad])
+            elif isinstance(module, nn.Parameter) and module.requires_grad:
+                self.log_mgda_share_params.append(module)
+
+        # --- LOG_MGDA for computing MGDA log-space weights (and optionally doing the update) ---
+        self.log_mgda = LOG_MGDA(
+            n_tasks=5,                                              # elbo, perceiver, predictive, orthogonal, adversarial
+            device=next(self.parameters()).device,                  # keep on GPU
+            params="shared",                                        # operate on shared trunk params
+            normalization="loss+",     # 'none' | 'l2' | 'loss' | 'loss+'
+            max_norm=self._grad_clip,                               # reuse grad clip
         )
 
         # Discriminator optimizer (separate)
@@ -2111,26 +2125,20 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         task_losses = [elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]
         
         self.gen_optimizer.zero_grad(set_to_none=True)
-        parts = []
-        for k in ('latents', 'hidden_states'):
-            if k in outputs and outputs[k] is not None:
-                v = self._flatten_for_diag(outputs[k])
-                if v is not None:
-                    parts.append(v)
+        
+        weighted_loss, extra = self.log_mgda.get_weighted_loss(
+            losses=task_losses,
+            shared_parameters=list(self.log_mgda_share_params),
+            last_shared_parameters=None,
+            representation=None,
+        )
+        weighted_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.head_params, self._grad_clip * 0.5)
 
-        shared_rep = torch.cat(parts, dim=0)
-
-        # Hand the shared rep to IMTL-G (UB mode) and do the combined backward.
-        self.imtl.set_auxiliaries(shared_repr=shared_rep)  # IMTL expects this in UB mode
-        self.imtl.custom_backwards(task_losses)            # does the scaled / affine-combo backward
-
-        alpha = getattr(self.imtl, "_alpha_to_log", None)
-        if alpha is not None:
-            sol = alpha.detach().float().cpu().numpy()       
-
-        torch.nn.utils.clip_grad_norm_(list(self._imtl_shared_params), max_norm=self._grad_clip)
         self.gen_optimizer.step()
 
+        # --- for logging: MGDA weights (on CPU as floats) ---
+        sol = extra["weights"].cpu().numpy()
 
         task_names = ['elbo', 'perceiver', 'predictive', 'orthogonal', 'adversarial']
         weight_dict = {f'weight_{name}': float(sol[i]) for i, name in enumerate(task_names)}

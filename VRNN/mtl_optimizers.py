@@ -1692,8 +1692,454 @@ class MGDA(AbsWeighting):
         del grads, loss_data
         return sol.detach().cpu().numpy()
     
+class DB_MTL(AbsWeighting):
+
+    def __init__(self):
+        super(DB_MTL, self).__init__()
+
+    def init_param(self):
+        self.step = 0
+        self._compute_grad_dim()
+        self.grad_buffer = torch.zeros(self.task_num, self.grad_dim).to(self.device)
+        
+    def backward(self, losses, **kwargs):
+        self.step += 1
+        beta = kwargs['DB_beta']
+        beta_sigma = kwargs['DB_beta_sigma']
+
+        batch_weight = np.ones(len(losses))
+        if self.rep_grad:
+            raise ValueError('No support method DB_MTL with representation gradients (rep_grad=True)')
+        else:
+            self._compute_grad_dim()
+            batch_grads = self._compute_grad(torch.log(losses+1e-8), mode='backward') # [task_num, grad_dim]
+
+        self.grad_buffer = batch_grads + (beta/self.step**beta_sigma) * (self.grad_buffer - batch_grads)
+
+        u_grad = self.grad_buffer.norm(dim=-1)
+
+        alpha = u_grad.max() / (u_grad + 1e-8)
+        new_grads = sum([alpha[i] * self.grad_buffer[i] for i in range(self.task_num)])
+
+        self._reset_grad(new_grads)
+        return batch_weight
 
 
+# Neural Information Processing Systems (NeurIPS) 2018
+# https://github.com/intel-isl/MultiObjectiveOptimization
+class MinNormSolver:
+    MAX_ITER = 250
+    STOP_CRIT = 1e-5
+
+    @staticmethod
+    def _min_norm_element_from2(v1v1, v1v2, v2v2):
+        """
+        Analytical solution for min_{c} |c x1 + (1-c) x2|_2^2
+        d is the distance (objective) optimized
+        v1v1 = <x1,x1>
+        v1v2 = <x1,x2>
+        v2v2 = <x2,x2>
+        """
+        if v1v2 >= v1v1:
+            # Case: Fig 1, third column
+            gamma = 0.999
+            cost = v1v1
+            return gamma, cost
+        if v1v2 >= v2v2:
+            # Case: Fig 1, first column
+            gamma = 0.001
+            cost = v2v2
+            return gamma, cost
+        # Case: Fig 1, second column
+        gamma = -1.0 * ((v1v2 - v2v2) / (v1v1 + v2v2 - 2 * v1v2))
+        cost = v2v2 + gamma * (v1v2 - v2v2)
+        return gamma, cost
+
+    @staticmethod
+    def _min_norm_2d(vecs, dps):
+        """
+        Find the minimum norm solution as combination of two points
+        This is correct only in 2D
+        i.e., min_c || sum_i c_i x_i ||_2^2  s.t. sum_i c_i = 1,
+        1 >= c_i >= 0 for all i, and exists i,j with c_i + c_j = 1.0
+        """
+        dmin = 1e8
+        for i in range(len(vecs)):
+            for j in range(i + 1, len(vecs)):
+                if (i, j) not in dps:
+                    dps[(i, j)] = 0.0
+                    for k in range(len(vecs[i])):
+                        # match numpy reference: sum over components
+                        dps[(i, j)] += torch.dot(
+                            vecs[i][k].reshape(-1), vecs[j][k].reshape(-1)
+                        ).item()
+                    dps[(j, i)] = dps[(i, j)]
+                if (i, i) not in dps:
+                    dps[(i, i)] = 0.0
+                    for k in range(len(vecs[i])):
+                        dps[(i, i)] += torch.dot(
+                            vecs[i][k].reshape(-1), vecs[i][k].reshape(-1)
+                        ).item()
+                if (j, j) not in dps:
+                    dps[(j, j)] = 0.0
+                    for k in range(len(vecs[i])):  # matches the numpy loop bound
+                        dps[(j, j)] += torch.dot(
+                            vecs[j][k].flatten(), vecs[j][k].flatten()
+                        ).item()
+                c, d = MinNormSolver._min_norm_element_from2(
+                    dps[(i, i)], dps[(i, j)], dps[(j, j)]
+                )
+                if d < dmin:
+                    dmin = d
+                    sol = [(i, j), c, d]
+        return sol, dps
+
+    @staticmethod
+    def _projection2simplex(y):
+        """
+        Given y, solve argmin_z ||y - z||_2  s.t. sum_i z_i = 1 and 1 >= z_i >= 0
+        """
+        m = len(y)
+        # sort descending to mirror np.flip(np.sort(y), axis=0)
+        sorted_y, _ = torch.sort(y, descending=True)
+        tmpsum = torch.tensor(0.0, device=y.device, dtype=y.dtype)
+        tmax_f = (y.sum() - 1.0) / m
+        for i in range(m - 1):
+            tmpsum = tmpsum + sorted_y[i]
+            tmax = (tmpsum - 1.0) / (i + 1.0)
+            if tmax > sorted_y[i + 1]:
+                tmax_f = tmax
+                break
+        return torch.maximum(y - tmax_f, torch.zeros_like(y))
+
+    @staticmethod
+    def _next_point(cur_val, grad, n):
+        proj_grad = grad - (grad.sum() / n)
+        # masks as in numpy slicing
+        mask_neg = proj_grad < 0
+        mask_pos = proj_grad > 0
+        tm1 = -cur_val[mask_neg] / proj_grad[mask_neg]
+        tm2 = (1.0 - cur_val[mask_pos]) / proj_grad[mask_pos]
+
+        # keep skippers to mirror numpy code path (value unused)
+        skippers = (tm1 < 1e-7).sum() + (tm2 < 1e-7).sum()
+
+        t = torch.tensor(1.0, device=cur_val.device, dtype=cur_val.dtype)
+        if (tm1 > 1e-7).any():
+            t = torch.min(tm1[tm1 > 1e-7])
+        if (tm2 > 1e-7).any():
+            t = torch.min(tm2[tm2 > 1e-7])
+
+        next_point = proj_grad * t + cur_val
+        next_point = MinNormSolver._projection2simplex(next_point)
+        return next_point
+
+    @staticmethod
+    def find_min_norm_element(vecs):
+        """
+        Given a list of vectors (vecs), find the minimum-norm element in the convex hull:
+        min ||u||_2  s.t. u = sum_i c_i vecs[i], sum_i c_i = 1.
+        """
+        # establish device/dtype from inputs
+        dev = vecs[0][0].device
+        dtype = vecs[0][0].dtype
+
+        # best 2-task solution
+        dps = {}
+        init_sol, dps = MinNormSolver._min_norm_2d(vecs, dps)
+
+        n = len(vecs)
+        sol_vec = torch.zeros(n, device=dev, dtype=dtype)
+        sol_vec[init_sol[0][0]] = torch.tensor(init_sol[1], device=dev, dtype=dtype)
+        sol_vec[init_sol[0][1]] = torch.tensor(1.0 - init_sol[1], device=dev, dtype=dtype)
+
+        if n < 3:
+            # optimal for n=2
+            return sol_vec, init_sol[2]
+
+        iter_count = 0
+        grad_mat = torch.zeros((n, n), device=dev, dtype=dtype)
+        for i in range(n):
+            for j in range(n):
+                grad_mat[i, j] = torch.tensor(dps[(i, j)], device=dev, dtype=dtype)
+
+        while iter_count < MinNormSolver.MAX_ITER:
+            grad_dir = -1.0 * torch.matmul(grad_mat, sol_vec)
+            new_point = MinNormSolver._next_point(sol_vec, grad_dir, n)
+
+            # recompute inner products for line search
+            v1v1 = 0.0
+            v1v2 = 0.0
+            v2v2 = 0.0
+            for i in range(n):
+                for j in range(n):
+                    dij = dps[(i, j)]
+                    v1v1 += float(sol_vec[i].item() * sol_vec[j].item() * dij)
+                    v1v2 += float(sol_vec[i].item() * new_point[j].item() * dij)
+                    v2v2 += float(new_point[i].item() * new_point[j].item() * dij)
+
+            nc, nd = MinNormSolver._min_norm_element_from2(v1v1, v1v2, v2v2)
+            new_sol_vec = nc * sol_vec + (1.0 - nc) * new_point
+            change = new_sol_vec - sol_vec
+            if torch.sum(torch.abs(change)) < MinNormSolver.STOP_CRIT:
+                # mirror numpy: return current sol_vec (not new_sol_vec) and nd
+                return sol_vec, nd
+            sol_vec = new_sol_vec
+            iter_count += 1
+
+        return sol_vec, nd
+
+    @staticmethod
+    def find_min_norm_element_FW(vecs):
+        """
+        Frank–Wolfe variant: same objective as find_min_norm_element.
+        """
+        dev = vecs[0][0].device
+        dtype = vecs[0][0].dtype
+
+        dps = {}
+        init_sol, dps = MinNormSolver._min_norm_2d(vecs, dps)
+
+        n = len(vecs)
+        sol_vec = torch.zeros(n, device=dev, dtype=dtype)
+        sol_vec[init_sol[0][0]] = torch.tensor(init_sol[1], device=dev, dtype=dtype)
+        sol_vec[init_sol[0][1]] = torch.tensor(1.0 - init_sol[1], device=dev, dtype=dtype)
+
+        if n < 3:
+            return sol_vec, init_sol[2]
+
+        grad_mat = torch.zeros((n, n), device=dev, dtype=dtype)
+        for i in range(n):
+            for j in range(n):
+                grad_mat[i, j] = torch.tensor(dps[(i, j)], device=dev, dtype=dtype)
+
+        iter_count = 0
+        while iter_count < MinNormSolver.MAX_ITER:
+            # t_iter = argmin over columns of grad_mat @ sol_vec
+            t_iter = torch.argmin(torch.matmul(grad_mat, sol_vec)).item()
+
+            v1v1 = float(torch.dot(sol_vec, torch.matmul(grad_mat, sol_vec)).item())
+            v1v2 = float(torch.dot(sol_vec, grad_mat[:, t_iter]).item())
+            v2v2 = float(grad_mat[t_iter, t_iter].item())
+
+            nc, nd = MinNormSolver._min_norm_element_from2(v1v1, v1v2, v2v2)
+            new_sol_vec = nc * sol_vec.clone()
+            new_sol_vec[t_iter] += (1.0 - nc)
+
+            change = new_sol_vec - sol_vec
+            if torch.sum(torch.abs(change)) < MinNormSolver.STOP_CRIT:
+                return sol_vec, nd
+            sol_vec = new_sol_vec
+            iter_count += 1
+
+        return sol_vec, nd
+
+
+def gradient_normalizers(grads, losses, normalization_type):
+    """
+    grads: Dict[int, List[torch.Tensor]]  (each tensor is flattened per-param grad)
+    losses: Sequence[torch.Tensor]        (task losses)
+    returns: Dict[int, float]             (per-task normalizer)
+    """
+    eps = torch.finfo(torch.float32).eps
+
+    def l2_norm(g_list):
+        # sqrt(sum_i ||g_i||^2) over that task's parameter grads
+        return torch.sqrt(sum(g.pow(2).sum() for g in g_list)) + eps
+
+    gn = {}
+    for t, g_list in grads.items():
+        if normalization_type in ("norm", "l2"):
+            val = l2_norm(g_list)
+        elif normalization_type == "loss":
+            val = losses[t].detach().abs() + eps
+        elif normalization_type == "loss+":
+            val = (losses[t].detach().abs() + eps) * l2_norm(g_list)
+        elif normalization_type == "none":
+            val = torch.tensor(1.0, device=(g_list[0].device if len(g_list) else losses[t].device))
+        else:
+            raise ValueError(f"Invalid Normalization Type: {normalization_type}")
+        gn[t] = float(val.item())
+    return gn
+
+
+class WeightMethod:
+    def __init__(self, n_tasks: int, device: torch.device, max_norm = 1.0):
+        super().__init__()
+        self.n_tasks = n_tasks
+        self.device = device
+        self.max_norm = max_norm
+
+    @abstractmethod
+    def get_weighted_loss(
+        self,
+        losses: torch.Tensor,
+        shared_parameters: Union[List[torch.nn.parameter.Parameter], torch.Tensor],
+        task_specific_parameters: Union[
+            List[torch.nn.parameter.Parameter], torch.Tensor
+        ],
+        last_shared_parameters: Union[List[torch.nn.parameter.Parameter], torch.Tensor],
+        representation: Union[torch.nn.parameter.Parameter, torch.Tensor],
+        **kwargs,
+    ):
+        pass
+
+    def backward(
+        self,
+        losses: torch.Tensor,
+        shared_parameters: Union[
+            List[torch.nn.parameter.Parameter], torch.Tensor
+        ] = None,
+        task_specific_parameters: Union[
+            List[torch.nn.parameter.Parameter], torch.Tensor
+        ] = None,
+        last_shared_parameters: Union[
+            List[torch.nn.parameter.Parameter], torch.Tensor
+        ] = None,
+        representation: Union[List[torch.nn.parameter.Parameter], torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[Union[torch.Tensor, None], Union[dict, None]]:
+        """
+
+        Parameters
+        ----------
+        losses :
+        shared_parameters :
+        task_specific_parameters :
+        last_shared_parameters : parameters of last shared layer/block
+        representation : shared representation
+        kwargs :
+
+        Returns
+        -------
+        Loss, extra outputs
+        """
+        loss, extra_outputs = self.get_weighted_loss(
+            losses=losses,
+            shared_parameters=shared_parameters,
+            task_specific_parameters=task_specific_parameters,
+            last_shared_parameters=last_shared_parameters,
+            representation=representation,
+            **kwargs,
+        )
+
+        if self.max_norm > 0 and shared_parameters is not None:
+            torch.nn.utils.clip_grad_norm_(shared_parameters, self.max_norm)
+
+        loss.backward()
+        return loss, extra_outputs
+
+    def __call__(
+        self,
+        losses: torch.Tensor,
+        shared_parameters: Union[
+            List[torch.nn.parameter.Parameter], torch.Tensor
+        ] = None,
+        task_specific_parameters: Union[
+            List[torch.nn.parameter.Parameter], torch.Tensor
+        ] = None,
+        **kwargs,
+    ):
+        return self.backward(
+            losses=losses,
+            shared_parameters=shared_parameters,
+            task_specific_parameters=task_specific_parameters,
+            **kwargs,
+        )
+
+    def parameters(self) -> List[torch.Tensor]:
+        """return learnable parameters"""
+        return []
+
+
+class LOG_MGDA(WeightMethod):
+    """Based on the official implementation of: Multi-Task Learning as Multi-Objective Optimization
+    Ozan Sener, Vladlen Koltun
+    Neural Information Processing Systems (NeurIPS) 2018
+    https://github.com/intel-isl/MultiObjectiveOptimization
+
+    """
+
+    def __init__(
+        self, n_tasks, device: torch.device, params="shared", normalization="none",
+        max_norm=1.0,
+    ):
+        super().__init__(n_tasks, device=device)
+        self.solver = MinNormSolver()
+        assert params in ["shared", "last", "rep"]
+        self.params = params
+        assert normalization in ["norm", "loss", "loss+", "none"]
+        self.normalization = normalization
+        self.max_norm = max_norm
+
+    @staticmethod
+    def _flattening(grad):
+        return torch.cat(
+            tuple(
+                g.reshape(
+                    -1,
+                )
+                for i, g in enumerate(grad)
+            ),
+            dim=0,
+        )
+
+    def get_weighted_loss(
+        self,
+        losses,
+        shared_parameters=None,
+        last_shared_parameters=None,
+        representation=None,
+        **kwargs,
+    ):
+        """
+
+        Parameters
+        ----------
+        losses :
+        shared_parameters :
+        last_shared_parameters :
+        representation :
+        kwargs :
+
+        Returns
+        -------
+
+        """
+        eps = torch.finfo(torch.float32).eps
+        grads = {}
+        params = dict(
+            rep=representation, shared=shared_parameters, last=last_shared_parameters
+        )[self.params]
+        for i, loss in enumerate(losses):
+            g = list(
+                torch.autograd.grad(
+                    loss,
+                    params,
+                    retain_graph=True,
+                    allow_unused=True,  # <— key: avoid errors when a task doesn’t touch a param
+                )
+            )
+            # Normalize all gradients, this is optional and not included in the paper.
+
+            #grads[i] = [torch.flatten(grad) for grad in g]
+            grads[i] = [(grad if grad is not None else torch.zeros_like(p)).flatten() for p, grad in zip(params, g)]
+
+
+        gn = gradient_normalizers(grads, losses, self.normalization)
+        for t in range(self.n_tasks):
+            for gr_i in range(len(grads[t])):
+                grads[t][gr_i] = grads[t][gr_i] / gn[t]
+
+        sol, min_norm = self.solver.find_min_norm_element(
+            [grads[t] for t in range(len(grads))]
+        )
+        sol = sol * self.n_tasks  # make sure it sums to self.n_tasks
+        
+        weighted_loss = sum([losses[i]  * sol[i]  for i in range(len(sol))])
+        return weighted_loss, {"weights": sol.detach().to(torch.float32)}
+
+    
 class MTLOptim:
     """
     Implements basic operations for customized MTL Optimizers.

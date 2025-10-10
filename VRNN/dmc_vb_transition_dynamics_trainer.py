@@ -1661,9 +1661,9 @@ def main():
         
         # Model settings
         'max_components': 15,
-        'latent_dim': 28,
+        'latent_dim': 32,
         'hidden_dim': 32, #must be divisible by 8
-        'context_dim': 36,
+        'context_dim': 64,
         'attention_dim': 20,
         'attention_resolution': 16,
         'input_channels': 3*1,  # 3 stacked frames
@@ -1673,7 +1673,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 6,
+        'batch_size': 8,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
