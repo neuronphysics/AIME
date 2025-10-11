@@ -40,8 +40,8 @@ VARIANTS = {
     '16x3_lite': {
     'num_groups': (16, 1, 16),
     'num_self_attends_per_block': (1, 6, 1),
-    'z_index_dim': (128, 512, 128),
-    'num_z_channels': (128, 384, 128),       # narrower than your current 1024 processor
+    'z_index_dim': (128, 128, 128),
+    'num_z_channels': (128, 512, 128),       # narrower than current 1024 processor
     'num_cross_attend_heads': (1, 1, 1),
     'num_self_attend_heads': (4, 16, 4),
     'cross_attend_widening_factor': (1, 1, 1),
