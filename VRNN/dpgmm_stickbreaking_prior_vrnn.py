@@ -19,14 +19,12 @@ from models import (
     AddEpsilon, check_tensor, SelfModelBlock, PerpetualOrthogonalProjectionLoss
 )
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
-from VRNN.mtl_optimizers import LOG_MGDA, WeightClipping
+from VRNN.mtl_optimizers import AdaptiveLossBalancer, WeightClipping
 
 
 from VRNN.lstm import LSTMLayer
 
-from VRNN.perceiver.Utils import generate_model
-from VRNN.perceiver import perceiver_helpers
-import VRNN.perceiver.perceiver as perceiver
+from VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
 from VRNN.Kumaraswamy import KumaraswamyStable
 def beta_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
@@ -670,73 +668,6 @@ class AttentionSchema(nn.Module):
             fused_feat=fused
         )    
     
-class PerceiverContextEmbedding(nn.Module):
-
-    def __init__(self, perceiver_latent_dim, context_dim, num_heads=4, dropout=0.1, device='cuda'):
-        super().__init__()
-        self.perceiver_latent_dim = perceiver_latent_dim
-        self.context_dim = context_dim
-        self.device = device
-        
-        # This is our "context memory" - what we're trying to understand/extract
-        # Initialize with small random values to break symmetry
-        self.context_memory = nn.Parameter(
-            torch.randn(context_dim, perceiver_latent_dim) * 0.02
-        )
-        
-        # Layer norm for the context memory to keep it well-behaved
-        self.context_norm = nn.LayerNorm(perceiver_latent_dim)
-        
-        # Cross-attention where context memory queries the Perceiver output
-        # This is where the "updating" happens
-        self.update_attention = nn.MultiheadAttention(
-            embed_dim=perceiver_latent_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # A gating mechanism to control how much the context changes
-        # This helps stability - we don't want context to change too drastically
-        self.update_gate = nn.Sequential(
-            nn.Linear(perceiver_latent_dim * 2, perceiver_latent_dim),
-            nn.Sigmoid()
-        )
-        
-        # Final projection to ensure we output exactly context_dim
-        # This also allows the model to learn a different "output representation"
-        # of the context if needed
-        self.output_projection = nn.Linear(perceiver_latent_dim, 1)
-        
-        self.to(device)
-    
-    def forward(self, perceiver_output):
-        batch_size = perceiver_output.shape[0]
-        
-        # Normalize and expand context memory for each batch element
-        # Think of this as "preparing our questions"
-        context_queries = self.context_norm(self.context_memory)
-        context_queries = context_queries.unsqueeze(0).expand(batch_size, -1, -1)
-        
-        # Query the Perceiver output with our context memory
-        # This asks: "Given what the Perceiver sees globally, how should we update our context understanding?"
-        updated_context, attention_weights = self.update_attention(
-            query=context_queries,     # What we want to know: [batch, context_dim, latent_dim]
-            key=perceiver_output,      # What's available: [batch, num_latents, latent_dim]
-            value=perceiver_output     # The information to extract
-        )
-        
-        # Optional: Apply gating to blend old and new context
-        # This prevents the context from changing too dramatically
-        gate_input = torch.cat([context_queries, updated_context], dim=-1)
-        gate = self.update_gate(gate_input)
-        gated_context = gate * updated_context + (1 - gate) * context_queries
-        
-        # Project to get final context values
-        # [batch, context_dim, latent_dim] -> [batch, context_dim, 1] -> [batch, context_dim]
-        context = self.output_projection(gated_context).squeeze(-1)
-        
-        return context, attention_weights 
     
 @contextmanager
 def _temporarily_disable_ckpt(*mods):
@@ -771,11 +702,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         input_dim: int,
         latent_dim: int,
         hidden_dim: int,
-        context_dim: int, # Context dimension for perceiving temporal dynamics
         attention_dim: int,
         action_dim: int,
         sequence_length: int,
-        img_disc_channels:int,
+        img_perceiver_channels:int,
         img_disc_layers:int,
         disc_num_heads:int,
         device: torch.device= torch.device('cuda'),
@@ -788,13 +718,19 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         weight_decay: float = 0.00001,
         use_orthogonal: bool = True,  # Use orthogonal initialization for LSTM,
         number_lstm_layer: int = 3,  # Number of LSTM layers
-        HiP_type: str = '16x3',  # Type of perceiver model
         self_model_weight: float = 0.5,
-        use_global_context: bool = True,
         context_window_size: int = 10,
         attention_resolution: int = 21,  # Resolution for attention maps
         warmup_epochs=25,
         dropout: float = 0.1,
+        num_encoder_perceiver_layers: int = 4,
+        num_perceiver_heads: int = 8,
+        num_latent_perceiver: int = 128,
+        num_latent_channels_perceiver: int = 128,
+        num_codebook_perceiver: int = 1024,
+        perceiver_code_dim: int = 128,
+        downsample_perceiver: int = 4,
+        perceiver_lr_multiplier: float = 0.5,
     ):
         super().__init__()
         #core dimensions
@@ -803,24 +739,29 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.max_K = max_components
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
-        self.context_dim = context_dim ##
+        self.context_dim = num_latent_channels_perceiver
         self.attention_dim = attention_dim ##
         self.action_dim = action_dim ##
         self.sequence_length = sequence_length ##
         self.device = device
         self.dropout = dropout
         # Hyperparameters
-        self.HiP_type = HiP_type
         self.self_model_weight = self_model_weight
-        self.use_global_context = use_global_context
         self.context_window_size = context_window_size
         self._lr = learning_rate
         self._grad_clip = grad_clip
         self.attention_resolution = attention_resolution
         self.number_lstm_layer = number_lstm_layer
-        self.temporal_attention_temp = nn.Parameter(torch.tensor(1.0))
         self.warmup_epochs = warmup_epochs
         self.current_epoch = 0
+        self.num_encoder_perceiver_layers = num_encoder_perceiver_layers
+        self.num_perceiver_heads = num_perceiver_heads
+        self.num_latent_perceiver = num_latent_perceiver
+        self.num_codebook_perceiver = num_codebook_perceiver
+        self.perceiver_code_dim = perceiver_code_dim
+        self.img_perceiver_channels = img_perceiver_channels
+        self.downsample_perceiver = downsample_perceiver
+        self.perceiver_lr_multiplier = perceiver_lr_multiplier  
         #initialization different parts of the model
         
         self._init_perceiver_context()
@@ -832,7 +773,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # DP-GMM prior
         self.prior = DPGMMPrior(max_components, 
                                 self.latent_dim, 
-                                hidden_dim + context_dim, #This is because that the input for the prior is the hidden state of recurrent model plus context which is coming from perceiver
+                                hidden_dim + self.context_dim, #This is because that the input for the prior is the hidden state of recurrent model plus context which is coming from perceiver
                                 device, prior_alpha=prior_alpha,
                                 prior_beta=prior_beta)
 
@@ -948,50 +889,25 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.apply(self.init_weights)
 
     def _init_perceiver_context(self):
-        """Initialize Hierarchical Perceiver with architecture-aware dimensions"""
+        """Initialize Perceiver with architecture-aware dimensions"""
 
-        # 1) Build mock input ON THE SAME DEVICE as the model
-        mock_input = self.generate_mock_input() 
-
-        extra_kwargs = {
-            "unet_adapter_cfg": {
-                "modalities": ["image"],   
-                "base_channels": 32,
-                "auto_depth": True,
-                "norm": "group",
-                "gn_groups": 8,
-                "enable_decode_unet": True,
-            }
-        }
 
         # 3) Create the Perceiver with Utils.generate_model
-        self.perceiver_model = generate_model(
-            'HiPClassBottleneck', self.HiP_type, mock_input, extra_kwargs=extra_kwargs
+        self.perceiver_model = CausalPerceiverIO(
+            video_shape=(self.context_window_size, self.input_channels, self.image_size, self.image_size),
+            num_latents=self.num_latent_perceiver,
+            num_latent_channels=self.context_dim,
+            num_attention_heads=self.num_perceiver_heads,
+            num_encoder_layers=self.num_encoder_perceiver_layers,
+            code_dim=self.perceiver_code_dim,
+            num_codes=self.num_codebook_perceiver,
+            downsample=self.downsample_perceiver,
+            dropout=self.dropout,
+            base_channels=self.img_perceiver_channels,
+            num_quantizers=1,
         )
-        self.perceiver_model.to(self.device)
 
-        # 4) Probe latents to get actual dims (eval mode, no grad)
-        self.perceiver_lr_multiplier= getattr(self, 'perceiver_lr_multiplier', 2.0)
-        self.out_keys = perceiver_helpers.ModelOutputKeys  # enum with LATENTS/INPUT_RECONSTRUCTION :contentReference[oaicite:1]{index=1}
-        was_training = self.perceiver_model.training
-        self.perceiver_model.eval()
-        with torch.no_grad():
-            test_output = self.perceiver_model(mock_input, is_training=False)  # forward returns dict with LATENTS & recon :contentReference[oaicite:2]{index=2}
-            latents_dict = test_output[self.out_keys.LATENTS]
-            mod_key = 'image' if 'image' in latents_dict else next(iter(latents_dict))
-            test_latents = latents_dict[mod_key]
-            perceiver_latent_dim = test_latents.shape[-1]
-            perceiver_index_dim = test_latents.shape[-2]
-        self.perceiver_model.train(was_training)
-
-        print(f"Detected Perceiver context output dimension: {perceiver_latent_dim}, "
-            f"{perceiver_index_dim} latent vectors")
-
-        # 5) Projection on top of Perceiver latents
-        self.perceiver_projection = PerceiverContextEmbedding(
-            perceiver_latent_dim, self.context_dim, dropout=self.dropout, device=self.device
-        )
-                
+                       
 
     def _init_discriminators(self, img_disc_layers:int, patch_size: int, num_heads: int = 4):
         # Initialize discriminators
@@ -1165,15 +1081,18 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
     def _setup_optimizers(self, learning_rate: float, weight_decay: float) -> None:
         
-        def get_params(*modules):
+        def get_params(*modules, exclude_params=None):
             params = []
+            exclude_ids = {id(p) for p in (exclude_params or [])}
             for m in modules:
                 if m is None:
                     continue
                 if isinstance(m, nn.Module):
-                    params.extend([p for p in m.parameters() if p.requires_grad])
-                elif isinstance(m, nn.Parameter) and m.requires_grad:
-                    params.append(m)
+                    params.extend([p for p in m.parameters()
+                                if p.requires_grad and id(p) not in exclude_ids])
+                elif isinstance(m, nn.Parameter):
+                    if m.requires_grad and id(m) not in exclude_ids:
+                        params.append(m)
             return params
 
         def split_by_weight_decay(params, wd):
@@ -1184,7 +1103,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if decay:    groups.append({"params": decay,    "weight_decay": wd})
             if no_decay: groups.append({"params": no_decay, "weight_decay": 0.0})
             return groups
-        perceiver_params = get_params(self.perceiver_model, self.perceiver_projection)
+        
+        perceiver_params = get_params(self.perceiver_model)
         param_groups = []
         if perceiver_params:  # guard empty
             perceiver_groups = split_by_weight_decay(perceiver_params, weight_decay)
@@ -1194,19 +1114,29 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 if g.get("weight_decay", 0.0) > 0: g["weight_decay"] *= 0.5
             param_groups.extend(perceiver_groups)
 
-        trunk_modules = [self.encoder, self.decoder, self.prior, self._rnn, self.rnn_layer_norm]
+        trunk_modules = [self.encoder, self.decoder, self.prior, self._rnn, self.rnn_layer_norm, self.gram_loss]
 
-        head_modules = [
-            self.attention_prior_posterior, self.phi_attention, self.self_model,
+        # Collect special parameters that need different treatment
+        special_params = []
+        if hasattr(self, "POPL") and hasattr(self.POPL, "class_centres"):
+            special_params.append(self.POPL.class_centres)
+
+        head_modules = [self.attention_prior_posterior, self.phi_attention, self.self_model, self.POPL]
+        # Exclude special params from general head params
+        special_ids = {id(p) for p in special_params}  # identity set (hashable)
+        self.head_params = [
+            p
+            for m in head_modules if m is not None
+            for p in m.parameters()
+            if p.requires_grad and id(p) not in special_ids
         ]
-        self.head_params = [p for m in head_modules for p in m.parameters() if p.requires_grad]
 
-        scalar_params = [self.h0, self.c0, self.temporal_attention_temp]
+        scalar_params = [self.h0, self.c0]
 
-        
         param_groups.extend(split_by_weight_decay(get_params(*trunk_modules), weight_decay))
 
-        for g in split_by_weight_decay(get_params(*head_modules), weight_decay * 0.5):
+        # Use filtered head_params instead of recollecting
+        for g in split_by_weight_decay(self.head_params, weight_decay * 0.5):
             g["lr"] = learning_rate * 1.2
             param_groups.append(g)
 
@@ -1214,39 +1144,30 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if scalars:
             param_groups.append({"params": scalars, "lr": learning_rate * 0.1, "weight_decay": 0.0})
 
-        # Optional: POPL centres at a smaller LR, no WD
-        if hasattr(self, "POPL") and hasattr(self.POPL, "class_centres"):
-            param_groups.append({"params": [self.POPL.class_centres], "lr": learning_rate * 0.5, "weight_decay": 0.0})
+        # Now add POPL centres with special treatment
+        if special_params:
+            param_groups.append({"params": special_params, "lr": learning_rate * 0.5, "weight_decay": 0.0})
 
         self.gen_optimizer = torch.optim.Adam(
             param_groups, lr=learning_rate, betas=(0.9, 0.999), eps=1e-8
         )
-
-        # Shared modules = generator stack (enc/dec/prior/RNN/perceiver/attention/self_model + scalar knobs)
-        shared_modules = [
-            self.encoder, self.decoder, self.prior, self._rnn, self.rnn_layer_norm,
-            self.perceiver_model, self.perceiver_projection,
-            self.attention_prior_posterior, self.phi_attention, self.self_model,
-            self.h0, self.c0, self.temporal_attention_temp,
-        ]
-
-        self.log_mgda_share_params = []
-        for module in shared_modules:
-            if module is None:
-                continue
-            if isinstance(module, nn.Module):
-                self.log_mgda_share_params.extend([p for p in module.parameters() if p.requires_grad])
-            elif isinstance(module, nn.Parameter) and module.requires_grad:
-                self.log_mgda_share_params.append(module)
-
-        # --- LOG_MGDA for computing MGDA log-space weights (and optionally doing the update) ---
-        self.log_mgda = LOG_MGDA(
-            n_tasks=5,                                              # elbo, perceiver, predictive, orthogonal, adversarial
-            device=next(self.parameters()).device,                  # keep on GPU
-            params="shared",                                        # operate on shared trunk params
-            normalization="loss+",     # 'none' | 'l2' | 'loss' | 'loss+'
-            max_norm=self._grad_clip,                               # reuse grad clip
+    
+        self.loss_balancer = AdaptiveLossBalancer(
+            method=getattr(self, "loss_balance_method", "magnitude"),  # "grad_norm" | "magnitude" | "dynamic"
+            alpha=0.99,
+            temperature=2.0,
+            min_weight=0.01,
+            max_weight=5.0,
         )
+
+        # Base weights used as priors; scaled adaptively each step
+        self.base_task_weights = {
+            "elbo":        1.0,
+            "perceiver":   1.0,
+            "predictive":  1.0,
+            "orthogonal":  0.5,   # diversity/orthogonality is usually a bit softer
+            "adversarial": 1.0,   # further scaled by lambda_img at runtime
+        }
 
         # Discriminator optimizer (separate)
         if hasattr(self, 'image_discriminator'):
@@ -1294,17 +1215,18 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             actions = torch.zeros(batch_size, seq_len, self.action_dim).to(self.device)
         
         # Extract global context using Perceiver
-        if self.use_global_context:
-            context_sequence, cross_attention, perceiver_recon = self.compute_global_context(observations)
-        else:
-            context_sequence = []
-            cross_attention = None
-            perceiver_recon = None
+        T_ctx = max(1, min(self.context_window_size, seq_len - 1))
+        context_sequence, context_info = self.compute_global_context(
+            observations,
+            num_context_frames=T_ctx,  # Use the computed context length
+            train=self.training,
+            generate_future=False
+        )
         
         # Initialize LSTM hidden states
         h = self.h0.expand(self.number_lstm_layer, batch_size, -1).contiguous()
         c = self.c0.expand(self.number_lstm_layer, batch_size, -1).contiguous()
-        
+        c_prev = torch.zeros(batch_size, self.context_dim).to(self.device)
         # Storage for outputs
         outputs = {
             'observations': observations,
@@ -1341,11 +1263,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             a_t = actions[:, t]
             
             # Get context (global or local)
-            if self.use_global_context:
-                c_t = context_sequence[:, t]
-            else:
-                c_t = self.compute_local_context(observations, t)
-            
+            c_t = context_sequence[:, t]
             outputs['context_states'].append(c_t)
             
             #Inference Network q(z_t|o_≤t, z_<t) 
@@ -1413,7 +1331,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             outputs['group_assignments'] = self.attention_prior_posterior.posterior_net.group_assignments
             outputs['slot_features']       = self.attention_prior_posterior.posterior_net.slot_features
             # === Prior Network p(z_t|o_<t, z_<t) ===
-            h_context = torch.cat([h[-1], c_t], dim=-1)
+            h_context = torch.cat([h[-1], c_prev], dim=-1)
             
             # Get DP-GMM prior distribution
             prior_dist, prior_params = self.prior(h_context)
@@ -1506,12 +1424,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     prev_pred = outputs['self_predictions'][t-1]
                     att_pred_dist = prev_pred['distributions']['attention_dist']
 
-                    att_loss = -att_pred_dist.log_prob(attention_state.detach()).mean()
+                    att_loss = -att_pred_dist.log_prob(attention_state).mean()
                     outputs['self_att_prediction_loss'].append(att_loss)
                 # Compute self-model KL losses
             
-            # === Update recurrent state ===
-            
+            c_prev = c_t
             rnn_input = torch.cat([z_t, c_t, attention_state, a_t], dim=-1)
             rnn_output, (h, c) = self._rnn(
                 rnn_input, h, c, 
@@ -1543,31 +1460,18 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             outputs['future_att_bonus'] = torch.tensor(0.0).to(self.device)
         
         # Perceiver loss
-        B, T, C, H, W = observations.shape
-        obs_flat = observations.permute(0, 1, 3, 4, 2).contiguous().reshape(B, T, H*W, C)  # [B, T, (H*W), C]
-        mse_all = (perceiver_recon - obs_flat).pow(2)  # [(B*T), (H*W), C]
-        per_frame = mse_all.mean(dim=(2, 3))                                                 # [(B,T)]
-        per_episode = per_frame.view(B, T).mean(dim=1)                                       # [B]  (episode-wise MSE)
     
-        outputs['perceiver_loss'] = per_episode.mean() # scalar for optimization
+        outputs['perceiver_vq_loss'] = context_info["vq_loss"] # scalar for optimization
         
         # Add auxiliary outputs
         outputs['context_sequence'] = context_sequence
-        outputs['cross_attention'] = cross_attention
-        outputs['perceiver_recon'] = perceiver_recon.reshape(B * T, H * W, C)
+        outputs['perceiver_ce_loss'] = context_info["ce_loss"]
+        outputs['perceiver_perceptual_loss'] = context_info["perceptual_loss"]
+        outputs['perceiver_total_loss'] = context_info["total_loss"]
 
         return outputs
 
     
-    def generate_mock_input(self):
-        # Change to match [-1, 1] range used in actual training
-        return {
-            'image': torch.from_numpy(
-                # Change to match [-1, 1] range used in actual training
-                (np.random.random((1, self.image_size*self.image_size, self.input_channels)) * 2 - 1)
-                .astype(np.float32)
-            ).to(self.device),
-        }
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
         # Encode
         z, z_mean, z_logvar, h = self.encoder(x)
@@ -1600,7 +1504,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                            lambda_recon=1.0, 
                            lambda_att_dyn=0.1, 
                            lambda_att=0.1, 
-                           lambda_gram=0.05):
+                           lambda_gram=0.05,
+                           ):
         """
         Corrected loss computation recognizing that kumar_beta_kl already includes alpha prior KL
         """
@@ -1626,7 +1531,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         losses['cluster_entropy'] = torch.stack(outputs['cluster_entropies']).mean() if outputs['cluster_entropies'] else torch.tensor(0.0).to(self.device)
         
         # Auxiliary losses
-        losses['perceiver_loss'] = outputs['perceiver_loss'] 
+        losses['perceiver_loss'] = outputs['perceiver_total_loss']
 
 
         slot_features = outputs.get('slot_features', None)
@@ -1822,8 +1727,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         Compute adversarial losses for both image and latent space
         """
         # Image sequence adversarial loss
-        for p in self.image_discriminator.parameters():
-            p.requires_grad_(False)
+        
         fake_img_outputs = self.image_discriminator(reconstruction, z=z_seq, return_features=True)
         img_adv_loss = -torch.mean(fake_img_outputs['final_score'])
         #reward for generating temporally consistent images
@@ -1843,85 +1747,161 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # L1 loss between feature statistics
         feature_match_loss = self.compute_feature_matching_loss(real_features, fake_img_outputs['hidden_3d'])
-        for p in self.image_discriminator.parameters():
-            p.requires_grad_(True)
+
         return img_adv_loss , temporal_loss_frames, feature_match_loss
       
-    def compute_global_context(self, observations):
+    def compute_global_context(
+        self, 
+        videos, 
+        num_context_frames,
+        train=True,
+        generate_future=False,  # Control whether to generate or use GT
+    ):
         """
-        Process entire sequence through Perceiver for global context
-        
-        Args:
-            observations: [batch_size, seq_len, channels, height, width]
-        
-        Returns:
-            context: [batch_size, seq_len, context_dim]
-            cross_attention: [batch_size, seq_len, num_heads, spatial_dim]
+        Unified context computation for training and generation.
+        temporal_context: [B, T_total, C_ctx]
         """
-        batch_size, seq_len, channels, H, W = observations.shape
-        t_emb = perceiver_helpers.sinusoidal_time_embedding(seq_len, channels, observations.device)
-        t_emb = t_emb.view(1,seq_len, channels, 1, 1)
-        observations = observations + t_emb  # Add time embedding to each frame
-        # Flatten observations for perceiver
-        obs_flat = observations.permute(0, 1, 3, 4, 2).reshape(batch_size * seq_len, H * W, channels)
+        B, T_input = videos.shape[:2]
+        Ht = Wt = None
+        generated_videos = None
+        ce_loss = perceptual_loss = None
+        ce_loss = torch.tensor(0.0, device=self.device)
+        perceptual_loss = torch.tensor(0.0, device=self.device)
+        total_loss = torch.tensor(0.0, device=self.device)
 
-        # Process through perceiver
-        perceiver_output = self.perceiver_model({'image': obs_flat}, is_training=True)
-        latents = perceiver_output[self.out_keys.LATENTS]['image']
-        #Perceiver latents shape: torch.Size([50, 2048, 128]) [batch_size* seq_len, ?, ?]
-        # Extract reconstruction for perceiver loss
-        perceiver_recon = perceiver_output[self.out_keys.INPUT_RECONSTRUCTION]['image']
 
-        perceiver_recon = perceiver_recon.reshape(batch_size, seq_len, H * W, channels)
-        # Project to context dimension
-        
-        context, _ = self.perceiver_projection(latents)
-        context = context.reshape(batch_size, seq_len, self.context_dim)
-        
-        # Extract cross-attention patterns for attention schema
-        # Note: This would require modifying perceiver to expose attention weights
-        cross_attention = self._extract_perceiver_attention(perceiver_output)
-        
-        return context, cross_attention, perceiver_recon
-    
-    def compute_local_context(self, observations, t):
-        """
-        Compute context using local window around time t
-        
-        Args:
-            observations: [batch_size, seq_len, channels, height, width]
-            t: current timestep
-        
-        Returns:
-            context: [batch_size, context_dim]
-        """
-        batch_size, seq_len = observations.shape[:2]
-        
-        # Define window boundaries
-        window_start = max(0, t - self.context_window_size // 2)
-        window_end = min(seq_len, t + self.context_window_size // 2 + 1)
-        
-        # Extract local observations
-        local_obs = observations[:, window_start:window_end]  # [batch_size, window_size, C, H, W]
-        B, Wlen, C, H, W = local_obs.shape
-        local_obs_flat = local_obs.permute(0, 1, 3, 4, 2).reshape(B * Wlen, H * W, C)  # [batch_size*window_size, H*W, C]
-        # Process through perceiver
-        perceiver_output = self.perceiver_model({'image': local_obs_flat}, is_training=True)
-        latents = perceiver_output[self.out_keys.LATENTS]['image']
-        
-        # Average pool over the window and project
-        latents = latents.reshape(batch_size, window_end - window_start, -1)
-        #compute temporal distances from current time t
-        distances = torch.abs(torch.arange(window_start, window_end, dtype=torch.float32, device=observations.device) - t)
-        attention_weights= F.softmax(-distances/self.temporal_attention_temp, dim=-1).unsqueeze(0).unsqueeze(-1) # [1, window_size, 1]
-        latents = latents* attention_weights.expand(batch_size, -1, latents.shape[-1])  # Apply attention weights
-        
-        # Average over the window
-        latents = latents.sum(dim=1, keepdim=True).transpose(1, 2)   # [batch_size, latent_dim. 1]
-        context, _ = self.perceiver_projection(latents).squeeze()
-        
-        return context
-    
+        if not generate_future:
+            # ==========================
+            # TRAIN / EVAL WITH GT CONTEXT
+            # ==========================
+            T_total = T_input
+            T_ctx = num_context_frames
+            T_pred = T_total - T_ctx
+
+            # 1) One Perceiver forward for FUTURE prediction
+            perceiver_outputs = self.perceiver_model(
+                videos,
+                num_context_frames=T_ctx,
+                return_dict=True
+            )
+            
+            # If encoder_latents doesn't exist or has wrong shape, compute it:
+            if "encoder_latents" in perceiver_outputs:
+                ctx_future_raw = perceiver_outputs["encoder_latents"]
+                
+                # Verify shape
+                if ctx_future_raw.shape[1] != T_pred:
+                    # Need to extract properly
+                    future_token_ids, _, _, _ = self.perceiver_model.tokenizer.encode(videos[:, T_ctx:])
+                    future_encoder_out = self.perceiver_model.model.encoder(future_token_ids)
+                    ctx_future = self.perceiver_model.model.extract_temporal_bottleneck(
+                        future_encoder_out.last_hidden_state, T_pred
+                    )
+                else:
+                    ctx_future = ctx_future_raw
+            else:
+                # Fallback: compute future context explicitly
+                future_token_ids, _, _, _ = self.perceiver_model.tokenizer.encode(videos[:, T_ctx:])
+                future_encoder_out = self.perceiver_model.model.encoder(future_token_ids)
+                ctx_future = self.perceiver_model.model.extract_temporal_bottleneck(
+                    future_encoder_out.last_hidden_state, T_pred
+                )
+            
+            vq_loss = perceiver_outputs.get("vq_loss", 0.0)
+            Ht = perceiver_outputs.get("Ht")
+            Wt = perceiver_outputs.get("Wt")
+
+            # 2) PAST temporal context (no future leakage)
+            token_ids_ctx, _, _, _ = self.perceiver_model.tokenizer.encode(videos[:, :T_ctx])
+            enc_ctx = self.perceiver_model.model.encoder(token_ids_ctx)
+            ctx_past = self.perceiver_model.model.extract_temporal_bottleneck(
+                enc_ctx.last_hidden_state, T_ctx
+            )
+
+            # 3) Concatenate and project
+            temporal_context = torch.cat([ctx_past, ctx_future], dim=1)
+            
+            # IMPORTANT: Ensure shapes are correct
+            assert temporal_context.shape == (B, T_total, self.perceiver_model.model.num_latent_channels), \
+                f"Shape mismatch: {temporal_context.shape}"
+            
+
+            # 4) Losses
+            if train:
+                losses = self.perceiver_model.compute_loss(
+                    perceiver_outputs,
+                    target_videos=videos[:, T_ctx:],
+                    perceptual_weight=0.5,
+                    label_smoothing=0.1,
+                )
+                ce_loss = losses["ce_loss"]
+                perceptual_loss = losses["perceptual_loss"]
+                total_loss = losses["loss"]
+            return temporal_context, {
+                "vq_loss": vq_loss,
+                "ce_loss": ce_loss,
+                "perceptual_loss": perceptual_loss,
+                "total_loss": total_loss,
+                "Ht": Ht, 
+                "Wt": Wt,
+                "generated_videos": None,
+            }
+
+        else:
+            # ==========================
+            # GENERATION: AR predict future
+            # ==========================
+            with torch.no_grad():
+                T_input = videos.shape[1]
+                T_ctx = num_context_frames
+
+                
+                # 1) PAST context from GT
+                token_ids_ctx, _, _, _ = self.perceiver_model.tokenizer.encode(videos)
+                Ht, Wt = token_ids_ctx.shape[-2:]
+                enc_ctx = self.perceiver_model.model.encoder(token_ids_ctx)
+                ctx_past = self.perceiver_model.model.extract_temporal_bottleneck(
+                    enc_ctx.last_hidden_state, T_ctx
+                )
+
+                # 2) Determine future frames
+                num_future_frames = T_input - T_ctx
+
+                # 3) Generate future
+                generated_videos = self.perceiver_model.generate_autoregressive(
+                    context_videos=videos[:,:T_ctx],
+                    num_frames_to_generate=num_future_frames,
+                    temperature=1.0,
+                    top_k=50,
+                    top_p=0.9,
+                )
+
+                # 4) Extract future context
+                future_videos = generated_videos[:, T_ctx:T_ctx+num_future_frames]
+                
+                # Ensure we have frames to encode
+                if future_videos.shape[1] > 0:
+                    token_ids_future, _, _, _ = self.perceiver_model.tokenizer.encode(future_videos)
+                    enc_future = self.perceiver_model.model.encoder(token_ids_future)
+                    ctx_future = self.perceiver_model.model.extract_temporal_bottleneck(
+                        enc_future.last_hidden_state, num_future_frames
+                    )
+                else:
+                    # Fallback: repeat last context
+                    ctx_future = ctx_past[:, -1:].repeat(1, num_future_frames, 1)
+
+                # 5) Concatenate and project
+                temporal_context = torch.cat([ctx_past, ctx_future], dim=1)
+
+                return temporal_context, {
+                    "vq_loss": None,
+                    "ce_loss": None,
+                    "perceptual_loss": None,
+                    "Ht": Ht, 
+                    "Wt": Wt,
+                    "generated_videos": generated_videos,
+                } 
+              
     def self_model_step(self, h_t, z_t, attention_t, a_t, current_time, context_t=None):
         """
         Predict next internal states using self-model
@@ -1959,62 +1939,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         }
         
 
-    def _extract_perceiver_attention(self, perceiver_output):
-        """
-        Extract cross-attention weights from perceiver blocks
-        """
-        attention_maps = []
-        
-        # The perceiver model structure has blocks with cross-attention
-        for i, block in enumerate(self.perceiver_model.blocks):
-            # Each PerceiverBlock has a projector (HiPCrossAttention)
-            if hasattr(block, 'projector') and hasattr(block.projector, '_attention_weights'):
-                attention_weights = block.projector._attention_weights
-                
-                if attention_weights is not None:
-                    # attention_weights shape: [batch*groups, num_heads, queries, keys]
-                    # We need to reshape and process these weights
-                    
-                    batch_size, num_groups, num_heads, Q, K = attention_weights.shape
-                    
-                    # Reshape to separate batch and groups
-                    #print(f"Extracting attention weights from block {i} with shape {attention_weights.shape}, batch_size {batch_size}, num_groups {num_groups}")
-                    attention_weights = attention_weights.view(
-                        batch_size, num_groups, 
-                        attention_weights.shape[2],  # num_heads
-                        attention_weights.shape[3],  # queries
-                        attention_weights.shape[4]   # keys
-                    )
-                    
-                    # Average over heads and groups for visualization
-                    attention_avg = attention_weights.mean(dim=[1, 2])  # [batch, queries, keys]
-                    
-                    attention_maps.append(attention_avg)
-        
-        # Use the processor block (middle block) attention as primary
-        processor_idx = len(self.perceiver_model.blocks) // 2
-        
-        if processor_idx < len(attention_maps) and len(attention_maps) > 0:
-            primary_attention = attention_maps[processor_idx]
-            
-            # Reshape to spatial format if needed
-            # Assuming the keys correspond to flattened spatial positions
-            seq_len = primary_attention.shape[-1]
-            spatial_size = int(np.sqrt(seq_len))
-            
-            if spatial_size * spatial_size == seq_len:
-                # Reshape to spatial attention map
-                primary_attention = primary_attention.view(
-                    primary_attention.shape[0], 
-                    primary_attention.shape[1], 
-                    spatial_size, 
-                    spatial_size
-                )
-            
-            return primary_attention
-        
-        # If no attention found, return None
-        return None
     
     def prepare_images_for_training(self, images):
         """
@@ -2121,28 +2045,45 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         adv_loss = lambda_img_eff * (img_adv_loss + temporal_adv_loss + feat_match_loss)
         
+        # ---- Adaptive loss balancing (ALB) ----
+        loss_dict = {
+            "elbo":        elbo_loss.reshape([]),
+            "perceiver":   perceiver_loss.reshape([]),
+            "predictive":  predictive_loss.reshape([]),
+            "orthogonal":  orth_loss.reshape([]),
+            "adversarial": adv_loss.reshape([]),
+        }
 
-        task_losses = [elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]
-        
-        self.gen_optimizer.zero_grad(set_to_none=True)
-        
-        weighted_loss, extra = self.log_mgda.get_weighted_loss(
-            losses=task_losses,
-            shared_parameters=list(self.log_mgda_share_params),
-            last_shared_parameters=None,
-            representation=None,
+        # Compute adaptive weights (grad_norm uses per-loss autograd.grad with retain_graph)
+        weights = self.loss_balancer.balance_losses(
+            losses=loss_dict,
+            base_weights=self.base_task_weights,
+            model=self,  # needed for 'grad_norm' method
         )
-        weighted_loss.backward()
+
+        # Scalar combined loss
+        total_loss = sum(weights[name] * loss_dict[name] for name in loss_dict.keys())
+
+        # Standard backward + step
+        self.gen_optimizer.zero_grad(set_to_none=True)
+        total_loss.backward()
+
         torch.nn.utils.clip_grad_norm_(self.head_params, self._grad_clip * 0.5)
 
         self.gen_optimizer.step()
 
-        # --- for logging: MGDA weights (on CPU as floats) ---
-        sol = extra["weights"].cpu().numpy()
-
-        task_names = ['elbo', 'perceiver', 'predictive', 'orthogonal', 'adversarial']
-        weight_dict = {f'weight_{name}': float(sol[i]) for i, name in enumerate(task_names)}
-
+        # For logging: ALB weights and stats
+        alb_weight_log = {f"alb_w_{k}": float(weights[k]) for k in weights.keys()}
+        alb_stats_raw = self.loss_balancer.get_statistics()  # includes grad norms & loss EMAs
+        alb_stats = {}
+        for key, value in alb_stats_raw.items():
+            if isinstance(value, dict):
+                # Flatten nested dict 
+                for sub_key, sub_value in value.items():
+                    alb_stats[f"{key}_{sub_key}"] = float(sub_value) if not isinstance(sub_value, (int, float)) else sub_value
+            else:
+                alb_stats[key] = float(value) if not isinstance(value, (int, float)) else value
+        
         grad_norm_sq = 0.0
         for group in self.gen_optimizer.param_groups:
             for p in group['params']:
@@ -2180,7 +2121,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             **vae_losses,
             # Discriminators
             **avg_disc_losses,
-            **weight_dict,
+            **alb_weight_log,  
+            **alb_stats,
             # Adversarial gen
             'img_adv_loss': float(img_adv_loss.item()),
             'temporal_adv_loss': float(temporal_adv_loss.item()),
@@ -2226,47 +2168,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.ema_decoder.restore()
         return samples
 
-    def get_cluster_statistics(self, x: torch.Tensor) -> Dict[str, Union[float, torch.Tensor]]:
-        """
-        Get detailed clustering statistics for a batch of data.
 
-        """
-        with torch.no_grad():
-            # Forward pass
-            reconstruction, params = self.forward(x)
-
-            # Get entropy and clustering statistics
-            _, cluster_stats = self.compute_conditional_entropy(
-                params['prior_dist'].mixture_distribution.logits,
-                params
-            )
-
-            # Compute additional statistics
-            cluster_stats.update({
-               'reconstruction_error': nn.MSELoss()(reconstruction, x).item(),
-               'cluster_assignments': params['prior_dist'].mixture_distribution.probs.argmax(1),
-               'cluster_proportions': params['pi'].mean(0)
-            })
-
-            # Add dimensionality information
-            cluster_stats.update({
-              'n_samples': x.shape[0],
-              'n_clusters': self.max_K,
-              'latent_dim': self.latent_dim
-            })
-
-            # Add entropy-based clustering quality metrics
-            probs = params['prior_dist'].mixture_distribution.probs
-            eps = torch.finfo(torch.float32).eps
-            cluster_entropy = -torch.sum(probs * torch.log(probs + eps), dim=1)
-            cluster_stats.update({
-              'min_entropy': cluster_entropy.min().item(),
-              'max_entropy': cluster_entropy.max().item(),
-              'mean_entropy': cluster_entropy.mean().item()
-            })
-
-        return cluster_stats
-    
     def sample_next_latent(self, h_t, c_t, temperature=1.0):
         """
         Sample z_{t+1} from the DPGMM prior given current hidden state and context
@@ -2357,20 +2259,26 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             # 1. Encode initial observation
             z_0, _, _, _ = self.encoder(initial_obs)
             generated_latents.append(z_0)
-            
-            # 2. Get initial context
-            if self.use_global_context and context_window is not None:
-                # Use perceiver for global context
-                context_sequence, _, _ = self.compute_global_context(context_window)
-                c_0 = context_sequence[:, -1]  # Use last context
-            else:
-                # Use current observation for context
-                c_0 = self.compute_local_context(initial_obs.unsqueeze(1), 0)
+            padding_frames = torch.zeros(
+                batch_size, horizon - 1, *initial_obs.shape[1:]
+            ).to(device)
+            extended_context = torch.cat([context_window, padding_frames], dim=1)
+
+            # 2. Get initial context (TODO: how to pass the predicted context correctly??)
+            context_sequence, _= self.compute_global_context(
+                extended_context,
+                num_context_frames=1,
+                train=False,
+                generate_future=True  # generation mode
+            )
+
             
             # 3. Initialize LSTM states
             h = self.h0.expand(self.number_lstm_layer, batch_size, -1).contiguous()
             c = self.c0.expand(self.number_lstm_layer, batch_size, -1).contiguous()
-            
+            c_prev = torch.zeros(batch_size, self.context_dim, device=device)
+
+
             # 4. Initialize attention
             attention_map = torch.ones(
                 batch_size, 
@@ -2378,7 +2286,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 self.attention_resolution
             ).to(device) / (self.attention_resolution ** 2)
             attention_map, attention_coords = self.attention_prior_posterior._compute_posterior_attention(
-                self.encoder, initial_obs, h[-1], c_0, detach=False
+                self.encoder, initial_obs, h[-1], context_sequence[:, 0], detach=False
             )
             # Process initial step through VRNN
             
@@ -2394,19 +2302,16 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             phi_attention = phi_attention_mean + phi_attention_std * torch.randn_like(phi_attention_std).to(device)
             attention_uncertainties.append(phi_attention_std.mean(dim=-1))
 
-            
             # Update LSTM
-            rnn_input = torch.cat([z_0, c_0, phi_attention, initial_action], dim=-1)
+            rnn_input = torch.cat([z_0, c_prev, phi_attention, initial_action], dim=-1)
             _, (h, c) = self._rnn(rnn_input, h, c, torch.ones(batch_size).to(device))
             
-            current_h = h[-1]
-            current_c_t = c_0
             current_action = initial_action
             
             # 5. Generate future sequence
             for t in range(horizon):
                 # Sample next latent from DPGMM prior
-                z_next, prior_info = self.sample_next_latent(current_h, current_c_t, temperature)
+                z_next, prior_info = self.sample_next_latent(h[-1], c_prev, temperature)
                 generated_latents.append(z_next)
                 
                 # Decode to observation
@@ -2415,7 +2320,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 
                 # Update attention using prior network
                 attention_map, attention_info = self.attention_prior_posterior.prior_net(
-                    attention_map, current_h, z_next
+                    attention_map, h[-1], z_next
                 )
                 generated_attentions.append(attention_map)
                 
@@ -2444,12 +2349,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 attention_uncertainties.append(phi_attention_std.mean(dim=-1))
                 phi_attention = phi_attention_mean + phi_attention_std * torch.randn_like(phi_attention_std).to(device)
 
-                
-                rnn_input = torch.cat([z_next, current_c_t, phi_attention, current_action], dim=-1)
+
+                rnn_input = torch.cat([z_next, context_sequence[:, t], phi_attention, current_action], dim=-1)
                 _, (h, c) = self._rnn(rnn_input, h, c, torch.ones(batch_size).to(device))
-                
-                current_h = h[-1]
-                hidden_states.append(current_h)
+                c_prev = context_sequence[:, t]
+                hidden_states.append(h[-1])
                 
         
         # Stack results
@@ -2469,7 +2373,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'attention_uncertainties': torch.stack(attention_uncertainties, dim=1),
             'attention_coords': torch.stack(generated_attention_coords, dim=1),
             'hidden_states': torch.stack(hidden_states, dim=1) if hidden_states else None,
-            'initial_context': c_0
+            'context': context_sequence,
         }
     
     def visualize_attention_comparison(self, observations, predicted_attention, 

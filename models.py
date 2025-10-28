@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from typing import Optional, Tuple, Dict, Union, List
-from VRNN.perceiver.Utils import RopePositionEmbedding  # spatial RoPE
+from VRNN.perceiver.utilities import RopePositionEmbedding  # spatial RoPE
 
 import logging
 import functools

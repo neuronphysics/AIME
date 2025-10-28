@@ -18,7 +18,7 @@ from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoenc
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
 from torch.utils.data._utils.collate import default_collate
 from VRNN.grad_diagnostics import GradDiagnosticsAggregator  
-os.environ["MPLBACKEND"] = "Agg"  # must be set before importing matplotlib.pyplot
+os.environ["MPLBACKEND"] = "Agg"  
 import matplotlib
 matplotlib.use("Agg", force=True)
 plt.ioff()
@@ -41,16 +41,6 @@ class HumanoidAwareZoomTransform:
     """
     Zoom-crop augmentation for sequences shaped [T, C, H, W].
 
-    Goals:
-      - Apply the SAME crop to all frames (time-consistent).
-      - Keep the humanoid inside the crop.
-      - Position the humanoid near a CORNER of the crop (off-center), to reduce center bias.
-      - Resize back to the original (H, W) so downstream shapes stay unchanged.
-
-    Expected `sample` keys:
-      - sample["observations"]: torch.Tensor [T, C, H, W], dtype float/half/int.
-      - Optional: sample[center_key] containing humanoid center in normalized coords [-1, 1]
-          * Either shape [2], [T, 2], or [*, 2] .
 
     """
 
@@ -150,11 +140,6 @@ class HumanoidAwareZoomTransform:
         """
         Choose the CROP CENTER (normalized) so that the humanoid appears near a corner INSIDE the crop.
 
-        Idea:
-          - Inside the crop patch, we want the humanoid located at ~70-85% toward a corner.
-          - Convert that desired in-crop position into an offset in normalized units,
-            then subtract from the humanoid center to get the required crop center.
-          - Clamp crop center so the crop box stays fully inside the image.
         """
         # Pick a random corner and a target proximity within [corner_min, corner_max].
         ux = random.uniform(self.corner_min, self.corner_max)
@@ -268,7 +253,6 @@ class TFRecordConverter:
         reversible compression transforms, revealing the underlying visual manifold.
         """
         
-        
         try:
             # Phase 1: Decompress using zlib
             decompressed = zlib.decompress(obs_bytes)
@@ -279,7 +263,6 @@ class TFRecordConverter:
             # Phase 3: Reshape to canonical dimensions
             height, width, channels = target_shape
     
-            
             return obs_array.reshape(height, width, channels)        
                 
         except zlib.error as e:
@@ -290,11 +273,6 @@ class TFRecordConverter:
     def parse_tfrecord_episode(tfrecord_path: Path, action_dim:int) -> Dict[str, np.ndarray]:
         """
         Robust TFRecord parser acknowledging compressed observation encoding
-        
-        This implementation synthesizes insights from:
-        - Information-theoretic compression principles
-        - Empirical data morphology analysis
-        - Canonical DMC-VB preprocessing pipelines
         """
         
         dataset = tf.data.TFRecordDataset(str(tfrecord_path))
@@ -676,12 +654,6 @@ def count_parameters(model, print_details=True):
     """
     Count the number of parameters in a model
     
-    Args:
-        model: PyTorch model
-        print_details: If True, print detailed breakdown
-    
-    Returns:
-        dict with parameter counts
     """
     
     
@@ -782,7 +754,7 @@ class GradientMonitor:
         return {
             'encoder': ['encoder.net', 'encoder.proj'],
             'decoder': ['decoder.net'],
-            'perceiver': ['perceiver_model', 'perceiver_projection'],
+            'perceiver': ['perceiver_model' ],
             'prior_dynamics': ['prior.stick_breaking.kumar_net', 'prior.component_nn'],
             'attention_schema': ['attention_prior_posterior'],
             'vrnn_core': ['_rnn', 'rnn_layer_norm'],
@@ -1086,7 +1058,7 @@ class DMCVBTrainer:
                      wandb.log({
                          'eval/samples': wandb.Image(
                         torchvision.utils.make_grid(
-                            self.denormalize_image(samples), nrow=4, normalize=True, value_range=(0, 1)
+                            self.denormalize_for_grid(samples), nrow=4
                         )
                     )
                      })
@@ -1105,14 +1077,12 @@ class DMCVBTrainer:
         self,
         max_B: int = 1,
         max_T: int = 4,
-        disable_perceiver_grad: bool = True,
         include_adv_in_diag: bool = True,
         use_amp: bool = True,
     ):
         """
         One-shot gradient diagnostics on a tiny (B,T) slice to avoid OOM.
         """
-        # Keep most modules in eval(), but force the RNN to train() so cuDNN allows backward
 
         self.model.eval()
 
@@ -1129,9 +1099,6 @@ class DMCVBTrainer:
 
         # Optionally prevent backprop through Perceiver to save memory
         
-        was_global_ctx = getattr(self.model, "use_global_context", True)
-        if disable_perceiver_grad:
-            self.model.use_global_context = False  # skip compute_global_context() during forward
 
         amp_ctx = (torch.amp.autocast('cuda',dtype=torch.bfloat16) if use_amp else contextlib.nullcontext())
         with torch.set_grad_enabled(True), amp_ctx:
@@ -1171,7 +1138,7 @@ class DMCVBTrainer:
                 for p in D.parameters():
                     p.requires_grad_(True)
             else:
-                adv_loss = torch.zeros((), device=obs.device)
+                adv_loss = torch.zeros((), device=obs.device, requires_grad=True)
 
             task_losses      = [elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]
 
@@ -1186,9 +1153,6 @@ class DMCVBTrainer:
                 param_patterns=None,  # or None to include ALL trainable params
             )
 
-        # Restore model global-context flag
-        if disable_perceiver_grad:
-            self.model.use_global_context = was_global_ctx
 
         # Log the figures once (cosine heatmap, etc.)
         self._agg.tensorboard_log(self.writer, tag_prefix="diag/grads", global_step=getattr(self.grad_monitor, "global_step", 0))  # :contentReference[oaicite:5]{index=5}
@@ -1324,7 +1288,6 @@ class DMCVBTrainer:
                     else:
                         axes[row, 2].set_title('No Perceiver'); axes[row, 2].axis('off')
 
-                    # ---------- 4–7) OpenCV attention visualizations ----------
                     # The posterior is attached to the model; pass the single image with batch dim
                     att_post = self.model.attention_prior_posterior.posterior_net
 
@@ -1565,6 +1528,12 @@ class DMCVBTrainer:
         if squeeze_batch:
             img = img[0]
         return img
+    
+    def denormalize_for_grid(self, img):
+        """For torchvision.make_grid: [-1,1] → [0,1] float"""
+        img = (img + 1) / 2
+        return torch.clamp(img, 0, 1)
+
 
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save model checkpoint"""
@@ -1604,7 +1573,7 @@ class DMCVBTrainer:
             
             # Evaluate
             eval_metrics = self.evaluate(epoch)
-            self.run_grad_diag(max_B=1, max_T=self.episode_length, disable_perceiver_grad=False, use_amp=True)            
+            self.run_grad_diag(max_B=1, max_T=self.episode_length, use_amp=True)            
             # Combine metrics
             all_metrics = {**train_metrics, **eval_metrics}
             
@@ -1663,17 +1632,16 @@ def main():
         'max_components': 15,
         'latent_dim': 32,
         'hidden_dim': 32, #must be divisible by 8
-        'context_dim': 64,
+        'context_dim': 128,
         'attention_dim': 20,
         'attention_resolution': 16,
         'input_channels': 3*1,  # 3 stacked frames
-        'HiP_type': 'Mini',
         'prior_alpha': 6.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 8,
+        'batch_size': 12,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
@@ -1720,17 +1688,16 @@ def main():
         input_dim=config['img_height'],
         latent_dim=config['latent_dim'],
         hidden_dim=config['hidden_dim'],
-        context_dim=config['context_dim'],
+        num_latent_channels_perceiver=config['context_dim'],
         attention_dim=config['attention_dim'],
         action_dim=action_dim,
         sequence_length=config['sequence_length'],
-        img_disc_channels=64,
+        img_perceiver_channels=64,
         img_disc_layers=2,
         disc_num_heads = config["disc_num_heads"] if "disc_num_heads" in config else 4,
         device=device,
         input_channels=config['input_channels'],
         learning_rate=config['learning_rate'],
-        HiP_type=config['HiP_type'],
         attention_resolution=config['attention_resolution'],
         grad_clip= config['grad_clip'],
         prior_alpha =config['prior_alpha'],
