@@ -904,6 +904,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             downsample=self.downsample_perceiver,
             dropout=self.dropout,
             base_channels=self.img_perceiver_channels,
+            use_3d_conv= True,
+            temporal_downsample= True,
             num_quantizers=1,
         )
 
@@ -980,40 +982,62 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.self_model.enable_checkpointing()
 
     def init_weights(self, module: nn.Module):
-        """Initialize the weights using the typical initialization schemes """
+        """Initialize the weights using the typical initialization schemes."""
         if isinstance(module, nn.Linear):
-           nn.init.trunc_normal_(module.weight, std=0.02)
-           if module.bias is not None:
-              nn.init.zeros_(module.bias)
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
         elif isinstance(module, nn.Embedding):
-           nn.init.trunc_normal_(module.weight, std=0.02)
-           if module.padding_idx is not None:
-              module.weight.data[module.padding_idx].zero_()
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
         elif isinstance(module, nn.Conv2d):
-           nn.init.kaiming_normal_(module.weight,
-                                   mode='fan_out',
-                                   nonlinearity='relu')
-           if module.bias is not None:
-              nn.init.zeros_(module.bias)
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
         elif isinstance(module, nn.ConvTranspose2d):
-           nn.init.kaiming_normal_(module.weight,
-                                   mode='fan_out',
-                                   nonlinearity='relu')
-           if module.bias is not None:
-              nn.init.zeros_(module.bias)
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.Conv3d):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.ConvTranspose3d):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
         elif isinstance(module, nn.MultiheadAttention):
-           # Initialize q, k, v projections
-           if module.in_proj_weight is not None:
-              nn.init.xavier_uniform_(module.in_proj_weight)
-           if module.out_proj.weight is not None:
-              nn.init.xavier_uniform_(module.out_proj.weight)
-           if module.in_proj_bias is not None:
-              nn.init.zeros_(module.in_proj_bias)
-           if module.out_proj.bias is not None:
-              nn.init.zeros_(module.out_proj.bias)
-        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
-           nn.init.ones_(module.weight)
-           nn.init.zeros_(module.bias)
+            # qkv packed in in_proj_weight; out proj separate
+            if module.in_proj_weight is not None:
+                nn.init.xavier_uniform_(module.in_proj_weight)
+            if module.out_proj.weight is not None:
+                nn.init.xavier_uniform_(module.out_proj.weight)
+            if module.in_proj_bias is not None:
+                nn.init.zeros_(module.in_proj_bias)
+            if module.out_proj.bias is not None:
+                nn.init.zeros_(module.out_proj.bias)
+
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm2d, nn.BatchNorm3d, nn.GroupNorm)):
+            if hasattr(module, 'weight') and module.weight is not None:
+                nn.init.ones_(module.weight)
+            if hasattr(module, 'bias') and module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.LSTM):
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param.data)
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param.data)
+                elif 'bias' in name:
+                    nn.init.constant_(param.data, 0)
 
     def contrastive_loss(
         self,
@@ -1165,7 +1189,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "elbo":        1.0,
             "perceiver":   1.0,
             "predictive":  1.0,
-            "orthogonal":  0.5,   # diversity/orthogonality is usually a bit softer
+            "orthogonal":  1.0,   # diversity/orthogonality is usually a bit softer
             "adversarial": 1.0,   # further scaled by lambda_img at runtime
         }
 
@@ -1255,7 +1279,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'gram_enc': [],
             'K_eff': [],
         }
-        
+        outputs['perceiver_reconstructed_img'] = context_info['reconstruct']
         # Process sequence step by step
         for t in range(seq_len):
             # Get current inputs
@@ -1428,12 +1452,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     outputs['self_att_prediction_loss'].append(att_loss)
                 # Compute self-model KL losses
             
-            c_prev = c_t
+            
             rnn_input = torch.cat([z_t, c_t, attention_state, a_t], dim=-1)
             rnn_output, (h, c) = self._rnn(
                 rnn_input, h, c, 
                 torch.ones(batch_size).to(self.device)
             )
+            c_prev = c_t
             rnn_output = self.rnn_layer_norm(rnn_output)
             outputs['hidden_states'].append(h[-1])
 
@@ -1831,8 +1856,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 losses = self.perceiver_model.compute_loss(
                     perceiver_outputs,
                     target_videos=videos[:, T_ctx:],
-                    perceptual_weight=0.5,
-                    label_smoothing=0.1,
+                    perceptual_weight=0.9,
+                    label_smoothing=0.05,
                 )
                 ce_loss = losses["ce_loss"]
                 perceptual_loss = losses["perceptual_loss"]
@@ -1844,6 +1869,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "total_loss": total_loss,
                 "Ht": Ht, 
                 "Wt": Wt,
+                "reconstruct": perceiver_outputs['reconstructed'],
                 "generated_videos": None,
             }
 
@@ -2254,29 +2280,34 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         generated_attention_coords = []
         attention_uncertainties = []
         hidden_states = []
-        
+        T_ctx = context_window.shape[1] if context_window is not None else 1
         with torch.no_grad():
             # 1. Encode initial observation
             z_0, _, _, _ = self.encoder(initial_obs)
             generated_latents.append(z_0)
-            padding_frames = torch.zeros(
-                batch_size, horizon - 1, *initial_obs.shape[1:]
-            ).to(device)
-            extended_context = torch.cat([context_window, padding_frames], dim=1)
+            padding_frames = torch.zeros(batch_size, horizon , *initial_obs.shape[1:]).to(device)
+            if context_window is None:
+                # Use the observed initial frame as the only context
+                base_context = initial_obs.unsqueeze(1)          # [B, 1, C, H, W]
+            else:
+                base_context = context_window                    # [B, T_ctx, C, H, W]
+
+            extended_context = torch.cat([base_context, padding_frames], dim=1)  # [B, T_ctx + horizon, C, H, W]
+
 
             # 2. Get initial context (TODO: how to pass the predicted context correctly??)
             context_sequence, _= self.compute_global_context(
                 extended_context,
-                num_context_frames=1,
+                num_context_frames=T_ctx,
                 train=False,
                 generate_future=True  # generation mode
             )
 
-            
+            # context_sequence shape [B, horizon, context_dim]
             # 3. Initialize LSTM states
             h = self.h0.expand(self.number_lstm_layer, batch_size, -1).contiguous()
             c = self.c0.expand(self.number_lstm_layer, batch_size, -1).contiguous()
-            c_prev = torch.zeros(batch_size, self.context_dim, device=device)
+            c_prev = context_sequence[:, T_ctx - 1]
 
 
             # 4. Initialize attention
@@ -2286,7 +2317,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 self.attention_resolution
             ).to(device) / (self.attention_resolution ** 2)
             attention_map, attention_coords = self.attention_prior_posterior._compute_posterior_attention(
-                self.encoder, initial_obs, h[-1], context_sequence[:, 0], detach=False
+                self.encoder, initial_obs, h[-1], context_sequence[:, T_ctx-1], detach=False
             )
             # Process initial step through VRNN
             
@@ -2311,7 +2342,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             # 5. Generate future sequence
             for t in range(horizon):
                 # Sample next latent from DPGMM prior
-                z_next, prior_info = self.sample_next_latent(h[-1], c_prev, temperature)
+                c_t = context_sequence[:, T_ctx + t]
+                z_next, prior_info = self.sample_next_latent(h[-1], c_t, temperature)
                 generated_latents.append(z_next)
                 
                 # Decode to observation
@@ -2350,9 +2382,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 phi_attention = phi_attention_mean + phi_attention_std * torch.randn_like(phi_attention_std).to(device)
 
 
-                rnn_input = torch.cat([z_next, context_sequence[:, t], phi_attention, current_action], dim=-1)
+                rnn_input = torch.cat([z_next, c_t, phi_attention, current_action], dim=-1)
                 _, (h, c) = self._rnn(rnn_input, h, c, torch.ones(batch_size).to(device))
-                c_prev = context_sequence[:, t]
                 hidden_states.append(h[-1])
                 
         

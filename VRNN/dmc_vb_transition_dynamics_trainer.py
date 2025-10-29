@@ -1084,10 +1084,22 @@ class DMCVBTrainer:
         One-shot gradient diagnostics on a tiny (B,T) slice to avoid OOM.
         """
 
+        # Set model to train mode for gradient computation
         self.model.eval()
+        
+        # Explicitly enable gradients for all parameters
+        for param in self.model.parameters():
+            param.requires_grad_(True)
+
+        if hasattr(self.model, "perceiver_model"):
+            self.model.perceiver_model.train()
+            for param in self.model.perceiver_model.parameters():
+                param.requires_grad_(True)
 
         if hasattr(self.model, "_rnn") and isinstance(getattr(self.model, "_rnn"), torch.nn.Module):
-            self.model._rnn.train()   
+            self.model._rnn.train()
+            for param in self.model._rnn.parameters():
+                param.requires_grad_(True)
 
         torch.cuda.empty_cache()
 
@@ -1097,11 +1109,12 @@ class DMCVBTrainer:
         obs = batch["observations"][:max_B, :max_T].contiguous().to(self.device, non_blocking=True)
         act = batch["actions"][:max_B, :max_T].contiguous().to(self.device, non_blocking=True)
 
-        # Optionally prevent backprop through Perceiver to save memory
-        
-
         amp_ctx = (torch.amp.autocast('cuda',dtype=torch.bfloat16) if use_amp else contextlib.nullcontext())
         with torch.set_grad_enabled(True), amp_ctx:
+            # Ensure we're computing gradients
+            obs.requires_grad_(True)
+            act.requires_grad_(True)
+            
             vae_losses, outputs = self.model.compute_total_loss(
                 obs, act,
                 beta=self.config['beta'],                  
@@ -1112,6 +1125,7 @@ class DMCVBTrainer:
                 lambda_gram=self.config.get('lambda_gram', 0.0),
             )
 
+            # Ensure all losses require gradients
             elbo_loss = (
                 self.config['lambda_recon'] * vae_losses['recon_loss']
                 + self.config['beta'] * vae_losses['kl_z']
@@ -1119,20 +1133,23 @@ class DMCVBTrainer:
                 - self.config['entropy_weight'] * vae_losses['cluster_entropy']
                 + self.config.get('lambda_gram', 0.0) * vae_losses['gram_enc_loss']
             )
-            perceiver_loss   = vae_losses['perceiver_loss']
-            predictive_loss  = vae_losses['attention_loss']
-            orth_loss        = vae_losses['attention_diversity'] + vae_losses['slot_ortho']
+            
+            # Make sure all losses are attached to the computation graph
+            perceiver_loss = vae_losses['perceiver_loss'].requires_grad_(True)
+            predictive_loss = vae_losses['attention_loss'].requires_grad_(True)
+            orth_loss = (vae_losses['attention_diversity'] + vae_losses['slot_ortho']).requires_grad_(True)
 
             if include_adv_in_diag and hasattr(self.model, "image_discriminator"):
                 recon = outputs["reconstructions"]       # [B,T,C,H,W]
                 z_seq = outputs["latents"]              # or outputs["z_seq"] 
                 D = self.model.image_discriminator
 
+                # Temporarily enable gradients for discriminator
                 for p in D.parameters():
                     p.requires_grad_(False)
 
                 fake = D(recon, z=z_seq, return_features=True)
-                adv_loss = -fake["final_score"].mean()  
+                adv_loss = -fake["final_score"].mean().requires_grad_(True)
 
                 # restore
                 for p in D.parameters():
@@ -1140,8 +1157,13 @@ class DMCVBTrainer:
             else:
                 adv_loss = torch.zeros((), device=obs.device, requires_grad=True)
 
-            task_losses      = [elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]
-
+            task_losses = [elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]
+            
+            # Verify all losses require gradients
+            for i, loss in enumerate(task_losses):
+                if not loss.requires_grad:
+                    task_losses[i] = loss.requires_grad_(True)
+            
             assert len(task_losses) == 5, f"Expected 5 losses, got {len(task_losses)}"
             named_params = list(self.model.named_parameters())
 
@@ -1153,23 +1175,25 @@ class DMCVBTrainer:
                 param_patterns=None,  # or None to include ALL trainable params
             )
 
-
         # Log the figures once (cosine heatmap, etc.)
-        self._agg.tensorboard_log(self.writer, tag_prefix="diag/grads", global_step=getattr(self.grad_monitor, "global_step", 0))  # :contentReference[oaicite:5]{index=5}
+        self._agg.tensorboard_log(self.writer, tag_prefix="diag/grads", global_step=getattr(self.grad_monitor, "global_step", 0))
+        
+        # Clean up computation graph to free VRAM immediately
         for k, v in list(outputs.items()):
             if isinstance(v, torch.Tensor):
                 outputs[k] = v.detach().cpu()   # sever graph + move off GPU
             elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                 outputs[k] = [t.detach().cpu() for t in v]
 
-        # Clean up computation graph to free VRAM immediately
-        del vae_losses, outputs, task_losses
+        # Clean up computation graph
         self.model.zero_grad(set_to_none=True)
+        
+        # Restore model to its original state (train mode for training)
         self.model.train()
 
         gc.collect()
         torch.cuda.empty_cache()
-    
+
     def compute_psnr(self, original: torch.Tensor, reconstructed: torch.Tensor) -> torch.Tensor:
         """Compute Peak Signal-to-Noise Ratio"""
         mse = F.mse_loss(reconstructed, original)
@@ -1256,8 +1280,8 @@ class DMCVBTrainer:
             ]):
                 # run model once to populate outputs and the posterior's slot maps/assignments
                 _, outputs = self.model.compute_total_loss(observations=observations, actions=actions)
-                perceiver_reconst = outputs.get('perceiver_recon', None)
-
+                
+                perceiver_reconst = outputs['perceiver_reconstructed_img']
                 # convenience
                 H, W = self.model.image_size, self.model.image_size
                 seq_len = observations.shape[1]
@@ -1278,11 +1302,8 @@ class DMCVBTrainer:
 
                     # ---------- 3) Perceiver Recon (if present) ----------
                     if perceiver_reconst is not None:
-                        idx = i * seq_len + t
-                        pc = perceiver_reconst[idx]                        # [H*W, C]
-                        pc = pc.reshape(H, W, -1)[..., :3]                 # [H,W,3]
-                        
-                        pc = pc.permute(2, 0, 1)  # [C,H,W] for imshow
+
+                        pc = perceiver_reconst[i, t, :3]  # [3,H,W]                    
                         axes[row, 2].imshow(self.denormalize_image(pc))
                         axes[row, 2].set_title('Perceiver'); axes[row, 2].axis('off')
                     else:

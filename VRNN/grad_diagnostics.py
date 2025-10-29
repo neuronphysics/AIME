@@ -68,7 +68,7 @@ def zero_grads(params):
 
 def per_task_component_grad_norms(model, task_losses, component_groups):
     """
-    component_groups: same dict you already use, e.g.
+    component_groups
     Returns: dict task_name -> dict component -> grad_norm
     """
     named = list(model.named_parameters())
@@ -108,7 +108,8 @@ def title_for_dirs(mode, param_patterns=None):
 def title_for_cos(mode, param_patterns=None):
     return f"Mean cosine({_grad_symbol(mode)}) across tasks{_subset_label(param_patterns)}"
 
-def quiver_shared_dirs(G, task_names, ax=None, scale=1.0, mode="shared", param_patterns=None, title=None, label_frac=0.5, offset_frac=0.06, fontsize=9):
+def quiver_shared_dirs(G, task_names, ax=None, scale=1.0, mode="shared", param_patterns=None, 
+                       title=None, label_frac=0.5, offset_frac=0.06, fontsize=9, task_colors=None, cmap_name='tab10', flip_upside_down=True):
     """
     G: [T, D] unit-norm grads on z (mode='shared') or params (mode='params')
     """
@@ -124,10 +125,17 @@ def quiver_shared_dirs(G, task_names, ax=None, scale=1.0, mode="shared", param_p
         fig = ax.figure
     ax.axhline(0, ls='--', lw=0.5)
     ax.axvline(0, ls='--', lw=0.5)
-    ax.quiver(np.zeros(len(P2)), np.zeros(len(P2)), P2[:,0], P2[:,1],
-              angles='xy', scale_units='xy', scale=scale)
-    
-    for (dx, dy), name in zip(P2, task_names):
+    if task_colors is None:
+        cmap = plt.cm.get_cmap(cmap_name, len(task_names))
+        colors = [cmap(i) for i in range(len(task_names))]
+        ax.quiver(np.zeros(len(P2)), np.zeros(len(P2)), P2[:,0], P2[:,1],
+              angles='xy', scale_units='xy', scale=scale, color=colors)
+    else:
+        colors = [task_colors[name] for name in task_names]
+        ax.quiver(np.zeros(len(P2)), np.zeros(len(P2)), P2[:,0], P2[:,1],
+              angles='xy', scale_units='xy', scale=scale, color=colors)
+
+    for i,((dx, dy), name) in enumerate(zip(P2, task_names)):
         # skip zero-length vectors
         length = float(np.hypot(dx, dy))
         if length < 1e-9:
@@ -149,16 +157,17 @@ def quiver_shared_dirs(G, task_names, ax=None, scale=1.0, mode="shared", param_p
 
         # rotation to match ray angle (degrees)
         angle = float(np.degrees(np.arctan2(dy, dx)))
-
-    ax.text(
-        xlab, ylab, name,
-        rotation=angle,
-        rotation_mode='anchor',
-        ha='center', va='bottom',  # Changed from 'center' to 'bottom'
-        fontsize=fontsize,
-        zorder=3,
-        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='none')  # Optional: add background
-    )
+        if flip_upside_down and (angle > 90 or angle < -90):
+            angle = angle - 180 
+        ax.text(
+            xlab, ylab, name,
+            rotation=angle,
+            rotation_mode='anchor',
+            ha='center', va='bottom',  # Changed from 'center' to 'bottom'
+            fontsize=fontsize, color=colors[i],
+            zorder=3,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='none')  # Optional: add background
+        )
     ax.set_title(title or title_for_dirs(mode, param_patterns))
     fig.tight_layout()
     return fig
@@ -178,14 +187,10 @@ def make_cosine_heatmap(cos: torch.Tensor, task_names, title=None, mode="shared"
 def _unit_grads_z(shared_repr, task_losses):
     """Return unit ∇_z for each task (T x D) and cosine matrix (T x T)."""
     G, cos = compute_shared_cosines( shared_repr=shared_repr, task_losses=task_losses)
-    # G already unit-normalized per your helper
     return G, cos
 
 class GradDiagnosticsAggregator:
-    """
-    Accumulates gradient directions & amplitudes across eval batches, then
-    builds TensorBoard-friendly figures + scalars.
-    """
+
     def __init__(self, task_names, component_groups=None, average_component_norms=False):
         self.task_names = list(task_names)
         self.T = len(task_names)
@@ -294,9 +299,15 @@ class GradDiagnosticsAggregator:
 
     def tensorboard_log(self, writer, tag_prefix, global_step, quiver_scale=1.0, mode="params", param_patterns=None):
         mean_dirs, cos_mean, grad_amp_rms, comp_amp_rms = self.finalize()
-
+        task_colors = {
+            "elbo":           "#1f77b4",  # blue
+            "perceiver":      "#ff7f0e",  # orange
+            "predictive":     "#2ca02c",  # green
+            "orthogonal":     "#d62728",  # red
+            "adversarial":    "#9467bd",  # purple
+        }
         # Quiver (2D PCA of mean dirs) — ensure we pass a Figure to TB
-        fig_q = quiver_shared_dirs(mean_dirs, self.task_names, scale=quiver_scale, mode=mode, param_patterns=param_patterns)
+        fig_q = quiver_shared_dirs(mean_dirs, self.task_names, scale=quiver_scale, mode=mode, param_patterns=param_patterns, task_colors=task_colors)
         writer.add_figure(f"{tag_prefix}/quiver_mean_dirs", fig_q, global_step=global_step)
         plt.close(fig_q)
 
