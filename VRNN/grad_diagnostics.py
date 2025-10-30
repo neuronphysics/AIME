@@ -303,8 +303,7 @@ class GradDiagnosticsAggregator:
             "elbo":           "#1f77b4",  # blue
             "perceiver":      "#ff7f0e",  # orange
             "predictive":     "#2ca02c",  # green
-            "orthogonal":     "#d62728",  # red
-            "adversarial":    "#9467bd",  # purple
+            "adversarial":     "#d62728",  # red
         }
         # Quiver (2D PCA of mean dirs) — ensure we pass a Figure to TB
         fig_q = quiver_shared_dirs(mean_dirs, self.task_names, scale=quiver_scale, mode=mode, param_patterns=param_patterns, task_colors=task_colors)

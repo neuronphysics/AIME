@@ -16,7 +16,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (
     EMA, TemporalDiscriminator,
     LinearResidual, AttentionPosterior, AttentionPrior,
-    AddEpsilon, check_tensor, PerpetualOrthogonalProjectionLoss
+    AddEpsilon, check_tensor
 )
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
 from VRNN.mtl_optimizers import WeightClipping
@@ -954,15 +954,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.phi_attention = LinearResidual( self.hidden_dim//2 + 2, 2*self.hidden_dim)
         K = self.attention_prior_posterior.posterior_net.num_semantic_slots
         d = self.attention_prior_posterior.posterior_net.d
-        self.POPL = PerpetualOrthogonalProjectionLoss(
-            num_classes=K,
-            feat_dim=d,
-            no_norm=False,
-            use_attention=True,
-            orthogonality_weight=0.3,
-            slot_ortho_weight=0.2,
-            device=self.device,
-        )
+        
 
 
     def init_weights(self, module: nn.Module):
@@ -1126,10 +1118,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # Collect special parameters that need different treatment
         special_params = []
-        if hasattr(self, "POPL") and hasattr(self.POPL, "class_centres"):
-            special_params.append(self.POPL.class_centres)
 
-        head_modules = [self.attention_prior_posterior, self.phi_attention, self.POPL]
+        head_modules = [self.attention_prior_posterior, self.phi_attention]
         # Exclude special params from general head params
         special_ids = {id(p) for p in special_params}  # identity set (hashable)
         self.head_params = [
@@ -1163,7 +1153,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.grad_balancer = RGB()
 
         # tasks in the same order you’ll pass losses in training_step_sequence
-        self.grad_balancer.task_name = ["elbo", "perceiver", "predictive", "orthogonal", "adversarial"]
+        self.grad_balancer.task_name = ["elbo", "perceiver", "predictive", "adversarial"]
         self.grad_balancer.task_num  = len(self.grad_balancer.task_name)
         self.grad_balancer.device    = self.device
         self.grad_balancer.rep_grad  = False        # operate on shared params (θ), not reps
@@ -1513,14 +1503,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         losses['perceiver_loss'] = outputs['perceiver_total_loss']
 
 
-        slot_features = outputs.get('slot_features', None)
-        if slot_features is not None:
-            B, K, d = slot_features.shape
-            features = slot_features.view(B * K, d)
-            labels = torch.arange(B*K, device=self.device)
-            losses['slot_ortho'] = self.POPL(features, labels)
-        else:
-            losses['slot_ortho'] = torch.tensor(0.0).to(self.device)
+
         # Aggregate diversity losses collected during forward pass
         losses['attention_diversity'] = (
             torch.stack(outputs['attention_diversity_losses']).mean() 
@@ -1539,7 +1522,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             entropy_weight * losses['cluster_entropy']+
             lambda_gram * losses['gram_enc_loss'] 
         )
-        losses['attention_loss'] =  beta * losses['attention_kl'] + lambda_att_dyn * outputs['attention_dynamics_loss']
+        losses['attention_loss'] =  beta * losses['attention_kl'] + lambda_att_dyn * outputs['attention_dynamics_loss'] + losses['attention_diversity']
         return losses, outputs
 
     
@@ -1962,8 +1945,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             - entropy_weight * vae_losses['cluster_entropy']
             + lambda_gram * vae_losses['gram_enc_loss']
         )
-        predictive_loss = vae_losses['attention_loss']
-        orth_loss = vae_losses['attention_diversity'] + vae_losses['slot_ortho']
+        predictive_loss = vae_losses['attention_loss'] 
         perceiver_loss = vae_losses['perceiver_loss']
         disc_losses_list = []
         for _ in range(n_critic):
@@ -1993,17 +1975,15 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "elbo":        elbo_loss.reshape([]),
             "perceiver":   perceiver_loss.reshape([]),
             "predictive":  predictive_loss.reshape([]),
-            "orthogonal":  orth_loss.reshape([]),
             "adversarial": adv_loss.reshape([]),
         }
 
         L_elbo        = loss_dict["elbo"]
         L_perceiver   = loss_dict["perceiver"]
         L_predictive  = loss_dict["predictive"]
-        L_orthogonal  = loss_dict["orthogonal"]
         L_adv        = lambda_img * loss_dict["adversarial"]
 
-        task_losses = [L_elbo, L_perceiver, L_predictive, L_orthogonal, L_adv]
+        task_losses = [L_elbo, L_perceiver, L_predictive, L_adv]
 
         self.gen_optimizer.zero_grad(set_to_none=True)
         # RGB computes per-task grads and writes back the rotated aggregate grad
@@ -2041,7 +2021,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             elbo_loss.item()
             + perceiver_loss.item()
             + predictive_loss.item()
-            + orth_loss.item()
             + (lambda_img_eff * (img_adv_loss.item() + temporal_adv_loss.item() + feat_match_loss.item()))
         )
 

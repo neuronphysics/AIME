@@ -900,7 +900,7 @@ class DMCVBTrainer:
         else:
             self.writer = None
         self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
-        task_names = ['elbo','perceiver','predictive','orthogonal','adversarial']  
+        task_names = ['elbo','perceiver','predictive','adversarial']  
         self._agg = GradDiagnosticsAggregator(task_names, 
                                               component_groups=self.grad_monitor.component_groups,
                                               average_component_norms=True)
@@ -1129,7 +1129,6 @@ class DMCVBTrainer:
             # Make sure all losses are attached to the computation graph
             perceiver_loss = vae_losses['perceiver_loss'].requires_grad_(True)
             predictive_loss = vae_losses['attention_loss'].requires_grad_(True)
-            orth_loss = (vae_losses['attention_diversity'] + vae_losses['slot_ortho']).requires_grad_(True)
 
             if include_adv_in_diag and hasattr(self.model, "image_discriminator"):
                 recon = outputs["reconstructions"]       # [B,T,C,H,W]
@@ -1149,14 +1148,14 @@ class DMCVBTrainer:
             else:
                 adv_loss = torch.zeros((), device=obs.device, requires_grad=True)
 
-            task_losses = [elbo_loss, perceiver_loss, predictive_loss, orth_loss, adv_loss]
+            task_losses = [elbo_loss, perceiver_loss, predictive_loss, adv_loss]
             
             # Verify all losses require gradients
             for i, loss in enumerate(task_losses):
                 if not loss.requires_grad:
                     task_losses[i] = loss.requires_grad_(True)
-            
-            assert len(task_losses) == 5, f"Expected 5 losses, got {len(task_losses)}"
+
+            assert len(task_losses) == 4, f"Expected 4 losses, got {len(task_losses)}"
             named_params = list(self.model.named_parameters())
 
             self._agg.update(
@@ -1632,7 +1631,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 7,
+        'batch_size': 8,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
