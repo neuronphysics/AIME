@@ -682,7 +682,6 @@ def count_parameters(model, print_details=True):
         'perceiver': 'perceiver_model',
         'prior': 'prior',
         'attention': 'attention_prior_posterior',
-        'self_model': 'self_model',
         'rnn': '_rnn',
         'discriminators': 'image_discriminator'
     }
@@ -758,7 +757,6 @@ class GradientMonitor:
             'prior_dynamics': ['prior.stick_breaking.kumar_net', 'prior.component_nn'],
             'attention_schema': ['attention_prior_posterior'],
             'vrnn_core': ['_rnn', 'rnn_layer_norm'],
-            'self_model': ['self_model'],
             'discriminators': ['image_discriminator']
         }
     
@@ -960,7 +958,6 @@ class DMCVBTrainer:
                 lambda_img=self.config['lambda_img'],
                 lambda_recon=self.config['lambda_recon'],
                 lambda_att_dyn=self.config['lambda_att_dyn'],
-                lambda_att=self.config['lambda_att'],
                 entropy_weight=self.config['entropy_weight'],
             )
             component_grads = self.grad_monitor.compute_component_gradients()
@@ -1046,10 +1043,6 @@ class DMCVBTrainer:
                     att_consistency = self.compute_attention_consistency(outputs['attention_maps'])
                     eval_metrics['attention_consistency'].append(att_consistency.item())
                 
-                # 3. Predictive accuracy
-                if 'self_predictions' in outputs:
-                    pred_acc = self.compute_predictive_accuracy(outputs)
-                    eval_metrics['predictive_accuracy'].append(pred_acc)
         if epoch %10 == 0:
              with torch.no_grad():
                  num_samples = 16
@@ -1121,7 +1114,6 @@ class DMCVBTrainer:
                 entropy_weight=self.config['entropy_weight'],
                 lambda_recon=self.config['lambda_recon'],
                 lambda_att_dyn=self.config['lambda_att_dyn'],
-                lambda_att=self.config['lambda_att'],
                 lambda_gram=self.config.get('lambda_gram', 0.0),
             )
 
@@ -1222,28 +1214,6 @@ class DMCVBTrainer:
         
         return torch.stack(consistencies).mean()
     
-    def compute_predictive_accuracy(self, outputs: Dict) -> float:
-
-        """Compute accuracy of self-model predictions"""
-        if not any(outputs.get(f'one_step_{x}_prediction_loss') for x in ['h', 'z', 'att']):
-            return 0.0
-        
-        accuracies = []
-        for modality in ['h', 'z', 'att']:
-            loss_key = f'one_step_{modality}_prediction_loss'
-            if loss_key in outputs and outputs[loss_key]:
-                losses = outputs[loss_key]
-                # Handle both list of tensors and single tensor cases
-                if isinstance(losses, list):
-                    loss_tensor = torch.stack([l.detach() for l in losses])
-                else:
-                    loss_tensor = losses.detach()
-                
-                # Compute negative mean as accuracy proxy
-                accuracy = -loss_tensor.mean().cpu().item()
-                accuracies.append(accuracy)
-        
-        return np.mean(accuracies) if accuracies else 0.0
 
     def visualize_results(self, epoch: int):
         """
@@ -1662,7 +1632,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 12,
+        'batch_size': 7,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
@@ -1683,7 +1653,6 @@ def main():
         'lambda_img': 1.0,
         'lambda_recon': 1.0,
         'lambda_att_dyn': 0.95,
-        'lambda_att': 0.95,
         'grad_clip': 5,
         'n_critic': 1,
         

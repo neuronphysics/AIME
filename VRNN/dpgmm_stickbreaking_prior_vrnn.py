@@ -16,12 +16,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (
     EMA, TemporalDiscriminator,
     LinearResidual, AttentionPosterior, AttentionPrior,
-    AddEpsilon, check_tensor, SelfModelBlock, PerpetualOrthogonalProjectionLoss
+    AddEpsilon, check_tensor, PerpetualOrthogonalProjectionLoss
 )
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
-from VRNN.mtl_optimizers import AdaptiveLossBalancer, WeightClipping
+from VRNN.mtl_optimizers import WeightClipping
 
-
+from VRNN.RGB import RGB
 from VRNN.lstm import LSTMLayer
 
 from VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
@@ -718,7 +718,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         weight_decay: float = 0.00001,
         use_orthogonal: bool = True,  # Use orthogonal initialization for LSTM,
         number_lstm_layer: int = 3,  # Number of LSTM layers
-        self_model_weight: float = 0.5,
         context_window_size: int = 10,
         attention_resolution: int = 21,  # Resolution for attention maps
         warmup_epochs=25,
@@ -746,7 +745,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.device = device
         self.dropout = dropout
         # Hyperparameters
-        self.self_model_weight = self_model_weight
         self.context_window_size = context_window_size
         self._lr = learning_rate
         self._grad_clip = grad_clip
@@ -768,7 +766,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self._init_vrnn_dynamics(use_orthogonal=use_orthogonal,number_lstm_layer=number_lstm_layer)
         self._init_attention_schema(attention_resolution)
         self._init_encoder_decoder()
-        self._init_self_model()
         self._init_discriminators( img_disc_layers, patch_size, num_heads= disc_num_heads)
         # DP-GMM prior
         self.prior = DPGMMPrior(max_components, 
@@ -967,19 +964,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             device=self.device,
         )
 
-    def _init_self_model(self):
-        """Initialize comprehensive self-modeling components"""
-        # Hidden state predictor: p(h_{t+1}|h_t, z_t, a_t)
-        self.self_model = SelfModelBlock(
-            z_dim =self.latent_dim,
-            A_dim=self.hidden_dim,
-            a_dim=self.action_dim,
-            c_dim=self.context_dim,
-            h_dim=self.hidden_dim,
-            d=40,
-            nhead=8,
-        )
-        self.self_model.enable_checkpointing()
 
     def init_weights(self, module: nn.Module):
         """Initialize the weights using the typical initialization schemes."""
@@ -1145,7 +1129,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if hasattr(self, "POPL") and hasattr(self.POPL, "class_centres"):
             special_params.append(self.POPL.class_centres)
 
-        head_modules = [self.attention_prior_posterior, self.phi_attention, self.self_model, self.POPL]
+        head_modules = [self.attention_prior_posterior, self.phi_attention, self.POPL]
         # Exclude special params from general head params
         special_ids = {id(p) for p in special_params}  # identity set (hashable)
         self.head_params = [
@@ -1172,26 +1156,26 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if special_params:
             param_groups.append({"params": special_params, "lr": learning_rate * 0.5, "weight_decay": 0.0})
 
-        self.gen_optimizer = torch.optim.Adam(
+        self.gen_optimizer = torch.optim.AdamW(
             param_groups, lr=learning_rate, betas=(0.9, 0.999), eps=1e-8
         )
     
-        self.loss_balancer = AdaptiveLossBalancer(
-            method=getattr(self, "loss_balance_method", "magnitude"),  # "grad_norm" | "magnitude" | "dynamic"
-            alpha=0.99,
-            temperature=2.0,
-            min_weight=0.01,
-            max_weight=5.0,
+        self.grad_balancer = RGB()
+
+        # tasks in the same order you’ll pass losses in training_step_sequence
+        self.grad_balancer.task_name = ["elbo", "perceiver", "predictive", "orthogonal", "adversarial"]
+        self.grad_balancer.task_num  = len(self.grad_balancer.task_name)
+        self.grad_balancer.device    = self.device
+        self.grad_balancer.rep_grad  = False        # operate on shared params (θ), not reps
+        self.grad_balancer.alpha_steps = 1  # Reduce from 3 to 1
+        self.grad_balancer.update_interval = 2  # Update every 2 steps instead of every step
+        self.grad_balancer.lr_inner = 0.1  # Smaller learning rate for stability
+
+        # give RGB access to *generator* params only
+        self.grad_balancer.get_share_params = lambda: (
+            p for g in self.gen_optimizer.param_groups for p in g["params"]
         )
 
-        # Base weights used as priors; scaled adaptively each step
-        self.base_task_weights = {
-            "elbo":        1.0,
-            "perceiver":   1.0,
-            "predictive":  1.0,
-            "orthogonal":  1.0,   # diversity/orthogonality is usually a bit softer
-            "adversarial": 1.0,   # further scaled by lambda_img at runtime
-        }
 
         # Discriminator optimizer (separate)
         if hasattr(self, 'image_discriminator'):
@@ -1266,14 +1250,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'context_states': [],
             'prior_params': [],
             'posterior_params': [],
-            'self_predictions': [], # Predictions made at t for t+1
             'kl_losses': [],
             'attention_losses': [],
             'kumaraswamy_kl_losses': [],
             'kl_latents': [],
             'reconstruction_losses': [],
             'cluster_entropies': [],
-            'self_att_prediction_loss': [], 
             'predicted_movements': [],
             'attention_diversity_losses': [],  # Collect per timestep
             'gram_enc': [],
@@ -1428,29 +1410,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             total_kl = kl_z + kumar_beta_kl
             outputs['kl_losses'].append(total_kl)
 
-            # === Self-Model Predictions ===
-            # TODO:6. Future prediction bonuses (need t and t+tau)? Does this predict next hidden state? 
-            if t < seq_len- 1:   # Time delta for future prediction
-                # Make self-model predictions
-                self_pred = self.self_model_step(
-                    h[-1], 
-                    outputs['latents'][-1],
-                    attention_state, 
-                    actions[:, t],
-                    current_time=t,
-                    context_t=c_t
-                )
-                outputs['self_predictions'].append(self_pred)
-                # The target no longer chases the online posterior optimized by ELBO/adversarial losses. It’s a slowly-evolving teacher signal.
 
-                if t > 0 and len(outputs['self_predictions']) > 0:
-                    #the prediction made at t-1 for t
-                    prev_pred = outputs['self_predictions'][t-1]
-                    att_pred_dist = prev_pred['distributions']['attention_dist']
-
-                    att_loss = -att_pred_dist.log_prob(attention_state).mean()
-                    outputs['self_att_prediction_loss'].append(att_loss)
-                # Compute self-model KL losses
             
             
             rnn_input = torch.cat([z_t, c_t, attention_state, a_t], dim=-1)
@@ -1478,11 +1438,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 outputs[key] = torch.stack(outputs[key], dim=1)
 
         
-        # One-step prediction bonuses (negative of losses for ELBO)
-        if outputs['self_att_prediction_loss']:
-            outputs['future_att_bonus'] = -torch.stack(outputs['self_att_prediction_loss']).mean()
-        else:
-            outputs['future_att_bonus'] = torch.tensor(0.0).to(self.device)
         
         # Perceiver loss
     
@@ -1528,7 +1483,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                            entropy_weight=0.1, 
                            lambda_recon=1.0, 
                            lambda_att_dyn=0.1, 
-                           lambda_att=0.1, 
                            lambda_gram=0.05,
                            ):
         """
@@ -1585,7 +1539,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             entropy_weight * losses['cluster_entropy']+
             lambda_gram * losses['gram_enc_loss'] 
         )
-        losses['attention_loss'] =  lambda_att * outputs['future_att_bonus'] + beta * losses['attention_kl'] + lambda_att_dyn * outputs['attention_dynamics_loss']
+        losses['attention_loss'] =  beta * losses['attention_kl'] + lambda_att_dyn * outputs['attention_dynamics_loss']
         return losses, outputs
 
     
@@ -1927,43 +1881,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     "Wt": Wt,
                     "generated_videos": generated_videos,
                 } 
-              
-    def self_model_step(self, h_t, z_t, attention_t, a_t, current_time, context_t=None):
-        """
-        Predict next internal states using self-model
-        
-        - p(A_{t+1}|h_t, z_t, A_t, a_t, c_t)
-        
-        Args:
-            h_t: Current hidden state [batch_size, hidden_dim]
-            z_t: Current latent state [batch_size, latent_dim] - NOW PROPERLY USED
-            attention_t: Current attention state [batch_size, attention_dim]
-            a_t: Current action [batch_size, action_dim]
-            c_t: current context (for z prediction) [batch_size, context_dim]
-        """
-        # 1. Predict A_{t+1} ~ p(A_{t+1}|h_t, z_t, a_t, c_t, A_t)
-        # The hidden state evolution depends on current hidden state, latent, and action
-        if context_t is None:
-            c_t = torch.zeros(h_t.shape[0], self.context_dim).to(h_t.device)
-        else:
-            c_t = context_t
-        
-        t_normalized = torch.tensor(
-            [[current_time / self.sequence_length]],
-            dtype=torch.float32
-        ).to(self.device).expand(h_t.shape[0], -1)
-
-
-        attention_mean, attention_logvar, _ = self.self_model(z_t, attention_t, a_t, c_t, h_t, t_normalized)
-        
-        return {
-            'attention_mean': attention_mean, 
-            'attention_logvar': attention_logvar,
-            'distributions': {
-                'attention_dist': Normal(attention_mean, torch.exp(0.5 * attention_logvar).clamp(min=-10, max=10))
-            }
-        }
-        
+                      
 
     
     def prepare_images_for_training(self, images):
@@ -2020,7 +1938,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                 lambda_img: float = 0.2,
                                 lambda_recon: float = 1.0,
                                 lambda_att_dyn: float = 0.75,
-                                lambda_att: float = 0.95,
                                 entropy_weight: float = 0.5,
                                 lambda_gram: float = 0.25,
                                 ) -> Dict[str, torch.Tensor]:
@@ -2033,7 +1950,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         vae_losses, outputs = self.compute_total_loss(
             observations, actions, beta, entropy_weight,
-            lambda_recon, lambda_att_dyn, lambda_att, lambda_gram
+            lambda_recon, lambda_att_dyn, lambda_gram
         )
         lambda_img_eff = (lambda_img * warmup_factor) if warmup_factor > 0.0 else 0.0
 
@@ -2080,35 +1997,25 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "adversarial": adv_loss.reshape([]),
         }
 
-        # Compute adaptive weights (grad_norm uses per-loss autograd.grad with retain_graph)
-        weights = self.loss_balancer.balance_losses(
-            losses=loss_dict,
-            base_weights=self.base_task_weights,
-            model=self,  # needed for 'grad_norm' method
-        )
+        L_elbo        = loss_dict["elbo"]
+        L_perceiver   = loss_dict["perceiver"]
+        L_predictive  = loss_dict["predictive"]
+        L_orthogonal  = loss_dict["orthogonal"]
+        L_adv        = lambda_img * loss_dict["adversarial"]
 
-        # Scalar combined loss
-        total_loss = sum(weights[name] * loss_dict[name] for name in loss_dict.keys())
+        task_losses = [L_elbo, L_perceiver, L_predictive, L_orthogonal, L_adv]
 
-        # Standard backward + step
         self.gen_optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(self.head_params, self._grad_clip * 0.5)
-
+        # RGB computes per-task grads and writes back the rotated aggregate grad
+        self.grad_balancer.backward(task_losses, mode="backward")
+        
+        
+        torch.nn.utils.clip_grad_norm_(
+            [p for g in self.gen_optimizer.param_groups for p in g["params"]],
+            self._grad_clip
+        )
         self.gen_optimizer.step()
 
-        # For logging: ALB weights and stats
-        alb_weight_log = {f"alb_w_{k}": float(weights[k]) for k in weights.keys()}
-        alb_stats_raw = self.loss_balancer.get_statistics()  # includes grad norms & loss EMAs
-        alb_stats = {}
-        for key, value in alb_stats_raw.items():
-            if isinstance(value, dict):
-                # Flatten nested dict 
-                for sub_key, sub_value in value.items():
-                    alb_stats[f"{key}_{sub_key}"] = float(sub_value) if not isinstance(sub_value, (int, float)) else sub_value
-            else:
-                alb_stats[key] = float(value) if not isinstance(value, (int, float)) else value
         
         grad_norm_sq = 0.0
         for group in self.gen_optimizer.param_groups:
@@ -2147,8 +2054,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             **vae_losses,
             # Discriminators
             **avg_disc_losses,
-            **alb_weight_log,  
-            **alb_stats,
             # Adversarial gen
             'img_adv_loss': float(img_adv_loss.item()),
             'temporal_adv_loss': float(temporal_adv_loss.item()),
