@@ -954,7 +954,8 @@ class Trainer:
             # Extract reconstructed for metrics
             reconstructed = outputs['reconstructed']
             # Compute PSNR
-            reconstructed_pred = reconstructed[:, context_frames:]
+            actual_context_frames = reconstructed.shape[1] - target.shape[1]
+            reconstructed_pred = reconstructed[:, actual_context_frames:]
             reconstructed_pred = (reconstructed_pred + 1.0) / 2.0 
             # Compute PSNR
             mse = torch.mean((reconstructed_pred - target) ** 2)
@@ -1149,6 +1150,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--perceptual_weight", type=float, default=0.5)
     parser.add_argument("--label_smoothing", type=float, default=0.2)
+    parser.add_argument("--use_3d_conv", action="store_true",
+                        help="Use 3D convolutions in Perceiver IO")
+    parser.add_argument("--use_temporal_downsample", action="store_true",
+                        help="Use temporal downsampling in Perceiver IO")
     
     args = parser.parse_args()
     
@@ -1202,6 +1207,9 @@ def main():
         num_codes=args.num_codes,
         downsample=args.downsample,
         dropout=args.dropout,
+        use_3d_conv=args.use_3d_conv,
+        temporal_downsample=args.use_temporal_downsample,
+
     )
     
     # Count parameters

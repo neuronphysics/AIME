@@ -96,7 +96,8 @@ class FourierPositionEncoding(nn.Module):
         :return: position coordinates tensor of shape (*shape, len(shape)).
         """
         coords = [torch.linspace(v_min, v_max, steps=s) for s in self.input_shape]
-        return torch.stack(torch.meshgrid(*coords), dim=len(self.input_shape))
+        return torch.stack(torch.meshgrid(*coords, indexing="ij"), dim=len(self.input_shape))
+
 
     def _position_encodings(
         self, p: torch.Tensor, max_frequencies: Optional[Tuple[int, ...]] = None, include_positions: bool = True

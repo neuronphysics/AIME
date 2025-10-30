@@ -271,7 +271,8 @@ class Down3D(nn.Module):
         self.pool = nn.Conv3d(in_ch, in_ch, 3, 1, 1)
         # Downsample both spatial and temporal if specified
         stride = (2, 2, 2) if temporal_downsample else (1, 2, 2)
-        self.down = nn.Conv3d(in_ch, out_ch, 4, stride, 1)
+        padding = 1 if temporal_downsample else (0, 1, 1)
+        self.down = nn.Conv3d(in_ch, out_ch, 4, stride, padding)
         self.res = ResBlock3D(out_ch, out_ch)
     
     def forward(self, x):
@@ -283,11 +284,17 @@ class Up3D(nn.Module):
     def __init__(self, in_ch, skip_ch, out_ch, temporal_upsample=True):
         super().__init__()
         stride = (2, 2, 2) if temporal_upsample else (1, 2, 2)
-        self.up = nn.ConvTranspose3d(in_ch, out_ch, 4, stride, 1)
+        padding = 1 if temporal_upsample else (0, 1, 1)
+        self.up = nn.ConvTranspose3d(in_ch, out_ch, 4, stride, padding)
         self.res = ResBlock3D(out_ch + skip_ch, out_ch)
     
     def forward(self, x, skip):
-        return self.res(torch.cat([self.up(x), skip], dim=1))
+        x_up = self.up(x)
+        if x_up.shape[-3:] != skip.shape[-3:]:
+           # resize skip (T,H,W) to match x_up
+           skip = F.interpolate(skip, size=x_up.shape[-3:], mode='trilinear', align_corners=False)
+
+        return self.res(torch.cat([x_up, skip], dim=1))
 
 
 class UNetEncoder3D(nn.Module):
@@ -420,23 +427,25 @@ class VQPTTokenizer(nn.Module):
             # 3D conv: process as (B, C, T, H, W)
             x = rearrange(videos, 'b t c h w -> b c t h w')
             z, skips = self.encoder(x)
+            T_enc = z.shape[2]
             # Flatten temporal dimension for VQ
             z = rearrange(z, 'b d t h w -> (b t) d h w')
         else:
             # 2D conv: flatten batch and time
             x_flat = rearrange(videos, 'b t c h w -> (b t) c h w')
             z, skips = self.encoder(x_flat)
+            T_enc = T  # No temporal downsampling
         
         quantized, ids, vq_loss = self.vq(z)
-        
-        token_ids = rearrange(ids, '(b t) h w -> b t h w', b=B, t=T)
-        quantized = rearrange(quantized, '(b t) d h w -> b t d h w', b=B, t=T)
-        
+
+        token_ids = rearrange(ids, '(b t) h w -> b t h w', b=B, t=T_enc)
+        quantized = rearrange(quantized, '(b t) d h w -> b t d h w', b=B, t=T_enc)
+
         return token_ids, quantized, vq_loss, skips
     
     def decode(self, quantized: torch.Tensor, skips: list | None = None, use_tanh: bool = True):
         """Decode quantized features to videos (uses real skips when provided)."""
-        B, T = quantized.shape[:2]
+        B, T_enc = quantized.shape[:2]
         
         if skips is None:
             # Fallback: dummy skips for generation
@@ -448,7 +457,7 @@ class VQPTTokenizer(nn.Module):
                     scale = 2 ** i
                     t_scale = 2 if self.temporal_downsample and i == 0 else 1
                     skips_to_use.append(torch.zeros(
-                        B, ch, T * t_scale, H * scale, W * scale, 
+                        B, ch, T_enc * t_scale, H * scale, W * scale, 
                         device=quantized.device, dtype=quantized.dtype
                     ))
             else:
@@ -458,7 +467,7 @@ class VQPTTokenizer(nn.Module):
                 for i, ch in enumerate(self.encoder.skip_channels):
                     scale = 2 ** i
                     skips_to_use.append(torch.zeros(
-                        B*T, ch, H*scale, W*scale, 
+                        B*T_enc, ch, H*scale, W*scale, 
                         device=quantized.device, dtype=q_flat.dtype
                     ))
         else:
@@ -484,8 +493,8 @@ class VQPTTokenizer(nn.Module):
             # 2D conv: flatten batch and time
             q_flat = rearrange(quantized, 'b t d h w -> (b t) d h w')
             recon = self.decoder(q_flat, skips_to_use)
-            recon = rearrange(recon, '(b t) c h w -> b t c h w', b=B, t=T)
-        
+            recon = rearrange(recon, '(b t) c h w -> b t c h w', b=B, t=T_enc)
+
         if use_tanh:
             recon = torch.tanh(recon)
         
@@ -750,16 +759,21 @@ class PerceiverTokenPredictor(nn.Module):
 
         B, T_total = videos.shape[:2]
         T_ctx = num_context_frames
-        T_pred = T_total - T_ctx
+        
         
         # Tokenize all frames
         token_ids, quantized, vq_loss, skips = self.tokenizer.encode(videos)
-        
+        T_tokens = token_ids.shape[1]
+
         assert token_ids.dim() == 4, f"Expected 4D token_ids, got {token_ids.dim()}D"
-        
+        downsample_factor = T_total / T_tokens  # e.g., 2.0 if 2x downsampling
+        T_ctx_enc = int(T_ctx / downsample_factor)  # floor division
+        T_ctx_enc = min(T_ctx_enc, T_tokens - 1)  # ensure at least 1 prediction token
+
+        T_pred_enc = T_tokens - T_ctx_enc
         # Split into context and target
-        context_tokens = token_ids[:, :T_ctx]
-        target_tokens = token_ids[:, T_ctx:]
+        context_tokens = token_ids[:, :T_ctx_enc]
+        target_tokens = token_ids[:, T_ctx_enc:]
         
         # Get actual token grid dimensions
         Ht, Wt = context_tokens.shape[-2:]
@@ -769,7 +783,7 @@ class PerceiverTokenPredictor(nn.Module):
         
         logits_future, temporal_context = self.decoder(
             latents.last_hidden_state, 
-            T_override=T_pred, 
+            T_override=T_pred_enc, 
             Ht=Ht, 
             Wt=Wt,
         )
@@ -782,19 +796,35 @@ class PerceiverTokenPredictor(nn.Module):
         
         # Reconstruct video from predicted tokens
         if return_dict:
-            # Get full sequence for reconstruction (GT context + predicted future)
-            B_full, T_full, Ht, Wt = token_ids.shape
-            gt_ctx = token_ids[:, :T_ctx]        # ground-truth context tokens
-            pred_future = predicted_tokens       # all predictions are for future (no slicing needed)
-            full_tokens = torch.cat([gt_ctx, pred_future], dim=1)     # (B, T_total, Ht, Wt)
+            # Use the actual token dimensions for reconstruction
+            B_full, T_tokens_actual, Ht, Wt = token_ids.shape
+            
+            # Create full token sequence
+            full_tokens = torch.cat([
+                token_ids[:, :T_ctx_enc],  # Context
+                predicted_tokens           # Predicted future
+            ], dim=1)
+            
+            # Ensure we don't exceed original temporal dimension
+            if full_tokens.shape[1] > T_tokens_actual:
+                full_tokens = full_tokens[:, :T_tokens_actual]
+            elif full_tokens.shape[1] < T_tokens_actual:
+                # Pad if needed (though this shouldn't happen)
+                padding = T_tokens_actual - full_tokens.shape[1]
+                full_tokens = torch.cat([
+                    full_tokens,
+                    torch.zeros(B_full, padding, Ht, Wt, device=full_tokens.device, dtype=full_tokens.dtype)
+                ], dim=1)
+            
+            # Flatten and get codes
             flat_tokens = rearrange(full_tokens, 'b t h w -> (b t h w)')
             codes = self.tokenizer.get_codes_from_indices(flat_tokens)
-            codes = rearrange(codes, '(b t h w) d -> b t d h w',
-                             b=B_full, t=T_full, h=Ht, w=Wt)
             
-            # Decode to video using original skips for quality
-            reconstructed = self.tokenizer.decode(codes, skips=skips)
-        
+            # Reshape back
+            codes = rearrange(codes, '(b t h w) d -> b t d h w',
+                            b=B_full, t=T_tokens_actual, h=Ht, w=Wt)
+            
+            reconstructed = self.tokenizer.decode(codes, skips=skips)        
         outputs = {
             'logits': logits_future,
             'context_tokens': context_tokens,
