@@ -19,7 +19,6 @@ from models import (
     AddEpsilon, check_tensor
 )
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
-from VRNN.mtl_optimizers import WeightClipping
 
 from VRNN.RGB import RGB
 from VRNN.lstm import LSTMLayer
@@ -729,7 +728,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         num_codebook_perceiver: int = 1024,
         perceiver_code_dim: int = 128,
         downsample_perceiver: int = 4,
-        perceiver_lr_multiplier: float = 0.5,
+        perceiver_lr_multiplier: float = 1.5,
     ):
         super().__init__()
         #core dimensions
@@ -1170,14 +1169,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Discriminator optimizer (separate)
         if hasattr(self, 'image_discriminator'):
             disc_params = [p for p in self.image_discriminator.parameters() if p.requires_grad]
-            self.img_disc_optimizer = WeightClipping(
-                params=disc_params,
-                beta=1.0,
-                optimizer=torch.optim.AdamW,
-                lr=learning_rate * 0.08,
-                betas=(0.8, 0.999),
-                clip_last_layer=True,
-                max_grad_norm=self._grad_clip
+            self.img_disc_optimizer = torch.optim.AdamW(
+                disc_params,
+                lr=learning_rate * 0.1,   
+                betas=(0.2, 0.9),          # canonical for WGAN-GP
+                weight_decay=0.0
             )
         
         # Setup schedulers

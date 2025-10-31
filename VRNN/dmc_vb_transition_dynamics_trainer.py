@@ -1620,7 +1620,7 @@ def main():
         
         # Model settings
         'max_components': 15,
-        'latent_dim': 32,
+        'latent_dim': 36,
         'hidden_dim': 32, #must be divisible by 8
         'context_dim': 128,
         'attention_dim': 20,
