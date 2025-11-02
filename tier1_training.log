@@ -1,6 +1,0 @@
-Traceback (most recent call last):
-  File "<frozen runpy>", line 198, in _run_module_as_main
-  File "<frozen runpy>", line 88, in _run_code
-  File "/home/g/zahra-dir/AIME/legacy/VRNN/run_perceiver_io_dmc_vb.py", line 22, in <module>
-    import tensorflow as tf
-ModuleNotFoundError: No module named 'tensorflow'
