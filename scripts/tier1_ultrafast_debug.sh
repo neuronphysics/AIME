@@ -4,6 +4,10 @@
 # Use: Quick bug finding, gradient diagnostics, feature testing
 # Environment: Cartpole (10x faster than humanoid)
 #
+# Prerequisites:
+#   1. Collect data first: bash scripts/collect_tier1_data.sh
+#   2. Or use existing HDF5 file with --data_path
+#
 
 set -e
 
@@ -13,16 +17,24 @@ DOMAIN="${AIME_DOMAIN:-cartpole}"
 TASK="${AIME_TASK:-swingup}"
 SEED="${AIME_SEED:-1}"
 DEBUG="${AIME_DEBUG:-0}"
+DATA_PATH="${AIME_DATA_PATH:-data/tier1/${DOMAIN}_${TASK}.hdf5}"
 
 # Fast debug hyperparameters
 BATCH_SIZE=16
-VIDEO_LENGTH=10      # Shortened from 50
+SEQUENCE_LENGTH=10   # Shortened from 50
 IMG_SIZE=64          # Reduced from 84
-LATENT_DIM=18        # Reduced from 36
-HIDDEN_DIM=256       # Reduced from 512
-MAX_COMPONENTS=8     # Reduced from 15
 NUM_EPOCHS=50
 LR=3e-4
+
+# Model hyperparameters (smaller for Tier 1)
+NUM_LATENTS=128
+NUM_LATENT_CHANNELS=256
+NUM_ENCODER_LAYERS=2
+NUM_ATTENTION_HEADS=4
+CODE_DIM=128
+NUM_CODES=512
+DOWNSAMPLE=4
+BASE_CHANNELS=32
 
 # Paths
 EXP_NAME="${DOMAIN}-${TASK}-tier1-seed${SEED}"
@@ -40,10 +52,25 @@ echo "=========================================="
 echo "🚀 Tier 1: Ultra-Fast Debug Training"
 echo "=========================================="
 echo "Environment: ${DOMAIN}-${TASK}"
-echo "Video shape: (${VIDEO_LENGTH}, 3, ${IMG_SIZE}, ${IMG_SIZE})"
-echo "Model: latent_dim=${LATENT_DIM}, hidden_dim=${HIDDEN_DIM}, max_components=${MAX_COMPONENTS}"
+echo "Data: ${DATA_PATH}"
+echo "Sequence length: ${SEQUENCE_LENGTH}"
+echo "Image size: ${IMG_SIZE}×${IMG_SIZE}"
+echo "Model: ${NUM_LATENTS} latents, ${NUM_LATENT_CHANNELS} channels"
 echo "Checkpoint: ${CHECKPOINT_DIR}"
 echo "=========================================="
+
+# Check if data exists
+if [ ! -f "${DATA_PATH}" ]; then
+    echo ""
+    echo "❌ Data file not found: ${DATA_PATH}"
+    echo ""
+    echo "Please collect data first:"
+    echo "  bash scripts/collect_tier1_data.sh"
+    echo ""
+    echo "Or specify data path:"
+    echo "  AIME_DATA_PATH=/path/to/data.hdf5 bash $0"
+    exit 1
+fi
 
 # Activate environment
 if command -v conda &> /dev/null; then
@@ -54,27 +81,31 @@ fi
 # Create checkpoint directory
 mkdir -p ${CHECKPOINT_DIR}
 
-# Run training
-CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-0} python -m VRNN.run_perceiver_io_dmc_vb \
-    --domain ${DOMAIN} \
-    --task ${TASK} \
-    --seed ${SEED} \
-    --video_length ${VIDEO_LENGTH} \
-    --img_size ${IMG_SIZE} \
+# Run training (use new Perceiver-only training script)
+python -m legacy.VRNN.run_perceiver_io_dmc_vb \
+    --base_path $(dirname ${DATA_PATH}) \
+    --task ${DOMAIN}_${TASK} \
+    --sequence_length ${SEQUENCE_LENGTH} \
+    --img_height ${IMG_SIZE} \
+    --img_width ${IMG_SIZE} \
     --batch_size ${BATCH_SIZE} \
-    --latent_dim ${LATENT_DIM} \
-    --hidden_dim ${HIDDEN_DIM} \
-    --context_dim $((HIDDEN_DIM / 2)) \
-    --max_components ${MAX_COMPONENTS} \
     --num_epochs ${NUM_EPOCHS} \
-    --lr ${LR} \
-    --checkpoint_dir ${CHECKPOINT_DIR} \
-    --wandb_project ${WANDB_PROJECT} \
-    --wandb_run_name ${EXP_NAME} \
-    --save_every 10 \
-    --eval_every 5 \
-    --log_every 10 \
+    --learning_rate ${LR} \
+    --num_latents ${NUM_LATENTS} \
+    --num_latent_channels ${NUM_LATENT_CHANNELS} \
+    --num_encoder_layers ${NUM_ENCODER_LAYERS} \
+    --num_attention_heads ${NUM_ATTENTION_HEADS} \
+    --code_dim ${CODE_DIM} \
+    --num_codes ${NUM_CODES} \
+    --downsample ${DOWNSAMPLE} \
+    --base_channels ${BASE_CHANNELS} \
+    --out_dir ${CHECKPOINT_DIR} \
+    --seed ${SEED} \
+    --run_name ${EXP_NAME} \
     --num_workers 4 \
+    --save_every 10 \
+    --vis_every 10 \
+    $([ "$DEBUG" = "1" ] && echo "--use_wandb" || echo "") \
     "$@"
 
 echo ""

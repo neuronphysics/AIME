@@ -20,17 +20,46 @@ Quick iteration strategy for testing AIME on faster environments.
 
 ## Quick Start
 
+### Step 1: Collect Data
+
+Each tier needs data collected first:
+
+```bash
+# Tier 1: Cartpole (50 episodes, ~10 seconds)
+bash scripts/collect_tier1_data.sh
+
+# Tier 2: Reacher (200 episodes, ~1 minute)
+bash scripts/collect_tier2_data.sh
+
+# Tier 3: Humanoid (1000 episodes, ~10 minutes)
+bash scripts/collect_tier3_data.sh
+```
+
+**Custom environments:**
+```bash
+# Different domain/task
+AIME_DOMAIN=pendulum AIME_TASK=swingup bash scripts/collect_tier1_data.sh
+
+# More/fewer episodes
+AIME_NUM_EPISODES=100 bash scripts/collect_tier1_data.sh
+```
+
+### Step 2: Train
+
 ### Tier 1: Ultra-Fast Debug (< 1 min/epoch)
 
 ```bash
-# Basic usage
+# Basic usage (requires data from Step 1)
 bash scripts/tier1_ultrafast_debug.sh
 
 # With debug mode (CUDA error checking)
 AIME_DEBUG=1 bash scripts/tier1_ultrafast_debug.sh
 
-# Custom environment
+# Custom environment (must match collected data)
 AIME_DOMAIN=pendulum AIME_TASK=swingup bash scripts/tier1_ultrafast_debug.sh
+
+# Custom data path
+AIME_DATA_PATH=/path/to/custom.hdf5 bash scripts/tier1_ultrafast_debug.sh
 
 # Custom seed
 AIME_SEED=42 bash scripts/tier1_ultrafast_debug.sh
@@ -122,23 +151,46 @@ AIME_DOMAIN=walker AIME_TASK=walk           # ~3x faster, 6 actuators
 
 ### Workflow 1: Finding Bugs
 
-1. **Tier 1** - Reproduce bug on cartpole
-2. **Tier 1** - Fix and verify on cartpole
-3. **Tier 2** - Confirm fix on reacher
-4. **Tier 3** - (Optional) Final check on humanoid
+1. **Collect Tier 1 data** - `bash scripts/collect_tier1_data.sh`
+2. **Reproduce bug** - Run Tier 1 training
+3. **Fix code** - Edit source files
+4. **Verify fix** - Re-run Tier 1 training
+5. **Scale test** - Collect Tier 2 data and confirm fix
+6. **(Optional)** Final check on Tier 3
 
 ### Workflow 2: New Feature
 
-1. **Tier 1** - Implement and test basic functionality
-2. **Tier 1** - Tune hyperparameters
-3. **Tier 2** - Validate at scale
-4. **Tier 3** - Benchmark against baseline
+1. **Test on synthetic data** - `python scripts/test_training_synthetic.py`
+2. **Collect Tier 1 data** - Quick real-world test
+3. **Implement feature** - Edit source files
+4. **Tune hyperparameters** - Multiple Tier 1 runs
+5. **Validate at scale** - Tier 2 training
+6. **Benchmark** - Tier 3 comparison
 
 ### Workflow 3: Hyperparameter Search
 
 1. **Tier 1** - Coarse grid search (many configs, fast)
 2. **Tier 2** - Fine-tune top 3-5 configs
 3. **Tier 3** - Multi-seed runs on best config
+
+### Workflow 4: First-Time Setup
+
+```bash
+# 1. Install dependencies
+pip install dm_control h5py wandb
+
+# 2. Test synthetic data (no DMC needed)
+python scripts/test_training_synthetic.py
+
+# 3. Test Perceiver IO fix
+python scripts/test_perceiver_fix.py
+
+# 4. Collect Tier 1 data
+bash scripts/collect_tier1_data.sh
+
+# 5. Run Tier 1 training
+bash scripts/tier1_ultrafast_debug.sh
+```
 
 ---
 

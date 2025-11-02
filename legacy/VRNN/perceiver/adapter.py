@@ -2,7 +2,7 @@ import torch
 from einops import rearrange
 from torch import nn as nn
 
-from VRNN.perceiver.position import FrequencyPositionEncoding, positions
+from legacy.VRNN.perceiver.position import FrequencyPositionEncoding, positions
 
 
 class InputAdapter(nn.Module):

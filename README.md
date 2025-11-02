@@ -29,25 +29,48 @@ Trained on DeepMind Control Suite (DMC) for learning visual dynamics and control
 git clone https://github.com/your-org/AIME.git
 cd AIME
 
-# Install dependencies
-pip install torch torchvision
-pip install -r requirements.txt  # If available
+# Install core dependencies
+pip install torch torchvision einops lpips
 
-# Required packages
-pip install geoopt opencv-python h5py wandb
+# Install DMC and data handling
+pip install dm_control h5py wandb
+
+# Optional: geoopt for advanced manifold optimization
+pip install geoopt opencv-python
 ```
+
+### Testing (No Data Required)
+
+```bash
+# Test 1: Perceiver IO with synthetic data (30 seconds)
+python scripts/test_training_synthetic.py
+
+# Test 2: Verify autoregressive generation fix (10 seconds)
+python scripts/test_perceiver_fix.py
+```
+
+### Quick Training (Tier 1 - Ultra Fast)
+
+```bash
+# Step 1: Collect cartpole data (~10 seconds)
+bash scripts/collect_tier1_data.sh
+
+# Step 2: Train Perceiver IO world model (~5 min for 50 epochs)
+bash scripts/tier1_ultrafast_debug.sh
+```
+
+**Result:** Trained model in `checkpoints/cartpole-swingup-tier1-seed1/`
 
 ### Basic Usage
 
 ```python
-from src.world_model import DPGMMVariationalRecurrentAutoencoder
-from src.multi_task_learning import LossAggregator, RGB
-from src.training import DMCVBDataset
+from src.perceiver_io import CausalPerceiverIO
 
-# Create model
-model = DPGMMVariationalRecurrentAutoencoder(
-    max_components=15,
-    latent_dim=36,
+# Create Perceiver IO model (video prediction)
+model = CausalPerceiverIO(
+    video_shape=(16, 3, 64, 64),  # (T, C, H, W)
+    num_latents=256,
+    num_latent_channels=512,
     hidden_dim=512,
     context_dim=256
 )
@@ -99,6 +122,49 @@ AIME follows a **Five Pillars** philosophy:
 | **3. Dynamics** | `temporal_dynamics/` | LSTM-based temporal prediction |
 | **4. Attention** | `attention_schema/` | Spatial attention & precision |
 | **5. Optimization** | `multi_task_learning/` | RGB gradient balancing |
+
+---
+
+## 3-Tier Testing System
+
+For fast iteration and debugging, AIME provides a 3-tier testing system:
+
+| Tier | Environment | Speed | Use Case |
+|------|-------------|-------|----------|
+| **Tier 1** | Cartpole | **10x faster** | Bug fixing, quick tests |
+| **Tier 2** | Reacher | **8x faster** | Validation, hyperparameter tuning |
+| **Tier 3** | Humanoid | **Baseline** | Final benchmarks |
+
+**Example workflow:**
+```bash
+# Debug on Tier 1 (minutes)
+bash scripts/collect_tier1_data.sh
+bash scripts/tier1_ultrafast_debug.sh
+
+# Validate on Tier 2 (tens of minutes)
+bash scripts/collect_tier2_data.sh
+bash scripts/tier2_medium_validation.sh
+
+# Final benchmark on Tier 3 (hours)
+bash scripts/collect_tier3_data.sh
+bash scripts/tier3_full_benchmark.sh
+```
+
+See [`docs/TIER_TESTING_GUIDE.md`](docs/TIER_TESTING_GUIDE.md) for full details.
+
+---
+
+## Recent Fixes
+
+### ✅ Perceiver IO Autoregressive Generation Bug (Fixed)
+
+**Issue:** `generate_autoregressive` crashed when generating beyond trained `sequence_length`.
+
+**Fix:** Handle out-of-bounds temporal positions by repeating last learned query + position encoding extrapolation.
+
+**Test:** `python scripts/test_perceiver_fix.py`
+
+**Details:** See [`docs/PERCEIVER_BUG_FIX.md`](docs/PERCEIVER_BUG_FIX.md)
 
 ---
 

@@ -5,11 +5,11 @@ from einops import rearrange
 from fairscale.nn import checkpoint_wrapper
 from torch import nn as nn
 
-from VRNN.perceiver.config import CausalSequenceModelConfig
-from VRNN.perceiver.adapter import InputAdapter, OutputAdapter, QueryProvider, RotarySupport, TrainableQueryProvider, TiedTokenOutputAdapter, TokenInputAdapterWithRotarySupport
+from legacy.VRNN.perceiver.config import CausalSequenceModelConfig
+from legacy.VRNN.perceiver.adapter import InputAdapter, OutputAdapter, QueryProvider, RotarySupport, TrainableQueryProvider, TiedTokenOutputAdapter, TokenInputAdapterWithRotarySupport
 
-from VRNN.perceiver.position import positions, RotaryPositionEmbedding
-from VRNN.perceiver.utilities import init_parameters, ModuleOutput, Residual
+from legacy.VRNN.perceiver.position import positions, RotaryPositionEmbedding
+from legacy.VRNN.perceiver.utilities import init_parameters, ModuleOutput, Residual
 
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]

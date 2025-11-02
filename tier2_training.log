@@ -1,0 +1,8 @@
+usage: train_perceiver_simple.py [-h] --data DATA
+                                 [--sequence_length SEQUENCE_LENGTH]
+                                 [--img_size IMG_SIZE]
+                                 [--batch_size BATCH_SIZE]
+                                 [--num_epochs NUM_EPOCHS] [--lr LR]
+                                 [--device DEVICE] [--out_dir OUT_DIR]
+                                 [--seed SEED]
+train_perceiver_simple.py: error: unrecognized arguments:        

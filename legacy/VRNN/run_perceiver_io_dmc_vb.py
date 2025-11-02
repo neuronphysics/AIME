@@ -24,9 +24,8 @@ from torch.utils.data._utils.collate import default_collate
 import sys
 from scipy import linalg
 import torch.nn.functional as F
-# Import from VRNN - adjust path if needed
-sys.path.append('VRNN')
-from VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
+# Import from legacy - adjust path if needed
+from legacy.VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
 
 # Plotting configuration
 plt.rcParams['figure.dpi'] = 100

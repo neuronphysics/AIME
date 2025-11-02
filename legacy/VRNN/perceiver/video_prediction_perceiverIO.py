@@ -6,16 +6,16 @@ from einops import rearrange, repeat, reduce
 from typing import Optional, Tuple, Dict, List
 import lpips
 import numpy as np
-from VRNN.perceiver.adapter import TiedTokenOutputAdapter, TrainableQueryProvider
-from VRNN.perceiver.modules import (
+from legacy.VRNN.perceiver.adapter import TiedTokenOutputAdapter, TrainableQueryProvider
+from legacy.VRNN.perceiver.modules import (
     CrossAttention, SelfAttentionBlock
 )
-from VRNN.perceiver.position import (
+from legacy.VRNN.perceiver.position import (
     FourierPositionEncoding, FrequencyPositionEncoding, 
     positions, RotaryPositionEmbedding
 )
-from VRNN.perceiver.utilities import ModuleOutput, _gn_groups, _finite_stats
-from VRNN.perceiver.vector_quantize import VectorQuantize
+from legacy.VRNN.perceiver.utilities import ModuleOutput, _gn_groups, _finite_stats
+from legacy.VRNN.perceiver.vector_quantize import VectorQuantize
 
 
 # ==========================================
