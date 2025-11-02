@@ -726,7 +726,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         num_latent_perceiver: int = 128,
         num_latent_channels_perceiver: int = 128,
         num_codebook_perceiver: int = 1024,
-        perceiver_code_dim: int = 128,
+        perceiver_code_dim: int = 256,
         downsample_perceiver: int = 4,
         perceiver_lr_multiplier: float = 1.5,
     ):

@@ -366,7 +366,8 @@ class VQPTTokenizer(nn.Module):
         num_codes: int = 1024,
         downsample: int = 4,
         base_channels: int = 64,
-        commitment_weight: float = 0.25,
+        commitment_weight: float = 0.1,
+        commitment_use_cross_entropy_loss: bool = True,
         use_cosine_sim: bool = False,
         kmeans_init: bool = True,
         gate_skips: bool = False,
@@ -374,6 +375,8 @@ class VQPTTokenizer(nn.Module):
         temporal_downsample: bool = False,  
         dropout: float = 0.1,
         num_quantizers: int = 4,
+        codebook_diversity_loss_weight: float = 0.01,
+        codebook_diversity_temperature: float = 1.0
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -406,10 +409,14 @@ class VQPTTokenizer(nn.Module):
             accept_image_fmap=True,
             channel_last=False,
             commitment_weight=commitment_weight,
+            commitment_use_cross_entropy_loss=commitment_use_cross_entropy_loss,
             kmeans_init=kmeans_init,
             use_cosine_sim=use_cosine_sim,
+            codebook_diversity_loss_weight=codebook_diversity_loss_weight,
+            codebook_diversity_temperature=codebook_diversity_temperature
         )
-        self.dropout = nn.Dropout2d(p=dropout)
+        self.dropout = nn.Dropout3d(p=dropout) if use_3d_conv else nn.Dropout2d(p=dropout)
+        
         # Optional skip gates (default: OFF, for ablation studies only)
         self.gate_skips = gate_skips
         if gate_skips:
@@ -454,7 +461,8 @@ class VQPTTokenizer(nn.Module):
                 B, T, D, H, W = quantized.shape
                 skips_to_use = []
                 for i, ch in enumerate(self.encoder.skip_channels):
-                    scale = 2 ** i
+                    scale = self.downsample // (2 ** i)
+                    #print(f"Scale for skip channel 3D {i}: {scale}")
                     t_scale = 2 if self.temporal_downsample and i == 0 else 1
                     skips_to_use.append(torch.zeros(
                         B, ch, T_enc * t_scale, H * scale, W * scale, 
@@ -465,7 +473,8 @@ class VQPTTokenizer(nn.Module):
                 q_flat = rearrange(quantized, 'b t d h w -> (b t) d h w')
                 skips_to_use = []
                 for i, ch in enumerate(self.encoder.skip_channels):
-                    scale = 2 ** i
+                    scale = self.downsample // (2 ** i)
+                    #print(f"Scale for skip channel in 2D {i}: {scale}")
                     skips_to_use.append(torch.zeros(
                         B*T_enc, ch, H*scale, W*scale, 
                         device=quantized.device, dtype=q_flat.dtype
@@ -499,9 +508,21 @@ class VQPTTokenizer(nn.Module):
             recon = torch.tanh(recon)
         
         return recon
+    def _sanitize_token_ids(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Ensure token indices are valid for codebook lookup"""
+        token_ids = token_ids.long()
+        # Codebook only has indices [0, num_codes-1]
+        invalid = (token_ids < 0) | (token_ids >= self.num_codes)
+        if invalid.any():
+            # Replace invalid tokens with a valid default (0)
+            token_ids = torch.where(invalid, torch.zeros_like(token_ids), token_ids)
+        return token_ids
     
     def get_codes_from_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Get code vectors from token indices using public VQ API"""
+        indices = self._sanitize_token_ids(indices)
+        indices = indices.clamp(0, self.num_codes - 1)  # Extra safety
+
         return self.vq.get_codes_from_indices(indices)
 
 
@@ -680,7 +701,8 @@ class PerceiverTokenPredictor(nn.Module):
     def extract_temporal_bottleneck(
         self, 
         latents: torch.Tensor, 
-        T_ctx: int,
+        T_to_extract: int,
+        T_start_index: int,
     ) -> torch.Tensor:
         """
         Extract time-aligned context from latent bottleneck.
@@ -696,10 +718,10 @@ class PerceiverTokenPredictor(nn.Module):
         device = latents.device
         
         # 1. Get base time queries (learned content)
-        q = self.time_queries(B)[:, :T_ctx, :]  # [B, T_ctx, C]
-        
+        q = self.time_queries(B)[:, T_start_index:T_start_index + T_to_extract, :]  # [B, T_ctx, C]
+
         # 2. Add explicit time position encoding
-        t_pos = positions(B, T_ctx, device=device)  # [B, T_ctx]
+        t_pos = positions(B, T_to_extract, device=device)  + T_start_index  # [B, T_ctx]
         d_head = C // self.num_self_attention_heads
         rotate_dim = d_head - (d_head % 2)
         freq = FrequencyPositionEncoding(dim=rotate_dim).to(device)(t_pos)
@@ -717,20 +739,21 @@ class PerceiverTokenPredictor(nn.Module):
     def decoder(
         self,
         latents: torch.Tensor,
-        T_override: Optional[int],
+        T_to_extract: int,
+        T_start_index: int,
         Ht: int,
         Wt: int,
     ) -> torch.Tensor:
 
         B = latents.shape[0]
-        T = T_override if T_override is not None else 1
         
-        self._ensure_pos_encoding(T, Ht, Wt, latents.device)
+        
+        self._ensure_pos_encoding(T_to_extract, Ht, Wt, latents.device)
         
         # Position encoding for output queries
         pos_enc = self.pos_encoding(B)  # (B, T*H*W, pos_dim)
         
-        temporal_context = self.extract_temporal_bottleneck(latents, T)
+        temporal_context = self.extract_temporal_bottleneck(latents, T_to_extract, T_start_index)
         temporal_expanded = repeat(
             temporal_context, 
             'b t d -> b (t h w) d', 
@@ -746,7 +769,7 @@ class PerceiverTokenPredictor(nn.Module):
         
         logits = self.output_adapter(output, self.token_embedding)
         # Reshape to spatial layout
-        logits = rearrange(logits, 'b (t h w) v -> b t h w v', t=T, h=Ht, w=Wt)
+        logits = rearrange(logits, 'b (t h w) v -> b t h w v', t=T_to_extract, h=Ht, w=Wt)
         
         return logits, temporal_context
     
@@ -783,7 +806,8 @@ class PerceiverTokenPredictor(nn.Module):
         
         logits_future, temporal_context = self.decoder(
             latents.last_hidden_state, 
-            T_override=T_pred_enc, 
+            T_to_extract=T_pred_enc, 
+            T_start_index=T_ctx_enc,
             Ht=Ht, 
             Wt=Wt,
         )
@@ -872,10 +896,23 @@ class PerceiverTokenPredictor(nn.Module):
                 
         #perceptual loss (LPIPS)
         B, T_target, C, H, W = target_videos.shape
-        context_frames = reconstructed.shape[1]-T_target
-        reconstructed_pred = reconstructed[:, context_frames:]
-        target_videos_norm = target_videos*2.0 -1.0  # Rescale to [-1, 1] for LPIPS
-        recon_flat =rearrange(reconstructed_pred, 'b t c h w -> (b t) c h w')
+        T_total = reconstructed.shape[1]
+        T_context = T_total - T_target
+        reconstructed_pred = reconstructed[:, T_context:]
+
+        # Check value ranges
+        expected_min, expected_max = -1.0, 1.0
+        actual_min_re, actual_max_re = reconstructed_pred.min().item(), reconstructed_pred.max().item()
+        actual_min_tg, actual_max_tg = target_videos.min().item(), target_videos.max().item()
+        if actual_min_re < expected_min or actual_max_re > expected_max:
+            print(f"WARNING: reconstructed range [{actual_min_re:.3f}, {actual_max_re:.3f}] "
+                  f"outside expected range [{expected_min}, {expected_max}]")
+        if actual_min_tg < expected_min or actual_max_tg > expected_max:
+            print(f"WARNING: target range [{actual_min_tg:.3f}, {actual_max_tg:.3f}] "
+                  f"outside expected range [{expected_min}, {expected_max}]")
+        # Clamp to valid range
+        target_videos_norm = target_videos.clamp(-1, 1)
+        recon_flat = rearrange(reconstructed_pred, 'b t c h w -> (b t) c h w')
         target_flat = rearrange(target_videos_norm, 'b t c h w -> (b t) c h w')
         lpips_loss = self.lpips_loss(recon_flat, target_flat).mean()
         # Total loss
@@ -906,11 +943,12 @@ class PerceiverTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         """MaskGIT-style iterative generation with enhanced sampling"""
         B = context_videos.shape[0]
-        T_ctx = context_videos.shape[1]
+        
         T_gen = num_frames_to_generate
         
         # Encode context 
         context_tokens, _, _, _ = self.tokenizer.encode(context_videos)
+        T_ctx = context_tokens.shape[1]
         Ht, Wt = context_tokens.shape[-2:]
         
         # Initialize future tokens randomly
@@ -936,9 +974,10 @@ class PerceiverTokenPredictor(nn.Module):
             # Encode
             latents = self.encoder(current_tokens)
             
-            logits_future, temporal_context = self.decoder(
+            logits_future, _ = self.decoder(
                 latents.last_hidden_state, 
-                T_override=T_gen, 
+                T_to_extract=T_gen, 
+                T_start_index=T_ctx,
                 Ht=Ht, 
                 Wt=Wt,
             )
@@ -1020,14 +1059,15 @@ class PerceiverTokenPredictor(nn.Module):
         Ht, Wt = context_tokens.shape[-2:]
         
         # Generate frame by frame
-        for _ in range(num_frames_to_generate):
+        for i in range(num_frames_to_generate):
             # Encode current sequence
             latents = self.encoder(current_tokens)
-            
+            T_start_index = current_tokens.shape[1]
             # Decode - predict only next frame with warm-start
             logits_next, temporal_context = self.decoder(
                 latents.last_hidden_state, 
-                T_override=1, 
+                T_to_extract=1, 
+                T_start_index=T_start_index,
                 Ht=Ht, 
                 Wt=Wt,
             )
@@ -1091,6 +1131,7 @@ class CausalPerceiverIO(nn.Module):
         use_3d_conv: bool = False,
         temporal_downsample: bool = False,
         num_quantizers: int = 1,  # Multi-head VQ
+        kmeans_init: bool = False,
     ):
         super().__init__()
         
@@ -1103,16 +1144,18 @@ class CausalPerceiverIO(nn.Module):
             num_codes=num_codes,
             downsample=downsample,
             base_channels=base_channels,
-            commitment_weight=0.25,
+            commitment_weight=0.05,
             use_cosine_sim=False,
-            kmeans_init=False,
+            kmeans_init=kmeans_init,
             gate_skips=False,
             use_3d_conv=use_3d_conv,
             temporal_downsample=temporal_downsample,
             dropout=dropout,
             num_quantizers=num_quantizers,
+            codebook_diversity_loss_weight=0.005,
+            codebook_diversity_temperature=1.0
         )
-        
+
         # Create main prediction model
         self.model = PerceiverTokenPredictor(
             tokenizer=self.tokenizer,

@@ -1266,9 +1266,17 @@ class VectorQuantize(Module):
                 dist_einops_eq = 'c b n l -> b l n c'
             else:
                 dist_einops_eq = '1 (b h) n l -> b l n h'
+            #new change
+            logits = rearrange(distances, dist_einops_eq, b=shape[0])  # (B, L, N)
+            if codes.dim() == 3:                # (B, H, W)
+                codes = rearrange(codes, 'b h w -> b (h w)')
+            elif codes.dim() == 4:              # (B, H, W, heads) — uncommon
+                # move heads into batch for CE (optional handling)
+                logits = rearrange(logits, 'b l n h -> (b h) l n')
+                codes  = rearrange(codes, 'b h w c -> (b c) (h w)')
 
             ce_loss = F.cross_entropy(
-                rearrange(distances, dist_einops_eq, b = shape[0]),
+                logits,
                 codes,
                 ignore_index = -1
             )
