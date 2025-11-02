@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from torch.distributions import Distribution, constraints
 from torch.distributions.utils import broadcast_all
 import torch.utils.data.distributed
-from agac_torch.agac.configs import AlgorithmConfig,LoggingConfig, ReinforcementLearningConfig
+from legacy.agac_torch.agac.configs import AlgorithmConfig,LoggingConfig, ReinforcementLearningConfig
 from VRNN.Normalization import compute_normalizer
 import numpy as np
 import json
@@ -32,7 +32,7 @@ from pathlib import Path
 import operator
 import re
 import math
-from agac_torch.agac.agac_ppo import *
+from legacy.agac_torch.agac.agac_ppo import *
 
 CONST_SQRT_2 = math.sqrt(2)
 CONST_INV_SQRT_2PI = 1 / math.sqrt(2 * math.pi)

@@ -13,18 +13,20 @@ import numpy as np
 import math
 from collections import OrderedDict
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from models import (
+from src.models import (
     EMA, TemporalDiscriminator,
-    LinearResidual, AttentionPosterior, AttentionPrior,
+    LinearResidual,
     AddEpsilon, check_tensor
 )
-from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
+from src.nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
 
-from VRNN.RGB import RGB
-from VRNN.lstm import LSTMLayer
+from src.multi_task_learning import RGB
+from src.temporal_dynamics import LSTMLayer
 
-from VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
-from VRNN.Kumaraswamy import KumaraswamyStable
+from src.perceiver_io import CausalPerceiverIO
+from src.generative_prior import DPGMMPrior, AdaptiveStickBreaking
+from src.generative_prior.distributions import KumaraswamyStable
+from src.attention_schema import AttentionSchema, AttentionPosterior, AttentionPrior
 def beta_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     """Compute beta function in log space for numerical stability"""

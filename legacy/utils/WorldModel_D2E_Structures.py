@@ -19,7 +19,7 @@ import itertools
 from VRNN.main import ModelState
 import pathlib
 from typing import Dict
-from agac_torch.agac.agac_ppo import Agent
+from legacy.agac_torch.agac.agac_ppo import Agent
 Transition = collections.namedtuple(
     'Transition', 's1, s2, a1, a2, discount, reward, done')
 

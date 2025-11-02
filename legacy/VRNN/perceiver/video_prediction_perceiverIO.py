@@ -699,41 +699,57 @@ class PerceiverTokenPredictor(nn.Module):
         return ModuleOutput(last_hidden_state=latents)
 
     def extract_temporal_bottleneck(
-        self, 
-        latents: torch.Tensor, 
+        self,
+        latents: torch.Tensor,
         T_to_extract: int,
         T_start_index: int,
     ) -> torch.Tensor:
         """
         Extract time-aligned context from latent bottleneck.
-        
+
         Args:
             latents: [B, num_latents, C] - encoder output
             T_ctx: number of timesteps to extract
-            
+
         Returns:
             temporal_context: [B, T_ctx, C] - time-aligned features
         """
         B, _, C = latents.shape
         device = latents.device
-        
-        # 1. Get base time queries (learned content)
-        q = self.time_queries(B)[:, T_start_index:T_start_index + T_to_extract, :]  # [B, T_ctx, C]
 
-        # 2. Add explicit time position encoding
+        # 1. Get base time queries (learned content)
+        # FIX: Handle autoregressive generation where T_start_index may exceed trained positions
+        all_queries = self.time_queries(B)  # [B, sequence_length, C]
+        max_learned_pos = all_queries.shape[1]
+
+        if T_start_index >= max_learned_pos:
+            # Beyond trained range: use last learned query and rely on position encoding
+            # Repeat the last query for all positions we need to extract
+            q = all_queries[:, -1:, :].expand(B, T_to_extract, C)
+        elif T_start_index + T_to_extract > max_learned_pos:
+            # Partially out of bounds: use available queries then repeat last
+            available = all_queries[:, T_start_index:, :]  # [B, remaining, C]
+            remaining = T_to_extract - available.shape[1]
+            repeated = all_queries[:, -1:, :].expand(B, remaining, C)
+            q = torch.cat([available, repeated], dim=1)
+        else:
+            # Within trained range: use as before
+            q = all_queries[:, T_start_index:T_start_index + T_to_extract, :]  # [B, T_ctx, C]
+
+        # 2. Add explicit time position encoding (provides actual temporal information)
         t_pos = positions(B, T_to_extract, device=device)  + T_start_index  # [B, T_ctx]
         d_head = C // self.num_self_attention_heads
         rotate_dim = d_head - (d_head % 2)
         freq = FrequencyPositionEncoding(dim=rotate_dim).to(device)(t_pos)
         q = q + self.time_pe_proj(freq)  # [B, T_ctx, C]
-        
+
         # 3. Cross-attention: time queries extract from latents
         q = self.temporal_cross_attn(q, latents).last_hidden_state  # [B, T_ctx, C]
-        
+
         # 4. Causal self-attention: temporal coherence
         rot = RotaryPositionEmbedding(freq)
         q = self.temporal_self_attn(q, rot_pos_emb=rot).last_hidden_state  # [B, T_ctx, C]
-        
+
         return q  
       
     def decoder(

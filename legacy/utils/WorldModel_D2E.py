@@ -4,16 +4,16 @@ from WorldModel_D2E_Utils import *
 from gym import spaces
 from tensor_utils import tensor_spec_from_gym_space
 import os
-from agac_torch.agac.agac_ppo import PPO
-from agac_torch.agac.memory import Memory, Transition
+from legacy.agac_torch.agac.agac_ppo import PPO
+from legacy.agac_torch.agac.memory import Memory, Transition
 from copy import deepcopy
 from welford import Welford
 from gym.spaces import Box, Discrete
-from agac_torch.agac.utils import DiscreteGrid, compute_advantages_and_returns
+from legacy.agac_torch.agac.utils import DiscreteGrid, compute_advantages_and_returns
 import sys
 from pathlib import Path
 import gym
-from agac_torch.agac.configs import ExperimentConfig
+from legacy.agac_torch.agac.configs import ExperimentConfig
 from torch.utils.tensorboard import SummaryWriter
 import argparse
 from typing import Dict, List, Iterator, Union

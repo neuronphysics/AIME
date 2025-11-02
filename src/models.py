@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from typing import Optional, Tuple, Dict, Union, List
-from VRNN.perceiver.utilities import RopePositionEmbedding  # spatial RoPE
+from legacy.VRNN.perceiver.utilities import RopePositionEmbedding  # spatial RoPE
 
 import logging
 import functools
@@ -12,6 +12,10 @@ import numpy as np
 from einops import rearrange
 from torch.autograd import Function
 import collections.abc as abc
+
+# Backward compatibility: Re-export attention classes from new module
+# Note: The original definitions remain below for now, but imports should use src.attention_schema
+from src.attention_schema import SlotAttention, AttentionPosterior, AttentionPrior, ConvGRUCell
 
 class AddEpsilon(nn.Module):
     def __init__(self, eps):
