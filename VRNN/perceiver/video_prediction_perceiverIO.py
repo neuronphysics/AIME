@@ -11,7 +11,7 @@ import numpy as np
 from functools import partial
 from VRNN.perceiver.adapter import TiedTokenOutputAdapter, TrainableQueryProvider
 from VRNN.perceiver.modules import (
-    CrossAttention, SelfAttentionBlock, KVCache
+    CrossAttention, SelfAttentionBlock, KVCache, SeparateKVCrossAttention
 )
 from VRNN.perceiver.position import (
     FourierPositionEncoding, FrequencyPositionEncoding, 
@@ -186,7 +186,7 @@ class DVAE(nn.Module):
         ), "vocab_size must be divisible by ratio_vocab_to_latent_channels"
         self.z_channels = z_channels
 
-        # ---------- Encoder: [B,C,T,H,W] -> [B,T,z_channels,H',W'] ----------
+        # Encoder: [B,C,T,H,W] -> [B,T,z_channels,H',W'] 
         self.video_encoder = VideoEncoder(
             ch=hidden,
             ch_mult=ch_mult,
@@ -206,7 +206,7 @@ class DVAE(nn.Module):
         # Dequantization: vocab_size -> z_channels
         self.post_quant = SamePadConv3d(vocab_size, z_channels, 1)
 
-        # ---------- Decoder: [B,T,z_channels,H',W'] -> [B,C,T,H,W] ----------
+        # Decoder: [B,T,z_channels,H',W'] -> [B,C,T,H,W]
         self.video_decoder = VideoDecoder(
             ch=hidden,
             z_channels=z_channels,
@@ -445,7 +445,7 @@ class VQPTTokenizer(nn.Module):
                 img_channels=in_channels,
                 hidden=base_channels,
                 kernel_size=3,
-                s_down=downsample,   # still kept for documentation / safety
+                s_down=downsample,  
                 t_down=1,
                 num_res_blocks=1,
             )
@@ -513,13 +513,13 @@ class VQPTTokenizer(nn.Module):
         Returns a scalar tensor in [0, 1].
         """
         # 1) Encode original
-        tok1, quantized, _ = self.encode(videos)   # tok1: [B,T,Ht,Wt(,Q)]
+        tok1, quantized, _, _ = self.encode(videos)   # tok1: [B,T,Ht,Wt(,Q)]
 
         # 2) Decode from quantized latents
         recon = self.decode(quantized, use_tanh=use_tanh)  # [B,T,C,H,W]
 
         # 3) Re-encode reconstruction
-        tok2, _, _ = self.encode(recon)
+        tok2, _, _, _ = self.encode(recon)
 
         # 4) Drop Q dim if present (multi-head)
         if tok1.dim() == 5:
@@ -573,7 +573,7 @@ class VQPTTokenizer(nn.Module):
         else:
             token_ids = rearrange(ids, '(b t) h w q -> b t h w q', b=B, t=T_enc)
 
-        return token_ids.long(), quantized, vq_loss
+        return token_ids.long(), quantized, latent_tm, vq_loss
     
     def decode(self, quantized: torch.Tensor,  use_tanh: bool = True):
         """Decode quantized features to videos ."""
@@ -649,6 +649,7 @@ class VQPTTokenizer(nn.Module):
             recon = recon.tanh()
         return recon
 
+
 class PerceiverTokenPredictor(nn.Module):
     """
     Perceiver-based video prediction model with discrete token prediction.
@@ -701,9 +702,14 @@ class PerceiverTokenPredictor(nn.Module):
 
         # Perceiver encoder core
         # Learnable latent queries
+
+        self.num_time_slots = num_latents // sequence_length   # N_L_spatial per time step
+
+        # time_latent_queries[t] has shape [N_L_spatial, C] for timestep t
         self.latent_queries = nn.Parameter(
-            torch.randn(num_latents, num_latent_channels) * 0.02
+            torch.randn(sequence_length, self.num_time_slots, num_latent_channels) * 0.02
         )
+
 
         # Cross-attn: latents <- token embeddings with residual
         self.encoder_cross_attn = Residual( 
@@ -713,16 +719,6 @@ class PerceiverTokenPredictor(nn.Module):
             num_kv_input_channels=num_latent_channels,
             dropout=dropout,
         ), dropout=dropout)
-
-        # Self-attn over latents (non-causal, bidirectional)
-        self.encoder_self_attn = SelfAttentionBlock(
-            num_layers=num_self_attention_layers,
-            num_heads=num_self_attention_heads,
-            num_channels=num_latent_channels,
-            widening_factor=widening_factor,
-            dropout=dropout,
-            causal_attention=False,
-        )
 
         # Temporal bottleneck
         assert sequence_length is not None, "sequence_length must be set for temporal bottleneck"
@@ -741,15 +737,16 @@ class PerceiverTokenPredictor(nn.Module):
             num_latent_channels,
         )
 
-        # Cross-attn: time queries <- latents
-        self.temporal_cross_attn = Residual(
-            CrossAttention(
-                num_heads=num_cross_attention_heads,
-                num_q_input_channels=num_latent_channels,
-                num_kv_input_channels=num_latent_channels,
-                dropout=dropout,
-            ), dropout=dropout
+        # Cross-attn: per-frame time-indexed cross-attn
+        self.temporal_cross_attn = SeparateKVCrossAttention(
+            dim_q=self.num_latent_channels,
+            dim_k=self.num_latent_channels,
+            dim_v=self.num_latent_channels,
+            dim_out=self.num_latent_channels,
+            num_heads=num_cross_attention_heads,
+            dropout=dropout,
         )
+        
 
         # Causal self-attn along time axis (temporal AR bottleneck)
         self.temporal_self_attn = SelfAttentionBlock(
@@ -798,7 +795,8 @@ class PerceiverTokenPredictor(nn.Module):
             dropout=dropout,
             widening_factor=ARdecoder_widening_factor,
         )
-
+        self.encoder_key_proj = nn.Linear(self.tokenizer.dvae.z_channels, self.num_latent_channels)
+        self.proj_ln = nn.LayerNorm(self.num_latent_channels)
         # --- VQ freezing config ---
         self.vq_freeze_threshold = 0.9993       # freeze when >= this
         self.vq_unfreeze_threshold = 0.995     # unfreeze when <= this
@@ -809,7 +807,7 @@ class PerceiverTokenPredictor(nn.Module):
         self._vq_unfreeze_counter = 0
 
         # DVAE: only freeze once very stable
-        self.dvae_freeze_threshold = 0.9999     # your "99%" condition
+        self.dvae_freeze_threshold = 0.9999     # "99%" condition
         self.dvae_freeze_patience = 5
         self._dvae_frozen = False
         self._dvae_freeze_counter = 0
@@ -910,6 +908,37 @@ class PerceiverTokenPredictor(nn.Module):
         target_tokens = token_ids[:, T_ctx_enc:]
 
         return context_tokens, target_tokens, T_ctx_enc, T_pred_enc
+    
+    def _encode_tokens_per_frame(
+        self,
+        token_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Helper for temporal bottleneck.
+
+        Args:
+            token_ids: [B, T_ctx_enc, Ht, Wt] or [B, T_ctx_enc, Ht, Wt, Q]
+
+        Returns:
+            tok_flat: [B, T_ctx_enc, N_tok, C]  (pure token embeddings)
+            x_frame: [B, T_ctx_enc, N_tok, C]  (token embeddings + 3D pos enc)
+        """
+        # Drop Q dim if present
+        if token_ids.dim() == 5:
+            token_ids = token_ids[..., 0]
+
+        B, T_ctx_enc, Ht, Wt = token_ids.shape
+
+        # Token embeddings
+        tok = self.token_embedding(token_ids.long())            # [B, T, Ht, Wt, C]
+        tok_flat = rearrange(tok, "b t h w c -> b t (h w) c")   # [B, T, N_tok, C]
+
+        # 3D spatio-temporal Fourier PE (same as encoder)
+        pe_flat = self._get_spatiotemporal_encoding(token_ids)  # [B, T*Ht*Wt, C]
+        pe = rearrange(pe_flat, "b (t hw) c -> b t hw c", t=T_ctx_enc)  # [B, T, N_tok, C]
+
+        x_frame = tok_flat + pe                                 # [B, T, N_tok, C]
+        return tok_flat, x_frame
 
     # VQ tokenizer freezing (used by compute_loss / cycle loss)
     def freeze_VQPT_tokenizer(self):
@@ -966,14 +995,13 @@ class PerceiverTokenPredictor(nn.Module):
         pe = pe.expand(B, -1, -1)               # [B, T*Ht*Wt, C]
         return pe
 
-    # Perceiver encoder + temporal bottleneck
-    def encoder(self, token_ids: torch.Tensor) -> ModuleOutput:
+    
+    def build_time_indexed_latents(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         token_ids: [B, T_enc, Ht, Wt] or [B, T_enc, Ht, Wt, Q==1]
         Returns latents: [B, num_latents, C]
         """
-        B, T_enc = token_ids.shape[:2]
-        Ht, Wt = token_ids.shape[2:4]
+        B, T_enc, Ht, Wt = token_ids.shape[:4]
         device = token_ids.device
 
         # drop Q dim if present (we only embed one index per site).
@@ -981,98 +1009,176 @@ class PerceiverTokenPredictor(nn.Module):
             token_ids = token_ids[..., 0]
 
         tok = self.token_embedding(token_ids.long())          # [B,T,Ht,Wt,C]
-        tok = rearrange(tok, "b t h w c -> b (t h w) c")      # [B, N, C]
+        tok = rearrange(tok, "b t h w c -> b t (h w) c")      # [B, T, N, C]
 
         pe = self._get_spatiotemporal_encoding(token_ids)     # [B, N, C]
-        enc_in = tok + pe                                     # [B, N, C]
+        pe = rearrange(pe, "b (t hw) c -> b t hw c", t=T_enc)  # [B, T, N, C]
+        enc_in = tok + pe                                   # [B, T, N, C]
 
-        # Latent queries
-        latents = self.latent_queries.expand(B, -1, -1)       # [B, L, C]
+            # Latent queries
+        # 2) Build time-indexed latent queries Q for each (b,t)  ----------
+        T_max, S, C = self.latent_queries.shape
+        assert T_enc <= T_max, "sequence_length (T_max) must be >= T_enc"
 
-        # Latents attend to tokens
+        # latent_queries_for_seq: [T_enc, S, C]
+        latent_q_seq = self.latent_queries[:T_enc]                        # [T_enc,S,C]
+
+        # expand over batch: [B, T_enc, S, C]
+        q_bt = latent_q_seq.unsqueeze(0).expand(B, -1, -1, -1)            # [B,T_enc,S,C]
+
+        # 3) Vectorize over (B,T_enc) by flattening into BT batch ---------
+        # q_bt_flat: [B*T_enc, S, C]
+        # kv_bt_flat: [B*T_enc, N_tok, C]
+        q_bt_flat = rearrange(q_bt,  "b t s c -> (b t) s c")
+        kv_bt_flat = rearrange(enc_in, "b t n c -> (b t) n c")
+
         ca_out = self.encoder_cross_attn(
-            latents,
-            x_kv=enc_in,
+            q_bt_flat,
+            x_kv=kv_bt_flat,
             pad_mask=None,
             rot_pos_emb_q=None,
             rot_pos_emb_k=None,
             kv_cache=None,
         )
-        latents = ca_out.last_hidden_state                    # [B,L,C]
+        latents_bt = ca_out.last_hidden_state                            # [B*T_enc,S,C]
 
-        sa_out = self.encoder_self_attn(
-            latents,
-            pad_mask=None,
-            rot_pos_emb=None,
-            kv_cache=None,
-        )
-        latents = sa_out.last_hidden_state                    # [B,L,C]
+        # 4) Reshape back to [B,T_enc,S,C]  --------------
+        latents_time = rearrange(latents_bt, "(b t) s c -> b t s c", b=B, t=T_enc)
 
-        return ModuleOutput(last_hidden_state=latents)
+        return latents_time
+
 
     def extract_temporal_bottleneck(
         self,
-        latents: torch.Tensor,       # [B, L, C]
-        T_to_extract: int,
-        T_start_index: int,
-    ) -> Tuple[torch.Tensor, Dict]:
+        ctx_token_ids: torch.Tensor,  # [B, T_ctx_enc, Ht, Wt] or [B, T_ctx_enc, Ht, Wt, Q]
+        encoder_latents: torch.Tensor,  # [B, T, z, H', W']
+        T_ctx_enc: int,
+        T_pred_enc: int,
+    ):
         """
-        Build a temporal sequence of length T_to_extract from Perceiver latents.
+        Explicit, time-indexed temporal bottleneck.
 
-        We index time with learnable queries + Fourier PE in time,
-        then causal self-attn along that axis.
-        Returns temporal_ctx: [B, T_to_extract, C].
+        Steps:
+        1) Build time-indexed latents per frame using build_time_indexed_latents.
+        2) Build per-frame token features (pure embeddings + PE) using _encode_tokens_per_frame.
+        3) Add 1D time positional encoding to Q, K, V for context frames.
+        4) Per-frame cross-attention (Q=latents[:,t], K=x[:,t], V=token[:,t]),
+            implemented in a vectorized way over (B,T_ctx_enc).
+        5) Pool spatial latent slots per frame -> [B, T_ctx_enc, C].
+        6) Append future time queries and run causal temporal self-attn over time.
+        7) Return future slice [B, T_pred_enc, C] as temporal_ctx.
         """
-        B, L, C = latents.shape
-        device = latents.device
+        device = ctx_token_ids.device
 
-        # Time positions for [T_start_index, T_start_index+T_to_extract)
+        # ------------------------------------------------------------------
+        # 1) Time-indexed latents from context tokens
+        # ------------------------------------------------------------------
+        latents_time = self.build_time_indexed_latents(ctx_token_ids)
+        # latents_time: [B, T_enc, S, C]
+        B, T_enc, S, C = latents_time.shape
+        assert T_enc == T_ctx_enc, f"T_ctx_enc mismatch: {T_enc} vs {T_ctx_enc}"
+
+        # ------------------------------------------------------------------
+        # 2) Per-frame token features (token[:,t], x[:,t])
+        # ------------------------------------------------------------------
+        tok_flat, x_frame = self._encode_tokens_per_frame(ctx_token_ids)
+        # tok_flat, x_frame: [B, T_ctx_enc, N_tok, C]
+        B2, T_tok, N_tok, C_tok = tok_flat.shape
+        assert B2 == B and T_tok == T_ctx_enc and C_tok == C, "Shape mismatch in _encode_tokens_per_frame output"
+
+        # ------------------------------------------------------------------
+        # 3) Time positional encodings for full timeline (context + future)
+        # ------------------------------------------------------------------
+        T_total = T_ctx_enc + T_pred_enc
+
         t_idx = torch.arange(
-            T_start_index,
-            T_start_index + T_to_extract,
+            0,
+            T_total,
             device=device,
             dtype=torch.long,
-        )  # [T_to_extract]
+        ).unsqueeze(0)                         # [1, T_total]
 
-        # 1D time positional encoding -> [T_to_extract, D_rot]
-        abs_pos = t_idx.unsqueeze(0)                                # [1, T]
-        t_fpe = self.time_tb_pos_encoder(abs_pos)                   # [1, T, D_rot]
-        t_fpe = t_fpe.squeeze(0)                                    # [T, D_rot]
+        # 1D time FPE -> [1, T_total, D_rot] -> [T_total, D_rot]
+        t_fpe = self.time_tb_pos_encoder(t_idx)    # [1, T_total, D_rot]
+        t_fpe = t_fpe.squeeze(0)                   # [T_total, D_rot]
 
-        # Project to latent dimension and add queries
-        t_pe = self.time_pe_proj(t_fpe)                             # [T, C]
-        time_queries = self.time_queries()  # [1,T,C] or [B,T,C]
-        assert T_to_extract <= time_queries.shape[1], f"T_to_extract={T_to_extract} > max={time_queries.shape[1]}"
-        # Slice to the required number of timesteps
-        time_queries = time_queries[:, :T_to_extract, :]            # [1, T, C]
+        # Project to latent dim -> [T_total, C]
+        t_pe = self.time_pe_proj(t_fpe)            # [T_total, C]
 
-        # Expand across batch
-        time_queries = time_queries.expand(B, -1, -1)               # [B, T, C]
+        # Split context vs future time PE
+        t_pe_ctx = t_pe[:T_ctx_enc]                # [T_ctx_enc, C]
+        t_pe_future = t_pe[T_ctx_enc:T_ctx_enc + T_pred_enc]   # [T_pred_enc, C]
 
-        time_q = time_queries + t_pe.unsqueeze(0)                   # [B,T,C]
+        # 4) Add time PE to Q, K, V for context frames
+        # Shape for broadcasting over spatial positions:
+        pe_ctx_exp = t_pe_ctx.view(1, T_ctx_enc, 1, C)   # [1, T_ctx_enc, 1, C]
+        
 
-        # Cross-attn: time_q <- latents
-        ca_out = self.temporal_cross_attn(
-            time_q,
-            x_kv=latents,
-            pad_mask=None,
-            rot_pos_emb_q=None,
-            rot_pos_emb_k=None,
-            kv_cache=None,
+        # Flatten spatial
+        enc_flat = rearrange(encoder_latents, "b t c h w -> b t (h w) c")   # [B,T,N_enc,zc]
+
+        # Project channels to latent dim
+        k_frame = self.proj_ln(self.encoder_key_proj(enc_flat))                          # [B,T,N_enc,C]
+
+        # Q = latents[:, t] + time PE
+        Q_ctx = latents_time + pe_ctx_exp                # [B, T_ctx_enc, S, C]
+        # K/V from x_frame / tok_flat + time PE
+        K_ctx = k_frame[:,:T_ctx_enc] + pe_ctx_exp                     # [B, T_ctx_enc, N_tok, C]
+        V_ctx = tok_flat + pe_ctx_exp                    # [B, T_ctx_enc, N_tok, C]
+
+        # 5) Per-frame cross-attention (vectorized over (B,T_ctx_enc))
+        #    Semantically what we want to do:
+        #      for t in range(T_ctx_enc):
+        #          Z[t] = SeparateKVCrossAttention(
+        #              Q = latents_time[:, t],   # [B,S,C]
+        #              K = x_frame[:, t],       # [B,N_tok,C]
+        #              V = tok_flat[:, t],      # [B,N_tok,C]
+        #          )
+        q_bt = rearrange(Q_ctx, "b t s c -> (b t) s c")   # [B*T_ctx_enc, S, C]
+        k_bt = rearrange(K_ctx, "b t n c -> (b t) n c")   # [B*T_ctx_enc, N_tok, C]
+        v_bt = rearrange(V_ctx, "b t n c -> (b t) n c")   # [B*T_ctx_enc, N_tok, C]
+
+        Z_bt = self.temporal_cross_attn(q_bt, k_bt, v_bt) # [B*T_ctx_enc, S, C]
+        Z_ctx = rearrange(Z_bt, "(b t) s c -> b t s c", b=B, t=T_ctx_enc)  # [B,T_ctx_enc,S,C]
+
+        # Pool spatial latent slots per frame -> [B, T_ctx_enc, C]
+        temporal_ctx_ctx = Z_ctx.mean(dim=2)              # [B, T_ctx_enc, C]
+
+        # 6) Build future time queries and run temporal self-attention
+        time_queries = self.time_queries()                # [1, sequence_length, C]
+        assert T_total <= time_queries.shape[1], (
+            f"T_total={T_total} exceeds time_queries.size(1)={time_queries.shape[1]}"
         )
-        t_feats = ca_out.last_hidden_state                            # [B,T,C]
 
-        # Causal self-attn along time axis
+        # Future queries: [1,T_pred_enc,C] -> [B,T_pred_enc,C]
+        q_future = time_queries[:, T_ctx_enc:T_ctx_enc + T_pred_enc, :]  # [1,T_pred_enc,C]
+        q_future = q_future.expand(B, -1, -1)                            # [B,T_pred_enc,C]
+        q_future = q_future + t_pe_future.view(1, T_pred_enc, C)         # add time PE
+
+        # Concatenate context + future along time
+        timeline_init = torch.cat(
+            [temporal_ctx_ctx, q_future], dim=1
+        )                                                                # [B,T_total,C]
+
+        # Causal self-attention along time axis
         sa_out = self.temporal_self_attn(
-            t_feats,
+            timeline_init,
             pad_mask=None,
             rot_pos_emb=None,
             kv_cache=None,
         )
-        t_feats = sa_out.last_hidden_state                            # [B,T,C]
+        timeline_out = sa_out.last_hidden_state                          # [B,T_total,C]
 
-        meta = dict(T_to_extract=T_to_extract, T_start_index=T_start_index)
-        return t_feats, meta
+        # Future slice is the temporal bottleneck for AR
+        temporal_ctx_future = timeline_out[:, T_ctx_enc:, :]             # [B,T_pred_enc,C]
+
+        meta = dict(
+            T_ctx_enc=T_ctx_enc,
+            T_pred_enc=T_pred_enc,
+            T_total=T_total,
+            num_time_slots=S,
+        )
+        return temporal_ctx_future, meta
 
 
     # The AR training over future tokens
@@ -1086,7 +1192,7 @@ class PerceiverTokenPredictor(nn.Module):
         device = videos.device
 
         # 1) VQ tokenize full clip
-        token_ids, quantized, vq_loss = self.tokenizer.encode(videos)
+        token_ids, quantized, latent_tm, vq_loss = self.tokenizer.encode(videos)
         # token_ids: [B, T_enc, Ht, Wt] or [B,T_enc,Ht,Wt,Q]
         token_ids = token_ids.long()
 
@@ -1095,17 +1201,14 @@ class PerceiverTokenPredictor(nn.Module):
             token_ids, num_context_frames, T_raw
         )
 
-        # 3) Encode **context tokens** with Perceiver
-        enc_out = self.encoder(context_tokens)
-        latents = enc_out.last_hidden_state          # [B, L, C]
-
         # 4) Temporal bottleneck for the future interval
+        # output: [B,T_pred_enc,C]
         temporal_ctx, _ = self.extract_temporal_bottleneck(
-            latents,
-            T_to_extract=T_pred_enc,
-            T_start_index=T_ctx_enc,
-        )                                            # [B,T_pred_enc,C]
-
+            context_tokens,
+            latent_tm,
+            T_ctx_enc=T_ctx_enc,
+            T_pred_enc=T_pred_enc,
+     )
         # 5) Prepare AR targets: flatten future tokens (L = T_pred_enc * tokens_per_frame)
         target_flat, meta_future = self._flatten_tokens(target_tokens)  # [B,L]
         L_future = target_flat.shape[1]
@@ -1321,7 +1424,7 @@ class PerceiverTokenPredictor(nn.Module):
             )                                        # (B, 1, C, H, W)
 
             # re-encode through frozen VQ tokenizer
-            _, quant_cycle, _ = self.tokenizer.encode(decoded_step)
+            _, quant_cycle, _, _ = self.tokenizer.encode(decoded_step)
             # quant_cycle: (B, 1, D, Ht, Wt)
             z_cycle = quant_cycle[:, 0]              # (B, D, Ht, Wt)
 
@@ -1421,7 +1524,7 @@ class PerceiverTokenPredictor(nn.Module):
         device = context_videos.device
 
         # 1) Encode context
-        ctx_token_ids, _, _ = self.tokenizer.encode(context_videos)
+        ctx_token_ids, _, latent_tm, _ = self.tokenizer.encode(context_videos)
         ctx_token_ids = ctx_token_ids.long()
         B2, T_ctx_enc, Ht, Wt = ctx_token_ids.shape[:4]
         assert B2 == B
@@ -1430,15 +1533,13 @@ class PerceiverTokenPredictor(nn.Module):
         frames_per_token = T_ctx_raw / float(T_ctx_enc)
         T_pred_enc = max(1, int(round(num_frames_to_generate / frames_per_token)))
 
-        # 2) Perceiver encoder on context
-        enc_out = self.encoder(ctx_token_ids)
-        latents = enc_out.last_hidden_state          # [B,L,C]
 
         # Temporal context for the *future* interval
         temporal_ctx, _ = self.extract_temporal_bottleneck(
-            latents,
-            T_to_extract=T_pred_enc,
-            T_start_index=T_ctx_enc,
+            ctx_token_ids,
+            latent_tm,
+            T_ctx_enc=T_ctx_enc,
+            T_pred_enc=T_pred_enc,
         )                                            # [B,T_pred_enc,C]
 
         # Flatten semantics: each temporal step corresponds to tokens_per_frame positions.
@@ -1519,7 +1620,7 @@ class PerceiverTokenPredictor(nn.Module):
         """
         Reconstruct videos through the VQ tokenizer 
         """
-        token_ids, _, _ = self.tokenizer.encode(videos)
+        token_ids, _, _, _ = self.tokenizer.encode(videos)
         _, T_enc, Ht, Wt = token_ids.shape[:4]
 
         return self.tokenizer.decode_code(
@@ -1634,11 +1735,7 @@ class CausalPerceiverIO(nn.Module):
             top_p
         )
     
-    @property
-    def encoder(self):
-        """Expose encoder from wrapped model"""
-        return self.model.encoder
-    
+
     
     @torch.no_grad()
     def reconstruct(self, videos: torch.Tensor) -> torch.Tensor:

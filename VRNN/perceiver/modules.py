@@ -1,5 +1,5 @@
 from typing import List, Optional, Tuple
-
+import math
 import torch
 from einops import rearrange
 from fairscale.nn import checkpoint_wrapper
@@ -600,6 +600,76 @@ class PerceiverEncoder(nn.Module):
             return x_latent, x_adapted
         else:
             return x_latent
+
+class SeparateKVCrossAttention(nn.Module):
+    """
+    Simple multi-head cross-attention with explicit Q, K, V inputs:
+        Q: [B, N_q, D_q]
+        K: [B, N_k, D_k]
+        V: [B, N_k, D_v]
+
+    Used in the temporal bottleneck to implement:
+        for t in range(T):
+            Z[t] = CrossAttn(Q=latents[:, t], K=x[:, t], V=token[:, t])
+    """
+    def __init__(
+        self,
+        dim_q: int,
+        dim_k: int,
+        dim_v: int,
+        dim_out: int,
+        num_heads: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        assert dim_out % num_heads == 0, "dim_out must be divisible by num_heads"
+
+        self.num_heads = num_heads
+        self.head_dim = dim_out // num_heads
+
+        self.q_proj = nn.Linear(dim_q, dim_out)
+        self.k_proj = nn.Linear(dim_k, dim_out)
+        self.v_proj = nn.Linear(dim_v, dim_out)
+        self.out_proj = nn.Linear(dim_out, dim_out)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        q: torch.Tensor,   # [B, N_q, D_q]
+        k: torch.Tensor,   # [B, N_k, D_k]
+        v: torch.Tensor,   # [B, N_k, D_v]
+    ) -> torch.Tensor:
+        B, N_q, _ = q.shape
+        Bk, N_k, _ = k.shape
+        Bv, N_v, _ = v.shape
+        assert B == Bk == Bv, "Batch size mismatch between q, k, v"
+        assert N_k == N_v, "K and V must have the same sequence length"
+
+        # Project to common model dimension
+        q = self.q_proj(q)   # [B, N_q, D]
+        k = self.k_proj(k)   # [B, N_k, D]
+        v = self.v_proj(v)   # [B, N_k, D]
+
+        # Reshape to [B, num_heads, N_*, head_dim]
+        H = self.num_heads
+        D = self.head_dim
+
+        q = q.view(B, N_q, H, D).transpose(1, 2)  # [B, H, N_q, D]
+        k = k.view(B, N_k, H, D).transpose(1, 2)  # [B, H, N_k, D]
+        v = v.view(B, N_k, H, D).transpose(1, 2)  # [B, H, N_k, D]
+
+        # Scaled dot-product attention
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)  # [B, H, N_q, N_k]
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        out = torch.matmul(attn_weights, v)  # [B, H, N_q, D]
+
+        # Merge heads
+        out = out.transpose(1, 2).contiguous().view(B, N_q, H * D)  # [B, N_q, D_out]
+        out = self.out_proj(out)  # [B, N_q, D_out]
+        return out
 
 
 class PerceiverDecoder(nn.Module):

@@ -1384,7 +1384,7 @@ def main():
     parser.add_argument("--num_attention_heads", type=int, default=8)
     parser.add_argument("--code_dim", type=int, default=2048)
     parser.add_argument("--num_codes", type=int, default=1024)
-    parser.add_argument("--downsample", type=int, default=8)
+    parser.add_argument("--downsample", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     
     # Data arguments 
