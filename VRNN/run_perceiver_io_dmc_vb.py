@@ -5,7 +5,7 @@ from typing import Dict, Optional, List, Tuple
 import json
 from collections import defaultdict
 import random, math
-
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,6 +24,7 @@ from torch.utils.data._utils.collate import default_collate
 import sys
 from scipy import linalg
 import torch.nn.functional as F
+from concurrent.futures import ThreadPoolExecutor
 # Import from VRNN - adjust path if needed
 sys.path.append('VRNN')
 from VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
@@ -600,7 +601,7 @@ class DMCVBDataset(Dataset):
         
         # Resize if needed
         if obs_sequence.shape[1:3] != (self.img_height, self.img_width):
-            import cv2
+            
             resized_sequence = []
             for frame in obs_sequence:
                 resized_frame = cv2.resize(frame, (self.img_width, self.img_height))
@@ -718,9 +719,92 @@ def create_mixed_dataset(
     return mixed_dataset
 
 
-# ========================
+def calculate_ssim(img1, img2):
+    """Calculate SSIM (structural similarity) for one channel images.
+
+    It is called by func:`calculate_ssim`.
+
+    Args:
+        img1 (ndarray): Images with range [0, 255] with order 'HWC'.
+        img2 (ndarray): Images with range [0, 255] with order 'HWC'.
+
+    Returns:
+        float: ssim result.
+    """
+
+    C1 = (0.01 * 255)**2
+    C2 = (0.03 * 255)**2
+
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    kernel = cv2.getGaussianKernel(11, 1.5)
+    window = np.outer(kernel, kernel.transpose())
+
+    mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]
+    mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
+    mu1_sq = mu1**2
+    mu2_sq = mu2**2
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = cv2.filter2D(img1**2, -1, window)[5:-5, 5:-5] - mu1_sq
+    sigma2_sq = cv2.filter2D(img2**2, -1, window)[5:-5, 5:-5] - mu2_sq
+    sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean()
+
+
+def calculate_ssim_batch(
+    real: torch.Tensor,
+    pred: torch.Tensor,
+    max_workers: Optional[int] = None,
+) -> float:
+    """
+    Wrapper around `calculate_ssim` for a batch of images.
+
+    real, pred: [N, C, H, W] torch tensors in [0,1].
+    Returns mean SSIM over N images.
+
+    Implementation:
+      - detach + move to CPU once
+      - convert to numpy in [0,255], CHW -> HWC
+      - run your original `calculate_ssim(img1, img2)` in parallel.
+    """
+    assert real.shape == pred.shape, "SSIM: real and pred must have same shape"
+    assert real.dim() == 4, "SSIM expects tensors of shape [N, C, H, W]"
+
+    # 1) Detach, move to CPU, clamp, scale to [0,255]
+    # shape: [N,C,H,W]
+    real_np = real.detach().clamp(0, 1).cpu().numpy()
+    pred_np = pred.detach().clamp(0, 1).cpu().numpy()
+
+    real_np = (real_np * 255.0).astype(np.uint8)
+    pred_np = (pred_np * 255.0).astype(np.uint8)
+
+    # 2) Convert to HWC for your function: [N,C,H,W] -> [N,H,W,C]
+    real_np = np.transpose(real_np, (0, 2, 3, 1))
+    pred_np = np.transpose(pred_np, (0, 2, 3, 1))
+
+    N = real_np.shape[0]
+
+    # 3) Prepare pairs of images for SSIM
+    pairs = [(real_np[i], pred_np[i]) for i in range(N)]
+
+    # 4) Run calculate_ssim in parallel over the batch
+    def _worker(pair):
+        img1, img2 = pair
+        return calculate_ssim(img1, img2)
+
+    if max_workers is None or max_workers <= 1:
+        # fallback: sequential (still using your original function)
+        scores = [_worker(p) for p in pairs]
+    else:
+        # Thread-based parallelism; cv2 is C code and generally releases the GIL
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            scores = list(ex.map(_worker, pairs))
+
+    return float(np.mean(scores))
+
 # Visualization
-# ========================
 
 class Visualizer:
     """Visualization utilities for video prediction"""
@@ -762,46 +846,130 @@ class Visualizer:
         return fig
     
     @staticmethod
+    def plot_context_and_multistep_predictions(
+        context,          # (T_ctx, C, H, W), [0,1]
+        context_recon,    # (T_ctx, C, H, W), [0,1]
+        gt_future,        # (T_f, C, H, W), [0,1], T_f <= 3
+        pred_future_3step,# (T_f, C, H, W), [0,1], T_f <= 3 (AR rollout)
+        save_path=None,
+    ):
+        """
+        Plot:
+          Row 0: Context (ground truth, first up to 3 frames)
+          Row 1: Context reconstruction (same frames)
+          Row 2: Future ground truth (first up to 3 frames)
+          Row 3: 3-step autoregressive predictions (steps 1..T_f)
+        """
+        T_ctx = context.shape[0]
+        T_ctx_show = min(T_ctx, 3)
+        T_f = gt_future.shape[0]  # <= 3
+        n_cols = max(T_ctx_show, T_f, 3)
+
+        fig = plt.figure(figsize=(n_cols * 2.5, 8))
+        gs = GridSpec(4, n_cols, hspace=0.3, wspace=0.1)
+
+        # Row 0: context GT
+        for t in range(T_ctx_show):
+            ax = fig.add_subplot(gs[0, t])
+            ax.imshow(context[t].permute(1, 2, 0).cpu().numpy())
+            ax.set_title(f'Context GT {t}', fontsize=8)
+            ax.axis('off')
+        for t in range(T_ctx_show, n_cols):
+            ax = fig.add_subplot(gs[0, t])
+            ax.axis('off')
+        fig.axes[0].set_ylabel("Context GT", fontsize=9)
+
+        # Row 1: context recon
+        for t in range(T_ctx_show):
+            ax = fig.add_subplot(gs[1, t])
+            ax.imshow(context_recon[t].permute(1, 2, 0).cpu().numpy())
+            ax.set_title(f'Context Recon {t}', fontsize=8)
+            ax.axis('off')
+        for t in range(T_ctx_show, n_cols):
+            ax = fig.add_subplot(gs[1, t])
+            ax.axis('off')
+        fig.axes[n_cols].set_ylabel("Context Recon", fontsize=9)
+
+        # Row 2: future GT (steps 1..T_f)
+        for t in range(T_f):
+            ax = fig.add_subplot(gs[2, t])
+            ax.imshow(gt_future[t].permute(1, 2, 0).cpu().numpy())
+            ax.set_title(f'GT +{t+1}', fontsize=8)
+            ax.axis('off')
+        for t in range(T_f, n_cols):
+            ax = fig.add_subplot(gs[2, t])
+            ax.axis('off')
+        fig.axes[2 * n_cols].set_ylabel("Future GT", fontsize=9)
+
+        # Row 3: 3-step AR predictions (steps 1..T_f)
+        for t in range(T_f):
+            ax = fig.add_subplot(gs[3, t])
+            ax.imshow(pred_future_3step[t].permute(1, 2, 0).cpu().numpy())
+            ax.set_title(f'AR Pred +{t+1}', fontsize=8)
+            ax.axis('off')
+        for t in range(T_f, n_cols):
+            ax = fig.add_subplot(gs[3, t])
+            ax.axis('off')
+        fig.axes[3 * n_cols].set_ylabel("AR (steps)", fontsize=9)
+
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight', dpi=150)
+
+        return fig
+    
+    @staticmethod
     def plot_metrics(metrics_history, save_path=None):
-        """Plot training metrics"""
-        fig, axes = plt.subplots(1, 4, figsize=(50, 10))
+        """Plot training metrics over epochs"""
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
         
-        # Loss
-        axes[0].plot(metrics_history['train_loss'], label='Train', alpha=0.7)
-        axes[0].plot(metrics_history['val_loss'], label='Val', alpha=0.7)
-        axes[0].set_xlabel('Epoch')
-        axes[0].set_ylabel('Loss')
-        axes[0].set_title('Reconstruction Loss')
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3)
+        epochs = range(len(metrics_history['train_loss']))
+        
+        # Plot training loss
+        ax = axes[0, 0]
+        ax.plot(epochs, metrics_history['train_loss'], label='Train Loss', marker='o')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('Training Loss')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Plot validation loss
+        ax = axes[0, 1]
+        ax.plot(epochs, metrics_history['val_loss'], label='Val Loss', marker='o', color='orange')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title('Validation Loss')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Plot validation PSNR
+        ax = axes[1, 0]
+        ax.plot(epochs, metrics_history['val_psnr'], label='Val PSNR', marker='o', color='green')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('PSNR (dB)')
+        ax.set_title('Validation PSNR')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Plot validation FID
+        ax = axes[1, 1]
+        ax.plot(epochs, metrics_history['val_fid'], label='Val FID', marker='o', color='red')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('FID')
+        ax.set_title('Validation FID')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
 
-        # PSNR
-        axes[1].plot(metrics_history['val_psnr'], label='Val PSNR', alpha=0.7)
-        axes[1].set_xlabel('Epoch')
-        axes[1].set_ylabel('PSNR (dB)')
-        axes[1].set_title('Peak Signal-to-Noise Ratio')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
+        # Plot validation SSIM
+        ax = axes[0, 2]
+        ax.plot(epochs, metrics_history['val_ssim'], label='Val SSIM', marker='o', color='purple')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('SSIM')
+        ax.set_title('Validation SSIM')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
 
-        # FID
-        axes[2].plot(metrics_history['val_fid'], label='Val FID', alpha=0.7)
-        axes[2].set_xlabel('Epoch')
-        axes[2].set_ylabel('FID')
-        axes[2].set_title('Fréchet Inception Distance')
-        axes[2].legend()
-        axes[2].grid(True, alpha=0.3)
-
-        # SSIM
-        if 'val_ssim' in metrics_history and len(metrics_history['val_ssim']) > 0:
-            axes[3].plot(metrics_history['val_ssim'], label='Val SSIM', alpha=0.7)
-            axes[3].set_xlabel('Epoch')
-            axes[3].set_ylabel('SSIM')
-            axes[3].set_title('Structural Similarity')
-            axes[3].legend()
-            axes[3].grid(True, alpha=0.3)
-        else:
-            # Hide the unused subplot
-            axes[3].set_visible(False)
+        fig.delaxes(axes[1, 2])
         plt.tight_layout()
         
         if save_path:
@@ -809,11 +977,7 @@ class Visualizer:
         
         return fig
 
-
-# ========================
 # Training
-# ========================
-
 class Trainer:
     """Training pipeline for video prediction"""
     
@@ -889,46 +1053,35 @@ class Trainer:
 
     def _align_time_grids(self, decoded_seq, raw_videos, context_frames, T_future_raw):
         """
-        Align raw timeline (videos) with decoded timeline (decoded_seq).
-        Returns (pred_seq_dec, target_dec) with matching time length.
+        decoded_seq: (B, T_dec, C, H, W)
+        raw_videos:  (B, T_raw, C, H, W)
+        context_frames: number of raw context frames used
+        T_future_raw:   number of raw future frames to evaluate against
         """
         B, T_dec, C, H, W = decoded_seq.shape
         T_raw = raw_videos.shape[1]
-        
-        # Calculate the ratio between raw and decoded frames
-        ratio = max(1, T_raw // T_dec)
-        
-        # Calculate decoded frame indices
-        start_dec = min(T_dec, context_frames // ratio)
-        T_future_dec = max(1, math.ceil(T_future_raw / ratio))
-        end_dec = min(T_dec, start_dec + T_future_dec)
-        
-        # Get predictions from decoded sequence
-        pred_seq = decoded_seq[:, start_dec:end_dec]
-        
-        # Get corresponding ground truth from raw videos
+
+        # 1) Map with inclusive endpoints to avoid off-by-one drift
+        ratio = (T_raw - 1) / max(T_dec - 1, 1)
+
+        # 2) Target slice in raw time
         start_raw = context_frames
-        end_raw = min(T_raw, start_raw + T_future_raw)
-        target_raw = raw_videos[:, start_raw:end_raw]
-        
-        # If temporal dimensions don't match, interpolate target to match predictions
-        if pred_seq.shape[1] != target_raw.shape[1]:
-            # Reshape for interpolation: (B, T, C, H, W) -> (B, C, T, H, W)
-            target_permuted = target_raw.permute(0, 2, 1, 3, 4)
-            pred_T = pred_seq.shape[1]
-            
-            # Interpolate temporal dimension
-            target_aligned = F.interpolate(
-                target_permuted, 
-                size=(pred_T, H, W), 
-                mode='trilinear', 
-                align_corners=False
-            )
-            target_aligned = target_aligned.permute(0, 2, 1, 3, 4)
-        else:
-            target_aligned = target_raw
-        
-        return pred_seq, target_aligned
+        end_raw   = min(T_raw, start_raw + T_future_raw)
+        target    = raw_videos[:, start_raw:end_raw]           # (B, T_tar, C, H, W)
+        T_tar     = target.shape[1]
+
+        # 3) Nearest-neighbor index mapping from raw->decoded time
+        #    raw index r maps to decoded index d ≈ r/ratio
+        start_dec = int(round(start_raw / ratio))
+        t_rel     = torch.arange(T_tar, device=decoded_seq.device, dtype=torch.float32)
+        dec_idx   = torch.round(start_dec + t_rel / ratio).to(torch.long)
+        dec_idx   = dec_idx.clamp(0, T_dec - 1)                 # safety
+
+        # 4) Gather predicted frames without temporal interpolation (better for PSNR/LPIPS)
+        pred = decoded_seq.index_select(dim=1, index=dec_idx)   # (B, T_tar, C, H, W)
+
+        return pred, target
+
 
     def train_epoch(self):
         """Train for one epoch"""
@@ -951,7 +1104,11 @@ class Trainer:
             outputs = self.model(full_video, context_frames)
             
             # Compute loss
-            loss_dict = self.model.compute_loss(outputs, target, perceptual_weight=self.config.get("perceptual_weight", 0.5), label_smoothing=self.config.get("label_smoothing", 0.1))
+            loss_dict = self.model.compute_loss(outputs, 
+                                                full_video, 
+                                                perceptual_weight=self.config.get("perceptual_weight", 0.5), 
+                                                label_smoothing=self.config.get("label_smoothing", 0.1),
+                                                ar_cycle_consistency_weight=self.config.get("ar_cycle_weight", 0.2))
             loss = loss_dict['loss']
             # Backward pass
             loss.backward()
@@ -974,6 +1131,7 @@ class Trainer:
         val_loss = 0.0
         val_psnr = 0.0
         
+        
         all_real_frames = []
         all_pred_frames = []
         first_batch_viz = None
@@ -989,19 +1147,21 @@ class Trainer:
 
             # Always compute TF loss (teacher-forced) so val_loss stays comparable
             full_video = torch.cat([context, target], dim=1)
-            outputs = self.model(full_video, context_frames)  # dict with 'reconstructed' etc. :contentReference[oaicite:2]{index=2}
+            outputs = self.model(full_video, context_frames)  # dict with 'reconstructed' etc. 
             loss_dict = self.model.compute_loss(
-                outputs, target,
+                outputs, 
+                full_video,
                 perceptual_weight=self.config["perceptual_weight"],
-                label_smoothing=self.config["label_smoothing"]
+                label_smoothing=self.config["label_smoothing"],
+                ar_cycle_consistency_weight=self.config["ar_cycle_weight"]
             )
             val_loss += loss_dict["loss"].item()
-
+            reconstructed_full = outputs["reconstructed"]
             # Choose which *predictions* to score/visualize
             gen_mode = self.config.get("gen_mode", "autoregressive")
             if gen_mode == "autoregressive":
                 # how many frames to roll out
-                T_future = target.shape[1] if self.config.get("num_gen_frames", 0) == 0 else self.config["num_gen_frames"]
+                T_future = target.shape[1] if self.config["num_gen_frames"] == 0 else self.config["num_gen_frames"]
 
                 # Call the built-in AR generator on just the context
                 ar_video = self.model.generate_autoregressive(
@@ -1018,25 +1178,9 @@ class Trainer:
                     context_frames=context_frames,
                     T_future_raw=T_future,
                 )
-            elif gen_mode == "maskgit":
-                # Optional: if you also want MaskGIT evaluation (you already have .generate_maskgit) :contentReference[oaicite:4]{index=4}
-                T_future = target.shape[1] if self.config.get("num_gen_frames", 0) == 0 else self.config["num_gen_frames"]
-                mg_video = self.model.generate_maskgit(
-                    context_videos=context,
-                    num_frames_to_generate=T_future,
-                    num_iterations=12,
-                    temperature=self.config["temperature"],
-                    top_k=(self.config["top_k"] or None),
-                    top_p=(self.config["top_p"] or None),
-                )
-                pred_seq, target_aligned = self._align_time_grids(
-                    decoded_seq=mg_video,
-                    raw_videos=videos,
-                    context_frames=context_frames,
-                    T_future_raw=T_future,
-                )
+
             else:
-                # Fall back to teacher-forced reconstruction you already use for metrics :contentReference[oaicite:5]{index=5}
+                # Fall back to teacher-forced reconstruction
                 reconstructed = outputs["reconstructed"]
                 
                 T_future = target.shape[1]
@@ -1046,40 +1190,73 @@ class Trainer:
                     context_frames=context_frames,
                     T_future_raw=T_future,
                 )
-            #TODO: ensure if num_gen_frames is not 0, we only compute metrics on that many frames
             
             # scale to [0,1] like you already do
-            pred_seq = (pred_seq.clamp(min=-1.0, max=1.0) + 1.0) / 2.0
-            target   = (target_aligned.clamp(min=-1.0, max=1.0) + 1.0) / 2.0
+            pred_seq = (pred_seq + 1.0) / 2.0
+            target   = (target_aligned + 1.0) / 2.0
             # PSNR (keep your current computation)
             mse  = torch.mean((pred_seq - target) ** 2)
             psnr = 20 * torch.log10(1.0 / torch.sqrt(mse))
             val_psnr += psnr.item()
-
-            # Accumulate for FID (unchanged) :contentReference[oaicite:6]{index=6}
+            
+            # Accumulate for FID 
             B, Tf = pred_seq.shape[:2]
             all_real_frames.append(target.reshape(B * Tf, *target.shape[2:]))
             all_pred_frames.append(pred_seq.reshape(B * Tf, *pred_seq.shape[2:]))
 
             if batch_idx == 0:
-                # Scale context to [0,1] for visualization
-                context= videos[:, :context_frames] 
-                context = (context.clamp(min=-1.0, max=1.0) + 1.0) / 2.0
-                first_batch_viz = (context[0], target[0], pred_seq[0])
-        
+                with torch.no_grad():
+                    recon_full = self.model.reconstruct(videos)    # [B,T,C,H,W]
+
+                context_raw = videos[0, :context_frames]                 # (Tc, C, H, W)
+                #The model produce reconstructed frames                  # (Tc+Tf, C, H, W)
+                recon_context_raw = recon_full[0, :context_frames]      # (Tc, C, H, W)
+
+                # We'll look at first up to 3 future frames
+                T_multistep = min(3, target.shape[1])
+                future_gt_raw = videos[0, context_frames:context_frames + T_multistep]  # (T_multistep, C, H, W)
+
+                # Run a 3-step autoregressive rollout on the first sample's context (still in [-1,1])
+                ar_video_3 = self.model.generate_autoregressive(
+                    context_videos=context_raw.unsqueeze(0),  # (1, Tc, C, H, W)
+                    num_frames_to_generate=T_multistep,
+                    temperature=self.config["temperature"],
+                    top_k=self.config["top_k"],
+                    top_p=self.config["top_p"],
+                )
+                # Take only the generated future part
+                future_pred3_raw = ar_video_3[0, -T_multistep:]  # (T_multistep, C, H, W)
+
+                # Scale everything to [0,1] for visualization
+                context_vis = (context_raw + 1.0) / 2.0
+                recon_context_vis = (recon_context_raw + 1.0) / 2.0
+                future_gt_vis = (future_gt_raw + 1.0) / 2.0
+                future_pred3_vis = (future_pred3_raw + 1.0) / 2.0
+
+                first_batch_viz = {
+                    "context": context_vis,
+                    "context_recon": recon_context_vis,
+                    "gt_future": future_gt_vis,
+                    "pred_future_3step": future_pred3_vis,
+                }
+
+
         all_real_frames = torch.cat(all_real_frames, dim=0)
         all_pred_frames = torch.cat(all_pred_frames, dim=0)
         val_fid = self.fid_calculator.calculate_fid(all_real_frames, all_pred_frames)
-        
+        val_ssim = calculate_ssim_batch(all_real_frames, all_pred_frames)
         # ===== Visualization AFTER loop (happens once) =====
         if first_batch_viz is not None and self.current_epoch % self.config.get("vis_every", 5) == 0:
-            context_vis, target_vis, pred_vis = first_batch_viz
-            fig = Visualizer.plot_video_sequence(
-                context_vis, target_vis, pred_vis,
-                save_path=self.video_dir / f"{gen_mode}_prediction_epoch{self.current_epoch}.png"
+            
+            fig = Visualizer.plot_context_and_multistep_predictions(
+                context=first_batch_viz["context"],
+                context_recon=first_batch_viz["context_recon"],
+                gt_future=first_batch_viz["gt_future"],
+                pred_future_3step=first_batch_viz["pred_future_3step"],
+                save_path=self.video_dir / f"{gen_mode}_context_and_multistep_epoch{self.current_epoch}.png"
             )
             if self.use_wandb:
-                wandb.log({f"{gen_mode}_predictions": wandb.Image(fig)})
+                wandb.log({f"{gen_mode}_context_and_multistep": wandb.Image(fig)})
             plt.close(fig)
         
         # Average metrics
@@ -1089,11 +1266,13 @@ class Trainer:
         self.metrics_history['val_loss'].append(avg_val_loss)
         self.metrics_history['val_psnr'].append(avg_val_psnr)
         self.metrics_history['val_fid'].append(val_fid)
-        
+        self.metrics_history['val_ssim'].append(val_ssim)
+
         return {
             'val_loss': avg_val_loss,
             'val_psnr': avg_val_psnr,
-            'val_fid': val_fid
+            'val_fid': val_fid,
+            'val_ssim': val_ssim
         }
     
     def save_checkpoint(self, is_best=False):
@@ -1192,25 +1371,23 @@ class Trainer:
             json.dump(metrics_dict, f, indent=2)
 
 
-# ========================
 # Main Function
-# ========================
 
 def main():
     parser = argparse.ArgumentParser(description="Train Video Prediction with Mixed Datasets")
     
     # Model arguments
-    parser.add_argument("--num_latents", type=int, default=40)
-    parser.add_argument("--num_latent_channels", type=int, default=512)
-    parser.add_argument("--num_encoder_layers", type=int, default=4)
-    parser.add_argument("--num_decoder_layers", type=int, default=1)
+    parser.add_argument("--num_latents", type=int, default=512)
+    parser.add_argument("--num_latent_channels", type=int, default=1024)
+    parser.add_argument("--num_encoder_layers", type=int, default=2)
+    parser.add_argument("--num_decoder_layers", type=int, default=2)
     parser.add_argument("--num_attention_heads", type=int, default=8)
-    parser.add_argument("--code_dim", type=int, default=256)
+    parser.add_argument("--code_dim", type=int, default=2048)
     parser.add_argument("--num_codes", type=int, default=1024)
-    parser.add_argument("--downsample", type=int, default=4)
+    parser.add_argument("--downsample", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
     
-    # Data arguments - MODIFIED FOR MULTI-DATASET
+    # Data arguments 
     parser.add_argument("--base_path", type=str, 
                        default="./transition_data/dmc_vb",
                        help="Base path containing dataset structure")
@@ -1227,7 +1404,7 @@ def main():
     parser.add_argument("--context_frames", type=int, default=8)
     parser.add_argument("--img_height", type=int, default=64)
     parser.add_argument("--img_width", type=int, default=64)
-    parser.add_argument("--train_split_ratio", type=float, default=0.75,
+    parser.add_argument("--train_split_ratio", type=float, default=0.9,
                        help="Ratio for train/val split")
     
     # Training arguments
@@ -1247,19 +1424,17 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--perceptual_weight", type=float, default=0.5)
     parser.add_argument("--label_smoothing", type=float, default=0.05)
-    parser.add_argument("--use_3d_conv", action="store_true",
-                        help="Use 3D convolutions in Perceiver IO")
-    parser.add_argument("--use_temporal_downsample", action="store_true",
-                        help="Use temporal downsampling in Perceiver IO")
-    parser.add_argument("--gen_mode", choices=["reconstruct", "autoregressive", "maskgit"], default="autoregressive",
+    parser.add_argument("--gen_mode", choices=["reconstruct", "autoregressive"], default="autoregressive",
                     help="Which generation path to use during validation/visualization")
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top_k", type=int, default=0, help="0 disables top-k")
+    parser.add_argument("--top_k", type=int, default=50, help="0 disables top-k")
     parser.add_argument("--top_p", type=float, default=0.0, help="0.0 disables nucleus sampling")
     parser.add_argument("--num_gen_frames", type=int, default=0,
                         help="How many future frames to generate for AR / MaskGIT; 0 = use target length")
     parser.add_argument("--kmeans_init", action="store_true",
                         help="Use K-means initialization for codebook")
+    parser.add_argument("--ar_cycle_weight", type=float, default=0.5, help="Weight for AR latent cycle-consistency loss (0 disables it)")
+
     args = parser.parse_args()
     
     # Set random seeds
@@ -1304,6 +1479,7 @@ def main():
         "top_p": args.top_p,
         "num_gen_frames": args.num_gen_frames,
         "kmeans_init": args.kmeans_init,
+        "ar_cycle_weight": args.ar_cycle_weight,
     }
     
     # Create model
@@ -1318,8 +1494,6 @@ def main():
         num_codes=args.num_codes,
         downsample=args.downsample,
         dropout=args.dropout,
-        use_3d_conv=args.use_3d_conv,
-        temporal_downsample=args.use_temporal_downsample,
         kmeans_init=args.kmeans_init,
     )
     

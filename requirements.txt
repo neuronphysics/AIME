@@ -29,6 +29,7 @@ filelock
 flatbuffers
 fonttools
 fsspec
+futures
 gast
 geoopt
 gin
@@ -125,4 +126,5 @@ wavio
 Werkzeug
 wget
 wrapt
+xformers
 zipp
