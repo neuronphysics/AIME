@@ -1379,12 +1379,11 @@ def main():
     # Model arguments
     parser.add_argument("--num_latents", type=int, default=512)
     parser.add_argument("--num_latent_channels", type=int, default=1024)
-    parser.add_argument("--num_encoder_layers", type=int, default=2)
-    parser.add_argument("--num_decoder_layers", type=int, default=2)
+    parser.add_argument("--num_self_attention_layers", type=int, default=1)
     parser.add_argument("--num_attention_heads", type=int, default=8)
     parser.add_argument("--code_dim", type=int, default=2048)
     parser.add_argument("--num_codes", type=int, default=1024)
-    parser.add_argument("--downsample", type=int, default=4)
+    parser.add_argument("--downsample", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
     
     # Data arguments 
@@ -1448,8 +1447,7 @@ def main():
     config = {
         "num_latents": args.num_latents,
         "num_latent_channels": args.num_latent_channels,
-        "num_encoder_layers": args.num_encoder_layers,
-        "num_decoder_layers": args.num_decoder_layers,
+        "num_self_attention_layers": args.num_self_attention_layers,
         "num_attention_heads": args.num_attention_heads,
         "code_dim": args.code_dim,
         "num_codes": args.num_codes,
@@ -1489,7 +1487,7 @@ def main():
         num_latents=args.num_latents,
         num_latent_channels=args.num_latent_channels,
         num_attention_heads=args.num_attention_heads,
-        num_encoder_layers=args.num_encoder_layers,
+        num_self_attention_layers=args.num_self_attention_layers,
         code_dim=args.code_dim,
         num_codes=args.num_codes,
         downsample=args.downsample,

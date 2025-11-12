@@ -575,6 +575,7 @@ class Resnet3DBlock(nn.Module):
                 self.nin_shortcut = CausalConvAfterNorm(
                     in_channels, out_channels, kernel_size=1
                 )
+        #self.pe = ProjectExciteLayer(self.out_channels, reduction_ratio=2)
 
     def forward(self, x, temb=None, is_init=True) -> torch.Tensor:
         x = x.permute(0, 2, 3, 4, 1).contiguous()
@@ -592,6 +593,8 @@ class Resnet3DBlock(nn.Module):
         x = self.conv2(h, residual=x)
 
         x = x.permute(0, 4, 1, 2, 3)
+        #x = self.pe(x)
+        
         return x
 
 
@@ -933,231 +936,52 @@ class SamePadConv3d(nn.Module):
     def forward(self, x):
         return self.conv(F.pad(x, self.pad_input))
 
-def view_range(x, i, j, shape):
-    shape = tuple(shape)
-
-    n_dims = len(x.shape)
-    if i < 0:
-        i = n_dims + i
-
-    if j is None:
-        j = n_dims
-    elif j < 0:
-        j = n_dims + j
-
-    assert 0 <= i < j <= n_dims
-
-    x_shape = x.shape
-    target_shape = x_shape[:i] + shape + x_shape[j:]
-    return x.view(target_shape)
-
-def scaled_dot_product_attention(q, k, v, mask=None, attn_dropout=0., training=True):
-    # Performs scaled dot-product attention over the second to last dimension dn
-
-    # (b, n_head, d1, ..., dn, d)
-    attn = torch.matmul(q, k.transpose(-1, -2))
-    attn = attn / np.sqrt(q.shape[-1])
-    if mask is not None:
-        attn = attn.masked_fill(mask == 0, float('-inf'))
-    attn_float = F.softmax(attn, dim=-1)
-    attn = attn_float.type_as(attn) # b x n_head x d1 x ... x dn x d
-    attn = F.dropout(attn, p=attn_dropout, training=training)
-
-    a = torch.matmul(attn, v) # b x n_head x d1 x ... x dn x d
-
-    return a
-
-class FullAttention(nn.Module):
-    def __init__(self, shape, causal, attn_dropout):
-        super().__init__()
-        self.causal = causal
-        self.attn_dropout = attn_dropout
-
-        seq_len = np.prod(shape)
-        if self.causal:
-            self.register_buffer('mask', torch.tril(torch.ones(seq_len, seq_len)))
-
-    def forward(self, q, k, v, decode_step, decode_idx):
-        mask = self.mask if self.causal else None
-        if decode_step is not None and mask is not None:
-            mask = mask[[decode_step]]
-
-        old_shape = q.shape[2:-1]
-        q = q.flatten(start_dim=2, end_dim=-2)
-        k = k.flatten(start_dim=2, end_dim=-2)
-        v = v.flatten(start_dim=2, end_dim=-2)
-
-        out = scaled_dot_product_attention(q, k, v, mask=mask,
-                                           attn_dropout=self.attn_dropout,
-                                           training=self.training)
-
-        return view_range(out, 2, 3, old_shape)
-
-class AxialAttention(nn.Module):
-    def __init__(self, n_dim, axial_dim):
-        super().__init__()
-        if axial_dim < 0:
-            axial_dim = 2 + n_dim + 1 + axial_dim
-        else:
-            axial_dim += 2 # account for batch, head, dim
-        self.axial_dim = axial_dim
-
-    def forward(self, q, k, v, decode_step, decode_idx):
-        q = shift_dim(q, self.axial_dim, -2).flatten(end_dim=-3)
-        k = shift_dim(k, self.axial_dim, -2).flatten(end_dim=-3)
-        v = shift_dim(v, self.axial_dim, -2)
-        old_shape = list(v.shape)
-        v = v.flatten(end_dim=-3)
-
-        out = scaled_dot_product_attention(q, k, v, training=self.training)
-        out = out.view(*old_shape)
-        out = shift_dim(out, -2, self.axial_dim)
-        return out
-
-def shift_dim(x, src_dim=-1, dest_dim=-1, make_contiguous=True):
-    n_dims = len(x.shape)
-    if src_dim < 0:
-        src_dim = n_dims + src_dim
-    if dest_dim < 0:
-        dest_dim = n_dims + dest_dim
-
-    assert 0 <= src_dim < n_dims and 0 <= dest_dim < n_dims
-
-    dims = list(range(n_dims))
-    del dims[src_dim]
-
-    permutation = []
-    ctr = 0
-    for i in range(n_dims):
-        if i == dest_dim:
-            permutation.append(src_dim)
-        else:
-            permutation.append(dims[ctr])
-            ctr += 1
-    x = x.permute(permutation)
-    if make_contiguous:
-        x = x.contiguous()
-    return x
-
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, shape, dim_q, dim_kv, n_head, n_layer,
-                 causal, attn_type, attn_kwargs):
-        super().__init__()
-        self.causal = causal
-        self.shape = shape
-
-        self.d_k = dim_q // n_head
-        self.d_v = dim_kv // n_head
-        self.n_head = n_head
-
-        self.w_qs = nn.Linear(dim_q, n_head * self.d_k, bias=False) # q
-        self.w_qs.weight.data.normal_(std=1.0 / np.sqrt(dim_q))
-
-        self.w_ks = nn.Linear(dim_kv, n_head * self.d_k, bias=False) # k
-        self.w_ks.weight.data.normal_(std=1.0 / np.sqrt(dim_kv))
-
-        self.w_vs = nn.Linear(dim_kv, n_head * self.d_v, bias=False) # v
-        self.w_vs.weight.data.normal_(std=1.0 / np.sqrt(dim_kv))
-
-        self.fc = nn.Linear(n_head * self.d_v, dim_q, bias=True) # c
-        self.fc.weight.data.normal_(std=1.0 / np.sqrt(dim_q * n_layer))
-
-        if attn_type == 'full':
-            self.attn = FullAttention(shape, causal, **attn_kwargs)
-        elif attn_type == 'axial':
-            assert not causal, 'causal axial attention is not supported'
-            self.attn = AxialAttention(len(shape), **attn_kwargs)
-
-        self.cache = None
-
-    def forward(self, q, k, v, decode_step=None, decode_idx=None):
-        """ Compute multi-head attention
-        Args
-            q, k, v: a [b, d1, ..., dn, c] tensor or
-                     a [b, 1, ..., 1, c] tensor if decode_step is not None
-
-        Returns
-            The output after performing attention
-        """
-
-        # compute k, q, v
-        d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
-        q = view_range(self.w_qs(q), -1, None, (n_head, d_k))
-        k = view_range(self.w_ks(k), -1, None, (n_head, d_k))
-        v = view_range(self.w_vs(v), -1, None, (n_head, d_v))
-
-        # b x n_head x seq_len x d
-        # (b, *d_shape, n_head, d) -> (b, n_head, *d_shape, d)
-        q = shift_dim(q, -2, 1)
-        k = shift_dim(k, -2, 1)
-        v = shift_dim(v, -2, 1)
-
-        # fast decoding
-        if decode_step is not None:
-            if decode_step == 0:
-                if self.causal:
-                    k_shape = (q.shape[0], n_head, *self.shape, self.d_k)
-                    v_shape = (q.shape[0], n_head, *self.shape, self.d_v)
-                    self.cache = dict(k=torch.zeros(k_shape, dtype=k.dtype, device=q.device),
-                                    v=torch.zeros(v_shape, dtype=v.dtype, device=q.device))
-                else:
-                    # cache only once in the non-causal case
-                    self.cache = dict(k=k.clone(), v=v.clone())
-            if self.causal:
-                idx = (slice(None, None), slice(None, None), *[slice(i, i+ 1) for i in decode_idx])
-                self.cache['k'][idx] = k
-                self.cache['v'][idx] = v
-            k, v = self.cache['k'], self.cache['v']
-
-        a = self.attn(q, k, v, decode_step, decode_idx)
-
-        # (b, *d_shape, n_head, d) -> (b, *d_shape, n_head * d)
-        a = shift_dim(a, 1, -2).flatten(start_dim=-2)
-        a = self.fc(a) # (b x seq_len x embd_dim)
-
-        return a
 
 ############
+class ProjectExciteLayer(nn.Module):
+    """
+        Project & Excite Module, specifically designed for 3D inputs
+        *quote*
+    """
 
-class AxialBlock(nn.Module):
-    def __init__(self, n_hiddens, n_head):
-        super().__init__()
-        kwargs = dict(shape=(0,) * 3, dim_q=n_hiddens,
-                      dim_kv=n_hiddens, n_head=n_head,
-                      n_layer=1, causal=False, attn_type='axial')
-        self.attn_w = MultiHeadAttention(attn_kwargs=dict(axial_dim=-2),
-                                         **kwargs)
-        self.attn_h = MultiHeadAttention(attn_kwargs=dict(axial_dim=-3),
-                                         **kwargs)
-        self.attn_t = MultiHeadAttention(attn_kwargs=dict(axial_dim=-4),
-                                         **kwargs)
+    def __init__(self, num_channels, reduction_ratio=2):
+        """
+        :param num_channels: No of input channels
+        :param reduction_ratio: By how much should the num_channels should be reduced
+        """
+        super(ProjectExciteLayer, self).__init__()
+        num_channels_reduced = num_channels // reduction_ratio
+        self.reduction_ratio = reduction_ratio
+        self.relu = nn.ReLU()
+        self.conv_c = nn.Conv3d(in_channels=num_channels, out_channels=num_channels_reduced, kernel_size=1, stride=1)
+        self.conv_cT = nn.Conv3d(in_channels=num_channels_reduced, out_channels=num_channels, kernel_size=1, stride=1)
+        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        x = shift_dim(x, 1, -1)
-        x = self.attn_w(x, x, x) + self.attn_h(x, x, x) + self.attn_t(x, x, x)
-        x = shift_dim(x, -1, 1)
-        return x
+    def forward(self, input_tensor):
+        """
+        :param input_tensor: X, shape = (batch_size, num_channels, D, H, W)
+        :return: output tensor
+        """
+        batch_size, num_channels, D, H, W = input_tensor.size()
 
+        # Project:
+        # Average along channels and different axes
+        squeeze_tensor_w = F.adaptive_avg_pool3d(input_tensor, (1, 1, W))
 
-class AttentionResidualBlock(nn.Module):
-    def __init__(self, n_hiddens):
-        super().__init__()
-        self.block = nn.Sequential(
-            Normalize(n_hiddens),
-            nn.LeakyReLU(),
-            SamePadConv3d(n_hiddens, n_hiddens // 2, 3, bias=False),
-            Normalize(n_hiddens // 2),
-            nn.LeakyReLU(),
-            SamePadConv3d(n_hiddens // 2, n_hiddens, 1, bias=False),
-            Normalize(n_hiddens),
-            nn.LeakyReLU(),
-            AxialBlock(n_hiddens, 2)
-        )
+        squeeze_tensor_h = F.adaptive_avg_pool3d(input_tensor, (1, H, 1))
 
-    def forward(self, x):
-        return x + self.block(x)
+        squeeze_tensor_d = F.adaptive_avg_pool3d(input_tensor, (D, 1, 1))
 
+        # tile tensors to original size and add:
+        final_squeeze_tensor = sum([squeeze_tensor_w.view(batch_size, num_channels, 1, 1, W),
+                                    squeeze_tensor_h.view(batch_size, num_channels, 1, H, 1),
+                                    squeeze_tensor_d.view(batch_size, num_channels, D, 1, 1)])
+
+        # Excitation:
+        final_squeeze_tensor = self.sigmoid(self.conv_cT(self.relu(self.conv_c(final_squeeze_tensor))))
+        output_tensor = torch.mul(input_tensor, final_squeeze_tensor)
+
+        return output_tensor
 
 
 class VideoDecoder(nn.Module):

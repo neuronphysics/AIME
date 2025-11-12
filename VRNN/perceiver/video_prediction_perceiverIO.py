@@ -144,7 +144,7 @@ class DVAE(nn.Module):
         kernel_size: int = 3,
         s_down: int = 4,   # spatial down factor (1,2,4,8,...)
         t_down: int = 1,   # kept for API compatibility, but must be 1 with current encoder/decoder
-        ratio_vocab_to_latent_channels: int = 32,
+        ratio_vocab_to_latent_channels: int = 16,
         # explicit architecture knobs
         ch_mult: Optional[Tuple[int, ...]] = None,   # e.g. (1, 2, 4)
         num_res_blocks: int = 1,                    # passed to VideoEncoder/Decoder
@@ -419,7 +419,7 @@ class VQPTTokenizer(nn.Module):
         code_dim: int = 256,
         num_codes: int = 1024,
         downsample: int = 4,
-        base_channels: int = 64,
+        base_channels: int = 96, #change it from 64 to 96
         commitment_weight: float = 0.25,
         commitment_use_cross_entropy_loss: bool = False,
         use_cosine_sim: bool = False,
@@ -650,6 +650,45 @@ class VQPTTokenizer(nn.Module):
         return recon
 
 
+
+class AttentionSlotPool(nn.Module):
+    """
+    Learnable pooling over S slots using standard nn.MultiheadAttention.
+
+    x: [B, S, C] -> pooled: [B, C]
+    """
+    def __init__(self, dim: int, num_heads: int = 4):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+
+        # Single learnable query vector [1, 1, C]
+        self.query = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+
+        # Standard PyTorch MHA
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            batch_first=True,  # so we can use [B, S, C]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, S, C]
+        returns: [B, C]
+        """
+        B, S, C = x.shape
+        assert C == self.dim
+
+        # Expand learnable query for the batch: [B, 1, C]
+        q = self.query.expand(B, -1, -1)     # [B, 1, C]
+
+        # K, V are the slots: [B, S, C]
+        # MHA returns (out, attn_weights)
+        out, _ = self.attn(q, x, x)          # out: [B, 1, C]
+
+        return out.squeeze(1)                # [B, C]
+
 class PerceiverTokenPredictor(nn.Module):
     """
     Perceiver-based video prediction model with discrete token prediction.
@@ -736,7 +775,7 @@ class PerceiverTokenPredictor(nn.Module):
             rotate_dim,
             num_latent_channels,
         )
-
+        self.time_pe_proj_ln = nn.LayerNorm(num_latent_channels)
         # Cross-attn: per-frame time-indexed cross-attn
         self.temporal_cross_attn = SeparateKVCrossAttention(
             dim_q=self.num_latent_channels,
@@ -757,7 +796,10 @@ class PerceiverTokenPredictor(nn.Module):
             dropout=dropout,
             causal_attention=True,
         )
-        self.spatial_pool = nn.Linear(num_latent_channels, 1)
+        self.spatial_pool = AttentionSlotPool(
+            dim=num_latent_channels,
+            num_heads=4,  
+        )
         # Position encodings
         self.pos_freq_bands = 64
         self._pos_shape = None
@@ -766,7 +808,8 @@ class PerceiverTokenPredictor(nn.Module):
 
         # Linear projections from positional encodings -> latent channels
         self.input_proj = nn.Linear(self._pos_enc_channels, num_latent_channels)
-        self.decoder_query_proj = nn.Linear(self._pos_enc_channels, num_latent_channels)
+        self.input_proj_ln = nn.LayerNorm(num_latent_channels)  
+        
         self.num_self_attention_heads = num_self_attention_heads
 
         # 1D time positional encoder for the temporal bottleneck (over timesteps)
@@ -991,7 +1034,7 @@ class PerceiverTokenPredictor(nn.Module):
 
         self._ensure_pos_encoding(T, Ht, Wt, device)
         pe = self.pos_encoding.to(device)       # [1, T*Ht*Wt, C_pos]
-        pe = self.input_proj(pe)                # [1, T*Ht*Wt, C]
+        pe = self.input_proj_ln(self.input_proj(pe))     # [1, T*Ht*Wt, C]
         pe = pe.expand(B, -1, -1)               # [B, T*Ht*Wt, C]
         return pe
 
@@ -1103,7 +1146,7 @@ class PerceiverTokenPredictor(nn.Module):
         t_fpe = t_fpe.squeeze(0)                   # [T_total, D_rot]
 
         # Project to latent dim -> [T_total, C]
-        t_pe = self.time_pe_proj(t_fpe)            # [T_total, C]
+        t_pe = self.time_pe_proj_ln(self.time_pe_proj(t_fpe))            # [T_total, C]
 
         # Split context vs future time PE
         t_pe_ctx = t_pe[:T_ctx_enc]                # [T_ctx_enc, C]
@@ -1141,12 +1184,11 @@ class PerceiverTokenPredictor(nn.Module):
         Z_bt = self.temporal_cross_attn(q_bt, k_bt, v_bt) # [B*T_ctx_enc, S, C]
         Z_ctx = rearrange(Z_bt, "(b t) s c -> b t s c", b=B, t=T_ctx_enc)  # [B,T_ctx_enc,S,C]
         # Pool spatial latent slots per frame -> [B, T_ctx_enc, C]
-        scores  = self.spatial_pool(Z_ctx).squeeze(-1)    # [B, T_ctx_enc, S]
-        weights = F.softmax(scores, dim=-1)               # [B, T_ctx_enc, S]
-
-        # Weighted sum over S
-        temporal_ctx_ctx = (weights.unsqueeze(-1) * Z_ctx).sum(dim=2)  # [B, T_ctx_enc, C]
-
+        B, T_ctx_enc, S, C = Z_ctx.shape
+        Z_flat = rearrange(Z_ctx, "b t s c -> (b t) s c")          # [B*T_ctx_enc, S, C]
+        pooled = self.spatial_pool(Z_flat)                        # [B*T_ctx_enc, C]
+        temporal_ctx_ctx = rearrange(pooled, "(b t) c -> b t c", b=B, t=T_ctx_enc) # [B,T_ctx_enc,C]
+                                    
         # 6) Build future time queries and run temporal self-attention
         time_queries = self.time_queries()                # [1, sequence_length, C]
         assert T_total <= time_queries.shape[1], (
@@ -1642,7 +1684,7 @@ class CausalPerceiverIO(nn.Module):
         num_latents: int = 512,
         num_latent_channels: int = 512,
         num_attention_heads: int = 8,
-        num_encoder_layers: int = 6,
+        num_self_attention_layers: int = 6,
         max_seq_len: int = 4096,
         code_dim: int = 256,
         num_codes: int = 1024,
@@ -1689,9 +1731,9 @@ class CausalPerceiverIO(nn.Module):
             num_latents=num_latents,
             num_latent_channels=num_latent_channels,
             num_cross_attention_heads=num_attention_heads,
-            num_self_attention_layers=num_encoder_layers,
+            num_self_attention_layers=num_self_attention_layers,
             num_self_attention_heads=num_attention_heads,
-            widening_factor=4,
+            widening_factor=2,
             dropout=dropout,
             sequence_length=T,
             max_seq_len= max_seq_len,
@@ -1713,7 +1755,7 @@ class CausalPerceiverIO(nn.Module):
         perceptual_weight: float = 0.5,
         recon_weight: float = 1.0,
         label_smoothing: float = 0.1,
-        ce_weight: float = 0.75,
+        ce_weight: float = 0.05,
         ar_cycle_consistency_weight: float = 0.5,
     ) -> Dict[str, torch.Tensor]:
         """Compute loss matching training script API"""
