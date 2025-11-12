@@ -750,14 +750,14 @@ class PerceiverTokenPredictor(nn.Module):
 
         # Causal self-attn along time axis (temporal AR bottleneck)
         self.temporal_self_attn = SelfAttentionBlock(
-            num_layers=1,
+            num_layers=num_self_attention_layers,
             num_heads=num_self_attention_heads,
             num_channels=num_latent_channels,
-            widening_factor=2,
+            widening_factor=widening_factor,
             dropout=dropout,
             causal_attention=True,
         )
-
+        self.spatial_pool = nn.Linear(num_latent_channels, 1)
         # Position encodings
         self.pos_freq_bands = 64
         self._pos_shape = None
@@ -1140,9 +1140,12 @@ class PerceiverTokenPredictor(nn.Module):
 
         Z_bt = self.temporal_cross_attn(q_bt, k_bt, v_bt) # [B*T_ctx_enc, S, C]
         Z_ctx = rearrange(Z_bt, "(b t) s c -> b t s c", b=B, t=T_ctx_enc)  # [B,T_ctx_enc,S,C]
-
         # Pool spatial latent slots per frame -> [B, T_ctx_enc, C]
-        temporal_ctx_ctx = Z_ctx.mean(dim=2)              # [B, T_ctx_enc, C]
+        scores  = self.spatial_pool(Z_ctx).squeeze(-1)    # [B, T_ctx_enc, S]
+        weights = F.softmax(scores, dim=-1)               # [B, T_ctx_enc, S]
+
+        # Weighted sum over S
+        temporal_ctx_ctx = (weights.unsqueeze(-1) * Z_ctx).sum(dim=2)  # [B, T_ctx_enc, C]
 
         # 6) Build future time queries and run temporal self-attention
         time_queries = self.time_queries()                # [1, sequence_length, C]
