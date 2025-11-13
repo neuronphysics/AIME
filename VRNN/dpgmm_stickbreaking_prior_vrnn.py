@@ -3,10 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, Gamma, Categorical, Independent, MixtureSameFamily
-from typing import Dict, Tuple, Union, Optional
+from typing import Dict, Tuple, Union, Optional, Any
 import sys
 import os
-import geoopt
+from einops import rearrange
 from contextlib import contextmanager
 from itertools import chain
 import numpy as np
@@ -545,7 +545,6 @@ class AttentionSchema(nn.Module):
         hidden_dim: int = 256,
         latent_dim: int = 32,
         context_dim: int = 128,
-        attention_dim: int = 64,
         input_channels: int = 3,
         device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ):
@@ -690,6 +689,107 @@ def apply_emas(*emas):
     finally:
         for e in reversed(emas): e.restore()
 
+
+class FrameAttentionPool(nn.Module):
+    """
+    Attention pool per frame over P slots:
+      x: [B, T, P, C_in]  ->  [B, T, C_out]
+    Uses a single learnable query per frame (content-agnostic), projects K/V, and MHA.
+    """
+    def __init__(self, c_in: int, c_out: int, n_heads: int = 4):
+        super().__init__()
+        self.q = nn.Parameter(torch.randn(1, 1, c_out) * 0.02)  # [1,1,C_out], shared
+        self.k_proj = nn.Linear(c_in,  c_out)
+        self.v_proj = nn.Linear(c_in,  c_out)
+        self.attn = nn.MultiheadAttention(embed_dim=c_out, num_heads=n_heads, batch_first=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, P, C_in]
+        B, T, P, _ = x.shape
+        x_bt = x.reshape(B * T, P, -1)               # [B*T, P, C_in]
+        K = self.k_proj(x_bt)                         # [B*T, P, C_out]
+        V = self.v_proj(x_bt)                         # [B*T, P, C_out]
+        Q = self.q.expand(B * T, -1, -1)              # [B*T, 1, C_out]
+        out, _ = self.attn(Q, K, V)                   # [B*T, 1, C_out]
+        out = out.squeeze(1).view(B, T, -1)           # [B, T, C_out]
+        return out
+
+
+class CausalContextPredictor(nn.Module):
+    """
+    Simple causal Transformer over (context, action) sequences.
+    Input:
+      context_seq: [B, T, C_ctx]
+      action_seq:  [B, T, A]
+    Output:
+      pred_context_seq: [B, T, C_ctx] where time t can only see <= t.
+    """
+    def __init__(
+        self,
+        context_dim: int,
+        action_dim: int,
+        latent_dim: int,
+        rnn_hidden_dim: int,
+        hidden_dim: Optional[int] = None,
+        num_layers: int = 1,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        hidden_dim = hidden_dim or context_dim
+
+        in_dim = context_dim + action_dim + latent_dim + rnn_hidden_dim
+
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        self.input_proj_ln = nn.LayerNorm(hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=2 * hidden_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+        )
+
+        self.output_proj = nn.Linear(hidden_dim, context_dim)
+        self.output_proj_ln = nn.LayerNorm(context_dim)
+
+    def forward(
+        self,
+        context_seq: torch.Tensor,   # [B, T, C_ctx]
+        action_seq: torch.Tensor,    # [B, T, A]
+        latent_seq: torch.Tensor,    # [B, T, D_z]
+        hidden_seq: torch.Tensor,    # [B, T, D_h]
+    ) -> torch.Tensor:
+        """
+        Returns pred_context_seq with the same temporal length as the input.
+        Training will shift targets so we do 1-step-ahead prediction.
+        """
+        x = torch.cat(
+            [context_seq, action_seq, latent_seq, hidden_seq],
+            dim=-1
+        ) 
+        x = self.input_proj_ln(self.input_proj(x))                            # [B,T,H]
+
+        B, T, H = x.shape
+        device = x.device
+
+        # causal mask: position t can attend to <= t
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=device, dtype=torch.bool),
+            diagonal=1
+        )
+        # nn.Transformer expects float mask with -inf on masked entries if using attn_mask,
+        # but bool mask works in recent PyTorch; if not, convert to float with -inf.
+        x = self.encoder(x, mask=causal_mask)
+
+        pred_ctx = self.output_proj_ln(self.output_proj(x))  # [B,T,C_ctx]
+        return pred_ctx
+
 class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     """
     Using Dirichlet Process GMM Prior with Stick-Breaking, Self-Modeling
@@ -701,7 +801,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         input_dim: int,
         latent_dim: int,
         hidden_dim: int,
-        attention_dim: int,
         action_dim: int,
         sequence_length: int,
         img_perceiver_channels:int,
@@ -717,7 +816,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         weight_decay: float = 0.00001,
         use_orthogonal: bool = True,  # Use orthogonal initialization for LSTM,
         number_lstm_layer: int = 3,  # Number of LSTM layers
-        context_window_size: int = 10,
         attention_resolution: int = 21,  # Resolution for attention maps
         warmup_epochs=25,
         dropout: float = 0.1,
@@ -738,13 +836,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         self.context_dim = num_latent_channels_perceiver
-        self.attention_dim = attention_dim ##
         self.action_dim = action_dim ##
         self.sequence_length = sequence_length ##
         self.device = device
         self.dropout = dropout
         # Hyperparameters
-        self.context_window_size = context_window_size
         self._lr = learning_rate
         self._grad_clip = grad_clip
         self.attention_resolution = attention_resolution
@@ -887,25 +983,43 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     def _init_perceiver_context(self):
         """Initialize Perceiver with architecture-aware dimensions"""
 
-
         # 3) Create the Perceiver with Utils.generate_model
         self.perceiver_model = CausalPerceiverIO(
-            video_shape=(self.context_window_size, self.input_channels, self.image_size, self.image_size),
+            video_shape=(self.sequence_length, self.input_channels, self.image_size, self.image_size),
             num_latents=self.num_latent_perceiver,
             num_latent_channels=self.context_dim,
             num_attention_heads=self.num_perceiver_heads,
-            num_encoder_layers=self.num_encoder_perceiver_layers,
+            num_self_attention_layers=self.num_encoder_perceiver_layers,
+            max_seq_len= 4096,
             code_dim=self.perceiver_code_dim,
             num_codes=self.num_codebook_perceiver,
             downsample=self.downsample_perceiver,
             dropout=self.dropout,
             base_channels=self.img_perceiver_channels,
-            use_3d_conv= True,
-            temporal_downsample= True,
             num_quantizers=1,
+            kmeans_init=False,
+            commitment_weight=0.5,
+            commitment_use_cross_entropy_loss=False,
+            orthogonal_reg_weight=0.0,
+            orthogonal_reg_active_codes_only=True,
+            orthogonal_reg_max_codes=2048,
+            threshold_ema_dead_code=0,
         )
-
-                       
+        self.frame_slot_pool = FrameAttentionPool(
+                c_in=self.context_dim,    # Perceiver bottleneck channel
+                c_out=self.context_dim,   # keep same dim for the VRNN interface
+                n_heads= 4,
+            )
+        self.context_predictor = CausalContextPredictor(
+            context_dim=self.context_dim,
+            action_dim=self.action_dim,
+            latent_dim=self.latent_dim,
+            rnn_hidden_dim=self.hidden_dim,
+            hidden_dim=self.context_dim,
+            num_layers=1,
+            num_heads=self.num_perceiver_heads,
+            dropout=self.dropout,
+        )                       
 
     def _init_discriminators(self, img_disc_layers:int, patch_size: int, num_heads: int = 4):
         # Initialize discriminators
@@ -946,7 +1060,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                                         hidden_dim=self.hidden_dim,
                                                         latent_dim=self.latent_dim,
                                                         context_dim=self.context_dim,
-                                                        attention_dim=self.attention_dim,
                                                         input_channels=self.input_channels,
                                                         )
         # Feature extractor for attention
@@ -1103,7 +1216,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if no_decay: groups.append({"params": no_decay, "weight_decay": 0.0})
             return groups
         
-        perceiver_params = get_params(self.perceiver_model)
+        perceiver_params = get_params(self.perceiver_model, self.context_predictor, self.frame_slot_pool)
         param_groups = []
         if perceiver_params:  # guard empty
             perceiver_groups = split_by_weight_decay(perceiver_params, weight_decay)
@@ -1207,16 +1320,15 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Default actions if not provided
         if actions is None:
             actions = torch.zeros(batch_size, seq_len, self.action_dim).to(self.device)
-        
+        perceiver_future_steps = getattr(self, "perceiver_future_steps", 2)
+        num_context_frames = max(1, seq_len - perceiver_future_steps)
         # Extract global context using Perceiver
-        T_ctx = max(1, min(self.context_window_size, seq_len - 1))
         context_sequence, context_info = self.compute_global_context(
             observations,
-            num_context_frames=T_ctx,  # Use the computed context length
-            train=self.training,
+            num_context_frames=num_context_frames,
             generate_future=False
         )
-        
+        ctx_pred_loss = 0.0
         # Initialize LSTM hidden states
         h = self.h0.expand(self.number_lstm_layer, batch_size, -1).contiguous()
         c = self.c0.expand(self.number_lstm_layer, batch_size, -1).contiguous()
@@ -1253,9 +1365,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             # Get current inputs
             o_t = observations[:, t]
             a_t = actions[:, t]
-            
             # Get context (global or local)
             c_t = context_sequence[:, t]
+            
             outputs['context_states'].append(c_t)
             
             #Inference Network q(z_t|o_≤t, z_<t) 
@@ -1395,10 +1507,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             # Total KL for this timestep
             total_kl = kl_z + kumar_beta_kl
             outputs['kl_losses'].append(total_kl)
-
-
-            
-            
             rnn_input = torch.cat([z_t, c_t, attention_state, a_t], dim=-1)
             rnn_output, (h, c) = self._rnn(
                 rnn_input, h, c, 
@@ -1422,18 +1530,44 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     'hidden_states', 'attention_maps']:
             if outputs[key]:
                 outputs[key] = torch.stack(outputs[key], dim=1)
-
-        
-        
-        # Perceiver loss
-    
-        outputs['perceiver_vq_loss'] = context_info["vq_loss"] # scalar for optimization
-        
-        # Add auxiliary outputs
-        outputs['context_sequence'] = context_sequence
-        outputs['perceiver_ce_loss'] = context_info["ce_loss"]
-        outputs['perceiver_perceptual_loss'] = context_info["perceptual_loss"]
         outputs['perceiver_total_loss'] = context_info["total_loss"]
+        latents_seq = outputs['latents']            # [B, T, D_z]
+        hidden_seq  = outputs['hidden_states']      # [B, T, D_h]
+        B, T, _ = context_sequence.shape
+
+        # Sanity guard: if T < 2, skip
+        if T > 1:
+            # Inputs at times 0..T-2
+            c_prev = context_sequence[:, :-1, :]        # [B, T-1, C_ctx]
+            a_prev = actions[:, :-1, :]            # [B, T-1, A]
+            z_prev = latents_seq[:, :-1, :]        # [B, T-1, D_z]
+            h_prev = hidden_seq[:, :-1, :]         # [B, T-1, D_h]
+
+            # Targets are next contexts 1..T-1
+            c_target = context_sequence[:, 1:, :]       # [B, T-1, C_ctx]
+
+            # Predictor is causal, so at index t it sees indices <= t
+            pred_ctx_seq = self.context_predictor(
+                context_seq=c_prev,
+                action_seq=a_prev,
+                latent_seq=z_prev,
+                hidden_seq=h_prev,
+            )  # [B, T-1, C_ctx]
+
+            ctx_pred_loss = F.mse_loss(pred_ctx_seq, c_target.detach())
+
+            # Hyperparameter for this auxiliary loss
+            lambda_ctx = getattr(self, "lambda_ctx_pred", 0.1)
+
+            # Add to perceiver task loss (so it goes into MGDA "perceiver" bucket)
+            outputs['perceiver_total_loss'] = outputs['perceiver_total_loss'] + lambda_ctx * ctx_pred_loss
+
+            outputs['context_pred_loss'] = ctx_pred_loss
+        # Add auxiliary outputs
+        outputs['perceiver_reconstructed_img'] = context_info['reconstruct']
+        outputs['perceiver_vq_loss']          = context_info['vq_loss']
+        outputs['perceiver_ce_loss']          = context_info['ce_loss']
+        outputs['perceiver_lpips_loss']       = context_info['lpips_loss']
 
         return outputs
 
@@ -1441,7 +1575,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
         # Encode
         z, z_mean, z_logvar, h = self.encoder(x)
-        
 
         # Get prior distribution and parameters
         prior_dist, prior_params = self.prior(h)
@@ -1497,8 +1630,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         # Auxiliary losses
         losses['perceiver_loss'] = outputs['perceiver_total_loss']
-
-
 
         # Aggregate diversity losses collected during forward pass
         losses['attention_diversity'] = (
@@ -1707,160 +1838,162 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         feature_match_loss = self.compute_feature_matching_loss(real_features, fake_img_outputs['hidden_3d'])
 
         return img_adv_loss , temporal_loss_frames, feature_match_loss
-      
+
     def compute_global_context(
-        self, 
-        videos, 
-        num_context_frames,
-        train=True,
-        generate_future=False,  # Control whether to generate or use GT
+        self,
+        videos: torch.Tensor,           # [B, T_raw, C, H, W]
+        num_context_frames: int,
+        generate_future: bool = False,
+        num_future_frames: Optional[int] = None,
     ):
         """
-        Unified context computation for training and generation.
-        temporal_context: [B, T_total, C_ctx]
-        """
-        B, T_input = videos.shape[:2]
-        Ht = Wt = None
-        generated_videos = None
-        ce_loss = perceptual_loss = None
-        ce_loss = torch.tensor(0.0, device=self.device)
-        perceptual_loss = torch.tensor(0.0, device=self.device)
-        total_loss = torch.tensor(0.0, device=self.device)
+        Build per-frame global context for the VRNN by extracting the Perceiver's
+        temporal self-attention bottleneck and attention-pooling it per frame.
 
+        TRAIN:   videos = x_{1:T},           return context c_{1:T}
+        GENERATE: videos = x_{1:T_ctx}, AR-generate T_future, return c_{1:T_ctx+T_future}
+
+        Returns:
+        temporal_context: [B, T_out, C_ctx]
+        info: dict with losses, Ht/Wt, and recon / generated videos for logging.
+        """
+        device = videos.device
+        B, T_raw, C_img, H_img, W_img = videos.shape
+        assert 1 <= num_context_frames <= T_raw, "Invalid num_context_frames"
+        T_ctx = num_context_frames
+
+        #  Helper: tokens → per-frame temporal context 
+        def _tokens_to_temporal_context(
+            token_ids: torch.Tensor,       # [B, T_enc, Ht, Wt] or [B, T_enc, Ht, Wt, Q]
+            encoder_latents: torch.Tensor, # [B, T_enc, C_enc, H_lat, W_lat]
+            T_frames: int,                 # raw frames represented by token_ids
+            T_ctx_frames: int,             # desired context length in raw frames
+        ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+
+            # If tokenizer returns multi-head codes, drop the codebook head axis
+            if token_ids.dim() == 5:
+                token_ids_flat = token_ids[..., 0]        # [B, T_enc, Ht, Wt]
+            else:
+                token_ids_flat = token_ids                 # [B, T_enc, Ht, Wt]
+
+            B_tok, T_enc, Ht, Wt = token_ids_flat.shape
+
+            # Split in ENCODED time (internally clamps so T_pred_enc ≥ 1)
+            ctx_tokens, future_tokens, T_ctx_enc, T_pred_enc = \
+                self.perceiver_model.model._split_context_target_tokens(
+                    token_ids_flat, num_context_frames=T_ctx_frames, T_raw=T_frames
+                )
+
+            # Run temporal bottleneck (context + future queries)
+            temporal_ctx_future, meta = self.perceiver_model.model.extract_temporal_bottleneck(
+                ctx_token_ids=ctx_tokens,
+                encoder_latents=encoder_latents,
+                T_ctx_enc=T_ctx_enc,
+                T_pred_enc=T_pred_enc,
+            )
+            # meta["whole_temporal_bottleneck"]: [B, T_enc_total, C_ctx]
+            whole_tb = meta["whole_temporal_bottleneck"]
+            T_enc_total = whole_tb.shape[1]
+
+            # Map encoded timesteps back to raw frame timesteps
+            assert T_enc_total % T_frames == 0, \
+                f"T_enc_total={T_enc_total}, T_frames={T_frames} not divisible"
+            tokens_per_frame = T_enc_total // T_frames
+
+            # [B, T_enc_total, C] → [B, T_frames, P, C] → attention-pool P
+            per_frame_slots = rearrange(
+                whole_tb, "b (t p) c -> b t p c", t=T_frames, p=tokens_per_frame
+            )                                                                  # [B, T, P, C]
+            per_frame_ctx = self.frame_slot_pool(per_frame_slots)              # [B, T, C]
+
+            meta_out = dict(
+                T_frames=T_frames,
+                T_ctx_frames=T_ctx_frames,
+                T_enc_total=T_enc_total,
+                T_ctx_enc=T_ctx_enc,
+                T_pred_enc=T_pred_enc,
+                tokens_per_frame=tokens_per_frame,
+                Ht=Ht, Wt=Wt,                       # expose token grid size
+            )
+            return per_frame_ctx, meta_out
+        # 
 
         if not generate_future:
-            # ==========================
-            # TRAIN / EVAL WITH GT CONTEXT
-            # ==========================
-            T_total = T_input
-            T_ctx = num_context_frames
-            T_pred = T_total - T_ctx
+            # Tokenize full training clip once
+            token_ids, _, latent_tm, vq_loss_tok = self.perceiver_model.tokenizer.encode(videos)
 
-            # 1) One Perceiver forward for FUTURE prediction
-            perceiver_outputs = self.perceiver_model(
-                videos,
-                num_context_frames=T_ctx,
-                return_dict=True
-            )
-            
-            # If encoder_latents doesn't exist or has wrong shape, compute it:
-            if "encoder_latents" in perceiver_outputs:
-                ctx_future_raw = perceiver_outputs["encoder_latents"]
-                
-                # Verify shape
-                if ctx_future_raw.shape[1] != T_pred:
-                    # Need to extract properly
-                    future_token_ids, _, _, _ = self.perceiver_model.tokenizer.encode(videos[:, T_ctx:])
-                    future_encoder_out = self.perceiver_model.model.encoder(future_token_ids)
-                    ctx_future = self.perceiver_model.model.extract_temporal_bottleneck(
-                        future_encoder_out.last_hidden_state, T_pred
-                    )
-                else:
-                    ctx_future = ctx_future_raw
-            else:
-                # Fallback: compute future context explicitly
-                future_token_ids, _, _, _ = self.perceiver_model.tokenizer.encode(videos[:, T_ctx:])
-                future_encoder_out = self.perceiver_model.model.encoder(future_token_ids)
-                ctx_future = self.perceiver_model.model.extract_temporal_bottleneck(
-                    future_encoder_out.last_hidden_state, T_pred
-                )
-            
-            vq_loss = perceiver_outputs.get("vq_loss", 0.0)
-            Ht = perceiver_outputs.get("Ht")
-            Wt = perceiver_outputs.get("Wt")
-
-            # 2) PAST temporal context (no future leakage)
-            token_ids_ctx, _, _, _ = self.perceiver_model.tokenizer.encode(videos[:, :T_ctx])
-            enc_ctx = self.perceiver_model.model.encoder(token_ids_ctx)
-            ctx_past = self.perceiver_model.model.extract_temporal_bottleneck(
-                enc_ctx.last_hidden_state, T_ctx
+            # Temporal bottleneck for all frames 1..T_raw
+            temporal_context, meta_ctx = _tokens_to_temporal_context(
+                token_ids=token_ids,
+                encoder_latents=latent_tm,
+                T_frames=T_raw,
+                T_ctx_frames=T_ctx,   # pass raw-frame T_ctx; split will ensure T_pred_enc≥1
             )
 
-            # 3) Concatenate and project
-            temporal_context = torch.cat([ctx_past, ctx_future], dim=1)
-            
-            # IMPORTANT: Ensure shapes are correct
-            assert temporal_context.shape == (B, T_total, self.perceiver_model.model.num_latent_channels), \
-                f"Shape mismatch: {temporal_context.shape}"
-            
+            # Perceiver AR+recon losses for logging/optimization
+            perc_out = self.perceiver_model(
+                videos, num_context_frames=T_ctx, return_dict=True
+            )
+            perc_losses = self.perceiver_model.model.compute_loss(
+                perc_out,
+                target_videos=videos,
+                perceptual_weight=getattr(self, "perceptual_weight", 1.0),
+                label_smoothing=0.05,
+                ce_weight=0.05,
+                ar_cycle_consistency_weight=0.01,
+            )
 
-            # 4) Losses
-            if train:
-                losses = self.perceiver_model.compute_loss(
-                    perceiver_outputs,
-                    target_videos=videos[:, T_ctx:],
-                    perceptual_weight=0.9,
-                    label_smoothing=0.05,
-                )
-                ce_loss = losses["ce_loss"]
-                perceptual_loss = losses["perceptual_loss"]
-                total_loss = losses["loss"]
-            return temporal_context, {
-                "vq_loss": vq_loss,
-                "ce_loss": ce_loss,
-                "perceptual_loss": perceptual_loss,
-                "total_loss": total_loss,
-                "Ht": Ht, 
-                "Wt": Wt,
-                "reconstruct": perceiver_outputs['reconstructed'],
+            info = {
+                "vq_loss":          perc_losses["vq_loss"],
+                "ce_loss":          perc_losses["ce_loss"],
+                "lpips_loss":       perc_losses["lpips_loss"],
+                "ar_cycle_loss":    perc_losses["ar_cycle_loss"],
+                "token_accuracy":   perc_out["token_accuracy"],
+                "total_loss":       perc_losses["loss"],
+                "Ht": meta_ctx["Ht"], "Wt": meta_ctx["Wt"],
+                "reconstruct":      perc_out["reconstructed"],  # needed by forward_sequence
                 "generated_videos": None,
             }
+            # Backwards-compat alias if your training loop still references it:
+            info["perceptual_loss"] = info["lpips_loss"]
+            return temporal_context, info
 
-        else:
-            # ==========================
-            # GENERATION: AR predict future
-            # ==========================
-            with torch.no_grad():
-                T_input = videos.shape[1]
-                T_ctx = num_context_frames
+        # Generation path (context + AR future) 
+        assert T_ctx >= 1, "Need ≥1 context frame for generation"
+        if num_future_frames is None:
+            num_future_frames = max(T_raw - T_ctx, 1)
 
-                
-                # 1) PAST context from GT
-                token_ids_ctx, _, _, _ = self.perceiver_model.tokenizer.encode(videos)
-                Ht, Wt = token_ids_ctx.shape[-2:]
-                enc_ctx = self.perceiver_model.model.encoder(token_ids_ctx)
-                ctx_past = self.perceiver_model.model.extract_temporal_bottleneck(
-                    enc_ctx.last_hidden_state, T_ctx
-                )
+        # AR generate future frames from the context
+        context_videos = videos[:, :T_ctx]   # [B, T_ctx, C, H, W]
+        generated_videos = self.perceiver_model.generate_autoregressive(
+            context_videos=context_videos,
+            num_frames_to_generate=num_future_frames,
+        )                                    # [B, T_ctx+T_future, C, H, W]
 
-                # 2) Determine future frames
-                num_future_frames = T_input - T_ctx
+        # Tokenize the concatenated (ctx+future) trajectory
+        tok_gen, _, lat_gen, vq_loss_gen = self.perceiver_model.tokenizer.encode(generated_videos)
 
-                # 3) Generate future
-                generated_videos = self.perceiver_model.generate_autoregressive(
-                    context_videos=videos[:,:T_ctx],
-                    num_frames_to_generate=num_future_frames,
-                    temperature=1.0,
-                    top_k=50,
-                    top_p=0.9,
-                )
+        # Temporal bottleneck over the full generated timeline
+        temporal_context_gen, meta_gen = _tokens_to_temporal_context(
+            token_ids=tok_gen,
+            encoder_latents=lat_gen,
+            T_frames=generated_videos.shape[1],
+            T_ctx_frames=generated_videos.shape[1],  # pool context over the whole timeline
+        )
 
-                # 4) Extract future context
-                future_videos = generated_videos[:, T_ctx:T_ctx+num_future_frames]
-                
-                # Ensure we have frames to encode
-                if future_videos.shape[1] > 0:
-                    token_ids_future, _, _, _ = self.perceiver_model.tokenizer.encode(future_videos)
-                    enc_future = self.perceiver_model.model.encoder(token_ids_future)
-                    ctx_future = self.perceiver_model.model.extract_temporal_bottleneck(
-                        enc_future.last_hidden_state, num_future_frames
-                    )
-                else:
-                    # Fallback: repeat last context
-                    ctx_future = ctx_past[:, -1:].repeat(1, num_future_frames, 1)
-
-                # 5) Concatenate and project
-                temporal_context = torch.cat([ctx_past, ctx_future], dim=1)
-
-                return temporal_context, {
-                    "vq_loss": None,
-                    "ce_loss": None,
-                    "perceptual_loss": None,
-                    "Ht": Ht, 
-                    "Wt": Wt,
-                    "generated_videos": generated_videos,
-                } 
-                      
+        info = {
+            "vq_loss":          vq_loss_gen,
+            "ce_loss":          None,
+            "lpips_loss":       None,
+            "ar_cycle_loss":    None,
+            "token_accuracy":   None,
+            "total_loss":       None,
+            "Ht": meta_gen["Ht"], 
+            "Wt": meta_gen["Wt"],
+            "reconstruct":      None,
+            "generated_videos": generated_videos,
+        }
+        return temporal_context_gen, info
 
     
     def prepare_images_for_training(self, images):
@@ -2133,159 +2266,107 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         return z_next, prior_info
 
 
-    def generate_future_sequence(self, 
-                                 initial_obs, 
-                                 initial_action=None, 
-                                 horizon=10, 
-                                 context_window=None, 
-                                 temperature=1.0):
+    @torch.no_grad()
+    def generate_future_sequence(
+        self,
+        initial_obs: torch.Tensor,   # [B,T_ctx,C,H,W]
+        actions: Optional[torch.Tensor],  # [B, T_total, A] or None
+        horizon: int,
+        decode_pixels: bool = True    # True: also produce frames for viz
+    ) -> Dict[str, torch.Tensor]:
         """
-        Generate a complete future sequence of observations
-        
+        imagination:
+        - consume T_ctx observed frames,
+        - roll future for `horizon` steps using PRIOR and ContextPredictor,
+        - use offline actions if provided, else zeros (later: policy(h,z,c))
+        - optionally decode pixels for visualization
+        Returns dict with z, c, a, h (and images if decode_pixels).
         """
-        batch_size = initial_obs.shape[0]
-        device = initial_obs.device
-        
-        # Normalize input if needed
-        initial_obs = self.prepare_images_for_training(initial_obs)
-        
-        # Initialize action if not provided
-        if initial_action is None:
-            initial_action = torch.zeros(batch_size, self.action_dim).to(device)
-        
-        # Storage for generated sequence
-        generated_observations = [initial_obs]
-        generated_latents = []
-        generated_attentions = []
-        generated_attention_coords = []
-        attention_uncertainties = []
-        hidden_states = []
-        T_ctx = context_window.shape[1] if context_window is not None else 1
-        with torch.no_grad():
-            # 1. Encode initial observation
-            z_0, _, _, _ = self.encoder(initial_obs)
-            generated_latents.append(z_0)
-            padding_frames = torch.zeros(batch_size, horizon , *initial_obs.shape[1:]).to(device)
-            if context_window is None:
-                # Use the observed initial frame as the only context
-                base_context = initial_obs.unsqueeze(1)          # [B, 1, C, H, W]
-            else:
-                base_context = context_window                    # [B, T_ctx, C, H, W]
+        B, T_ctx = initial_obs.shape[:2]
+        device = self.device
 
-            extended_context = torch.cat([base_context, padding_frames], dim=1)  # [B, T_ctx + horizon, C, H, W]
+        # 1) Contexts for observed frames (no future AR here)
+        ctx_obs, ctx_info = self.compute_global_context(
+            initial_obs, num_context_frames=T_ctx, train=False, generate_future=False
+        )  # ctx_obs: [B,T_ctx,C_ctx]
 
+        # 2) Build initial RNN state by scanning the observed segment (teacher-forced)
+        #    (matches forward_sequence but only up to T_ctx)
+        outputs = { 'z': [], 'h': [], 'c': [ctx_obs[:, 0]], 'a': [] }
+        h, c_rnn = self._init_state(B)  # your internal method that returns (h_layers, c_layers)
+        prev_attention = None
 
-            # 2. Get initial context (TODO: how to pass the predicted context correctly??)
-            context_sequence, _= self.compute_global_context(
-                extended_context,
-                num_context_frames=T_ctx,
-                train=False,
-                generate_future=True  # generation mode
+        for t in range(T_ctx):
+            x_t = initial_obs[:, t]         # [B,C,H,W]
+            c_t = ctx_obs[:, t]             # [B,C_ctx]
+            a_t = actions[:, t] if actions is not None else torch.zeros(B, self.action_dim, device=device)
+
+            # posterior attention + encode z_t (since we have x_t)
+            q_attn, _ = self.attention_prior_posterior._compute_posterior_attention(
+                self.encoder, x_t, h[-1], c_t, detach=False
             )
+            z_t, *_ = self.encoder(x_t)  # z from encoder (your encoder returns mean/logvar too)
 
-            # context_sequence shape [B, horizon, context_dim]
-            # 3. Initialize LSTM states
-            h = self.h0.expand(self.number_lstm_layer, batch_size, -1).contiguous()
-            c = self.c0.expand(self.number_lstm_layer, batch_size, -1).contiguous()
-            c_prev = context_sequence[:, T_ctx - 1]
+            # step RNN
+            rnn_in = torch.cat([z_t, c_t, q_attn, a_t], dim=-1)
+            _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, torch.ones(B, device=device))
+            outputs['z'].append(z_t); outputs['h'].append(h[-1]); outputs['a'].append(a_t)
 
+        # 3) Future imagination with PRIOR + ContextPredictor
+        c_prev = ctx_obs[:, -1]     # last observed context
+        z_prev = outputs['z'][-1]   # last observed z
 
-            # 4. Initialize attention
-            attention_map = torch.ones(
-                batch_size, 
-                self.attention_resolution, 
-                self.attention_resolution
-            ).to(device) / (self.attention_resolution ** 2)
-            attention_map, attention_coords = self.attention_prior_posterior._compute_posterior_attention(
-                self.encoder, initial_obs, h[-1], context_sequence[:, T_ctx-1], detach=False
-            )
-            # Process initial step through VRNN
-            
-            weighted_visual_features = self.attention_prior_posterior.posterior_net.bottleneck_features
-            #Get coordinates directly from posterior attention map
-            generated_attention_coords.append(attention_coords)
-            attention_features = torch.cat([ weighted_visual_features, attention_coords], dim=-1)
-            # Feature extraction
+        z_futures, c_futures, a_futures, h_futures = [], [], [], []
 
-            phi_attention = self.phi_attention(attention_features)
-            phi_attention_mean, phi_attention_logvar = torch.chunk(phi_attention, 2, dim=-1)
-            phi_attention_std = torch.exp(0.5 * phi_attention_logvar.clamp(min=-10, max=5))
-            phi_attention = phi_attention_mean + phi_attention_std * torch.randn_like(phi_attention_std).to(device)
-            attention_uncertainties.append(phi_attention_std.mean(dim=-1))
+        for t in range(horizon):
+            # (a) pick action
+            a_t = actions[:, T_ctx + t] if actions is not None and actions.shape[1] > (T_ctx + t) \
+                else torch.zeros(B, self.action_dim, device=device)
 
-            # Update LSTM
-            rnn_input = torch.cat([z_0, c_prev, phi_attention, initial_action], dim=-1)
-            _, (h, c) = self._rnn(rnn_input, h, c, torch.ones(batch_size).to(device))
-            
-            current_action = initial_action
-            
-            # 5. Generate future sequence
-            for t in range(horizon):
-                # Sample next latent from DPGMM prior
-                c_t = context_sequence[:, T_ctx + t]
-                z_next, prior_info = self.sample_next_latent(h[-1], c_t, temperature)
-                generated_latents.append(z_next)
-                
-                # Decode to observation
-                o_next = self.decoder.decode(z_next, deterministic=False)
-                generated_observations.append(o_next)
-                
-                # Update attention using prior network
-                attention_map, attention_info = self.attention_prior_posterior.prior_net(
-                    attention_map, h[-1], z_next
-                )
-                generated_attentions.append(attention_map)
-                
-                # Extract attention features
-                
-                #TODO: is this correct? Should we use attention_features or attention_map?
-                if 'predicted_movement' in attention_info:
-                    dx, dy = attention_info['predicted_movement']
-                    # Update attention coordinates based on movement
-                    new_coords = attention_coords + torch.stack([dx.mean(dim=[1,2]), 
-                                                            dy.mean(dim=[1,2])], dim=-1)
-                    new_coords = self.attention_prior_posterior.posterior_net.spatial_regularizer(new_coords)
-                    generated_attention_coords.append(new_coords)
-                    attention_coords = new_coords
-   
-                approx_weighted_features = self.attention_prior_posterior.posterior_net.bottleneck_features
-                
-                attention_features = torch.cat([
-                    approx_weighted_features,
-                    attention_coords
-                    ], dim=-1)
-                # Update VRNN state
-                phi_attention = self.phi_attention(attention_features)
-                phi_attention_mean, phi_attention_logvar = torch.chunk(phi_attention, 2, dim=-1)
-                phi_attention_std = torch.exp(0.5 * phi_attention_logvar.clamp(min=-10, max=5))
-                attention_uncertainties.append(phi_attention_std.mean(dim=-1))
-                phi_attention = phi_attention_mean + phi_attention_std * torch.randn_like(phi_attention_std).to(device)
+            # (b) prior over attention/z
+            prior_attn, _ = self.attention_prior_posterior.prior_net(prev_attention, h[-1], z_prev)
+            pz_dist, pz_params = self.prior(h[-1], c_prev)
+            z_t = pz_dist.rsample()     # stochastic roll
 
+            # (c) step RNN with imagined inputs
+            rnn_in = torch.cat([z_t, c_prev, prior_attn, a_t], dim=-1)
+            _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, torch.ones(B, device=device))
 
-                rnn_input = torch.cat([z_next, c_t, phi_attention, current_action], dim=-1)
-                _, (h, c) = self._rnn(rnn_input, h, c, torch.ones(batch_size).to(device))
-                hidden_states.append(h[-1])
-                
-        
-        # Stack results
-        generated_observations = torch.stack(generated_observations, dim=1)  # [B, T+1, C, H, W]
-        generated_latents = torch.stack(generated_latents, dim=1)  # [B, T+1, latent_dim]
-        
-        if generated_attentions:
-            generated_attentions = torch.stack(generated_attentions, dim=1)  # [B, T, H_att, W_att]
-        
-        # Denormalize images for visualization
-        generated_observations = self.denormalize_generated_images(generated_observations)
-        
-        return {
-            'observations': generated_observations,
-            'latents': generated_latents,
-            'attention_maps': generated_attentions,
-            'attention_uncertainties': torch.stack(attention_uncertainties, dim=1),
-            'attention_coords': torch.stack(generated_attention_coords, dim=1),
-            'hidden_states': torch.stack(hidden_states, dim=1) if hidden_states else None,
-            'context': context_sequence,
+            # (d) predict next context from (c_prev, a_t)
+            c_t = self.context_predictor(c_prev, a_t, z_t, h[-1])
+
+            # collect + advance
+            z_futures.append(z_t); c_futures.append(c_t); a_futures.append(a_t); h_futures.append(h[-1])
+            z_prev = z_t; c_prev = c_t; prev_attention = prior_attn
+
+        # 4) Pack latent imagination outputs
+        z_futures = torch.stack(z_futures, dim=1) if len(z_futures) else torch.empty(B,0, self.latent_dim, device=device)
+        c_futures = torch.stack(c_futures, dim=1) if len(c_futures) else torch.empty(B,0, self.context_dim, device=device)
+        a_futures = torch.stack(a_futures, dim=1) if len(a_futures) else torch.empty(B,0, self.action_dim, device=device)
+        h_futures = torch.stack(h_futures, dim=1) if len(h_futures) else torch.empty(B,0, h[-1].shape[-1], device=device)
+
+        result = {
+            "z_obs": torch.stack(outputs['z'], dim=1),     # [B,T_ctx, D_z]
+            "h_obs": torch.stack(outputs['h'], dim=1),     # [B,T_ctx, D_h]
+            "a_obs": torch.stack(outputs['a'], dim=1),     # [B,T_ctx, A]
+            "c_obs":  ctx_obs,                             # [B,T_ctx, D_c]
+            "z_future": z_futures,                         # [B,H,D_z]
+            "c_future": c_futures,                         # [B,H,D_c]
+            "a_future": a_futures,                         # [B,H,A]
+            "h_future": h_futures,                         # [B,H,D_h]
         }
+
+        # 5) pixel rollout via the Perceiver AR head (for visualization)
+        if decode_pixels:
+            # Use the Perceiver to generate frames from the observed context only.
+            # This remains independent of the *latent* imagination above (standard in Dreamer).
+            gen = self.perceiver_model.generate_autoregressive(
+                context_videos=initial_obs, num_frames_to_generate=horizon,
+                temperature=1.0, top_k=None, top_p=None
+            )  # [B,horizon,C,H,W]
+            result["pixels_future"] = gen
+
+        return result
     
     def visualize_attention_comparison(self, observations, predicted_attention, 
                                     true_attention=None, alpha=0.5):

@@ -1057,7 +1057,11 @@ class DMCVBTrainer:
                      })
         # Compute averages
         avg_metrics = {f'eval/{k}': np.mean(v) for k, v in eval_metrics.items()}
-        
+        pred_metrics = self.evaluate_two_step_prediction(num_batches=5, T_ctx=8) 
+        if self.config.get("use_wandb", False):
+            wandb.log({f"{k}": v for k, v in pred_metrics.items()}, step=epoch)
+
+        avg_metrics.update(pred_metrics)     
         # Save best model
         eval_loss = avg_metrics.get('eval/total_vae_loss', float('inf'))
         if eval_loss < self.best_eval_loss:
@@ -1065,7 +1069,66 @@ class DMCVBTrainer:
             self.save_checkpoint(epoch, is_best=True)
         
         return avg_metrics
- 
+
+    @torch.no_grad()
+    def visualize_two_step_prediction(self, epoch: int, T_ctx: int = 8, num_examples: int = 4):
+        """
+        Log a simple grid comparing context, GT t+1/t+2 vs predicted t+1/t+2.
+        """
+        self.model.eval()
+
+        batch = next(iter(self.eval_loader))
+        observations = batch["observations"].to(self.device)  # [B, T, C, H, W]
+        actions      = batch["actions"].to(self.device)        # [B, T, A]
+        B, T, C, H, W = observations.shape
+
+        assert T >= T_ctx + 2, f"Need at least T_ctx+2 frames, got T={T}"
+
+        initial_obs = observations[:, :T_ctx]
+
+        futures = self.model.generate_future_sequence(
+            initial_obs=initial_obs,
+            actions=actions,
+            horizon=2,
+            decode_pixels=True,
+        )
+        pred = futures["pixels_future"]  # [B, 2, C, H, W]
+
+        def denorm(x):
+            # your images are in [-1,1]
+            return ((x + 1.0) * 0.5).clamp(0.0, 1.0)
+
+        num_rows = min(num_examples, B)
+        fig, axes = plt.subplots(num_rows, 5, figsize=(5 * 4, 3 * num_rows))
+
+        if num_rows == 1:
+            axes = axes[None, :]  # make it 2D
+
+        for i in range(num_rows):
+            # Last context frame
+            ctx_last = denorm(observations[i, T_ctx - 1, :3])
+            gt_t1    = denorm(observations[i, T_ctx,     :3])
+            gt_t2    = denorm(observations[i, T_ctx + 1, :3])
+            pred_t1  = denorm(pred[i, 0, :3])
+            pred_t2  = denorm(pred[i, 1, :3])
+
+            def show(ax, img, title):
+                ax.imshow(img.permute(1, 2, 0).detach().cpu().numpy())
+                ax.set_title(title); ax.axis("off")
+
+            show(axes[i, 0], ctx_last, "Context last (t_ctx)")
+            show(axes[i, 1], gt_t1,    "GT t+1")
+            show(axes[i, 2], gt_t2,    "GT t+2")
+            show(axes[i, 3], pred_t1,  "Pred t+1")
+            show(axes[i, 4], pred_t2,  "Pred t+2")
+
+        fig.tight_layout()
+
+        if self.writer is not None:
+            self.writer.add_figure("qualitative/two_step_future", fig, epoch)
+
+        plt.close(fig)
+
     def run_grad_diag(
         self,
         max_B: int = 1,
@@ -1212,7 +1275,65 @@ class DMCVBTrainer:
             consistencies.append(similarity)
         
         return torch.stack(consistencies).mean()
-    
+
+    @torch.no_grad()
+    def evaluate_two_step_prediction(
+        self,
+        num_batches: int = 10,
+        T_ctx: int = 8,
+    ) -> Dict[str, float]:
+        """
+        Evaluate 1-step and 2-step pixel prediction PSNR using the
+        world model's generate_future_sequence method.
+        """
+        self.model.eval()
+        psnr_t1, psnr_t2 = [], []
+
+        for i, batch in enumerate(self.eval_loader):
+            if i >= num_batches:
+                break
+
+            observations = batch["observations"].to(self.device)  # [B, T, C, H, W]
+            actions      = batch["actions"].to(self.device)        # [B, T, A]
+            B, T, C, H, W = observations.shape
+
+            if T < T_ctx + 2:
+                continue  # skip too-short sequences
+
+            # Context frames
+            initial_obs = observations[:, :T_ctx]  # [B, T_ctx, C, H, W]
+
+            # Rollout 2 future steps
+            futures = self.model.generate_future_sequence(
+                initial_obs=initial_obs,
+                actions=actions,
+                horizon=2,
+                decode_pixels=True,
+            )
+            pred = futures["pixels_future"]   # [B, 2, C, H, W]
+
+            # Ground truth frames for t+1, t+2
+            gt = observations[:, T_ctx:T_ctx + 2]  # [B, 2, C, H, W]
+
+            # PSNR per step (reuse your compute_psnr which handles [-1,1])
+            psnr_1 = self.compute_psnr(gt[:, 0], pred[:, 0])  # t+1
+            psnr_2 = self.compute_psnr(gt[:, 1], pred[:, 1])  # t+2
+
+            psnr_t1.append(psnr_1.item())
+            psnr_t2.append(psnr_2.item())
+
+        metrics = {
+            "eval/pred_psnr_t+1": float(np.mean(psnr_t1)) if psnr_t1 else 0.0,
+            "eval/pred_psnr_t+2": float(np.mean(psnr_t2)) if psnr_t2 else 0.0,
+        }
+
+        # Optional: log to TensorBoard / wandb
+        if self.writer is not None:
+            self.writer.add_scalar("eval/pred_psnr_t+1", metrics["eval/pred_psnr_t+1"])
+            self.writer.add_scalar("eval/pred_psnr_t+2", metrics["eval/pred_psnr_t+2"])
+
+        return metrics
+
 
     def visualize_results(self, epoch: int):
         """
@@ -1589,6 +1710,8 @@ class DMCVBTrainer:
             # Visualize periodically
             if epoch % self.config['visualize_every'] == 0:
                 self.visualize_results(epoch)
+                self.visualize_two_step_prediction(epoch, T_ctx=8)
+
             
             # Save checkpoint
             if epoch % self.config['checkpoint_every'] == 0:
@@ -1623,7 +1746,6 @@ def main():
         'latent_dim': 36,
         'hidden_dim': 32, #must be divisible by 8
         'context_dim': 128,
-        'attention_dim': 20,
         'attention_resolution': 16,
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 6.0,  # Hyperparameters for prior
@@ -1678,7 +1800,6 @@ def main():
         latent_dim=config['latent_dim'],
         hidden_dim=config['hidden_dim'],
         num_latent_channels_perceiver=config['context_dim'],
-        attention_dim=config['attention_dim'],
         action_dim=action_dim,
         sequence_length=config['sequence_length'],
         img_perceiver_channels=64,

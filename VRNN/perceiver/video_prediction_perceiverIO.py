@@ -1222,6 +1222,7 @@ class PerceiverTokenPredictor(nn.Module):
             T_pred_enc=T_pred_enc,
             T_total=T_total,
             num_time_slots=S,
+            whole_temporal_bottleneck=timeline_out,   # [B,T_total,C]
         )
         return temporal_ctx_future, meta
 
