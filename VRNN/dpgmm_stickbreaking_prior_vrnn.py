@@ -12,6 +12,7 @@ from itertools import chain
 import numpy as np
 import math
 from collections import OrderedDict
+from VRNN.canny_net import CannyFilter
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (
     EMA, TemporalDiscriminator,
@@ -19,7 +20,7 @@ from models import (
     AddEpsilon, check_tensor
 )
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
-
+from VRNN.perceiver.position import RoPE
 from VRNN.RGB import RGB
 from VRNN.lstm import LSTMLayer
 
@@ -546,6 +547,8 @@ class AttentionSchema(nn.Module):
         latent_dim: int = 32,
         context_dim: int = 128,
         input_channels: int = 3,
+        num_heads: int = 4,
+        num_slots: int = 6,
         device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ):
         super().__init__()
@@ -558,20 +561,24 @@ class AttentionSchema(nn.Module):
             context_dim=context_dim,
             input_channels=input_channels,
             feature_channels=64,         # must equal d in fused_attention_features(...)
-            num_semantic_slots=4,
-            num_heads=4,
+            num_semantic_slots=num_slots,
+            num_heads=num_heads,
             attention_fusion_mode="weighted",
             enforce_diversity=True,
             device=device,
             expected_fused=False          # <--- important: skip internal pyramid
         )
+
+
         # Prior (top-down, predictive attention schema)
         self.prior_net = AttentionPrior(
             attention_resolution=attention_resolution,
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
-            motion_kernels=8,
-            feature_dim=hidden_dim
+            num_heads=num_heads,
+            feature_dim=hidden_dim,
+            num_slots=num_slots,
+            bottleneck_mlp_dim=hidden_dim,
         )
         self.prior_net.gradient_checkpointing_enable()
         self.to(device)
@@ -745,7 +752,7 @@ class CausalContextPredictor(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
-            dim_feedforward=2 * hidden_dim,
+            dim_feedforward= hidden_dim,
             dropout=dropout,
             activation="gelu",
             batch_first=True,
@@ -769,6 +776,15 @@ class CausalContextPredictor(nn.Module):
         Returns pred_context_seq with the same temporal length as the input.
         Training will shift targets so we do 1-step-ahead prediction.
         """
+        squeeze_time = False
+        if context_seq.dim() == 2:
+            # Upgrade to [B, 1, *]
+            context_seq = context_seq.unsqueeze(1)
+            action_seq  = action_seq.unsqueeze(1)
+            latent_seq  = latent_seq.unsqueeze(1)
+            hidden_seq  = hidden_seq.unsqueeze(1)
+            squeeze_time = True
+
         x = torch.cat(
             [context_seq, action_seq, latent_seq, hidden_seq],
             dim=-1
@@ -788,6 +804,8 @@ class CausalContextPredictor(nn.Module):
         x = self.encoder(x, mask=causal_mask)
 
         pred_ctx = self.output_proj_ln(self.output_proj(x))  # [B,T,C_ctx]
+        if squeeze_time:
+            pred_ctx = pred_ctx.squeeze(1)  # [B,C_ctx]
         return pred_ctx
 
 class DPGMMVariationalRecurrentAutoencoder(nn.Module):
@@ -827,6 +845,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         perceiver_code_dim: int = 256,
         downsample_perceiver: int = 4,
         perceiver_lr_multiplier: float = 1.5,
+        attention_rope_dim: Optional[int] = 96,
     ):
         super().__init__()
         #core dimensions
@@ -855,6 +874,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.img_perceiver_channels = img_perceiver_channels
         self.downsample_perceiver = downsample_perceiver
         self.perceiver_lr_multiplier = perceiver_lr_multiplier  
+        self.attention_rope_dim = attention_rope_dim if attention_rope_dim is not None else 64
         #initialization different parts of the model
         
         self._init_perceiver_context()
@@ -1055,18 +1075,108 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """Initialize attention schema components"""
         # Compute attention state from h, c, z
         self.attention_prior_posterior = AttentionSchema(
-                                                        image_size=self.image_size,
-                                                        attention_resolution=attention_resolution,  # 64/4
-                                                        hidden_dim=self.hidden_dim,
-                                                        latent_dim=self.latent_dim,
-                                                        context_dim=self.context_dim,
-                                                        input_channels=self.input_channels,
-                                                        )
-        # Feature extractor for attention
-        self.phi_attention = LinearResidual( self.hidden_dim//2 + 2, 2*self.hidden_dim)
-        K = self.attention_prior_posterior.posterior_net.num_semantic_slots
-        d = self.attention_prior_posterior.posterior_net.d
+            image_size=self.image_size,
+            attention_resolution=attention_resolution,  # 64/4
+            hidden_dim=self.hidden_dim,
+            latent_dim=self.latent_dim,
+            context_dim=self.context_dim,
+            input_channels=self.input_channels,
+        )
+
+        # Canny filter on attention maps
+        use_cuda = isinstance(self.device, torch.device) and (self.device.type == "cuda")
+        self.attention_edge_filter = CannyFilter(use_cuda=use_cuda)
+
+        # ---- 2D RoPE over attention grid ----
+        self.attention_rope_dim = self.hidden_dim // 2
+        if self.attention_rope_dim % 4 != 0:
+            self.attention_rope_dim -= self.attention_rope_dim % 4
+
+        assert self.attention_rope_dim % 4 == 0, "2D RoPE requires feature dim divisible by 4."
+
+        self.attention_rope = RoPE(
+            shape=(attention_resolution, attention_resolution, self.attention_rope_dim),
+            base=10000,
+        )
+
+        # We will concatenate RoPE features with the scalar edge value per location,
+        # and then aggregate spatially. So per-location feature dim = D_rope + 1.
+        self.edge_feature_dim = self.attention_rope_dim + 1
+
+        # Feature extractor for attention:
+        # [global pooled edge+RoPE features] -> [mean, logvar] of attention state
+        self.phi_attention = LinearResidual(
+            self.edge_feature_dim,
+            2 * self.hidden_dim,
+        )
+
         
+    def _compute_edge_features_from_attention(self, attention_map: torch.Tensor) -> torch.Tensor:
+        """
+        attention_map: [B, H, W] or [B, 1, H, W]
+        Returns:
+            edge_features: [B, self.edge_feature_dim] = [B, attention_rope_dim + 1]
+
+        Steps:
+        1) Canny edges from attention_map
+        2) 2D RoPE positional code over (H, W)
+        3) Concatenate RoPE code with edge magnitude per location
+        4) Edge-weighted spatial aggregation -> single vector per batch element
+        """
+        # Ensure shape [B,1,H,W] for Canny
+        if attention_map.dim() == 3:
+            att = attention_map.unsqueeze(1)  # [B,1,H,W]
+        elif attention_map.dim() == 4 and attention_map.shape[1] == 1:
+            att = attention_map
+        else:
+            raise ValueError(
+                f"Unexpected attention_map shape {attention_map.shape}, expected [B,H,W] or [B,1,H,W]."
+            )
+
+        B, _, H, W = att.shape
+        device = att.device
+        dtype = att.dtype
+
+        # 1) Differentiable Canny edges on the attention map
+        edges = self.attention_edge_filter(
+            att,
+            hysteresis=True,
+            # low_threshold=0.1,
+            # high_threshold=0.3,
+        )  # [B,1,H,W]
+
+        # 2) Build a pure 2D RoPE positional code [1, H, W, D]
+        D = self.attention_rope_dim
+
+        # x_base will be interpreted as complex numbers (real, imag) = (1, 0),
+        # so the RoPE output is just the rotation (cos θ, sin θ) at each position.
+        x_base = torch.zeros(1, H, W, D, device=device, dtype=dtype)
+        x_view = x_base.view(1, H, W, -1, 2)   # [..., 2] for complex
+        x_view[..., 0] = 1.0                   # real part = 1, imag part = 0
+        x_base = x_view.view(1, H, W, D)
+
+        # Apply 2D RoPE -> [1, H, W, D], then broadcast to [B, H, W, D]
+        rope_pe = self.attention_rope(x_base)[0]             # [H, W, D]
+        rope_pe = rope_pe.unsqueeze(0).expand(B, -1, -1, -1) # [B, H, W, D]
+
+        # 3) Concatenate RoPE positional code with edge magnitude per location
+        edge_hw1 = edges.permute(0, 2, 3, 1)                 # [B, H, W, 1]
+        per_loc_features = torch.cat(
+            [rope_pe, edge_hw1], dim=-1
+        )  # [B, H, W, D+1]
+
+        # 4) Edge-weighted spatial aggregation
+        per_loc_flat = per_loc_features.view(B, H * W, D + 1)      # [B, HW, D+1]
+        weights = edge_hw1.view(B, H * W, 1)                       # [B, HW, 1]
+
+        # If edges are mostly zero, this avoids divide-by-zero
+        weight_sum = weights.sum(dim=1) + torch.finfo(weights.dtype).eps  # [B, 1]
+
+        # Weighted sum over spatial locations
+        summed = (per_loc_flat * weights).sum(dim=1)               # [B, D+1]
+        edge_features = summed / weight_sum                        # [B, D+1]
+
+        return edge_features
 
 
     def init_weights(self, module: nn.Module):
@@ -1313,7 +1423,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.warmup_steps = 1000
         self.current_step = 0
 
-    def forward_sequence(self, observations, actions=None):
+    def forward_sequence(self, observations, actions=None, dones=None):
 
         batch_size, seq_len = observations.shape[:2]
         
@@ -1341,7 +1451,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'latents': [],
             'z_means': [],
             'z_logvars': [],
-            'attention_features': [],
             'attention_states': [],
             'attention_maps': [],
             'hidden_states': [],
@@ -1356,6 +1465,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'cluster_entropies': [],
             'predicted_movements': [],
             'attention_diversity_losses': [],  # Collect per timestep
+            'slot_attention_maps': [],
+            'slot_centers': [],
+            'group_assignments': [],
+            'slot_features': [],
             'gram_enc': [],
             'K_eff': [],
         }
@@ -1395,17 +1508,23 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             # === Attention Schema ===
             # Compute attention state A_t
             if t > 0:
-                prev_attention = outputs['attention_maps'][-1]
+                prev_fused_attention = outputs['attention_maps'][-1]          # [B,H,W] from t-1
+                prev_slot_maps = outputs['slot_attention_maps'][-1]           # [B,P,H,W] from t-1
             else:
-                # Initialize first attention map
-                prev_attention = torch.ones(
-                    batch_size, 
-                    self.attention_resolution, 
-                    self.attention_resolution
-                ).to(self.device) / (self.attention_resolution ** 2)
+                # initial uniform fused map
+                H_att = self.attention_prior_posterior.posterior_net.attention_resolution
+                W_att = H_att
+                prev_fused_attention = torch.ones(
+                    batch_size, H_att, W_att, device=observations.device
+                )
+                prev_fused_attention = prev_fused_attention / prev_fused_attention.sum(
+                    dim=(1, 2), keepdim=True
+                )
+                prev_slot_maps = None  # we won’t use prior at t=0 anyway
+
             
             # Posterior attention computation
-            attention_map, attention_coords = self.attention_prior_posterior._compute_posterior_attention(
+            attention_map = self.attention_prior_posterior._compute_posterior_attention(
                     self.encoder, o_t, h[-1], c_t, detach=False
                 )
             if self.training and self.attention_prior_posterior.posterior_net.enforce_diversity:
@@ -1413,27 +1532,19 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     self.attention_prior_posterior.posterior_net.diversity_loss
                 )
                 
-
             outputs['attention_maps'].append(attention_map)
-            attention_feat = self.attention_prior_posterior.posterior_net.bottleneck_features         
-            # Extract attention features
+            # canny+RoPE -> edge features
+            edge_features = self._compute_edge_features_from_attention(attention_map)  # [B, ?]
             
-            #print(f"Attention features shape: {attention_feat.shape}")  # Debugging shape [batch_size, attention_dim]
-            attention_features = torch.cat([
-             attention_feat,      # Spatial statistics: [B, attention_dim//2]        # Content features: [B, hidden_dim//2]
-             attention_coords      # Spatial coordinates: [B, 2]
-            ], dim=-1)
-     
-            outputs['attention_features'].append(attention_features)
-            attention_state = self.phi_attention(attention_features)
+            attention_state = self.phi_attention(edge_features)
             attention_state_mean, attention_state_logvar = torch.chunk(attention_state, 2, dim=-1)
             attention_state_logvar = torch.clamp(attention_state_logvar, min=-10.0, max=2.0)  # Stability
             attention_state= attention_state_mean + torch.exp(0.5 * attention_state_logvar) * torch.randn_like(attention_state_mean)
             outputs['attention_states'].append(attention_state)
-            outputs['slot_attention_maps'] = self.attention_prior_posterior.posterior_net.slot_attention_maps
-            outputs['slot_centers'] = self.attention_prior_posterior.posterior_net.slot_centers
-            outputs['group_assignments'] = self.attention_prior_posterior.posterior_net.group_assignments
-            outputs['slot_features']       = self.attention_prior_posterior.posterior_net.slot_features
+            outputs['slot_attention_maps'].append(self.attention_prior_posterior.posterior_net.slot_attention_maps)
+            outputs['slot_centers'].append(self.attention_prior_posterior.posterior_net.slot_centers)
+            outputs['group_assignments'].append(self.attention_prior_posterior.posterior_net.group_assignments)
+            outputs['slot_features'].append(self.attention_prior_posterior.posterior_net.slot_features)
             # === Prior Network p(z_t|o_<t, z_<t) ===
             h_context = torch.cat([h[-1], c_prev], dim=-1)
             
@@ -1489,7 +1600,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 # Prior attention prediction
                 z_prev = outputs['latents'][-2] if len(outputs['latents']) > 1 else z_t
                 prior_attention, prior_information = self.attention_prior_posterior.prior_net(
-                    prev_attention, h[-1], z_prev
+                    prev_slot_maps, #[B,P,H,W] 
+                    hidden_state=h[-1], 
+                    latent_state=z_prev, 
+                    prev_attention=prev_fused_attention
                 )
 
                 if 'predicted_movement' in prior_information:
@@ -1507,10 +1621,21 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             # Total KL for this timestep
             total_kl = kl_z + kumar_beta_kl
             outputs['kl_losses'].append(total_kl)
+            # === VRNN Recurrence ===
+            #build mask based on done signals
+            if dones is None:
+                mask_t = torch.ones(batch_size, device=self.device)
+            else:
+                if t == 0:
+                    first_t = torch.ones(batch_size, device=self.device)
+                else:
+                    first_t = dones[:, t-1].to(torch.float32).to(self.device)
+                mask_t = 1.0 - first_t
+
             rnn_input = torch.cat([z_t, c_t, attention_state, a_t], dim=-1)
             rnn_output, (h, c) = self._rnn(
                 rnn_input, h, c, 
-                torch.ones(batch_size).to(self.device)
+                mask_t
             )
             c_prev = c_t
             rnn_output = self.rnn_layer_norm(rnn_output)
@@ -1527,7 +1652,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # === Compute aggregated losses ===
         # Stack temporal sequences
         for key in ['reconstructions', 'latents', 'attention_states', 
-                    'hidden_states', 'attention_maps']:
+                    'hidden_states', 'attention_maps', 'slot_attention_maps',
+                    'slot_centers', 'group_assignments', 'slot_features']:
             if outputs[key]:
                 outputs[key] = torch.stack(outputs[key], dim=1)
         outputs['perceiver_total_loss'] = context_info["total_loss"]
@@ -2287,14 +2413,19 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # 1) Contexts for observed frames (no future AR here)
         ctx_obs, ctx_info = self.compute_global_context(
-            initial_obs, num_context_frames=T_ctx, train=False, generate_future=False
+            initial_obs, 
+            num_context_frames=T_ctx, 
+            generate_future=False
         )  # ctx_obs: [B,T_ctx,C_ctx]
 
         # 2) Build initial RNN state by scanning the observed segment (teacher-forced)
         #    (matches forward_sequence but only up to T_ctx)
         outputs = { 'z': [], 'h': [], 'c': [ctx_obs[:, 0]], 'a': [] }
-        h, c_rnn = self._init_state(B)  # your internal method that returns (h_layers, c_layers)
-        prev_attention = None
+        h = self.h0.expand(self.number_lstm_layer, B, -1).contiguous()
+        c_rnn = self.c0.expand(self.number_lstm_layer, B, -1).contiguous()
+
+        prev_attention = None #fused attention map
+        
 
         for t in range(T_ctx):
             x_t = initial_obs[:, t]         # [B,C,H,W]
@@ -2302,15 +2433,22 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             a_t = actions[:, t] if actions is not None else torch.zeros(B, self.action_dim, device=device)
 
             # posterior attention + encode z_t (since we have x_t)
-            q_attn, _ = self.attention_prior_posterior._compute_posterior_attention(
+            q_attn = self.attention_prior_posterior._compute_posterior_attention(
                 self.encoder, x_t, h[-1], c_t, detach=False
             )
             z_t, *_ = self.encoder(x_t)  # z from encoder (your encoder returns mean/logvar too)
 
+            attention_state = self._compute_edge_features_from_attention(q_attn)
+
+            attention_state = self.phi_attention(attention_state)
+            attention_state_mean, attention_state_logvar = torch.chunk(attention_state, 2, dim=-1)
+            attention_state_logvar = torch.clamp(attention_state_logvar, min=-10.0, max=2.0)  # Stability
+            attention_state= attention_state_mean + torch.exp(0.5 * attention_state_logvar) * torch.randn_like(attention_state_mean)
             # step RNN
-            rnn_in = torch.cat([z_t, c_t, q_attn, a_t], dim=-1)
+            rnn_in = torch.cat([z_t, c_t, attention_state, a_t], dim=-1)
             _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, torch.ones(B, device=device))
             outputs['z'].append(z_t); outputs['h'].append(h[-1]); outputs['a'].append(a_t)
+            prev_attention = q_attn
 
         # 3) Future imagination with PRIOR + ContextPredictor
         c_prev = ctx_obs[:, -1]     # last observed context
@@ -2325,19 +2463,25 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
             # (b) prior over attention/z
             prior_attn, _ = self.attention_prior_posterior.prior_net(prev_attention, h[-1], z_prev)
-            pz_dist, pz_params = self.prior(h[-1], c_prev)
-            z_t = pz_dist.rsample()     # stochastic roll
+            pz_dist, pz_params = self.prior(torch.cat([h[-1], c_prev], dim=-1))
+            z_t = pz_dist.sample()     # stochastic roll
+            edge_features_prior = self._compute_edge_features_from_attention(prior_attn)  # [B, edge_feature_dim]
+            prior_attention_state = self.phi_attention(edge_features_prior)
+            prior_mean, prior_logvar = torch.chunk(prior_attention_state, 2, dim=-1)
+            prior_logvar = torch.clamp(prior_logvar, min=-10.0, max=2.0)
+            attention_state_prior = prior_mean + torch.exp(0.5 * prior_logvar) * torch.randn_like(prior_mean)
 
             # (c) step RNN with imagined inputs
-            rnn_in = torch.cat([z_t, c_prev, prior_attn, a_t], dim=-1)
+            rnn_in = torch.cat([z_t, c_prev, attention_state_prior, a_t], dim=-1)
+            #
             _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, torch.ones(B, device=device))
 
             # (d) predict next context from (c_prev, a_t)
-            c_t = self.context_predictor(c_prev, a_t, z_t, h[-1])
-
+            c_t = self.context_predictor(context_seq=c_prev, action_seq=a_t, latent_seq=z_t, hidden_seq=h[-1])
             # collect + advance
             z_futures.append(z_t); c_futures.append(c_t); a_futures.append(a_t); h_futures.append(h[-1])
-            z_prev = z_t; c_prev = c_t; prev_attention = prior_attn
+            z_prev = z_t; c_prev = c_t
+            prev_attention = prior_attn
 
         # 4) Pack latent imagination outputs
         z_futures = torch.stack(z_futures, dim=1) if len(z_futures) else torch.empty(B,0, self.latent_dim, device=device)

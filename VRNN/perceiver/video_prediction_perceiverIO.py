@@ -148,6 +148,7 @@ class DVAE(nn.Module):
         # explicit architecture knobs
         ch_mult: Optional[Tuple[int, ...]] = None,   # e.g. (1, 2, 4)
         num_res_blocks: int = 1,                    # passed to VideoEncoder/Decoder
+        use_checkpoint: bool = True,
     ):
         super().__init__()
         # make GroupNorm operate in spatial mode
@@ -160,6 +161,7 @@ class DVAE(nn.Module):
         self.img_channels = img_channels
         self.hidden = hidden
         self.kernel_size = kernel_size
+        self.use_checkpoint = use_checkpoint
 
         # 1) Spatial hierarchy (ch_mult)
         if ch_mult is None:
@@ -196,6 +198,7 @@ class DVAE(nn.Module):
             double_z=False,
             resamp_with_conv=True,
             kernel_size=kernel_size,
+            use_checkpoint=self.use_checkpoint,
         )
 
         self.norm_pre_quant  = Normalize(z_channels)
@@ -214,6 +217,7 @@ class DVAE(nn.Module):
             ch_mult=ch_mult,
             num_res_blocks=num_res_blocks,
             resamp_with_conv=True,
+            use_checkpoint=self.use_checkpoint,
         )
 
     def _encode_logits(self, x: torch.Tensor) -> torch.Tensor:

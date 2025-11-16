@@ -811,16 +811,40 @@ class GradientMonitor:
         plt.close()
 
 
-def pick_bt(x, i, t):
-    if x is None: 
+def pick_bt(tensor_bt, i, t):
+    """
+    Utility to pick batch i and (optionally) time t from a variety of shapes.
+
+    - 5D: [B, T, ...]  -> [1, ...] at time t
+    - 4D: either
+        * [B, T, K, 2] (slot_centers with time) -> [1, K, 2] at time t
+        * [B, C, H, W] or [B, H, W, C] (no time) -> [1, ...]
+    - 3D: [B, ...] -> [1, ...]
+    """
+    if tensor_bt is None:
         return None
-    if x.ndim == 5:     # [B, T, K, H, W] or [B, T, H, W, K]
-        return x[i:i+1, t]
-    if x.ndim == 4:     # [B, K, H, W] or [B, H, W, K]
-        return x[i:i+1]
-    if x.ndim == 3:     # [B, K, 2] (centers)
-        return x[i:i+1]
-    return x  # fall back
+
+    if tensor_bt.ndim == 5:
+        # e.g. [B, T, K, H, W] or [B, T, H, W, K]
+        return tensor_bt[i:i+1, t]
+
+    elif tensor_bt.ndim == 4:
+        # Two cases:
+        #   (a) [B, T, K, 2]  (slot_centers over time)
+        #   (b) [B, C, H, W]  (images/features without time)
+        if tensor_bt.size(-1) == 2:
+            # Interpret as [B, T, K, 2]
+            return tensor_bt[i:i+1, t]   # -> [1, K, 2]
+        else:
+            # No explicit time dimension, just index batch
+            return tensor_bt[i:i+1]
+
+    elif tensor_bt.ndim == 3:
+        # [B, ..., ...] (e.g., [B, K, 2] or [B, H, W])
+        return tensor_bt[i:i+1]
+
+    else:
+        raise ValueError(f"Unexpected ndim={tensor_bt.ndim} in pick_bt")
 
 class DMCVBTrainer:
     """Trainer for DPGMM-VRNN on DMC Vision Benchmark"""
@@ -1405,7 +1429,7 @@ class DMCVBTrainer:
                     # Extract data (this part is correct)
                     slot_maps_bt = pick_bt(outputs['slot_attention_maps'], i, t)   # expects [1,K,H,W]
                     slot_cent_bt = pick_bt(outputs['slot_centers'],        i, t)   # expects [1,K,2]
-                    group_bt     = pick_bt(outputs.get('group_assignments'), i, t) # [1,H,W,K] or None
+                    group_bt     = pick_bt(outputs['group_assignments'], i, t) # [1,H,W,K] or None
 
 
                     # Call the PyTorch-based visualization method
@@ -1744,8 +1768,8 @@ def main():
         # Model settings
         'max_components': 15,
         'latent_dim': 36,
-        'hidden_dim': 32, #must be divisible by 8
-        'context_dim': 128,
+        'hidden_dim': 48, #must be divisible by 8
+        'context_dim': 256,
         'attention_resolution': 16,
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 6.0,  # Hyperparameters for prior

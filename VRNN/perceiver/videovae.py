@@ -7,7 +7,7 @@ import torch
 from einops import rearrange
 from torch import nn
 from torch.nn import functional as F
-
+from VRNN.perceiver.utilities import maybe_checkpoint
 
 def base_group_norm(x, norm_layer, act_silu=False, channel_last=False) -> torch.Tensor:
     if hasattr(base_group_norm, "spatial") and base_group_norm.spatial:
@@ -730,6 +730,7 @@ class VideoEncoder(nn.Module):
         double_z: bool = False,
         resamp_with_conv: bool = True,
         kernel_size: int = 3,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         assert not double_z, "VideoEncoder only supports double_z=False"
@@ -738,6 +739,7 @@ class VideoEncoder(nn.Module):
         self.z_channels = z_channels
         self.num_res_blocks = num_res_blocks
         self.resamp_with_conv = resamp_with_conv
+        self.use_checkpoint = use_checkpoint
 
         k3d = (kernel_size, kernel_size, kernel_size)
 
@@ -810,14 +812,20 @@ class VideoEncoder(nn.Module):
         # 1) Initial conv + ResNet stack
         h = self.conv_in(x, is_init=is_init)   # [B, ch, T, H, W]
         for block in self.res_in:
-            h = block(h, temb=None, is_init=is_init)
+            def fn(h_in, block=block, is_init=is_init):
+                return block(h_in, temb=None, is_init=is_init)
+            h = maybe_checkpoint(fn, h, self.use_checkpoint)
 
         # 2) Spatial downsampling tower (T unchanged)
         for down in self.down_blocks:
-            h = down(h, is_init=is_init)       # [B, ch, T, H', W']
+            def fn(h_in, down=down, is_init=is_init):
+                return down(h_in, is_init=is_init)
+            h = maybe_checkpoint(fn, h, self.use_checkpoint)
 
         for block in self.res_mid:
-            h = block(h, temb=None, is_init=is_init)
+            def fn(h_in, block=block, is_init=is_init):
+                return block(h_in, temb=None, is_init=is_init)
+            h = maybe_checkpoint(fn, h, self.use_checkpoint)
 
         h = self.norm_out(h)
         h = nonlinearity(h)
@@ -1018,6 +1026,7 @@ class VideoDecoder(nn.Module):
         num_res_blocks: int,
         kernel_size: int = 3,
         resamp_with_conv: bool = True,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
 
@@ -1028,6 +1037,7 @@ class VideoDecoder(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.num_resolutions = len(self.ch_mult)
         self.resamp_with_conv = resamp_with_conv
+        self.use_checkpoint = use_checkpoint
 
         k3d = (kernel_size, kernel_size, kernel_size)
         # Project encoder's latent z_channels back to shared hidden width ch
@@ -1108,16 +1118,22 @@ class VideoDecoder(nn.Module):
 
         # Coarsest-resolution ResNet blocks
         for block in self.res_mid:
-            h = block(h, temb=None, is_init=is_init)
-         
+            def fn(h_in, block=block, is_init=is_init):
+                return block(h_in, temb=None, is_init=is_init)
+            h = maybe_checkpoint(fn, h, self.use_checkpoint)
+
         # Spatial upsampling tower
         for _, up in enumerate(self.up_blocks):
-
-            h = up(h, is_init=is_init)
+            def fn(h_in, up=up, is_init=is_init):
+                return up(h_in, is_init=is_init)
+            h = maybe_checkpoint(fn, h, self.use_checkpoint)
 
         # Finest-resolution ResNet blocks
         for block in self.res_out:
-            h = block(h, temb=None, is_init=is_init)
+            def fn(h_in, block=block, is_init=is_init):
+                return block(h_in, temb=None, is_init=is_init)
+            h = maybe_checkpoint(fn, h, self.use_checkpoint)
+            
         h = self.norm_out(h)
         h = nonlinearity(h)
 

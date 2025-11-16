@@ -49,6 +49,30 @@ class RotaryPositionEmbedding:
         x = torch.stack((-x2, x1), dim=-1)
         return rearrange(x, "... c r -> ... (c r)")
 
+class RoPE(torch.nn.Module):
+    def __init__(self, shape, base=10000):
+        super(RoPE, self).__init__()
+
+        channel_dims, feature_dim = shape[:-1], shape[-1]
+        k_max = feature_dim // (2 * len(channel_dims))
+
+        assert feature_dim % k_max == 0
+
+        theta_ks = 1 / (base ** (torch.arange(k_max) / k_max))
+        angles = torch.cat([
+            t.unsqueeze(-1) * theta_ks
+            for t in torch.meshgrid([torch.arange(d) for d in channel_dims], indexing='ij')
+        ], dim=-1)
+
+        rotations_re = torch.cos(angles).unsqueeze(dim=-1)
+        rotations_im = torch.sin(angles).unsqueeze(dim=-1)
+        rotations = torch.cat([rotations_re, rotations_im], dim=-1)
+        self.register_buffer('rotations', rotations)
+
+    def forward(self, x):
+        x = torch.view_as_complex(x.reshape(*x.shape[:-1], -1, 2))
+        pe_x = torch.view_as_complex(self.rotations) * x
+        return torch.view_as_real(pe_x).flatten(-2)
 
 class FrequencyPositionEncoding(nn.Module):
     """Encodes positions as inverse frequencies.

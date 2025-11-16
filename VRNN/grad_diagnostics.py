@@ -173,7 +173,7 @@ def quiver_shared_dirs(G, task_names, ax=None, scale=1.0, mode="shared", param_p
     return fig
 
 def make_cosine_heatmap(cos: torch.Tensor, task_names, title=None, mode="shared", param_patterns=None):
-    fig, ax = plt.subplots(figsize=(4.5,4.0))
+    fig, ax = plt.subplots(figsize=(6, 4.5))
     im = ax.imshow(cos.cpu().numpy(), vmin=-1.0, vmax=1.0)
     ax.set_xticks(range(len(task_names)))
     ax.set_yticks(range(len(task_names)))

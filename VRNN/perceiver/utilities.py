@@ -5,6 +5,19 @@ import torch
 from typing import Literal
 from torch import Tensor
 import numpy as np
+from torch.utils.checkpoint import checkpoint as ckpt
+
+def maybe_checkpoint(fn, x, use_checkpoint: bool, use_reentrant: bool = False):
+    """
+    Wrap a single-tensor -> tensor function with torch.utils.checkpoint.
+
+    fn: callable(tensor) -> tensor
+    x:  input tensor
+    """
+    if use_checkpoint and x.requires_grad:
+        return ckpt(fn, x, use_reentrant=use_reentrant)
+    else:
+        return fn(x)
 
 class ModuleOutput(OrderedDict):
     def __getattr__(self, name):
@@ -183,3 +196,4 @@ class RopePositionEmbedding(nn.Module):
             periods = periods / base  # range [min_period / max_period, 1]
             periods = periods * self.max_period  # range [min_period, max_period]
         self.periods.data = periods
+

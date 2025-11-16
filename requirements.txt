@@ -13,6 +13,7 @@ cnest
 colorama
 contextlib2
 contourpy
+cupy
 cycler
 Cython==0.29.37
 decorator

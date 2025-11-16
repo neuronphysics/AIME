@@ -608,10 +608,7 @@ class SeparateKVCrossAttention(nn.Module):
         K: [B, N_k, D_k]
         V: [B, N_k, D_v]
 
-    Used in the temporal bottleneck to implement:
-        for t in range(T):
-            Z[t] = CrossAttn(Q=latents[:, t], K=x[:, t], V=token[:, t])
-    """
+   """
     def __init__(
         self,
         dim_q: int,
