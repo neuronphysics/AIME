@@ -7,7 +7,7 @@ import torch
 from einops import rearrange
 from torch import nn
 from torch.nn import functional as F
-from VRNN.perceiver.utilities import maybe_checkpoint
+from torch.utils.checkpoint import checkpoint as ckpt
 
 def base_group_norm(x, norm_layer, act_silu=False, channel_last=False) -> torch.Tensor:
     if hasattr(base_group_norm, "spatial") and base_group_norm.spatial:
@@ -799,6 +799,17 @@ class VideoEncoder(nn.Module):
             z_channels,
             kernel_size=k3d,
         )
+    def maybe_checkpoint(self, fn, *x, use_reentrant: bool = False):
+        """
+        Wrap a single-tensor -> tensor function with torch.utils.checkpoint.
+
+        fn: callable(tensor) -> tensor
+        x:  input tensor
+        """
+        if self.training and self.use_checkpoint:
+            return ckpt(fn, *x, use_reentrant=use_reentrant)
+        else:
+            return fn(*x)
 
     def forward(
         self,
@@ -814,18 +825,19 @@ class VideoEncoder(nn.Module):
         for block in self.res_in:
             def fn(h_in, block=block, is_init=is_init):
                 return block(h_in, temb=None, is_init=is_init)
-            h = maybe_checkpoint(fn, h, self.use_checkpoint)
+            h = self.maybe_checkpoint(fn, h)
 
         # 2) Spatial downsampling tower (T unchanged)
         for down in self.down_blocks:
             def fn(h_in, down=down, is_init=is_init):
                 return down(h_in, is_init=is_init)
-            h = maybe_checkpoint(fn, h, self.use_checkpoint)
+            h = self.maybe_checkpoint(fn, h)
 
         for block in self.res_mid:
             def fn(h_in, block=block, is_init=is_init):
                 return block(h_in, temb=None, is_init=is_init)
-            h = maybe_checkpoint(fn, h, self.use_checkpoint)
+            h = self.maybe_checkpoint(fn, h)
+
 
         h = self.norm_out(h)
         h = nonlinearity(h)
@@ -1098,6 +1110,18 @@ class VideoDecoder(nn.Module):
             out_channels,
             kernel_size=k3d,
         )
+    def maybe_checkpoint(self, fn, *x, use_reentrant: bool = False):
+        """
+        Wrap a single-tensor -> tensor function with torch.utils.checkpoint.
+
+        fn: callable(tensor) -> tensor
+        x:  input tensor
+        """
+        if self.training and self.use_checkpoint:
+            return ckpt(fn, *x, use_reentrant=use_reentrant)
+        else:
+            return fn(*x)
+
 
     def forward(self, z: torch.Tensor, is_init: bool = True) -> torch.Tensor:
         """
@@ -1120,20 +1144,20 @@ class VideoDecoder(nn.Module):
         for block in self.res_mid:
             def fn(h_in, block=block, is_init=is_init):
                 return block(h_in, temb=None, is_init=is_init)
-            h = maybe_checkpoint(fn, h, self.use_checkpoint)
+            h = self.maybe_checkpoint(fn, h)
 
         # Spatial upsampling tower
         for _, up in enumerate(self.up_blocks):
             def fn(h_in, up=up, is_init=is_init):
                 return up(h_in, is_init=is_init)
-            h = maybe_checkpoint(fn, h, self.use_checkpoint)
+            h = self.maybe_checkpoint(fn, h)
 
         # Finest-resolution ResNet blocks
         for block in self.res_out:
             def fn(h_in, block=block, is_init=is_init):
                 return block(h_in, temb=None, is_init=is_init)
-            h = maybe_checkpoint(fn, h, self.use_checkpoint)
-            
+            h = self.maybe_checkpoint(fn, h)
+
         h = self.norm_out(h)
         h = nonlinearity(h)
 

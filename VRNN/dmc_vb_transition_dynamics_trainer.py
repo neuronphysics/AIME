@@ -441,7 +441,7 @@ class DMCVBDataset(Dataset):
     def _load_episode_paths(self, training_percent: float =0.7) -> List[Path]:
         """Load all episode file paths"""
         all_episode_files = []
-        policy_levels = ['expert', 'medium']
+        policy_levels = ['expert', 'medium', 'mixed']
         subfolders =['none', 'dynamic_medium', 'static_medium']
         base_dir = self.data_dir / "dmc_vb" / f"{self.domain_name}_{self.task_name}"
         # Collect episodes from all combinations
@@ -1775,6 +1775,15 @@ def main():
         'prior_alpha': 6.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
         'dropout': 0.1,
+        'num_codebook_perceiver': 8192,     
+        'num_latent_perceiver': 128, 
+        'perceiver_code_dim': 256,           
+        'downsample_perceiver': 4,           
+        'use_pretrained_vqpt': True,
+        'pretrained_vqpt_ckpt': '/media/zsheikhb/29cd0dc6-0ccb-4a96-8e75-5aa530301a7e/home/zahra/Work/progress/results/vqpt_pretrain_dmc_vb/vqpt_epoch_0050.pt',  
+        'freeze_vq_codebook': True,        # freeze only codebook
+        'freeze_entire_tokenizer': True,  # set True if one wants encoder+decoder frozen too
+        'freeze_dvae_backbone': False,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
         'batch_size': 8,
@@ -1823,10 +1832,14 @@ def main():
         input_dim=config['img_height'],
         latent_dim=config['latent_dim'],
         hidden_dim=config['hidden_dim'],
+        num_latent_perceiver=config['num_latent_perceiver'],
         num_latent_channels_perceiver=config['context_dim'],
+        num_codebook_perceiver=config['num_codebook_perceiver'],
+        perceiver_code_dim=config['perceiver_code_dim'],
+        downsample_perceiver=config['downsample_perceiver'],
         action_dim=action_dim,
         sequence_length=config['sequence_length'],
-        img_perceiver_channels=64,
+        img_perceiver_channels=128,
         img_disc_layers=2,
         disc_num_heads = config["disc_num_heads"] if "disc_num_heads" in config else 4,
         device=device,
@@ -1839,6 +1852,15 @@ def main():
         dropout=config['dropout']
     )
     outputs = count_parameters(model, print_details=True)
+    if config['use_pretrained_vqpt']:
+        model.load_pretrained_vq_tokenizer(
+            ckpt_path=config['pretrained_vqpt_ckpt'],
+            freeze_codebook=config['freeze_vq_codebook'],
+            freeze_entire_tokenizer=config['freeze_entire_tokenizer'],
+            freeze_dvae_backbone=config['freeze_dvae_backbone'],
+            strict=True,
+        )
+
     # Initialize trainer
     trainer = DMCVBTrainer(
         model=model,

@@ -3,7 +3,8 @@ from __future__ import annotations
 from math import sqrt
 from functools import partial, cache
 from collections import namedtuple
-
+from random import randrange
+from math import ceil
 import torch
 from torch.nn import Module
 from torch import nn, einsum, is_tensor, Tensor
@@ -113,6 +114,9 @@ def uniform_init(*shape):
 def gumbel_noise(t):
     noise = torch.zeros_like(t).uniform_(0, 1)
     return -log(-log(noise))
+
+def round_up_multiple(num, mult):
+    return ceil(num / mult) * mult
 
 def gumbel_sample(
     logits,
@@ -1413,3 +1417,5 @@ class VectorQuantize(Module):
         loss_breakdown = LossBreakdown(commit_loss, codebook_diversity_loss, orthogonal_reg_loss, inplace_optimize_loss)
 
         return quantize, embed_ind, loss, loss_breakdown
+    
+

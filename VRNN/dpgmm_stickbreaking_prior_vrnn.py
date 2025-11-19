@@ -1000,6 +1000,80 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         self.apply(self.init_weights)
 
+    def load_pretrained_vq_tokenizer(
+        self,
+        ckpt_path: str,
+        freeze_codebook: bool = True,
+        freeze_entire_tokenizer: bool = False,
+        freeze_dvae_backbone: bool = True,   
+        strict: bool = True,
+    ):
+        """
+        Load a VQPTTokenizer checkpoint trained with pretrain_vqvae.py into
+        self.perceiver_model.tokenizer and optionally freeze it.
+        """
+        device = self.device if hasattr(self, "device") else next(self.parameters()).device
+        ckpt = torch.load(ckpt_path, map_location=device)
+
+        vq_state = ckpt["model_state"]
+        vq_config = ckpt.get("config", None)
+
+        # (Optional but recommended) sanity checks on architecture
+        if vq_config is not None:
+            assert vq_config["code_dim"] == self.perceiver_code_dim, \
+                f"code_dim mismatch: pretrain {vq_config['code_dim']} vs model {self.perceiver_code_dim}"
+            assert vq_config["num_codes"] == self.num_codebook_perceiver, \
+                f"num_codes mismatch: pretrain {vq_config['num_codes']} vs model {self.num_codebook_perceiver}"
+            assert vq_config["downsample"] == self.downsample_perceiver, \
+                f"downsample mismatch: pretrain {vq_config['downsample']} vs model {self.downsample_perceiver}"
+            assert vq_config["in_channels"] == self.input_channels, \
+                f"in_channels mismatch: pretrain {vq_config['in_channels']} vs model {self.input_channels}"
+
+        # Load into the tokenizer living inside the Perceiver
+        tokenizer = self.perceiver_model.tokenizer
+        missing, unexpected = tokenizer.load_state_dict(vq_state, strict=strict)
+        print(f"[DPGMM] Loaded VQPT tokenizer from {ckpt_path}")
+        if missing:
+            print("  missing keys:", missing)
+        if unexpected:
+            print("  unexpected keys:", unexpected)
+
+        # freeze DVAE backbone (encoder + quant convs + norms) 
+        if freeze_dvae_backbone and hasattr(tokenizer, "dvae"):
+            dvae = tokenizer.dvae
+
+            # Encoder path: video_encoder
+            for p in dvae.video_encoder.parameters():
+                p.requires_grad = False
+
+            # Quantization projection & norms inside DVAE
+            for p in dvae.quantize.parameters():
+                p.requires_grad = False
+            for p in dvae.post_quant.parameters():
+                p.requires_grad = False
+            for p in dvae.norm_pre_quant.parameters():
+                p.requires_grad = False
+            for p in dvae.norm_post_quant.parameters():
+                p.requires_grad = False
+
+            dvae.eval()
+            print("[DPGMM] Frozen DVAE encoder + quantization backbone")
+
+        # Optionally freeze only the codebook (what you called 'vq token')
+        if freeze_codebook and hasattr(tokenizer, "vq"):
+            for p in tokenizer.vq.parameters():
+                p.requires_grad = False
+            tokenizer.vq.freeze_codebook = True
+            print("[DPGMM] Frozen VQ codebook parameters")
+
+        # Optionally freeze everything in the tokenizer (encoder + decoder + VQ)
+        if freeze_entire_tokenizer:
+            for p in tokenizer.parameters():
+                p.requires_grad = False
+            if hasattr(tokenizer, "vq"):
+                tokenizer.vq.freeze_codebook = True
+            print("[DPGMM] Frozen entire VQPT tokenizer")
+
     def _init_perceiver_context(self):
         """Initialize Perceiver with architecture-aware dimensions"""
 

@@ -9,6 +9,7 @@ from typing import Optional, Tuple, Dict, List
 import lpips
 import numpy as np
 from functools import partial
+from torch.utils.checkpoint import checkpoint as ckpt
 from VRNN.perceiver.adapter import TiedTokenOutputAdapter, TrainableQueryProvider
 from VRNN.perceiver.modules import (
     CrossAttention, SelfAttentionBlock, KVCache, SeparateKVCrossAttention
@@ -17,7 +18,7 @@ from VRNN.perceiver.position import (
     FourierPositionEncoding, FrequencyPositionEncoding, 
     positions, RotaryPositionEmbedding
 )
-from VRNN.perceiver.utilities import ModuleOutput, _gn_groups, Residual
+from VRNN.perceiver.utilities import ModuleOutput, _gn_groups, Residual, BroadcastedPositionEmbedding
 from VRNN.perceiver.vector_quantize import VectorQuantize
 
 from VRNN.perceiver.videovae import VideoEncoder, VideoDecoder, base_group_norm, Normalize, nonlinearity, SamePadConv3d
@@ -294,12 +295,13 @@ class TokenARDecoder(nn.Module):
         max_seq_len: int,
         dropout: float = 0.0,
         widening_factor: int = 4,
+        attn_checkpoint: bool = True,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.max_seq_len = max_seq_len
-
+        self.attn_checkpoint = attn_checkpoint
         # Token embedding
         self.token_embedding = nn.Embedding(vocab_size, d_model)
 
@@ -335,7 +337,7 @@ class TokenARDecoder(nn.Module):
             widening_factor=widening_factor,
             dropout=dropout,
             residual_dropout=dropout,
-            activation_checkpointing=False,
+            activation_checkpointing=attn_checkpoint,
             activation_offloading=False,
         )
 
@@ -723,6 +725,8 @@ class PerceiverTokenPredictor(nn.Module):
         num_token_ar_decoder_heads: int = 8,
         max_seq_len: int = 4096,
         ARdecoder_widening_factor: int = 2,
+        freeze_vq_at_init: bool = False,
+        use_checkpointing: bool = True,
     ):
         super().__init__()
 
@@ -736,7 +740,7 @@ class PerceiverTokenPredictor(nn.Module):
 
         self.num_latents = num_latents
         self.num_latent_channels = num_latent_channels
-
+        self.use_checkpointing = use_checkpointing
         # Token embedding for Perceiver encoder
         self.token_embedding = nn.Embedding(
             self.code_vocab_size,     # only real VQ tokens
@@ -845,19 +849,11 @@ class PerceiverTokenPredictor(nn.Module):
         self.encoder_key_proj = nn.Linear(self.tokenizer.dvae.z_channels, self.num_latent_channels)
         self.proj_ln = nn.LayerNorm(self.num_latent_channels)
         # --- VQ freezing config ---
-        self.vq_freeze_threshold = 0.9993       # freeze when >= this
-        self.vq_unfreeze_threshold = 0.995     # unfreeze when <= this
-        self.vq_freeze_patience = 5
-        self.vq_unfreeze_patience = 5
-        self._vq_frozen = False
-        self._vq_freeze_counter = 0
-        self._vq_unfreeze_counter = 0
-
-        # DVAE: only freeze once very stable
-        self.dvae_freeze_threshold = 0.9999     # "99%" condition
-        self.dvae_freeze_patience = 5
-        self._dvae_frozen = False
-        self._dvae_freeze_counter = 0
+        self.freeze_vq_at_init = freeze_vq_at_init
+        if self.freeze_vq_at_init:
+            self.freeze_VQPT_tokenizer()
+        # --- Positional encoding caching ---
+        self.broadcast_pos_embed = None
 
     # Token flatten / unflatten helpers (support Q>1 token heads)
     def _flatten_tokens(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
@@ -1011,25 +1007,49 @@ class PerceiverTokenPredictor(nn.Module):
         device: torch.device,
     ):
         """
-        Lazily build a Fourier-based spatio-temporal positional encoding
+        Lazily build a spatio-temporal positional encoding
         with shape [1, T*Ht*Wt, C_pos], then keep it on the correct device.
         """
         shape = (T, Ht, Wt)
         if self._pos_shape == shape and self.pos_encoding is not None:
             # Already computed for this (T, Ht, Wt) configuration
             self.pos_encoding = self.pos_encoding.to(device)
+            if self.broadcast_pos_embed is not None:
+                self.broadcast_pos_embed.to(device)
             return
 
         self._pos_shape = shape
 
-        # Use the shared FourierPositionEncoding helper over a 3D grid (t, h, w).
-        fpe = FourierPositionEncoding((T, Ht, Wt), self.pos_freq_bands)
-        pe = fpe(b=1)                     # [1, T*Ht*Wt, C_pos]
-        pe = pe.to(device)
+        # keep the same positional dim that input_proj expects
+        pos_dim = self._pos_enc_channels   # 3 * (2 * pos_freq_bands + 1)
 
-        self.pos_encoding = pe
-        self._pos_enc_channels = pe.shape[-1]
+        # (re)build broadcasted PE module for this shape
+        self.broadcast_pos_embed = BroadcastedPositionEmbedding(
+            latent_shape=shape,
+            embedding_dim=pos_dim,
+        ).to(device)
 
+        # get all positions [0 .. T*Ht*Wt-1]
+        L = T * Ht * Wt
+        position_ids = torch.arange(L, device=device).unsqueeze(0)  # [1, L]
+
+        # [1, L, pos_dim]
+        pe = self.broadcast_pos_embed(position_ids)
+
+        self.pos_encoding = pe          # [1, L, pos_dim]
+        self._pos_enc_channels = pos_dim
+        
+    def maybe_checkpoint(self, fn, *x, use_reentrant: bool = False):
+        """
+        Wrap a single-tensor -> tensor function with torch.utils.checkpoint.
+
+        fn: callable(tensor) -> tensor
+        x:  input tensor
+        """
+        if self.training and self.use_checkpointing:
+            return ckpt(fn, *x, use_reentrant=use_reentrant)
+        else:
+            return fn(*x)
 
     def _get_spatiotemporal_encoding(self, token_ids: torch.Tensor) -> torch.Tensor:
         B, T = token_ids.shape[:2]
@@ -1040,6 +1060,7 @@ class PerceiverTokenPredictor(nn.Module):
         pe = self.pos_encoding.to(device)       # [1, T*Ht*Wt, C_pos]
         pe = self.input_proj_ln(self.input_proj(pe))     # [1, T*Ht*Wt, C]
         pe = pe.expand(B, -1, -1)               # [B, T*Ht*Wt, C]
+        assert T * Ht * Wt == self.pos_encoding.shape[1]
         return pe
 
     
@@ -1078,15 +1099,18 @@ class PerceiverTokenPredictor(nn.Module):
         # kv_bt_flat: [B*T_enc, N_tok, C]
         q_bt_flat = rearrange(q_bt,  "b t s c -> (b t) s c")
         kv_bt_flat = rearrange(enc_in, "b t n c -> (b t) n c")
-
-        ca_out = self.encoder_cross_attn(
-            q_bt_flat,
-            x_kv=kv_bt_flat,
-            pad_mask=None,
-            rot_pos_emb_q=None,
-            rot_pos_emb_k=None,
-            kv_cache=None,
-        )
+        def _encoder_cross_sttn(q ,x_kv):
+            return self.encoder_cross_attn(
+                q,
+                x_kv=x_kv,
+                pad_mask=None,
+                rot_pos_emb_q=None,
+                rot_pos_emb_k=None,
+                kv_cache=None,
+            )
+        ca_out = self.maybe_checkpoint(_encoder_cross_sttn, q_bt_flat, kv_bt_flat)
+         # Cross-attn: latents <- token embeddings  ----------------------
+        
         latents_bt = ca_out.last_hidden_state                            # [B*T_enc,S,C]
 
         # 4) Reshape back to [B,T_enc,S,C]  --------------
@@ -1429,7 +1453,8 @@ class PerceiverTokenPredictor(nn.Module):
 
         cycle_consistence_loss = torch.tensor(0.0, device=device)
         if ar_cycle_consistency_weight > 0.0:
-            self.freeze_VQPT_tokenizer()
+            if not self.freeze_vq_at_init:
+                self.freeze_VQPT_tokenizer()
 
             Bq, T_enc2, D, Ht_q, Wt_q = quantized.shape
             assert Bq == B and Ht_q == Ht and Wt_q == Wt, "Quantized shape mismatch"
@@ -1487,8 +1512,8 @@ class PerceiverTokenPredictor(nn.Module):
                 z_gt_flat,
                 dim=-1,
             ).mean()
-
-            self.unfreeze_VQPT_tokenizer()
+            if not self.freeze_vq_at_init:
+               self.unfreeze_VQPT_tokenizer()
 
         # --------- Total loss ---------
         total_loss = vq_loss + ce + perceptual_weight * lpips_loss + recon_weight * recon_loss
@@ -1501,42 +1526,6 @@ class PerceiverTokenPredictor(nn.Module):
                 target_videos
             ).detach()
 
-            s = float(token_self_consistency_val)
-
-            # --- VQ dynamic freeze/unfreeze ---
-            if not self._vq_frozen:
-                # consider freezing
-                if s >= self.vq_freeze_threshold:
-                    self._vq_freeze_counter += 1
-                    if self._vq_freeze_counter >= self.vq_freeze_patience:
-                        print(f"[VQ] Freezing VQ codebook (self-consistency={s:.3f})")
-                        self.freeze_VQPT_tokenizer()
-                        self._vq_unfreeze_counter = 0
-                else:
-                    self._vq_freeze_counter = 0
-            else:
-                # consider unfreezing
-                if s <= self.vq_unfreeze_threshold:
-                    self._vq_unfreeze_counter += 1
-                    if self._vq_unfreeze_counter >= self.vq_unfreeze_patience:
-                        print(f"[VQ] Unfreezing VQ codebook (self-consistency={s:.3f})")
-                        self.unfreeze_VQPT_tokenizer()
-                        self._vq_freeze_counter = 0
-                else:
-                    self._vq_unfreeze_counter = 0
-
-            # --- DVAE freeze only when very stable ---
-            if not self._dvae_frozen:
-                if s >= self.dvae_freeze_threshold:
-                    self._dvae_freeze_counter += 1
-                    if self._dvae_freeze_counter >= self.dvae_freeze_patience:
-                        if hasattr(self.tokenizer, "dvae"):
-                            for p in self.tokenizer.dvae.parameters():
-                                p.requires_grad = False
-                        self._dvae_frozen = True
-                        print(f"[VQ] Freezing DVAE (self-consistency={s:.3f})")
-                else:
-                    self._dvae_freeze_counter = 0
 
         return {
             "loss": total_loss,
