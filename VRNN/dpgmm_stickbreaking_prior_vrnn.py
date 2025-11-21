@@ -12,6 +12,7 @@ from itertools import chain
 import numpy as np
 import math
 from collections import OrderedDict
+from torch.utils.checkpoint import checkpoint as ckpt
 from VRNN.canny_net import CannyFilter
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import (
@@ -846,6 +847,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         downsample_perceiver: int = 4,
         perceiver_lr_multiplier: float = 1.5,
         attention_rope_dim: Optional[int] = 96,
+        use_ctx_checkpoint: bool = True,
     ):
         super().__init__()
         #core dimensions
@@ -882,6 +884,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self._init_attention_schema(attention_resolution)
         self._init_encoder_decoder()
         self._init_discriminators( img_disc_layers, patch_size, num_heads= disc_num_heads)
+
+        self.use_ctx_checkpoint = use_ctx_checkpoint
         # DP-GMM prior
         self.prior = DPGMMPrior(max_components, 
                                 self.latent_dim, 
@@ -1098,6 +1102,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             orthogonal_reg_active_codes_only=True,
             orthogonal_reg_max_codes=2048,
             threshold_ema_dead_code=0,
+            token_ar_checkpoint=False,
         )
         self.frame_slot_pool = FrameAttentionPool(
                 c_in=self.context_dim,    # Perceiver bottleneck channel
@@ -1497,6 +1502,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.warmup_steps = 1000
         self.current_step = 0
 
+    def maybe_checkpoint_ctx(self, fn, *x, use_reentrant: bool = False):
+        if self.training and self.use_ctx_checkpoint:
+            return ckpt(fn, *x, use_reentrant=use_reentrant)
+        return fn(*x)
+
     def forward_sequence(self, observations, actions=None, dones=None):
 
         batch_size, seq_len = observations.shape[:2]
@@ -1747,12 +1757,22 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             c_target = context_sequence[:, 1:, :]       # [B, T-1, C_ctx]
 
             # Predictor is causal, so at index t it sees indices <= t
-            pred_ctx_seq = self.context_predictor(
-                context_seq=c_prev,
-                action_seq=a_prev,
-                latent_seq=z_prev,
-                hidden_seq=h_prev,
-            )  # [B, T-1, C_ctx]
+            # [B, T-1, C_ctx]
+            def _ctx_predictor(context_seq, action_seq, latent_seq, hidden_seq):
+                return self.context_predictor(
+                    context_seq=context_seq,
+                    action_seq=action_seq,
+                    latent_seq=latent_seq,
+                    hidden_seq=hidden_seq,
+                )
+
+            pred_ctx_seq = self.maybe_checkpoint_ctx(
+                _ctx_predictor,
+                c_prev,
+                a_prev,
+                z_prev,
+                h_prev,
+            ) 
 
             ctx_pred_loss = F.mse_loss(pred_ctx_seq, c_target.detach())
 
@@ -2100,11 +2120,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 f"T_enc_total={T_enc_total}, T_frames={T_frames} not divisible"
             tokens_per_frame = T_enc_total // T_frames
 
-            # [B, T_enc_total, C] → [B, T_frames, P, C] → attention-pool P
+            # [B, T_enc_total, C] → [B, T_frames, P, C] → attention-pool P # [B, T, P, C]
             per_frame_slots = rearrange(
                 whole_tb, "b (t p) c -> b t p c", t=T_frames, p=tokens_per_frame
-            )                                                                  # [B, T, P, C]
-            per_frame_ctx = self.frame_slot_pool(per_frame_slots)              # [B, T, C]
+            )   
+            def _frame_slot_pool(x):
+                return self.frame_slot_pool(x)         
+                                                  
+            per_frame_ctx = self.maybe_checkpoint_ctx(_frame_slot_pool, per_frame_slots)              # [B, T, C]
 
             meta_out = dict(
                 T_frames=T_frames,

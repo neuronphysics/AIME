@@ -727,6 +727,7 @@ class PerceiverTokenPredictor(nn.Module):
         ARdecoder_widening_factor: int = 2,
         freeze_vq_at_init: bool = False,
         use_checkpointing: bool = True,
+        token_ar_checkpoint: bool = True,
     ):
         super().__init__()
 
@@ -800,9 +801,16 @@ class PerceiverTokenPredictor(nn.Module):
             num_layers=num_self_attention_layers,
             num_heads=num_self_attention_heads,
             num_channels=num_latent_channels,
+            num_qk_channels=None,
+            num_v_channels=None,
+            num_rotary_layers=-1,          # <- apply RoPE in *all* layers
+            max_heads_parallel=None,
+            causal_attention=True,
             widening_factor=widening_factor,
             dropout=dropout,
-            causal_attention=True,
+            residual_dropout=dropout,
+            activation_checkpointing=False,
+            activation_offloading=False,
         )
         self.spatial_pool = AttentionSlotPool(
             dim=num_latent_channels,
@@ -845,6 +853,7 @@ class PerceiverTokenPredictor(nn.Module):
             max_seq_len=max_seq_len,
             dropout=dropout,
             widening_factor=ARdecoder_widening_factor,
+            attn_checkpoint=token_ar_checkpoint,
         )
         self.encoder_key_proj = nn.Linear(self.tokenizer.dvae.z_channels, self.num_latent_channels)
         self.proj_ln = nn.LayerNorm(self.num_latent_channels)
@@ -1038,7 +1047,7 @@ class PerceiverTokenPredictor(nn.Module):
 
         self.pos_encoding = pe          # [1, L, pos_dim]
         self._pos_enc_channels = pos_dim
-        
+
     def maybe_checkpoint(self, fn, *x, use_reentrant: bool = False):
         """
         Wrap a single-tensor -> tensor function with torch.utils.checkpoint.
@@ -1171,10 +1180,14 @@ class PerceiverTokenPredictor(nn.Module):
 
         # 1D time FPE -> [1, T_total, D_rot] -> [T_total, D_rot]
         t_fpe = self.time_tb_pos_encoder(t_idx)    # [1, T_total, D_rot]
-        t_fpe = t_fpe.squeeze(0)                   # [T_total, D_rot]
-
+        
+        rotary_timeline = RotaryPositionEmbedding(
+            frq_pos_enc=t_fpe,
+            right_align=False,   # we attend over the full [0..T_total-1] timeline
+        )
+        t_fpe_flat = t_fpe.view(T_total, -1)              # [T_total, D_rot]
         # Project to latent dim -> [T_total, C]
-        t_pe = self.time_pe_proj_ln(self.time_pe_proj(t_fpe))            # [T_total, C]
+        t_pe = self.time_pe_proj_ln(self.time_pe_proj(t_fpe_flat))            # [T_total, C]
 
         # Split context vs future time PE
         t_pe_ctx = t_pe[:T_ctx_enc]                # [T_ctx_enc, C]
@@ -1209,7 +1222,10 @@ class PerceiverTokenPredictor(nn.Module):
         k_bt = rearrange(K_ctx, "b t n c -> (b t) n c")   # [B*T_ctx_enc, N_tok, C]
         v_bt = rearrange(V_ctx, "b t n c -> (b t) n c")   # [B*T_ctx_enc, N_tok, C]
 
-        Z_bt = self.temporal_cross_attn(q_bt, k_bt, v_bt) # [B*T_ctx_enc, S, C]
+        def _temporal_cross_sttn(q ,x_k, x_v):
+            return self.temporal_cross_attn(q, k=x_k, v=x_v)
+        
+        Z_bt = self.maybe_checkpoint(_temporal_cross_sttn, q_bt, k_bt, v_bt) # [B*T_ctx_enc, S, C]
         Z_ctx = rearrange(Z_bt, "(b t) s c -> b t s c", b=B, t=T_ctx_enc)  # [B,T_ctx_enc,S,C]
         # Pool spatial latent slots per frame -> [B, T_ctx_enc, C]
         B, T_ctx_enc, S, C = Z_ctx.shape
@@ -1237,7 +1253,7 @@ class PerceiverTokenPredictor(nn.Module):
         sa_out = self.temporal_self_attn(
             timeline_init,
             pad_mask=None,
-            rot_pos_emb=None,
+            rot_pos_emb=rotary_timeline,
             kv_cache=None,
         )
         timeline_out = sa_out.last_hidden_state                          # [B,T_total,C]
@@ -1693,6 +1709,7 @@ class CausalPerceiverIO(nn.Module):
         orthogonal_reg_active_codes_only: bool = True,
         orthogonal_reg_max_codes: int = 2048,
         threshold_ema_dead_code: int = 0,
+        token_ar_checkpoint: bool = True,
     ):
         super().__init__()
         
@@ -1731,6 +1748,7 @@ class CausalPerceiverIO(nn.Module):
             dropout=dropout,
             sequence_length=T,
             max_seq_len= max_seq_len,
+            token_ar_checkpoint= token_ar_checkpoint,
         )
     
     def forward(

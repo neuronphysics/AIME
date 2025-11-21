@@ -842,7 +842,9 @@ class VideoEncoder(nn.Module):
         h = self.norm_out(h)
         h = nonlinearity(h)
         # 3) Final projection to z_channels
-        h = self.conv_out(h, is_init=is_init)  # [B, z_channels, T, H', W']
+        def cnv_out(h_in, is_init=is_init):
+            return self.conv_out(h_in, is_init=is_init)
+        h = self.maybe_checkpoint(cnv_out, h)  # [B, z_channels, T, H', W']
 
         # 4) DVAE expects [B, T, C, H, W]
         h = rearrange(h, "b c t h w -> b t c h w")
@@ -1138,7 +1140,9 @@ class VideoDecoder(nn.Module):
         h = rearrange(z, "b t c h w -> b c t h w")
         
         # z_channels -> ch
-        h = self.conv_in(h, is_init=is_init)
+        def cnv_in_fn(h_in, is_init=is_init):
+            return self.conv_in(h_in, is_init=is_init)
+        h = self.maybe_checkpoint(cnv_in_fn, h)
 
         # Coarsest-resolution ResNet blocks
         for block in self.res_mid:

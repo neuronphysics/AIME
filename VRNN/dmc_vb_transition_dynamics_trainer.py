@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import time, contextlib
 import tensorflow as tf
-import zlib
+import zlib, gc
 from torch.utils.tensorboard import SummaryWriter
 from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoencoder
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
@@ -441,7 +441,7 @@ class DMCVBDataset(Dataset):
     def _load_episode_paths(self, training_percent: float =0.7) -> List[Path]:
         """Load all episode file paths"""
         all_episode_files = []
-        policy_levels = ['expert', 'medium', 'mixed']
+        policy_levels = ['expert', 'medium']# 'mixed'
         subfolders =['none', 'dynamic_medium', 'static_medium']
         base_dir = self.data_dir / "dmc_vb" / f"{self.domain_name}_{self.task_name}"
         # Collect episodes from all combinations
@@ -1705,10 +1705,9 @@ class DMCVBTrainer:
             # Train
             train_metrics = self.train_epoch(epoch)
             
-            
             # Evaluate
             eval_metrics = self.evaluate(epoch)
-            self.run_grad_diag(max_B=1, max_T=self.episode_length, use_amp=True)            
+            self.run_grad_diag(max_B=1, max_T=self.episode_length, use_amp=False)            
             # Combine metrics
             all_metrics = {**train_metrics, **eval_metrics}
             
@@ -1740,6 +1739,11 @@ class DMCVBTrainer:
             # Save checkpoint
             if epoch % self.config['checkpoint_every'] == 0:
                 self.save_checkpoint(epoch)
+
+            del train_metrics, eval_metrics, all_metrics
+            gc.collect()
+            torch.cuda.empty_cache()
+
         # Cleanup
         if self.writer:
             self.writer.close()
@@ -1780,7 +1784,7 @@ def main():
         'perceiver_code_dim': 256,           
         'downsample_perceiver': 4,           
         'use_pretrained_vqpt': True,
-        'pretrained_vqpt_ckpt': '/media/zsheikhb/29cd0dc6-0ccb-4a96-8e75-5aa530301a7e/home/zahra/Work/progress/results/vqpt_pretrain_dmc_vb/vqpt_epoch_0050.pt',  
+        'pretrained_vqpt_ckpt': '/media/zsheikhb/29cd0dc6-0ccb-4a96-8e75-5aa530301a7e/home/zahra/Work/progress/results/vqpt_pretrain_dmc_vb/vqpt_epoch_0080.pt',  
         'freeze_vq_codebook': True,        # freeze only codebook
         'freeze_entire_tokenizer': True,  # set True if one wants encoder+decoder frozen too
         'freeze_dvae_backbone': False,     # set True if one wants DVAE backbone frozen too
