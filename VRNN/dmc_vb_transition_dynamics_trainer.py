@@ -1098,12 +1098,13 @@ class DMCVBTrainer:
     def visualize_two_step_prediction(self, epoch: int, T_ctx: int = 8, num_examples: int = 4):
         """
         Log a simple grid comparing context, GT t+1/t+2 vs predicted t+1/t+2.
+        Now also shows VAE-decoded predictions.
         """
         self.model.eval()
 
         batch = next(iter(self.eval_loader))
         observations = batch["observations"].to(self.device)  # [B, T, C, H, W]
-        actions      = batch["actions"].to(self.device)        # [B, T, A]
+        actions      = batch["actions"].to(self.device)       # [B, T, A]
         B, T, C, H, W = observations.shape
 
         assert T >= T_ctx + 2, f"Need at least T_ctx+2 frames, got T={T}"
@@ -1116,14 +1117,16 @@ class DMCVBTrainer:
             horizon=2,
             decode_pixels=True,
         )
-        pred = futures["pixels_future"]  # [B, 2, C, H, W]
+        pred      = futures["pixels_future"]  # Perceiver predictions [B, 2, C, H, W]
+        pred_vae  = futures["vae_future"]     # VAE-decoder predictions [B, 2, C, H, W]
 
         def denorm(x):
             # your images are in [-1,1]
             return ((x + 1.0) * 0.5).clamp(0.0, 1.0)
 
         num_rows = min(num_examples, B)
-        fig, axes = plt.subplots(num_rows, 5, figsize=(5 * 4, 3 * num_rows))
+        num_cols = 7  # ctx_last, GT t+1, GT t+2, Perceiver t+1, Perceiver t+2, VAE t+1, VAE t+2
+        fig, axes = plt.subplots(num_rows, num_cols, figsize=(num_cols * 4, 3 * num_rows))
 
         if num_rows == 1:
             axes = axes[None, :]  # make it 2D
@@ -1133,18 +1136,27 @@ class DMCVBTrainer:
             ctx_last = denorm(observations[i, T_ctx - 1, :3])
             gt_t1    = denorm(observations[i, T_ctx,     :3])
             gt_t2    = denorm(observations[i, T_ctx + 1, :3])
+
+            # Perceiver predictions
             pred_t1  = denorm(pred[i, 0, :3])
             pred_t2  = denorm(pred[i, 1, :3])
 
+            # VAE-decoder predictions
+            vae_t1   = denorm(pred_vae[i, 0, :3])
+            vae_t2   = denorm(pred_vae[i, 1, :3])
+
             def show(ax, img, title):
                 ax.imshow(img.permute(1, 2, 0).detach().cpu().numpy())
-                ax.set_title(title); ax.axis("off")
+                ax.set_title(title)
+                ax.axis("off")
 
             show(axes[i, 0], ctx_last, "Context last (t_ctx)")
             show(axes[i, 1], gt_t1,    "GT t+1")
             show(axes[i, 2], gt_t2,    "GT t+2")
-            show(axes[i, 3], pred_t1,  "Pred t+1")
-            show(axes[i, 4], pred_t2,  "Pred t+2")
+            show(axes[i, 3], pred_t1,  "Perceiver t+1")
+            show(axes[i, 4], pred_t2,  "Perceiver t+2")
+            show(axes[i, 5], vae_t1,   "VAE t+1")
+            show(axes[i, 6], vae_t2,   "VAE t+2")
 
         fig.tight_layout()
 
@@ -1152,6 +1164,7 @@ class DMCVBTrainer:
             self.writer.add_figure("qualitative/two_step_future", fig, epoch)
 
         plt.close(fig)
+
 
     def run_grad_diag(
         self,

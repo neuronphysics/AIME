@@ -2601,11 +2601,24 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if decode_pixels:
             # Use the Perceiver to generate frames from the observed context only.
             # This remains independent of the *latent* imagination above (standard in Dreamer).
-            gen = self.perceiver_model.generate_autoregressive(
+            result["pixels_future"] = self.perceiver_model.generate_autoregressive(
                 context_videos=initial_obs, num_frames_to_generate=horizon,
                 temperature=1.0, top_k=None, top_p=None
             )  # [B,horizon,C,H,W]
-            result["pixels_future"] = gen
+
+        B, T_future, D = z_futures.shape
+        z_flat = z_futures.reshape(B * T_future, D)
+
+        # Use EMA decoder weights for nicer samples (optional but consistent with .sample())
+        if hasattr(self, "ema_decoder"):
+            self.ema_decoder.apply_shadow()
+
+        x_flat = self.decoder.decode(z_flat, deterministic=False)  # [B*T, C, H, W]
+
+        if hasattr(self, "ema_decoder"):
+            self.ema_decoder.restore()
+
+        result["vae_future"] = x_flat.view(B, T_future, *x_flat.shape[1:])  # [B, T_future, C, H, W]
 
         return result
     

@@ -1925,7 +1925,7 @@ class TemporalDiscriminator(nn.Module):
                 nn.TransformerEncoderLayer(
                     d_model=hidden_dim,
                     nhead=n_heads,
-                    dim_feedforward=4 * hidden_dim,
+                    dim_feedforward=2 * hidden_dim,
                     dropout=0.1,
                     activation="gelu",
                     batch_first=True,
@@ -1961,16 +1961,19 @@ class TemporalDiscriminator(nn.Module):
         # ---- Heads ----
         self.temporal_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(hidden_dim // 2, 1),
         )
         self.spatial_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(hidden_dim // 2, 1),
         )
         self.per_frame_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(hidden_dim // 2, 1),
         )
@@ -2078,20 +2081,20 @@ class TemporalDiscriminator(nn.Module):
         # a) sequence-level temporal score: last valid frame
         last_idx = (sequence_lengths - 1).clamp(min=0)
         idx = torch.arange(B, device=self.device)
-        temporal_rep = temporal_tokens[idx, last_idx] + self.head_temporal_cond(
-            z[idx, last_idx]
-        )
-        temporal_score = self.temporal_head(temporal_rep)  # [B, 1]
+        temporal_rep = temporal_tokens[idx, last_idx] + self._maybe_ckpt(self.head_temporal_cond, z[idx, last_idx])
+
+        temporal_score = self._maybe_ckpt(self.temporal_head, temporal_rep)  # [B, 1]
 
         # b) global spatial score: average over time & patches
         spatial_rep = h_4d.mean(dim=1).mean(dim=1) + self.head_spatial_cond(
             z.mean(dim=1)
         )
-        spatial_score = self.spatial_head(spatial_rep)  # [B, 1]
+
+        spatial_score = self._maybe_ckpt(self.spatial_head, spatial_rep)  # [B, 1]
 
         # c) per-frame scores (for consistency regularizers)
-        per_frame_rep = temporal_tokens + self.head_frame_cond(z)  # [B, T, D]
-        per_frame_scores = self.per_frame_head(per_frame_rep)  # [B, T, 1]
+        per_frame_rep = temporal_tokens + self._maybe_ckpt(self.head_frame_cond, z)  # [B, T, D]
+        per_frame_scores = self._maybe_ckpt(self.per_frame_head, per_frame_rep)  # [B, T, 1]
 
         # mask out padded frames, then average
         per_frame_scores = per_frame_scores.masked_fill(

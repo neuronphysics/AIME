@@ -780,11 +780,11 @@ class PerceiverTokenPredictor(nn.Module):
         d_head = num_latent_channels // num_self_attention_heads
         rotate_dim = d_head - (d_head % 2)
 
-        self.time_pe_proj = nn.Linear(
-            rotate_dim,
-            num_latent_channels,
+        
+        self.time_pe_proj = nn.Sequential(
+            nn.Linear(rotate_dim, num_latent_channels),
+            nn.LayerNorm(num_latent_channels)
         )
-        self.time_pe_proj_ln = nn.LayerNorm(num_latent_channels)
         # Cross-attn: per-frame time-indexed cross-attn
         self.temporal_cross_attn = SeparateKVCrossAttention(
             dim_q=self.num_latent_channels,
@@ -823,13 +823,15 @@ class PerceiverTokenPredictor(nn.Module):
         self._pos_enc_channels = 3 * (2 * self.pos_freq_bands + 1)
 
         # Linear projections from positional encodings -> latent channels
-        self.input_proj = nn.Linear(self._pos_enc_channels, num_latent_channels)
-        self.input_proj_ln = nn.LayerNorm(num_latent_channels)  
-        
+          
+        self.input_proj = nn.Sequential(
+            nn.Linear(self._pos_enc_channels, num_latent_channels),
+            nn.LayerNorm(num_latent_channels)
+        )
         self.num_self_attention_heads = num_self_attention_heads
 
         # 1D time positional encoder for the temporal bottleneck (over timesteps)
-        self.time_tb_pos_encoder = FrequencyPositionEncoding(self.time_pe_proj.in_features)
+        self.time_tb_pos_encoder = FrequencyPositionEncoding(self.time_pe_proj[0].in_features)
 
 
         self.output_adapter = TiedTokenOutputAdapter(
@@ -855,8 +857,11 @@ class PerceiverTokenPredictor(nn.Module):
             widening_factor=ARdecoder_widening_factor,
             attn_checkpoint=token_ar_checkpoint,
         )
-        self.encoder_key_proj = nn.Linear(self.tokenizer.dvae.z_channels, self.num_latent_channels)
-        self.proj_ln = nn.LayerNorm(self.num_latent_channels)
+        
+        self.encoder_key_proj = nn.Sequential(
+            nn.Linear(self.tokenizer.dvae.z_channels, self.num_latent_channels),
+            nn.LayerNorm(self.num_latent_channels)
+        )
         # --- VQ freezing config ---
         self.freeze_vq_at_init = freeze_vq_at_init
         if self.freeze_vq_at_init:
@@ -1067,7 +1072,7 @@ class PerceiverTokenPredictor(nn.Module):
 
         self._ensure_pos_encoding(T, Ht, Wt, device)
         pe = self.pos_encoding.to(device)       # [1, T*Ht*Wt, C_pos]
-        pe = self.input_proj_ln(self.input_proj(pe))     # [1, T*Ht*Wt, C]
+        pe = self.maybe_checkpoint(self.input_proj, pe)    # [1, T*Ht*Wt, C]
         pe = pe.expand(B, -1, -1)               # [B, T*Ht*Wt, C]
         assert T * Ht * Wt == self.pos_encoding.shape[1]
         return pe
@@ -1187,7 +1192,7 @@ class PerceiverTokenPredictor(nn.Module):
         )
         t_fpe_flat = t_fpe.view(T_total, -1)              # [T_total, D_rot]
         # Project to latent dim -> [T_total, C]
-        t_pe = self.time_pe_proj_ln(self.time_pe_proj(t_fpe_flat))            # [T_total, C]
+        t_pe = self.maybe_checkpoint(self.time_pe_proj, t_fpe_flat)           # [T_total, C]
 
         # Split context vs future time PE
         t_pe_ctx = t_pe[:T_ctx_enc]                # [T_ctx_enc, C]
@@ -1202,7 +1207,7 @@ class PerceiverTokenPredictor(nn.Module):
         enc_flat = rearrange(encoder_latents, "b t c h w -> b t (h w) c")   # [B,T,N_enc,zc]
 
         # Project channels to latent dim
-        k_frame = self.proj_ln(self.encoder_key_proj(enc_flat))                          # [B,T,N_enc,C]
+        k_frame = self.maybe_checkpoint(self.encoder_key_proj, enc_flat)                          # [B,T,N_enc,C]
 
         # Q = latents[:, t] + time PE
         Q_ctx = latents_time + pe_ctx_exp                # [B, T_ctx_enc, S, C]
