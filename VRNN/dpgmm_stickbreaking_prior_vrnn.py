@@ -903,7 +903,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
     def _warm_build_unet_adapters(self, batch_size: int = 1, dtype: torch.dtype | None = None):
         if dtype is None:
-            
             dtype = torch.float32
 
         x_dummy = torch.zeros(
@@ -915,33 +914,40 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             dtype=dtype,
         )
 
-        # Save/restore training modes to avoid BN/Dropout state updates.
         enc_was_training = self.encoder.training
         dec_was_training = self.decoder.training
         self.encoder.eval()
         self.decoder.eval()
 
         try:
-            # Inference mode is stricter than no_grad and avoids version counter bumps.
             with torch.no_grad(), _temporarily_disable_ckpt(self.encoder, self.decoder):
+                # 1) Run encoder once to get z and the *actual* UNet skips
                 z, _, _, _ = self.encoder(x_dummy)
                 skips = self.encoder.get_unet_skips(
-                    x_dummy, levels=("C2","C3","C4","C5","C6"), detach=True
+                    x_dummy, levels=("C1", "C2", "C3", "C4", "C5", "C6"), detach=True
                 )
-                _ = self.decoder(z, skips=skips)  # materializes/caches 1×1 adapters
 
-                # Only needed if legacy code still reads this; otherwise remove.
+                # 2) Use these real skips to prebuild all 1x1 adapters
+                if hasattr(self.decoder, "build_unet_adapters_from_skips"):
+                    self.decoder.build_unet_adapters_from_skips(skips)
+
+                # 3) Optional sanity check: dry forward to ensure no missing adapters
+                _ = self.decoder(z, skips=skips)
+
+                # We don't want decoder to rely on any stale cached skips
                 if hasattr(self.decoder, "_pending_skips"):
                     self.decoder._pending_skips = None
         finally:
-            # Restore prior train/eval state.
-            if enc_was_training: self.encoder.train()
-            if dec_was_training: self.decoder.train()
+            if enc_was_training:
+                self.encoder.train()
+            if dec_was_training:
+                self.decoder.train()
                 
     def _init_encoder_decoder(self):
-        # Encoder network 
+        # Encoder network
+        encoder_channels = [64, 64, 96, 128, 128, 192]
         self.encoder = VAEEncoder(
-                                  channel_size_per_layer=[64,64,96,128,128,192],
+                                  channel_size_per_layer=encoder_channels,
                                   layers_per_block_per_layer=[1,1,2,1,1,1],
                                   latent_size=self.latent_dim,
                                   width=self.image_size,
@@ -967,6 +973,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                   mlp_hidden_size= self.hidden_dim,
                                   dropout= self.dropout,
                                   use_se=False,
+                                  encoder_channel_size_per_layer=encoder_channels,
+                                  skip_levels_last_n=3
                                   ).to(self.device)
         
         self.gram_loss = GramLoss(
@@ -993,7 +1001,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 self.encoder.build_attention_fuser(
                     sample_input=dummy,
                     out_hw=(H, H),
-                    source=("C3", "C4", "C5"),  # or ("C3","C4","C5") if one wants to tap specific levels
+                    source=("C1", "C2", "C3", "C4", "C5", "C6"),  # or ("C3","C4","C5") if one wants to tap specific levels
                     d=d,  # must match
                 )
         self.encoder.gradient_checkpointing_enable()
@@ -1574,7 +1582,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
                 # Use cached skips (no recompute). 
                 skips = self.encoder.get_unet_skips(
-                    x=None, levels=("C2","C3","C4","C5","C6"), detach=False
+                    x=None, levels=("C1", "C2", "C3", "C4", "C5", "C6"), detach=False
                 )
                 # Decoder forward
                 logit_probs, means, log_scales, coeffs = self.decoder(z_t, skips=skips)
@@ -1582,7 +1590,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 q_params = {'mean': z_mean_t, 'logvar': z_logvar_t}
                 outputs['posterior_params'].append(q_params)
                 # store gram matrix for encoder decoder features
-                outputs['gram_enc'].append( self.encoder_gram_loss_student_teacher(o_t, levels=("C2","C3","C4","C5","C6")) )
+                outputs['gram_enc'].append( self.encoder_gram_loss_student_teacher(o_t, levels=("C1", "C2", "C3", "C4", "C5", "C6")) )
 
             # Store latent statistics
             outputs['latents'].append(z_t)
@@ -1798,7 +1806,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # Get prior distribution and parameters
         prior_dist, prior_params = self.prior(h)
-        skips = self.encoder.get_unet_skips(x, levels=("C2","C3","C4","C5","C6"))        # or encoder.get_unet_skips(x, levels=("C3","C4","C5"))
+        skips = self.encoder.get_unet_skips(x, levels=("C1", "C2", "C3", "C4", "C5", "C6"))        # or encoder.get_unet_skips(x, levels=("C3","C4","C5"))
         #self.decoder.set_unet_skips(skips, mode="concat")
         # Decode
         logit_probs, means, log_scales, coeffs = self.decoder(z, skips=skips)

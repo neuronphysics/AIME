@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 from contextlib import contextmanager
 import abc
 import math
+from collections import OrderedDict
 
 def swish(x):
     """Swish activation function"""
@@ -632,16 +633,25 @@ class VAEDecoder(nn.Module):
         downsample: Optional[int] = 4,
         mlp_hidden_size: Optional[int] = 512,
         use_se: bool = True,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        unet_use_checkpoint: bool = False,
+        encoder_channel_size_per_layer: Optional[List[int]] = None,
+        skip_levels_last_n: int = 3,
     ):
         super().__init__()
         self.downsample = downsample
-        self.use_checkpoint : bool = False
+        self.use_checkpoint : bool = unet_use_checkpoint
         # Compute initial spatial dimensions
         initial_h = height // (2 ** downsample)
         initial_w = width // (2 ** downsample)
         initial_channels = channel_size_per_layer[0]
-        
+        # Store config for UNet adapter construction
+        self._unet_height = height
+        self._unet_width = width
+        self._unet_channel_size_per_layer = list(channel_size_per_layer)
+        self._unet_num_layers_per_resolution = list(num_layers_per_resolution)
+        self._unet_downsample = downsample if downsample is not None else 0
+
         # MLP to project from latent to spatial
         mlp_output_size = initial_channels * initial_h * initial_w
         
@@ -693,6 +703,12 @@ class VAEDecoder(nn.Module):
                 )
                 current_channels = out_channels
                 layer_idx = layer_idx + 1
+        self._unet_encoder_channel_size_per_layer = (
+            encoder_channel_size_per_layer
+            if encoder_channel_size_per_layer is not None
+            else channel_size_per_layer   # fallback: symmetric encoder/decoder
+        )
+        self._unet_skip_levels_last_n = skip_levels_last_n
 
         self.decoder_blocks = nn.ModuleList(decoder_blocks)
         
@@ -714,8 +730,18 @@ class VAEDecoder(nn.Module):
         
         
         self._pending_skips: Optional[dict]= None               # dict[str, Tensor], set via set_unet_skips(...)
-        self._unet_mode: str = "concat"          # currently only "concat" is implemented
+        self._unet_mode: str = "concat"          
         self.post_concat_adapters = nn.ModuleDict()  # 1x1 convs to map cat(C_in+skip) -> C_in
+        if self._unet_downsample is not None and self._unet_downsample > 0:
+            self._init_unet_post_concat_adapters(
+                height=height,
+                width=width,
+                encoder_channel_size_per_layer=self._unet_encoder_channel_size_per_layer,
+                decoder_channel_size_per_layer=self._unet_channel_size_per_layer,
+                num_layers_per_resolution=self._unet_num_layers_per_resolution,
+                downsample=self._unet_downsample,
+                skip_levels_last_n=self._unet_skip_levels_last_n,
+            )
 
     def gradient_checkpointing_disable(self):
 
@@ -724,6 +750,202 @@ class VAEDecoder(nn.Module):
     def gradient_checkpointing_enable(self):
 
         self.use_checkpoint = True
+
+    def _init_unet_post_concat_adapters(
+        self,
+        height: int,
+        width: int,
+        encoder_channel_size_per_layer: List[int],
+        decoder_channel_size_per_layer: List[int],
+        num_layers_per_resolution: List[int],
+        downsample: int,
+        skip_levels_last_n: int = 3,
+    ) -> None:
+        """
+        Analytically mirror the VAEEncoder / VAEDecoder schedule to figure out
+        which (in_ch, out_ch, H, W) combos will be used for UNet skip fusion,
+        and create a Conv2d for each of them in self.post_concat_adapters.
+
+        Encoder and decoder can have different channel schedules:
+          * encoder_channel_size_per_layer: used to infer skip channels per level
+          * decoder_channel_size_per_layer: used to follow the actual decoder blocks
+        """
+
+        if downsample is None or downsample <= 0:
+            # No spatial down/up-sampling => no UNet-style fusion
+            return
+
+        # ---- 1) Simulate encoder pyramid levels (C1..C_{downsample+1}) ----
+        # enc_levels[level_idx] = (H, W, C)
+        enc_levels = {}
+        cur_h, cur_w = height, width
+        level = 0
+        enc_levels[1] = (cur_h, cur_w, None)  # C1; channels don't matter here
+        layer_idx = 0
+
+        for resolution_idx, n_layers in enumerate(num_layers_per_resolution):
+            should_downsample = resolution_idx < downsample
+            for block_idx in range(n_layers):
+                stride = 2 if (should_downsample and block_idx == 0) else 1
+                if stride == 2:
+                    # spatial downsample in encoder
+                    cur_h //= 2
+                    cur_w //= 2
+                    level += 1
+                out_ch = encoder_channel_size_per_layer[layer_idx]
+                layer_idx += 1
+                enc_levels[level + 1] = (cur_h, cur_w, out_ch)
+
+        max_level = max(enc_levels.keys())
+        skip_levels_last_n = min(skip_levels_last_n, max_level)
+
+        # Mimic get_unet_skips(levels=None): take last N pyramid levels
+        selected_levels = list(
+            range(max_level - skip_levels_last_n + 1, max_level + 1)
+        )
+        from collections import OrderedDict
+        skip_pool_template = OrderedDict()
+        for L in selected_levels:
+            H, W, C = enc_levels[L]
+            skip_pool_template[f"{H}x{W}"] = C  # same keys as get_unet_skips
+
+        # ---- 2) Simulate decoder blocks & where fusion actually happens ----
+        init_h = height // (2 ** downsample)
+        init_w = width // (2 ** downsample)
+        cur_h, cur_w = init_h, init_w
+        cur_ch = decoder_channel_size_per_layer[0]  # initial decoder channels
+
+        layer_idx = 0
+        upsample_count = 0
+        adapter_shapes = []
+
+        # Copy so we don't mutate the template
+        pool = OrderedDict(skip_pool_template)
+
+        for resolution_idx, n_layers in enumerate(num_layers_per_resolution):
+            # Same condition as in __init__
+            should_upsample = (
+                resolution_idx >= len(num_layers_per_resolution) - downsample
+                and upsample_count < downsample
+            )
+            for block_idx in range(n_layers):
+                prev_hw = (cur_h, cur_w)
+                upsample = bool(should_upsample and block_idx == 0)
+                if upsample:
+                    upsample_count += 1
+                    cur_h *= 2
+                    cur_w *= 2
+
+                out_ch = decoder_channel_size_per_layer[layer_idx]
+                layer_idx += 1
+                cur_ch = out_ch
+                new_hw = (cur_h, cur_w)
+
+                # Fusion triggers only when spatial size changed and we still have skips.
+                if pool and new_hw != prev_hw:
+                    H, W = new_hw
+                    hw_key = f"{H}x{W}"
+
+                    if hw_key in pool:
+                        # exact spatial match
+                        skip_ch = pool.pop(hw_key)
+                    else:
+                        # Fallback: same as _pick_and_prep_skip_from -> popitem() (LIFO)
+                        _, skip_ch = pool.popitem()
+
+                    in_ch = cur_ch + skip_ch
+                    adapter_shapes.append((in_ch, cur_ch, H, W))
+
+        # ---- 3) Instantiate one Conv2d per unique (in_ch, out_ch, H, W) ----
+        seen = set()
+        for in_ch, out_ch, H, W in adapter_shapes:
+            key = f"cat_{in_ch}->{out_ch}@{H}x{W}"
+            if key in seen:
+                continue
+            seen.add(key)
+            self.post_concat_adapters[key] = nn.Conv2d(
+                in_ch, out_ch, kernel_size=1, bias=True
+            )
+            print(f"Created UNet adapter: {key}")
+
+    def build_unet_adapters_from_skips(self, skips: dict) -> None:
+        """
+        Prebuild self.post_concat_adapters using actual encoder skip tensors.
+
+        Call this once during model initialization (e.g. from
+        DPGMMVariationalRecurrentAutoencoder._warm_build_unet_adapters),
+        before creating the optimizer. After this, _fuse_unet_skip_if_needed
+        will never instantiate new layers.
+        """
+
+        if not skips:
+            return
+
+        downsample = int(self._unet_downsample)
+        if downsample <= 0:
+            return
+
+        # 1) Get skip channels per spatial resolution, preserving encoder order
+        pool = OrderedDict()
+        for k, v in skips.items():        # k like "32x32"
+            H, W = map(int, k.split("x"))
+            pool[(H, W)] = v.shape[1]     # channels
+
+        # 2) Mirror the decoder schedule (same logic as in __init__ / forward)
+        cur_h = self._unet_height // (2 ** downsample)
+        cur_w = self._unet_width  // (2 ** downsample)
+        cur_ch = self._unet_channel_size_per_layer[0]
+        layer_idx = 0
+        upsample_count = 0
+
+        # Use a reference param to put new convs on the right device / dtype
+        ref_param = next(self.parameters())
+        device = ref_param.device
+        dtype  = ref_param.dtype
+
+        for resolution_idx, n_layers in enumerate(self._unet_num_layers_per_resolution):
+            should_upsample = (
+                resolution_idx >= len(self._unet_num_layers_per_resolution) - downsample
+                and upsample_count < downsample
+            )
+            for block_idx in range(n_layers):
+                prev_hw = (cur_h, cur_w)
+                upsample = bool(should_upsample and block_idx == 0)
+                if upsample:
+                    upsample_count += 1
+                    cur_h *= 2
+                    cur_w *= 2
+
+                out_ch = self._unet_channel_size_per_layer[layer_idx]
+                layer_idx += 1
+                cur_ch = out_ch
+                new_hw = (cur_h, cur_w)
+
+                # We only fuse when the spatial size changed and there are skips left
+                if pool and new_hw != prev_hw:
+                    H, W = new_hw
+                    key_exact = (H, W)
+
+                    if key_exact in pool:
+                        skip_ch = pool.pop(key_exact)
+                    else:
+                        match_key = None
+                        for hw in pool.keys():
+                            if hw == (H, W):
+                                match_key = hw
+                                break
+                        if match_key is not None:
+                            skip_ch = pool.pop(match_key)
+                        else:
+                            # Same fallback as _pick_and_prep_skip_from: last inserted
+                            _, skip_ch = pool.popitem()
+
+                    in_ch = cur_ch + skip_ch
+                    adapter_key = f"cat_{in_ch}->{cur_ch}@{H}x{W}"
+                    if adapter_key not in self.post_concat_adapters:
+                        self.post_concat_adapters[adapter_key] = nn.Conv2d(
+                            in_ch, cur_ch, kernel_size=1, bias=True
+                        ).to(device=device, dtype=dtype)
 
     def set_unet_skips(self, skips: Optional[dict], mode: str = "concat"):
         """
@@ -787,10 +1009,25 @@ class VAEDecoder(nn.Module):
         out_ch = h.shape[1]
         H, W  = h.shape[-2:]
         adapter_key = f"cat_{in_ch}->{out_ch}@{H}x{W}"
-        # Lazily create adapter once; harmless on recomputation since key already exists.
+
         if adapter_key not in self.post_concat_adapters:
-            self.post_concat_adapters[adapter_key] = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=True).to(h.device)
-        return self.post_concat_adapters[adapter_key](cat)
+            # If this ever happens, it means the architecture or skip selection
+            # changed in a way that _init_unet_post_concat_adapters didn't anticipate.
+            raise RuntimeError(
+                f"Missing UNet adapter {adapter_key}. "
+                f"You may need to update _init_unet_post_concat_adapters "
+                f"for the new architecture / skip shapes."
+            )
+
+        adapter = self.post_concat_adapters[adapter_key]
+
+        if self.use_checkpoint and self.training:
+            # checkpoint the 1x1 conv on the concatenated feature
+            return torch.utils.checkpoint.checkpoint(
+                adapter, cat, use_reentrant=False, preserve_rng_state=True
+            )
+        else:
+            return adapter(cat)
 
     def forward(self, z: torch.Tensor, skips: Optional[dict] = None):
         # Determine skip source - prefer explicitly passed skips for checkpoint safety

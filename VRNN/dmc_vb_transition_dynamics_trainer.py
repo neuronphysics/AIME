@@ -1785,7 +1785,7 @@ def main():
         # Model settings
         'max_components': 15,
         'latent_dim': 36,
-        'hidden_dim': 48, #must be divisible by 8
+        'hidden_dim': 32, #must be divisible by 8
         'context_dim': 256,
         'attention_resolution': 16,
         'input_channels': 3*1,  # 3 stacked frames
@@ -1803,7 +1803,7 @@ def main():
         'freeze_dvae_backbone': False,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
-        'batch_size': 8,
+        'batch_size': 7,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,

@@ -12,7 +12,7 @@ import numpy as np
 from einops import rearrange
 from torch.autograd import Function
 import collections.abc as abc
-
+import timm
 class AddEpsilon(nn.Module):
     def __init__(self, eps):
         super().__init__()
@@ -1225,9 +1225,9 @@ class AttentionPrior(nn.Module):
             depth=1,                        # simplest: one fusion layer
             bottleneck_units=self.spatial_dim,
             heads=1,
-            dim_head=1,
+            dim_head=8,
             mlp_dim=bottleneck_mlp_dim,                      # tiny MLP is fine
-            dropout=0.0,
+            dropout=dropout,
         )
 
         # 3) Spatial dynamics over fused map
@@ -1383,7 +1383,7 @@ class AttentionPrior(nn.Module):
         next_attention = att_probs_flat.view(B, H, W)   # [B,H,W]
 
         # 5) Motion prediction from prev_attention
-        movement = self.movement_predictor(prev_for_motion.unsqueeze(1))  # [B,2,H,W]
+        movement = self._maybe_ckpt(self.movement_predictor, prev_for_motion.unsqueeze(1))  # [B,2,H,W]
         dx = movement[:, 0].mean(dim=[1, 2])
         dy = movement[:, 1].mean(dim=[1, 2])
 
@@ -1866,6 +1866,7 @@ class TemporalDiscriminator(nn.Module):
         film_scale: float = 0.5,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         rope_base: float = 10000.0,
+        dropout: float = 0.1,
         use_checkpoint: bool = True,
     ):
         super().__init__()
@@ -1919,16 +1920,15 @@ class TemporalDiscriminator(nn.Module):
             ]
         )
 
-        # ---- Temporal transformer stack (non-causal, PyTorch encoder layers) ----
         self.temporal_layers = nn.ModuleList(
             [
-                nn.TransformerEncoderLayer(
-                    d_model=hidden_dim,
-                    nhead=n_heads,
-                    dim_feedforward=2 * hidden_dim,
+                Transformer(
+                    dim=hidden_dim,
+                    heads=n_heads,
+                    dim_head=hidden_dim // n_heads,  # 512 / 8 = 64, etc.
+                    mlp_dim=2 * hidden_dim,          # matches dim_feedforward
                     dropout=0.1,
-                    activation="gelu",
-                    batch_first=True,
+                    drop_path_prob=dropout,              # keep 0.0 so we don't need timm.DropPath
                 )
                 for _ in range(n_layers)
             ]
@@ -2060,15 +2060,27 @@ class TemporalDiscriminator(nn.Module):
 
         h = flat
         all_hidden = []
+        
         for layer in self.temporal_layers:
             def _layer(h_in, mask_in):
-                # mask_in: [B, S] bool, True for valid
-                src_key_padding_mask = ~mask_in  # True for pad positions
-                return layer(h_in, src_key_padding_mask=src_key_padding_mask)
+                # mask_in: [B, S] bool, True = valid tokens
+                # We need a [B, S, S] attention mask with True where attention is allowed.
+                if mask_in.dtype is not torch.bool:
+                    mask_b = mask_in.bool()
+                else:
+                    mask_b = mask_in
+
+                # Allow attention only between valid tokens
+                # shape: [B, S, S]
+                attn_mask = mask_b.unsqueeze(1) & mask_b.unsqueeze(2)
+
+                # Our custom Transformer takes `mask`, not `src_key_padding_mask`
+                return layer(h_in, mask=attn_mask)
 
             h = self._maybe_ckpt(_layer, h, flat_mask)
             if return_features:
-                all_hidden.append(h)
+               all_hidden.append(h)
+
 
         h = self.ln_f(h)
         h_4d = h.reshape(B, T, N, D)  # [B, T, N, D]
