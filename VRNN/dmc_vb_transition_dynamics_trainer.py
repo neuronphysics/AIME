@@ -650,6 +650,16 @@ class DMCVBDataset(Dataset):
         
         return sample
 
+def list_frozen_params(model):
+    print("\n=== FROZEN PARAMETERS (requires_grad=False) ===")
+    total = 0
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            print(f"{name:80s}  shape={tuple(p.shape)}")
+            total += p.numel()
+    print(f"Total frozen params: {total}")
+    print("==============================================\n")
+
 def count_parameters(model, print_details=True):
     """
     Count the number of parameters in a model
@@ -1800,7 +1810,7 @@ def main():
         'pretrained_vqpt_ckpt': '/media/zsheikhb/29cd0dc6-0ccb-4a96-8e75-5aa530301a7e/home/zahra/Work/progress/results/vqpt_pretrain_dmc_vb/vqpt_epoch_0080.pt',  
         'freeze_vq_codebook': True,        # freeze only codebook
         'freeze_entire_tokenizer': True,  # set True if one wants encoder+decoder frozen too
-        'freeze_dvae_backbone': False,     # set True if one wants DVAE backbone frozen too
+        'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
         'batch_size': 7,
@@ -1868,7 +1878,6 @@ def main():
         prior_beta = config['prior_beta'],
         dropout=config['dropout']
     )
-    outputs = count_parameters(model, print_details=True)
     if config['use_pretrained_vqpt']:
         model.load_pretrained_vq_tokenizer(
             ckpt_path=config['pretrained_vqpt_ckpt'],
@@ -1877,6 +1886,9 @@ def main():
             freeze_dvae_backbone=config['freeze_dvae_backbone'],
             strict=True,
         )
+
+    outputs = count_parameters(model, print_details=True)
+    list_frozen_params(model)
 
     # Initialize trainer
     trainer = DMCVBTrainer(
