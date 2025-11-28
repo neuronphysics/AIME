@@ -15,7 +15,7 @@ from collections import OrderedDict
 from torch.utils.checkpoint import checkpoint as ckpt
 from VRNN.canny_net import CannyFilter
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from models import (
+from vis_networks import (
     EMA, TemporalDiscriminator,
     LinearResidual, AttentionPosterior, AttentionPrior,
     AddEpsilon, check_tensor
@@ -1071,7 +1071,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             dvae.eval()
             print("[DPGMM] Frozen DVAE encoder + quantization backbone")
 
-        # Optionally freeze only the codebook (what you called 'vq token')
+        # Optionally freeze only the codebook 
         if freeze_codebook and hasattr(tokenizer, "vq"):
             for p in tokenizer.vq.parameters():
                 p.requires_grad = False
@@ -1461,14 +1461,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     
         self.grad_balancer = RGB()
 
-        # tasks in the same order you’ll pass losses in training_step_sequence
+        # tasks in the same order losses were passed in training_step_sequence
         self.grad_balancer.task_name = ["elbo", "perceiver", "predictive", "adversarial"]
         self.grad_balancer.task_num  = len(self.grad_balancer.task_name)
         self.grad_balancer.device    = self.device
         self.grad_balancer.rep_grad  = False        # operate on shared params (θ), not reps
         self.grad_balancer.alpha_steps = 1  # Reduce from 3 to 1
         self.grad_balancer.update_interval = 2  # Update every 2 steps instead of every step
-        self.grad_balancer.lr_inner = 0.1  # Smaller learning rate for stability
+        self.grad_balancer.lr_inner = 0.05  # Smaller learning rate for stability
 
         # give RGB access to *generator* params only
         self.grad_balancer.get_share_params = lambda: (
@@ -1482,7 +1482,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self.img_disc_optimizer = torch.optim.AdamW(
                 disc_params,
                 lr=learning_rate * 0.1,   
-                betas=(0.2, 0.9),          # canonical for WGAN-GP
+                betas=(0.5, 0.9),          # canonical for WGAN-GP
                 weight_decay=0.0
             )
         
@@ -2185,7 +2185,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "reconstruct":      perc_out["reconstructed"],  # needed by forward_sequence
                 "generated_videos": None,
             }
-            # Backwards-compat alias if your training loop still references it:
+            # Backwards-compat alias if the training loop still references it:
             info["perceptual_loss"] = info["lpips_loss"]
             return temporal_context, info
 
@@ -2348,14 +2348,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.gen_optimizer.zero_grad(set_to_none=True)
         # RGB computes per-task grads and writes back the rotated aggregate grad
         self.grad_balancer.backward(task_losses, mode="backward")
-        
-        
+
         torch.nn.utils.clip_grad_norm_(
             [p for g in self.gen_optimizer.param_groups for p in g["params"]],
             self._grad_clip
         )
         self.gen_optimizer.step()
-
         
         grad_norm_sq = 0.0
         for group in self.gen_optimizer.param_groups:
@@ -2541,7 +2539,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             q_attn = self.attention_prior_posterior._compute_posterior_attention(
                 self.encoder, x_t, h[-1], c_t, detach=False
             )
-            z_t, *_ = self.encoder(x_t)  # z from encoder (your encoder returns mean/logvar too)
+            z_t, *_ = self.encoder(x_t)  # z from encoder 
 
             attention_state = self._compute_edge_features_from_attention(q_attn)
 

@@ -1796,7 +1796,7 @@ def main():
         'max_components': 15,
         'latent_dim': 36,
         'hidden_dim': 32, #must be divisible by 8
-        'context_dim': 256,
+        'context_dim': 32,
         'attention_resolution': 16,
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 6.0,  # Hyperparameters for prior

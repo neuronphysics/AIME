@@ -16,11 +16,18 @@ import lpips
 from tqdm.auto import tqdm
 from einops import rearrange
 from VRNN.perceiver.video_prediction_perceiverIO import VQPTTokenizer
+from torch.utils.tensorboard import SummaryWriter
 from VRNN.dmc_vb_transition_dynamics_trainer import (
     DMCVBDataset,
     safe_collate,
 )
+from pathlib import Path
+import os
+SCRIPT_DIR = Path(__file__).resolve().parent
+PARENT_DIR = SCRIPT_DIR.parent
 
+print("Script dir:", SCRIPT_DIR)
+print("Parent dir:", PARENT_DIR)
 # SSIM (your implementation) + batch wrapper
 def calculate_ssim(img1, img2):
     """Single-image SSIM on HWC uint8 in [0,255]."""
@@ -260,6 +267,7 @@ def save_reconstruction_grid(
     epoch: int,
     num_samples: int = 8,
     wandb_run: Optional[wandb.sdk.wandb_run.Run] = None,
+    writer: Optional[SummaryWriter] = None,
 ):
     os.makedirs(out_dir, exist_ok=True)
     tokenizer.eval()
@@ -283,8 +291,14 @@ def save_reconstruction_grid(
     )
     save_path = os.path.join(out_dir, f"recon_epoch_{epoch:04d}.png")
     save_image(grid, save_path)
+
     if wandb_run is not None:
         wandb.log({"reconstruction": wandb.Image(save_path)}, step=epoch)
+
+    if writer is not None:
+        # grid is [C,H,W], in [0,1]
+        writer.add_image("reconstruction", grid, global_step=epoch)
+
     print(f"[recon] saved grid to {save_path}")
 
 
@@ -473,11 +487,9 @@ def train_vqpt_tokenizer_dmc_vb(config: Dict):
             threshold_ema_dead_code=config["threshold_ema_dead_code"]
     ).to(device)
     lpips_fn = lpips.LPIPS(net='alex').to(device)
-    
     lpips_fn.eval()
     for param in lpips_fn.parameters():
         param.requires_grad = False
-
 
     optimizer = torch.optim.Adam(
         tokenizer.parameters(),
@@ -485,8 +497,17 @@ def train_vqpt_tokenizer_dmc_vb(config: Dict):
         betas=(0.9, 0.999),
         weight_decay=config["weight_decay"],
     )
-    wandb_run = None
-    if config["wandb_project"]:
+
+    # --- Logging backends ---
+    wandb_run: Optional[wandb.sdk.wandb_run.Run] = None
+    writer: Optional[SummaryWriter] = None
+
+    out_dir = config["out_dir"]
+    ckpt_dir = os.path.join(out_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Choose logging backend
+    if config.get("use_wandb", False) and config.get("wandb_project"):
         # you should run `wandb login` once in your shell
         wandb.login()
         wandb_run = wandb.init(
@@ -496,15 +517,15 @@ def train_vqpt_tokenizer_dmc_vb(config: Dict):
             config=config,
         )
         wandb.watch(tokenizer, log="all", log_freq=100)
+    elif config.get("use_tensorboard", False):
+        tb_log_dir = os.path.join(out_dir, "tb_logs")
+        writer = SummaryWriter(log_dir=tb_log_dir)
+        print(f"[logging] Using TensorBoard at {tb_log_dir}")
 
 
     contrastive_weight = config["contrastive_weight"]
     mask_prob = config["mask_prob"]
 
-    
-    out_dir = config["out_dir"]
-    ckpt_dir = os.path.join(out_dir, "checkpoints")
-    os.makedirs(ckpt_dir, exist_ok=True)
 
     inception = build_inception(device)
 
@@ -578,9 +599,11 @@ def train_vqpt_tokenizer_dmc_vb(config: Dict):
                 lpips=f"{lpips_val.item():.4f}",
                 loss=f"{loss.item():.4f}",
             )
+
         epoch_recon = running_recon / count
         epoch_vq = running_vq / count
         epoch_cl = running_cl / max(count, 1)
+
         if wandb_run is not None and global_step % config["log_every_steps"] == 0:
             wandb.log(
                 {
@@ -594,6 +617,14 @@ def train_vqpt_tokenizer_dmc_vb(config: Dict):
                 step=epoch,
             )
 
+        if writer is not None and global_step % config["log_every_steps"] == 0:
+            writer.add_scalar("train/recon_loss", epoch_recon, global_step)
+            writer.add_scalar("train/vq_loss", epoch_vq, global_step)
+            writer.add_scalar("train/contrastive_loss", epoch_cl, global_step)
+            writer.add_scalar("train/contrastive_weight", contrastive_weight, global_step)
+            writer.add_scalar("train/mask_prob", mask_prob, global_step)
+
+
         print(
             f"[epoch {epoch}] recon={epoch_recon:.4f}  "
             f"vq={epoch_vq:.4f}  cl={epoch_cl:.4f}"
@@ -601,7 +632,15 @@ def train_vqpt_tokenizer_dmc_vb(config: Dict):
 
         # Save recon grid every few epochs
         if epoch % config.get("recon_every", 5) == 0:
-            save_reconstruction_grid(tokenizer, val_loader, device, out_dir, epoch, wandb_run=wandb_run)
+            save_reconstruction_grid(
+                tokenizer,
+                val_loader,
+                device,
+                out_dir,
+                epoch,
+                wandb_run=wandb_run,
+                writer=writer,
+            )
 
         # Evaluate (SSIM, PSNR, FID)
         if epoch % config.get("eval_every", 5) == 0:
@@ -631,6 +670,11 @@ def train_vqpt_tokenizer_dmc_vb(config: Dict):
                     },
                     step=epoch,
                 )
+            if writer is not None:
+                writer.add_scalar("val/mse", metrics["mse"], epoch)
+                writer.add_scalar("val/psnr", metrics["psnr"], epoch)
+                writer.add_scalar("val/ssim", metrics["ssim"], epoch)
+                writer.add_scalar("val/fid", metrics["fid"], epoch)
 
         # Checkpoint
         if epoch % config.get("ckpt_every", 10) == 0:
@@ -645,12 +689,17 @@ def train_vqpt_tokenizer_dmc_vb(config: Dict):
                 ckpt_path,
             )
             print(f"[ckpt] saved {ckpt_path}")
+    # after the training loop
+    if writer is not None:
+        writer.close()
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
     # Minimal example config – tweak as needed
     cfg = {
-        "data_dir": "/media/zsheikhb/29cd0dc6-0ccb-4a96-8e75-5aa530301a7e/home/zahra/Work/progress/transition_data",  # root containing dmc_vb/humanoid_walk/...
+        "data_dir": PARENT_DIR / "transition_data",  # root containing dmc_vb/humanoid_walk/...
         "domain_name": "humanoid",
         "task_name": "walk",
         "sequence_length": 1,   # 1 frame per "video" for VQ pretraining
@@ -672,9 +721,9 @@ if __name__ == "__main__":
         "img_height": 64,
         "img_width": 64,
         "weight_decay": 1e-5,
-        "batch_size": 40,
+        "batch_size": 45,
         "num_workers": 4,
-        "epochs": 80,
+        "epochs": 120,
         "lpips_weight": 1.0,
         "lr": 2e-4,
         "grad_clip": 1.0,
@@ -682,13 +731,15 @@ if __name__ == "__main__":
         "commitment_weight": 0.25,
         "contrastive_weight": 0.05,  # set to 0.0 to disable CL
         "mask_prob": 0.4,
-        "out_dir": "/media/zsheikhb/29cd0dc6-0ccb-4a96-8e75-5aa530301a7e/home/zahra/Work/progress/results/vqpt_pretrain_dmc_vb",
+        "out_dir": PARENT_DIR / "results" / "vqpt_pretrain_dmc_vb",
         "recon_every": 5,
         "eval_every": 5,
         "ckpt_every": 10,
         "eval_batches": 20,
         "max_fid_images": 1024,
         "num_quantizers": 1,
+        "use_wandb": False,          # set False to turn off wandb
+        "use_tensorboard": True,   # set True to use TensorBoard instead
         # wandb
         'wandb_project': 'dpgmm-vrnn-dmc',
         'wandb_entity': 'zsheikhb',        

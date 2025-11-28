@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, Gamma, Categorical, Independent, MixtureSameFamily
 from typing import Dict, Tuple, Union
-from models import *
+from vis_networks import *
 import math
 from collections import OrderedDict
 

@@ -3,6 +3,7 @@ __pycache__
 sbatch_scripts
 results*
 result*
+logdir*
 logs/
 run/
 runs/
@@ -16,6 +17,7 @@ __pycache__/
 .env
 *.pth
 data/*
+dreamerv3/imgs*
 VRNN/perceiver/data/
 VRNN/perceiver/model/
 transition_data/

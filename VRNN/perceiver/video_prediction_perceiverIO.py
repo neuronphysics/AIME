@@ -149,7 +149,7 @@ class DVAE(nn.Module):
         # explicit architecture knobs
         ch_mult: Optional[Tuple[int, ...]] = None,   # e.g. (1, 2, 4)
         num_res_blocks: int = 1,                    # passed to VideoEncoder/Decoder
-        use_checkpoint: bool = True,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         # make GroupNorm operate in spatial mode
@@ -438,6 +438,7 @@ class VQPTTokenizer(nn.Module):
         codebook_diversity_loss_weight: float = 0.0,
         codebook_diversity_temperature: float = 1.0,
         threshold_ema_dead_code: int = 2,
+        use_checkpoint: bool = False,
 
     ):
         super().__init__()
@@ -454,6 +455,7 @@ class VQPTTokenizer(nn.Module):
                 s_down=downsample,  
                 t_down=1,
                 num_res_blocks=1,
+                use_checkpoint=use_checkpoint,
             )
 
         

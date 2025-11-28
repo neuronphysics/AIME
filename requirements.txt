@@ -13,6 +13,7 @@ cnest
 colorama
 contextlib2
 contourpy
+crafter
 cupy
 cycler
 Cython==0.29.37
@@ -21,6 +22,7 @@ dill
 dm-control
 dm-env
 dm-tree
+dm_control
 einops
 etils
 expecttest
@@ -62,6 +64,7 @@ lxml
 Markdown
 MarkupSafe
 matplotlib
+memory_maze
 ml-collections
 moviepy
 mpmath
@@ -95,6 +98,7 @@ regex
 requests
 requests-oauthlib
 rsa
+ruamel.yaml
 sacrebleu
 scikit-learn
 scipy
@@ -123,6 +127,7 @@ triton
 typing_extensions
 tzdata
 urllib3
+wandb
 wavio
 Werkzeug
 wget
