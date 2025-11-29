@@ -24,6 +24,7 @@ dm-env
 dm-tree
 dm_control
 einops
+einx
 etils
 expecttest
 Farama-Notifications

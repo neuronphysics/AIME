@@ -28,14 +28,14 @@ module load mujoco/3.3.0
 module load mpi4py/3.1.6
 module load arrow
 
-
-
-
 #virtualenv --no-download --clear /home/memole/D2E
 source /home/memole/D2E/bin/activate
 pip install "sentry-sdk>=2.0.0" "gitpython!=3.1.29,>=1.0.0"
 python -m pip install "pydantic>=2,<3"
-pip install -r requirements.txt --no-deps
+pip install fairscale
+#pip install tensorflow
+#pip install --user einx
+#pip install -r requirements.txt --no-deps
 #gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium /home/memole/scratch/AIME/transition_data/dmc_vb/humanoid_walk
 echo "pretrain VQVAE ....."
 CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.pretrain_vqvae
