@@ -117,6 +117,7 @@ tensorflow-io-gcs-filesystem
 tensorflow-metadata
 termcolor
 threadpoolctl
+timm
 toml
 torch
 torch-optimizer

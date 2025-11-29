@@ -723,7 +723,7 @@ if __name__ == "__main__":
         "weight_decay": 1e-5,
         "batch_size": 80,
         "num_workers": 4,
-        "epochs": 120,
+        "epochs": 151,
         "lpips_weight": 1.0,
         "lr": 2e-4,
         "grad_clip": 1.0,

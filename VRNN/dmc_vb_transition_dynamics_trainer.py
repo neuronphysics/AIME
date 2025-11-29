@@ -12,6 +12,20 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import time, contextlib
 import tensorflow as tf
+try:
+    # completely disable TF GPUs (safest, simplest)
+    tf.config.set_visible_devices([], 'GPU')
+    print("[TF] Using CPU only (GPUs hidden from TensorFlow).")
+except Exception as e:
+    print("[TF] Could not hide GPUs, trying memory_growth:", e)
+    try:
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print("[TF] Enabled memory growth on GPUs.")
+    except Exception as e2:
+        print("[TF] Could not set memory growth:", e2)
+
 import zlib, gc
 from torch.utils.tensorboard import SummaryWriter
 from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoencoder
@@ -1817,7 +1831,7 @@ def main():
         'perceiver_code_dim': 256,           
         'downsample_perceiver': 4,           
         'use_pretrained_vqpt': True,
-        'pretrained_vqpt_ckpt': PARENT_DIR / "results" / "vqpt_pretrain_dmc_vb" / "vqpt_epoch_0120.pt",  
+        'pretrained_vqpt_ckpt': PARENT_DIR / "results" / "vqpt_pretrain_dmc_vb" / "vqpt_epoch_0150.pt",  
         'freeze_vq_codebook': True,        # freeze only codebook
         'freeze_entire_tokenizer': True,  # set True if one wants encoder+decoder frozen too
         'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too

@@ -10,7 +10,7 @@ from einops import rearrange
 from contextlib import contextmanager
 from itertools import chain
 import numpy as np
-import math
+import math, inspect
 from collections import OrderedDict
 from torch.utils.checkpoint import checkpoint as ckpt
 from VRNN.canny_net import CannyFilter
@@ -47,6 +47,26 @@ def prune_small_components(pi: torch.Tensor, threshold: float = 1e-5) -> torch.T
     
     return pi
 
+def torch_load_version_compat(path, map_location=None):
+    """
+    Backward-compatible torch.load:
+    - On PyTorch >= 2.6, sets weights_only=False explicitly.
+    - On older versions, just calls torch.load(path, map_location=...).
+    Use ONLY with checkpoints you trust.
+    """
+    import torch
+    sig = inspect.signature(torch.load)
+    kwargs = {}
+
+    # keep your map_location behavior
+    if "map_location" in sig.parameters:
+        kwargs["map_location"] = map_location
+
+    # Newer torch versions have weights_only; set it to False explicitly
+    if "weights_only" in sig.parameters:
+        kwargs["weights_only"] = False
+
+    return torch.load(path, **kwargs)
 
 class GammaPosterior(nn.Module):
     """
@@ -1025,7 +1045,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.perceiver_model.tokenizer and optionally freeze it.
         """
         device = self.device if hasattr(self, "device") else next(self.parameters()).device
-        ckpt = torch.load(ckpt_path, map_location=device)
+
+        ckpt = torch_load_version_compat(ckpt_path, map_location=device)
 
         vq_state = ckpt["model_state"]
         vq_config = ckpt.get("config", None)
@@ -1503,7 +1524,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # 3) Discriminator scheduler (unchanged)
         self.img_disc_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.img_disc_optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-7, verbose=True
+            self.img_disc_optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-7
         )
 
         # Warmup bookkeeping 
