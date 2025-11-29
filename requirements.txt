@@ -60,6 +60,7 @@ keras
 kiwisolver
 labmaze
 libclang
+lpips
 lxml
 Markdown
 MarkupSafe
