@@ -18,8 +18,15 @@ from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoenc
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
 from torch.utils.data._utils.collate import default_collate
 from VRNN.grad_diagnostics import GradDiagnosticsAggregator  
-os.environ["MPLBACKEND"] = "Agg"  
+ 
 import matplotlib
+from pathlib import Path
+os.environ["MPLBACKEND"] = "Agg" 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PARENT_DIR = SCRIPT_DIR.parent
+
+print("Script dir:", SCRIPT_DIR)
+print("Parent dir:", PARENT_DIR)
 matplotlib.use("Agg", force=True)
 plt.ioff()
 def safe_collate(batch):
@@ -441,7 +448,7 @@ class DMCVBDataset(Dataset):
     def _load_episode_paths(self, training_percent: float =0.7) -> List[Path]:
         """Load all episode file paths"""
         all_episode_files = []
-        policy_levels = ['expert', 'medium']# 'mixed'
+        policy_levels = ['expert', 'medium', 'mixed']
         subfolders =['none', 'dynamic_medium', 'static_medium']
         base_dir = self.data_dir / "dmc_vb" / f"{self.domain_name}_{self.task_name}"
         # Collect episodes from all combinations
@@ -870,6 +877,9 @@ class DMCVBTrainer:
         self.device = device
         self.config = config
         self.data_dir = data_dir
+        default_ckpt_dir = PARENT_DIR / "results" / "dpgmm_vrnn_dmc_vb" / "checkpoints"
+        self.ckpt_dir = Path(config.get("ckpt_dir", default_ckpt_dir))
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         # Setup datasets
         self.train_dataset = DMCVBDataset(
             data_dir=data_dir,
@@ -928,7 +938,7 @@ class DMCVBTrainer:
         
         self.use_wandb = config.get('use_wandb', False) and self._try_init_wandb(config)
         if not self.use_wandb:
-            log_dir = f"runs/{config.get('experiment_name', 'dpgmm_vrnn')}_{time.strftime('%Y%m%d_%H%M%S')}"
+            log_dir = PARENT_DIR / "results" / "dpgmm_vrnn_dmc_vb" / "runs" / f"{config.get('experiment_name', 'dpgmm_vrnn')}_{time.strftime('%Y%m%d_%H%M%S')}"
             self.writer = SummaryWriter(log_dir)
             print(f"TensorBoard logging to: {log_dir}")
         else:
@@ -1704,13 +1714,13 @@ class DMCVBTrainer:
         }
         
         # Save regular checkpoint
-        checkpoint_path = f'checkpoints/checkpoint_epoch_{epoch}.pt'
-        os.makedirs('checkpoints', exist_ok=True)
-        torch.save(checkpoint, checkpoint_path)
         
-        # Save best model
+        checkpoint_path = self.ckpt_dir / f"checkpoint_epoch_{epoch:04d}.pt"
+        torch.save(checkpoint, checkpoint_path)
+
         if is_best:
-            torch.save(checkpoint, 'checkpoints/best_model.pt')
+            best_path = self.ckpt_dir / "best_model.pt"
+            torch.save(checkpoint, best_path)
     
     def train(self, n_epochs: int):
         """Main training loop"""
@@ -1787,7 +1797,7 @@ def main():
     # Configuration
     config = {
         # Data settings
-        'data_dir': '/media/zsheikhb/29cd0dc6-0ccb-4a96-8e75-5aa530301a7e/home/zahra/Work/progress/transition_data',
+        'data_dir': PARENT_DIR / "transition_data",
         'domain_name': 'humanoid',
         'task_name': 'walk',
         'policy_level': 'expert',
@@ -1795,9 +1805,9 @@ def main():
         # Model settings
         'max_components': 15,
         'latent_dim': 36,
-        'hidden_dim': 32, #must be divisible by 8
-        'context_dim': 32,
-        'attention_resolution': 16,
+        'hidden_dim': 48, #must be divisible by 8
+        'context_dim': 128,
+        'attention_resolution': 32,
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 6.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
@@ -1807,20 +1817,20 @@ def main():
         'perceiver_code_dim': 256,           
         'downsample_perceiver': 4,           
         'use_pretrained_vqpt': True,
-        'pretrained_vqpt_ckpt': '/media/zsheikhb/29cd0dc6-0ccb-4a96-8e75-5aa530301a7e/home/zahra/Work/progress/results/vqpt_pretrain_dmc_vb/vqpt_epoch_0080.pt',  
+        'pretrained_vqpt_ckpt': PARENT_DIR / "results" / "vqpt_pretrain_dmc_vb" / "vqpt_epoch_0120.pt",  
         'freeze_vq_codebook': True,        # freeze only codebook
         'freeze_entire_tokenizer': True,  # set True if one wants encoder+decoder frozen too
         'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
-        'batch_size': 7,
+        'batch_size': 20,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
         'learning_rate': 0.0002,
-        'n_epochs': 400,
+        'n_epochs': 200,
         'num_workers': 4,
 
         'beta_min': 0.5,

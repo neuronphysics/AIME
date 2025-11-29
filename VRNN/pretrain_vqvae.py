@@ -721,7 +721,7 @@ if __name__ == "__main__":
         "img_height": 64,
         "img_width": 64,
         "weight_decay": 1e-5,
-        "batch_size": 45,
+        "batch_size": 80,
         "num_workers": 4,
         "epochs": 120,
         "lpips_weight": 1.0,
