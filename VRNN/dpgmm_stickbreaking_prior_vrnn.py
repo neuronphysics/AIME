@@ -865,7 +865,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         num_codebook_perceiver: int = 1024,
         perceiver_code_dim: int = 256,
         downsample_perceiver: int = 4,
-        perceiver_lr_multiplier: float = 1.5,
+        perceiver_lr_multiplier: float = 0.01,
         attention_rope_dim: Optional[int] = 96,
         use_ctx_checkpoint: bool = True,
     ):
@@ -1502,8 +1502,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             disc_params = [p for p in self.image_discriminator.parameters() if p.requires_grad]
             self.img_disc_optimizer = torch.optim.AdamW(
                 disc_params,
-                lr=learning_rate * 0.1,   
-                betas=(0.5, 0.9),          # canonical for WGAN-GP
+                lr=learning_rate * 0.01,   
+                betas=(0.9, 0.99),          # canonical for WGAN-GP
                 weight_decay=0.0
             )
         

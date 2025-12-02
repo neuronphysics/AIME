@@ -439,60 +439,67 @@ class LatentAGACBehavior(ImagBehavior):
     """
     Dreamer-style behavior class with AGAC-like exploration in latent space.
 
+    - Uses TWO critics:
+        * self.value:      extrinsic value V_extr(s)
+        * self.value_adv:  AGAC value V_agac(s) for the KL stream
+
+    - Actor sees a combined advantage:
+        A_comb_t = A_extr_t + beta_kl * A_agac_t
+        A_hat_t  = AdvNorm_total(A_comb_t)
+
+      and optimizes:
+
+        L_actor ≈ -E_t[ w_t * log π(a_t|s_t) * A_hat_t ]  + small δ-term
+
+    - δ_t = log π_old(a_t|s_t) - log q_old(a_t|s_t) is the per-sample log ratio
+      between slow actor and slow adversary (optional extra REINFORCE bonus).
+
     Modes:
-      agac.kl_mode = "none"
+      kl_mode = "none"
         -> identical to ImagBehavior (no AGAC terms)
 
-      agac.kl_mode = "recursive"
-        -> Design B:
-           - critic sees KL-shaped reward r_t + beta_kl * K_t
-           - actor gets standard Dreamer loss + extra REINFORCE term
-             with advantage bonus beta_delta * delta_t
-
-      agac.kl_mode = "actor_horizon"
-        -> Design A':
-           - critic stays purely extrinsic
-           - actor gets standard Dreamer loss + extra REINFORCE term
-             with horizon KL bonus beta_kl * G_t^KL
-
-    Old policy options:
-      agac.old_policy_mode = "ema"
-        -> EMA lagged actor/adversary 
-
-      agac.old_policy_mode = "snapshot"
-        -> snapshot actor/adversary once per _train() call
-           (closer to strict PPO-style use of π_old)
+      kl_mode = "recursive"
+        -> multi-critic: extrinsic + KL critic, combined advantage,
+           optional δ-term if beta_delta > 0.
     """
 
     def __init__(self, config, world_model):
-        # Initialize ImagBehavior (actor, value, slow_value, ema, etc.)
         super().__init__(config, world_model)
         self._agac_cfg = getattr(config, "agac", None)
-        
+
         def _cfg_get(obj, key, default):
             if isinstance(obj, dict):
                 return obj.get(key, default)
             return getattr(obj, key, default)
 
         if self._agac_cfg is None:
-            # No AGAC section: fall back to defaults
             self._agac_cfg = {}
 
-
-        # KL framework hyperparameters
-        self._kl_mode = _cfg_get(self._agac_cfg, "kl_mode", "none")
-        self._beta_kl = _cfg_get(self._agac_cfg, "beta_kl", 0.0)
+        # AGAC hyperparameters
+        self._kl_mode    = _cfg_get(self._agac_cfg, "kl_mode", "none")
+        self._beta_kl    = _cfg_get(self._agac_cfg, "beta_kl", 0.0)
         self._beta_delta = _cfg_get(self._agac_cfg, "beta_delta", 0.0)
-        self._gamma_kl = _cfg_get(self._agac_cfg, "gamma_kl", config.discount)
+        self._gamma_kl   = _cfg_get(self._agac_cfg, "gamma_kl", config.discount)
+
+        # Only allow "none" or "recursive" now
+        assert self._kl_mode in ["none", "recursive"], (
+            f"kl_mode='{self._kl_mode}' not supported; use 'none' or 'recursive'."
+        )
 
         # Old-policy handling (for KL and adversary)
-        self._old_policy_mode = _cfg_get(self._agac_cfg, "old_policy_mode", "ema")
+        self._old_policy_mode   = _cfg_get(self._agac_cfg, "old_policy_mode", "ema")
         assert self._old_policy_mode in ["ema", "snapshot"]
         self._slow_actor_fraction = _cfg_get(self._agac_cfg, "slow_actor_fraction", 0.01)
-        self._slow_actor_update = _cfg_get(self._agac_cfg, "slow_actor_update", 1)
-        print("[AGAC] kl_mode:", self._kl_mode, "beta_kl:", self._beta_kl, "beta_delta:", self._beta_delta, "old_policy_mode:", self._old_policy_mode)
+        self._slow_actor_update   = _cfg_get(self._agac_cfg, "slow_actor_update", 1)
 
-        # Latent feature size (same as ImagBehavior)
+        print(
+            "[AGAC] kl_mode:", self._kl_mode,
+            "beta_kl:", self._beta_kl,
+            "beta_delta:", self._beta_delta,
+            "old_policy_mode:", self._old_policy_mode
+        )
+
+        # Networks: adversary policy + AGAC critic (value_adv)
         if config.dyn_discrete:
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
@@ -517,8 +524,23 @@ class LatentAGACBehavior(ImagBehavior):
             name="Adversary",
         )
 
-        # Optimizer for adversary (reuse actor optimizer settings)
+        # AGAC value function for KL stream: V_agac(s)
+        self.value_adv = networks.MLP(
+            feat_size,
+            (255,) if config.critic["dist"] == "symlog_disc" else (),
+            config.critic["layers"],
+            config.units,
+            config.act,
+            config.norm,
+            config.critic["dist"],
+            outscale=config.critic["outscale"],
+            device=config.device,
+            name="Value_Adversary",
+        )
+
+        # Optimizers
         kw = dict(wd=config.weight_decay, opt=config.opt, use_amp=self._use_amp)
+
         self._adv_opt = tools.Optimizer(
             "adversary",
             self.adversary.parameters(),
@@ -528,26 +550,51 @@ class LatentAGACBehavior(ImagBehavior):
             **kw,
         )
         print(
-            f"Optimizer adversary_opt has "
-            f"{sum(p.numel() for p in self.adversary.parameters())} variables."
+            "Optimizer adversary_opt has",
+            sum(p.numel() for p in self.adversary.parameters()),
+            "variables.",
+        )
+
+        self._value_adv_opt = tools.Optimizer(
+            "value_adv",
+            self.value_adv.parameters(),
+            config.critic["lr"],
+            config.critic["eps"],
+            config.critic["grad_clip"],
+            **kw,
+        )
+        print(
+            "Optimizer value_adv_opt has",
+            sum(p.numel() for p in self.value_adv.parameters()),
+            "variables.",
         )
 
         # Slow (old) copies of actor and adversary
-        self._slow_actor = copy.deepcopy(self.actor)
+        self._slow_actor     = copy.deepcopy(self.actor)
         self._slow_adversary = copy.deepcopy(self.adversary)
-        self._agac_updates = 0  # counter for EMA updates
+        self._agac_updates   = 0  # counter for EMA updates
 
-    # ------------------------------------------------------------------
-    # Slow targets: critic (from ImagBehavior) + old policies (AGAC)
-    # ------------------------------------------------------------------
+        # Optional slow target for AGAC critic
+        if self._config.critic.get("slow_target", False):
+            self._slow_value_adv     = copy.deepcopy(self.value_adv)
+            self._value_adv_updates  = 0
+
+        # Director-style normalisers for extrinsic and AGAC advantages
+        norm_decay = _cfg_get(self._agac_cfg, "norm_decay", 0.99)
+        self.ret_norm_extr   = tools.Normalize("mean_std", decay=norm_decay)
+        self.ret_norm_agac   = tools.Normalize("mean_std", decay=norm_decay)
+        self.score_norm_extr = tools.Normalize("mean_std", decay=norm_decay)
+        self.score_norm_agac = tools.Normalize("mean_std", decay=norm_decay)
+        self.adv_norm_total  = tools.Normalize("mean_std", decay=norm_decay)
+
+    # Slow targets: main critic, AGAC critic, and old policies
     def _update_slow_target(self):
         """
-        Called once per behavior update.
-
-        1) Keeps ImagBehavior behavior for slow critic.
-        2) Additionally maintains slow actor/adversary if in EMA mode.
+        1) Update slow main critic (ImagBehavior logic).
+        2) Update slow AGAC critic.
+        3) Update slow actor/adversary if EMA mode.
         """
-        # 1) slow critic (ImagBehavior logic)
+        # 1) slow main critic
         if self._config.critic["slow_target"]:
             if self._updates % self._config.critic["slow_target_update"] == 0:
                 mix = self._config.critic["slow_target_fraction"]
@@ -555,7 +602,21 @@ class LatentAGACBehavior(ImagBehavior):
                     d.data = mix * s.data + (1 - mix) * d.data
             self._updates += 1
 
-        # 2) EMA old policies
+        # 2) slow AGAC critic
+        if hasattr(self, "_slow_value_adv"):
+            if (
+                self._value_adv_updates
+                % self._config.critic.get("slow_target_update", 1)
+                == 0
+            ):
+                mix = self._config.critic.get("slow_target_fraction", 1.0)
+                for s, d in zip(
+                    self.value_adv.parameters(), self._slow_value_adv.parameters()
+                ):
+                    d.data.mul_(1.0 - mix).add_(mix * s.data)
+            self._value_adv_updates += 1
+
+        # 3) EMA old policies
         if self._old_policy_mode == "ema":
             self._update_slow_policies_ema()
 
@@ -565,17 +626,14 @@ class LatentAGACBehavior(ImagBehavior):
         if self._agac_updates % self._slow_actor_update == 0:
             for s, d in zip(self.actor.parameters(), self._slow_actor.parameters()):
                 d.data.mul_(1.0 - mix).add_(mix * s.data)
-            for s, d in zip(self.adversary.parameters(), self._slow_adversary.parameters()):
+            for s, d in zip(
+                self.adversary.parameters(), self._slow_adversary.parameters()
+            ):
                 d.data.mul_(1.0 - mix).add_(mix * s.data)
         self._agac_updates += 1
 
     def _snapshot_policies(self):
-        """
-        Snapshot current actor/adversary into _slow_*.
-
-        This is closer to strict PPO/AGAC semantics:
-        freeze π_old once per batch, and use it for KL and adversary loss.
-        """
+        """Snapshot current actor/adversary into _slow_* (PPO-style π_old)."""
         self._slow_actor.load_state_dict(self.actor.state_dict())
         self._slow_adversary.load_state_dict(self.adversary.state_dict())
 
@@ -584,127 +642,119 @@ class LatentAGACBehavior(ImagBehavior):
         """
         Compute per-step KL and log-ratio δ_t between *slow* actor and adversary:
 
-          K_t    = D_KL(pi_slow(·|s_t) || adv_slow(·|s_t))
-          δ_t    = log pi_slow(a_t|s_t) − log adv_slow(a_t|s_t)
+          K_t    = D_KL(pi_slow(·|s_{t+1}) || adv_slow(·|s_{t+1}))
+          δ_t    = log pi_slow(a_t|s_{t+1}) − log adv_slow(a_t|s_{t+1})
 
-        Uses no gradients (π_old, adv_old are treated as fixed).
+        We use imag_feat[1:] so shapes align with reward[1:], discount[1:],
+        and value[:-1] when computing lambda-returns.
+
+        Returns:
+          K_t:      (T, B, 1)
+          delta_t:  (T, B, 1)
         """
+        # (T, B, feat)
         with torch.no_grad():
-            pi = self._slow_actor(imag_feat)
-            adv = self._slow_adversary(imag_feat)
+            pi  = self._slow_actor(imag_feat[:-1])
+            adv = self._slow_adversary(imag_feat[:-1])
 
-            a_sample = imag_action.detach()
-            logp_pi = pi.log_prob(a_sample)
+            a_sample = imag_action.detach()   # (T, B, act)
+            logp_pi  = pi.log_prob(a_sample)
             logp_adv = adv.log_prob(a_sample)
-            # shape (time, batch, 1)
-            delta_t = (logp_pi - logp_adv)[..., None]
-            inner_pi  = pi._dist           # ContDist._dist
-            inner_adv = adv._dist
 
-            # state-wise KL
+            # δ_t: per-sample log-ratio, shape (T,B,1)
+            delta_t = (logp_pi - logp_adv)[..., None]
+
+            inner_pi  = getattr(pi, "_dist", None)
+            inner_adv = getattr(adv, "_dist", None)
+
+            # Categorical case
             if hasattr(pi, "logits") and hasattr(adv, "logits"):
-                old_pi_distribution = Categorical(logits=pi.logits)
+                old_pi_distribution     = Categorical(logits=pi.logits)
                 adv_old_pi_distribution = Categorical(logits=adv.logits)
                 K_raw = kl_divergence(old_pi_distribution, adv_old_pi_distribution)  # (T,B)
-                K_t = K_raw[..., None]
-                
-            elif isinstance(inner_pi, Independent) and isinstance(inner_pi.base_dist, Normal):
+                K_t   = K_raw[..., None]  # (T,B,1)
+
+            # Gaussian case
+            elif (
+                isinstance(inner_pi, Independent)
+                and isinstance(inner_pi.base_dist, Normal)
+                and isinstance(inner_adv, Independent)
+                and isinstance(inner_adv.base_dist, Normal)
+            ):
                 base_pi  = inner_pi.base_dist
                 base_adv = inner_adv.base_dist
-                # KL over action dimensions, keep (T,B,1)
-                K_t_raw = kl_divergence(base_pi, base_adv)       # (T,B,action_dim)
-                K_t = K_t_raw.sum(-1, keepdim=True)              # (T,B,1)
+                K_t_raw  = kl_divergence(base_pi, base_adv)   # (T,B,action_dim)
+                K_t      = K_t_raw.sum(-1, keepdim=True)      # (T,B,1)
+            else:
+                # Fallback: approximate KL via log-ratio
+                K_t = (logp_pi - logp_adv)[..., None]
 
         return K_t, delta_t
 
-    def _horizon_kl_return(self, e_t, discount):
-        """
-        Discount-aware horizon KL:
-
-          G_t^KL = Σ_{n>=0} (γ_kl * discount_{t+n})^n * e_{t+n}
-
-        Args:
-          e_t:       (T, B, 1) per-step KL signal K_t
-          discount:  (T, B, 1) continuation discount from world model
-        """
-        T = e_t.shape[0]
-        G = torch.zeros_like(e_t)
-        running = torch.zeros_like(e_t[-1])
-        for t in reversed(range(T)):
-            running = e_t[t] + self._gamma_kl * discount[t] * running
-            G[t] = running
-        return G
-
-    # Main training: extends ImagBehavior._train with AGAC bonuses
-    def _train(
-        self,
-        start,
-        objective,
-    ):
+    # Main training: multi-critic actor + two critic losses
+    def _train(self, start, objective):
         """
         start: posterior states from WorldModel._train.
         objective: function(imag_feat, imag_state, imag_action) -> reward_t.
 
-        Behavior:
-          - Always calls ImagBehavior._compute_target and _compute_actor_loss
-            as the base Dreamer actor-critic.
-          - Adds AGAC-style extra policy gradients on top:
-              * recursive: log π * beta_delta * δ_t
-              * actor_horizon: log π * beta_kl * G_t^KL
-          - Uses slow actor/adversary for KL and δ_t.
+        Two critics:
+          - self.value:      extrinsic value V_extr(s)
+          - self.value_adv:  KL critic    V_agac(s)
+
+        Actor:
+          - Base Dreamer loss from _compute_actor_loss (extrinsic only).
+          - Extra REINFORCE bonus from combined advantage:
+                A_hat_t = AdvNorm_total(A_extr_t + beta_kl * A_agac_t)
+          - Optional δ bonus: beta_delta * δ_t.
         """
-        # 1) slow critic + (if EMA) slow policies
+        # 1) Update slow targets and EMA policies
         self._update_slow_target()
-        # 2) snapshot old policies if requested
+        # 2) Snapshot old policies if requested
         if self._old_policy_mode == "snapshot":
             self._snapshot_policies()
 
         metrics = {}
+        use_agac_critic = (self._kl_mode != "none") and (self._beta_kl > 0.0)
 
-        # Actor (Dreamer + AGAC bonus) 
-        with tools.RequiresGrad(self.actor), tools.RequiresGrad(self.adversary):
+        # ----------------- Actor + AGAC critic forward -----------------
+        with tools.RequiresGrad(self.actor), tools.RequiresGrad(self.adversary), tools.RequiresGrad(self.value_adv):
             with torch.amp.autocast("cuda", enabled=self._use_amp):
                 # Imagine rollout in latent space
                 imag_feat, imag_state, imag_action = self._imagine(
                     start, self.actor, self._config.imag_horizon
                 )
+                # reward: (T+1, B, 1)
                 reward = objective(imag_feat, imag_state, imag_action)
+
+                # Entropies
                 actor_ent = self.actor(imag_feat).entropy()
                 state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
 
-                # For actor_horizon we need discount explicitly
-                if self._kl_mode == "actor_horizon":
-                    if "cont" in self._world_model.heads:
-                        inp = self._world_model.dynamics.get_feat(imag_state)
-                        discount = (
-                            self._config.discount
-                            * self._world_model.heads["cont"](inp).mean
-                        )
-                    else:
-                        discount = self._config.discount * torch.ones_like(reward)
+                # Discount from continuation model (for AGAC critic & weights)
+                if "cont" in self._world_model.heads:
+                    inp = self._world_model.dynamics.get_feat(imag_state)
+                    discount = (
+                        self._config.discount
+                        * self._world_model.heads["cont"](inp).mean
+                    )
                 else:
-                    discount = None
+                    discount = self._config.discount * torch.ones_like(reward)
 
-                # KL terms (only if any KL mode is active)
+                # KL and δ terms if AGAC is active
                 if self._kl_mode != "none":
                     K_t, delta_t = self._compute_kl_terms(imag_feat, imag_action)
                 else:
                     K_t, delta_t = None, None
 
-                # Critic reward:
-                #  - recursive: r + beta_kl * K_t (KL-shaped MDP)
-                #  - others:    pure extrinsic reward
-                if self._kl_mode == "recursive" and K_t is not None:
-                    reward_for_critic = reward + self._beta_kl * K_t
-                else:
-                    reward_for_critic = reward
-
-                # Base Dreamer target, weights, baseline (uses reward_for_critic)
+                # -------------- Base Dreamer target + actor loss --------------
+                # Uses extrinsic reward only
                 target, weights, base = self._compute_target(
-                    imag_feat, imag_state, reward_for_critic
+                    imag_feat, imag_state, reward
                 )
+                # target: list length T, each (B,1)
+                # weights: (T+1,B,1)
+                # base: (T,B,1)
 
-                # Base Dreamer actor loss (dynamics / reinforce / both)
                 actor_loss_main, mets = self._compute_actor_loss(
                     imag_feat,
                     imag_action,
@@ -713,86 +763,140 @@ class LatentAGACBehavior(ImagBehavior):
                     base,
                 )
 
-                # Extra AGAC policy gradient
-                # We add an extra REINFORCE-style term:
-                #   L_bonus ~ - E[ weights * log π(a|s) * bonus_adv_t ]
-                # where bonus_adv_t is:
-                #   - beta_kl * G_t^KL   for actor_horizon
-                #   - beta_delta * δ_t   for recursive
-                actor_loss_bonus = 0.0
-                if self._kl_mode in ["actor_horizon", "recursive"]:
-                    policy = self.actor(imag_feat.detach())
-                    logp = policy.log_prob(imag_action)  # (T,B) or (T,B,1)
-                    # Align shapes to (T-1, B, 1) as in ImagBehavior
-                    logp = logp[:-1]
-                    if logp.ndim == 2:
-                        logp = logp[:, :, None]
+                # -------------- Extrinsic advantage for multi-critic ----------
+                # Stack λ-returns for extrinsic stream: (T,B,1)
+                extr_returns = torch.stack(target, dim=0)          # (T,B,1)
+                extr_baseline = base.detach()                      # (T,B,1)
 
-                    if self._kl_mode == "actor_horizon":
-                        # Discount-aware horizon KL bonus, critic stays extrinsic
-                        assert K_t is not None and discount is not None
-                        G_kl = self._horizon_kl_return(K_t, discount)  # (T,B,1)
-                        bonus_adv = self._beta_kl * G_kl[1:].detach()  # (T-1,B,1)
-                    elif self._kl_mode == "recursive":
-                        # Log-ratio δ_t bonus (AGAC-style)
-                        assert delta_t is not None
-                        bonus_adv = self._beta_delta * delta_t[1:].detach()  # (T-1,B,1)
-                    else:
-                        bonus_adv = None
+                extr_ret_norm  = self.ret_norm_extr(extr_returns)
+                extr_base_norm = self.ret_norm_extr(extr_baseline, update=False)
+                adv_extr       = self.score_norm_extr(extr_ret_norm - extr_base_norm)
 
-                    if bonus_adv is not None:
-                        actor_target_bonus = logp * bonus_adv
-                        actor_loss_bonus = -weights[:-1] * actor_target_bonus
+                # -------------- AGAC critic stream (KL rewards) ---------------
+                if use_agac_critic and (K_t is not None):
+                    agac_value_pred = self.value_adv(imag_feat).mode()  # (T+1,B,1ish)
+                    discount_kl     = self._gamma_kl * discount          # (T+1,B,1)
 
-                # Ensure same shape as main actor_loss tensor
-                if not torch.is_tensor(actor_loss_bonus):
-                    # scalar 0.0 -> broadcastable tensor of zeros
-                    actor_loss_bonus = torch.zeros_like(actor_loss_main)
+                    # KL rewards K_t are (T,B,1) aligned with imag_feat, imag_action.
+                    # We treat K_t as "step rewards" for t=0..T-1, and use
+                    # discount_kl[1:] as pcont, mirroring Dreamer's λ-return.
+                    agac_returns = tools.lambda_return(
+                        K_t,                                     # (T,B,1)
+                        agac_value_pred[:-1],                   # (T,B,1)
+                        discount_kl[1:],                        # (T,B,1)
+                        agac_value_pred[-1],                    # (B,1)
+                        lambda_=self._config.discount_lambda,
+                        axis=0,
+                    )                                           # list of T tensors
 
-                # Combine main + bonus, then add entropy and reduce
-                actor_loss = actor_loss_main + actor_loss_bonus
-                actor_loss -= (
+                    agac_baseline = agac_value_pred[:-1].detach()  # (T,B,1)
+
+                    agac_ret_stack = torch.stack(agac_returns, dim=0)  # (T,B,1)
+                    agac_ret_norm  = self.ret_norm_agac(agac_ret_stack)
+                    agac_base_norm = self.ret_norm_agac(agac_baseline, update=False)
+                    adv_agac       = self.score_norm_agac(
+                        agac_ret_norm - agac_base_norm
+                    )
+
+                    combined_adv = adv_extr + self._beta_kl * adv_agac
+                else:
+                    agac_returns = None
+                    combined_adv = adv_extr
+
+                # Final combined advantage, normalised once more
+                final_adv = self.adv_norm_total(combined_adv)      # (T,B,1)
+
+                # -------------- Extra REINFORCE actor bonus -------------------
+                # Log prob of actions under current actor: (T,B) or (T,B,1)
+                policy_dist = self.actor(imag_feat[:-1].detach())
+                logp = policy_dist.log_prob(imag_action)
+                if logp.ndim == 2:
+                    logp = logp[:, :, None]                        # (T,B,1)
+
+                # Use weights[:-1] to match Dreamer time indexing (T,B,1)
+
+                # Multi-critic REINFORCE term: -w_t * logπ * A_hat_t
+                actor_loss_mc = -weights[:-1] * logp * final_adv.detach()
+
+                # δ bonus: -w_t * logπ * beta_delta * δ_t
+                if (self._beta_delta > 0.0) and (delta_t is not None):
+                    bonus_adv  = self._beta_delta * delta_t.detach()   # (T,B,1)
+                    actor_loss_delta = -weights[:-1] * logp * bonus_adv
+                else:
+                    actor_loss_delta = torch.zeros_like(actor_loss_mc)
+
+                # Total actor loss tensor (time-by-batch):
+                actor_loss_total = actor_loss_main + actor_loss_mc + actor_loss_delta
+
+                # Entropy regularisation (Dreamer style)
+                actor_loss_total -= (
                     self._config.actor["entropy"] * actor_ent[:-1, ..., None]
                 )
-                actor_loss = torch.mean(actor_loss)
 
+                # Reduce over time and batch
+                actor_loss = torch.mean(actor_loss_total)
+
+                # Metrics from actor
                 metrics.update(mets)
-                metrics["actor_loss_main"] = to_np(actor_loss_main.mean())
-                metrics["actor_loss_bonus"] = to_np(actor_loss_bonus.mean())
-                metrics["actor_entropy"] = to_np(actor_ent.mean())
-                metrics["imag_state_entropy"] = to_np(state_ent.mean())
+                metrics["actor_loss_main_dreamer"] = to_np(actor_loss_main.mean())
+                metrics["actor_loss_mc"]           = to_np(actor_loss_mc.mean())
+                metrics["actor_loss_delta"]        = to_np(actor_loss_delta.mean())
+                metrics["actor_entropy"]           = to_np(actor_ent.mean())
+                metrics["imag_state_entropy"]      = to_np(state_ent.mean())
+
+                # Save targets for critics (unnormalised)
+                extr_target_stack = torch.stack(target, dim=1)  # (B,T,1)
+                if agac_returns is not None:
+                    agac_target_stack = torch.stack(agac_returns, dim=1)  # (B,T,1)
+                else:
+                    agac_target_stack = None
                 value_input = imag_feat
 
-        # Critic (Dreamer, possibly shaped) 
+        # ----------------- Critic updates -----------------
+        # Main extrinsic critic (self.value)
         with tools.RequiresGrad(self.value):
             with torch.amp.autocast("cuda", enabled=self._use_amp):
-                value = self.value(value_input[:-1].detach())
-                target_tensor = torch.stack(target, dim=1)
-                value_loss = -value.log_prob(target_tensor.detach())
-                slow_target = self._slow_value(value_input[:-1].detach())
-                if self._config.critic["slow_target"]:
-                    value_loss -= value.log_prob(slow_target.mode().detach())
+                val_dist = self.value(value_input[:-1].detach())
+                value_loss = -val_dist.log_prob(extr_target_stack.detach())
+                if self._config.critic.get("slow_target", False):
+                    slow_val_dist = self._slow_value(value_input[:-1].detach())
+                    value_loss -= val_dist.log_prob(slow_val_dist.mode().detach())
+                # weights[:-1] again (T,B,1), value_loss -> (B,T) or (B,T,1)
                 value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
-        # ----------------- Adversary (track old actor) -----------------
+        # AGAC critic on KL stream
+        if use_agac_critic and (agac_target_stack is not None):
+            with tools.RequiresGrad(self.value_adv):
+                with torch.amp.autocast("cuda", enabled=self._use_amp):
+                    agac_dist = self.value_adv(value_input[:-1].detach())
+                    agac_value_loss = -agac_dist.log_prob(agac_target_stack.detach())
+                    if hasattr(self, "_slow_value_adv"):
+                        slow_agac_dist = self._slow_value_adv(
+                            value_input[:-1].detach()
+                        )
+                        agac_value_loss -= agac_dist.log_prob(
+                            slow_agac_dist.mode().detach()
+                        )
+                    agac_value_loss = torch.mean(
+                        weights[:-1] * agac_value_loss[:, :, None]
+                    )
+        else:
+            agac_value_loss = torch.tensor(0.0, device=self._config.device)
+
+        # ----------------- Adversary update -----------------
         with tools.RequiresGrad(self.adversary):
             with torch.amp.autocast("cuda", enabled=self._use_amp):
-                # 1) Get old actor distribution (no grads)
                 with torch.no_grad():
                     pi_old = self._slow_actor(imag_feat.detach())
-
-                # 2) Current adversary distribution (we DO want grads here)
                 adv_dist = self.adversary(imag_feat.detach())
 
-                # ---- Discrete case: exact Categorical KL ----
+                # Discrete case
                 if hasattr(pi_old, "logits") and hasattr(adv_dist, "logits"):
-                    p = Categorical(logits=pi_old.logits)   # π_old
-                    q = Categorical(logits=adv_dist.logits) # π_adv
-                    kl = kl_divergence(p, q)                # (T,B)
-                    adv_loss = torch.mean(kl)               # scalar
-
+                    p  = Categorical(logits=pi_old.logits)
+                    q  = Categorical(logits=adv_dist.logits)
+                    kl_val  = kl_divergence(p, q)    # (T,B)
+                    adv_loss = torch.mean(kl_val)
                 else:
-                    # ---- Continuous Gaussian case: exact Normal KL if possible ----
                     inner_pi  = getattr(pi_old, "_dist", None)
                     inner_adv = getattr(adv_dist, "_dist", None)
                     if (
@@ -801,37 +905,32 @@ class LatentAGACBehavior(ImagBehavior):
                         and isinstance(inner_adv, Independent)
                         and isinstance(inner_adv.base_dist, Normal)
                     ):
-                        base_pi  = inner_pi.base_dist      # Normal(loc_old, scale_old)
-                        base_adv = inner_adv.base_dist     # Normal(loc_adv, scale_adv)
-                        # KL over action dims: (T,B,action_dim) -> (T,B)
-                        kl_raw = kl_divergence(base_pi, base_adv)   # (T,B,action_dim)
-                        kl = kl_raw.sum(-1)                         # (T,B)
-                        adv_loss = torch.mean(kl)                   # scalar
+                        base_pi  = inner_pi.base_dist
+                        base_adv = inner_adv.base_dist
+                        kl_raw   = kl_divergence(base_pi, base_adv)  # (T,B,act_dim)
+                        kl_val   = kl_raw.sum(-1)                    # (T,B)
+                        adv_loss = torch.mean(kl_val)
                     else:
-                        # Fallback: MC estimate as before
                         a_sample = imag_action.detach()
                         logp_old = pi_old.log_prob(a_sample)
                         logp_adv = adv_dist.log_prob(a_sample)
                         adv_loss = torch.mean(logp_old - logp_adv)
 
-        # ----------------- Optimizer steps & metrics -----------------
+        # ----------------- Optimizer steps & logging -----------------
         with tools.RequiresGrad(self):
             metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
+            if use_agac_critic and (agac_target_stack is not None):
+                metrics.update(
+                    self._value_adv_opt(agac_value_loss, self.value_adv.parameters())
+                )
             metrics.update(self._adv_opt(adv_loss, self.adversary.parameters()))
 
-        metrics["actor_loss"] = to_np(actor_loss)
-        metrics["value_loss"] = to_np(value_loss)
-        metrics["adv_loss"] = to_np(adv_loss)
-        metrics["kl_mode"] = {
-            "none": 0.0,
-            "recursive": 1.0,
-            "actor_horizon": 2.0,
-        }[self._kl_mode]
-        metrics["old_policy_mode"] = {
-            "ema": 0.0,
-            "snapshot": 1.0,
-        }[self._old_policy_mode]
+        metrics["actor_loss"]      = to_np(actor_loss)
+        metrics["value_loss"]      = to_np(value_loss)
+        metrics["agac_value_loss"] = to_np(agac_value_loss)
+        metrics["adv_loss"]        = to_np(adv_loss)
+        metrics["kl_mode"]         = {"none": 0.0, "recursive": 1.0}[self._kl_mode]
+        metrics["old_policy_mode"] = {"ema": 0.0, "snapshot": 1.0}[self._old_policy_mode]
 
-        # Same return signature as ImagBehavior._train
         return imag_feat, imag_state, imag_action, weights, metrics

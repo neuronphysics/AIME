@@ -32,7 +32,7 @@ from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoenc
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
 from torch.utils.data._utils.collate import default_collate
 from VRNN.grad_diagnostics import GradDiagnosticsAggregator  
- 
+from contextlib import contextmanager
 import matplotlib
 from pathlib import Path
 os.environ["MPLBACKEND"] = "Agg" 
@@ -43,6 +43,30 @@ print("Script dir:", SCRIPT_DIR)
 print("Parent dir:", PARENT_DIR)
 matplotlib.use("Agg", force=True)
 plt.ioff()
+
+
+
+@contextmanager
+def disable_all_checkpoint_modules(model: torch.nn.Module):
+    """
+    Temporarily sets .use_checkpoint = False for all submodules of `model`
+    that define this attribute, then restores the original flags.
+    """
+    modules = []
+    flags = []
+
+    for m in model.modules():
+        if hasattr(m, "use_checkpoint"):
+            modules.append(m)
+            flags.append(m.use_checkpoint)
+            m.use_checkpoint = False
+
+    try:
+        yield
+    finally:
+        for m, flag in zip(modules, flags):
+            m.use_checkpoint = flag
+
 def safe_collate(batch):
     all_keys = set().union(*(b.keys() for b in batch))
     out = {}
@@ -836,7 +860,7 @@ class GradientMonitor:
         total_grad = sum(values)
         percentages = [v/total_grad * 100 for v in values]
         ax2.pie(percentages, labels=components, autopct='%1.1f%%', colors=colors)
-        ax2.set_title('Relative Gradient Contribution')
+        ax2.set_title('Relative Gradient Contribution', y=-0.2)
         
         self.writer.add_figure('gradient_analysis/component_distribution', fig, epoch)
         plt.close()
@@ -1209,115 +1233,112 @@ class DMCVBTrainer:
     ):
         """
         One-shot gradient diagnostics on a tiny (B,T) slice to avoid OOM.
+
+        IMPORTANT: This version just measures gradients w.r.t. whatever is currently
+        trainable under your normal training configuration.
         """
 
-        # Set model to train mode for gradient computation
-        self.model.eval()
-        
-        # Explicitly enable gradients for all parameters
-        for param in self.model.parameters():
-            param.requires_grad_(True)
-
-        if hasattr(self.model, "perceiver_model"):
-            self.model.perceiver_model.train()
-            for param in self.model.perceiver_model.parameters():
-                param.requires_grad_(True)
-
-        if hasattr(self.model, "_rnn") and isinstance(getattr(self.model, "_rnn"), torch.nn.Module):
-            self.model._rnn.train()
-            for param in self.model._rnn.parameters():
-                param.requires_grad_(True)
-
-        torch.cuda.empty_cache()
-
-        batch = next(iter(self.eval_loader))
-
-        # Slice to tiny B,T to keep Perceiver + RNN tiny
-        obs = batch["observations"][:max_B, :max_T].contiguous().to(self.device, non_blocking=True)
-        act = batch["actions"][:max_B, :max_T].contiguous().to(self.device, non_blocking=True)
-
-        amp_ctx = (torch.amp.autocast('cuda',dtype=torch.bfloat16) if use_amp else contextlib.nullcontext())
-        with torch.set_grad_enabled(True), amp_ctx:
-            # Ensure we're computing gradients
-            obs.requires_grad_(True)
-            act.requires_grad_(True)
-            
-            vae_losses, outputs = self.model.compute_total_loss(
-                obs, act,
-                beta=self.config['beta'],                  
-                entropy_weight=self.config['entropy_weight'],
-                lambda_recon=self.config['lambda_recon'],
-                lambda_att_dyn=self.config['lambda_att_dyn'],
-                lambda_gram=self.config.get('lambda_gram', 0.0),
-            )
-
-            # Ensure all losses require gradients
-            elbo_loss = (
-                self.config['lambda_recon'] * vae_losses['recon_loss']
-                + self.config['beta'] * vae_losses['kl_z']
-                + self.config['beta'] * vae_losses['hierarchical_kl']
-                - self.config['entropy_weight'] * vae_losses['cluster_entropy']
-                + self.config.get('lambda_gram', 0.0) * vae_losses['gram_enc_loss']
-            )
-            
-            # Make sure all losses are attached to the computation graph
-            perceiver_loss = vae_losses['perceiver_loss'].requires_grad_(True)
-            predictive_loss = vae_losses['attention_loss'].requires_grad_(True)
-
-            if include_adv_in_diag and hasattr(self.model, "image_discriminator"):
-                recon = outputs["reconstructions"]       # [B,T,C,H,W]
-                z_seq = outputs["latents"]              # or outputs["z_seq"] 
-                D = self.model.image_discriminator
-
-                # Temporarily enable gradients for discriminator
-                for p in D.parameters():
-                    p.requires_grad_(False)
-
-                fake = D(recon, z=z_seq, return_features=True)
-                adv_loss = -fake["final_score"].mean().requires_grad_(True)
-
-                # restore
-                for p in D.parameters():
-                    p.requires_grad_(True)
-            else:
-                adv_loss = torch.zeros((), device=obs.device, requires_grad=True)
-
-            task_losses = [elbo_loss, perceiver_loss, predictive_loss, adv_loss]
-            
-            # Verify all losses require gradients
-            for i, loss in enumerate(task_losses):
-                if not loss.requires_grad:
-                    task_losses[i] = loss.requires_grad_(True)
-
-            assert len(task_losses) == 4, f"Expected 4 losses, got {len(task_losses)}"
-            named_params = list(self.model.named_parameters())
-
-            self._agg.update(
-                self.model,
-                shared_repr=None,
-                task_losses=task_losses,
-                named_params=named_params,
-                param_patterns=None,  # or None to include ALL trainable params
-            )
-
-        # Log the figures once (cosine heatmap, etc.)
-        self._agg.tensorboard_log(self.writer, tag_prefix="diag/grads", global_step=getattr(self.grad_monitor, "global_step", 0))
-        
-        # Clean up computation graph to free VRAM immediately
-        for k, v in list(outputs.items()):
-            if isinstance(v, torch.Tensor):
-                outputs[k] = v.detach().cpu()   # sever graph + move off GPU
-            elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
-                outputs[k] = [t.detach().cpu() for t in v]
-
-        # Clean up computation graph
-        self.model.zero_grad(set_to_none=True)
-        
-        # Restore model to its original state (train mode for training)
+        # Remember original train/eval mode and then use train-mode for diag
+        was_training = self.model.training
         self.model.train()
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        try:
+            # One tiny batch from eval_loader
+            batch = next(iter(self.eval_loader))
+            obs = batch["observations"][:max_B, :max_T].contiguous().to(
+                self.device, non_blocking=True
+            )
+            act = batch["actions"][:max_B, :max_T].contiguous().to(
+                self.device, non_blocking=True
+            )
+
+            # Clear any stale grads
+            self.model.zero_grad(set_to_none=True)
+
+            amp_ctx = (
+                torch.amp.autocast("cuda", dtype=torch.bfloat16)
+                if (use_amp and self.device.type == "cuda")
+                else contextlib.nullcontext()
+            )
+
+            with disable_all_checkpoint_modules(self.model), torch.set_grad_enabled(True), amp_ctx:
+                vae_losses, outputs = self.model.compute_total_loss(
+                    obs,
+                    act,
+                    beta=self.config["beta"],
+                    entropy_weight=self.config["entropy_weight"],
+                    lambda_recon=self.config["lambda_recon"],
+                    lambda_att_dyn=self.config["lambda_att_dyn"],
+                    lambda_gram=self.config.get("lambda_gram", 0.0),
+                )
+
+                # Same ELBO combination you use elsewhere
+                elbo_loss = (
+                    self.config["lambda_recon"] * vae_losses["recon_loss"]
+                    + self.config["beta"] * vae_losses["kl_z"]
+                    + self.config["beta"] * vae_losses["hierarchical_kl"]
+                    - self.config["entropy_weight"] * vae_losses["cluster_entropy"]
+                    + self.config["lambda_gram"] * vae_losses["gram_enc_loss"]
+                )
+
+                perceiver_loss = vae_losses["perceiver_loss"]
+                predictive_loss = vae_losses["attention_loss"]
+
+                # Optional adversarial term – we DO NOT want grads into D's params
+                if include_adv_in_diag and hasattr(self.model, "image_discriminator"):
+                    D = self.model.image_discriminator
+
+                    # Snapshot original flags and temporarily freeze D params
+                    disc_flags = [p.requires_grad for p in D.parameters()]
+                    for p in D.parameters():
+                        p.requires_grad_(False)
+
+                    recon = outputs["reconstructions"]
+                    z_seq = outputs.get("latents", outputs.get("z_seq", None))
+
+                    fake = D(recon, z=z_seq, return_features=True)
+                    adv_loss = -fake["final_score"].mean()
+
+                    # Restore original flags
+                    for p, flag in zip(D.parameters(), disc_flags):
+                        p.requires_grad_(flag)
+                else:
+                    adv_loss = torch.zeros((), device=obs.device)
+
+                task_losses = [elbo_loss, perceiver_loss, predictive_loss, adv_loss]
+
+                # Let GradDiagnosticsAggregator handle backward() etc.
+                named_params = list(self.model.named_parameters())
+                self._agg.update(
+                    self.model,
+                    shared_repr=None,
+                    task_losses=task_losses,
+                    named_params=named_params,
+                    param_patterns=None,  # track all trainable params
+                )
+
+            # Log cosines, norms, etc.
+            if self.writer is not None:
+                self._agg.tensorboard_log(
+                    self.writer,
+                    tag_prefix="diag/grads",
+                    global_step=getattr(self.grad_monitor, "global_step", 0),
+                )
+
+        finally:
+            # detach outputs if you log them
+            for k, v in list(outputs.items()):
+                if isinstance(v, torch.Tensor):
+                    outputs[k] = v.detach().cpu()
+                elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                    outputs[k] = [t.detach().cpu() for t in v]
+            # Hard reset grads + restore train/eval mode
+            self.model.zero_grad(set_to_none=True)
+            self.model.train(was_training)
+
+            gc.collect()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
     def compute_psnr(self, original: torch.Tensor, reconstructed: torch.Tensor) -> torch.Tensor:
         """Compute Peak Signal-to-Noise Ratio"""
@@ -1837,7 +1858,7 @@ def main():
         'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
-        'batch_size': 20,
+        'batch_size': 19,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
@@ -1858,6 +1879,7 @@ def main():
         'lambda_img': 1.0,
         'lambda_recon': 1.0,
         'lambda_att_dyn': 0.95,
+        "lambda_gram": 0.05,
         'grad_clip': 5,
         'n_critic': 1,
         

@@ -88,20 +88,21 @@ class AbsWeighting(nn.Module):
                     grads[tn] = self.rep_tasks[task].grad.data.clone()
         return grads
 
+
     def _reset_grad(self, new_grads):
         """Reset shared parameter gradients to new values."""
-        count = 0
-        for p in self.get_share_params():
-            if p.grad is not None:
-                beg = 0 if count == 0 else sum(self.grad_index[:count])
-                end = sum(self.grad_index[:(count+1)])
-                slice_ = new_grads[beg:end].contiguous().view_as(p).to(p.device, p.dtype)
-                if p.grad is None:
-                    p.grad = slice_.detach().clone()
-                else:
-                    p.grad.detach_()
-                    p.grad.copy_(slice_)
-            count += 1
+        offset = 0
+        for p, n in zip(self.get_share_params(), self.grad_index):
+            slice_ = new_grads[offset: offset + n].contiguous()
+            offset += n
+
+            slice_ = slice_.view_as(p).to(p.device, p.dtype)
+
+            if p.grad is None:
+                p.grad = slice_.detach().clone()
+            else:
+                p.grad.detach_()
+                p.grad.copy_(slice_)
             
     def _get_grads(self, losses, mode='backward'):
         """Returns gradients of representations or shared parameters."""
@@ -460,3 +461,46 @@ class RGB(AbsWeighting):
 
         # Return equal weights (RGB doesn't use adaptive task weighting)
         return np.ones(T)
+
+class GradNorm(AbsWeighting):
+    r"""Gradient Normalization (GradNorm).
+    
+    This method is proposed in `GradNorm: Gradient Normalization for Adaptive Loss Balancing in Deep Multitask Networks (ICML 2018) <http://proceedings.mlr.press/v80/chen18a/chen18a.pdf>`_ \
+    and implemented by us.
+
+    Args:
+        alpha (float, default=1.5): The strength of the restoring force which pulls tasks back to a common training rate.
+
+    """
+    def __init__(self):
+        super(GradNorm, self).__init__()
+        
+    def init_param(self):
+        self.loss_scale = nn.Parameter(torch.tensor([1.0]*self.task_num, device=self.device))
+        
+    def backward(self, losses, **kwargs):
+        alpha = kwargs['alpha']
+        if self.epoch >= 1:
+            loss_scale = self.task_num * F.softmax(self.loss_scale, dim=-1)
+            grads = self._get_grads(losses, mode='backward')
+            if self.rep_grad:
+                per_grads, grads = grads[0], grads[1]
+                
+            G_per_loss = torch.norm(loss_scale.unsqueeze(1)*grads, p=2, dim=-1)
+            G = G_per_loss.mean(0)
+            L_i = torch.Tensor([losses[tn].item()/self.train_loss_buffer[tn, 0] for tn in range(self.task_num)]).to(self.device)
+            r_i = L_i/L_i.mean()
+            constant_term = (G*(r_i**alpha)).detach()
+            L_grad = (G_per_loss-constant_term).abs().sum(0)
+            L_grad.backward()
+            loss_weight = loss_scale.detach().clone()
+            
+            if self.rep_grad:
+                self._backward_new_grads(loss_weight, per_grads=per_grads)
+            else:
+                self._backward_new_grads(loss_weight, grads=grads)
+            return loss_weight.cpu().numpy()
+        else:
+            loss = torch.mul(losses, torch.ones_like(losses).to(self.device)).sum()
+            loss.backward()
+            return np.ones(self.task_num)

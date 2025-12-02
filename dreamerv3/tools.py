@@ -1026,3 +1026,69 @@ def recursively_load_optim_state_dict(obj, optimizers_state_dicts):
         for key in keys:
             obj_now = getattr(obj_now, key)
         obj_now.load_state_dict(state_dict)
+
+
+class Normalize(nn.Module):
+    """Running mean and standard deviation normalizer.
+
+    This module maintains an exponential moving average of the mean and
+    squared mean of the incoming values.  On each call, if `update` is
+    True, the statistics are updated.  The returned tensor is normalized
+    according to the stored statistics.  This behaviour mirrors the
+    `Normalize` class used by Director to stabilise multiple reward streams.
+    """
+
+    def __init__(self, impl='mean_std', decay=0.99, max_val=1e8, vareps=0.0, stdeps=0.0):
+        super().__init__()
+        assert impl in ('mean_std', 'std', 'off'), impl
+        self.impl = impl
+        self.decay = decay
+        self.max_val = max_val
+        self.vareps = vareps
+        self.stdeps = stdeps
+        # Use double precision for accumulators for numerical stability
+        self.register_buffer('mean', torch.zeros((), dtype=torch.float64))
+        self.register_buffer('sqrs', torch.zeros((), dtype=torch.float64))
+        self.register_buffer('step', torch.tensor(0, dtype=torch.long))
+
+    def update(self, values):
+        # Flatten across all but the last dimensions and accumulate
+        x = values.to(dtype=torch.float64)
+        m = self.decay
+        self.step += 1
+        # compute batch mean and squared mean
+        batch_mean = x.mean().detach()
+        batch_sqrs = (x ** 2).mean().detach()
+        self.mean.mul_(m).add_((1 - m) * batch_mean)
+        self.sqrs.mul_(m).add_((1 - m) * batch_sqrs)
+
+    def transform(self, values):
+        # Correction compensates for bias during the warmup phase
+        if self.step.item() == 0:
+            correction = 1.0
+        else:
+            correction = 1.0 - (self.decay ** self.step.item())
+        mean = self.mean / correction
+        var = (self.sqrs / correction) - mean ** 2
+        # Compute scale from variance.  The original implementation
+        # optionally caps the scale at `max_val` to avoid exploding normals.
+        if self.max_val > 0.0:
+            # Prevent division by zero or extremely small variance
+            denom = torch.maximum(var, torch.tensor(1.0 / (self.max_val ** 2) + self.vareps, dtype=var.dtype, device=var.device)) + self.stdeps
+            scale = torch.rsqrt(denom)
+        else:
+            scale = torch.rsqrt(var + self.vareps) + self.stdeps
+        # Normalise input depending on chosen implementation
+        if self.impl == 'off':
+            return values
+        elif self.impl == 'mean_std':
+            return (values - mean.to(values.dtype)) * scale.to(values.dtype)
+        elif self.impl == 'std':
+            return values * scale.to(values.dtype)
+        else:
+            raise NotImplementedError(self.impl)
+
+    def forward(self, values, update=True):
+        if update:
+            self.update(values)
+        return self.transform(values)

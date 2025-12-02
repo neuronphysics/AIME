@@ -1,7 +1,7 @@
 results
 __pycache__
 sbatch_scripts
-results*
+results/
 result*
 logdir*
 logs/

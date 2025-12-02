@@ -1471,72 +1471,103 @@ class PerceiverTokenPredictor(nn.Module):
         #   For a future timestep τ:
         #     z_GT      = quantized GT latent for frame τ
         #     z_AR      = expected latent from AR logits at τ
-        #     z_cycle   = encode(decode(z_AR))  through frozen VQ
-        #     L_cycle   = || z_GT - z_cycle ||^2
+        #     z_cycle   = encode(decode(z_AR)) through DVAE+VQ
+        #     L_cycle   = 1 - cos(z_GT, z_cycle)
+        #
+        # IMPORTANT: we do not want AR cycle to update DVAE or VQ parameters.
+        # We snapshot their requires_grad flags, freeze them inside this block,
+        # and then restore whatever state they had before.
 
         cycle_consistence_loss = torch.tensor(0.0, device=device)
         if ar_cycle_consistency_weight > 0.0:
-            if not self.freeze_vq_at_init:
-                self.freeze_VQPT_tokenizer()
+            # --- snapshot + freeze DVAE and VQ ---
+            orig_flags = {}
+            dvae = getattr(self.tokenizer, "dvae", None)
+            vq   = getattr(self.tokenizer, "vq",   None)
 
-            Bq, T_enc2, D, Ht_q, Wt_q = quantized.shape
-            assert Bq == B and Ht_q == Ht and Wt_q == Wt, "Quantized shape mismatch"
+            if dvae is not None:
+                for name, p in dvae.named_parameters():
+                    if p.requires_grad:
+                       key = f"dvae.{name}"
+                       orig_flags[key] = p.requires_grad
+                       p.requires_grad_(False)
 
-            # context + target tokens in encoder space
-            T_tokens = T_enc2
-            T_context_tokens = T_tokens - T_pred
-            assert T_context_tokens > 0, "No context tokens for AR cycle consistency"
+            if vq is not None:
+                for name, p in vq.named_parameters():
+                    if p.requires_grad:
+                       key = f"vq.{name}"
+                       orig_flags[key] = p.requires_grad
+                       p.requires_grad_(False)
 
-            # choose a random future step index in [0, T_pred)
-            t_idx = torch.randint(
-                low=0, high=T_pred, size=(1,), device=device
-            ).item()
+            try:
+                Bq, T_enc2, D, Ht_q, Wt_q = quantized.shape
+                assert Bq == B and Ht_q == Ht and Wt_q == Wt, "Quantized shape mismatch"
 
-            # ground-truth latent at that step: (B, D, Ht, Wt)
-            z_gt = quantized[:, T_context_tokens + t_idx]
-            z_gt = z_gt.detach()   # do not backprop into VQ encoder
+                # context + target tokens in encoder space
+                T_tokens         = T_enc2
+                T_context_tokens = T_tokens - T_pred
+                assert T_context_tokens > 0, "No context tokens for AR cycle consistency"
 
-            # get "soft" AR latent from logits via codebook expectation
-            logits_step = logits[:, t_idx]          # (B, Ht, Wt, V)
-            probs_step  = F.softmax(logits_step, dim=-1)
-            probs_flat  = rearrange(probs_step, "b h w v -> (b h w) v")
+                # choose a random future step index in [0, T_pred)
+                t_idx = torch.randint(
+                    low=0, high=T_pred, size=(1,), device=device
+                ).item()
 
-            # codebook: (V, D)
-            codebook = self.tokenizer.vq.codebook.to(device)
+                # ground-truth latent at that step: (B, D, Ht, Wt)
+                z_gt = quantized[:, T_context_tokens + t_idx]
+                z_gt = z_gt.detach()   # no gradient into VQ encoder
 
-            # expected embedding per spatial location
-            z_pred_flat = probs_flat @ codebook      # (B*H*W, D)
-            # reshape to (B, D, Ht, Wt)
-            z_pred = rearrange(
-                z_pred_flat,
-                "(b h w) d -> b d h w",
-                b=B,
-                h=Ht,
-                w=Wt,
-            )
+                # get "soft" AR latent from logits via codebook expectation
+                logits_step = logits[:, t_idx]          # (B, Ht, Wt, V)
+                probs_step  = F.softmax(logits_step, dim=-1)
+                probs_flat  = rearrange(probs_step, "b h w v -> (b h w) v")
 
-            z_pred_batch = z_pred.unsqueeze(1)       # (B, 1, D, Ht, Wt)
-            decoded_step = self.tokenizer.decode(
-                z_pred_batch,
-                use_tanh=True,
-            )                                        # (B, 1, C, H, W)
+                # codebook: (V, D)
+                codebook = self.tokenizer.vq.codebook.to(device)
 
-            # re-encode through frozen VQ tokenizer
-            _, quant_cycle, _, _ = self.tokenizer.encode(decoded_step)
-            # quant_cycle: (B, 1, D, Ht, Wt)
-            z_cycle = quant_cycle[:, 0]              # (B, D, Ht, Wt)
+                # expected embedding per spatial location
+                z_pred_flat = probs_flat @ codebook      # (B*H*W, D)
+                z_pred = rearrange(
+                    z_pred_flat,
+                    "(b h w) d -> b d h w",
+                    b=B,
+                    h=Ht,
+                    w=Wt,
+                )
 
-            # cosine cycle-consistency in latent space
-            z_gt_flat    = rearrange(z_gt,    "b d h w -> (b h w) d")
-            z_cycle_flat = rearrange(z_cycle, "b d h w -> (b h w) d")
+                # decode z_pred through DVAE, then re-encode through VQ
+                z_pred_batch = z_pred.unsqueeze(1)       # (B, 1, D, Ht, Wt)
+                decoded_step = self.tokenizer.decode(
+                    z_pred_batch,
+                    use_tanh=True,
+                )                                        # (B, 1, C, H, W)
 
-            cycle_consistence_loss = 1.0 - F.cosine_similarity(
-                z_cycle_flat,
-                z_gt_flat,
-                dim=-1,
-            ).mean()
-            if not self.freeze_vq_at_init:
-               self.unfreeze_VQPT_tokenizer()
+                # re-encode through tokenizer (DVAE+VQ) – no grad into their params
+                _, quant_cycle, _, _ = self.tokenizer.encode(decoded_step)
+                z_cycle = quant_cycle[:, 0]              # (B, D, Ht, Wt)
+
+                # cosine cycle-consistency in latent space
+                z_gt_flat    = rearrange(z_gt,    "b d h w -> (b h w) d")
+                z_cycle_flat = rearrange(z_cycle, "b d h w -> (b h w) d")
+
+                cycle_consistence_loss = 1.0 - F.cosine_similarity(
+                    z_cycle_flat,
+                    z_gt_flat,
+                    dim=-1,
+                ).mean()
+            finally:
+                # --- restore original requires_grad flags for DVAE+VQ ---
+                if dvae is not None:
+                    for name, p in dvae.named_parameters():
+                        key = f"dvae.{name}"
+                        if key in orig_flags:
+                            p.requires_grad_(orig_flags[key])
+
+                if vq is not None:
+                    for name, p in vq.named_parameters():
+                        key = f"vq.{name}"
+                        if key in orig_flags:
+                            p.requires_grad_(orig_flags[key])
 
         # --------- Total loss ---------
         total_loss = vq_loss + ce + perceptual_weight * lpips_loss + recon_weight * recon_loss

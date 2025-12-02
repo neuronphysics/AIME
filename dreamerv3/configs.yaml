@@ -21,34 +21,22 @@ defaults:
   control_behavior: 'imag' #'agac_latent'
   agac:
     # KL usage modes
-    #   'none'         -> no AGAC, just Dreamer
-    #   'recursive'    -> Design B (KL-shaped critic, δ_t bonus for actor)
-    #   'actor_horizon'-> Design A' (extrinsic critic, horizon KL bonus for actor)
-    kl_mode: 'none'          # default: off Scenario A:'actor_horizon' or B:'recursive'
-    beta_kl: 0.0             # weight for KL term (Design A': 1.0 / B: 1.0)
-    beta_delta: 0.0          # weight for log-ratio δ_t bonus (Design B:0.001)
+    #   'none'      -> no AGAC, just Dreamer
+    #   'recursive' -> multi-critic AGAC (extrinsic + KL critic, optional δ bonus)
+    kl_mode: 'none'          # default: plain Dreamer
+    beta_kl: 0.0             # weight for KL critic (set >0 to enable AGAC stream)
+    beta_delta: 0.0          # weight for log-ratio δ_t bonus (only used if kl_mode='recursive')
     gamma_kl: 0.997          # usually same as discount
     old_policy_mode: "ema"
     slow_actor_fraction: 0.01
     slow_actor_update: 1
   wandb_group: "dmc_walker_dreamer"
-  # AGAC in latent space - Design A' (actor_horizon)
-  agac_actor_horizon:
-    control_behavior: agac_latent
-    agac:
-      kl_mode: "actor_horizon"
-      beta_kl: 1.0
-      beta_delta: 0.0
-      old_policy_mode: "ema"
-    wandb_group: "dmc_walker_agacA"
-
-
-  # AGAC in latent space - Design B (recursive)
+  # AGAC in latent space -  (recursive)
   agac_recursive:
     control_behavior: agac_latent
     agac:
       kl_mode: "recursive"
-      beta_kl: 1.0
+      beta_kl: 0.1
       beta_delta: 0.001
     wandb_group: "dmc_walker_agacB"
 
