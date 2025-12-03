@@ -1018,7 +1018,7 @@ class DMCVBTrainer:
         
         epoch_metrics = defaultdict(list)
         self.epoch_disc_losses = {'image': [], 'latent': []}
-
+        total_loss =[]
         epoch_component_grads = defaultdict(list)
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch} [Train]')
@@ -1056,7 +1056,7 @@ class DMCVBTrainer:
                 if isinstance(value, torch.Tensor):
                     value = value.item()
                 epoch_metrics[key].append(value)
-            
+            total_loss.append(losses['total_gen_loss'])
             # Update progress bar
             pbar.set_postfix({
                 'total_loss': losses['total_gen_loss'],
@@ -1070,7 +1070,11 @@ class DMCVBTrainer:
         avg_img_disc_loss = np.mean(self.epoch_disc_losses['image']) 
         self.model.img_disc_scheduler.step(avg_img_disc_loss)
         avg_metrics['train/img_disc_lr'] = self.model.img_disc_optimizer.param_groups[0]['lr']
-        
+
+        avg_total_gen_loss = np.mean(total_loss)
+        self.model.gen_scheduler.step(avg_total_gen_loss)
+        avg_metrics['train/gen_lr'] = self.model.gen_optimizer.param_groups[0]['lr']
+
         avg_component_grads = {
                  component: np.mean(grads) 
                  for component, grads in epoch_component_grads.items()

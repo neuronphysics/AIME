@@ -13,7 +13,7 @@ import numpy as np
 import math, inspect
 from collections import OrderedDict
 from torch.utils.checkpoint import checkpoint as ckpt
-from VRNN.canny_net import CannyFilter
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from vis_networks import (
     EMA, TemporalDiscriminator,
@@ -725,7 +725,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         num_codebook_perceiver: int = 1024,
         perceiver_code_dim: int = 256,
         downsample_perceiver: int = 4,
-        perceiver_lr_multiplier: float = 0.1,
+        perceiver_lr_multiplier: float = 0.7,
         use_ctx_checkpoint: bool = True,
         contrastive_weight: float = 0.01,
     ):
@@ -1215,11 +1215,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Discriminator optimizer (separate)
         if hasattr(self, 'image_discriminator'):
             disc_params = [p for p in self.image_discriminator.parameters() if p.requires_grad]
-            self.img_disc_optimizer = torch.optim.AdamW(
+            self.img_disc_optimizer = torch.optim.Adam(
                 disc_params,
-                lr=learning_rate * 0.01,   
-                betas=(0.9, 0.99),          # canonical for WGAN-GP
-                weight_decay=0.0
+                lr=learning_rate * 0.1,   
+                betas=(0.0, 0.9),          # canonical for WGAN-GP
+                weight_decay=0.00005
             )
         
         # Setup schedulers
@@ -1242,9 +1242,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self.img_disc_optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-7
         )
 
-        # Warmup bookkeeping 
-        self.warmup_steps = 1000
-        self.current_step = 0
+
 
     def maybe_checkpoint_ctx(self, fn, *x, use_reentrant: bool = False):
         if self.training and self.use_ctx_checkpoint:
@@ -1610,6 +1608,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         real_images: torch.Tensor, #[B, T, C, H, W]
         fake_images: torch.Tensor, #[B, T, C, H, W]
         latents: torch.Tensor,  #[B, T, Z]
+        WGAN_GP_Coeff: float = 5.0,
     ) -> Dict[str, torch.Tensor]:
         """
         Training step for both discriminators
@@ -1635,7 +1634,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         img_disc_loss = (
             torch.mean(fake_img_score) - torch.mean(real_img_score) +
-            10.0 * img_gp/ seq_len
+            WGAN_GP_Coeff * img_gp/ seq_len
         )
 
         # Temporal consistency losses
@@ -1675,7 +1674,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         Compute adversarial losses for both image and latent space
         """
-        # Image sequence adversarial loss
+        D = self.image_discriminator
+        flags = [p.requires_grad for p in D.parameters()] #freeze Discriminator parameters
+        for p in D.parameters():
+            p.requires_grad_(False)
         
         fake_img_outputs = self.image_discriminator(reconstruction, z=z_seq, return_features=True)
         img_adv_loss = -torch.mean(fake_img_outputs['final_score'])
@@ -1696,6 +1698,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # L1 loss between feature statistics
         feature_match_loss = self.compute_feature_matching_loss(real_features, fake_img_outputs['hidden_3d'])
+        # Restore Discriminator parameter gradients
+        for p, f in zip(D.parameters(), flags):
+            p.requires_grad_(f)
 
         return img_adv_loss , temporal_loss_frames, feature_match_loss
 
@@ -1956,19 +1961,23 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             reconstruction=outputs['reconstructions'],
             z_seq=outputs['latents'],
         )
-
-        adv_loss = lambda_img_eff * (img_adv_loss + temporal_adv_loss + feat_match_loss)
-        
-        # ---- Adaptive loss balancing (ALB) ----
+        adv_base = img_adv_loss + temporal_adv_loss + feat_match_loss
+        adv_loss = lambda_img_eff * adv_base  # for logging and total_gen_loss
+        # Total generator loss (tensor), used both for logging and LR scheduling
+        total_gen_loss = (
+            elbo_loss
+            + perceiver_loss
+            + (lambda_img_eff * (img_adv_loss + temporal_adv_loss + feat_match_loss))
+        )
         loss_dict = {
             "elbo":        elbo_loss.reshape([]),
             "perceiver":   perceiver_loss.reshape([]),
-            "adversarial": adv_loss.reshape([]),
+            "adversarial": adv_base.reshape([]),  # <-- store unscaled base
         }
 
-        L_elbo        = loss_dict["elbo"]
-        L_perceiver   = loss_dict["perceiver"]
-        L_adv        = lambda_img * loss_dict["adversarial"]
+        L_elbo      = loss_dict["elbo"]
+        L_perceiver = loss_dict["perceiver"]
+        L_adv       = lambda_img_eff * loss_dict["adversarial"]  # <-- single scaling
 
         task_losses = [L_elbo, L_perceiver, L_adv]
 
@@ -1994,19 +2003,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if hasattr(self, "ema_encoder"): self.ema_encoder.update()
             if hasattr(self, "ema_decoder"): self.ema_decoder.update()
 
-        if self.current_step >= self.warmup_steps:
-            self.gen_scheduler.step()
-        self.current_step = self.current_step + 1
 
         avg_max_prob = torch.stack(
             [p["logit_probs"].softmax(1).max(1)[0].mean() for p in outputs["mdl_params"]]
         ).mean()
-
-        total_gen_loss = (
-            elbo_loss.item()
-            + perceiver_loss.item()
-            + (lambda_img_eff * (img_adv_loss.item() + temporal_adv_loss.item() + feat_match_loss.item()))
-        )
 
 
         eff_comp = outputs['prior_params'][0]['pi'].max(1)[0].mean().item()
@@ -2022,7 +2022,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'temporal_adv_loss': float(temporal_adv_loss.item()),
             'feat_match_loss': float(feat_match_loss.item()),
             # Training stats
-            'total_gen_loss': float(total_gen_loss),
+            'total_gen_loss': float(total_gen_loss.item()),
             'grad_norm': float(grad_norm),
             'effective_components': eff_comp,
             'Top 6 coverage': top6_cov,
