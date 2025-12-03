@@ -721,15 +721,15 @@ if __name__ == "__main__":
         "img_height": 64,
         "img_width": 64,
         "weight_decay": 1e-5,
-        "batch_size": 80,
+        "batch_size": 45,
         "num_workers": 4,
-        "epochs": 151,
+        "epochs": 80,
         "lpips_weight": 1.0,
         "lr": 2e-4,
         "grad_clip": 1.0,
         "log_every_steps": 20,
         "commitment_weight": 0.25,
-        "contrastive_weight": 0.05,  # set to 0.0 to disable CL
+        "contrastive_weight": 0.01,  # set to 0.0 to disable CL
         "mask_prob": 0.4,
         "out_dir": PARENT_DIR / "results" / "vqpt_pretrain_dmc_vb",
         "recon_every": 5,

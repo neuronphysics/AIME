@@ -736,7 +736,6 @@ def count_parameters(model, print_details=True):
         'decoder': 'decoder',
         'perceiver': 'perceiver_model',
         'prior': 'prior',
-        'attention': 'attention_prior_posterior',
         'rnn': '_rnn',
         'discriminators': 'image_discriminator'
     }
@@ -810,7 +809,6 @@ class GradientMonitor:
             'decoder': ['decoder.net'],
             'perceiver': ['perceiver_model' ],
             'prior_dynamics': ['prior.stick_breaking.kumar_net', 'prior.component_nn'],
-            'attention_schema': ['attention_prior_posterior'],
             'vrnn_core': ['_rnn', 'rnn_layer_norm'],
             'discriminators': ['image_discriminator']
         }
@@ -832,7 +830,7 @@ class GradientMonitor:
                     param_count += 1
                     
                     # Track individual layer gradients for critical components
-                    if 'kumar' in name or 'attention' in name:
+                    if 'kumar' in name:
                         if self.writer is not None:  
                             self.writer.add_scalar(f'gradients/layers/{name}', grad_norm, self.global_step)
             
@@ -982,7 +980,7 @@ class DMCVBTrainer:
         else:
             self.writer = None
         self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
-        task_names = ['elbo','perceiver','predictive','adversarial']  
+        task_names = ['elbo','perceiver','adversarial']  
         self._agg = GradDiagnosticsAggregator(task_names, 
                                               component_groups=self.grad_monitor.component_groups,
                                               average_component_norms=True)
@@ -1039,8 +1037,6 @@ class DMCVBTrainer:
                 n_critic=self.config['n_critic'],
                 lambda_img=self.config['lambda_img'],
                 lambda_recon=self.config['lambda_recon'],
-                lambda_att_dyn=self.config['lambda_att_dyn'],
-                entropy_weight=self.config['entropy_weight'],
             )
             component_grads = self.grad_monitor.compute_component_gradients()
             for component, grad_norm in component_grads.items():
@@ -1104,7 +1100,6 @@ class DMCVBTrainer:
                     observations=observations,
                     actions=actions,
                     beta=self.config.get('beta_eval', self.config.get('beta_max', 1.0)),
-                    entropy_weight=self.config['entropy_weight']
                 )
                 
                 # Track metrics
@@ -1120,10 +1115,6 @@ class DMCVBTrainer:
                 psnr = self.compute_psnr(observations, recon)
                 eval_metrics['psnr'].append(psnr.item())
                 
-                # 2. Attention consistency
-                if 'attention_maps' in outputs and len(outputs['attention_maps']) > 1:
-                    att_consistency = self.compute_attention_consistency(outputs['attention_maps'])
-                    eval_metrics['attention_consistency'].append(att_consistency.item())
                 
         if epoch %10 == 0:
              with torch.no_grad():
@@ -1266,10 +1257,8 @@ class DMCVBTrainer:
                     obs,
                     act,
                     beta=self.config["beta"],
-                    entropy_weight=self.config["entropy_weight"],
                     lambda_recon=self.config["lambda_recon"],
-                    lambda_att_dyn=self.config["lambda_att_dyn"],
-                    lambda_gram=self.config.get("lambda_gram", 0.0),
+                    lambda_gram=self.config["lambda_gram"],
                 )
 
                 # Same ELBO combination you use elsewhere
@@ -1277,12 +1266,10 @@ class DMCVBTrainer:
                     self.config["lambda_recon"] * vae_losses["recon_loss"]
                     + self.config["beta"] * vae_losses["kl_z"]
                     + self.config["beta"] * vae_losses["hierarchical_kl"]
-                    - self.config["entropy_weight"] * vae_losses["cluster_entropy"]
                     + self.config["lambda_gram"] * vae_losses["gram_enc_loss"]
                 )
 
                 perceiver_loss = vae_losses["perceiver_loss"]
-                predictive_loss = vae_losses["attention_loss"]
 
                 # Optional adversarial term – we DO NOT want grads into D's params
                 if include_adv_in_diag and hasattr(self.model, "image_discriminator"):
@@ -1305,7 +1292,7 @@ class DMCVBTrainer:
                 else:
                     adv_loss = torch.zeros((), device=obs.device)
 
-                task_losses = [elbo_loss, perceiver_loss, predictive_loss, adv_loss]
+                task_losses = [elbo_loss, perceiver_loss, adv_loss]
 
                 # Let GradDiagnosticsAggregator handle backward() etc.
                 named_params = list(self.model.named_parameters())
@@ -1346,27 +1333,6 @@ class DMCVBTrainer:
         psnr = 20 * torch.log10(2.0 / torch.sqrt(mse))  # Assuming images in [-1, 1]
         return psnr
     
-    def compute_attention_consistency(self, attention_maps: List[torch.Tensor]) -> torch.Tensor:
-        """Compute temporal consistency of attention maps"""
-        consistencies = []
-        
-        for t in range(1, len(attention_maps)):
-            prev_att = attention_maps[t-1]
-            curr_att = attention_maps[t]
-            
-            # Compute correlation between consecutive attention maps
-            prev_flat = prev_att.view(prev_att.size(0), -1)
-            curr_flat = curr_att.view(curr_att.size(0), -1)
-            
-            # Normalize
-            prev_norm = F.normalize(prev_flat, p=2, dim=1)
-            curr_norm = F.normalize(curr_flat, p=2, dim=1)
-            
-            # Compute cosine similarity
-            similarity = (prev_norm * curr_norm).sum(dim=1)
-            consistencies.append(similarity)
-        
-        return torch.stack(consistencies).mean()
 
     @torch.no_grad()
     def evaluate_two_step_prediction(
@@ -1429,8 +1395,8 @@ class DMCVBTrainer:
 
     def visualize_results(self, epoch: int):
         """
-        Enhanced visualization using OpenCV-based attention panels:
-        Cols = [Original, Recon, Perceiver, Heat, Slots, Segmentation, Contours]
+        
+        Cols = [Original, Recon, Perceiver]
         """
         self.model.eval()
 
@@ -1447,7 +1413,7 @@ class DMCVBTrainer:
         eval_actions = eval_batch['actions'].to(self.device)
 
         batch_size = min(train_obs.shape[0], eval_obs.shape[0], 4)  # cap at 4 rows per split
-        n_cols = 7
+        n_cols = 4
         fig, axes = plt.subplots(2 * batch_size, n_cols, figsize=(3.2 * n_cols, 3.2 * (2 * batch_size)))
         if axes.ndim == 1:
             axes = axes.reshape(1, -1)
@@ -1491,53 +1457,9 @@ class DMCVBTrainer:
                     else:
                         axes[row, 2].set_title('No Perceiver'); axes[row, 2].axis('off')
 
-                    # The posterior is attached to the model; pass the single image with batch dim
-                    att_post = self.model.attention_prior_posterior.posterior_net
-
-                    # Extract data (this part is correct)
-                    slot_maps_bt = pick_bt(outputs['slot_attention_maps'], i, t)   # expects [1,K,H,W]
-                    slot_cent_bt = pick_bt(outputs['slot_centers'],        i, t)   # expects [1,K,2]
-                    group_bt     = pick_bt(outputs['group_assignments'], i, t) # [1,H,W,K] or None
-
-
-                    # Call the PyTorch-based visualization method
-                    vis = att_post.visualize_multi_object_attention(
-                        observation=orig_img.unsqueeze(0),
-                        slot_attention_maps=slot_maps_bt,
-                        slot_centers=slot_cent_bt,
-                        group_assignments=group_bt,
-                        return_mode='all'
-                    )
-
-                    # Helper to convert PyTorch tensor to numpy for matplotlib
-                    def tensor_to_numpy(tensor):
-                        """Convert [B, C, H, W] tensor to [H, W, C] numpy"""
-                        return tensor[0].permute(1, 2, 0).cpu().numpy()
-
-                    # 4) Combined visualization with contours
-                    combined = tensor_to_numpy(vis['combined_with_contours'])
-                    axes[row, 3].imshow(combined)
-                    axes[row, 3].set_title('Attention + Centers')
-                    axes[row, 3].axis('off')
-
-                    # 5) Slot overlays - average all slots
-                    slots = vis['slot_overlays']  # [B*K, 3, H, W]
-                    K = self.model.attention_prior_posterior.posterior_net.num_semantic_slots
-                    slots_reshaped = slots.view(1, K, 3, H, W)[0]  # [K, 3, H, W]
-                    # Average across slots and convert to numpy
-                    slot_avg = tensor_to_numpy(slots_reshaped.mean(dim=0, keepdim=True))
-                    axes[row, 4].imshow(slot_avg)
-                    axes[row, 4].set_title('Slots Overlay')
-                    axes[row, 4].axis('off')
-
-                    # 6) Semantic segmentation
-                    segmentation = tensor_to_numpy(vis['semantic_segmentation'])
-                    axes[row, 5].imshow(segmentation)
-                    axes[row, 5].set_title('Slot Segmentation')
-                    axes[row, 5].axis('off')
 
                     # 7) Hide unused column
-                    axes[row, 6].axis('off')
+                    axes[row, 3].axis('off')
 
         plt.tight_layout()
         if self.use_wandb:
@@ -1557,154 +1479,6 @@ class DMCVBTrainer:
 
         plt.close(fig)
 
-    @torch.no_grad()
-    def visualize_multi_object_attention(
-        self,
-        observation: torch.Tensor,
-        return_mode: str = "all",  # 'all' | 'combined' | 'slots' | 'groups'
-    ) -> Dict[str, np.ndarray]:
-        """
-
-        Inputs
-        -------
-        observation : torch.Tensor
-            [B, C, H, W], RGB, in [0,1] or [-1,1].
-            NOTE: Call a forward pass first so that:
-            - self.slot_attention_maps: [B, K, H_att, W_att]
-            - self.group_assignments:  [B, H_att, W_att, K]   (optional)
-            - self.slot_centers:       [B, K, 2] in [-1,1]    (optional)
-            are populated.
-
-        Returns
-        -------
-        Dict[str, np.ndarray] with BGR uint8 images:
-        - 'overlay_heat_bgr'          : [B, H, W, 3]
-        - 'overlay_contours_bgr'      : [B, H, W, 3] (centers drawn if available)
-        - 'slot_overlays_bgr'         : [B, K, H, W, 3]
-        - 'semantic_segmentation_bgr' : [B, H, W, 3]
-        
-        """
-
-        assert observation.ndim == 4, "observation must be [B,C,H,W]"
-        B, C, H, W = observation.shape
-        device = observation.device
-
-        # ----- cheap converters -----
-        def torch_chw_to_bgr_u8(img_chw: torch.Tensor) -> np.ndarray:
-            x = img_chw.detach().to("cpu").float()
-            if x.min() < 0:
-                x = (x + 1.0) * 0.5
-            x = x.clamp(0, 1)
-            rgb = (x * 255.0 + 0.5).byte().permute(1, 2, 0).numpy()  # [H,W,3] RGB u8
-            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-        def to_float_np(hw: torch.Tensor) -> np.ndarray:
-            return hw.detach().to("cpu").float().numpy()
-
-        # ----- colors for slots -----
-        palette = [
-            (0, 0, 255),     # red
-            (0, 255, 0),     # green
-            (255, 0, 0),     # blue
-            (0, 255, 255),   # yellow
-            (255, 0, 255),   # magenta
-            (255, 255, 0),   # cyan
-        ][: self.num_semantic_slots]
-
-        # ----- inputs prepared -----
-        imgs_bgr = [torch_chw_to_bgr_u8(observation[b]) for b in range(B)]
-
-        slot_maps_t = getattr(self, "slot_attention_maps", None)  # [B,K,h,w]
-        assert slot_maps_t is not None, "Run a forward pass first (slot_attention_maps missing)."
-        slot_maps = to_float_np(slot_maps_t)  # np [B,K,h,w]
-        B_chk, K, h_att, w_att = slot_maps.shape
-        assert B_chk == B, "Batch mismatch between observation and slot maps."
-
-        groups_t = getattr(self, "group_assignments", None)  # [B,h,w,K] or None
-
-        # fused attention map for heat/contours (simple sum; for viz this is fine)
-        fused = slot_maps.sum(axis=1)  # [B,h,w]
-
-        want = lambda key: (return_mode == "all") or (key == return_mode)
-        out: Dict[str, np.ndarray] = {}
-
-        # pre-alloc containers
-        if want("overlay_heat_bgr"):          heat_list = []
-        if want("overlay_contours_bgr"):      contours_list = []
-        if want("slot_overlays_bgr"):         slots_list = []
-        if want("semantic_segmentation_bgr"): seg_list = []
-
-        for b in range(B):
-            base = imgs_bgr[b]
-            # === heat overlay ===
-            if want("overlay_heat_bgr"):
-                att = cv2.resize(fused[b], (W, H), interpolation=cv2.INTER_LINEAR)
-                att_u8 = cv2.normalize(att, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-                heat = cv2.applyColorMap(att_u8, cv2.COLORMAP_TURBO)
-                heat_vis = cv2.addWeighted(base, 0.55, heat, 0.45, 0.0)
-                heat_list.append(heat_vis)
-
-            # === contour overlay (plus slot centers) ===
-            if want("overlay_contours_bgr"):
-                cont = base.copy()
-                # edges from fused mask via morphological gradient
-                att = cv2.resize(fused[b], (W, H), interpolation=cv2.INTER_LINEAR)
-                mask = (cv2.normalize(att, None, 0, 1, cv2.NORM_MINMAX) >= 0.30).astype(np.uint8) * 255
-                edge = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))  # 0/255
-                yx = np.where(edge > 0)
-                cont[yx[0], yx[1]] = (255, 255, 255)  # white contour
-
-                # draw per-slot centers (if available)
-                if hasattr(self, "slot_centers"):
-                    centers = self.slot_centers[b].detach().to("cpu").numpy()  # [K,2] in [-1,1]
-                    px = ((centers[:, 0] + 1.0) * 0.5 * (W - 1)).astype(int)
-                    py = ((centers[:, 1] + 1.0) * 0.5 * (H - 1)).astype(int)
-                    for k in range(min(K, len(palette))):
-                        cv2.drawMarker(
-                            cont,
-                            (int(px[k]), int(py[k])),
-                            (255, 255, 255),
-                            markerType=cv2.MARKER_TILTED_CROSS,
-                            markerSize=10,
-                            thickness=2,
-                            line_type=cv2.LINE_AA,
-                        )
-                        cv2.circle(cont, (int(px[k]), int(py[k])), 3, palette[k], thickness=2, lineType=cv2.LINE_AA)
-                contours_list.append(cont)
-
-            # === per-slot overlays ===
-            if want("slot_overlays_bgr"):
-                per_slot_imgs = []
-                for k in range(K):
-                    m = cv2.resize(slot_maps[b, k], (W, H), interpolation=cv2.INTER_LINEAR)
-                    m_u8 = cv2.normalize(m, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-                    color_img = np.full_like(base, palette[k])
-                    gray3 = cv2.merge([m_u8, m_u8, m_u8])
-                    color_layer = (gray3.astype(np.float32) / 255.0 * color_img).astype(np.uint8)
-                    per_slot_imgs.append(cv2.addWeighted(base, 1.0, color_layer, 0.35, 0.0))
-                slots_list.append(np.stack(per_slot_imgs, axis=0))  # [K,H,W,3]
-
-            # === semantic segmentation from group assignments ===
-            if want("semantic_segmentation_bgr"):
-                if groups_t is not None:
-                    g = to_float_np(groups_t[b])  # [h,w,K]
-                    labels = np.argmax(g, axis=-1).astype(np.int32)  # [h,w]
-                    labels = cv2.resize(labels, (W, H), interpolation=cv2.INTER_NEAREST)
-                    seg = np.zeros_like(base)
-                    for k in range(K):
-                        seg[labels == k] = palette[k]
-                    seg_vis = cv2.addWeighted(base, 0.5, seg, 0.5, 0.0)
-                else:
-                    seg_vis = base.copy()
-                seg_list.append(seg_vis)
-
-        # pack outputs
-        if want("overlay_heat_bgr"):          out["overlay_heat_bgr"] = np.stack(heat_list, axis=0)
-        if want("overlay_contours_bgr"):      out["overlay_contours_bgr"] = np.stack(contours_list, axis=0)
-        if want("slot_overlays_bgr"):         out["slot_overlays_bgr"] = np.stack(slots_list, axis=0)         # [B,K,H,W,3]
-        if want("semantic_segmentation_bgr"): out["semantic_segmentation_bgr"] = np.stack(seg_list, axis=0)
-
-        return out if return_mode == "all" else {return_mode: out[return_mode]}
 
 
     def denormalize_image(self, img: torch.Tensor) -> np.ndarray:
@@ -1842,9 +1616,8 @@ def main():
         'latent_dim': 36,
         'hidden_dim': 48, #must be divisible by 8
         'context_dim': 128,
-        'attention_resolution': 32,
         'input_channels': 3*1,  # 3 stacked frames
-        'prior_alpha': 6.0,  # Hyperparameters for prior
+        'prior_alpha': 8.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
         'dropout': 0.1,
         'num_codebook_perceiver': 8192,     
@@ -1858,7 +1631,7 @@ def main():
         'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
-        'batch_size': 19,
+        'batch_size': 8,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
@@ -1875,10 +1648,8 @@ def main():
         
         # Loss weights
         'beta': 1.0,
-        'entropy_weight': 0.6,
         'lambda_img': 1.0,
         'lambda_recon': 1.0,
-        'lambda_att_dyn': 0.95,
         "lambda_gram": 0.05,
         'grad_clip': 5,
         'n_critic': 1,
@@ -1918,7 +1689,6 @@ def main():
         device=device,
         input_channels=config['input_channels'],
         learning_rate=config['learning_rate'],
-        attention_resolution=config['attention_resolution'],
         grad_clip= config['grad_clip'],
         prior_alpha =config['prior_alpha'],
         prior_beta = config['prior_beta'],

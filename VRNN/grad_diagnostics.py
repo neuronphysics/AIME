@@ -316,7 +316,6 @@ class GradDiagnosticsAggregator:
         task_colors = {
             "elbo":           "#1f77b4",  # blue
             "perceiver":      "#ff7f0e",  # orange
-            "predictive":     "#2ca02c",  # green
             "adversarial":     "#d62728",  # red
         }
         # Quiver (2D PCA of mean dirs) — ensure we pass a Figure to TB
