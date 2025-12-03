@@ -1631,7 +1631,7 @@ def main():
         'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
-        'batch_size': 8,
+        'batch_size': 7,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
