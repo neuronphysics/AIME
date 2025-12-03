@@ -725,8 +725,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         num_codebook_perceiver: int = 1024,
         perceiver_code_dim: int = 256,
         downsample_perceiver: int = 4,
-        perceiver_lr_multiplier: float = 0.01,
-        attention_rope_dim: Optional[int] = 96,
+        perceiver_lr_multiplier: float = 0.1,
         use_ctx_checkpoint: bool = True,
         contrastive_weight: float = 0.01,
     ):
@@ -756,7 +755,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.img_perceiver_channels = img_perceiver_channels
         self.downsample_perceiver = downsample_perceiver
         self.perceiver_lr_multiplier = perceiver_lr_multiplier  
-        self.attention_rope_dim = attention_rope_dim if attention_rope_dim is not None else 64
         self.contrastive_weight = contrastive_weight 
         #initialization different parts of the model
         
