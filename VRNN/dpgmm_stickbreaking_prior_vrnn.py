@@ -20,7 +20,7 @@ from vis_networks import (
     AddEpsilon, check_tensor
 )
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
-from VRNN.RGB import RGB, GradNorm
+from VRNN.RGB import RGB, GradNorm, PCGrad
 from VRNN.lstm import LSTMLayer
 
 from VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
@@ -1155,7 +1155,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 if isinstance(m, nn.Module):
                     params.extend(
                         [p for p in m.parameters()
-                        if p.requires_grad and id(p) not in exclude_ids]
+                         if p.requires_grad and id(p) not in exclude_ids]
                     )
                 elif isinstance(m, nn.Parameter):
                     if m.requires_grad and id(m) not in exclude_ids:
@@ -1170,7 +1170,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 (decay if p.ndim >= 2 else no_decay).append(p)
             groups = []
             if decay:
-                groups.append({"params": decay,    "weight_decay": wd})
+                groups.append({"params": decay, "weight_decay": wd})
             if no_decay:
                 groups.append({"params": no_decay, "weight_decay": 0.0})
             return groups
@@ -1178,6 +1178,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # 1) Generator param groups 
         gen_param_groups = []
 
+        # Perceiver / context branch
         perceiver_params = get_params(
             self.perceiver_model,
             self.context_predictor,
@@ -1191,6 +1192,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     g["weight_decay"] *= 0.5
             gen_param_groups.extend(perceiver_groups)
 
+        # Trunk / world-model modules
         trunk_modules = [
             self.encoder,
             self.decoder,
@@ -1203,6 +1205,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if trunk_params:
             gen_param_groups.extend(split_by_weight_decay(trunk_params, weight_decay))
 
+        # Scalar initial states (h0, c0)
         scalar_params = [self.h0, self.c0]
         scalars = [
             p for p in scalar_params
@@ -1213,19 +1216,19 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 {"params": scalars, "lr": learning_rate, "weight_decay": 1e-4}
             )
 
-        # 2) Gradient balancer (RGB or GradNorm) 
+        # 2) Gradient balancer (RGB, GradNorm, or none)
         method = getattr(self, "grad_balance_method", "rgb")
         method = (method or "none").lower()
 
         self.grad_balancer = None
-        task_names = ["generator", "perceiver"]
-
+        task_names = ["generator", "perceiver"]   # must match training_step_sequence
         balancer_param_groups = []
 
         if method == "rgb":
             self.grad_balancer = RGB()
         elif method == "gradnorm":
             self.grad_balancer = GradNorm()
+        # NOTE: for "pcgrad" we do NOT create self.grad_balancer; PCGrad wraps the optimizer instead.
 
         if self.grad_balancer is not None:
             self.grad_balancer.task_name = task_names
@@ -1239,7 +1242,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             )
 
             if method == "rgb":
-                # RGB has no trainable params (I assume), just configure hyperparams
+                # RGB has no learnable parameters
                 self.grad_balancer.alpha_steps     = 1
                 self.grad_balancer.update_interval = 2
                 self.grad_balancer.lr_inner        = 0.05
@@ -1247,29 +1250,34 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 self.grad_balancer.train_loss_buffer = None
 
             elif method == "gradnorm":
-                # Initialize internal parameter loss_scale
+                # GradNorm has a trainable loss_scale vector
                 self.grad_balancer.init_param()  # creates self.loss_scale
                 self.grad_balancer.epoch = 0
                 self.grad_balancer.train_loss_buffer = None
 
-                # Add loss_scale as a separate param group (no weight decay)
                 balancer_param_groups.append({
                     "params": [self.grad_balancer.loss_scale],
                     "lr": learning_rate,
                     "weight_decay": 0.0,
                 })
 
-        #  3) Final optimizer over generator + balancer 
+        # 3) Base optimizer over generator (+ optional balancer params)
         param_groups = gen_param_groups + balancer_param_groups
-
-        self.gen_optimizer = torch.optim.AdamW(
+        base_optimizer = torch.optim.AdamW(
             param_groups,
             lr=learning_rate,
             betas=(0.9, 0.999),
             eps=1e-8,
         )
 
-        #  4) Discriminator optimizer 
+        # If requested, wrap the base optimizer with PCGrad
+        if method == "pcgrad":
+            # Two tasks: generator loss and perceiver loss (see training_step_sequence)
+            self.gen_optimizer = PCGrad(num_tasks=len(task_names), optimizer=base_optimizer)
+        else:
+            self.gen_optimizer = base_optimizer
+
+        #  4) Discriminator optimizer (unchanged)
         if hasattr(self, "image_discriminator"):
             disc_params = [
                 p for p in self.image_discriminator.parameters()
@@ -1289,20 +1297,32 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     def _setup_schedulers(self):
         """Setup learning-rate schedulers for all optimizers (Option B)."""
 
+        # If we're using PCGrad, schedulers should see the wrapped optimizer
+        opt_for_sched = getattr(self.gen_optimizer, "_optim", self.gen_optimizer)
+
+
         # Store initial lrs for trunk optimizer
-        for group in self.gen_optimizer.param_groups:
+        for group in opt_for_sched.param_groups:
             group["initial_lr"] = group["lr"]
 
-        # 1) Trunk scheduler (MGDA step uses this optimizer)
+        # 1) Trunk scheduler (PCGrad or not, this uses the base optimizer)
         self.gen_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.gen_optimizer, mode='min', factor=0.2, patience=10, threshold=0.0001, 
+            opt_for_sched,
+            mode='min',
+            factor=0.2,
+            patience=10,
+            threshold=0.0001,
         )
 
         # 3) Discriminator scheduler (unchanged)
-        self.img_disc_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.img_disc_optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-7
-        )
-
+        if hasattr(self, "img_disc_optimizer"):
+            self.img_disc_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.img_disc_optimizer,
+                mode="min",
+                factor=0.5,
+                patience=10,
+                min_lr=1e-7,
+            )
 
 
     def maybe_checkpoint_ctx(self, fn, *x, use_reentrant: bool = False):
@@ -1992,7 +2012,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
         lambda_img_eff = (lambda_img * warmup_factor) if warmup_factor > 0.0 else 0.0
 
-        # ---- 4) Compose task losses for MGDA (3 tasks) ----
+        # ---- 4) Compose task losses for MGDA (2 tasks: generator, perceiver) ----
         elbo_loss = (
             lambda_recon * vae_losses['recon_loss']
             + beta * vae_losses['kl_z']
@@ -2001,6 +2021,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
         
         perceiver_loss = vae_losses['perceiver_loss']
+
+        # Discriminator updates (n_critic)
         disc_losses_list = []
         for _ in range(n_critic):
             disc_loss = self.discriminator_step(
@@ -2016,6 +2038,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 k: sum(d[k] for d in disc_losses_list) / len(disc_losses_list)
                 for k in disc_losses_list[0].keys()
             }
+
         img_adv_loss, temporal_adv_loss, feat_match_loss = self.compute_adversarial_losses(
             x=observations,
             reconstruction=outputs['reconstructions'],
@@ -2037,61 +2060,110 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         L_gen = loss_dict["generator"]
         L_ctx = loss_dict["perceiver"]
 
-        # Only two tasks for RGB / GradNorm: generator vs perceiver
+        # Only two tasks for RGB / GradNorm / PCGrad: generator vs perceiver
         task_losses = [L_gen, L_ctx]
 
-        self.gen_optimizer.zero_grad(set_to_none=True)
         method = getattr(self, "grad_balance_method", "rgb")
         method = (method or "none").lower()
 
-        if self.grad_balancer is not None and method in ("rgb", "gradnorm"):
-            # Keep GradNorm's internal epoch in sync with the model, if present
-            if hasattr(self.grad_balancer, "epoch"):
-                self.grad_balancer.epoch = getattr(self, "current_epoch", 0)
+        # Branch 1: PCGrad (optimizer wrapper)
+        if method == "pcgrad":
+            # gen_optimizer is a PCGrad instance wrapping an AdamW
+            base_opt = self.gen_optimizer._optim
 
-            if method == "gradnorm":
-                if self.grad_balancer.train_loss_buffer is None:
-                    with torch.no_grad():
-                        base = torch.stack([loss.detach() for loss in task_losses])
-                        
-                    # shape [T, 1] as expected in GradNorm code
-                    self.grad_balancer.train_loss_buffer = base.view(-1, 1).to(self.device)
-                self.grad_balancer.backward(
+
+            # Clear both underlying grads and PCGrad accumulators
+            self.gen_optimizer.zero_grad()
+
+            # Accumulate per-task gradients inside PCGrad
+            self.gen_optimizer.backward(task_losses)
+
+            # Reproduce PCGrad.step logic, but insert grad clipping before the step
+            grads, shapes, has_grads = self.gen_optimizer._pack_accum_grads()
+            pc_grad = self.gen_optimizer._project_conflicting(grads, has_grads)
+            pc_grad = self.gen_optimizer._unflatten_grad(pc_grad, shapes[0])
+            self.gen_optimizer._set_grad(pc_grad)
+
+            # Clip gradient norm on the underlying optimizer’s parameters
+            torch.nn.utils.clip_grad_norm_(
+                [p for g in base_opt.param_groups for p in g["params"]],
+                self._grad_clip,
+            )
+
+            # Optimizer step (respect GradScaler if used)
+            if self.gen_optimizer.scaler is not None:
+                self.gen_optimizer.scaler.step(base_opt)
+                self.gen_optimizer.scaler.update()
+            else:
+                base_opt.step()
+
+            # Compute grad norm for logging from the underlying optimizer
+            grad_norm_sq = 0.0
+            for group in base_opt.param_groups:
+                for p in group['params']:
+                    if p.grad is not None:
+                        g = p.grad.data
+                        grad_norm_sq += float((g.norm(2)).item() ** 2)
+            grad_norm = (grad_norm_sq ** 0.5) if grad_norm_sq > 0 else 0.0
+
+            # Reset accumulators for next step
+            self.gen_optimizer.zero_grad()
+
+        # Branch 2: RGB / GradNorm as before
+        else:
+            self.gen_optimizer.zero_grad(set_to_none=True)
+
+            if self.grad_balancer is not None and method in ("rgb", "gradnorm"):
+                # Keep GradNorm's internal epoch in sync with the model, if present
+                if hasattr(self.grad_balancer, "epoch"):
+                    self.grad_balancer.epoch = getattr(self, "current_epoch", 0)
+
+                if method == "gradnorm":
+                    if self.grad_balancer.train_loss_buffer is None:
+                        with torch.no_grad():
+                            base = torch.stack([loss.detach() for loss in task_losses])
+                        # shape [T, 1] as expected in GradNorm code
+                        self.grad_balancer.train_loss_buffer = base.view(-1, 1).to(self.device)
+
+                    self.grad_balancer.backward(
                         task_losses,
                         mode="backward",
                         alpha=self.gradnorm_alpha,
-                        log_grads = True,
+                        log_grads=True,
                     )
-               
-            else:  # "rgb"
-                self.grad_balancer.backward(task_losses, mode="backward")
-        else:
-            # Fallback: plain summed loss (no multi-task weighting)
-            total_gen_loss.backward()
+                else:  # "rgb"
+                    self.grad_balancer.backward(task_losses, mode="backward")
+            else:
+                # Fallback: plain summed loss (no multi-task weighting)
+                total_gen_loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(
-            [p for g in self.gen_optimizer.param_groups for p in g["params"]],
-            self._grad_clip
-        )
-        self.gen_optimizer.step()
-        
-        grad_norm_sq = 0.0
-        for group in self.gen_optimizer.param_groups:
-            for p in group['params']:
-                if p.grad is not None:
-                    g = p.grad.data
-                    grad_norm_sq = grad_norm_sq + float((g.norm(2)).item() ** 2)
-        grad_norm = (grad_norm_sq ** 0.5) if grad_norm_sq > 0 else 0.0
+            # Clip and step with the standard optimizer
+            torch.nn.utils.clip_grad_norm_(
+                [p for g in self.gen_optimizer.param_groups for p in g["params"]],
+                self._grad_clip,
+            )
+            self.gen_optimizer.step()
 
+            # Grad norm logging (standard optimizer)
+            grad_norm_sq = 0.0
+            for group in self.gen_optimizer.param_groups:
+                for p in group['params']:
+                    if p.grad is not None:
+                        g = p.grad.data
+                        grad_norm_sq = grad_norm_sq + float((g.norm(2)).item() ** 2)
+            grad_norm = (grad_norm_sq ** 0.5) if grad_norm_sq > 0 else 0.0
+
+        # EMA updates
         with torch.no_grad():
-            if hasattr(self, "ema_encoder"): self.ema_encoder.update()
-            if hasattr(self, "ema_decoder"): self.ema_decoder.update()
+            if hasattr(self, "ema_encoder"):
+                self.ema_encoder.update()
+            if hasattr(self, "ema_decoder"):
+                self.ema_decoder.update()
 
-
+        # Some mixture-model stats for logging
         avg_max_prob = torch.stack(
             [p["logit_probs"].softmax(1).max(1)[0].mean() for p in outputs["mdl_params"]]
         ).mean()
-
 
         eff_comp = outputs['prior_params'][0]['pi'].max(1)[0].mean().item()
         top6_cov = outputs['prior_params'][0]['pi'].topk(6, dim=-1)[0].sum(dim=-1).mean().item()

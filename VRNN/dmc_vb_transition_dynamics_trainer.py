@@ -1663,7 +1663,7 @@ def main():
         "lambda_gram": 0.05,
         'grad_clip': 5,
         'n_critic': 1,
-        "grad_balance_method": "rgb",  # or "rgb" 
+        "grad_balance_method": "pcgrad",  # "gradnorm" or "rgb" 
         "gradnorm_alpha": 1.5,        
         # Logging
         'use_wandb': False,
