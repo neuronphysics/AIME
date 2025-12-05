@@ -13,6 +13,7 @@ from einops import rearrange
 from torch.autograd import Function
 import collections.abc as abc
 import timm
+from torch.nn.utils.spectral_norm import spectral_norm as SpectralNorm
 class AddEpsilon(nn.Module):
     def __init__(self, eps):
         super().__init__()
@@ -1749,14 +1750,14 @@ class CausalConv3d(nn.Module):
         time_pad = dilation_t * (kt - 1)  # causal (left) time pad
         self._pad = (w_pad, w_pad, h_pad, h_pad, time_pad, 0)
 
-        self.conv = nn.Conv3d(
+        self.conv = SpectralNorm(nn.Conv3d(
             chan_in,
             chan_out,
             kernel_size=(kt, kh, kw),
             stride=(stride_t, kh, kw),  
             dilation=(dilation_t, 1, 1),
             bias=bias,
-        )
+        ))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T, H, W)
@@ -1843,6 +1844,8 @@ class SpatialTemporalTokenizer(nn.Module):
         x = self.norm(x)
         return x, (Hn, Wn)
 
+
+
 class TemporalDiscriminator(nn.Module):
     """
     Temporal discriminator conditioned on latent z_t (per-timestep).
@@ -1867,7 +1870,7 @@ class TemporalDiscriminator(nn.Module):
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         rope_base: float = 10000.0,
         dropout: float = 0.1,
-        use_checkpoint: bool = True,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.image_size = image_size
@@ -1937,6 +1940,10 @@ class TemporalDiscriminator(nn.Module):
         # Norms
         self.spatial_norm = nn.LayerNorm(hidden_dim)
         self.ln_f = nn.LayerNorm(hidden_dim)
+        self.cls_token = nn.Parameter(
+            torch.zeros(1, 1, hidden_dim)
+        )
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
 
         # -------- Conditioning modules (cGAN-style) --------
         self.film = nn.Sequential(
@@ -1962,19 +1969,19 @@ class TemporalDiscriminator(nn.Module):
         self.temporal_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
         self.spatial_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
         self.per_frame_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
 
@@ -2055,57 +2062,73 @@ class TemporalDiscriminator(nn.Module):
         spatial_feats = torch.stack(spatial_feats, dim=1)  # [B, T, N, D]
 
         # 5) Temporal processing: flatten tokens across patches
-        flat = spatial_feats.reshape(B, T * N, D)  # [B, T*N, D]
+        flat_tokens = spatial_feats.reshape(B, T * N, D)  # [B, S, D], S = T*N
+
+        # Build mask for the patch tokens: [B, S]
         flat_mask = temporal_mask.unsqueeze(2).expand(-1, -1, N).reshape(B, T * N)
 
-        h = flat
+        # Add CLS token at position 0
+        cls = self.cls_token.expand(B, 1, D)  # [B, 1, D]
+        h = torch.cat([cls, flat_tokens], dim=1)  # [B, 1+S, D]
+
+        # Extend mask: CLS is always valid
+        cls_mask = torch.ones(B, 1, device=self.device, dtype=torch.bool)
+        full_mask = torch.cat([cls_mask, flat_mask], dim=1)  # [B, 1+S]
+
         all_hidden = []
-        
+
         for layer in self.temporal_layers:
             def _layer(h_in, mask_in):
-                # mask_in: [B, S] bool, True = valid tokens
-                # We need a [B, S, S] attention mask with True where attention is allowed.
+                # mask_in: [B, S'], True = valid tokens
                 if mask_in.dtype is not torch.bool:
                     mask_b = mask_in.bool()
                 else:
                     mask_b = mask_in
 
-                # Allow attention only between valid tokens
-                # shape: [B, S, S]
+                # Build attention mask: [B, S', S']
                 attn_mask = mask_b.unsqueeze(1) & mask_b.unsqueeze(2)
 
-                # Our custom Transformer takes `mask`, not `src_key_padding_mask`
+                # Our custom Transformer takes `mask`
                 return layer(h_in, mask=attn_mask)
 
-            h = self._maybe_ckpt(_layer, h, flat_mask)
+            h = self._maybe_ckpt(_layer, h, full_mask)
             if return_features:
-               all_hidden.append(h)
+                all_hidden.append(h)
 
+        # Final norm
+        h = self.ln_f(h)  # [B, 1+S, D]
 
-        h = self.ln_f(h)
-        h_4d = h.reshape(B, T, N, D)  # [B, T, N, D]
+        # Separate CLS token and patch tokens
+        cls_out = h[:, 0]          # [B, D]
+        tokens_out = h[:, 1:]      # [B, S, D] = [B, T*N, D]
+
+        # Reshape tokens back to [B, T, N, D]
+        h_4d = tokens_out.reshape(B, T, N, D)  # [B, T, N, D]
 
         # 6) Heads
 
-        # temporal summary per frame = patch-mean
+        # temporal summary per frame = patch-mean (still used for per-frame stuff)
         temporal_tokens = h_4d.mean(dim=2)  # [B, T, D]
 
-        # a) sequence-level temporal score: last valid frame
-        last_idx = (sequence_lengths - 1).clamp(min=0)
+        # a) sequence-level temporal score: use CLS + masked mean z
         idx = torch.arange(B, device=self.device)
-        temporal_rep = temporal_tokens[idx, last_idx] + self._maybe_ckpt(self.head_temporal_cond, z[idx, last_idx])
 
+        # masked mean of z over valid timesteps
+        z_mask = temporal_mask.unsqueeze(-1).float()  # [B, T, 1]
+        z_sum = (z * z_mask).sum(dim=1)               # [B, z_dim]
+        z_count = z_mask.sum(dim=1).clamp(min=1.0)    # [B, 1]
+        z_mean_masked = z_sum / z_count               # [B, z_dim]
+
+        temporal_rep = cls_out + self.head_temporal_cond(z_mean_masked)  # [B, D]
         temporal_score = self._maybe_ckpt(self.temporal_head, temporal_rep)  # [B, 1]
-
         # b) global spatial score: average over time & patches
         spatial_rep = h_4d.mean(dim=1).mean(dim=1) + self.head_spatial_cond(
             z.mean(dim=1)
         )
-
         spatial_score = self._maybe_ckpt(self.spatial_head, spatial_rep)  # [B, 1]
 
         # c) per-frame scores (for consistency regularizers)
-        per_frame_rep = temporal_tokens + self._maybe_ckpt(self.head_frame_cond, z)  # [B, T, D]
+        per_frame_rep = temporal_tokens + self.head_frame_cond(z)  # [B, T, D]
         per_frame_scores = self._maybe_ckpt(self.per_frame_head, per_frame_rep)  # [B, T, 1]
 
         # mask out padded frames, then average
@@ -2127,6 +2150,7 @@ class TemporalDiscriminator(nn.Module):
         if return_features:
             out["features"] = all_hidden   # list of [B, T*N, D]
             out["hidden_3d"] = h_4d        # [B, T, N, D]
+            out["cls_token"] = cls_out     # [B, D]
 
         return out
 

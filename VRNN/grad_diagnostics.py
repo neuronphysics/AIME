@@ -314,10 +314,10 @@ class GradDiagnosticsAggregator:
     def tensorboard_log(self, writer, tag_prefix, global_step, quiver_scale=1.0, mode="params", param_patterns=None):
         mean_dirs, cos_mean, grad_amp_rms, comp_amp_rms = self.finalize()
         task_colors = {
-            "elbo":           "#1f77b4",  # blue
-            "perceiver":      "#ff7f0e",  # orange
-            "adversarial":     "#d62728",  # red
+            "generator":   "#1f77b4",  # also blue (ELBO+adv)
+            "perceiver":   "#ff7f0e",  # orange
         }
+
         # Quiver (2D PCA of mean dirs) — ensure we pass a Figure to TB
         fig_q = quiver_shared_dirs(mean_dirs, self.task_names, scale=quiver_scale, mode=mode, param_patterns=param_patterns, task_colors=task_colors)
         writer.add_figure(f"{tag_prefix}/quiver_mean_dirs", fig_q, global_step=global_step)

@@ -20,8 +20,7 @@ from vis_networks import (
     AddEpsilon, check_tensor
 )
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
-from VRNN.perceiver.position import RoPE
-from VRNN.RGB import RGB
+from VRNN.RGB import RGB, GradNorm
 from VRNN.lstm import LSTMLayer
 
 from VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
@@ -728,7 +727,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         perceiver_lr_multiplier: float = 0.7,
         use_ctx_checkpoint: bool = True,
         contrastive_weight: float = 0.01,
-    ):
+        grad_balance_method: str = 'rgb',
+        gradnorm_alpha: float = 1.5, 
+        ):
         super().__init__()
         #core dimensions
         self.input_channels = input_channels
@@ -756,6 +757,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.downsample_perceiver = downsample_perceiver
         self.perceiver_lr_multiplier = perceiver_lr_multiplier  
         self.contrastive_weight = contrastive_weight 
+        self.grad_balance_method = grad_balance_method
+        self.gradnorm_alpha = gradnorm_alpha
         #initialization different parts of the model
         
         self._init_perceiver_context()
@@ -1143,7 +1146,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         return alpha * (intra_loss + inter_loss) + (1 - alpha) * temporal_loss    
 
     def _setup_optimizers(self, learning_rate: float, weight_decay: float) -> None:
-        
         def get_params(*modules, exclude_params=None):
             params = []
             exclude_ids = {id(p) for p in (exclude_params or [])}
@@ -1151,8 +1153,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 if m is None:
                     continue
                 if isinstance(m, nn.Module):
-                    params.extend([p for p in m.parameters()
-                                if p.requires_grad and id(p) not in exclude_ids])
+                    params.extend(
+                        [p for p in m.parameters()
+                        if p.requires_grad and id(p) not in exclude_ids]
+                    )
                 elif isinstance(m, nn.Parameter):
                     if m.requires_grad and id(m) not in exclude_ids:
                         params.append(m)
@@ -1161,69 +1165,126 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         def split_by_weight_decay(params, wd):
             decay, no_decay = [], []
             for p in params:
+                if not p.requires_grad:
+                    continue
                 (decay if p.ndim >= 2 else no_decay).append(p)
             groups = []
-            if decay:    groups.append({"params": decay,    "weight_decay": wd})
-            if no_decay: groups.append({"params": no_decay, "weight_decay": 0.0})
+            if decay:
+                groups.append({"params": decay,    "weight_decay": wd})
+            if no_decay:
+                groups.append({"params": no_decay, "weight_decay": 0.0})
             return groups
-        
-        perceiver_params = get_params(self.perceiver_model, self.context_predictor, self.frame_slot_pool)
-        param_groups = []
-        if perceiver_params:  # guard empty
+
+        # 1) Generator param groups 
+        gen_param_groups = []
+
+        perceiver_params = get_params(
+            self.perceiver_model,
+            self.context_predictor,
+            self.frame_slot_pool,
+        )
+        if perceiver_params:
             perceiver_groups = split_by_weight_decay(perceiver_params, weight_decay)
             for g in perceiver_groups:
                 g["lr"] = learning_rate * self.perceiver_lr_multiplier
-                # Optional: slightly less WD on perceiver
-                if g.get("weight_decay", 0.0) > 0: g["weight_decay"] *= 0.5
-            param_groups.extend(perceiver_groups)
+                if g.get("weight_decay", 0.0) > 0:
+                    g["weight_decay"] *= 0.5
+            gen_param_groups.extend(perceiver_groups)
 
-        trunk_modules = [self.encoder, self.decoder, self.prior, self._rnn, self.rnn_layer_norm, self.gram_loss]
+        trunk_modules = [
+            self.encoder,
+            self.decoder,
+            self.prior,
+            self._rnn,
+            self.rnn_layer_norm,
+            self.gram_loss,
+        ]
+        trunk_params = get_params(*trunk_modules)
+        if trunk_params:
+            gen_param_groups.extend(split_by_weight_decay(trunk_params, weight_decay))
 
-        
         scalar_params = [self.h0, self.c0]
-
-        param_groups.extend(split_by_weight_decay(get_params(*trunk_modules), weight_decay))
-
-
-
-        scalars = [p for p in scalar_params if isinstance(p, nn.Parameter) and p.requires_grad]
+        scalars = [
+            p for p in scalar_params
+            if isinstance(p, nn.Parameter) and p.requires_grad
+        ]
         if scalars:
-            param_groups.append({"params": scalars, "lr": learning_rate, "weight_decay": 0.0001})
+            gen_param_groups.append(
+                {"params": scalars, "lr": learning_rate, "weight_decay": 1e-4}
+            )
 
+        # 2) Gradient balancer (RGB or GradNorm) 
+        method = getattr(self, "grad_balance_method", "rgb")
+        method = (method or "none").lower()
+
+        self.grad_balancer = None
+        task_names = ["generator", "perceiver"]
+
+        balancer_param_groups = []
+
+        if method == "rgb":
+            self.grad_balancer = RGB()
+        elif method == "gradnorm":
+            self.grad_balancer = GradNorm()
+
+        if self.grad_balancer is not None:
+            self.grad_balancer.task_name = task_names
+            self.grad_balancer.task_num  = len(task_names)
+            self.grad_balancer.device    = self.device
+            self.grad_balancer.rep_grad  = False
+
+            # Grad balancer should only see *generator* params, not its own params
+            self.grad_balancer.get_share_params = lambda: (
+                p for g in gen_param_groups for p in g["params"]
+            )
+
+            if method == "rgb":
+                # RGB has no trainable params (I assume), just configure hyperparams
+                self.grad_balancer.alpha_steps     = 1
+                self.grad_balancer.update_interval = 2
+                self.grad_balancer.lr_inner        = 0.05
+                self.grad_balancer.epoch = 0
+                self.grad_balancer.train_loss_buffer = None
+
+            elif method == "gradnorm":
+                # Initialize internal parameter loss_scale
+                self.grad_balancer.init_param()  # creates self.loss_scale
+                self.grad_balancer.epoch = 0
+                self.grad_balancer.train_loss_buffer = None
+
+                # Add loss_scale as a separate param group (no weight decay)
+                balancer_param_groups.append({
+                    "params": [self.grad_balancer.loss_scale],
+                    "lr": learning_rate,
+                    "weight_decay": 0.0,
+                })
+
+        #  3) Final optimizer over generator + balancer 
+        param_groups = gen_param_groups + balancer_param_groups
 
         self.gen_optimizer = torch.optim.AdamW(
-            param_groups, lr=learning_rate, betas=(0.9, 0.999), eps=1e-8
-        )
-    
-        self.grad_balancer = RGB()
-
-        # tasks in the same order losses were passed in training_step_sequence
-        self.grad_balancer.task_name = ["elbo", "perceiver", "adversarial"]
-        self.grad_balancer.task_num  = len(self.grad_balancer.task_name)
-        self.grad_balancer.device    = self.device
-        self.grad_balancer.rep_grad  = False        # operate on shared params (θ), not reps
-        self.grad_balancer.alpha_steps = 1  # Reduce from 3 to 1
-        self.grad_balancer.update_interval = 2  # Update every 2 steps instead of every step
-        self.grad_balancer.lr_inner = 0.05  # Smaller learning rate for stability
-
-        # give RGB access to *generator* params only
-        self.grad_balancer.get_share_params = lambda: (
-            p for g in self.gen_optimizer.param_groups for p in g["params"]
+            param_groups,
+            lr=learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8,
         )
 
+        #  4) Discriminator optimizer 
+        if hasattr(self, "image_discriminator"):
+            disc_params = [
+                p for p in self.image_discriminator.parameters()
+                if p.requires_grad
+            ]
+            if disc_params:
+                self.img_disc_optimizer = torch.optim.Adam(
+                    disc_params,
+                    lr=learning_rate * 0.1,
+                    betas=(0.0, 0.9),
+                    weight_decay=5e-5,
+                )
 
-        # Discriminator optimizer (separate)
-        if hasattr(self, 'image_discriminator'):
-            disc_params = [p for p in self.image_discriminator.parameters() if p.requires_grad]
-            self.img_disc_optimizer = torch.optim.Adam(
-                disc_params,
-                lr=learning_rate * 0.1,   
-                betas=(0.0, 0.9),          # canonical for WGAN-GP
-                weight_decay=0.00005
-            )
-        
-        # Setup schedulers
         self._setup_schedulers()
+
 
     def _setup_schedulers(self):
         """Setup learning-rate schedulers for all optimizers (Option B)."""
@@ -1510,7 +1571,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         return losses, outputs
 
-    
         
     def compute_conditional_entropy(self, logits, params):
         """
@@ -1670,7 +1730,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         x: torch.Tensor, #[B, T, C, H, W  ]
         reconstruction: torch.Tensor, #[B, T, C, H, W]
         z_seq: torch.Tensor, #[B, T, Z]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute adversarial losses for both image and latent space
         """
@@ -1679,13 +1739,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         for p in D.parameters():
             p.requires_grad_(False)
         
-        fake_img_outputs = self.image_discriminator(reconstruction, z=z_seq, return_features=True)
+        fake_img_outputs = D(reconstruction, z=z_seq, return_features=True)
+        real_img_outputs = D(x,             z=z_seq, return_features=True)
         img_adv_loss = -torch.mean(fake_img_outputs['final_score'])
         #reward for generating temporally consistent images
     
-        real_frame_features = x.reshape(x.shape[0], x.shape[1], -1)  # Flatten spatial dimensions
-        #I want it to be fake image generated with size [B, T, C, H, W]
-        fake_frame_features = reconstruction.reshape(x.shape[0], x.shape[1], -1)
+        real_frame_features = real_img_outputs['hidden_3d'].mean(dim=2)  # Flatten spatial dimensions
+        
+        fake_frame_features = fake_img_outputs['hidden_3d'].mean(dim=2)
 
         temporal_loss_frames =self.contrastive_loss(
         real_features=real_frame_features,
@@ -1694,10 +1755,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             
         # === Feature Matching Loss ===
         # This helps stabilize training
-        real_features = self.image_discriminator(x, z=z_seq, return_features=True)['hidden_3d']
 
         # L1 loss between feature statistics
-        feature_match_loss = self.compute_feature_matching_loss(real_features, fake_img_outputs['hidden_3d'])
+        feature_match_loss = self.compute_feature_matching_loss(real_img_outputs['hidden_3d'], fake_img_outputs['hidden_3d'])
         # Restore Discriminator parameter gradients
         for p, f in zip(D.parameters(), flags):
             p.requires_grad_(f)
@@ -1932,7 +1992,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
         lambda_img_eff = (lambda_img * warmup_factor) if warmup_factor > 0.0 else 0.0
 
-        # ---- 4) Compose task losses for MGDA (5 tasks) ----
+        # ---- 4) Compose task losses for MGDA (3 tasks) ----
         elbo_loss = (
             lambda_recon * vae_losses['recon_loss']
             + beta * vae_losses['kl_z']
@@ -1962,28 +2022,52 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             z_seq=outputs['latents'],
         )
         adv_base = img_adv_loss + temporal_adv_loss + feat_match_loss
-        adv_loss = lambda_img_eff * adv_base  # for logging and total_gen_loss
-        # Total generator loss (tensor), used both for logging and LR scheduling
-        total_gen_loss = (
-            elbo_loss
-            + perceiver_loss
-            + (lambda_img_eff * (img_adv_loss + temporal_adv_loss + feat_match_loss))
-        )
+        
+        # ---- VAE-GAN style generator loss: ELBO + adversarial ----
+        generator_loss = elbo_loss + lambda_img_eff * adv_base
+
+        # Total loss used for logging / schedulers (gen + perceiver)
+        total_gen_loss = generator_loss + perceiver_loss
+
         loss_dict = {
-            "elbo":        elbo_loss.reshape([]),
-            "perceiver":   perceiver_loss.reshape([]),
-            "adversarial": adv_base.reshape([]),  # <-- store unscaled base
+            "generator": generator_loss.reshape([]),
+            "perceiver": perceiver_loss.reshape([]),
         }
 
-        L_elbo      = loss_dict["elbo"]
-        L_perceiver = loss_dict["perceiver"]
-        L_adv       = lambda_img_eff * loss_dict["adversarial"]  # <-- single scaling
+        L_gen = loss_dict["generator"]
+        L_ctx = loss_dict["perceiver"]
 
-        task_losses = [L_elbo, L_perceiver, L_adv]
+        # Only two tasks for RGB / GradNorm: generator vs perceiver
+        task_losses = [L_gen, L_ctx]
 
         self.gen_optimizer.zero_grad(set_to_none=True)
-        # RGB computes per-task grads and writes back the rotated aggregate grad
-        self.grad_balancer.backward(task_losses, mode="backward")
+        method = getattr(self, "grad_balance_method", "rgb")
+        method = (method or "none").lower()
+
+        if self.grad_balancer is not None and method in ("rgb", "gradnorm"):
+            # Keep GradNorm's internal epoch in sync with the model, if present
+            if hasattr(self.grad_balancer, "epoch"):
+                self.grad_balancer.epoch = getattr(self, "current_epoch", 0)
+
+            if method == "gradnorm":
+                if self.grad_balancer.train_loss_buffer is None:
+                    with torch.no_grad():
+                        base = torch.stack([loss.detach() for loss in task_losses])
+                        
+                    # shape [T, 1] as expected in GradNorm code
+                    self.grad_balancer.train_loss_buffer = base.view(-1, 1).to(self.device)
+                self.grad_balancer.backward(
+                        task_losses,
+                        mode="backward",
+                        alpha=self.gradnorm_alpha,
+                        log_grads = True,
+                    )
+               
+            else:  # "rgb"
+                self.grad_balancer.backward(task_losses, mode="backward")
+        else:
+            # Fallback: plain summed loss (no multi-task weighting)
+            total_gen_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(
             [p for g in self.gen_optimizer.param_groups for p in g["params"]],

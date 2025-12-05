@@ -980,7 +980,7 @@ class DMCVBTrainer:
         else:
             self.writer = None
         self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
-        task_names = ['elbo','perceiver','adversarial']  
+        task_names = ["generator", "perceiver"]  
         self._agg = GradDiagnosticsAggregator(task_names, 
                                               component_groups=self.grad_monitor.component_groups,
                                               average_component_norms=True)
@@ -1295,8 +1295,14 @@ class DMCVBTrainer:
                         p.requires_grad_(flag)
                 else:
                     adv_loss = torch.zeros((), device=obs.device)
+                warmup_factor = self.model.get_warmup_factor()
+                lambda_img_eff = (
+                    self.config["lambda_img"] * warmup_factor
+                    if warmup_factor > 0.0 else 0.0
+                )                
+                generator_loss = elbo_loss + lambda_img_eff * adv_loss
 
-                task_losses = [elbo_loss, perceiver_loss, adv_loss]
+                task_losses = [generator_loss, perceiver_loss]
 
                 # Let GradDiagnosticsAggregator handle backward() etc.
                 named_params = list(self.model.named_parameters())
@@ -1635,7 +1641,7 @@ def main():
         'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
-        'batch_size': 35,
+        'batch_size': 40,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
@@ -1657,7 +1663,8 @@ def main():
         "lambda_gram": 0.05,
         'grad_clip': 5,
         'n_critic': 1,
-        
+        "grad_balance_method": "rgb",  # or "rgb" 
+        "gradnorm_alpha": 1.5,        
         # Logging
         'use_wandb': False,
         'wandb_project': 'dpgmm-vrnn-dmc',
@@ -1696,7 +1703,9 @@ def main():
         grad_clip= config['grad_clip'],
         prior_alpha =config['prior_alpha'],
         prior_beta = config['prior_beta'],
-        dropout=config['dropout']
+        dropout=config['dropout'],
+        grad_balance_method=config['grad_balance_method'],
+        gradnorm_alpha=config['gradnorm_alpha'],
     )
     if config['use_pretrained_vqpt']:
         model.load_pretrained_vq_tokenizer(

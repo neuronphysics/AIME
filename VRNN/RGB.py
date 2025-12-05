@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import numpy as np
-
+import torch.nn.functional as F
 
 class AbsWeighting(nn.Module):
     r"""An abstract class for weighting strategies."""
@@ -55,10 +55,7 @@ class AbsWeighting(nn.Module):
             grads = torch.zeros(self.task_num, self.grad_dim).to(self.device)
             for tn in range(self.task_num):
                 if mode == 'backward':
-                    if 'MoDo' in [base.__name__ for base in self.__class__.__bases__] or 'SDMGrad' in [base.__name__ for base in self.__class__.__bases__]:
-                        losses[tn].backward(retain_graph=True)
-                    else:
-                        losses[tn].backward(retain_graph=True) if (tn+1)!=self.task_num else losses[tn].backward()
+                    losses[tn].backward(retain_graph=True)
                     grads[tn] = self._grad2vec()
                 elif mode == 'autograd':
                     params = list(self.get_share_params())
@@ -462,45 +459,97 @@ class RGB(AbsWeighting):
         # Return equal weights (RGB doesn't use adaptive task weighting)
         return np.ones(T)
 
+
+
 class GradNorm(AbsWeighting):
     r"""Gradient Normalization (GradNorm).
-    
-    This method is proposed in `GradNorm: Gradient Normalization for Adaptive Loss Balancing in Deep Multitask Networks (ICML 2018) <http://proceedings.mlr.press/v80/chen18a/chen18a.pdf>`_ \
-    and implemented by us.
 
-    Args:
-        alpha (float, default=1.5): The strength of the restoring force which pulls tasks back to a common training rate.
-
+    Chen et al., ICML 2018: 
+    "GradNorm: Gradient Normalization for Adaptive Loss Balancing in Deep Multitask Networks".
     """
+
     def __init__(self):
-        super(GradNorm, self).__init__()
-        
+        super().__init__()
+
     def init_param(self):
-        self.loss_scale = nn.Parameter(torch.tensor([1.0]*self.task_num, device=self.device))
-        
+        # one scale per task
+        self.loss_scale = nn.Parameter(
+            torch.ones(self.task_num, device=self.device)
+        )
+
+    def _canonicalize_losses(self, losses):
+        """Convert different loss containers to a list of tensors [L_0, ..., L_{T-1}]."""
+        if isinstance(losses, (list, tuple)):
+            return list(losses)
+        if isinstance(losses, dict):
+            # assumes integer keys 0..task_num-1
+            return [losses[i] for i in range(self.task_num)]
+        if isinstance(losses, torch.Tensor):
+            # e.g., shape [task_num]
+            if losses.ndim == 0:
+                # single scalar loss; treat as 1 task
+                return [losses]
+            return [losses[i] for i in range(self.task_num)]
+        raise TypeError(f"Unsupported type for losses: {type(losses)}")
+
     def backward(self, losses, **kwargs):
-        alpha = kwargs['alpha']
+        alpha = kwargs["alpha"]
+        log_grads = kwargs.get("log_grads", False)
+
+        # Canonicalize
+        losses_list = self._canonicalize_losses(losses)
+
         if self.epoch >= 1:
+            # ----- Main GradNorm logic -----
             loss_scale = self.task_num * F.softmax(self.loss_scale, dim=-1)
-            grads = self._get_grads(losses, mode='backward')
+
+            grads = self._get_grads(losses_list, mode="backward")
             if self.rep_grad:
                 per_grads, grads = grads[0], grads[1]
-                
-            G_per_loss = torch.norm(loss_scale.unsqueeze(1)*grads, p=2, dim=-1)
-            G = G_per_loss.mean(0)
-            L_i = torch.Tensor([losses[tn].item()/self.train_loss_buffer[tn, 0] for tn in range(self.task_num)]).to(self.device)
-            r_i = L_i/L_i.mean()
-            constant_term = (G*(r_i**alpha)).detach()
-            L_grad = (G_per_loss-constant_term).abs().sum(0)
+
+            # grads: [task_num, grad_dim]
+            G_per_loss = torch.norm(
+                loss_scale.unsqueeze(1) * grads, p=2, dim=-1
+            )  # [task_num]
+            G = G_per_loss.mean(0)  # scalar
+
+            L_i = torch.tensor(
+                [
+                    losses_list[tn].item() / self.train_loss_buffer[tn, 0]
+                    for tn in range(self.task_num)
+                ],
+                device=self.device,
+                dtype=self.loss_scale.dtype,
+            )
+
+            r_i = L_i / L_i.mean()
+            constant_term = (G * (r_i ** alpha)).detach()  # [task_num]
+
+            L_grad = (G_per_loss - constant_term).abs().sum(0)  # scalar
             L_grad.backward()
+
             loss_weight = loss_scale.detach().clone()
-            
+
             if self.rep_grad:
-                self._backward_new_grads(loss_weight, per_grads=per_grads)
+                new_grads = self._backward_new_grads(
+                    loss_weight, per_grads=per_grads
+                )
             else:
-                self._backward_new_grads(loss_weight, grads=grads)
-            return loss_weight.cpu().numpy()
+                new_grads = self._backward_new_grads(
+                    loss_weight, grads=grads
+                )
+
+            return loss_weight.cpu().numpy(), new_grads
         else:
-            loss = torch.mul(losses, torch.ones_like(losses).to(self.device)).sum()
-            loss.backward()
-            return np.ones(self.task_num)
+            # ----- Warmup: epoch < 1 -----
+            if log_grads:
+                # log gradients without applying GradNorm yet
+                self._compute_grad_dim()
+                grads = self._compute_grad(losses_list, mode="backward")
+                self._reset_grad(grads.sum(0))
+                return np.ones(self.task_num), grads
+
+            # Just sum all task losses and backprop once
+            total_loss = sum(losses_list)
+            total_loss.backward()
+            return np.ones(self.task_num), None

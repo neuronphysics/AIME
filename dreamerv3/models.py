@@ -774,7 +774,7 @@ class LatentAGACBehavior(ImagBehavior):
 
                 # -------------- Extrinsic advantage for multi-critic ----------
                 # Stack λ-returns for extrinsic stream: (T-1,B,1)-like
-                extr_returns  = torch.stack(target, dim=0)
+                extr_returns  = torch.stack(target, dim=1)
                 extr_baseline = base.detach()
 
                 extr_ret_norm  = self.ret_norm_extr(extr_returns)
@@ -782,37 +782,39 @@ class LatentAGACBehavior(ImagBehavior):
                 adv_extr       = self.score_norm_extr(extr_ret_norm - extr_base_norm)
 
                 # -------------- AGAC critic stream (KL rewards) ---------------
+                agac_returns      = None
+                agac_target_stack = None
+
                 if use_agac_critic and (K_t is not None):
-                    agac_value_pred = self.value_adv(imag_feat).mode()  # ~ (T,B,1)
+                    # Keep a critic over the KL stream so V_agac ≈ E[∑ γ^t K_t]
+                    agac_value_pred = self.value_adv(imag_feat).mode()  # (T,B,1)
                     discount_kl     = self._gamma_kl * discount
 
-                    # Use K_t (T-1,...) and discount_kl[1:] (T-1,...),
-                    # mirroring Dreamer's λ-return for reward[1:].
                     agac_returns = tools.lambda_return(
-                        K_t,                                     # (T-1,·)
-                        agac_value_pred[:-1],                   # (T-1,·)
-                        discount_kl[1:],                        # (T-1,·)
-                        agac_value_pred[-1],                    # (B,·)
+                        K_t,                          # (T,B,1)   -> lambda-return along time
+                        agac_value_pred[:-1],         # (T-1,B,1)
+                        discount_kl[1:],              # (T-1,B,1)
+                        agac_value_pred[-1],          # (B,1)
                         lambda_=self._config.discount_lambda,
                         axis=0,
-                    )                                           # list of T-1 tensors
-
-                    agac_baseline = agac_value_pred[:-1].detach()
-
-                    agac_ret_stack = torch.stack(agac_returns, dim=0)
-                    agac_ret_norm  = self.ret_norm_agac(agac_ret_stack)
-                    agac_base_norm = self.ret_norm_agac(agac_baseline, update=False)
-                    adv_agac       = self.score_norm_agac(
-                        agac_ret_norm - agac_base_norm
                     )
+                    agac_target_stack = torch.stack(agac_returns, dim=1)  # (B,T-1,1)
 
-                    combined_adv = adv_extr + self._beta_kl * adv_agac
+                # ---------- AGAC advantage:  A_extr + c (δ - KL) ----------
+                if (self._kl_mode != "none") and (K_t is not None) and (delta_t is not None):
+                    # K_t, delta_t are (T,B,1); drop last step to match λ-return horizon T-1
+                    bonus_raw  = (delta_t - K_t)        # (T,B,1)
+
+                    # Optional normalisation so scales roughly match adv_extr
+                    bonus_norm = self.score_norm_agac(bonus_raw)
+
+                    # c in the paper  ≈  self._beta_kl here
+                    combined_adv = adv_extr + self._beta_kl * bonus_norm
                 else:
-                    agac_returns = None
                     combined_adv = adv_extr
 
                 # Final combined advantage, normalised once more
-                final_adv = self.adv_norm_total(combined_adv)      # (T-1,·)
+                final_adv = self.adv_norm_total(combined_adv)   # (T-1,B,1)
 
                 # -------------- Extra REINFORCE actor bonus -------------------
                 # Log prob of actions under current actor: use steps 0..T-2
@@ -844,18 +846,14 @@ class LatentAGACBehavior(ImagBehavior):
                         f"[AGAC] KL reward K_t time dim {T_K} != extr_returns {T_extr}"
                     )
 
-                # Multi-critic REINFORCE term: -w_t * logπ * A_hat_t
-                actor_loss_mc = -w * logp * final_adv.detach()
+                # Multi-critic / AGAC policy gradient:  -w_t * logπ * A_t^{AGAC}
+                actor_loss_mc    = -w * logp * final_adv.detach()
 
-                # δ bonus: -w_t * logπ * beta_delta * δ_t
-                if (self._beta_delta > 0.0) and (delta_t is not None):
-                    bonus_adv      = self._beta_delta * delta_t.detach()
-                    actor_loss_delta = -w * logp * bonus_adv
-                else:
-                    actor_loss_delta = torch.zeros_like(actor_loss_mc)
+                # We now *include* δ and KL inside final_adv, so no extra δ term.
+                actor_loss_delta = torch.zeros_like(actor_loss_mc)
 
-                # Total actor loss tensor (time-by-batch):
-                actor_loss_total = actor_loss_main + actor_loss_mc + actor_loss_delta
+                # Total actor loss tensor
+                actor_loss_total = actor_loss_main + actor_loss_mc  # + 0
 
                 # Entropy regularisation (Dreamer style)
                 actor_loss_total -= (
