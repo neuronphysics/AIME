@@ -4,8 +4,7 @@ Pytorch implementation of [Mastering Diverse Domains through World Models](https
 This fork additionally supports **Adversarially Guided Actor-Critic (AGAC)** in the **latent space** via a custom `LatentAGACBehavior` controller.
 
 - **Policy:** Latent-space **Adversarially Guided Actor-Critic (AGAC)** insired behavior:
-  - Two KL-designs:
-    - `actor_horizon` – critic purely extrinsic, actor gets a horizon KL bonus.
+  - KL-designs:
     - `recursive` – KL-shaped critic and log-ratio bonus for the actor.
   - Old-policy options:
     - `ema` – EMA-smoothed old policies.
