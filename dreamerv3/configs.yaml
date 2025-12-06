@@ -52,7 +52,7 @@ defaults:
   action_repeat: 2
   time_limit: 1000
   grayscale: False
-  prefill: 2500
+  prefill: 5000
   reward_EMA: True
 
   # Model
@@ -88,7 +88,7 @@ defaults:
   initial: 'learned'
 
   # Training
-  batch_size: 16
+  batch_size: 180
   batch_length: 64
   train_ratio: 512
   pretrain: 100

@@ -590,6 +590,10 @@ class PCGrad():
     @property
     def scaler(self):
         return self._scaler
+    
+    @property
+    def param_groups(self):
+        return self._optim.param_groups
 
     def zero_grad(self):
         '''

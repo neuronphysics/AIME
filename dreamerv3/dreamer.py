@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from torch import distributions as torchd
 
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 to_np = lambda x: x.detach().cpu().numpy()
 
