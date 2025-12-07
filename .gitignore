@@ -19,7 +19,7 @@ data/*
 dreamerv3/imgs*
 VRNN/perceiver/data/
 VRNN/perceiver/model/
-transition_data/*
+transition_data/
 wandb/
 checkpoints/
 VRNN/test/

@@ -796,16 +796,14 @@ class LatentAGACBehavior(ImagBehavior):
                     # K_t, delta_t are (T,B,1); drop last step to match λ-return horizon T-1
                     bonus_raw  = (delta_t - K_t)        # (T,B,1)
 
-                    # Optional normalisation so scales roughly match adv_extr
-                    bonus_norm = self.score_norm_agac(bonus_raw)
 
                     # c in the paper  ≈  self._beta_kl here
-                    combined_adv = self._beta_kl * bonus_norm
+                    combined_adv =  self.score_norm_agac(bonus_raw)
                 else:
                     combined_adv = torch.zeros_like(weights[:-1])   # (T-1,B,1)
 
                 # Final combined advantage, normalised once more
-                final_adv = self.adv_norm_total(combined_adv)   # (T-1,B,1)
+                final_adv = self._beta_kl * self.adv_norm_total(combined_adv)   # (T-1,B,1)
 
                 # -------------- Extra REINFORCE actor bonus -------------------
                 # Log prob of actions under current actor: use steps 0..T-2
