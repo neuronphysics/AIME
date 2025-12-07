@@ -28,10 +28,19 @@ module load mujoco/3.3.0
 module load mpi4py/3.1.6
 module load arrow
 
-export MUJOCO_GL=egl
+
 #virtualenv --no-download --clear /home/memole/D2E
 source /home/memole/D2E/bin/activate
+#export LD_LIBRARY_PATH=/usr/lib64/nvidia:${LD_LIBRARY_PATH}
+
 ### FORCE SINGLE-THREAD BLAS / OMP / TORCH
+#export MUJOCO_GL=egl        # If using MuJoCo
+#export PYOPENGL_PLATFORM=egl
+#export MUJOCO_EGL_DEVICE_ID=0      
+#export EGL_DEVICE_ID=0
+export MUJOCO_GL=osmesa
+
+###
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1

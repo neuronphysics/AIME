@@ -255,9 +255,22 @@ class VAEEncoder(nn.Module):
                 layer_idx = layer_idx + 1
 
         self.encoder_blocks = nn.ModuleList(encoder_blocks)
-        
+        self.refine_block = NVAEResidualBlock(
+            current_channels,
+            current_channels,
+            stride=1,
+            use_se=use_se,
+            dropout=dropout,
+        )
+
+        # Use GroupNorm here (more stable for small batches)
+        num_groups = (
+            min(32, current_channels)
+            if current_channels % 8 == 0
+            else max(1, current_channels // 4)
+        )        
         # Final processing
-        self.final_norm = nn.BatchNorm2d(current_channels)
+        self.final_norm = nn.GroupNorm(num_groups, current_channels)
         self.final_act = Swish()
         
         # Compute final spatial dimensions
@@ -335,6 +348,14 @@ class VAEEncoder(nn.Module):
                 # last block at a resolution wins (same as extract_pyramid)
                 self._cached_levels[f"C{level}"] = feat
                 self._cached_hw[f"{hw[0]}x{hw[1]}"] = feat
+
+        if self.use_checkpoint and self.training:
+            h = torch.utils.checkpoint.checkpoint(
+                self.refine_block, h,
+                use_reentrant=False, preserve_rng_state=True
+            )
+        else:
+            h = self.refine_block(h)
         
         # Final processing
         h = self.final_norm(h)
@@ -711,10 +732,21 @@ class VAEDecoder(nn.Module):
         self._unet_skip_levels_last_n = skip_levels_last_n
 
         self.decoder_blocks = nn.ModuleList(decoder_blocks)
-        
+        self.refine_block = NVAEResidualBlock(
+            current_channels,
+            current_channels,
+            stride=1,
+            use_se=use_se,
+            dropout=dropout,
+        )
+
         # Final layers
-        #self.final_norm = nn.BatchNorm2d(current_channels)
-        num_groups = min(32, current_channels) if current_channels % 8 == 0 else current_channels // 4 if current_channels > 4 else 1
+        num_groups = (
+            min(32, current_channels)
+            if current_channels % 8 == 0
+            else current_channels // 4 if current_channels > 4 else 1
+        )        
+        
         self.final_norm = nn.GroupNorm(num_groups, current_channels)
 
         self.final_act = Swish()
@@ -1059,6 +1091,13 @@ class VAEDecoder(nn.Module):
             # fuse skip only if spatial size changed (i.e., just upsampled)
             if enable_unet:
                 h = self._fuse_unet_skip_if_needed(h, prev_hw, local_skip_pool, mode)
+        if self.use_checkpoint and self.training:
+            h = torch.utils.checkpoint.checkpoint(
+                self.refine_block, h,
+                use_reentrant=False, preserve_rng_state=True
+            )
+        else:
+            h = self.refine_block(h)
 
         # 3) Final head
         if self.use_checkpoint and self.training:

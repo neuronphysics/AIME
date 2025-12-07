@@ -805,8 +805,8 @@ class GradientMonitor:
     def _define_component_hierarchy(self):
         """Establish semantic groupings for architectural components"""
         return {
-            'encoder': ['encoder.net', 'encoder.proj'],
-            'decoder': ['decoder.net'],
+            'encoder': ['encoder.'],
+            'decoder': ['decoder.'],
             'perceiver': ['perceiver_model' ],
             'prior_dynamics': ['prior.stick_breaking.kumar_net', 'prior.component_nn'],
             'vrnn_core': ['_rnn', 'rnn_layer_norm'],
@@ -980,7 +980,7 @@ class DMCVBTrainer:
         else:
             self.writer = None
         self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
-        task_names = ["generator", "perceiver"]  
+        task_names = ["ELBO", "adversarial", "perceiver"]  
         self._agg = GradDiagnosticsAggregator(task_names, 
                                               component_groups=self.grad_monitor.component_groups,
                                               average_component_norms=True)
@@ -1300,9 +1300,8 @@ class DMCVBTrainer:
                     self.config["lambda_img"] * warmup_factor
                     if warmup_factor > 0.0 else 0.0
                 )                
-                generator_loss = elbo_loss + lambda_img_eff * adv_loss
-
-                task_losses = [generator_loss, perceiver_loss]
+                
+                task_losses = [elbo_loss, lambda_img_eff * adv_loss, perceiver_loss]
 
                 # Let GradDiagnosticsAggregator handle backward() etc.
                 named_params = list(self.model.named_parameters())
@@ -1641,29 +1640,29 @@ def main():
         'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
-        'batch_size': 40,
+        'batch_size': 45,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
-        'learning_rate': 0.0002,
+        'learning_rate': 0.0003,
         'n_epochs': 200,
         'num_workers': 4,
 
-        'beta_min': 0.5,
+        'beta_min': 0.7,
         'beta_max': 1.0,
-        'beta_warmup_epochs': 25,  # 20–50 is common
+        'beta_warmup_epochs': 10,  # 20–50 is common
         'beta_eval': 1.0,          # force eval to use full KL (recommended)
         
         # Loss weights
         'beta': 1.0,
         'lambda_img': 1.0,
-        'lambda_recon': 1.0,
-        "lambda_gram": 0.05,
-        'grad_clip': 5,
+        'lambda_recon': 3.0,
+        "lambda_gram": 0.5,
+        'grad_clip': 2.0,
         'n_critic': 1,
-        "grad_balance_method": "pcgrad",  # "gradnorm" or "rgb" 
+        "grad_balance_method": "rgb",  # "gradnorm" or "rgb" 
         "gradnorm_alpha": 1.5,        
         # Logging
         'use_wandb': False,

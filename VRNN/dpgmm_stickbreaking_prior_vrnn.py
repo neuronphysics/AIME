@@ -396,6 +396,34 @@ class AdaptiveStickBreaking(nn.Module):
         prior_rate = self.gamma_b
         return self.alpha_posterior.kl_divergence(h, prior_concentration, prior_rate)
 
+class ComponentNN(nn.Module):
+    def __init__(self, hidden_dim, latent_dim, max_components):
+        super().__init__()
+        inner_dim = hidden_dim * 2
+
+        self.fc1 = nn.Linear(hidden_dim, inner_dim)
+        self.ln1 = nn.LayerNorm(inner_dim)
+
+        self.fc2 = nn.Linear(inner_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+
+        self.out = nn.Linear(hidden_dim, 2 * latent_dim * max_components)
+
+    def forward(self, x):
+        residual = x                          # [B, hidden_dim]
+
+        h = self.fc1(x)
+        h = F.gelu(h)
+        h = self.ln1(h)
+
+        h = self.fc2(h)
+        h = F.gelu(h)
+        h = self.ln2(h)
+
+        h = h + residual                      # true residual
+
+        return self.out(h)                    # [B, 2 * latent_dim * K]
+
 class DPGMMPrior(nn.Module):
     """
     Implements Dirichlet Process GMM prior for VAE
@@ -419,13 +447,8 @@ class DPGMMPrior(nn.Module):
         self.stick_breaking = AdaptiveStickBreaking(max_components, hidden_dim, device, prior_alpha=prior_alpha, prior_beta=prior_beta)
 
         # Component parameters generators
-        self.component_nn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.LeakyReLU(0.2, inplace=False),
-            nn.Linear(hidden_dim, 2 * latent_dim * max_components),
-            nn.LayerNorm(2 * latent_dim * max_components),
-        )
+        self.component_nn = ComponentNN(hidden_dim, latent_dim, max_components)
+
         self.to(device)
 
     def compute_kl_divergence_mc(
@@ -724,7 +747,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         num_codebook_perceiver: int = 1024,
         perceiver_code_dim: int = 256,
         downsample_perceiver: int = 4,
-        perceiver_lr_multiplier: float = 0.7,
+        perceiver_lr_multiplier: float = 0.8,
         use_ctx_checkpoint: bool = True,
         contrastive_weight: float = 0.01,
         grad_balance_method: str = 'rgb',
@@ -775,7 +798,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                 prior_beta=prior_beta)
 
         # Initialize weights
-        
+        self.apply(self.init_weights)
         self.to(device)
         
         # Setup optimizers
@@ -826,10 +849,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 
     def _init_encoder_decoder(self):
         # Encoder network
-        encoder_channels = [64, 64, 96, 128, 128, 192]
+        encoder_channels = [64, 96, 128, 192, 192, 256]
         self.encoder = VAEEncoder(
                                   channel_size_per_layer=encoder_channels,
-                                  layers_per_block_per_layer=[1,1,2,1,1,1],
+                                  layers_per_block_per_layer=[1,1,1,2,1,2],
                                   latent_size=self.latent_dim,
                                   width=self.image_size,
                                   height=self.image_size,
@@ -846,8 +869,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                   latent_size=self.latent_dim,
                                   width=self.image_size,
                                   height= self.image_size,
-                                  channel_size_per_layer=[192,128,128,96,64,64],
-                                  layers_per_block_per_layer=[1,1,1,2,1,1],
+                                  channel_size_per_layer=[256,192,192,128,96,64],
+                                  layers_per_block_per_layer=[2,1,2,1,1,1],
                                   num_layers_per_resolution=[1,2,2,1],
                                   reconstruction_channels=self.input_channels,
                                   downsample=4,
@@ -873,7 +896,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.ema_encoder = EMA(self.encoder, decay=0.995, use_num_updates=True)
         self.ema_decoder = EMA(self.decoder, decay=0.995, use_num_updates=True)
 
-        self.apply(self.init_weights)
+
 
     def load_pretrained_vq_tokenizer(
         self,
@@ -1221,7 +1244,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         method = (method or "none").lower()
 
         self.grad_balancer = None
-        task_names = ["generator", "perceiver"]   # must match training_step_sequence
+        task_names = ["ELBO", "adversarial", "perceiver"]   # must match training_step_sequence
         balancer_param_groups = []
 
         if method == "rgb":
@@ -1265,7 +1288,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         param_groups = gen_param_groups + balancer_param_groups
         base_optimizer = torch.optim.AdamW(
             param_groups,
-            lr=learning_rate,
+            lr=learning_rate*1.2,
             betas=(0.9, 0.999),
             eps=1e-8,
         )
@@ -1286,7 +1309,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if disc_params:
                 self.img_disc_optimizer = torch.optim.Adam(
                     disc_params,
-                    lr=learning_rate * 0.1,
+                    lr=learning_rate * 0.2,
                     betas=(0.0, 0.9),
                     weight_decay=5e-5,
                 )
@@ -1299,7 +1322,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # If we're using PCGrad, schedulers should see the wrapped optimizer
         opt_for_sched = getattr(self.gen_optimizer, "_optim", self.gen_optimizer)
-
 
         # Store initial lrs for trunk optimizer
         for group in opt_for_sched.param_groups:
@@ -1553,7 +1575,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                            actions=None, 
                            beta=1.0,  
                            lambda_recon=1.0, 
-                           lambda_gram=0.05,
+                           lambda_gram=0.1,
                            ):
         """
         Corrected loss computation recognizing that kumar_beta_kl already includes alpha prior KL
@@ -2044,25 +2066,24 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             reconstruction=outputs['reconstructions'],
             z_seq=outputs['latents'],
         )
-        adv_base = img_adv_loss + temporal_adv_loss + feat_match_loss
+        adv_base = lambda_img_eff * img_adv_loss + warmup_factor * temporal_adv_loss + lambda_img * feat_match_loss
         
-        # ---- VAE-GAN style generator loss: ELBO + adversarial ----
-        generator_loss = elbo_loss + lambda_img_eff * adv_base
 
         # Total loss used for logging / schedulers (gen + perceiver)
-        total_gen_loss = generator_loss + perceiver_loss
+        total_gen_loss = elbo_loss +  adv_base + perceiver_loss
 
         loss_dict = {
-            "generator": generator_loss.reshape([]),
+            "ELBO": elbo_loss.reshape([]),
+            "adversarial":  adv_base.reshape([]),
             "perceiver": perceiver_loss.reshape([]),
         }
 
-        L_gen = loss_dict["generator"]
+        L_elbo = loss_dict["ELBO"] 
+        L_adv = loss_dict["adversarial"]
         L_ctx = loss_dict["perceiver"]
 
         # Only two tasks for RGB / GradNorm / PCGrad: generator vs perceiver
-        task_losses = [L_gen, L_ctx]
-
+        task_losses = [L_elbo, L_adv, L_ctx]
         method = getattr(self, "grad_balance_method", "rgb")
         method = (method or "none").lower()
 
@@ -2070,7 +2091,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if method == "pcgrad":
             # gen_optimizer is a PCGrad instance wrapping an AdamW
             base_opt = self.gen_optimizer._optim
-
 
             # Clear both underlying grads and PCGrad accumulators
             self.gen_optimizer.zero_grad()

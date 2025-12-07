@@ -19,16 +19,15 @@ class Crafter:
             "image": gym.spaces.Box(
                 0, 255, self._env.observation_space.shape, dtype=np.uint8
             ),
-            "is_first": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
-            "is_last": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
-            "is_terminal": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
             "log_reward": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "is_first": gym.spaces.Box(0.0, 1.0, (), dtype=np.float32),
+            "is_last": gym.spaces.Box(0.0, 1.0, (), dtype=np.float32),
+            "is_terminal": gym.spaces.Box(0.0, 1.0, (), dtype=np.float32),
+            "reward": gym.spaces.Box(-np.inf, np.inf, (), dtype=np.float32),
         }
         spaces.update(
             {
-                f"log_achievement_{k}": gym.spaces.Box(
-                    -np.inf, np.inf, (1,), dtype=np.float32
-                )
+                f"log_achievement_{k}": gym.spaces.Box(0, 2**31 - 1, (), np.int32)
                 for k in self._achievements
             }
         )
