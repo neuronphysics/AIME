@@ -772,15 +772,6 @@ class LatentAGACBehavior(ImagBehavior):
                     base,
                 )
 
-                # -------------- Extrinsic advantage for multi-critic ----------
-                # Stack λ-returns for extrinsic stream: (T-1,B,1)-like
-                extr_returns  = torch.stack(target, dim=1)
-                extr_baseline = base.detach()
-
-                extr_ret_norm  = self.ret_norm_extr(extr_returns)
-                extr_base_norm = self.ret_norm_extr(extr_baseline, update=False)
-                adv_extr       = self.score_norm_extr(extr_ret_norm - extr_base_norm)
-
                 # -------------- AGAC critic stream (KL rewards) ---------------
                 agac_returns      = None
                 agac_target_stack = None
@@ -809,9 +800,9 @@ class LatentAGACBehavior(ImagBehavior):
                     bonus_norm = self.score_norm_agac(bonus_raw)
 
                     # c in the paper  ≈  self._beta_kl here
-                    combined_adv = adv_extr + self._beta_kl * bonus_norm
+                    combined_adv = self._beta_kl * bonus_norm
                 else:
-                    combined_adv = adv_extr
+                    combined_adv = torch.zeros_like(weights[:-1])   # (T-1,B,1)
 
                 # Final combined advantage, normalised once more
                 final_adv = self.adv_norm_total(combined_adv)   # (T-1,B,1)
@@ -825,26 +816,6 @@ class LatentAGACBehavior(ImagBehavior):
 
                 w = weights[:-1]  # (T-1,B,1)
 
-                T_extr = extr_returns.shape[0]      # T
-                T_adv  = final_adv.shape[0]
-                T_logp = logp.shape[0]
-                T_w    = w.shape[0]
-
-                assert T_adv == T_extr, (
-                    f"[AGAC] final_adv time dim {T_adv} != extr_returns {T_extr}"
-                )
-                assert T_logp == T_extr, (
-                    f"[AGAC] logp time dim {T_logp} != extr_returns {T_extr}"
-                )
-                assert T_w == T_extr, (
-                    f"[AGAC] weights time dim {T_w} != extr_returns {T_extr}"
-                )
-
-                if K_t is not None:
-                    T_K = K_t.shape[0]
-                    assert T_K == T_extr, (
-                        f"[AGAC] KL reward K_t time dim {T_K} != extr_returns {T_extr}"
-                    )
 
                 # Multi-critic / AGAC policy gradient:  -w_t * logπ * A_t^{AGAC}
                 actor_loss_mc    = -w * logp * final_adv.detach()
