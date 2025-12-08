@@ -105,6 +105,7 @@ ruamel.yaml
 sacrebleu
 scikit-learn
 scipy
+setuptools
 six
 sympy
 tabulate

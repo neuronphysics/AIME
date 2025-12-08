@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import time, contextlib
 import tensorflow as tf
+import argparse
+
 try:
     # completely disable TF GPUs (safest, simplest)
     tf.config.set_visible_devices([], 'GPU')
@@ -1602,12 +1604,153 @@ class DMCVBTrainer:
         
         print("Training completed!")
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train DPGMM-VRNN transition dynamics on DMC VB data"
+    )
+
+    # --- data / task ---
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Override default transition_data dir")
+    parser.add_argument("--domain_name", type=str, default=None,
+                        help="DMC domain name (e.g. humanoid)")
+    parser.add_argument("--task_name", type=str, default=None,
+                        help="DMC task name (e.g. walk)")
+    parser.add_argument("--policy_level", type=str, default=None,
+                        help="dataset policy level (expert / medium / random)")
+
+    # --- model ---
+    parser.add_argument("--max_components", type=int, default=None)
+    parser.add_argument("--latent_dim", type=int, default=None)
+    parser.add_argument("--hidden_dim", type=int, default=None)
+    parser.add_argument("--context_dim", type=int, default=None)
+    parser.add_argument("--num_latent_perceiver", type=int, default=None)
+    parser.add_argument("--num_codebook_perceiver", type=int, default=None)
+    parser.add_argument("--perceiver_code_dim", type=int, default=None)
+    parser.add_argument("--downsample_perceiver", type=int, default=None)
+
+    # --- training ---
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--sequence_length", type=int, default=None)
+    parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--n_epochs", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument(
+        "--grad_balance_method",
+        type=str,
+        choices=["mgda", "gradnorm", "rgb", "none"],
+        default=None,
+        help="How to balance gradients across losses.",
+    )
+    parser.add_argument("--use_dynamic_weight_average", type=str2bool, default=False )
+
+    parser.add_argument("--beta_min", type=float, default=None)
+    parser.add_argument("--beta_max", type=float, default=None)
+    parser.add_argument("--beta_warmup_epochs", type=int, default=None)
+    parser.add_argument("--beta_eval", type=float, default=None)
+
+    parser.add_argument("--lambda_img", type=float, default=None)
+    parser.add_argument("--lambda_recon", type=float, default=None)
+    parser.add_argument("--lambda_gram", type=float, default=None)
+    parser.add_argument("--grad_clip", type=float, default=None)
+    parser.add_argument("--n_critic", type=int, default=None)
+
+    # --- logging / wandb ---
+    parser.add_argument("--experiment_name", type=str, default=None)
+    parser.add_argument(
+        "--use_wandb", action="store_true",
+        help="Enable Weights & Biases logging (overrides config to True)",
+    )
+    parser.add_argument(
+        "--no_wandb", action="store_true",
+        help="Disable Weights & Biases logging (overrides config to False)",
+    )
+
+    return parser.parse_args()
+def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
+    """
+    Take the default config dict and override fields if the corresponding
+    CLI arg is not None.
+    """
+    # keys in config that we allow overriding directly from args
+    overridable_keys = [
+        # data / task
+        "data_dir", "domain_name", "task_name", "policy_level",
+        # model
+        "max_components", "latent_dim", "hidden_dim", "context_dim",
+        "num_latent_perceiver", "num_codebook_perceiver",
+        "perceiver_code_dim", "downsample_perceiver",
+        # training
+        "batch_size", "sequence_length", "learning_rate", "n_epochs",
+        "num_workers", "beta_min", "beta_max", "beta_warmup_epochs",
+        "beta_eval", "lambda_img", "lambda_recon", "lambda_gram",
+        "grad_clip", "n_critic", "use_dynamic_weight_average", "grad_balance_method"
+        # logging
+        "experiment_name",
+    ]
+
+    for key in overridable_keys:
+        if hasattr(args, key):
+            val = getattr(args, key)
+            if val is not None:
+                # handle Path-like fields nicely
+                if key == "data_dir":
+                    config[key] = Path(val)
+                else:
+                    config[key] = val
+
+    # W&B override logic
+    if getattr(args, "use_wandb", False):
+        config["use_wandb"] = True
+    if getattr(args, "no_wandb", False):
+        config["use_wandb"] = False
+
+    return config
+def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
+    """
+    Take the default config dict and override fields if the corresponding
+    CLI arg is not None.
+    """
+    # keys in config that we allow overriding directly from args
+    overridable_keys = [
+        # data / task
+        "data_dir", "domain_name", "task_name", "policy_level",
+        # model
+        "max_components", "latent_dim", "hidden_dim", "context_dim",
+        "num_latent_perceiver", "num_codebook_perceiver",
+        "perceiver_code_dim", "downsample_perceiver",
+        # training
+        "batch_size", "sequence_length", "learning_rate", "n_epochs",
+        "num_workers", "beta_min", "beta_max", "beta_warmup_epochs",
+        "beta_eval", "lambda_img", "lambda_recon", "lambda_gram",
+        "grad_clip", "n_critic",
+        # logging
+        "experiment_name",
+    ]
+
+    for key in overridable_keys:
+        if hasattr(args, key):
+            val = getattr(args, key)
+            if val is not None:
+                # handle Path-like fields nicely
+                if key == "data_dir":
+                    config[key] = Path(val)
+                else:
+                    config[key] = val
+
+    # W&B override logic
+    if getattr(args, "use_wandb", False):
+        config["use_wandb"] = True
+    if getattr(args, "no_wandb", False):
+        config["use_wandb"] = False
+
+    return config
 
 def main():
     """Main training script"""
     torch.autograd.set_detect_anomaly(True) #check issues with gradients
     
-
+    args = parse_args()
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')  # Enable TensorFloat32 cores
     torch.cuda.empty_cache()  
@@ -1623,7 +1766,7 @@ def main():
         
         # Model settings
         'max_components': 15,
-        'latent_dim': 36,
+        'latent_dim': 64,
         'hidden_dim': 48, #must be divisible by 8
         'context_dim': 128,
         'input_channels': 3*1,  # 3 stacked frames
@@ -1674,7 +1817,13 @@ def main():
         'visualize_every': 4,
         'checkpoint_every': 10
     }
-    
+    config = override_config_from_args(config, args)
+
+    # Optional: print final config so you see what actually ran
+    print("=== Final config ===")
+    for k, v in config.items():
+        print(f"{k}: {v}")
+    print("====================")    
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
