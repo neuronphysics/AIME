@@ -1644,7 +1644,7 @@ def parse_args():
     parser.add_argument(
         "--grad_balance_method",
         type=str,
-        choices=["mgda", "gradnorm", "rgb", "none"],
+        choices=["mgda", "gradnorm", "rgb", "pcgrad", "none"],
         default=None,
         help="How to balance gradients across losses.",
     )
