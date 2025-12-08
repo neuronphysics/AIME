@@ -444,8 +444,7 @@ class LatentAGACBehavior(ImagBehavior):
         * self.value_adv:  AGAC value V_agac(s) for the KL stream
 
     - Actor sees a combined advantage:
-        A_comb_t = A_extr_t + beta_kl * A_agac_t
-        A_hat_t  = AdvNorm_total(A_comb_t)
+        A_hat_t  = beta_kl * AdvNorm_total(A_agac_t)
 
       and optimizes:
 
@@ -723,7 +722,7 @@ class LatentAGACBehavior(ImagBehavior):
         use_agac_critic = (self._kl_mode != "none") and (self._beta_kl > 0.0)
 
         # ----------------- Actor + AGAC critic forward -----------------
-        with tools.RequiresGrad(self.actor), tools.RequiresGrad(self.adversary), tools.RequiresGrad(self.value_adv):
+        with tools.RequiresGrad(self.actor), tools.RequiresGrad(self.value_adv):
             with torch.amp.autocast("cuda", enabled=self._use_amp):
                 # Imagine rollout in latent space
                 imag_feat, imag_state, imag_action = self._imagine(
@@ -796,16 +795,12 @@ class LatentAGACBehavior(ImagBehavior):
                     # K_t, delta_t are (T,B,1); drop last step to match λ-return horizon T-1
                     bonus_raw  = (delta_t - K_t)        # (T,B,1)
 
-                    # Optional normalisation so scales roughly match adv_extr
-                    bonus_norm = self.score_norm_agac(bonus_raw)
-
-                    # c in the paper  ≈  self._beta_kl here
-                    combined_adv = self._beta_kl * bonus_norm
+                    combined_adv =  self.score_norm_agac(bonus_raw)
                 else:
                     combined_adv = torch.zeros_like(weights[:-1])   # (T-1,B,1)
 
                 # Final combined advantage, normalised once more
-                final_adv = self.adv_norm_total(combined_adv)   # (T-1,B,1)
+                final_adv = self._beta_kl * self.adv_norm_total(combined_adv)   # (T-1,B,1)
 
                 # -------------- Extra REINFORCE actor bonus -------------------
                 # Log prob of actions under current actor: use steps 0..T-2

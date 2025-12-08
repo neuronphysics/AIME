@@ -5,6 +5,12 @@ import numpy as np
 import torch.nn.functional as F
 import copy
 import random
+from typing import Dict, Sequence, Union
+from collections import deque
+from copy import deepcopy
+import abc
+
+
 class AbsWeighting(nn.Module):
     r"""An abstract class for weighting strategies."""
     def __init__(self):
@@ -751,3 +757,335 @@ class PCGrad():
         grad_flatten = self._flatten_grad(grad, shape)
         has_grad_flatten = self._flatten_grad(has_grad, shape)
         return grad_flatten, shape, has_grad_flatten
+
+"""
+.. codeauthor:: Daniel Seichter <daniel.seichter@tu-ilmenau.de>
+"""
+
+
+
+
+class LossWeightingBase(abc.ABC, torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def initialize(self, device: torch.device):
+        # move additional things to correct device
+        # note, currently not used as the loss reduction is done on cpu
+        pass
+
+    @property
+    @abc.abstractmethod
+    def weights(self) -> Union[Dict[str, Union[float, torch.Tensor]], None]:
+        pass
+
+    @abc.abstractmethod
+    def reset_weights(self):
+        pass
+
+    @abc.abstractmethod
+    def reduce_losses(
+        self,
+        losses: Dict[str, torch.Tensor],
+        batch_idx: int
+    ) -> torch.Tensor:
+        pass
+
+    def forward(
+        self,
+        losses: Dict[str, torch.Tensor],
+        batch_idx: int
+    ) -> torch.Tensor:
+        return self.reduce_losses(losses, batch_idx)
+
+
+class DynamicWeightAverage(LossWeightingBase):
+    def __init__(
+        self,
+        loss_keys_to_consider: Sequence[str],
+        temperature: float = 2.0
+    ) -> None:
+        # see: https://arxiv.org/pdf/1803.10704.pdf
+        super().__init__()
+
+        self._loss_keys = loss_keys_to_consider
+        self._temperature = temperature
+
+        self._loss_history = deque([], maxlen=2)    # for determining weights
+        self._loss_buffer = []      # stores the losses within an epoch
+
+        # init weights
+        self._default_weights = {k: 1.0 for k in self._loss_keys}
+        self._weights = deepcopy(self._default_weights)
+
+    @property
+    def weights(self) -> Dict[str, Union[float, torch.Tensor]]:
+        return self._weights
+
+    def reset_weights(self):
+        self._loss_buffer = []
+        self._loss_history = deque([], maxlen=2)
+        self._weights = deepcopy(self._default_weights)
+
+    def _compute_weights(self) -> None:
+        # update loss history (take mean of epoch)
+        if self._loss_buffer:
+            self._loss_history.append({
+                k: torch.mean(
+                    torch.stack([losses[k] for losses in self._loss_buffer])
+                )
+                for k in self._loss_keys
+            })
+            # print(self._loss_history)
+
+        # compute weights
+        if len(self._loss_history) < 2:
+            # not enough values in loss history, assign default weights
+            self._weights = deepcopy(self._default_weights)
+            return
+
+        # dwa
+        # note only as of python >= 3.7: dicts are always ordered !
+        weights = torch.stack([
+            # t-1 / t-2
+            self._loss_history[-1][k] / self._loss_history[-2][k]
+            for k in self._loss_keys
+        ])
+        weights = len(weights)*torch.nn.functional.softmax(
+            weights/self._temperature, dim=-1
+        )
+        self._weights = {k: w.item() for k, w in zip(self._loss_keys,
+                                                     weights)}
+
+    def reduce_losses(
+        self,
+        losses: Dict[str, torch.Tensor],
+        batch_idx: int
+    ) -> torch.Tensor:
+        if 0 == batch_idx:
+            # compute new weights at the beginning of a new epoch
+            # note: a sanity check breaks this smart hack compute new weights,
+            # use `reset_weights` to reset after performing the sanity check
+            self._compute_weights()
+
+        # store current losses within the same epoch in loss buffer
+        detached_losses = {k: losses[k].detach().clone()
+                           for k in self._loss_keys}
+        if len(self._loss_buffer) == batch_idx:
+            # we still must enlarge the buffer
+            self._loss_buffer.append(detached_losses)
+        else:
+            # replace element in buffer
+            # note, we assume same length for all epochs
+            self._loss_buffer[batch_idx] = detached_losses
+
+        # reduce loss
+        total_loss = torch.sum(
+            torch.stack([self.weights[key] * losses[key]
+                         for key in self._loss_keys])
+        )
+
+        return total_loss
+
+class MinNormSolver:
+    MAX_ITER = 250
+    STOP_CRIT = 1e-5
+
+    def _min_norm_element_from2(v1v1, v1v2, v2v2):
+        """
+        Analytical solution for min_{c} |cx_1 + (1-c)x_2|_2^2
+        d is the distance (objective) optimzed
+        v1v1 = <x1,x1>
+        v1v2 = <x1,x2>
+        v2v2 = <x2,x2>
+        """
+        if v1v2 >= v1v1:
+            # Case: Fig 1, third column
+            gamma = 0.999
+            cost = v1v1
+            return gamma, cost
+        if v1v2 >= v2v2:
+            # Case: Fig 1, first column
+            gamma = 0.001
+            cost = v2v2
+            return gamma, cost
+        # Case: Fig 1, second column
+        gamma = -1.0 * ((v1v2 - v2v2) / (v1v1 + v2v2 - 2 * v1v2))
+        cost = v2v2 + gamma * (v1v2 - v2v2)
+        return gamma, cost
+
+    def _min_norm_2d(vecs, dps):
+        """
+        Find the minimum norm solution as combination of two points
+        This is correct only in 2D
+        ie. min_c |\sum c_i x_i|_2^2 st. \sum c_i = 1 , 1 >= c_1 >= 0 for all i, c_i + c_j = 1.0 for some i, j
+        """
+        dmin = 1e8
+        sol = None
+        for i in range(len(vecs)):
+            for j in range(i + 1, len(vecs)):
+                if torch.isnan(dps[i][j]):
+                    dps[(i, j)] = 0.0
+                    dps[(i, j)] = torch.sum(vecs[i] * vecs[j]).data.item()
+
+                    dps[(j, i)] = dps[(i, j)]
+                if torch.isnan(dps[(i, i)]):
+                    dps[(i, i)] = 0.0
+                    dps[(i, i)] = torch.sum(vecs[i] * vecs[i]).data.item()
+                if torch.isnan(dps[(j, j)]):
+                    dps[(j, j)] = 0.0
+                    dps[(j, j)] = torch.sum(vecs[j] * vecs[j]).data.item()
+                c, d = MinNormSolver._min_norm_element_from2(
+                    dps[(i, i)], dps[(i, j)], dps[(j, j)]
+                )
+                if d < dmin:
+                    dmin = d
+                    sol = [(i, j), c, d]
+
+        if sol is None:
+            return None
+        return sol, dps
+
+    def _projection2simplex(y):
+        """
+        Given y, it solves argmin_z |y-z|_2 st \sum z = 1 , 1 >= z_i >= 0 for all i
+        """
+        m = len(y)
+        sorted_y = torch.flip(torch.sort(y).values, dims=[0])
+        tmpsum = 0.0
+        tmax_f = (torch.sum(y) - 1.0) / m
+        for i in range(m - 1):
+            tmpsum += sorted_y[i]
+            tmax = (tmpsum - 1) / (i + 1.0)
+            if tmax > sorted_y[i + 1]:
+                tmax_f = tmax
+                break
+        return torch.max(y - tmax_f, torch.Tensor(size=y.shape).fill_(0.0).type_as(y))
+
+    def _next_point(cur_val, grad, n):
+        proj_grad = grad - (torch.sum(grad) / n)
+        tm1 = -1.0 * cur_val[proj_grad < 0] / proj_grad[proj_grad < 0]
+        tm2 = (1.0 - cur_val[proj_grad > 0]) / (proj_grad[proj_grad > 0])
+
+        skippers = torch.sum(tm1 < 1e-7) + torch.sum(tm2 < 1e-7)
+        t = 1
+        if len(tm1[tm1 > 1e-7]) > 0:
+            t = torch.min(tm1[tm1 > 1e-7])
+        if len(tm2[tm2 > 1e-7]) > 0:
+            t = min(t, torch.min(tm2[tm2 > 1e-7]))
+
+        next_point = proj_grad * t + cur_val
+        next_point = MinNormSolver._projection2simplex(next_point)
+        return next_point
+
+    def apply(vecs):
+        """
+        Given a list of vectors (vecs), this method finds the minimum norm element in the convex hull
+        as min |u|_2 st. u = \sum c_i vecs[i] and \sum c_i = 1.
+        It is quite geometric, and the main idea is the fact that if d_{ij} = min |u|_2 st u = c x_i + (1-c) x_j; the solution lies in (0, d_{i,j})
+        Hence, we find the best 2-task solution, and then run the projected gradient descent until convergence
+        """
+        # Solution lying at the combination of two points
+        # dps = {}
+        n = vecs.shape[0]
+        dps = torch.Tensor(size=(n, n)).fill_(float("nan")).type_as(vecs)
+        rtype = MinNormSolver._min_norm_2d(vecs, dps)
+        if rtype is None:
+            return torch.zeros(n).type_as(vecs), None
+        init_sol, dps = rtype  # MinNormSolver._min_norm_2d(vecs, dps)
+
+        sol_vec = torch.Tensor(n).fill_(0.0).type_as(vecs)
+        sol_vec[init_sol[0][0]] = init_sol[1]
+        sol_vec[init_sol[0][1]] = 1 - init_sol[1]
+
+        if n < 3:
+            # This is optimal for n=2, so return the solution
+            return sol_vec, init_sol[2]
+
+        iter_count = 0
+
+        grad_mat = dps
+        while iter_count < MinNormSolver.MAX_ITER:
+
+            grad_dir = -1.0 * (grad_mat @ sol_vec)
+            new_point = MinNormSolver._next_point(sol_vec, grad_dir, n)
+            # Re-compute the inner products for line search
+            v1v1 = sol_vec @ dps @ sol_vec.T
+            v1v2 = sol_vec @ dps @ new_point.T
+            v2v2 = new_point @ dps @ new_point.T
+
+            nc, nd = MinNormSolver._min_norm_element_from2(v1v1, v1v2, v2v2)
+            new_sol_vec = nc * sol_vec + (1 - nc) * new_point
+            change = new_sol_vec - sol_vec
+            if torch.sum(torch.abs(change)) < MinNormSolver.STOP_CRIT:
+                return sol_vec, nd
+            sol_vec = new_sol_vec
+            iter_count += 1
+        return sol_vec, nd
+
+class MGDA(AbsWeighting):
+    r"""Multiple Gradient Descent Algorithm (MGDA)."""
+
+    def __init__(self, solver=None):
+        super(MGDA, self).__init__()
+        # Allow injecting a custom solver; default to MinNormSolver
+        self.solver = solver or MinNormSolver
+
+    def _find_min_norm_element(self, grads: torch.Tensor) -> torch.Tensor:
+        """
+        grads: [task_num, grad_dim]
+        Returns:
+            sol_vec: [task_num] convex weights on the simplex.
+        """
+        # Use the modular solver
+        sol_vec, cost = self.solver.apply(grads)
+
+        # Safety: if solver fails or returns None, fall back to uniform weights
+        if sol_vec is None:
+            n = grads.size(0)
+            sol_vec = torch.ones(n, device=grads.device) / float(n)
+        return sol_vec
+
+    def _gradient_normalizers(self, grads, loss_data, ntype):
+        if ntype == 'l2':
+            gn = grads.pow(2).sum(-1).sqrt()
+        elif ntype == 'loss':
+            gn = loss_data
+        elif ntype == 'loss+':
+            gn = loss_data * grads.pow(2).sum(-1).sqrt()
+        elif ntype == 'none':
+            gn = torch.ones_like(loss_data).to(self.device)
+        else:
+            raise ValueError(f'No support normalization type {ntype} for MGDA')
+        gn = gn.clamp(min=1e-8)
+        grads = grads / gn.unsqueeze(1).repeat(1, grads.size(1))
+        return grads
+
+    def backward(self, losses, **kwargs):
+        """
+        Args:
+            losses: list of per-task losses (length = task_num)
+            kwargs:
+                mgda_gn: 'none' | 'l2' | 'loss' | 'loss+'
+        """
+        mgda_gn = kwargs['mgda_gn']
+
+        # 1) Get per-task gradients (AbsWeighting logic)
+        grads = self._get_grads(losses, mode='backward')
+        if self.rep_grad:
+            per_grads, grads = grads[0], grads[1]
+
+        # 2) Optional gradient normalization
+        loss_data = torch.tensor([loss.item() for loss in losses], device=self.device)
+        grads = self._gradient_normalizers(grads, loss_data, ntype=mgda_gn)
+
+        # 3) Use modular solver to get weights on the simplex
+        sol = self._find_min_norm_element(grads)  # [task_num]
+
+        # 4) Apply these weights back to parameters / representations
+        if self.rep_grad:
+            self._backward_new_grads(sol, per_grads=per_grads)
+        else:
+            self._backward_new_grads(sol, grads=grads)
+
+        return sol.detach().cpu().numpy()

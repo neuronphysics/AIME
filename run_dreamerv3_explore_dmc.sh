@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=100G
-#SBATCH --time=01-20:59
+#SBATCH --time=20:59:59
 #SBATCH --account=def-irina
 #SBATCH --output=/home/memole/scratch/AIME/logs/dreamerv3-dmc-run-seed-1_%N-%j.out
 #SBATCH --error=/home/memole/scratch/AIME/logs/dreamerv3-dmc-run-seed-1_%N-%j.err

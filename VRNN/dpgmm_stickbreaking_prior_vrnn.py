@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, Gamma, Categorical, Independent, MixtureSameFamily
-from typing import Dict, Tuple, Union, Optional, Any
+from typing import Dict, Tuple, List, Optional, Any
 import sys
 import os
 from einops import rearrange
@@ -15,12 +15,9 @@ from collections import OrderedDict
 from torch.utils.checkpoint import checkpoint as ckpt
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from vis_networks import (
-    EMA, TemporalDiscriminator,
-    AddEpsilon, check_tensor
-)
+from vis_networks import EMA, TemporalDiscriminator, AddEpsilon, check_tensor
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
-from VRNN.RGB import RGB, GradNorm, PCGrad
+from VRNN.RGB import RGB, GradNorm, PCGrad, DynamicWeightAverage, MGDA
 from VRNN.lstm import LSTMLayer
 
 from VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
@@ -752,6 +749,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         contrastive_weight: float = 0.01,
         grad_balance_method: str = 'rgb',
         gradnorm_alpha: float = 1.5, 
+        use_dwa: bool = False,
+        dwa_temperature: float = 2.0,
+        mgda_gn: str = "l2",
         ):
         super().__init__()
         #core dimensions
@@ -782,12 +782,16 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.contrastive_weight = contrastive_weight 
         self.grad_balance_method = grad_balance_method
         self.gradnorm_alpha = gradnorm_alpha
+        self.use_dwa = use_dwa
+        self.mgda_gn = mgda_gn
         #initialization different parts of the model
         
         self._init_perceiver_context()
         self._init_vrnn_dynamics(use_orthogonal=use_orthogonal,number_lstm_layer=number_lstm_layer)
         self._init_encoder_decoder()
         self._init_discriminators( img_disc_layers, patch_size, num_heads= disc_num_heads)
+        if use_dwa:
+            self._init_DynamicWeightAverage(dwa_temperature)
 
         self.use_ctx_checkpoint = use_ctx_checkpoint
         # DP-GMM prior
@@ -846,7 +850,60 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 self.encoder.train()
             if dec_was_training:
                 self.decoder.train()
-                
+
+    def _init_DynamicWeightAverage(self, temperature: float = 2.0):
+        if  self.grad_balance_method != 'none':
+            # ELBO components: recon + two KLs + Gram
+            self.elbo_weighter = DynamicWeightAverage(
+                loss_keys_to_consider=[
+                    "recon_loss",
+                    "kl_z",
+                    "hierarchical_kl",
+                    "gram_enc_loss",
+                ],
+                temperature=temperature,
+            )
+
+            # Adversarial components: image adv + temporal adv + feature matching
+            self.adv_weighter = DynamicWeightAverage(
+                loss_keys_to_consider=[
+                    "img_adv_loss",
+                    "temporal_adv_loss",
+                    "feat_match_loss",
+                ],
+                temperature=temperature,
+            )
+
+            # Perceiver components: you can start simple and refine later
+            self.perceiver_weighter = DynamicWeightAverage(
+                loss_keys_to_consider=[
+                    "perceiver_vq_loss",
+                    "perceiver_ce_loss",
+                    "perceiver_lpips_loss",
+                    "perceiver_recon_loss",
+                    "context_cycle_consistency_loss",
+                ],
+                temperature=temperature,
+            )
+        else:
+            self.total_weighter = DynamicWeightAverage(
+                loss_keys_to_consider=["recon_loss",
+                    "kl_z",
+                    "hierarchical_kl",
+                    "gram_enc_loss",
+                    "img_adv_loss",
+                    "temporal_adv_loss",
+                    "feat_match_loss",
+                    "perceiver_vq_loss",
+                    "perceiver_ce_loss",
+                    "perceiver_lpips_loss",
+                    "perceiver_recon_loss",
+                    "context_cycle_consistency_loss",
+                ],
+                temperature=temperature,
+            )
+
+
     def _init_encoder_decoder(self):
         # Encoder network
         encoder_channels = [64, 96, 128, 192, 192, 256]
@@ -1251,18 +1308,22 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self.grad_balancer = RGB()
         elif method == "gradnorm":
             self.grad_balancer = GradNorm()
-        # NOTE: for "pcgrad" we do NOT create self.grad_balancer; PCGrad wraps the optimizer instead.
+        elif method == "mgda":
+            self.grad_balancer = MGDA()
 
         if self.grad_balancer is not None:
+
             self.grad_balancer.task_name = task_names
             self.grad_balancer.task_num  = len(task_names)
             self.grad_balancer.device    = self.device
             self.grad_balancer.rep_grad  = False
 
             # Grad balancer should only see *generator* params, not its own params
-            self.grad_balancer.get_share_params = lambda: (
-                p for g in gen_param_groups for p in g["params"]
-            )
+            # After gen_param_groups is fully built, inside _setup_optimizers:
+
+            _shared_params = [p for g in gen_param_groups for p in g["params"]]
+
+            self.grad_balancer.get_share_params = lambda: iter(_shared_params)
 
             if method == "rgb":
                 # RGB has no learnable parameters
@@ -1495,7 +1556,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         for key in ['reconstructions', 'latents', 'hidden_states', 'context_states']:
             if outputs[key]:
                 outputs[key] = torch.stack(outputs[key], dim=1)
-        outputs['perceiver_total_loss'] = context_info["total_loss"]
+        outputs['perceiver_total_loss'] =       context_info["total_loss"]
+
+
         latents_seq = outputs['latents']            # [B, T, D_z]
         hidden_seq  = outputs['hidden_states']      # [B, T, D_h]
         B, T, _ = context_sequence.shape
@@ -1543,7 +1606,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         outputs['perceiver_vq_loss']          = context_info['vq_loss']
         outputs['perceiver_ce_loss']          = context_info['ce_loss']
         outputs['perceiver_lpips_loss']       = context_info['lpips_loss']
-
+        outputs["perceiver_recon_loss"] =       context_info["recon_loss"]
+        outputs["perceiver_cycle_loss"] =       context_info["ar_cycle_loss"]
         return outputs
 
     
@@ -1917,6 +1981,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "vq_loss":          perc_losses["vq_loss"],
                 "ce_loss":          perc_losses["ce_loss"],
                 "lpips_loss":       perc_losses["lpips_loss"],
+                "recon_loss":       perc_losses["recon_loss"],
                 "ar_cycle_loss":    perc_losses["ar_cycle_loss"],
                 "token_accuracy":   perc_out["token_accuracy"],
                 "total_loss":       perc_losses["loss"],
@@ -2013,39 +2078,38 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         return x.reshape(-1)  # flatten all dims
 
     def training_step_sequence(self, 
-                                observations: torch.Tensor,
-                                actions: torch.Tensor = None,
-                                beta: float = 1.0,
-                                n_critic: int = 3,
-                                lambda_img: float = 0.2,
-                                lambda_recon: float = 1.0,
-                                lambda_gram: float = 0.25,
-                                ) -> Dict[str, torch.Tensor]:
+                            observations: torch.Tensor,
+                            actions: torch.Tensor = None,
+                            beta: float = 1.0,
+                            n_critic: int = 3,
+                            lambda_img: float = 0.2,
+                            lambda_recon: float = 1.0,
+                            lambda_gram: float = 0.25,
+                            batch_idx: Optional[int] = None,
+                            ) -> Dict[str, torch.Tensor]:
+        """
+        Supports:
+        - Dynamic Weight Averaging (DWA) over either:
+            * ELBO / adv / perceiver streams (when grad_balance_method != "none"), or
+            * all individual loss terms together (when grad_balance_method == "none").
+        - RGB / GradNorm / PCGrad /MGDAmulti-task gradient balancing when requested.
+        """
         self.train()
         if getattr(self, "image_discriminator", None) is not None:
             self.image_discriminator.train()
 
+        # 1) Prepare data and compute VAE & perceiver losses
         observations = self.prepare_images_for_training(observations)
         warmup_factor = self.get_warmup_factor()
-        
+
         vae_losses, outputs = self.compute_total_loss(
             observations, actions, beta,
             lambda_recon, lambda_gram
         )
         lambda_img_eff = (lambda_img * warmup_factor) if warmup_factor > 0.0 else 0.0
 
-        # ---- 4) Compose task losses for MGDA (2 tasks: generator, perceiver) ----
-        elbo_loss = (
-            lambda_recon * vae_losses['recon_loss']
-            + beta * vae_losses['kl_z']
-            + beta * vae_losses['hierarchical_kl']
-            + lambda_gram * vae_losses['gram_enc_loss']
-        )
-        
-        perceiver_loss = vae_losses['perceiver_loss']
-
-        # Discriminator updates (n_critic)
-        disc_losses_list = []
+        # 2) Discriminator updates (n_critic)
+        disc_losses_list: List[Dict[str, torch.Tensor]] = []
         for _ in range(n_critic):
             disc_loss = self.discriminator_step(
                 real_images=observations,
@@ -2061,63 +2125,138 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 for k in disc_losses_list[0].keys()
             }
 
+        # 3) Adversarial generator losses
         img_adv_loss, temporal_adv_loss, feat_match_loss = self.compute_adversarial_losses(
             x=observations,
             reconstruction=outputs['reconstructions'],
             z_seq=outputs['latents'],
         )
-        adv_base = lambda_img_eff * img_adv_loss + warmup_factor * temporal_adv_loss + lambda_img * feat_match_loss
-        
 
-        # Total loss used for logging / schedulers (gen + perceiver)
-        total_gen_loss = elbo_loss +  adv_base + perceiver_loss
+        # 4) Combine losses with DWA
+        if self.use_dwa and hasattr(self, "elbo_weighter"):
+            # Per-stream DWA (grad_balance_method != "none")
+            elbo_components = {
+                "recon_loss":      vae_losses["recon_loss"].reshape([]),
+                "kl_z":            vae_losses["kl_z"].reshape([]),
+                "hierarchical_kl": vae_losses["hierarchical_kl"].reshape([]),
+                "gram_enc_loss":   vae_losses["gram_enc_loss"].reshape([]),
+            }
+            adv_components = {
+                "img_adv_loss":      img_adv_loss.reshape([]),
+                "temporal_adv_loss": temporal_adv_loss.reshape([]),
+                "feat_match_loss":   feat_match_loss.reshape([]),
+            }
+            perceiver_components = {
+                "perceiver_vq_loss":    outputs["perceiver_vq_loss"].reshape([]),
+                "perceiver_ce_loss":    outputs["perceiver_ce_loss"].reshape([]),
+                "perceiver_lpips_loss": outputs["perceiver_lpips_loss"].reshape([]),
+                "perceiver_recon_loss": outputs["perceiver_recon_loss"].reshape([]),
+                "context_cycle_consistency_loss": outputs["perceiver_cycle_loss"].reshape([]),
+            }
 
+            elbo_loss      = self.elbo_weighter.reduce_losses(elbo_components, batch_idx)
+            adv_base       = self.adv_weighter.reduce_losses(adv_components, batch_idx)
+            perceiver_loss = self.perceiver_weighter.reduce_losses(perceiver_components, batch_idx)
+
+            total_gen_loss = elbo_loss + adv_base + perceiver_loss
+
+        elif self.use_dwa and hasattr(self, "total_weighter"):
+            # grad_balance_method == "none": single DWA over *all* loss terms
+            total_components = {
+                "recon_loss":      vae_losses["recon_loss"].reshape([]),
+                "kl_z":            vae_losses["kl_z"].reshape([]),
+                "hierarchical_kl": vae_losses["hierarchical_kl"].reshape([]),
+                "gram_enc_loss":   vae_losses["gram_enc_loss"].reshape([]),
+                "img_adv_loss":      img_adv_loss.reshape([]),
+                "temporal_adv_loss": temporal_adv_loss.reshape([]),
+                "feat_match_loss":   feat_match_loss.reshape([]),
+                "perceiver_vq_loss":    outputs["perceiver_vq_loss"].reshape([]),
+                "perceiver_ce_loss":    outputs["perceiver_ce_loss"].reshape([]),
+                "perceiver_lpips_loss": outputs["perceiver_lpips_loss"].reshape([]),
+                "perceiver_recon_loss": outputs["perceiver_recon_loss"].reshape([]),
+                "context_cycle_consistency_loss": outputs["perceiver_cycle_loss"].reshape([]),
+            }
+            # This is the actual scalar we differentiate
+            total_gen_loss = self.total_weighter.reduce_losses(total_components, batch_idx)
+
+            # For logging / diagnostics only (no grads through these):
+            with torch.no_grad():
+                adv_base = (
+                    lambda_img_eff * img_adv_loss
+                    + warmup_factor * temporal_adv_loss
+                    + lambda_img * feat_match_loss
+                )
+                elbo_loss = (
+                    lambda_recon * vae_losses['recon_loss']
+                    + beta * vae_losses['kl_z']
+                    + beta * vae_losses['hierarchical_kl']
+                    + lambda_gram * vae_losses['gram_enc_loss']
+                )
+                perceiver_loss = vae_losses['perceiver_loss']
+
+        else:
+            # No DWA: fixed scalar weights
+            adv_base = (
+                lambda_img_eff * img_adv_loss
+                + warmup_factor * temporal_adv_loss
+                + lambda_img * feat_match_loss
+            )
+            elbo_loss = (
+                lambda_recon * vae_losses['recon_loss']
+                + beta * vae_losses['kl_z']
+                + beta * vae_losses['hierarchical_kl']
+                + lambda_gram * vae_losses['gram_enc_loss']
+            )
+            perceiver_loss = vae_losses['perceiver_loss']
+
+            total_gen_loss = elbo_loss + adv_base + perceiver_loss
+
+        # Losses used for grad balancing & logging
         loss_dict = {
-            "ELBO": elbo_loss.reshape([]),
-            "adversarial":  adv_base.reshape([]),
-            "perceiver": perceiver_loss.reshape([]),
+            "ELBO":        elbo_loss.reshape([]),
+            "adversarial": adv_base.reshape([]),
+            "perceiver":   perceiver_loss.reshape([]),
         }
 
-        L_elbo = loss_dict["ELBO"] 
-        L_adv = loss_dict["adversarial"]
-        L_ctx = loss_dict["perceiver"]
+        L_elbo = loss_dict["ELBO"]
+        L_adv  = loss_dict["adversarial"]
+        L_ctx  = loss_dict["perceiver"]
 
-        # Only two tasks for RGB / GradNorm / PCGrad: generator vs perceiver
         task_losses = [L_elbo, L_adv, L_ctx]
         method = getattr(self, "grad_balance_method", "rgb")
         method = (method or "none").lower()
 
-        # Branch 1: PCGrad (optimizer wrapper)
+        # 5) Gradient balancing + step
         if method == "pcgrad":
-            # gen_optimizer is a PCGrad instance wrapping an AdamW
+            # PCGrad wrapper around an AdamW optimizer
             base_opt = self.gen_optimizer._optim
 
-            # Clear both underlying grads and PCGrad accumulators
+            # Clear grads & internal accumulators
             self.gen_optimizer.zero_grad()
 
-            # Accumulate per-task gradients inside PCGrad
+            # Accumulate per-task gradients
             self.gen_optimizer.backward(task_losses)
 
-            # Reproduce PCGrad.step logic, but insert grad clipping before the step
+            # Project conflicting gradients and set them on base optimizer params
             grads, shapes, has_grads = self.gen_optimizer._pack_accum_grads()
             pc_grad = self.gen_optimizer._project_conflicting(grads, has_grads)
             pc_grad = self.gen_optimizer._unflatten_grad(pc_grad, shapes[0])
             self.gen_optimizer._set_grad(pc_grad)
 
-            # Clip gradient norm on the underlying optimizer’s parameters
+            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(
                 [p for g in base_opt.param_groups for p in g["params"]],
                 self._grad_clip,
             )
 
-            # Optimizer step (respect GradScaler if used)
+            # Step with optional AMP scaler
             if self.gen_optimizer.scaler is not None:
                 self.gen_optimizer.scaler.step(base_opt)
                 self.gen_optimizer.scaler.update()
             else:
                 base_opt.step()
 
-            # Compute grad norm for logging from the underlying optimizer
+            # Grad norm for logging
             grad_norm_sq = 0.0
             for group in base_opt.param_groups:
                 for p in group['params']:
@@ -2126,23 +2265,24 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                         grad_norm_sq += float((g.norm(2)).item() ** 2)
             grad_norm = (grad_norm_sq ** 0.5) if grad_norm_sq > 0 else 0.0
 
-            # Reset accumulators for next step
+            # Reset accumulators
             self.gen_optimizer.zero_grad()
 
-        # Branch 2: RGB / GradNorm as before
         else:
+            # RGB / GradNorm / "none"
             self.gen_optimizer.zero_grad(set_to_none=True)
 
-            if self.grad_balancer is not None and method in ("rgb", "gradnorm"):
-                # Keep GradNorm's internal epoch in sync with the model, if present
+            if self.grad_balancer is not None and method in ("rgb", "gradnorm", "mgda"):
+                # Keep GradNorm's internal epoch in sync, if present
                 if hasattr(self.grad_balancer, "epoch"):
                     self.grad_balancer.epoch = getattr(self, "current_epoch", 0)
 
                 if method == "gradnorm":
-                    if self.grad_balancer.train_loss_buffer is None:
+                    # Initialize loss buffer on first step
+                    if getattr(self.grad_balancer, "train_loss_buffer", None) is None:
                         with torch.no_grad():
                             base = torch.stack([loss.detach() for loss in task_losses])
-                        # shape [T, 1] as expected in GradNorm code
+                        # shape [T, 1] as expected in GradNorm
                         self.grad_balancer.train_loss_buffer = base.view(-1, 1).to(self.device)
 
                     self.grad_balancer.backward(
@@ -2151,20 +2291,29 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                         alpha=self.gradnorm_alpha,
                         log_grads=True,
                     )
+                elif method == "mgda":
+                    # MGDA: use per-task gradients to find minimum-norm weights.
+                    # mgda_gn controls gradient normalization: "none", "l2", "loss", "loss+"
+                    
+                    self.grad_balancer.backward(
+                        task_losses,
+                        mgda_gn=self.mgda_gn,
+                    )
+
                 else:  # "rgb"
                     self.grad_balancer.backward(task_losses, mode="backward")
             else:
-                # Fallback: plain summed loss (no multi-task weighting)
+                # No multi-task balancer: just backprop total_gen_loss
                 total_gen_loss.backward()
 
-            # Clip and step with the standard optimizer
+            # Clip and step with standard optimizer
             torch.nn.utils.clip_grad_norm_(
                 [p for g in self.gen_optimizer.param_groups for p in g["params"]],
                 self._grad_clip,
             )
             self.gen_optimizer.step()
 
-            # Grad norm logging (standard optimizer)
+            # Grad norm for logging
             grad_norm_sq = 0.0
             for group in self.gen_optimizer.param_groups:
                 for p in group['params']:
@@ -2173,14 +2322,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                         grad_norm_sq = grad_norm_sq + float((g.norm(2)).item() ** 2)
             grad_norm = (grad_norm_sq ** 0.5) if grad_norm_sq > 0 else 0.0
 
-        # EMA updates
+        # 6) EMA updates for encoder/decoder
         with torch.no_grad():
             if hasattr(self, "ema_encoder"):
                 self.ema_encoder.update()
             if hasattr(self, "ema_decoder"):
                 self.ema_decoder.update()
 
-        # Some mixture-model stats for logging
+        # 7) Mixture-model stats for logging
         avg_max_prob = torch.stack(
             [p["logit_probs"].softmax(1).max(1)[0].mean() for p in outputs["mdl_params"]]
         ).mean()
@@ -2193,7 +2342,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             **vae_losses,
             # Discriminators
             **avg_disc_losses,
-            # Adversarial gen
+            # Adversarial gen (cast to float for logging)
             'img_adv_loss': float(img_adv_loss.item()),
             'temporal_adv_loss': float(temporal_adv_loss.item()),
             'feat_match_loss': float(feat_match_loss.item()),
@@ -2205,7 +2354,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'mdl_avg_max_mixture_prob': avg_max_prob.item(),
             'mdl_effective_mixtures': (1.0 / avg_max_prob).item(),
         }
-
     
     def set_epoch(self, epoch: int):
         """Update current epoch for scheduling purposes"""

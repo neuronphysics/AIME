@@ -3,9 +3,9 @@
 #SBATCH --nodes=1
 #SBATCH --gpus=h100:1 
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=12
 #SBATCH --mem=100G
-#SBATCH --time=01-20:59
+#SBATCH --time=01-02:59
 #SBATCH --account=def-irina
 #SBATCH --output=/home/memole/scratch/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.out
 #SBATCH --error=/home/memole/scratch/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.err

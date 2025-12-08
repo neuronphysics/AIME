@@ -1037,6 +1037,7 @@ class DMCVBTrainer:
                 n_critic=self.config['n_critic'],
                 lambda_img=self.config['lambda_img'],
                 lambda_recon=self.config['lambda_recon'],
+                batch_idx=batch_idx,
             )
             component_grads = self.grad_monitor.compute_component_gradients()
             for component, grad_norm in component_grads.items():
@@ -1640,7 +1641,7 @@ def main():
         'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
-        'batch_size': 45,
+        'batch_size': 50,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
@@ -1658,12 +1659,13 @@ def main():
         # Loss weights
         'beta': 1.0,
         'lambda_img': 1.0,
-        'lambda_recon': 3.0,
+        'lambda_recon': 1.0,
         "lambda_gram": 0.5,
         'grad_clip': 2.0,
         'n_critic': 1,
-        "grad_balance_method": "rgb",  # "gradnorm" or "rgb" 
+        "grad_balance_method": "mgda",  # "gradnorm" or "rgb" 
         "gradnorm_alpha": 1.5,        
+        "use_dynamic_weight_average": False,
         # Logging
         'use_wandb': False,
         'wandb_project': 'dpgmm-vrnn-dmc',
@@ -1705,6 +1707,7 @@ def main():
         dropout=config['dropout'],
         grad_balance_method=config['grad_balance_method'],
         gradnorm_alpha=config['gradnorm_alpha'],
+        use_dwa = config["use_dynamic_weight_average"],
     )
     if config['use_pretrained_vqpt']:
         model.load_pretrained_vq_tokenizer(

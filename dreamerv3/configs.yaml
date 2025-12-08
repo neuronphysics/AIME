@@ -36,7 +36,7 @@ defaults:
     control_behavior: agac_latent
     agac:
       kl_mode: "recursive"
-      beta_kl: 0.04
+      beta_kl: 0.01
       beta_delta: 0.001
     wandb_group: "dmc_walker_agacB"
 

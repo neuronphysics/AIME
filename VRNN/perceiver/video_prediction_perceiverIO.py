@@ -1580,16 +1580,16 @@ class PerceiverTokenPredictor(nn.Module):
                 target_videos
             ).detach()
 
-
         return {
             "loss": total_loss,
-            "vq_loss": vq_loss.detach(),
-            "ce_loss": ce.detach(),
-            "lpips_loss": lpips_loss.detach(),
-            "ar_cycle_loss": cycle_consistence_loss.detach(),
-            "token_accuracy": outputs["token_accuracy"],
-            "token_self_consistency": token_self_consistency_val.detach(),
-        }
+            "vq_loss": vq_loss,                        
+            "ce_loss": ce,                             
+            "lpips_loss": lpips_loss,                  
+            "recon_loss": recon_loss,                  
+            "ar_cycle_loss": cycle_consistence_loss,   # no detach
+            "token_accuracy": outputs["token_accuracy"].detach(),   # metric only
+            "token_self_consistency": token_self_consistency_val,   # already no grad (no_grad block)
+            }
         
 
     # AR generation from context
