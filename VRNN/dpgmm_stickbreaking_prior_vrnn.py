@@ -13,11 +13,7 @@ import numpy as np
 import math, inspect
 from collections import OrderedDict
 from torch.utils.checkpoint import checkpoint as ckpt
-from distutils.util import strtobool
 
-
-def str2bool(v):
-    return bool(strtobool(v))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from vis_networks import EMA, TemporalDiscriminator, AddEpsilon, check_tensor
 from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss

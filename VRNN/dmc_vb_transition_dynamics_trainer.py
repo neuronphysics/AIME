@@ -37,6 +37,12 @@ from VRNN.grad_diagnostics import GradDiagnosticsAggregator
 from contextlib import contextmanager
 import matplotlib
 from pathlib import Path
+from distutils.util import strtobool
+
+
+def str2bool(v):
+    return bool(strtobool(v))
+    
 os.environ["MPLBACKEND"] = "Agg" 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PARENT_DIR = SCRIPT_DIR.parent
