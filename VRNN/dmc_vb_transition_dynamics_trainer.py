@@ -1644,7 +1644,7 @@ def parse_args():
     parser.add_argument(
         "--grad_balance_method",
         type=str,
-        choices=["mgda", "gradnorm", "rgb", "pcgrad", "none"],
+        choices=["mgda", "gradnorm", "rgb", "pcgrad", "upgrad", "none"],
         default=None,
         help="How to balance gradients across losses.",
     )
@@ -1772,7 +1772,7 @@ def main():
         
         # Model settings
         'max_components': 15,
-        'latent_dim': 64,
+        'latent_dim': 80,
         'hidden_dim': 48, #must be divisible by 8
         'context_dim': 128,
         'input_channels': 3*1,  # 3 stacked frames
@@ -1800,16 +1800,16 @@ def main():
         'n_epochs': 200,
         'num_workers': 4,
 
-        'beta_min': 0.7,
+        'beta_min': 0.5,
         'beta_max': 1.0,
-        'beta_warmup_epochs': 10,  # 20–50 is common
+        'beta_warmup_epochs': 15,  # 20–50 is common
         'beta_eval': 1.0,          # force eval to use full KL (recommended)
         
         # Loss weights
         'beta': 1.0,
         'lambda_img': 1.0,
         'lambda_recon': 1.0,
-        "lambda_gram": 0.5,
+        "lambda_gram": 0.15,
         'grad_clip': 2.0,
         'n_critic': 1,
         "grad_balance_method": "mgda",  # "gradnorm" or "rgb" 

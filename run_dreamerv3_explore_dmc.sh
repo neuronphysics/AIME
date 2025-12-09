@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=100G
-#SBATCH --time=20:59:59
+#SBATCH --time=14:59:59
 #SBATCH --account=def-irina
 #SBATCH --output=/home/memole/scratch/AIME/logs/dreamerv3-dmc-run-seed-1_%N-%j.out
 #SBATCH --error=/home/memole/scratch/AIME/logs/dreamerv3-dmc-run-seed-1_%N-%j.err
@@ -64,4 +64,8 @@ python -m pip install dm_control==1.0.28
 #pip install -r requirements.txt --no-deps
 echo "train dreamerv3 with AGAC exploration ....."
 
-CUDA_VISIBLE_DEVICES=0 python3 -m dreamerv3.dreamer --configs dmc_vision agac_recursive --task dmc_reacher_hard --logdir ./results/policy/runs/logdir/dmc_reacher_hard
+#CUDA_VISIBLE_DEVICES=0 python3 -m dreamerv3.dreamer --configs dmc_vision agac_recursive --task dmc_reacher_hard --logdir ./results/policy/runs/logdir/dmc_reacher_hard
+CUDA_VISIBLE_DEVICES=0 python3 -m dreamerv3.dreamer \
+  --configs dmc_vision \
+  --task dmc_reacher_hard \
+  --logdir ./results/policy/runs/logdir/dmc_reacher_hard

@@ -22,6 +22,16 @@ from VRNN.lstm import LSTMLayer
 
 from VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
 from VRNN.Kumaraswamy import KumaraswamyStable
+try:
+    from torchjd.autogram import Engine as JD_Engine
+    from torchjd.aggregation import UPGradWeighting
+    HAS_TORCHJD = True
+except ImportError:
+    JD_Engine = None
+    UPGradWeighting = None
+    HAS_TORCHJD = False
+
+
 def beta_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     """Compute beta function in log space for numerical stability"""
@@ -808,7 +818,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Setup optimizers
         self.has_optimizers = True
         self._setup_optimizers(learning_rate, weight_decay)
-
     def _warm_build_unet_adapters(self, batch_size: int = 1, dtype: torch.dtype | None = None):
         if dtype is None:
             dtype = torch.float32
@@ -829,20 +838,25 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         try:
             with torch.no_grad(), _temporarily_disable_ckpt(self.encoder, self.decoder):
-                # 1) Run encoder once to get z and the *actual* UNet skips
-                z, _, _, _ = self.encoder(x_dummy)
+                # run encoder just to get **real skip tensors**
+                _, _, _, _ = self.encoder(x_dummy)
                 skips = self.encoder.get_unet_skips(
                     x_dummy, levels=("C1", "C2", "C3", "C4", "C5", "C6"), detach=True
                 )
 
-                # 2) Use these real skips to prebuild all 1x1 adapters
                 if hasattr(self.decoder, "build_unet_adapters_from_skips"):
                     self.decoder.build_unet_adapters_from_skips(skips)
 
-                # 3) Optional sanity check: dry forward to ensure no missing adapters
-                _ = self.decoder(z, skips=skips)
+                # dummy latent with size [z, c, h]
+                full_latent_size = self.latent_dim + self.context_dim + self.hidden_dim
+                z_dummy = torch.zeros(
+                    batch_size,
+                    full_latent_size,
+                    device=self.device,
+                    dtype=dtype,
+                )
+                _ = self.decoder(z_dummy, skips=skips)
 
-                # We don't want decoder to rely on any stale cached skips
                 if hasattr(self.decoder, "_pending_skips"):
                     self.decoder._pending_skips = None
         finally:
@@ -850,6 +864,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 self.encoder.train()
             if dec_was_training:
                 self.decoder.train()
+
 
     def _init_DynamicWeightAverage(self, temperature: float = 2.0):
         if  self.grad_balance_method != 'none':
@@ -923,7 +938,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                   ).to(self.device)
         # Decoder network 
         self.decoder = VAEDecoder(
-                                  latent_size=self.latent_dim,
+                                  latent_size=self.latent_dim + self.context_dim + self.hidden_dim,
                                   width=self.image_size,
                                   height= self.image_size,
                                   channel_size_per_layer=[256,192,192,128,96,64],
@@ -937,6 +952,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                   encoder_channel_size_per_layer=encoder_channels,
                                   skip_levels_last_n=3
                                   ).to(self.device)
+        self.skip_dropout_p = 0.5 
         
         self.gram_loss = GramLoss(
             apply_norm=True,
@@ -1310,6 +1326,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self.grad_balancer = GradNorm()
         elif method == "mgda":
             self.grad_balancer = MGDA()
+        elif method == "upgrad" and HAS_TORCHJD:
+            self._jd_engine = JD_Engine(self, batch_dim=None)
+            self._jd_weighting = UPGradWeighting()
 
         if self.grad_balancer is not None:
 
@@ -1370,7 +1389,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if disc_params:
                 self.img_disc_optimizer = torch.optim.Adam(
                     disc_params,
-                    lr=learning_rate * 0.2,
+                    lr=learning_rate * 0.4,
                     betas=(0.0, 0.9),
                     weight_decay=5e-5,
                 )
@@ -1467,18 +1486,28 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             with self.encoder.enable_caching():
                 # Inference Network q(z_t | o_<=t, z_<t)
                 z_t, z_mean_t, z_logvar_t, _ = self.encoder(o_t)
+                if self.training and getattr(self, "skip_dropout_p", 0.0) > 0.0:
+                    keep_skips = torch.rand(1, device=self.device).item() > self.skip_dropout_p
+                else:
+                    keep_skips = True
 
-                # Use cached skips (no recompute). 
-                skips = self.encoder.get_unet_skips(
-                    x=None, levels=("C1", "C2", "C3", "C4", "C5", "C6"), detach=False
-                )
+                if keep_skips:
+                    skips = self.encoder.get_unet_skips(
+                        x=None,
+                        levels=("C1", "C2", "C3", "C4", "C5", "C6"),
+                        detach=False,
+                    )
+                else:
+                    skips = None
+
                 # Decoder forward
-                logit_probs, means, log_scales, coeffs = self.decoder(z_t, skips=skips)
+                decoder_input = torch.cat([z_t, c_t, h[-1]], dim=-1)
+                logit_probs, means, log_scales, coeffs = self.decoder(decoder_input, skips=skips)
 
                 q_params = {'mean': z_mean_t, 'logvar': z_logvar_t}
                 outputs['posterior_params'].append(q_params)
                 # store gram matrix for encoder decoder features
-                outputs['gram_enc'].append( self.encoder_gram_loss_student_teacher(o_t, levels=("C1", "C2", "C3", "C4", "C5", "C6")) )
+                outputs['gram_enc'].append( self.encoder_gram_loss_student_teacher(o_t, levels=("C1", "C2", "C3", "C4")) )
 
             # Store latent statistics
             outputs['latents'].append(z_t)
@@ -1610,29 +1639,26 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         outputs["perceiver_cycle_loss"] =       context_info["ar_cycle_loss"]
         return outputs
 
-    
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        # Encode
-        z, z_mean, z_logvar, h = self.encoder(x)
+        """
+        Convenience wrapper: treat x as a length-1 sequence and reuse forward_sequence.
+        """
+        # x: [B, C, H, W] -> [B, 1, C, H, W]
+        observations = x.unsqueeze(1)
+        outputs = self.forward_sequence(observations, actions=None)
 
-        # Get prior distribution and parameters
-        prior_dist, prior_params = self.prior(h)
-        skips = self.encoder.get_unet_skips(x, levels=("C1", "C2", "C3", "C4", "C5", "C6"))        # or encoder.get_unet_skips(x, levels=("C3","C4","C5"))
-        #self.decoder.set_unet_skips(skips, mode="concat")
-        # Decode
-        logit_probs, means, log_scales, coeffs = self.decoder(z, skips=skips)
+        # last timestep reconstruction
+        recon_seq = outputs['reconstructions']          # list -> stack in forward_sequence
+        if isinstance(recon_seq, list):
+            recon_seq = torch.stack(recon_seq, dim=1)   # [B, T, C, H, W]
+        recon = recon_seq[:, -1]                        # [B, C, H, W]
 
-        # Sample reconstruction for visualization
-        reconstruction = self.decoder.mdl_head.sample(logit_probs, means, log_scales, coeffs, scale_temp=0.3)
-
-
-        return reconstruction, {
-            'z': z,
-            'z_mean': z_mean,
-            'z_logvar': z_logvar,
-            'prior_dist': prior_dist,
-            **prior_params
+        return recon, {
+            'z': outputs['latents'][:, -1],
+            'z_mean': outputs['z_means'][:, -1],
+            'z_logvar': outputs['z_logvars'][:, -1],
         }
+    
     
     def compute_total_loss(self, 
                            observations, 
@@ -2267,7 +2293,39 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
             # Reset accumulators
             self.gen_optimizer.zero_grad()
+        elif method == "upgrad":
+            loss_vec = torch.stack(task_losses, dim=0)   # shape [3]
+            # -------- UPGrad via TorchJD (low memory) --------
+            if not (hasattr(self, "_jd_engine") and hasattr(self, "_jd_weighting")) and self._jd_engine is None or self._jd_weighting is None:
+                raise RuntimeError(
+                    "grad_balance_method='upgrad' but TorchJD engine/weighting "
+                    "are not initialized. Did you call setup_optimizer?"
+                )
 
+            self.gen_optimizer.zero_grad(set_to_none=True)
+
+            # Gramian of Jacobian of [L_elbo, L_adv, L_ctx] wrt generator params
+            gramian = self._jd_engine.compute_gramian(loss_vec)   # shape [3, 3]
+
+            # UPGrad weights for the 3 objectives
+            weights = self._jd_weighting(gramian)                 # shape [3]
+
+            # Weighted sum of losses → standard backward
+            weighted_loss = (weights * loss_vec).sum()
+            weighted_loss.backward()
+
+            # Gradient clipping & step exactly as before
+            gen_params = [p for g in self.gen_optimizer.param_groups for p in g["params"]]
+            torch.nn.utils.clip_grad_norm_(gen_params, self._grad_clip)
+            self.gen_optimizer.step()
+
+            # For logging: compute grad_norm after clipping / before step if you prefer
+            grad_norm_sq = 0.0
+            for p in gen_params:
+                if p.grad is not None:
+                    g = p.grad.detach()
+                    grad_norm_sq += float(g.norm(2).item() ** 2)
+            grad_norm = grad_norm_sq ** 0.5
         else:
             # RGB / GradNorm / "none"
             self.gen_optimizer.zero_grad(set_to_none=True)
@@ -2367,21 +2425,37 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
     def sample(self, num_samples: int) -> torch.Tensor:
         """
-        Generate samples from the model
+        Generate unconditional samples from the model.
 
+        Decoder expects a latent of size:
+            latent_size = latent_dim + context_dim + hidden_dim
+        so we build [z, c, h] here to match.
         """
         self.ema_encoder.apply_shadow()
         self.ema_decoder.apply_shadow()
-        # Sample hidden representation
-        h = torch.randn(num_samples, self.hidden_dim + self.context_dim, device=self.device)
-        # Get prior distribution
-        prior_dist, _ = self.prior(h)
 
-        # Sample latents
+        # 1) Sample a joint (h, c) vector used by the prior
+        #    h_ctx shape: [B, hidden_dim + context_dim]
+        h_ctx = torch.randn(num_samples,
+                            self.hidden_dim + self.context_dim,
+                            device=self.device)
+
+        # 2) Prior over z | (h, c)
+        prior_dist, _ = self.prior(h_ctx)     # z ~ [B, latent_dim]
         z = prior_dist.sample()
 
-        # Decode
-        samples = self.decoder.decode(z, deterministic=False)
+        # 3) Split h_ctx back into h and c
+        h_sample = h_ctx[:, :self.hidden_dim]             # [B, hidden_dim]
+        c_sample = h_ctx[:, self.hidden_dim:]             # [B, context_dim]
+
+        # 4) Build full latent [z, c, h] for the decoder
+        decoder_input = torch.cat([z, c_sample, h_sample], dim=-1)
+        # decoder_input.shape[1] should equal
+        # self.latent_dim + self.context_dim + self.hidden_dim
+
+        # 5) Decode
+        samples = self.decoder.decode(decoder_input, deterministic=False)
+
         self.ema_encoder.restore()
         self.ema_decoder.restore()
         return samples
@@ -2518,7 +2592,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             z_futures.append(z_t); c_futures.append(c_t); a_futures.append(a_t); h_futures.append(h[-1])
             c_prev = c_t
 
-
+   
         # 4) Pack latent imagination outputs
         z_futures = torch.stack(z_futures, dim=1) if len(z_futures) else torch.empty(B,0, self.latent_dim, device=device)
         c_futures = torch.stack(c_futures, dim=1) if len(c_futures) else torch.empty(B,0, self.context_dim, device=device)
@@ -2526,38 +2600,49 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         h_futures = torch.stack(h_futures, dim=1) if len(h_futures) else torch.empty(B,0, h[-1].shape[-1], device=device)
 
         result = {
-            "z_obs": torch.stack(outputs['z'], dim=1),     # [B,T_ctx, D_z]
-            "h_obs": torch.stack(outputs['h'], dim=1),     # [B,T_ctx, D_h]
-            "a_obs": torch.stack(outputs['a'], dim=1),     # [B,T_ctx, A]
-            "c_obs":  ctx_obs,                             # [B,T_ctx, D_c]
-            "z_future": z_futures,                         # [B,H,D_z]
-            "c_future": c_futures,                         # [B,H,D_c]
-            "a_future": a_futures,                         # [B,H,A]
-            "h_future": h_futures,                         # [B,H,D_h]
+            "z_obs": torch.stack(outputs['z'], dim=1),
+            "h_obs": torch.stack(outputs['h'], dim=1),
+            "a_obs": torch.stack(outputs['a'], dim=1),
+            "c_obs": ctx_obs,
+            "z_future": z_futures,
+            "c_future": c_futures,
+            "a_future": a_futures,
+            "h_future": h_futures,
         }
 
-        # 5) pixel rollout via the Perceiver AR head (for visualization)
+        # 5) pixel rollout via the Perceiver AR head (unchanged)
         if decode_pixels:
-            # Use the Perceiver to generate frames from the observed context only.
-            # This remains independent of the *latent* imagination above (standard in Dreamer).
             result["pixels_future"] = self.perceiver_model.generate_autoregressive(
-                context_videos=initial_obs, num_frames_to_generate=horizon,
-                temperature=1.0, top_k=None, top_p=None
-            )  # [B,horizon,C,H,W]
+                context_videos=initial_obs,
+                num_frames_to_generate=horizon,
+                temperature=1.0, top_k=None, top_p=None,
+            )
 
-        B, T_future, D = z_futures.shape
-        z_flat = z_futures.reshape(B * T_future, D)
+        # ---- NEW: decode *full* latent [z, c, h] with the VAE ----
+        if z_futures.numel() > 0:
+            B, T_future, Dz = z_futures.shape
+            Dc = c_futures.shape[-1]
+            Dh = h_futures.shape[-1]
 
-        # Use EMA decoder weights for nicer samples (optional but consistent with .sample())
-        if hasattr(self, "ema_decoder"):
-            self.ema_decoder.apply_shadow()
+            z_flat = z_futures.reshape(B * T_future, Dz)
+            c_flat = c_futures.reshape(B * T_future, Dc)
+            h_flat = h_futures.reshape(B * T_future, Dh)
 
-        x_flat = self.decoder.decode(z_flat, deterministic=False)  # [B*T, C, H, W]
+            latent_full = torch.cat([z_flat, c_flat, h_flat], dim=-1)
 
-        if hasattr(self, "ema_decoder"):
-            self.ema_decoder.restore()
+            if hasattr(self, "ema_decoder"):
+                self.ema_decoder.apply_shadow()
 
-        result["vae_future"] = x_flat.view(B, T_future, *x_flat.shape[1:])  # [B, T_future, C, H, W]
+            x_flat = self.decoder.decode(latent_full, deterministic=False)
+
+            if hasattr(self, "ema_decoder"):
+                self.ema_decoder.restore()
+
+            result["vae_future"] = x_flat.view(B, T_future, *x_flat.shape[1:])
+        else:
+            result["vae_future"] = torch.empty(
+                B, 0, self.input_channels, self.image_size, self.image_size,
+                device=device,
+            )
 
         return result
-    

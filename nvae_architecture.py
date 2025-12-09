@@ -511,7 +511,7 @@ class MDLHead(nn.Module):
             y = y.view(B, self.n_mix, 10, H, W)
             logit_probs = y[:, :, 0]                 # [B,K,H,W]
             means       = y[:, :, 1:4]               # [B,K,3,H,W]
-            log_scales  = y[:, :, 4:7].clamp(min=-7) # [B,K,3,H,W]
+            log_scales  = y[:, :, 4:7].clamp(min=-5, max=2) # [B,K,3,H,W]
             coeffs      = torch.tanh(y[:, :, 7:10])  # [B,K,3,H,W]
             return logit_probs, means, log_scales, coeffs
         else:
@@ -756,7 +756,7 @@ class VAEDecoder(nn.Module):
                         nn.SiLU(),
                     )
                     # MDL head
-        self.mdl_head = MDLHead(current_channels // 2, out_ch=reconstruction_channels, n_mix=10)
+        self.mdl_head = MDLHead(current_channels // 2, out_ch=reconstruction_channels, n_mix=15)
         if hasattr(self.mdl_head, 'gradient_checkpointing_enable'):
            self.mdl_head.gradient_checkpointing_enable()
         

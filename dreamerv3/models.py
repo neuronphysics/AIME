@@ -815,9 +815,6 @@ class LatentAGACBehavior(ImagBehavior):
                 # Multi-critic / AGAC policy gradient:  -w_t * logπ * A_t^{AGAC}
                 actor_loss_mc    = -w * logp * final_adv.detach()
 
-                # We now *include* δ and KL inside final_adv, so no extra δ term.
-                actor_loss_delta = torch.zeros_like(actor_loss_mc)
-
                 # Total actor loss tensor
                 actor_loss_total = actor_loss_main + actor_loss_mc  # + 0
 
@@ -833,7 +830,8 @@ class LatentAGACBehavior(ImagBehavior):
                 metrics.update(mets)
                 metrics["actor_loss_main_dreamer"] = to_np(actor_loss_main.mean())
                 metrics["actor_loss_mc"]           = to_np(actor_loss_mc.mean())
-                metrics["actor_loss_delta"]        = to_np(actor_loss_delta.mean())
+                if (delta_t is not None) and (K_t is not None):
+                   metrics["actor_loss_delta"]        = to_np((delta_t - K_t).mean())
                 metrics["actor_entropy"]           = to_np(actor_ent.mean())
                 metrics["imag_state_entropy"]      = to_np(state_ent.mean())
 
