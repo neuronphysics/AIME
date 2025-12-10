@@ -314,8 +314,7 @@ class GradDiagnosticsAggregator:
     def tensorboard_log(self, writer, tag_prefix, global_step, quiver_scale=1.0, mode="params", param_patterns=None):
         mean_dirs, cos_mean, grad_amp_rms, comp_amp_rms = self.finalize()
         task_colors = {
-            "ELBO":   "#1f77b4",  # also blue (ELBO+adv)
-            "adversarial":   "#2ca02c",  # green
+            "ELBO":   "#38b41f",  # also blue ELBO
             "perceiver":   "#ff7f0e",  # orange
         }
 

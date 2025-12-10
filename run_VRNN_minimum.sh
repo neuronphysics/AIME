@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=100G
-#SBATCH --time=01-02:59
+#SBATCH --time=01-01:59:59
 #SBATCH --account=def-irina
 #SBATCH --output=/home/memole/scratch/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.out
 #SBATCH --error=/home/memole/scratch/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.err
@@ -53,5 +53,5 @@ echo "pretrain VQVAE ....."
 #CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.pretrain_vqvae
 echo "finished pretraining and start training world model dpgmm vrnn model... " 
 
-CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.dmc_vb_transition_dynamics_trainer --grad_balance_method "rgb" --use_dynamic_weight_average False
+CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.dmc_vb_transition_dynamics_trainer --grad_balance_method "mgda" --use_dynamic_weight_average False
 

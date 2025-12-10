@@ -745,7 +745,6 @@ def count_parameters(model, print_details=True):
         'perceiver': 'perceiver_model',
         'prior': 'prior',
         'rnn': '_rnn',
-        'discriminators': 'image_discriminator'
     }
     
     for comp_name, attr_names in component_map.items():
@@ -818,7 +817,6 @@ class GradientMonitor:
             'perceiver': ['perceiver_model' ],
             'prior_dynamics': ['prior.stick_breaking.kumar_net', 'prior.component_nn'],
             'vrnn_core': ['_rnn', 'rnn_layer_norm'],
-            'discriminators': ['image_discriminator']
         }
     
     def compute_component_gradients(self, update_global_step: bool = True) -> Dict[str, float]:
@@ -988,7 +986,7 @@ class DMCVBTrainer:
         else:
             self.writer = None
         self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
-        task_names = ["ELBO", "adversarial", "perceiver"]  
+        task_names = ["ELBO", "perceiver"]  
         self._agg = GradDiagnosticsAggregator(task_names, 
                                               component_groups=self.grad_monitor.component_groups,
                                               average_component_norms=True)
@@ -1025,7 +1023,7 @@ class DMCVBTrainer:
         # Calculate alpha for gradient normalization this epoch
         
         epoch_metrics = defaultdict(list)
-        self.epoch_disc_losses = {'image': [], 'latent': []}
+
         total_loss =[]
         epoch_component_grads = defaultdict(list)
         
@@ -1042,24 +1040,13 @@ class DMCVBTrainer:
                 observations=observations,
                 actions=actions,
                 beta=beta_t,
-                n_critic=self.config['n_critic'],
-                lambda_img=self.config['lambda_img'],
                 lambda_recon=self.config['lambda_recon'],
                 batch_idx=batch_idx,
             )
             component_grads = self.grad_monitor.compute_component_gradients()
             for component, grad_norm in component_grads.items():
                 epoch_component_grads[component].append(grad_norm)
-            if 'img_disc_loss' in losses:
-                self.epoch_disc_losses['image'].append(
-                losses['img_disc_loss'].item() if torch.is_tensor(losses['img_disc_loss']) 
-                else losses['img_disc_loss']
-                )
-            if 'latent_disc_loss' in losses:
-                self.epoch_disc_losses['latent'].append(
-                    losses['latent_disc_loss'].item() if torch.is_tensor(losses['latent_disc_loss']) 
-                    else losses['latent_disc_loss']
-                )
+
             # Track metrics
             for key, value in losses.items():
                 if isinstance(value, torch.Tensor):
@@ -1076,10 +1063,7 @@ class DMCVBTrainer:
         
         # Compute epoch averages
         avg_metrics = {f'train/{k}': np.mean(v) for k, v in epoch_metrics.items()}
-        avg_img_disc_loss = np.mean(self.epoch_disc_losses['image']) 
-        self.model.img_disc_scheduler.step(avg_img_disc_loss)
-        avg_metrics['train/img_disc_lr'] = self.model.img_disc_optimizer.param_groups[0]['lr']
-
+        
         avg_total_gen_loss = np.mean(total_loss)
         self.model.gen_scheduler.step(avg_total_gen_loss)
         avg_metrics['train/gen_lr'] = self.model.gen_optimizer.param_groups[0]['lr']
@@ -1232,7 +1216,6 @@ class DMCVBTrainer:
         self,
         max_B: int = 1,
         max_T: int = 4,
-        include_adv_in_diag: bool = True,
         use_amp: bool = True,
     ):
         """
@@ -1283,34 +1266,9 @@ class DMCVBTrainer:
                 )
 
                 perceiver_loss = vae_losses["perceiver_loss"]
-
-                # Optional adversarial term – we DO NOT want grads into D's params
-                if include_adv_in_diag and hasattr(self.model, "image_discriminator"):
-                    D = self.model.image_discriminator
-
-                    # Snapshot original flags and temporarily freeze D params
-                    disc_flags = [p.requires_grad for p in D.parameters()]
-                    for p in D.parameters():
-                        p.requires_grad_(False)
-
-                    recon = outputs["reconstructions"]
-                    z_seq = outputs.get("latents", outputs.get("z_seq", None))
-
-                    fake = D(recon, z=z_seq, return_features=True)
-                    adv_loss = -fake["final_score"].mean()
-
-                    # Restore original flags
-                    for p, flag in zip(D.parameters(), disc_flags):
-                        p.requires_grad_(flag)
-                else:
-                    adv_loss = torch.zeros((), device=obs.device)
-                warmup_factor = self.model.get_warmup_factor()
-                lambda_img_eff = (
-                    self.config["lambda_img"] * warmup_factor
-                    if warmup_factor > 0.0 else 0.0
-                )                
+           
                 
-                task_losses = [elbo_loss, lambda_img_eff * adv_loss, perceiver_loss]
+                task_losses = [elbo_loss, perceiver_loss]
 
                 # Let GradDiagnosticsAggregator handle backward() etc.
                 named_params = list(self.model.named_parameters())
@@ -1655,11 +1613,9 @@ def parse_args():
     parser.add_argument("--beta_warmup_epochs", type=int, default=None)
     parser.add_argument("--beta_eval", type=float, default=None)
 
-    parser.add_argument("--lambda_img", type=float, default=None)
     parser.add_argument("--lambda_recon", type=float, default=None)
     parser.add_argument("--lambda_gram", type=float, default=None)
     parser.add_argument("--grad_clip", type=float, default=None)
-    parser.add_argument("--n_critic", type=int, default=None)
 
     # --- logging / wandb ---
     parser.add_argument("--experiment_name", type=str, default=None)
@@ -1673,6 +1629,7 @@ def parse_args():
     )
 
     return parser.parse_args()
+
 def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
     """
     Take the default config dict and override fields if the corresponding
@@ -1689,47 +1646,8 @@ def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
         # training
         "batch_size", "sequence_length", "learning_rate", "n_epochs",
         "num_workers", "beta_min", "beta_max", "beta_warmup_epochs",
-        "beta_eval", "lambda_img", "lambda_recon", "lambda_gram",
-        "grad_clip", "n_critic", "use_dynamic_weight_average", "grad_balance_method"
-        # logging
-        "experiment_name",
-    ]
-
-    for key in overridable_keys:
-        if hasattr(args, key):
-            val = getattr(args, key)
-            if val is not None:
-                # handle Path-like fields nicely
-                if key == "data_dir":
-                    config[key] = Path(val)
-                else:
-                    config[key] = val
-
-    # W&B override logic
-    if getattr(args, "use_wandb", False):
-        config["use_wandb"] = True
-    if getattr(args, "no_wandb", False):
-        config["use_wandb"] = False
-
-    return config
-def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
-    """
-    Take the default config dict and override fields if the corresponding
-    CLI arg is not None.
-    """
-    # keys in config that we allow overriding directly from args
-    overridable_keys = [
-        # data / task
-        "data_dir", "domain_name", "task_name", "policy_level",
-        # model
-        "max_components", "latent_dim", "hidden_dim", "context_dim",
-        "num_latent_perceiver", "num_codebook_perceiver",
-        "perceiver_code_dim", "downsample_perceiver",
-        # training
-        "batch_size", "sequence_length", "learning_rate", "n_epochs",
-        "num_workers", "beta_min", "beta_max", "beta_warmup_epochs",
-        "beta_eval", "lambda_img", "lambda_recon", "lambda_gram",
-        "grad_clip", "n_critic",
+        "beta_eval", "lambda_recon", "lambda_gram",
+        "grad_clip", 
         # logging
         "experiment_name",
     ]
@@ -1792,7 +1710,6 @@ def main():
         # Training settings
         'batch_size': 50,
         'sequence_length': 10,
-        'disc_num_heads': 8,
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
@@ -1807,11 +1724,9 @@ def main():
         
         # Loss weights
         'beta': 1.0,
-        'lambda_img': 1.0,
         'lambda_recon': 1.0,
         "lambda_gram": 0.15,
         'grad_clip': 2.0,
-        'n_critic': 1,
         "grad_balance_method": "mgda",  # "gradnorm" or "rgb" 
         "gradnorm_alpha": 1.5,        
         "use_dynamic_weight_average": False,
@@ -1851,8 +1766,6 @@ def main():
         action_dim=action_dim,
         sequence_length=config['sequence_length'],
         img_perceiver_channels=128,
-        img_disc_layers=2,
-        disc_num_heads = config["disc_num_heads"] if "disc_num_heads" in config else 4,
         device=device,
         input_channels=config['input_channels'],
         learning_rate=config['learning_rate'],
