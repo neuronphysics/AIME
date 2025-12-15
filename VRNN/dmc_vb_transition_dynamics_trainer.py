@@ -13,7 +13,7 @@ from collections import defaultdict
 import time, contextlib
 import tensorflow as tf
 import argparse
-
+import wandb
 try:
     # completely disable TF GPUs (safest, simplest)
     tf.config.set_visible_devices([], 'GPU')
@@ -268,7 +268,7 @@ class HumanoidAwareZoomTransform:
                 for c in range(C):
                     patch = np.ascontiguousarray(imgs_np[t, c, y0:y1, x0:x1])
                     out[t, c] = cv2.resize(patch, (W, H), interpolation=self._cv2_interp)
-
+        out = np.clip(out, -1.0, 1.0)
         return out
 
 class DMCVBInfo:
@@ -644,7 +644,7 @@ class DMCVBDataset(Dataset):
             if obs.dtype == np.uint8:
                 obs = obs.astype(np.float32) / 255.0
             obs = (obs * 2.0) - 1.0
-        
+            obs = np.clip(obs, -1.0, 1.0)
         # Convert to channels first [C, H, W]
         obs = np.transpose(obs, (2, 0, 1))
         
@@ -718,8 +718,6 @@ def count_parameters(model, print_details=True):
     Count the number of parameters in a model
     
     """
-    
-    
     # Count total parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -740,9 +738,8 @@ def count_parameters(model, print_details=True):
     
     component_params = {}
     component_map = {
-        'encoder': 'encoder',
-        'decoder': 'decoder',
-        'perceiver': 'perceiver_model',
+        'encoder': 'vdvae.encoder',
+        'decoder': 'vdvae.decoder',
         'prior': 'prior',
         'rnn': '_rnn',
         'discriminators': 'image_discriminator'
@@ -813,38 +810,68 @@ class GradientMonitor:
     def _define_component_hierarchy(self):
         """Establish semantic groupings for architectural components"""
         return {
-            'encoder': ['encoder.'],
-            'decoder': ['decoder.'],
-            'perceiver': ['perceiver_model' ],
+            'encoder': ['vdvae.encoder.'],
+            'decoder': ['vdvae.decoder.'],
             'prior_dynamics': ['prior.stick_breaking.kumar_net', 'prior.component_nn'],
             'vrnn_core': ['_rnn', 'rnn_layer_norm'],
             'discriminators': ['image_discriminator']
         }
     
-    def compute_component_gradients(self, update_global_step: bool = True) -> Dict[str, float]:
-        """Extract gradient magnitudes per architectural component"""
+
+
+    def compute_component_gradients(
+        self,
+        update_global_step: bool = True,
+        normalize: str = "rms_elem",  # "none" | "rms_elem" | "l2_per_sqrt_elem" | "mean_tensor"
+    ) -> Dict[str, float]:
+        """
+        Returns a scalar per component group.
+
+        normalize:
+        - "none":             sqrt(sum g^2)  (total L2; best for dominance)
+        - "rms_elem":         sqrt(mean g^2) (scale per parameter element; best for comparing modules)
+        - "l2_per_sqrt_elem": sqrt(sum g^2) / sqrt(numel) (same as rms_elem)
+        - "mean_tensor":      sqrt(sum g^2) / n_tensors   (NOT recommended for proportions)
+        """
         if update_global_step:
-            self.global_step += 1  
-        
-        component_grads = {}
+            self.global_step += 1
+
+        component_grads: Dict[str, float] = {}
+
         for group_name, module_patterns in self.component_groups.items():
-            group_grad_norm = 0.0
-            param_count = 0
-            
-            for name, param in self.model.named_parameters():
-                if param.grad is not None and any(pattern in name for pattern in module_patterns):
-                    grad_norm = param.grad.data.norm(2).item()
-                    group_grad_norm += grad_norm ** 2
-                    param_count += 1
-                    
-                    # Track individual layer gradients for critical components
-                    if 'kumar' in name:
-                        if self.writer is not None:  
-                            self.writer.add_scalar(f'gradients/layers/{name}', grad_norm, self.global_step)
-            
-            if param_count > 0:
-                component_grads[group_name] = (group_grad_norm ** 0.5) / param_count
-        
+            sqsum = 0.0
+            n_tensors = 0
+            n_elems = 0
+
+            for name, p in self.model.named_parameters():
+                if p.grad is None:
+                    continue
+                if not any(pat in name for pat in module_patterns):
+                    continue
+
+                g = p.grad.detach()
+                sqsum += g.pow(2).sum().item()
+                n_tensors += 1
+                n_elems += g.numel()
+
+                # Optional: per-layer tracking
+                if "kumar" in name and self.writer is not None:
+                    self.writer.add_scalar(f"gradients/layers/{name}", g.norm(2).item(), self.global_step)
+
+            if n_elems == 0:
+                continue
+
+            if normalize == "none":
+                val = math.sqrt(sqsum)
+            elif normalize in ("rms_elem", "l2_per_sqrt_elem"):
+                val = math.sqrt(sqsum / n_elems)
+            elif normalize == "mean_tensor":
+                val = math.sqrt(sqsum) / max(1, n_tensors)
+            else:
+                raise ValueError(f"Unknown normalize={normalize}")
+
+            component_grads[group_name] = val
+
         return component_grads
 
     def visualize_gradient_flow(self, component_grads, epoch):
@@ -988,7 +1015,7 @@ class DMCVBTrainer:
         else:
             self.writer = None
         self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
-        task_names = ["ELBO", "adversarial", "perceiver"]  
+        task_names = ["ELBO", "adversarial"]  
         self._agg = GradDiagnosticsAggregator(task_names, 
                                               component_groups=self.grad_monitor.component_groups,
                                               average_component_norms=True)
@@ -1113,6 +1140,7 @@ class DMCVBTrainer:
                     observations=observations,
                     actions=actions,
                     beta=self.config.get('beta_eval', self.config.get('beta_max', 1.0)),
+                    lambda_recon =self.config['lambda_recon'],
                 )
                 
                 # Track metrics
@@ -1136,8 +1164,7 @@ class DMCVBTrainer:
                  if self.use_wandb:
                      wandb.log({
                          'eval/samples': wandb.Image(
-                        torchvision.utils.make_grid(
-                            self.denormalize_for_grid(samples), nrow=4
+                        torchvision.utils.make_grid(samples, nrow=4
                         )
                     )
                      })
@@ -1177,9 +1204,8 @@ class DMCVBTrainer:
             initial_obs=initial_obs,
             actions=actions,
             horizon=2,
-            decode_pixels=True,
         )
-        pred      = futures["pixels_future"]  # Perceiver predictions [B, 2, C, H, W]
+
         pred_vae  = futures["vae_future"]     # VAE-decoder predictions [B, 2, C, H, W]
 
         def denorm(x):
@@ -1187,7 +1213,9 @@ class DMCVBTrainer:
             return ((x + 1.0) * 0.5).clamp(0.0, 1.0)
 
         num_rows = min(num_examples, B)
-        num_cols = 7  # ctx_last, GT t+1, GT t+2, Perceiver t+1, Perceiver t+2, VAE t+1, VAE t+2
+        num_cols = 5  # ctx_last, GT t+1, GT t+2, VAE t+1, VAE t+2
+
+         # Create figure
         fig, axes = plt.subplots(num_rows, num_cols, figsize=(num_cols * 4, 3 * num_rows))
 
         if num_rows == 1:
@@ -1199,9 +1227,6 @@ class DMCVBTrainer:
             gt_t1    = denorm(observations[i, T_ctx,     :3])
             gt_t2    = denorm(observations[i, T_ctx + 1, :3])
 
-            # Perceiver predictions
-            pred_t1  = denorm(pred[i, 0, :3])
-            pred_t2  = denorm(pred[i, 1, :3])
 
             # VAE-decoder predictions
             vae_t1   = denorm(pred_vae[i, 0, :3])
@@ -1215,10 +1240,8 @@ class DMCVBTrainer:
             show(axes[i, 0], ctx_last, "Context last (t_ctx)")
             show(axes[i, 1], gt_t1,    "GT t+1")
             show(axes[i, 2], gt_t2,    "GT t+2")
-            show(axes[i, 3], pred_t1,  "Perceiver t+1")
-            show(axes[i, 4], pred_t2,  "Perceiver t+2")
-            show(axes[i, 5], vae_t1,   "VAE t+1")
-            show(axes[i, 6], vae_t2,   "VAE t+2")
+            show(axes[i, 3], vae_t1,   "VAE t+1")
+            show(axes[i, 4], vae_t2,   "VAE t+2")
 
         fig.tight_layout()
 
@@ -1271,7 +1294,6 @@ class DMCVBTrainer:
                     act,
                     beta=self.config["beta"],
                     lambda_recon=self.config["lambda_recon"],
-                    lambda_gram=self.config["lambda_gram"],
                 )
 
                 # Same ELBO combination you use elsewhere
@@ -1279,10 +1301,8 @@ class DMCVBTrainer:
                     self.config["lambda_recon"] * vae_losses["recon_loss"]
                     + self.config["beta"] * vae_losses["kl_z"]
                     + self.config["beta"] * vae_losses["hierarchical_kl"]
-                    + self.config["lambda_gram"] * vae_losses["gram_enc_loss"]
                 )
 
-                perceiver_loss = vae_losses["perceiver_loss"]
 
                 # Optional adversarial term – we DO NOT want grads into D's params
                 if include_adv_in_diag and hasattr(self.model, "image_discriminator"):
@@ -1294,7 +1314,8 @@ class DMCVBTrainer:
                         p.requires_grad_(False)
 
                     recon = outputs["reconstructions"]
-                    z_seq = outputs.get("latents", outputs.get("z_seq", None))
+                    
+                    z_seq = torch.cat([outputs['latents'], outputs['hidden_states']], dim=-1)
 
                     fake = D(recon, z=z_seq, return_features=True)
                     adv_loss = -fake["final_score"].mean()
@@ -1310,7 +1331,7 @@ class DMCVBTrainer:
                     if warmup_factor > 0.0 else 0.0
                 )                
                 
-                task_losses = [elbo_loss, lambda_img_eff * adv_loss, perceiver_loss]
+                task_losses = [elbo_loss, lambda_img_eff * adv_loss]
 
                 # Let GradDiagnosticsAggregator handle backward() etc.
                 named_params = list(self.model.named_parameters())
@@ -1384,9 +1405,8 @@ class DMCVBTrainer:
                 initial_obs=initial_obs,
                 actions=actions,
                 horizon=2,
-                decode_pixels=True,
             )
-            pred = futures["pixels_future"]   # [B, 2, C, H, W]
+            pred = futures["vae_future"]   # [B, 2, C, H, W]
 
             # Ground truth frames for t+1, t+2
             gt = observations[:, T_ctx:T_ctx + 2]  # [B, 2, C, H, W]
@@ -1414,7 +1434,7 @@ class DMCVBTrainer:
     def visualize_results(self, epoch: int):
         """
         
-        Cols = [Original, Recon, Perceiver]
+        Cols = [Original, Recon]
         """
         self.model.eval()
 
@@ -1426,31 +1446,28 @@ class DMCVBTrainer:
         # random eval minibatch
         batch_idx = random.randint(0, len(self.eval_loader) - 1)
         for i, eval_batch in enumerate(self.eval_loader):
-            if i == batch_idx: break
+            if i == batch_idx: 
+                break
         eval_obs     = eval_batch['observations'].to(self.device)
         eval_actions = eval_batch['actions'].to(self.device)
 
         batch_size = min(train_obs.shape[0], eval_obs.shape[0], 4)  # cap at 4 rows per split
-        n_cols = 4
+        n_cols = 3
         fig, axes = plt.subplots(2 * batch_size, n_cols, figsize=(3.2 * n_cols, 3.2 * (2 * batch_size)))
         if axes.ndim == 1:
             axes = axes.reshape(1, -1)
 
-        def bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
-            return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         with torch.no_grad():
             for split_idx, (observations, actions, split_name) in enumerate([
                 (train_obs[:batch_size], train_actions[:batch_size], "Train"),
                 (eval_obs[:batch_size],  eval_actions[:batch_size],  "Eval")
             ]):
+                observations = observations.clamp(-1.0, 1.0)
+
                 # run model once to populate outputs and the posterior's slot maps/assignments
                 _, outputs = self.model.compute_total_loss(observations=observations, actions=actions)
                 
-                perceiver_reconst = outputs['perceiver_reconstructed_img']
-                # convenience
-                H, W = self.model.image_size, self.model.image_size
-                seq_len = observations.shape[1]
 
                 for i in range(batch_size):
                     row = split_idx * batch_size + i
@@ -1462,26 +1479,18 @@ class DMCVBTrainer:
                     axes[row, 0].set_title(f'{split_name} Original'); axes[row, 0].axis('off')
 
                     # ---------- 2) VAE Reconstruction ----------
+                    recon_img = outputs['reconstruction_samples'][i, t, :3]  # [3,H,W]
+                    axes[row, 1].imshow(recon_img.detach().clamp(0, 255).to(torch.uint8).cpu().permute(1,2,0).numpy())
+                    axes[row, 1].set_title('VAE Recon samples'); axes[row, 1].axis('off')
+
                     recon_img = outputs['reconstructions'][i, t, :3]  # [3,H,W]
-                    axes[row, 1].imshow(self.denormalize_image(recon_img))
-                    axes[row, 1].set_title('VAE Recon'); axes[row, 1].axis('off')
+                    axes[row, 2].imshow(self.denormalize_image(recon_img))
+                    axes[row, 2].set_title('VAE Recon'); axes[row, 2].axis('off')
 
-                    # ---------- 3) Perceiver Recon (if present) ----------
-                    if perceiver_reconst is not None:
-
-                        pc = perceiver_reconst[i, t, :3]  # [3,H,W]                    
-                        axes[row, 2].imshow(self.denormalize_image(pc))
-                        axes[row, 2].set_title('Perceiver'); axes[row, 2].axis('off')
-                    else:
-                        axes[row, 2].set_title('No Perceiver'); axes[row, 2].axis('off')
-
-
-                    # 7) Hide unused column
-                    axes[row, 3].axis('off')
 
         plt.tight_layout()
         if self.use_wandb:
-            import wandb
+            
             # Convert figure to image for wandb
             wandb.log({
                 f'visualizations/train_eval_epoch_{epoch}': wandb.Image(fig),
@@ -1555,8 +1564,8 @@ class DMCVBTrainer:
         print(f"Train dataset size: {len(self.train_dataset)}")
         print(f"Eval dataset size: {len(self.eval_dataset)}")
         # Register EMA model
-        self.model.ema_encoder.register()
-        self.model.ema_decoder.register()
+        self.model.ema_vdvae.register()
+        self.model.ema_vdvae.register()
 
         for epoch in range(n_epochs):
             
@@ -1629,11 +1638,6 @@ def parse_args():
     parser.add_argument("--max_components", type=int, default=None)
     parser.add_argument("--latent_dim", type=int, default=None)
     parser.add_argument("--hidden_dim", type=int, default=None)
-    parser.add_argument("--context_dim", type=int, default=None)
-    parser.add_argument("--num_latent_perceiver", type=int, default=None)
-    parser.add_argument("--num_codebook_perceiver", type=int, default=None)
-    parser.add_argument("--perceiver_code_dim", type=int, default=None)
-    parser.add_argument("--downsample_perceiver", type=int, default=None)
 
     # --- training ---
     parser.add_argument("--batch_size", type=int, default=None)
@@ -1657,7 +1661,6 @@ def parse_args():
 
     parser.add_argument("--lambda_img", type=float, default=None)
     parser.add_argument("--lambda_recon", type=float, default=None)
-    parser.add_argument("--lambda_gram", type=float, default=None)
     parser.add_argument("--grad_clip", type=float, default=None)
     parser.add_argument("--n_critic", type=int, default=None)
 
@@ -1683,52 +1686,11 @@ def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
         # data / task
         "data_dir", "domain_name", "task_name", "policy_level",
         # model
-        "max_components", "latent_dim", "hidden_dim", "context_dim",
-        "num_latent_perceiver", "num_codebook_perceiver",
-        "perceiver_code_dim", "downsample_perceiver",
+        "max_components", "latent_dim", "hidden_dim", 
         # training
         "batch_size", "sequence_length", "learning_rate", "n_epochs",
         "num_workers", "beta_min", "beta_max", "beta_warmup_epochs",
-        "beta_eval", "lambda_img", "lambda_recon", "lambda_gram",
-        "grad_clip", "n_critic", "use_dynamic_weight_average", "grad_balance_method"
-        # logging
-        "experiment_name",
-    ]
-
-    for key in overridable_keys:
-        if hasattr(args, key):
-            val = getattr(args, key)
-            if val is not None:
-                # handle Path-like fields nicely
-                if key == "data_dir":
-                    config[key] = Path(val)
-                else:
-                    config[key] = val
-
-    # W&B override logic
-    if getattr(args, "use_wandb", False):
-        config["use_wandb"] = True
-    if getattr(args, "no_wandb", False):
-        config["use_wandb"] = False
-
-    return config
-def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
-    """
-    Take the default config dict and override fields if the corresponding
-    CLI arg is not None.
-    """
-    # keys in config that we allow overriding directly from args
-    overridable_keys = [
-        # data / task
-        "data_dir", "domain_name", "task_name", "policy_level",
-        # model
-        "max_components", "latent_dim", "hidden_dim", "context_dim",
-        "num_latent_perceiver", "num_codebook_perceiver",
-        "perceiver_code_dim", "downsample_perceiver",
-        # training
-        "batch_size", "sequence_length", "learning_rate", "n_epochs",
-        "num_workers", "beta_min", "beta_max", "beta_warmup_epochs",
-        "beta_eval", "lambda_img", "lambda_recon", "lambda_gram",
+        "beta_eval", "lambda_img", "lambda_recon", 
         "grad_clip", "n_critic",
         # logging
         "experiment_name",
@@ -1771,36 +1733,26 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 15,
-        'latent_dim': 64,
+        'max_components': 17,
+        'latent_dim': 36,
         'hidden_dim': 48, #must be divisible by 8
-        'context_dim': 128,
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 8.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
         'dropout': 0.1,
-        'num_codebook_perceiver': 8192,     
-        'num_latent_perceiver': 128, 
-        'perceiver_code_dim': 256,           
-        'downsample_perceiver': 4,           
-        'use_pretrained_vqpt': True,
-        'pretrained_vqpt_ckpt': PARENT_DIR / "results" / "vqpt_pretrain_dmc_vb" / "vqpt_epoch_0150.pt",  
-        'freeze_vq_codebook': True,        # freeze only codebook
-        'freeze_entire_tokenizer': True,  # set True if one wants encoder+decoder frozen too
-        'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
-        'batch_size': 50,
+        'batch_size': 4,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
-        'learning_rate': 0.0003,
+        'learning_rate': 0.0004,
         'n_epochs': 200,
         'num_workers': 4,
 
-        'beta_min': 0.7,
+        'beta_min': 0.5,
         'beta_max': 1.0,
         'beta_warmup_epochs': 10,  # 20–50 is common
         'beta_eval': 1.0,          # force eval to use full KL (recommended)
@@ -1809,11 +1761,8 @@ def main():
         'beta': 1.0,
         'lambda_img': 1.0,
         'lambda_recon': 1.0,
-        "lambda_gram": 0.5,
         'grad_clip': 2.0,
-        'n_critic': 1,
-        "grad_balance_method": "mgda",  # "gradnorm" or "rgb" 
-        "gradnorm_alpha": 1.5,        
+        'n_critic': 1,       
         "use_dynamic_weight_average": False,
         # Logging
         'use_wandb': False,
@@ -1843,14 +1792,8 @@ def main():
         input_dim=config['img_height'],
         latent_dim=config['latent_dim'],
         hidden_dim=config['hidden_dim'],
-        num_latent_perceiver=config['num_latent_perceiver'],
-        num_latent_channels_perceiver=config['context_dim'],
-        num_codebook_perceiver=config['num_codebook_perceiver'],
-        perceiver_code_dim=config['perceiver_code_dim'],
-        downsample_perceiver=config['downsample_perceiver'],
         action_dim=action_dim,
         sequence_length=config['sequence_length'],
-        img_perceiver_channels=128,
         img_disc_layers=2,
         disc_num_heads = config["disc_num_heads"] if "disc_num_heads" in config else 4,
         device=device,
@@ -1860,18 +1803,9 @@ def main():
         prior_alpha =config['prior_alpha'],
         prior_beta = config['prior_beta'],
         dropout=config['dropout'],
-        grad_balance_method=config['grad_balance_method'],
-        gradnorm_alpha=config['gradnorm_alpha'],
         use_dwa = config["use_dynamic_weight_average"],
     )
-    if config['use_pretrained_vqpt']:
-        model.load_pretrained_vq_tokenizer(
-            ckpt_path=config['pretrained_vqpt_ckpt'],
-            freeze_codebook=config['freeze_vq_codebook'],
-            freeze_entire_tokenizer=config['freeze_entire_tokenizer'],
-            freeze_dvae_backbone=config['freeze_dvae_backbone'],
-            strict=True,
-        )
+
 
     outputs = count_parameters(model, print_details=True)
     list_frozen_params(model)
