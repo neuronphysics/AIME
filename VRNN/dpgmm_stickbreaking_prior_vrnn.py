@@ -751,7 +751,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         num_codebook_perceiver: int = 1024,
         perceiver_code_dim: int = 256,
         downsample_perceiver: int = 4,
-        perceiver_lr_multiplier: float = 0.8,
+        perceiver_lr_multiplier: float = 0.1,
         use_ctx_checkpoint: bool = True,
         contrastive_weight: float = 0.01,
         grad_balance_method: str = 'rgb',
@@ -1866,7 +1866,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         Supports:
         - Dynamic Weight Averaging (DWA) over either:
-            * ELBO / adv / perceiver streams (when grad_balance_method != "none"), or
+            * ELBO /  perceiver streams (when grad_balance_method != "none"), or
             * all individual loss terms together (when grad_balance_method == "none").
         - RGB / GradNorm / PCGrad /MGDAmulti-task gradient balancing when requested.
         """
@@ -2006,12 +2006,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
             self.gen_optimizer.zero_grad(set_to_none=True)
 
-            # Gramian of Jacobian of [L_elbo, L_adv, L_ctx] wrt generator params
-            gramian = self._jd_engine.compute_gramian(loss_vec)   # shape [3, 3]
+            # Gramian of Jacobian of [L_elbo, L_ctx] wrt generator params
+            gramian = self._jd_engine.compute_gramian(loss_vec)   # shape [2, 2]
 
-            # UPGrad weights for the 3 objectives
-            weights = self._jd_weighting(gramian)                 # shape [3]
-
+            # UPGrad weights for the 2 objectives
+            weights = self._jd_weighting(gramian)                 # shape [2]
             # Weighted sum of losses → standard backward
             weighted_loss = (weights * loss_vec).sum()
             weighted_loss.backward()

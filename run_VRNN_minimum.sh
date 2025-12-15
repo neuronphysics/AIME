@@ -53,5 +53,5 @@ echo "pretrain VQVAE ....."
 #CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.pretrain_vqvae
 echo "finished pretraining and start training world model dpgmm vrnn model... " 
 
-CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.dmc_vb_transition_dynamics_trainer --grad_balance_method "mgda" --use_dynamic_weight_average False
+CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.dmc_vb_transition_dynamics_trainer --grad_balance_method "upgrad" --use_dynamic_weight_average False
 
