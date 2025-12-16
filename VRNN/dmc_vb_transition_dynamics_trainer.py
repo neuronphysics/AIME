@@ -1734,7 +1734,7 @@ def main():
         
         # Model settings
         'max_components': 17,
-        'latent_dim': 36,
+        'latent_dim': 48,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 8.0,  # Hyperparameters for prior
@@ -1742,19 +1742,20 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 4,
+        'batch_size': 29,
         'sequence_length': 10,
         'disc_num_heads': 8,
+        'img_disc_layers': 2,
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
-        'learning_rate': 0.0004,
+        'learning_rate': 0.0006,
         'n_epochs': 200,
         'num_workers': 4,
 
-        'beta_min': 0.5,
+        'beta_min': 0.3,
         'beta_max': 1.0,
-        'beta_warmup_epochs': 10,  # 20–50 is common
+        'beta_warmup_epochs': 15,  # 20–50 is common
         'beta_eval': 1.0,          # force eval to use full KL (recommended)
         
         # Loss weights
@@ -1794,7 +1795,7 @@ def main():
         hidden_dim=config['hidden_dim'],
         action_dim=action_dim,
         sequence_length=config['sequence_length'],
-        img_disc_layers=2,
+        img_disc_layers=config["img_disc_layers"],
         disc_num_heads = config["disc_num_heads"] if "disc_num_heads" in config else 4,
         device=device,
         input_channels=config['input_channels'],

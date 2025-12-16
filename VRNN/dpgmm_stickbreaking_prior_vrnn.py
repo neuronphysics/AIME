@@ -945,7 +945,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 if p.requires_grad
             ]
             if disc_params:
-                self.img_disc_optimizer = torch.optim.Adam(
+                self.img_disc_optimizer = torch.optim.Adamax(
                     disc_params,
                     lr=learning_rate * 0.05,
                     betas=(0.0, 0.9),
