@@ -16,9 +16,11 @@ from torch.utils.checkpoint import checkpoint as ckpt
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from vis_networks import EMA, AddEpsilon, check_tensor
-from nvae_architecture import VAEEncoder, VAEDecoder, GramLoss
 from VRNN.RGB import RGB, GradNorm, PCGrad, DynamicWeightAverage, MGDA
 from VRNN.lstm import LSTMLayer
+from vdvae.vae import VDVAE
+from vdvae.hps import Hyperparams
+from vdvae.vae_helpers import mean_from_discretized_mix_logistic
 
 from VRNN.perceiver.video_prediction_perceiverIO import CausalPerceiverIO
 from VRNN.Kumaraswamy import KumaraswamyStable
@@ -59,7 +61,6 @@ def torch_load_version_compat(path, map_location=None):
     - On older versions, just calls torch.load(path, map_location=...).
     Use ONLY with checkpoints you trust.
     """
-    import torch
     sig = inspect.signature(torch.load)
     kwargs = {}
 
@@ -209,8 +210,8 @@ class KumaraswamyNetwork(nn.Module):
             mean_b = torch.nanmean(log_b)  
             log_b = torch.where(torch.isnan(log_b)| torch.isinf(log_b), mean_b, log_b)
 
-
         return log_a, log_b
+
 
 class AdaptiveStickBreaking(nn.Module):
     """
@@ -233,9 +234,6 @@ class AdaptiveStickBreaking(nn.Module):
         self.gamma_a = nn.Parameter(torch.tensor(prior_alpha, device=self.device), requires_grad=True)
         self.gamma_b = nn.Parameter(torch.tensor(prior_beta, device=self.device), requires_grad=True)
 
-        # Register parameter names
-        self.register_parameter('gamma_prior_a', self.gamma_a)
-        self.register_parameter('gamma_prior_b', self.gamma_b)
         # Neural network for generating stick-breaking proportions
         # Kumaraswamy parameter network
         self.kumar_net = KumaraswamyNetwork(hidden_dim, max_components, device)
@@ -282,13 +280,9 @@ class AdaptiveStickBreaking(nn.Module):
         # Sample uniformly with numerical stability
         # Create stable Kumaraswamy distributions
         kumar_dist = KumaraswamyStable(log_a, log_b)
-        
         # Sample using the stable implementation
         v = kumar_dist.rsample()
-        
         return v, perm
-
-
 
     @staticmethod
     def compute_stick_breaking_proportions(v: torch.Tensor,  
@@ -316,9 +310,9 @@ class AdaptiveStickBreaking(nn.Module):
         
         pi = pi / (pi.sum(dim=-1, keepdim=True) + eps)
         return pi
-    def forward(self, h: torch.Tensor, n_samples: int = 10, use_rand_perm: bool = True, truncation_threshold: float = 0.995) -> Tuple[torch.Tensor, Dict]:
+    
+    def forward(self, h: torch.Tensor, use_rand_perm: bool = True, truncation_threshold: float = 0.995) -> Tuple[torch.Tensor, Dict]:
        
-        
         # Generate stick-breaking proportions
         # Get Kumaraswamy parameters
         log_kumar_a, log_kumar_b = self.kumar_net(h)
@@ -347,7 +341,6 @@ class AdaptiveStickBreaking(nn.Module):
         
         # Renormalize
         pi_final = pi_final / (pi_final.sum(dim=-1, keepdim=True) + torch.finfo(torch.float32).eps )
-        
         
         return pi, {
             'kumar_a': torch.exp(log_kumar_a),
@@ -469,13 +462,19 @@ class DPGMMPrior(nn.Module):
    
         Uses Monte Carlo sampling with reparameterization.
         """
+        B_img = prior_params["pi"].shape[0]      # true batch
+        N = posterior_mean.shape[0]              # token count
+        rep = N // B_img
+        assert N == B_img * rep
 
-        prior_weights = prior_params['pi']
-        prior_means = prior_params['means']
-        prior_logvars = prior_params['log_vars']
+        prior_weights = prior_params["pi"].repeat_interleave(rep, dim=0)      # [N, K]
+        prior_means   = prior_params["means"].repeat_interleave(rep, dim=0)   # [N, K, C]
+        prior_logvars = prior_params["log_vars"].repeat_interleave(rep, dim=0)# [N, K, C]
+
         B, D = posterior_mean.shape
         K = prior_weights.shape[1]
         eps = torch.finfo(torch.float32).eps
+
 
         # Sample from posterior (n_samples, B, D)
         noise = torch.randn(n_samples, B, D, device=posterior_mean.device)
@@ -518,11 +517,8 @@ class DPGMMPrior(nn.Module):
             kumar_a_k = params['kumar_a'][:, k:k+1]  # [batch_size, 1]
             kumar_b_k = params['kumar_b'][:, k:k+1]  # [batch_size, 1]
             
-            alpha_k = alpha[:, k:k+1] if k < alpha.shape[1] else alpha[:, -1:] # Get alpha for current stick
-
             beta_alpha = torch.ones_like(alpha_scalar).squeeze(-1)  # Beta(1,α)
-            beta_beta = alpha_scalar.squeeze(-1)  # Current stick's α
-                        
+            beta_beta = alpha_scalar.squeeze(-1)  # Current stick's α       
                         
             assert kumar_a_k.shape == kumar_b_k.shape == beta_alpha.shape == beta_beta.shape, \
             f"Shape mismatch: kumar_a={kumar_a_k.shape}, kumar_b={kumar_b_k.shape}, " \
@@ -550,7 +546,7 @@ class DPGMMPrior(nn.Module):
         batch_size = h.shape[0]
 
         # Get mixing proportions and Kumaraswamy parameters
-        pi, kumar_params = self.stick_breaking(h, n_samples, use_rand_perm=True)
+        pi, kumar_params = self.stick_breaking(h, use_rand_perm=True)
         # Sample concentration parameter from posterior
         alpha = self.stick_breaking.alpha_posterior.sample(h, n_samples)  # [n_samples]
         # Generate component parameters
@@ -582,22 +578,6 @@ class DPGMMPrior(nn.Module):
         cumsum = torch.cumsum(sorted_pi, dim=-1)
         return torch.sum(cumsum < (1.0 - threshold), dim=-1) + 1
 
-
-
-    
-@contextmanager
-def _temporarily_disable_ckpt(*mods):
-    flags = []
-    for m in mods:
-        flags.append(getattr(m, "use_checkpoint", None))
-        if hasattr(m, "use_checkpoint"):
-            m.use_checkpoint = False
-    try:
-        yield
-    finally:
-        for m, f in zip(mods, flags):
-            if f is not None:
-                m.use_checkpoint = f
 
 @contextmanager
 def apply_emas(*emas):
@@ -721,8 +701,8 @@ class CausalContextPredictor(nn.Module):
 
 class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     """
-    Using Dirichlet Process GMM Prior with Stick-Breaking, Self-Modeling
-    This architecture incorporates adaptive temporal dynamics, self-modeling, and attention mechanisms
+    Using Dirichlet Process GMM Prior with Stick-Breaking
+    
     """
     def __init__(
         self,
@@ -759,6 +739,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         use_dwa: bool = False,
         dwa_temperature: float = 2.0,
         mgda_gn: str = "l2",
+        lambda_ctx_pred: float = 1.0,
         ):
         super().__init__()
         #core dimensions
@@ -786,81 +767,26 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.img_perceiver_channels = img_perceiver_channels
         self.downsample_perceiver = downsample_perceiver
         self.perceiver_lr_multiplier = perceiver_lr_multiplier  
+        self.lambda_ctx_pred = lambda_ctx_pred
         self.contrastive_weight = contrastive_weight 
         self.grad_balance_method = grad_balance_method
         self.gradnorm_alpha = gradnorm_alpha
         self.use_dwa = use_dwa
         self.mgda_gn = mgda_gn
         #initialization different parts of the model
-        
+        self.use_ctx_checkpoint = use_ctx_checkpoint
         self._init_perceiver_context()
-        self._init_vrnn_dynamics(use_orthogonal=use_orthogonal,number_lstm_layer=number_lstm_layer)
-        self._init_encoder_decoder()
+        self._init_encoder_decoder(max_components, prior_alpha, prior_beta)  # defines self.top_zdim
+        self._init_vrnn_dynamics(use_orthogonal=use_orthogonal, number_lstm_layer=number_lstm_layer)
+
         if use_dwa:
             self._init_DynamicWeightAverage(dwa_temperature)
 
-        self.use_ctx_checkpoint = use_ctx_checkpoint
-        # DP-GMM prior
-        self.prior = DPGMMPrior(max_components, 
-                                self.latent_dim, 
-                                hidden_dim + self.context_dim, #This is because that the input for the prior is the hidden state of recurrent model plus context which is coming from perceiver
-                                device, prior_alpha=prior_alpha,
-                                prior_beta=prior_beta)
-
-        # Initialize weights
-        self.apply(self.init_weights)
         self.to(device)
         
         # Setup optimizers
         self.has_optimizers = True
         self._setup_optimizers(learning_rate, weight_decay)
-    def _warm_build_unet_adapters(self, batch_size: int = 1, dtype: torch.dtype | None = None):
-        if dtype is None:
-            dtype = torch.float32
-
-        x_dummy = torch.zeros(
-            batch_size,
-            self.input_channels,
-            self.image_size,
-            self.image_size,
-            device=self.device,
-            dtype=dtype,
-        )
-
-        enc_was_training = self.encoder.training
-        dec_was_training = self.decoder.training
-        self.encoder.eval()
-        self.decoder.eval()
-
-        try:
-            with torch.no_grad(), _temporarily_disable_ckpt(self.encoder, self.decoder):
-                # run encoder just to get **real skip tensors**
-                _, _, _, _ = self.encoder(x_dummy)
-                skips = self.encoder.get_unet_skips(
-                    x_dummy, levels=("C1", "C2"), detach=True
-                )
-
-                if hasattr(self.decoder, "build_unet_adapters_from_skips"):
-                    self.decoder.build_unet_adapters_from_skips(skips)
-
-                # dummy latent with size [z, c, h]
-                full_latent_size = self.latent_dim + self.context_dim + self.hidden_dim
-                z_dummy = torch.zeros(
-                    batch_size,
-                    full_latent_size,
-                    device=self.device,
-                    dtype=dtype,
-                )
-                _ = self.decoder(z_dummy, skips=skips)
-
-                if hasattr(self.decoder, "_pending_skips"):
-                    self.decoder._pending_skips = None
-        finally:
-            if enc_was_training:
-                self.encoder.train()
-            if dec_was_training:
-                self.decoder.train()
-
 
     def _init_DynamicWeightAverage(self, temperature: float = 2.0):
         if  self.grad_balance_method != 'none':
@@ -870,7 +796,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     "recon_loss",
                     "kl_z",
                     "hierarchical_kl",
-                    "gram_enc_loss",
                 ],
                 temperature=temperature,
             )
@@ -890,69 +815,63 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         else:
             self.total_weighter = DynamicWeightAverage(
                 loss_keys_to_consider=["recon_loss",
-                    "kl_z",
-                    "hierarchical_kl",
-                    "gram_enc_loss",
-                    "perceiver_vq_loss",
-                    "perceiver_ce_loss",
-                    "perceiver_lpips_loss",
-                    "perceiver_recon_loss",
-                    "context_cycle_consistency_loss",
-                ],
-                temperature=temperature,
-            )
+                                        "kl_z",
+                                        "hierarchical_kl",
+                                        "perceiver_vq_loss",
+                                        "perceiver_ce_loss",
+                                        "perceiver_lpips_loss",
+                                        "perceiver_recon_loss",
+                                        "context_cycle_consistency_loss",
+                                    ], temperature=temperature,
+                                    )
 
 
-    def _init_encoder_decoder(self):
-        # Encoder network
-        encoder_channels = [64, 96, 128, 192, 192, 256]
-        self.encoder = VAEEncoder(
-                                  channel_size_per_layer=encoder_channels,
-                                  layers_per_block_per_layer=[1,1,1,2,1,2],
-                                  latent_size=self.latent_dim,
-                                  width=self.image_size,
-                                  height=self.image_size,
-                                  num_layers_per_resolution=[1,2,2,1],
-                                  mlp_hidden_size=self.hidden_dim,
-                                  channel_size=64,
-                                  input_channels=self.input_channels,
-                                  downsample=4,
-                                  use_se=False,
-                                  dropout= self.dropout,
-                                  ).to(self.device)
-        # Decoder network 
-        self.decoder = VAEDecoder(
-                                  latent_size=self.latent_dim + self.context_dim + self.hidden_dim,
-                                  width=self.image_size,
-                                  height= self.image_size,
-                                  channel_size_per_layer=[256,192,192,128,96,64],
-                                  layers_per_block_per_layer=[2,1,2,1,1,1],
-                                  num_layers_per_resolution=[1,2,2,1],
-                                  reconstruction_channels=self.input_channels,
-                                  downsample=4,
-                                  mlp_hidden_size= self.hidden_dim,
-                                  dropout= self.dropout,
-                                  use_se=False,
-                                  encoder_channel_size_per_layer=encoder_channels,
-                                  skip_levels_last_n=3
-                                  ).to(self.device)
-        self.skip_dropout_p = 0.5 
-        
-        self.gram_loss = GramLoss(
-            apply_norm=True,
-            img_level=True,             
-            remove_neg=True,           # set True to match DINOv3’s “positives-only” option
-            remove_only_teacher_neg=False,
-        )
-        # Warm-build UNet adapters before creating optimizer
-        self._warm_build_unet_adapters(batch_size=1)
+    def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int =15):
+        # DPGMM Prior
+        # ---- 1) Build VDVAE hyperparams ----
+        H = Hyperparams()
+        H.use_checkpoint = self.use_ctx_checkpoint
+        H.image_channels = self.input_channels   # usually 3
+        H.zdim = self.latent_dim                 # or set explicitly (e.g., 16)
+        H.bottleneck_multiple = 0.25 
+        H.width = 200
+        H.image_size = self.image_size          # e.g. 64
+        H.dataset = 'imagenet64'
+        H.num_mixtures = 10
+        H.skip_threshold = 500.
+        # ~9–10 blocks encoder/decoder
+        H.dec_blocks = "1x1,4m1,4x2,8m4,8x4,16m8,16x6,32m16,32x7,64m32,64x2"
+        H.enc_blocks = "64x2,64d2,32x7,32d2,16x6,16d2,8x4,8d2,4x2,4d4,1x3"
 
-        self.encoder.gradient_checkpointing_enable()
-        self.decoder.gradient_checkpointing_enable()
-       
-        self.ema_encoder = EMA(self.encoder, decay=0.995, use_num_updates=True)
-        self.ema_decoder = EMA(self.decoder, decay=0.995, use_num_updates=True)
+        H.no_bias_above = 64
+        H.custom_width_str = ""
 
+        # ---- 2) Instantiate VDVAE (no prior yet) ----
+        self.vdvae = VDVAE(
+            H,
+            prior=None,              # we'll set self.prior separately
+            top_kl_weight=1.0,
+            prior_kl_mc_samples=prior_mc_samples,
+        ).to(self.device)
+
+        # ---- 3) Extract top block latent dim & resolution ----
+        top_block = self.vdvae.decoder.dec_blocks[0]        # is_top=True for first block
+        C = top_block.zdim                                  # latent channels
+        res = top_block.base                                # spatial resolution (e.g. 8)
+        self.top_zdim = C * res * res
+
+        self.prior = DPGMMPrior(max_components, 
+                                latent_dim=C,   # latent dim 
+                                hidden_dim=self.hidden_dim+ self.context_dim, #This is because that the input for the prior is the hidden state of recurrent model plus context which is coming from perceiver
+                                device=self.device, 
+                                prior_alpha=prior_alpha,
+                                prior_beta=prior_beta)
+        # EMA for VDVAE
+        self.ema_decay = 0.999
+        self.ema_vdvae = EMA(self.vdvae, decay=self.ema_decay)  
+
+        # Attach prior to VDVAE so its forward() computes dp_kl / dp_rate
+        self.vdvae.prior = self.prior
 
 
     def load_pretrained_vq_tokenizer(
@@ -1079,7 +998,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         
         # VRNN recurrence: h_t = f(h_{t-1}, z_t, c_t, a_t)
         self._rnn = LSTMLayer(
-            input_size=self.latent_dim + self.action_dim + self.context_dim ,  # z_t + c_t +  a_t
+            input_size=self.top_zdim + self.action_dim + self.context_dim ,  # z_t + c_t +  a_t
             hidden_size=self.hidden_dim,
             n_lstm_layers= number_lstm_layer,
             use_orthogonal=use_orthogonal
@@ -1197,12 +1116,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # Trunk / world-model modules
         trunk_modules = [
-            self.encoder,
-            self.decoder,
+            self.vdvae.encoder,
+            self.vdvae.decoder,
             self.prior,
             self._rnn,
             self.rnn_layer_norm,
-            self.gram_loss,
         ]
         trunk_params = get_params(*trunk_modules)
         if trunk_params:
@@ -1273,7 +1191,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # 3) Base optimizer over generator (+ optional balancer params)
         param_groups = gen_param_groups + balancer_param_groups
-        base_optimizer = torch.optim.AdamW(
+        base_optimizer = torch.optim.Adamax(
             param_groups,
             lr=learning_rate*1.2,
             betas=(0.9, 0.999),
@@ -1310,8 +1228,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             threshold=0.0001,
         )
 
-
-
     def maybe_checkpoint_ctx(self, fn, *x, use_reentrant: bool = False):
         if self.training and self.use_ctx_checkpoint:
             return ckpt(fn, *x, use_reentrant=use_reentrant)
@@ -1339,21 +1255,18 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         c_prev = torch.zeros(batch_size, self.context_dim).to(self.device)
         # Storage for outputs
         outputs = {
-            'observations': observations,
             'reconstructions': [],
-            'mdl_params': [], 
+            "reconstruction_samples": [],
             'latents': [],
-            'z_means': [],
-            'z_logvars': [],
             'hidden_states': [],
             'context_states': [],
             'prior_params': [],
-            'posterior_params': [],
-            'kl_losses': [],
-            'kumaraswamy_kl_losses': [],
-            'kl_latents': [],
-            'reconstruction_losses': [],
-            'gram_enc': [],
+            "kumaraswamy_kl_losses": [],
+            "kl_latents": [],              # per-step total KL (gauss + DP), scalar
+            "reconstruction_losses": [],   # per-step distortion, scalar
+            "vae_elbos": [],
+            "gauss_rates": [],
+            "gm_rates": [],
             'K_eff': [],
         }
         outputs['perceiver_reconstructed_img'] = context_info['reconstruct']
@@ -1361,85 +1274,52 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         for t in range(seq_len):
             # Get current inputs
             o_t = observations[:, t]
+            x_t = o_t.permute(0,2,3,1).contiguous()  # to NHWC for VDVAE
             a_t = actions[:, t]
             # Get context (global or local)
             c_t = context_sequence[:, t]
             
             outputs['context_states'].append(c_t)
             
-            #Inference Network q(z_t|o_≤t, z_<t) 
-            with self.encoder.enable_caching():
-                # Inference Network q(z_t | o_<=t, z_<t)
-                z_t, z_mean_t, z_logvar_t, _ = self.encoder(o_t)
-                if self.training:
-                    skips = self.encoder.get_unet_skips(
-                        x=None,
-                        levels=("C1", "C2"),
-                        detach=False,
-                    )
-                else:
-                    skips = None
-
-                # Decoder forward
-                decoder_input = torch.cat([z_t, c_t, h[-1]], dim=-1)
-                logit_probs, means, log_scales, coeffs = self.decoder(decoder_input, skips=skips)
-
-                q_params = {'mean': z_mean_t, 'logvar': z_logvar_t}
-                outputs['posterior_params'].append(q_params)
-                # store gram matrix for encoder decoder features
-                outputs['gram_enc'].append( self.encoder_gram_loss_student_teacher(o_t, levels=("C1", "C2")) )
-
-            # Store latent statistics
-            outputs['latents'].append(z_t)
-            outputs['z_means'].append(z_mean_t)
-            outputs['z_logvars'].append(z_logvar_t)
-            
             # === Prior Network p(z_t|o_<t, z_<t) ===
             h_context = torch.cat([h[-1], c_prev], dim=-1)
-            
-            # Get DP-GMM prior distribution
-            prior_dist, prior_params = self.prior(h_context)
-            outputs['prior_params'].append(prior_params)
-            
-            outputs['mdl_params'].append({
-                    'logit_probs': logit_probs,
-                    'means': means,
-                    'log_scales': log_scales,
-                    'coeffs': coeffs
-                })
-            reconstruction_t = self.decoder.mdl_head.sample(logit_probs, means, log_scales, coeffs, scale_temp=0.3)
-            outputs['reconstructions'].append(reconstruction_t)
-                
-            # Compute NLL loss instead of MSE
-            outputs['reconstruction_losses'].append(self.decoder.mdl_head.nll(o_t, logit_probs, means, log_scales, coeffs).mean())
+            vdvae_out = self.vdvae(x_t, x_t, h_context)
+            distortion_t = vdvae_out["distortion"]   # recon per-pixel
+            rate_t = vdvae_out["rate"]              # total KL per-pixel (gauss + DP)
+            elbo_t = vdvae_out["elbo"]
+            gauss_rate_t = vdvae_out["gauss_rate"]
+            dp_rate_t = vdvae_out["dp_rate"]
 
-            # === KL Divergence Computation ===
-            # 1. KL between posterior and DP-GMM prior
+            outputs["reconstruction_losses"].append(distortion_t)
+            outputs["kl_latents"].append(rate_t)
+            outputs["vae_elbos"].append(elbo_t)
+            outputs["gauss_rates"].append(gauss_rate_t)
+            outputs["gm_rates"].append(dp_rate_t)
 
-            kl_z = self.prior.compute_kl_divergence_mc(z_mean_t, z_logvar_t, prior_params)
-            outputs['kl_latents'].append(kl_z)
-            
+            # ---- 2) Stick-breaking / hierarchical KL (Kumaraswamy vs Beta/Gamma priors) ----
+            prior_params = vdvae_out["prior_params"]
+
             # 2. KL for stick-breaking (Kumaraswamy vs Beta and Gamma prior vs Gamma posterior)
+
             kumar_beta_kl = self.prior.compute_kl_loss(
                 prior_params, 
                 prior_params['alpha'], 
-                h_context,
+                h_context.detach(),
             )
             # Stick-breaking KL
             outputs['kumaraswamy_kl_losses'].append(kumar_beta_kl)
+            outputs['prior_params'].append(prior_params)
             
             # 4. Compute effective number of components and penalty for unused components
             K_eff = self.prior.get_effective_components(prior_params['pi'])
+            eps = torch.randn_like(vdvae_out["top_q_logvar_map"])
+            z_map = vdvae_out["top_q_mean_map"] + eps * torch.exp(0.5 * vdvae_out["top_q_logvar_map"])
 
+            z_t = z_map.contiguous().view(batch_size, -1)  # flatten
 
             outputs['K_eff'].append(K_eff.float().mean())
-           # Negative for ELBO
+            outputs['latents'].append(z_t)
 
-            
-            # Total KL for this timestep
-            total_kl = kl_z + kumar_beta_kl
-            outputs['kl_losses'].append(total_kl)
-            # === VRNN Recurrence ===
             #build mask based on done signals
             if dones is None:
                 mask_t = torch.ones(batch_size, device=self.device)
@@ -1449,8 +1329,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 else:
                     first_t = dones[:, t-1].to(torch.float32).to(self.device)
                 mask_t = 1.0 - first_t
-
-            rnn_input = torch.cat([z_t, c_prev, a_t], dim=-1)
+            
+            rnn_input = torch.cat([z_t, c_t, a_t], dim=-1)
             rnn_output, (h, c) = self._rnn(
                 rnn_input, h, c, 
                 mask_t
@@ -1458,11 +1338,23 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             c_prev = c_t
             rnn_output = self.rnn_layer_norm(rnn_output)
             outputs['hidden_states'].append(h[-1])
+            dmol_out = self.vdvae.decoder.out_net.forward(vdvae_out["px_z"])  # [B, H, W, 10*nr_mix]
+            recon_mean = mean_from_discretized_mix_logistic(dmol_out, self.vdvae.H.num_mixtures)  # [B,H,W,3]
+            #print(f"image reconstruction range: min {recon_mean.min().item()}, max {recon_mean.max().item()}")
+            recon_mean = recon_mean.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+            outputs["reconstructions"].append(recon_mean)
+
+            with torch.no_grad():
+                sample = self.vdvae.decoder.out_net.sample(vdvae_out["px_z"])   # [B, H, W, C] uint8
+                sample = torch.from_numpy(sample).to(device=self.device, dtype=torch.float32)
+                sample = sample.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+                #numpy array in [0, 255]
+            outputs["reconstruction_samples"].append(sample) #in range [0, 255]
 
         outputs['K_eff'] = torch.stack(outputs['K_eff']).mean() 
         # === Compute aggregated losses ===
         # Stack temporal sequences
-        for key in ['reconstructions', 'latents', 'hidden_states', 'context_states']:
+        for key in ['reconstructions', 'latents', 'hidden_states', 'context_states', 'reconstruction_samples']:
             if outputs[key]:
                 outputs[key] = torch.stack(outputs[key], dim=1)
         outputs['perceiver_total_loss'] =       context_info["total_loss"]
@@ -1503,11 +1395,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
             ctx_pred_loss = F.mse_loss(pred_ctx_seq, c_target.detach())
 
-            # Hyperparameter for this auxiliary loss
-            lambda_ctx = getattr(self, "lambda_ctx_pred", 0.1)
-
+            
             # Add to perceiver task loss (so it goes into MGDA "perceiver" bucket)
-            outputs['perceiver_total_loss'] = outputs['perceiver_total_loss'] + lambda_ctx * ctx_pred_loss
+            outputs['perceiver_total_loss'] = outputs['perceiver_total_loss'] + self.lambda_ctx_pred * ctx_pred_loss
 
             outputs['context_pred_loss'] = ctx_pred_loss
         # Add auxiliary outputs
@@ -1518,135 +1408,48 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         outputs["perceiver_recon_loss"] =       context_info["recon_loss"]
         outputs["perceiver_cycle_loss"] =       context_info["ar_cycle_loss"]
         return outputs
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        """
-        Convenience wrapper: treat x as a length-1 sequence and reuse forward_sequence.
-        """
-        # x: [B, C, H, W] -> [B, 1, C, H, W]
-        observations = x.unsqueeze(1)
-        outputs = self.forward_sequence(observations, actions=None)
-
-        # last timestep reconstruction
-        recon_seq = outputs['reconstructions']          # list -> stack in forward_sequence
-        if isinstance(recon_seq, list):
-            recon_seq = torch.stack(recon_seq, dim=1)   # [B, T, C, H, W]
-        recon = recon_seq[:, -1]                        # [B, C, H, W]
-
-        return recon, {
-            'z': outputs['latents'][:, -1],
-            'z_mean': outputs['z_means'][:, -1],
-            'z_logvar': outputs['z_logvars'][:, -1],
-        }
-    
     
     def compute_total_loss(self, 
                            observations, 
                            actions=None, 
                            beta=1.0,  
                            lambda_recon=1.0, 
-                           lambda_gram=0.1,
                            ):
         """
         Corrected loss computation recognizing that kumar_beta_kl already includes alpha prior KL
         """
         outputs = self.forward_sequence(observations, actions)
-        losses = {}
-        
-        # === Reconstruction Term (Positive in Loss) ===
-        # This is already negative value -E_q[log p(x|z)] under Gaussian assumption
-        losses['recon_loss'] = torch.stack(outputs['reconstruction_losses']).mean()  if outputs['reconstruction_losses'] else torch.tensor(0.0).to(self.device)
-        losses['gram_enc_loss'] = torch.stack(outputs['gram_enc']).mean() if outputs['gram_enc'] else torch.tensor(0.0).to(self.device)
-        # === KL Divergence Terms ===
-        
-        # 1. Latent KL: KL[q(z|x) || p(z|h,c)]
-        losses['kl_z'] = torch.stack(outputs['kl_latents']).mean() if outputs['kl_latents'] else torch.tensor(0.0).to(self.device)
-        
-        # 2. Hierarchical KL (includes BOTH stick-breaking AND alpha prior)
-        # This is what compute_kl_loss returns
-        losses['hierarchical_kl'] = torch.stack(outputs['kumaraswamy_kl_losses']).mean() if outputs['kumaraswamy_kl_losses'] else torch.tensor(0.0).to(self.device)
-                
-        # Auxiliary losses
-        losses['perceiver_loss'] = outputs['perceiver_total_loss']
+        if len(outputs["reconstruction_losses"]) > 0:
+            recon_loss = torch.stack(outputs["reconstruction_losses"]).mean()
+        else:
+            recon_loss = torch.zeros((), device=self.device)
 
+        # --- Latent KL (Gaussian + DP at top) ---
+        if len(outputs["kl_latents"]) > 0:
+            kl_z = torch.stack(outputs["kl_latents"]).mean()
+        else:
+            kl_z = torch.zeros((), device=self.device)
 
-        
-        # === Total Loss (Minimizing Negative ELBO) ===
-        losses['total_vae_loss'] = (
-            # Reconstruction (positive - we want to minimize error)
-            lambda_recon * losses['recon_loss'] +
-            # KL terms 
-            beta * losses['kl_z'] +
-            beta * losses['hierarchical_kl']+
-            lambda_gram * losses['gram_enc_loss'] 
+        # --- Stick-breaking / hierarchical KL (Kumaraswamy + alpha prior) ---
+        if len(outputs["kumaraswamy_kl_losses"]) > 0:
+            hierarchical_kl = torch.stack(outputs["kumaraswamy_kl_losses"]).mean()
+        else:
+            hierarchical_kl = torch.zeros((), device=self.device)
+
+        total_vae_loss = (
+            lambda_recon * recon_loss
+            + beta * (kl_z + hierarchical_kl)
         )
-        
-        return losses, outputs
 
-        
-    def compute_conditional_entropy(self, logits, params):
-        """
-        Compute conditional entropy of cluster assignments with temperature scaling.
-        H(C|Z) = -E[log P(C|Z)]
-
-        """
-        # Ensure temperature stays above minimum value
-        eps = torch.finfo(params['pi'].dtype).eps
-
-        # Computer cluster probabilities with temperature scaling
-        probs = F.softmax(logits , dim=-1)
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        # Compute entropy for each sample
-        entropy_per_sample = -torch.sum(probs * log_probs, dim=-1)
-
-        # Compute mean entropy
-        mean_entropy = entropy_per_sample.mean()
-        mixing_proportions = params['pi']
-        mixing_proportions_safe = mixing_proportions.clamp(min=eps)
-        #The entropy H(π) tells how "spread out" or "diverse" the cluster usage is
-        mixing_entropy = -torch.sum(
-            mixing_proportions_safe * torch.log(mixing_proportions_safe), 
-            dim=-1
-        ).mean() 
-        # Compute additional clustering statistics
-        cluster_stats = {
-            'mean_prob_per_cluster': probs.mean(0),
-            'mixing_entropy': mixing_entropy.item(),
-            'max_prob_per_sample': probs.max(1)[0].mean(),
-            'entropy_std': entropy_per_sample.std() if entropy_per_sample.numel() > 1 else torch.tensor(0.0, device=entropy_per_sample.device),
-            'active_clusters': (probs.mean(0) > eps).sum().item()
+        vae_losses = {
+            "recon_loss": recon_loss,
+            "kl_z": kl_z,
+            "hierarchical_kl": hierarchical_kl,
+            "total_vae_loss": total_vae_loss,
         }
 
-        return mean_entropy + mixing_entropy, cluster_stats
-
-
-    def encoder_gram_loss_student_teacher(self, x, levels=('C3','C4'), pool=2):
-        # Student encoder features
-        enc_s = self.encoder.get_unet_skips(x=None, levels=levels, detach=False)  # dict { 'HxW': Tensor[B,C,H,W] }
-        if not enc_s:  # cache may be None or empty outside caching context
-            enc_s = self.encoder.get_unet_skips(x, levels=levels, detach=False)
-
-        # Teacher (EMA) encoder features
-        self.ema_encoder.apply_shadow()
-        with torch.inference_mode():
-            enc_t = self.encoder.get_unet_skips(x, levels=levels, detach=True)
-        self.ema_encoder.restore()
-
-        loss = 0.0
-        common = set(enc_s.keys()) & set(enc_t.keys())
-        for k in common:
-            Fs, Ft = enc_s[k], enc_t[k]              # [B,C,H,W]
-            if pool and (Fs.shape[-1] % pool == 0):  # optional downsample 
-                Fs = torch.nn.functional.avg_pool2d(Fs, pool)
-                Ft = torch.nn.functional.avg_pool2d(Ft, pool)
-            # reshape to (B, N, D) = (B, HW, C)
-            s = Fs.flatten(2).transpose(1, 2).contiguous()
-            t = Ft.flatten(2).transpose(1, 2).contiguous()
-            # call the DINOv3 loss (it normalizes internally when apply_norm=True)
-            loss = loss + self.gram_loss(s, t, img_level=True)
-        return loss
-
+        return vae_losses, outputs
+       
 
     def compute_global_context(
         self,
@@ -1666,7 +1469,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         temporal_context: [B, T_out, C_ctx]
         info: dict with losses, Ht/Wt, and recon / generated videos for logging.
         """
-        device = videos.device
+        
         B, T_raw, C_img, H_img, W_img = videos.shape
         assert 1 <= num_context_frames <= T_raw, "Invalid num_context_frames"
         T_ctx = num_context_frames
@@ -1844,6 +1647,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         Convert generated images from [-1, 1] back to [0, 1] for visualization
         """
         return (images + 1) / 2
+    
     @staticmethod
     def _flatten_for_diag(x: torch.Tensor | list | tuple):
         if x is None:
@@ -1860,7 +1664,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                             actions: torch.Tensor = None,
                             beta: float = 1.0,
                             lambda_recon: float = 1.0,
-                            lambda_gram: float = 0.25,
                             batch_idx: Optional[int] = None,
                             ) -> Dict[str, torch.Tensor]:
         """
@@ -1872,11 +1675,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         self.train()
         # 1) Prepare data and compute VAE & perceiver losses
-        observations = self.prepare_images_for_training(observations)
 
         vae_losses, outputs = self.compute_total_loss(
             observations, actions, beta,
-            lambda_recon, lambda_gram
+            lambda_recon, 
         )
 
         # 4) Combine losses with DWA
@@ -1886,7 +1688,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "recon_loss":      vae_losses["recon_loss"].reshape([]),
                 "kl_z":            vae_losses["kl_z"].reshape([]),
                 "hierarchical_kl": vae_losses["hierarchical_kl"].reshape([]),
-                "gram_enc_loss":   vae_losses["gram_enc_loss"].reshape([]),
             }
 
             perceiver_components = {
@@ -1895,6 +1696,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "perceiver_lpips_loss": outputs["perceiver_lpips_loss"].reshape([]),
                 "perceiver_recon_loss": outputs["perceiver_recon_loss"].reshape([]),
                 "context_cycle_consistency_loss": outputs["perceiver_cycle_loss"].reshape([]),
+                "context_pred_loss": outputs["context_pred_loss"].reshape([]),
             }
 
             elbo_loss      = self.elbo_weighter.reduce_losses(elbo_components, batch_idx)
@@ -1908,7 +1710,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "recon_loss":      vae_losses["recon_loss"].reshape([]),
                 "kl_z":            vae_losses["kl_z"].reshape([]),
                 "hierarchical_kl": vae_losses["hierarchical_kl"].reshape([]),
-                "gram_enc_loss":   vae_losses["gram_enc_loss"].reshape([]),
                 "perceiver_vq_loss":    outputs["perceiver_vq_loss"].reshape([]),
                 "perceiver_ce_loss":    outputs["perceiver_ce_loss"].reshape([]),
                 "perceiver_lpips_loss": outputs["perceiver_lpips_loss"].reshape([]),
@@ -1924,9 +1725,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     lambda_recon * vae_losses['recon_loss']
                     + beta * vae_losses['kl_z']
                     + beta * vae_losses['hierarchical_kl']
-                    + lambda_gram * vae_losses['gram_enc_loss']
                 )
-                perceiver_loss = vae_losses['perceiver_loss']
+                perceiver_loss = outputs['perceiver_total_loss']
 
         else:
             # No DWA: fixed scalar weights
@@ -1935,9 +1735,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 lambda_recon * vae_losses['recon_loss']
                 + beta * vae_losses['kl_z']
                 + beta * vae_losses['hierarchical_kl']
-                + lambda_gram * vae_losses['gram_enc_loss']
             )
-            perceiver_loss = vae_losses['perceiver_loss']
+            perceiver_loss = outputs['perceiver_total_loss']
 
             total_gen_loss = elbo_loss + perceiver_loss
 
@@ -2063,7 +1862,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     self.grad_balancer.backward(task_losses, mode="backward")
             else:
                 # No multi-task balancer: just backprop total_gen_loss
-                total_gen_loss.backward()
+                total_gen_loss.backward(retain_graph=True)
 
             # Clip and step with standard optimizer
             torch.nn.utils.clip_grad_norm_(
@@ -2088,10 +1887,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if hasattr(self, "ema_decoder"):
                 self.ema_decoder.update()
 
-        # 7) Mixture-model stats for logging
-        avg_max_prob = torch.stack(
-            [p["logit_probs"].softmax(1).max(1)[0].mean() for p in outputs["mdl_params"]]
-        ).mean()
 
         eff_comp = outputs['prior_params'][0]['pi'].max(1)[0].mean().item()
         top6_cov = outputs['prior_params'][0]['pi'].topk(6, dim=-1)[0].sum(dim=-1).mean().item()
@@ -2104,8 +1899,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'grad_norm': float(grad_norm),
             'effective_components': eff_comp,
             'Top 6 coverage': top6_cov,
-            'mdl_avg_max_mixture_prob': avg_max_prob.item(),
-            'mdl_effective_mixtures': (1.0 / avg_max_prob).item(),
         }
     
     def set_epoch(self, epoch: int):
@@ -2121,178 +1914,136 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             latent_size = latent_dim + context_dim + hidden_dim
         so we build [z, c, h] here to match.
         """
-        self.ema_encoder.apply_shadow()
-        self.ema_decoder.apply_shadow()
-
         # 1) Sample a joint (h, c) vector used by the prior
         #    h_ctx shape: [B, hidden_dim + context_dim]
         h_ctx = torch.randn(num_samples,
                             self.hidden_dim + self.context_dim,
                             device=self.device)
 
-        # 2) Prior over z | (h, c)
-        prior_dist, _ = self.prior(h_ctx)     # z ~ [B, latent_dim]
-        z = prior_dist.sample()
+        # (B) apply EMA E
+        if hasattr(self, "ema_vdvae"):
+            self.ema_vdvae.apply_shadow()
 
-        # 3) Split h_ctx back into h and c
-        h_sample = h_ctx[:, :self.hidden_dim]             # [B, hidden_dim]
-        c_sample = h_ctx[:, self.hidden_dim:]             # [B, context_dim]
+        x_np = self.vdvae.sample(num_samples, h_ctx)
 
-        # 4) Build full latent [z, c, h] for the decoder
-        decoder_input = torch.cat([z, c_sample, h_sample], dim=-1)
-        # decoder_input.shape[1] should equal
-        # self.latent_dim + self.context_dim + self.hidden_dim
+        if hasattr(self, "ema_vdvae"):
+            self.ema_vdvae.restore()
 
-        # 5) Decode
-        samples = self.decoder.decode(decoder_input, deterministic=False)
-
-        self.ema_encoder.restore()
-        self.ema_decoder.restore()
-        return samples
-
-
-    def sample_next_latent(self, h_t, c_t, temperature=1.0):
-        """
-        Sample z_{t+1} from the DPGMM prior given current hidden state and context
-        
-        """
-        batch_size = h_t.shape[0]
-        
-        # Combine hidden state and context for prior conditioning
-        h_context = torch.cat([h_t, c_t], dim=-1)
-        
-        # Get DPGMM prior distribution
-        prior_dist, prior_params = self.prior(h_context)
-        
-        # Sample from the mixture with temperature scaling
-        if temperature > 0:
-            # Sample component assignments from categorical distribution
-            pi = prior_params['pi']  # [batch_size, K]
-            
-            # Apply temperature to mixing proportions
-            if temperature != 1.0:
-                logits = torch.log(pi + torch.finfo(torch.float32).eps) / temperature
-                pi = F.softmax(logits, dim=-1)
-            
-            # Sample component indices
-            component_dist = Categorical(probs=pi)
-            selected_components = component_dist.sample()  # [batch_size]
-            
-            # Get parameters for selected components
-            means = prior_params['means']  # [batch_size, K, latent_dim]
-            log_vars = prior_params['log_vars']  # [batch_size, K, latent_dim]
-            
-            # Extract parameters for selected components
-            batch_indices = torch.arange(batch_size).to(selected_components.device)
-            selected_means = means[batch_indices, selected_components]  # [batch_size, latent_dim]
-            selected_log_vars = log_vars[batch_indices, selected_components]  # [batch_size, latent_dim]
-            
-            # Sample from selected Gaussian components
-            std = torch.exp(0.5 * selected_log_vars) * temperature
-            z_next = selected_means + std * torch.randn_like(std)
-            
-        else:
-            # Deterministic: use mode of dominant component
-            dominant_components = prior_params['pi'].argmax(dim=-1)  # [batch_size]
-            batch_indices = torch.arange(batch_size).to(dominant_components.device)
-            z_next = prior_params['means'][batch_indices, dominant_components]
-            selected_components = dominant_components
-        
-        prior_info = {
-            'pi': prior_params['pi'],
-            'selected_components': selected_components,
-            'means': prior_params['means'],
-            'log_vars': prior_params['log_vars'],
-            'prior_dist': prior_dist
-        }
-        
-        return z_next, prior_info
-
-
+        # uint8 NHWC -> float NCHW in [-1,1]
+        x = torch.from_numpy(x_np).permute(0, 3, 1, 2).contiguous().float() / 127.5 - 1.0
+        return x
+    
     @torch.no_grad()
-    def generate_future_sequence(
-        self,
-        initial_obs: torch.Tensor,   # [B,T_ctx,C,H,W]
-        actions: Optional[torch.Tensor],  # [B, T_total, A] or None
-        horizon: int,
-        decode_pixels: bool = True    # True: also produce frames for viz
-    ) -> Dict[str, torch.Tensor]:
-        """
-        imagination:
-        - consume T_ctx observed frames,
-        - roll future for `horizon` steps using PRIOR and ContextPredictor,
-        - use offline actions if provided, else zeros (later: policy(h,z,c))
-        - optionally decode pixels for visualization
-        Returns dict with z, c, a, h (and images if decode_pixels).
-        """
+    def generate_future_sequence(self, initial_obs, actions=None, horizon=2, decode_pixels=True):
+        device = initial_obs.device
         B, T_ctx = initial_obs.shape[:2]
-        device = self.device
 
         # 1) Contexts for observed frames (no future AR here)
-        ctx_obs, ctx_info = self.compute_global_context(
-            initial_obs, 
-            num_context_frames=T_ctx, 
-            generate_future=False
-        )  # ctx_obs: [B,T_ctx,C_ctx]
+        ctx_obs, context_info = self.compute_global_context(
+            initial_obs,
+            num_context_frames=T_ctx,
+            generate_future=False,
+        )  # [B, T_ctx, C_ctx]
 
-        # 2) Build initial RNN state by scanning the observed segment (teacher-forced)
-        #    (matches forward_sequence but only up to T_ctx)
-        outputs = { 'z': [], 'h': [], 'c': [ctx_obs[:, 0]], 'a': [] }
+        # 2) Scan the observed segment (teacher-forced) to get h_{T_ctx-1}, z_{T_ctx-1}, a_{T_ctx-1}
+        outputs = {"z": [], "h": [], "a": []}
         h = self.h0.expand(self.number_lstm_layer, B, -1).contiguous()
         c_rnn = self.c0.expand(self.number_lstm_layer, B, -1).contiguous()
-        #at t=0, c_prev = ctx_obs[:,t-1] is just ctx_obs[:,0] (initialized above)
+
+        top_block = self.vdvae.decoder.dec_blocks[0]
+        C = top_block.zdim
+        res = top_block.base
+
+        def sample_top_z_map_and_pooled(h_context: torch.Tensor):
+            B_, Hc = h_context.shape
+            h_map = h_context.view(B_, Hc, 1, 1).expand(B_, Hc, res, res)
+            h_map = self.vdvae.add_coord_no_proj(h_map, scale=0.05)  # matches training :contentReference[oaicite:3]{index=3}
+            h_tokens = h_map.permute(0, 2, 3, 1).reshape(B_ * res * res, Hc)
+            pz_dist, _ = self.prior(h_tokens)
+            z_tokens = pz_dist.sample()
+            z_map = z_tokens.view(B_, res, res, C).permute(0, 3, 1, 2).contiguous()
+            return z_map, z_map.view(B_, -1)  # z_flat is [B, top_zdim] (NOT [B, C])
+
+        # c_prev is the "previous context" for the prior conditioning when t=0 (c_{-1}); zeros is fine.
         c_prev = torch.zeros(B, self.context_dim, device=device)
+
         for t in range(T_ctx):
-            x_t = initial_obs[:, t]         # [B,C,H,W]
-            c_t = ctx_obs[:, t]             # [B,C_ctx]
+            x_t = initial_obs[:, t]                           # [B,C,H,W]
+            c_t = ctx_obs[:, t]                               # [B,C_ctx]
             a_t = actions[:, t] if actions is not None else torch.zeros(B, self.action_dim, device=device)
 
-            z_t, *_ = self.encoder(x_t)  # z from encoder 
+            x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
+            h_context = torch.cat([h[-1], c_prev], dim=-1)
 
-            # step RNN
+            vdvae_out = self.vdvae(x_t_nhwc, x_t_nhwc, h_context)
+            eps = torch.randn_like(vdvae_out["top_q_mean_map"])
+            z_map = vdvae_out["top_q_mean_map"] + eps * torch.exp(0.5 * vdvae_out["top_q_logvar_map"])
+            z_t = z_map.contiguous().view(B, -1)             # [B, top_zdim]
+
             rnn_in = torch.cat([z_t, c_t, a_t], dim=-1)
             _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, torch.ones(B, device=device))
-            outputs['z'].append(z_t)
-            outputs['h'].append(h[-1])
-            outputs['a'].append(a_t)
 
-        # 3) Future imagination with PRIOR + ContextPredictor
-        c_prev = ctx_obs[:, -1]     # last observed context
+            c_prev = c_t
+            outputs["z"].append(z_t)
+            outputs["h"].append(h[-1])
+            outputs["a"].append(a_t)
 
+        # Seed "previous-step" variables at t = T_ctx-1
+        z_prev = outputs["z"][-1]
+        a_prev = outputs["a"][-1]
+
+        # 3) Future imagination (consistent timestamps)
         z_futures, c_futures, a_futures, h_futures = [], [], [], []
+        z_top_maps = []
 
-        for t in range(horizon):
-            # (a) pick action
-            a_t = actions[:, T_ctx + t] if actions is not None and actions.shape[1] > (T_ctx + t) \
+        for k in range(horizon):
+            # action at the NEW timestep (t = T_ctx + k)
+            a_cur = (
+                actions[:, T_ctx + k]
+                if actions is not None and actions.shape[1] > (T_ctx + k)
                 else torch.zeros(B, self.action_dim, device=device)
+            )
 
-            # (b) prior over attention/z
-            
-            pz_dist, pz_params = self.prior(torch.cat([h[-1], c_prev], dim=-1))
-            z_t = pz_dist.sample()     # stochastic roll
+            h_top = h[-1]  # this is h_t (top layer) for the *previous* timestep
 
-            # (c) step RNN with imagined inputs
-            rnn_in = torch.cat([z_t, c_prev, a_t], dim=-1)
-            #
+            # predict c_cur = c_{t+1} from (c_t, a_t, z_t, h_t)  (matches training) :contentReference[oaicite:4]{index=4}
+            c_cur = self.context_predictor(
+                context_seq=c_prev,
+                action_seq=a_prev,
+                latent_seq=z_prev,
+                hidden_seq=h_top,
+            )
+
+            # sample z_cur = z_{t+1} from prior p(z_{t+1} | h_t, c_t)
+            h_context = torch.cat([h_top, c_prev], dim=-1)
+            z_map, z_cur = sample_top_z_map_and_pooled(h_context)
+
+            # step RNN to get h_{t+1} using CURRENT (z_{t+1}, c_{t+1}, a_{t+1})
+            rnn_in = torch.cat([z_cur, c_cur, a_cur], dim=-1)
             _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, torch.ones(B, device=device))
 
-            # (d) predict next context from (c_prev, a_t)
-            c_t = self.context_predictor(context_seq=c_prev, action_seq=a_t, latent_seq=z_t, hidden_seq=h[-1])
-            # collect + advance
-            z_futures.append(z_t); c_futures.append(c_t); a_futures.append(a_t); h_futures.append(h[-1])
-            c_prev = c_t
+            # collect
+            z_futures.append(z_cur)
+            c_futures.append(c_cur)
+            a_futures.append(a_cur)
+            h_futures.append(h[-1])
+            z_top_maps.append(z_map)
 
-   
-        # 4) Pack latent imagination outputs
-        z_futures = torch.stack(z_futures, dim=1) if len(z_futures) else torch.empty(B,0, self.latent_dim, device=device)
-        c_futures = torch.stack(c_futures, dim=1) if len(c_futures) else torch.empty(B,0, self.context_dim, device=device)
-        a_futures = torch.stack(a_futures, dim=1) if len(a_futures) else torch.empty(B,0, self.action_dim, device=device)
-        h_futures = torch.stack(h_futures, dim=1) if len(h_futures) else torch.empty(B,0, h[-1].shape[-1], device=device)
+            # advance "previous" variables for next loop
+            c_prev = c_cur
+            z_prev = z_cur
+            a_prev = a_cur
+
+        # 4) Pack outputs (same as your current code)
+        z_futures = torch.stack(z_futures, dim=1) if z_futures else torch.empty(B, 0, self.top_zdim, device=device)
+        c_futures = torch.stack(c_futures, dim=1) if c_futures else torch.empty(B, 0, self.context_dim, device=device)
+        a_futures = torch.stack(a_futures, dim=1) if a_futures else torch.empty(B, 0, self.action_dim, device=device)
+        h_futures = torch.stack(h_futures, dim=1) if h_futures else torch.empty(B, 0, h[-1].shape[-1], device=device)
 
         result = {
-            "z_obs": torch.stack(outputs['z'], dim=1),
-            "h_obs": torch.stack(outputs['h'], dim=1),
-            "a_obs": torch.stack(outputs['a'], dim=1),
+            "z_obs": torch.stack(outputs["z"], dim=1),
+            "h_obs": torch.stack(outputs["h"], dim=1),
+            "a_obs": torch.stack(outputs["a"], dim=1),
             "c_obs": ctx_obs,
             "z_future": z_futures,
             "c_future": c_futures,
@@ -2300,7 +2051,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "h_future": h_futures,
         }
 
-        # 5) pixel rollout via the Perceiver AR head (unchanged)
+        # 5) Pixel rollouts: Perceiver AR (unchanged) + VDVAE decode from sampled top-z maps (unchanged)
         if decode_pixels:
             result["pixels_future"] = self.perceiver_model.generate_autoregressive(
                 context_videos=initial_obs,
@@ -2308,31 +2059,17 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 temperature=1.0, top_k=None, top_p=None,
             )
 
-        # ---- NEW: decode *full* latent [z, c, h] with the VAE ----
-        if z_futures.numel() > 0:
-            B, T_future, Dz = z_futures.shape
-            Dc = c_futures.shape[-1]
-            Dh = h_futures.shape[-1]
-
-            z_flat = z_futures.reshape(B * T_future, Dz)
-            c_flat = c_futures.reshape(B * T_future, Dc)
-            h_flat = h_futures.reshape(B * T_future, Dh)
-
-            latent_full = torch.cat([z_flat, c_flat, h_flat], dim=-1)
-
-            if hasattr(self, "ema_decoder"):
-                self.ema_decoder.apply_shadow()
-
-            x_flat = self.decoder.decode(latent_full, deterministic=False)
-
-            if hasattr(self, "ema_decoder"):
-                self.ema_decoder.restore()
-
-            result["vae_future"] = x_flat.view(B, T_future, *x_flat.shape[1:])
+        if len(z_top_maps) > 0:
+            z_top = torch.stack(z_top_maps, dim=1)  # [B,Tf,C,res,res]
+            B_, Tf = z_top.shape[:2]
+            z_top_flat = z_top.view(B_ * Tf, C, res, res)
+            latents = [z_top_flat] + [None] * (len(self.vdvae.decoder.dec_blocks) - 1)
+            px_z = self.vdvae.decoder.forward_manual_latents(B_ * Tf, latents, t=None)
+            x_np = self.vdvae.decoder.out_net.sample(px_z)  # uint8 NHWC
+            x = torch.from_numpy(x_np).to(device=device, dtype=torch.float32) / 127.5 - 1.0
+            x = x.permute(0, 3, 1, 2).contiguous()
+            result["vae_future"] = x.view(B_, Tf, *x.shape[1:])
         else:
-            result["vae_future"] = torch.empty(
-                B, 0, self.input_channels, self.image_size, self.image_size,
-                device=device,
-            )
+            result["vae_future"] = torch.empty(B, 0, self.input_channels, self.image_size, self.image_size, device=device)
 
         return result

@@ -39,7 +39,7 @@ import matplotlib
 from pathlib import Path
 from distutils.util import strtobool
 
-
+import wandb
 def str2bool(v):
     return bool(strtobool(v))
     
@@ -51,8 +51,6 @@ print("Script dir:", SCRIPT_DIR)
 print("Parent dir:", PARENT_DIR)
 matplotlib.use("Agg", force=True)
 plt.ioff()
-
-
 
 @contextmanager
 def disable_all_checkpoint_modules(model: torch.nn.Module):
@@ -268,7 +266,7 @@ class HumanoidAwareZoomTransform:
                 for c in range(C):
                     patch = np.ascontiguousarray(imgs_np[t, c, y0:y1, x0:x1])
                     out[t, c] = cv2.resize(patch, (W, H), interpolation=self._cv2_interp)
-
+        out = np.clip(out, -1.0, 1.0)
         return out
 
 class DMCVBInfo:
@@ -644,7 +642,8 @@ class DMCVBDataset(Dataset):
             if obs.dtype == np.uint8:
                 obs = obs.astype(np.float32) / 255.0
             obs = (obs * 2.0) - 1.0
-        
+            obs = np.clip(obs, -1.0, 1.0)
+
         # Convert to channels first [C, H, W]
         obs = np.transpose(obs, (2, 0, 1))
         
@@ -740,8 +739,8 @@ def count_parameters(model, print_details=True):
     
     component_params = {}
     component_map = {
-        'encoder': 'encoder',
-        'decoder': 'decoder',
+        'encoder': 'vdvae.encoder',
+        'decoder': 'vdvae.decoder',
         'perceiver': 'perceiver_model',
         'prior': 'prior',
         'rnn': '_rnn',
@@ -812,37 +811,66 @@ class GradientMonitor:
     def _define_component_hierarchy(self):
         """Establish semantic groupings for architectural components"""
         return {
-            'encoder': ['encoder.'],
-            'decoder': ['decoder.'],
+            'encoder': ['vdvae.encoder.'],
+            'decoder': ['vdvae.decoder.'],
             'perceiver': ['perceiver_model' ],
             'prior_dynamics': ['prior.stick_breaking.kumar_net', 'prior.component_nn'],
             'vrnn_core': ['_rnn', 'rnn_layer_norm'],
         }
     
-    def compute_component_gradients(self, update_global_step: bool = True) -> Dict[str, float]:
-        """Extract gradient magnitudes per architectural component"""
+    def compute_component_gradients(
+        self,
+        update_global_step: bool = True,
+        normalize: str = "rms_elem",  # "none" | "rms_elem" | "l2_per_sqrt_elem" | "mean_tensor"
+    ) -> Dict[str, float]:
+        """
+        Returns a scalar per component group.
+
+        normalize:
+        - "none":             sqrt(sum g^2)  (total L2; best for dominance)
+        - "rms_elem":         sqrt(mean g^2) (scale per parameter element; best for comparing modules)
+        - "l2_per_sqrt_elem": sqrt(sum g^2) / sqrt(numel) (same as rms_elem)
+        - "mean_tensor":      sqrt(sum g^2) / n_tensors   (NOT recommended for proportions)
+        """
         if update_global_step:
-            self.global_step += 1  
-        
-        component_grads = {}
+            self.global_step += 1
+
+        component_grads: Dict[str, float] = {}
+
         for group_name, module_patterns in self.component_groups.items():
-            group_grad_norm = 0.0
-            param_count = 0
-            
-            for name, param in self.model.named_parameters():
-                if param.grad is not None and any(pattern in name for pattern in module_patterns):
-                    grad_norm = param.grad.data.norm(2).item()
-                    group_grad_norm += grad_norm ** 2
-                    param_count += 1
-                    
-                    # Track individual layer gradients for critical components
-                    if 'kumar' in name:
-                        if self.writer is not None:  
-                            self.writer.add_scalar(f'gradients/layers/{name}', grad_norm, self.global_step)
-            
-            if param_count > 0:
-                component_grads[group_name] = (group_grad_norm ** 0.5) / param_count
-        
+            sqsum = 0.0
+            n_tensors = 0
+            n_elems = 0
+
+            for name, p in self.model.named_parameters():
+                if p.grad is None:
+                    continue
+                if not any(pat in name for pat in module_patterns):
+                    continue
+
+                g = p.grad.detach()
+                sqsum += g.pow(2).sum().item()
+                n_tensors += 1
+                n_elems += g.numel()
+
+                # Optional: per-layer tracking
+                if "kumar" in name and self.writer is not None:
+                    self.writer.add_scalar(f"gradients/layers/{name}", g.norm(2).item(), self.global_step)
+
+            if n_elems == 0:
+                continue
+
+            if normalize == "none":
+                val = math.sqrt(sqsum)
+            elif normalize in ("rms_elem", "l2_per_sqrt_elem"):
+                val = math.sqrt(sqsum / n_elems)
+            elif normalize == "mean_tensor":
+                val = math.sqrt(sqsum) / max(1, n_tensors)
+            else:
+                raise ValueError(f"Unknown normalize={normalize}")
+
+            component_grads[group_name] = val
+
         return component_grads
 
     def visualize_gradient_flow(self, component_grads, epoch):
@@ -994,7 +1022,7 @@ class DMCVBTrainer:
     def _try_init_wandb(self, config):
         """Attempt to initialize W&B, return success status"""
         try:
-            import wandb
+            
             wandb.init(
                 project=config['wandb_project'],
                 config=config,
@@ -1097,6 +1125,7 @@ class DMCVBTrainer:
                     observations=observations,
                     actions=actions,
                     beta=self.config.get('beta_eval', self.config.get('beta_max', 1.0)),
+                    lambda_recon =self.config['lambda_recon'],
                 )
                 
                 # Track metrics
@@ -1254,7 +1283,6 @@ class DMCVBTrainer:
                     act,
                     beta=self.config["beta"],
                     lambda_recon=self.config["lambda_recon"],
-                    lambda_gram=self.config["lambda_gram"],
                 )
 
                 # Same ELBO combination you use elsewhere
@@ -1262,12 +1290,9 @@ class DMCVBTrainer:
                     self.config["lambda_recon"] * vae_losses["recon_loss"]
                     + self.config["beta"] * vae_losses["kl_z"]
                     + self.config["beta"] * vae_losses["hierarchical_kl"]
-                    + self.config["lambda_gram"] * vae_losses["gram_enc_loss"]
                 )
-
-                perceiver_loss = vae_losses["perceiver_loss"]
+                perceiver_loss = outputs["perceiver_total_loss"]
            
-                
                 task_losses = [elbo_loss, perceiver_loss]
 
                 # Let GradDiagnosticsAggregator handle backward() etc.
@@ -1394,14 +1419,13 @@ class DMCVBTrainer:
         if axes.ndim == 1:
             axes = axes.reshape(1, -1)
 
-        def bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
-            return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         with torch.no_grad():
             for split_idx, (observations, actions, split_name) in enumerate([
                 (train_obs[:batch_size], train_actions[:batch_size], "Train"),
                 (eval_obs[:batch_size],  eval_actions[:batch_size],  "Eval")
             ]):
+                observations = observations.clamp_(-1, 1)
                 # run model once to populate outputs and the posterior's slot maps/assignments
                 _, outputs = self.model.compute_total_loss(observations=observations, actions=actions)
                 
@@ -1420,26 +1444,24 @@ class DMCVBTrainer:
                     axes[row, 0].set_title(f'{split_name} Original'); axes[row, 0].axis('off')
 
                     # ---------- 2) VAE Reconstruction ----------
+                    recon_img = outputs['reconstruction_samples'][i, t, :3]  # [3,H,W]
+                    axes[row, 1].imshow(recon_img.detach().clamp(0, 255).to(torch.uint8).cpu().permute(1,2,0).numpy())
+                    axes[row, 1].set_title('VAE Recon Samples'); axes[row, 1].axis('off')
                     recon_img = outputs['reconstructions'][i, t, :3]  # [3,H,W]
-                    axes[row, 1].imshow(self.denormalize_image(recon_img))
-                    axes[row, 1].set_title('VAE Recon'); axes[row, 1].axis('off')
-
+                    axes[row, 2].imshow(self.denormalize_image(recon_img))
+                    axes[row, 2].set_title('VAE Recon'); axes[row, 2].axis('off')
                     # ---------- 3) Perceiver Recon (if present) ----------
                     if perceiver_reconst is not None:
 
                         pc = perceiver_reconst[i, t, :3]  # [3,H,W]                    
-                        axes[row, 2].imshow(self.denormalize_image(pc))
-                        axes[row, 2].set_title('Perceiver'); axes[row, 2].axis('off')
+                        axes[row, 3].imshow(self.denormalize_image(pc))
+                        axes[row, 3].set_title('Perceiver'); axes[row, 3].axis('off')
                     else:
-                        axes[row, 2].set_title('No Perceiver'); axes[row, 2].axis('off')
+                        axes[row, 3].set_title('No Perceiver'); axes[row, 3].axis('off')
 
-
-                    # 7) Hide unused column
-                    axes[row, 3].axis('off')
 
         plt.tight_layout()
         if self.use_wandb:
-            import wandb
             # Convert figure to image for wandb
             wandb.log({
                 f'visualizations/train_eval_epoch_{epoch}': wandb.Image(fig),
@@ -1513,8 +1535,8 @@ class DMCVBTrainer:
         print(f"Train dataset size: {len(self.train_dataset)}")
         print(f"Eval dataset size: {len(self.eval_dataset)}")
         # Register EMA model
-        self.model.ema_encoder.register()
-        self.model.ema_decoder.register()
+        self.model.ema_vdvae.register()
+        self.model.ema_vdvae.register()
 
         for epoch in range(n_epochs):
             
@@ -1614,7 +1636,6 @@ def parse_args():
     parser.add_argument("--beta_eval", type=float, default=None)
 
     parser.add_argument("--lambda_recon", type=float, default=None)
-    parser.add_argument("--lambda_gram", type=float, default=None)
     parser.add_argument("--grad_clip", type=float, default=None)
 
     # --- logging / wandb ---
@@ -1646,7 +1667,7 @@ def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
         # training
         "batch_size", "sequence_length", "learning_rate", "n_epochs",
         "num_workers", "beta_min", "beta_max", "beta_warmup_epochs",
-        "beta_eval", "lambda_recon", "lambda_gram",
+        "beta_eval", "lambda_recon", 
         "grad_clip", 
         # logging
         "experiment_name",
@@ -1690,9 +1711,9 @@ def main():
         
         # Model settings
         'max_components': 15,
-        'latent_dim': 80,
+        'latent_dim': 36,
         'hidden_dim': 48, #must be divisible by 8
-        'context_dim': 128,
+        'context_dim': 64,
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 8.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
@@ -1708,7 +1729,7 @@ def main():
         'freeze_dvae_backbone': True,     # set True if one wants DVAE backbone frozen too
 
         # Training settings
-        'batch_size': 50,
+        'batch_size': 3,
         'sequence_length': 10,
         'frame_stack': 1,
         'img_height': 64,
@@ -1725,9 +1746,8 @@ def main():
         # Loss weights
         'beta': 1.0,
         'lambda_recon': 1.0,
-        "lambda_gram": 0.15,
         'grad_clip': 2.0,
-        "grad_balance_method": "mgda",  # "gradnorm" or "rgb" 
+        "grad_balance_method": "none",  # "gradnorm" or "rgb" 
         "gradnorm_alpha": 1.5,        
         "use_dynamic_weight_average": False,
         # Logging
