@@ -38,7 +38,7 @@ from contextlib import contextmanager
 import matplotlib
 from pathlib import Path
 from distutils.util import strtobool
-
+from VRNN.visualize_latent_clusters import visualize_dpgmm_clustering
 
 def str2bool(v):
     return bool(strtobool(v))
@@ -1158,16 +1158,29 @@ class DMCVBTrainer:
                 
                 
         if epoch %10 == 0:
-             with torch.no_grad():
+            with torch.no_grad():
                  num_samples = 16
                  samples =self.model.sample(num_samples)
                  if self.use_wandb:
                      wandb.log({
                          'eval/samples': wandb.Image(
-                        torchvision.utils.make_grid(samples, nrow=4
+                        torchvision.utils.make_grid(self.denormalize_image(samples), nrow=4
                         )
                     )
                      })
+            save_path = str(self.ckpt_dir / f"dpgmm_prior_tsne_epoch_{epoch:04d}.png")
+            visualize_dpgmm_clustering(
+                model=self.model,
+                dataloader=self.eval_loader,
+                device=self.device,
+                max_batches=15,       # keep it cheap
+                max_samples=8000,
+                perplexity=30.0,
+                save_path=save_path,
+                image_level=True,     # start with image_level
+                t_select=0,            # choose which frame from the sequence
+                use_rnn_context= True
+            )
         # Compute averages
         avg_metrics = {f'eval/{k}': np.mean(v) for k, v in eval_metrics.items()}
         pred_metrics = self.evaluate_two_step_prediction(num_batches=5, T_ctx=8) 
@@ -1190,10 +1203,12 @@ class DMCVBTrainer:
         Now also shows VAE-decoded predictions.
         """
         self.model.eval()
-
+        horizon = 2  # predict two steps ahead
         batch = next(iter(self.eval_loader))
         observations = batch["observations"].to(self.device)  # [B, T, C, H, W]
         actions      = batch["actions"].to(self.device)       # [B, T, A]
+        if batch.get("done") is not None:
+            dones = batch["done"].to(self.device)             # [B, T]
         B, T, C, H, W = observations.shape
 
         assert T >= T_ctx + 2, f"Need at least T_ctx+2 frames, got T={T}"
@@ -1202,8 +1217,9 @@ class DMCVBTrainer:
 
         futures = self.model.generate_future_sequence(
             initial_obs=initial_obs,
-            actions=actions,
-            horizon=2,
+            actions=actions[:,:T_ctx + horizon],
+            horizon=horizon,
+            dones=dones[:, :T_ctx + horizon] if dones is not None else None,
         )
 
         pred_vae  = futures["vae_future"]     # VAE-decoder predictions [B, 2, C, H, W]
@@ -1392,6 +1408,7 @@ class DMCVBTrainer:
 
             observations = batch["observations"].to(self.device)  # [B, T, C, H, W]
             actions      = batch["actions"].to(self.device)        # [B, T, A]
+            dones        = batch["done"].to(self.device)           # [B, T]
             B, T, C, H, W = observations.shape
 
             if T < T_ctx + 2:
@@ -1403,8 +1420,9 @@ class DMCVBTrainer:
             # Rollout 2 future steps
             futures = self.model.generate_future_sequence(
                 initial_obs=initial_obs,
-                actions=actions,
+                actions=actions[:, :T_ctx + 2],
                 horizon=2,
+                dones=dones[:, :T_ctx + 2],
             )
             pred = futures["vae_future"]   # [B, 2, C, H, W]
 
@@ -1755,7 +1773,7 @@ def main():
 
         'beta_min': 0.3,
         'beta_max': 1.0,
-        'beta_warmup_epochs': 15,  # 20–50 is common
+        'beta_warmup_epochs': 20,  # 20–50 is common
         'beta_eval': 1.0,          # force eval to use full KL (recommended)
         
         # Loss weights

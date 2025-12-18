@@ -46,7 +46,7 @@ def torch_load_version_compat(path, map_location=None):
     """
     Backward-compatible torch.load
     """
-    import torch
+    
     sig = inspect.signature(torch.load)
     kwargs = {}
 
@@ -195,8 +195,6 @@ class KumaraswamyNetwork(nn.Module):
             log_a = torch.where(torch.isnan(log_a)| torch.isinf(log_a), mean_a, log_a)
             mean_b = torch.nanmean(log_b)  
             log_b = torch.where(torch.isnan(log_b)| torch.isinf(log_b), mean_b, log_b)
-
-
         return log_a, log_b
 
 class AdaptiveStickBreaking(nn.Module):
@@ -219,7 +217,6 @@ class AdaptiveStickBreaking(nn.Module):
         # Named gamma hyperprior parameters
         self.gamma_a = nn.Parameter(torch.tensor(prior_alpha, device=self.device), requires_grad=True)
         self.gamma_b = nn.Parameter(torch.tensor(prior_beta, device=self.device), requires_grad=True)
-
     
         # Neural network for generating stick-breaking proportions
         # Kumaraswamy parameter network
@@ -273,8 +270,6 @@ class AdaptiveStickBreaking(nn.Module):
         
         return v, perm
 
-
-
     @staticmethod
     def compute_stick_breaking_proportions(v: torch.Tensor,  
                                         perm: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -301,16 +296,15 @@ class AdaptiveStickBreaking(nn.Module):
         
         pi = pi / (pi.sum(dim=-1, keepdim=True) + eps)
         return pi
-    def forward(self, h: torch.Tensor, n_samples: int = 10, use_rand_perm: bool = True, truncation_threshold: float = 0.995) -> Tuple[torch.Tensor, Dict]:
+    
+    def forward(self, h: torch.Tensor, use_rand_perm: bool = True, truncation_threshold: float = 0.995) -> Tuple[torch.Tensor, Dict]:
        
-        
         # Generate stick-breaking proportions
         # Get Kumaraswamy parameters
         log_kumar_a, log_kumar_b = self.kumar_net(h)
         
         # Sample v from Kumaraswamy for each alpha sample
         v, perm = self.sample_kumaraswamy(log_kumar_a, log_kumar_b, self.max_K, use_rand_perm)  # [n_samples, batch, K-1]
-
 
         # Initialize mixing proportions
         pi = self.compute_stick_breaking_proportions(v, perm)
@@ -332,7 +326,6 @@ class AdaptiveStickBreaking(nn.Module):
         
         # Renormalize
         pi_final = pi_final / (pi_final.sum(dim=-1, keepdim=True) + torch.finfo(torch.float32).eps )
-        
         
         return pi, {
             'kumar_a': torch.exp(log_kumar_a),
@@ -378,7 +371,6 @@ class AdaptiveStickBreaking(nn.Module):
             print(f"  beta range: ({beta.min().item()}, {beta.max().item()})")
 
         return torch.clamp(kl, min=0.0) 
-    
 
     def compute_gamma2gamma_kl(self, h: torch.Tensor) -> torch.Tensor:
         """
@@ -387,6 +379,7 @@ class AdaptiveStickBreaking(nn.Module):
         prior_concentration = self.gamma_a
         prior_rate = self.gamma_b
         return self.alpha_posterior.kl_divergence(h, prior_concentration, prior_rate)
+    
 
 class ComponentNN(nn.Module):
     def __init__(self, hidden_dim, latent_dim, max_components):
@@ -403,17 +396,13 @@ class ComponentNN(nn.Module):
 
     def forward(self, x):
         residual = x                          # [B, hidden_dim]
-
         h = self.fc1(x)
         h = F.gelu(h)
         h = self.ln1(h)
-
         h = self.fc2(h)
         h = F.gelu(h)
         h = self.ln2(h)
-
         h = h + residual                      # true residual
-
         return self.out(h)                    # [B, 2 * latent_dim * K]
 
 class DPGMMPrior(nn.Module):
@@ -502,7 +491,6 @@ class DPGMMPrior(nn.Module):
         """
         total_kl = 0.0
         alpha_scalar = alpha.mean(dim=1, keepdim=True) if alpha.dim() > 1 else alpha
-        
         # For each stick-breaking weight
         for k in range(self.max_K - 1):
 
@@ -537,9 +525,8 @@ class DPGMMPrior(nn.Module):
         Generate mixture distribution and return relevant parameters
         """
         batch_size = h.shape[0]
-
         # Get mixing proportions and Kumaraswamy parameters
-        pi, kumar_params = self.stick_breaking(h, n_samples, use_rand_perm=True)
+        pi, kumar_params = self.stick_breaking(h, use_rand_perm=False)
         # Sample concentration parameter from posterior
         alpha = self.stick_breaking.alpha_posterior.sample(h, n_samples)  # [n_samples]
         # Generate component parameters
@@ -554,7 +541,6 @@ class DPGMMPrior(nn.Module):
         mix = Categorical(probs=pi)
         comp = Independent(Normal(means, torch.exp(0.5 * log_vars)), 1)
         mixture = MixtureSameFamily(mix, comp)
-
         return mixture, {
             'pi': pi,
             'alpha': alpha,
@@ -572,7 +558,6 @@ class DPGMMPrior(nn.Module):
         return torch.sum(cumsum < (1.0 - threshold), dim=-1) + 1
 
 
-
 @contextmanager
 def apply_emas(*emas):
     for e in emas: e.apply_shadow()
@@ -581,7 +566,8 @@ def apply_emas(*emas):
     finally:
         for e in reversed(emas): e.restore()
 
-
+##############################
+### Main DPGMMVRNN Class ##### 
 
 class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     """
@@ -645,7 +631,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Initialize weights
         #self.apply(self.init_weights)
         self.to(device)
-        
         # Setup optimizers
         self.has_optimizers = True
         self._setup_optimizers(learning_rate, weight_decay)
@@ -665,7 +650,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
 
 
-    def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int = 15):
+    def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int = 50):
         """
         Initialize VDVAE + DPGMM prior.
         
@@ -680,7 +665,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.image_size = self.image_size          # e.g. 64
         H.dataset = 'imagenet64'
         H.num_mixtures = 10
-
+        H.skip_threshold = 300.0
         # ~9–10 blocks encoder/decoder 
         H.dec_blocks = "1x1,4m1,4x2,8m4,8x4,16m8,16x6,32m16,32x8,64m32,64x3"
         H.enc_blocks = "64x3,64d2,32x8,32d2,16x6,16d2,8x4,8d2,4x2,4d4,1x3"
@@ -695,7 +680,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             top_kl_weight=1.0,
             prior_kl_mc_samples=prior_mc_samples,
         ).to(self.device)
-
         # ---- 3) Extract top block latent dim & resolution ----
         top_block = self.vdvae.decoder.dec_blocks[0]        # is_top=True for first block
         C = top_block.zdim                                  # latent channels
@@ -928,8 +912,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             gen_param_groups.append(
                 {"params": scalars, "lr": learning_rate, "weight_decay": 1e-4}
             )
-
-
         #
         self.gen_optimizer = torch.optim.Adamax(
             gen_param_groups,
@@ -957,8 +939,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
     def _setup_schedulers(self):
         """Setup learning-rate schedulers for all optimizers (Option B)."""
-
-
         # 1) Trunk scheduler (PCGrad or not, this uses the base optimizer)
         self.gen_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.gen_optimizer,
@@ -967,7 +947,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             patience=10,
             threshold=0.0001,
         )
-
         # 3) Discriminator scheduler (unchanged)
         if hasattr(self, "img_disc_optimizer"):
             self.img_disc_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -1006,7 +985,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "K_eff": [],
         }
 
-    
         # Process sequence step by step
         for t in range(seq_len):
             # Get current inputs
@@ -1095,8 +1073,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if outputs["K_eff"]:
             outputs["K_eff"] = torch.stack(outputs["K_eff"]).mean()
         return outputs
-
-    
 
     def compute_total_loss(
         self,
@@ -1259,7 +1235,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             
         # === Feature Matching Loss ===
         # This helps stabilize training
-
         # L1 loss between feature statistics
         feature_match_loss = self.compute_feature_matching_loss(real_img_outputs['hidden_3d'], fake_img_outputs['hidden_3d'])
         # Restore Discriminator parameter gradients
@@ -1300,17 +1275,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         Convert generated images from [-1, 1] back to [0, 1] for visualization
         """
         return (images + 1) / 2
-    
-    @staticmethod
-    def _flatten_for_diag(x: torch.Tensor | list | tuple):
-        if x is None:
-            return None
-        # If it is a list/tuple of tensors, stack along time to match compute_total_loss
-        if isinstance(x, (list, tuple)):
-            if len(x) == 0:
-                return None
-            x = torch.stack(x, dim=1)  # [B, T, ...]
-        return x.reshape(-1)  # flatten all dims
+
 
     def training_step_sequence(self, 
                             observations: torch.Tensor,
@@ -1333,7 +1298,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self.image_discriminator.train()
 
         # 1) Prepare data and compute VAE loss
-        
         warmup_factor = self.get_warmup_factor()
 
         vae_losses, outputs = self.compute_total_loss(
@@ -1433,7 +1397,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'grad_norm': float(grad_norm),
             'effective_components': eff_comp,
             'Top 6 coverage': top6_cov,
-
         }
     
     def set_epoch(self, epoch: int):
@@ -1467,106 +1430,185 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self.ema_vdvae.restore()
 
         # uint8 NHWC -> float NCHW in [-1,1]
-        x = torch.from_numpy(x_np).permute(0, 3, 1, 2).contiguous()
+        x = torch.from_numpy(x_np).permute(0, 3, 1, 2).contiguous().float()/ 127.5 - 1.0
         return x
-    
+
+
     @torch.no_grad()
-    def generate_future_sequence(self, initial_obs, actions, horizon):
+    def generate_future_sequence(
+        self,
+        initial_obs: torch.Tensor,          # [B, T_ctx, C, H, W] in [-1, 1]
+        actions: torch.Tensor | None,       # [B, T_total, action_dim] (needs >= T_ctx + horizon)
+        horizon: int,
+        dones: torch.Tensor | None = None,  # [B, T_ctx] or [B, T_total] bool/int (optional)
+        sample_mode: str = "mode",          # "sample" | "mode" | "mean"
+        temperature: float = 0.7,           # <1 reduces noise
+        decode_mode: str = "sample",        # "sample" | "mean"
+    ):
+        """
+        Returns:
+        pred_imgs: [B, horizon, C, H, W] in [-1, 1]
+        debug: dict with sampled z, h, a
+        """
+
         B, T_ctx = initial_obs.shape[:2]
         device = self.device
 
-        outputs = {'z': [], 'h': [], 'a': []}
+        # --- init RNN state ---
         h = self.h0.expand(self.number_lstm_layer, B, -1).contiguous()
         c_rnn = self.c0.expand(self.number_lstm_layer, B, -1).contiguous()
 
         # --- VDVAE top block info ---
         top_block = self.vdvae.decoder.dec_blocks[0]
-        C = top_block.zdim
+        C_top = top_block.zdim
         res = top_block.base
+        top_zdim = C_top * res * res
 
-        def sample_top_z_map_and_pooled(h_context: torch.Tensor):
+        def _mask_at(t: int, T: int):
+            # matches your training logic: mask_t = 1 - first_t, first_t=1 at t=0 :contentReference[oaicite:5]{index=5}
+            if dones is None:
+                return torch.ones(B, device=device)
+            if t == 0:
+                first_t = torch.ones(B, device=device)
+            else:
+                first_t = dones[:, t - 1].to(torch.float32).to(device)
+            return 1.0 - first_t
+
+        def sample_top_z_map_and_flat(h_context: torch.Tensor):
+            """
+            h_context: [B, hidden_dim]
+            returns:
+            z_map:  [B, C_top, res, res]
+            z_flat: [B, top_zdim]
+            """
             B_, Hc = h_context.shape
-            h_tokens = (
-                h_context.view(B_, 1, 1, Hc)
-                .expand(B_, res, res, Hc)
-                .contiguous()
-                .view(B_ * res * res, Hc)
-            )
-            pz_dist, _ = self.prior(h_tokens)
-            z_tokens = pz_dist.sample()  # [B_*res*res, C]
-            z_map = z_tokens.view(B_, res, res, C).permute(0, 3, 1, 2).contiguous()  # [B_,C,res,res]
 
-            return z_map, z_map.contiguous().view(B_, -1)
+            # build spatial conditioning map, then add coord exactly like VDVAE.sample does 
+            h_map = h_context.view(B_, Hc, 1, 1).expand(B_, Hc, res, res).contiguous()
+            h_map = self.vdvae.add_coord_no_proj(h_map, scale=0.05)  
 
-        # ---- 1) teacher-forced scan over context ----
+            h_tokens = h_map.permute(0, 2, 3, 1).reshape(B_ * res * res, Hc)  # [N, Hc]
+            prior_dist, prior_params = self.prior(h_tokens)                  # MixtureSameFamily 
+            pi = prior_params["pi"]                       # [N, K]
+            means = prior_params["means"]                 # [N, K, C_top]
+            if sample_mode == "mean":
+                # mixture mean: sum_k pi_k * mu_k
+
+                z_tokens = (pi.unsqueeze(-1) * means).sum(dim=1)
+            else:
+                # "sample" or "mode" but with controllable temperature
+                log_vars = prior_params["log_vars"]           # [N, K, C_top]
+
+                if sample_mode == "mode":
+                    k = pi.argmax(dim=1)                      # [N]
+                else:
+                    k = Categorical(probs=pi).sample()        # [N]
+
+                idx = torch.arange(pi.shape[0], device=device)
+                mu = means[idx, k]                            # [N, C_top]
+                std = torch.exp(0.5 * log_vars[idx, k])       # [N, C_top]
+                eps = torch.randn_like(mu)
+                z_tokens = mu + (temperature * std) * eps
+
+            z_map = z_tokens.view(B_, res, res, C_top).permute(0, 3, 1, 2).contiguous()
+            z_flat = z_map.view(B_, -1)
+            pi_map = pi.view(B_, res, res, -1).permute(0, 3, 1, 2).contiguous()  # [B, K, res, res]
+            k_map = None
+            if k is not None:
+                k_map = k.view(B_, res, res)  # [B, res, res]
+            # shape sanity
+            assert z_flat.shape == (B_, top_zdim)
+            return z_map, z_flat, pi_map, k_map
+
+        # -------------------------
+        # 1) Teacher-forced context scan
+        # -------------------------
+        debug = {"z_obs": [], "h_obs": [], "a_obs": []}
+
         for t in range(T_ctx):
             x_t = initial_obs[:, t]  # [B,C,H,W]
             a_t = actions[:, t] if actions is not None else torch.zeros(B, self.action_dim, device=device)
 
-            x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()  # [B,H,W,C]
+            x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
             h_context = h[-1]
+
+            # VDVAE forward: top_q_mean_map/logvar_map are [B,C_top,res,res] 
             vdvae_out = self.vdvae(x_t_nhwc, x_t_nhwc, h_context)
+
+            # sample z_t from posterior q(z|x,h)
             eps = torch.randn_like(vdvae_out["top_q_mean_map"])
             z_map = vdvae_out["top_q_mean_map"] + eps * torch.exp(0.5 * vdvae_out["top_q_logvar_map"])
+            z_t = z_map.contiguous().view(B, -1)  # [B, top_zdim]
 
-            z_t = z_map.contiguous().view(B, -1)
+            # step RNN with SAME input structure as your training: [z_t, a_t] 
             rnn_in = torch.cat([z_t, a_t], dim=-1)
-            _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, torch.ones(B, device=device))
+            mask_t = _mask_at(t, T_ctx)
+            _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, mask_t)
 
-            outputs['z'].append(z_t)
-            outputs['h'].append(h[-1])
-            outputs['a'].append(a_t)
+            debug["z_obs"].append(z_t)
+            debug["h_obs"].append(h[-1])
+            debug["a_obs"].append(a_t)
 
-        # ---- 2) imagine future ----
-        z_futures, a_futures, h_futures = [], [], []
-        z_top_maps = []  # <-- needed for VDVAE decoding
+        # -------------------------
+        # 2) Imagination rollout (prior sampling)
+        # -------------------------
+        z_top_maps = []
+        z_fut, h_fut, a_fut, pi_fut, k_fut = [], [], [], [], []
 
-        for t in range(horizon):
-            a_t = (
-                actions[:, T_ctx + t]
-                if actions is not None and actions.shape[1] > (T_ctx + t)
+        for k in range(horizon):
+            t_abs = T_ctx + k
+            a_k = (
+                actions[:, t_abs]
+                if actions is not None and actions.shape[1] > t_abs
                 else torch.zeros(B, self.action_dim, device=device)
             )
 
             h_context = h[-1]
-            z_map, z_t = sample_top_z_map_and_pooled(h_context)  # z_map:[B,C,res,res], z_t:[B,C]
+            z_map_k, z_k, pi_map_k, k_map_k = sample_top_z_map_and_flat(h_context)  
+            z_top_maps.append(z_map_k)
+            z_fut.append(z_k)
+            a_fut.append(a_k)
+            pi_fut.append(pi_map_k)
+            k_fut.append(k_map_k)
+            
 
-            rnn_in = torch.cat([z_t, a_t], dim=-1)
-            _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, torch.ones(B, device=device))
+            rnn_in = torch.cat([z_k, a_k], dim=-1)
+            # if you have dones for the rollout part, you can also mask here:
+            mask_k = torch.ones(B, device=device) if dones is None else (1.0 - dones[:, t_abs - 1].float().to(device))
+            _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, mask_k)
+            h_fut.append(h[-1])
+        debug["h_obs"] = torch.stack(debug["h_obs"], dim=1)
+        debug["z_obs"] = torch.stack(debug["z_obs"], dim=1)
+        debug["a_obs"] = torch.stack(debug["a_obs"], dim=1)
+        debug["pi_future"] = torch.stack(pi_fut, dim=1) # [B, horizon, K, res, res]
+        debug["k_future"] = torch.stack(k_fut, dim=1) # [B, horizon, res, res]
+        # -------------------------
+        # 3) Decode predicted frames from sampled top-level latents
+        # -------------------------
+        z_top = torch.stack(z_top_maps, dim=1)              # [B, horizon, C_top, res, res]
 
-            z_futures.append(z_t)
-            z_top_maps.append(z_map)
-            a_futures.append(a_t)
-            h_futures.append(h[-1])
+        z_top_flat = z_top.view(B * horizon, C_top, res, res).contiguous()
 
-        # ---- 3) pack outputs ----
-        z_futures = torch.stack(z_futures, dim=1) if len(z_futures) else torch.empty(B, 0, C, device=device)
-        a_futures = torch.stack(a_futures, dim=1) if len(a_futures) else torch.empty(B, 0, self.action_dim, device=device)
-        h_futures = torch.stack(h_futures, dim=1) if len(h_futures) else torch.empty(B, 0, h[-1].shape[-1], device=device)
+        latents = [z_top_flat] + [None] * (len(self.vdvae.decoder.dec_blocks) - 1)
+        px_z = self.vdvae.decoder.forward_manual_latents(B * horizon, latents, t=None)  
 
-        result = {
-            "z_obs": torch.stack(outputs['z'], dim=1),
-            "h_obs": torch.stack(outputs['h'], dim=1),
-            "a_obs": torch.stack(outputs['a'], dim=1),
-            "z_future": z_futures,
-            "a_future": a_futures,
-            "h_future": h_futures,
-        }
-
-        # ---- 4) decode imagined futures with VDVAE ----
-        if len(z_top_maps) > 0:
-            z_top = torch.stack(z_top_maps, dim=1)  # [B,Tf,C,res,res]
-            B_, Tf = z_top.shape[:2]
-            z_top_flat = z_top.view(B_ * Tf, C, res, res)
-
-            latents = [z_top_flat] + [None] * (len(self.vdvae.decoder.dec_blocks) - 1)
-            px_z = self.vdvae.decoder.forward_manual_latents(B_ * Tf, latents, t=None)
-
-            x_np = self.vdvae.decoder.out_net.sample(px_z)  # uint8 NHWC
-            x = torch.from_numpy(x_np).to(device=device, dtype=torch.float32) / 127.5 - 1.0
-            x = x.permute(0, 3, 1, 2).contiguous()
-            result["vae_future"] = x.view(B_, Tf, *x.shape[1:])
+        if decode_mode == "mean":
+            # deterministic, less speckle than sampling
+            dmol = self.vdvae.decoder.out_net.forward(px_z)
+            recon = mean_from_discretized_mix_logistic(dmol, self.vdvae.H.num_mixtures)  # [B*horizon,H,W,C]
+            pred = recon.permute(0, 3, 1, 2).contiguous()
+        elif decode_mode == "sample":
+            # uint8 NHWC -> float NCHW in [-1,1] (same conversion as your sample wrapper)
+            out_uint8 = self.vdvae.decoder.out_net.sample(px_z)  # uint8 NHWC
+            pred = torch.from_numpy(out_uint8).to(device=device, dtype=torch.float32).permute(0, 3, 1, 2).contiguous() / 127.5 - 1.0
         else:
-            result["vae_future"] = torch.empty(B, 0, self.input_channels, self.image_size, self.image_size, device=device)
+            raise ValueError(f"Unknown decode_mode {decode_mode}")
 
-        return result
+        pred_imgs = pred.view(B, horizon, *pred.shape[1:])       # [B, horizon, C, H, W]
+
+        debug["z_future"] = torch.stack(z_fut, dim=1)
+        debug["h_future"] = torch.stack(h_fut, dim=1)
+        debug["a_future"] = torch.stack(a_fut, dim=1)
+        debug["vae_future"] = pred_imgs
+        debug["z_top_future_maps"] = z_top
+        return debug
