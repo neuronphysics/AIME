@@ -650,7 +650,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
 
 
-    def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int = 50):
+    def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int = 75):
         """
         Initialize VDVAE + DPGMM prior.
         
@@ -983,6 +983,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "gauss_rates": [],
             "gm_rates": [],
             "K_eff": [],
+            "component_margin": [],
         }
 
         # Process sequence step by step
@@ -1018,6 +1019,19 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 prior_params['alpha'], 
                 h_context,
             )
+            pi = prior_params["pi"]  # expected [B, K] (or [K]; handle both)
+            eps_ent = torch.finfo(torch.float32).eps
+
+            if pi.dim() == 1:              # [K] -> pretend batch of 1
+                pi_use = pi.unsqueeze(0)
+            else:
+                pi_use = pi               # [B, K]
+
+            # Marginal entropy: entropy of average usage across batch
+            pi_bar = pi_use.mean(0).clamp(min=eps_ent)   # [K]
+            H_marg_t = -(pi_bar * pi_bar.log()).sum()
+
+            outputs["component_margin"].append(H_marg_t)
             # Stick-breaking KL
             outputs['kumaraswamy_kl_losses'].append(kumar_beta_kl)
             outputs['prior_params'].append(prior_params)
@@ -1101,16 +1115,21 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             hierarchical_kl = torch.stack(outputs["kumaraswamy_kl_losses"]).mean()
         else:
             hierarchical_kl = torch.zeros((), device=device)
-
+        if len(outputs["component_margin"]) > 0:
+            component_margin = torch.stack(outputs["component_margin"]).mean()
+        else:
+            component_margin = torch.zeros((), device=device)
         total_vae_loss = (
             lambda_recon * recon_loss
             + beta * (kl_z + hierarchical_kl)
+            - component_margin # encourage diverse component usage (maximize margin entropy)
         )
 
         vae_losses = {
             "recon_loss": recon_loss,
             "kl_z": kl_z,
             "hierarchical_kl": hierarchical_kl,
+            "component_margin": component_margin,
             "total_vae_loss": total_vae_loss,
         }
 
@@ -1339,6 +1358,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "img_adv_loss":      (warmup_factor * img_adv_loss).reshape([]),
                 "temporal_adv_loss": (warmup_factor * temporal_adv_loss).reshape([]),
                 "feat_match_loss":   feat_match_loss.reshape([]),
+                "component_margin": vae_losses["component_margin"].reshape([]),
             }
             total_gen_loss = self.total_weighter.reduce_losses(total_components, batch_idx)
 
@@ -1353,6 +1373,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 lambda_recon * vae_losses['recon_loss']
                 + beta * vae_losses['kl_z']
                 + beta * vae_losses['hierarchical_kl']
+                - vae_losses['component_margin']  # encourage diverse component usage
             )
 
             total_gen_loss = elbo_loss + adv_base 

@@ -444,7 +444,8 @@ def visualize_dpgmm_clustering(
         ax2.set_title("Ground Truth (unavailable)", fontsize=11)
     ax2.set_xlabel("t-SNE 1")
     ax2.set_ylabel("t-SNE 2")
-    
+    if labels is None:
+        ax2.set_visible(False)
     # 3. Component utilization histogram
     ax3 = fig.add_subplot(2, 3, 3)
     all_assignments = data["assignments"]

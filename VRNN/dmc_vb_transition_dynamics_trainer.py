@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import random, math, cv2, gc, os, h5py
+import random, math, cv2, gc, os, h5py, zlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 import wandb
@@ -28,7 +28,6 @@ except Exception as e:
     except Exception as e2:
         print("[TF] Could not set memory growth:", e2)
 
-import zlib, gc
 from torch.utils.tensorboard import SummaryWriter
 from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoencoder
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
@@ -1213,16 +1212,12 @@ class DMCVBTrainer:
 
         assert T >= T_ctx + 2, f"Need at least T_ctx+2 frames, got T={T}"
 
-        initial_obs = observations[:, :T_ctx]
-
         futures = self.model.generate_future_sequence(
-            initial_obs=initial_obs,
+            initial_obs=observations[:, :T_ctx],
             actions=actions[:,:T_ctx + horizon],
             horizon=horizon,
             dones=dones[:, :T_ctx + horizon] if dones is not None else None,
         )
-
-        pred_vae  = futures["vae_future"]     # VAE-decoder predictions [B, 2, C, H, W]
 
         def denorm(x):
             # your images are in [-1,1]
@@ -1243,10 +1238,9 @@ class DMCVBTrainer:
             gt_t1    = denorm(observations[i, T_ctx,     :3])
             gt_t2    = denorm(observations[i, T_ctx + 1, :3])
 
-
             # VAE-decoder predictions
-            vae_t1   = denorm(pred_vae[i, 0, :3])
-            vae_t2   = denorm(pred_vae[i, 1, :3])
+            vae_t1   = denorm(futures["vae_future"][i, 0, :3])
+            vae_t2   = denorm(futures["vae_future"][i, 1, :3])
 
             def show(ax, img, title):
                 ax.imshow(img.permute(1, 2, 0).detach().cpu().numpy())
@@ -1265,6 +1259,10 @@ class DMCVBTrainer:
             self.writer.add_figure("qualitative/two_step_future", fig, epoch)
 
         plt.close(fig)
+        del futures
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        gc.collect()
 
 
     def run_grad_diag(
@@ -1414,24 +1412,17 @@ class DMCVBTrainer:
             if T < T_ctx + 2:
                 continue  # skip too-short sequences
 
-            # Context frames
-            initial_obs = observations[:, :T_ctx]  # [B, T_ctx, C, H, W]
-
             # Rollout 2 future steps
             futures = self.model.generate_future_sequence(
-                initial_obs=initial_obs,
+                initial_obs=observations[:, :T_ctx],  # [B, T_ctx, C, H, W]
                 actions=actions[:, :T_ctx + 2],
                 horizon=2,
                 dones=dones[:, :T_ctx + 2],
             )
-            pred = futures["vae_future"]   # [B, 2, C, H, W]
-
-            # Ground truth frames for t+1, t+2
-            gt = observations[:, T_ctx:T_ctx + 2]  # [B, 2, C, H, W]
 
             # PSNR per step (reuse your compute_psnr which handles [-1,1])
-            psnr_1 = self.compute_psnr(gt[:, 0], pred[:, 0])  # t+1
-            psnr_2 = self.compute_psnr(gt[:, 1], pred[:, 1])  # t+2
+            psnr_1 = self.compute_psnr(observations[:, T_ctx:T_ctx + 2][:, 0], futures["vae_future"][:, 0])  # t+1
+            psnr_2 = self.compute_psnr(observations[:, T_ctx:T_ctx + 2][:, 1], futures["vae_future"][:, 1])  # t+2
 
             psnr_t1.append(psnr_1.item())
             psnr_t2.append(psnr_2.item())
@@ -1446,6 +1437,10 @@ class DMCVBTrainer:
             self.writer.add_scalar("eval/pred_psnr_t+1", metrics["eval/pred_psnr_t+1"])
             self.writer.add_scalar("eval/pred_psnr_t+2", metrics["eval/pred_psnr_t+2"])
 
+        del observations, actions, dones, futures
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        gc.collect()
         return metrics
 
 
@@ -1525,7 +1520,6 @@ class DMCVBTrainer:
         plt.close(fig)
 
 
-
     def denormalize_image(self, img: torch.Tensor) -> np.ndarray:
         """Convert from [-1, 1] to [0, 1] for visualization
         Args:
@@ -1568,9 +1562,9 @@ class DMCVBTrainer:
         }
         
         # Save regular checkpoint
-        
-        checkpoint_path = self.ckpt_dir / f"checkpoint_epoch_{epoch:04d}.pt"
-        torch.save(checkpoint, checkpoint_path)
+        if epoch % 10 == 0:
+           checkpoint_path = self.ckpt_dir / f"checkpoint_epoch_{epoch:04d}.pt"
+           torch.save(checkpoint, checkpoint_path)
 
         if is_best:
             best_path = self.ckpt_dir / "best_model.pt"
@@ -1628,9 +1622,10 @@ class DMCVBTrainer:
                 self.save_checkpoint(epoch)
 
             del train_metrics, eval_metrics, all_metrics
-            gc.collect()
+            
             torch.cuda.empty_cache()
-
+            torch.cuda.ipc_collect()
+            gc.collect()
         # Cleanup
         if self.writer:
             self.writer.close()
@@ -1755,12 +1750,12 @@ def main():
         'latent_dim': 48,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
-        'prior_alpha': 8.0,  # Hyperparameters for prior
+        'prior_alpha': 15.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 29,
+        'batch_size': 28,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 2,
