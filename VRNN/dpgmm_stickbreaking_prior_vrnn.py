@@ -650,7 +650,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
 
 
-    def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int = 75):
+    def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int = 100):
         """
         Initialize VDVAE + DPGMM prior.
         
@@ -1464,17 +1464,15 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         dones: torch.Tensor | None = None,  # [B, T_ctx] or [B, T_total] bool/int (optional)
         sample_mode: str = "mode",          # "sample" | "mode" | "mean"
         temperature: float = 0.7,           # <1 reduces noise
-        decode_mode: str = "sample",        # "sample" | "mean"
+        decode_mode: str = "mean",        # "sample" | "mean"
     ):
         """
         Returns:
         pred_imgs: [B, horizon, C, H, W] in [-1, 1]
         debug: dict with sampled z, h, a
         """
-
         B, T_ctx = initial_obs.shape[:2]
         device = self.device
-
         # --- init RNN state ---
         h = self.h0.expand(self.number_lstm_layer, B, -1).contiguous()
         c_rnn = self.c0.expand(self.number_lstm_layer, B, -1).contiguous()
@@ -1483,10 +1481,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         top_block = self.vdvae.decoder.dec_blocks[0]
         C_top = top_block.zdim
         res = top_block.base
-        top_zdim = C_top * res * res
 
-        def _mask_at(t: int, T: int):
-            # matches your training logic: mask_t = 1 - first_t, first_t=1 at t=0 :contentReference[oaicite:5]{index=5}
+        def _mask_at(t: int):
+            # matches training logic: mask_t = 1 - first_t, first_t=1 at t=0 :contentReference[oaicite:5]{index=5}
             if dones is None:
                 return torch.ones(B, device=device)
             if t == 0:
@@ -1501,44 +1498,51 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             returns:
             z_map:  [B, C_top, res, res]
             z_flat: [B, top_zdim]
+            pi_map: [B, K, res, res]
+            k_map:  [B, res, res] (Long) or sentinel -1 if sample_mode=="mean"
             """
             B_, Hc = h_context.shape
-
+            N = B_ * res * res
             # build spatial conditioning map, then add coord exactly like VDVAE.sample does 
             h_map = h_context.view(B_, Hc, 1, 1).expand(B_, Hc, res, res).contiguous()
             h_map = self.vdvae.add_coord_no_proj(h_map, scale=0.05)  
 
-            h_tokens = h_map.permute(0, 2, 3, 1).reshape(B_ * res * res, Hc)  # [N, Hc]
-            prior_dist, prior_params = self.prior(h_tokens)                  # MixtureSameFamily 
+            h_tokens = h_map.permute(0, 2, 3, 1).reshape(N, Hc)  # [N, Hc]
+            _, prior_params = self.prior(h_tokens)                  # MixtureSameFamily 
             pi = prior_params["pi"]                       # [N, K]
             means = prior_params["means"]                 # [N, K, C_top]
+            log_vars = prior_params["log_vars"].clamp(-10, 10)           # [N, K, C_top]
+ 
+            K = pi.shape[1]
+            pi_map = pi.view(B_, res, res, K).permute(0, 3, 1, 2).contiguous()  # [B, K, res, res]
             if sample_mode == "mean":
                 # mixture mean: sum_k pi_k * mu_k
-
                 z_tokens = (pi.unsqueeze(-1) * means).sum(dim=1)
+                k_map = torch.full((B_, res, res), -1, dtype=torch.long, device=device)  # sentinel -1 for mean
             else:
                 # "sample" or "mode" but with controllable temperature
-                log_vars = prior_params["log_vars"]           # [N, K, C_top]
-
+                pi_img = pi.view(B_, res * res, K).mean(dim=1)  # [B, K] average over spatial locations for more stable sampling
+                eps_prob = torch.finfo(pi_img.dtype).eps
+                pi_img = pi_img.clamp(min=eps_prob)
+                pi_img = pi_img / (pi_img.sum(dim=1, keepdim=True)+ eps_prob)  # re-normalize
+                
                 if sample_mode == "mode":
-                    k = pi.argmax(dim=1)                      # [N]
+                    k_img = pi_img.argmax(dim=1)                      # [B]
+                elif sample_mode == "sample":
+                    k_img =Categorical(probs=pi_img).sample()  # [B]
                 else:
-                    k = Categorical(probs=pi).sample()        # [N]
-
-                idx = torch.arange(pi.shape[0], device=device)
+                    raise ValueError(f"Unknown sample_mode {sample_mode}")
+                k = k_img.repeat_interleave(res * res)  # [N]
+                k_map = k.view(B_, res, res).contiguous()         # [B, res, res]
+                idx = torch.arange(N, device=device)
                 mu = means[idx, k]                            # [N, C_top]
                 std = torch.exp(0.5 * log_vars[idx, k])       # [N, C_top]
                 eps = torch.randn_like(mu)
                 z_tokens = mu + (temperature * std) * eps
 
-            z_map = z_tokens.view(B_, res, res, C_top).permute(0, 3, 1, 2).contiguous()
+            z_map = z_tokens.view(B_, res, res, means.shape[-1]).permute(0, 3, 1, 2).contiguous()
             z_flat = z_map.view(B_, -1)
-            pi_map = pi.view(B_, res, res, -1).permute(0, 3, 1, 2).contiguous()  # [B, K, res, res]
-            k_map = None
-            if k is not None:
-                k_map = k.view(B_, res, res)  # [B, res, res]
-            # shape sanity
-            assert z_flat.shape == (B_, top_zdim)
+            
             return z_map, z_flat, pi_map, k_map
 
         # -------------------------
@@ -1557,13 +1561,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             vdvae_out = self.vdvae(x_t_nhwc, x_t_nhwc, h_context)
 
             # sample z_t from posterior q(z|x,h)
-            eps = torch.randn_like(vdvae_out["top_q_mean_map"])
-            z_map = vdvae_out["top_q_mean_map"] + eps * torch.exp(0.5 * vdvae_out["top_q_logvar_map"])
-            z_t = z_map.contiguous().view(B, -1)  # [B, top_zdim]
+            z_t = vdvae_out["top_q_mean_map"].contiguous().view(B, -1)  # [B, top_zdim]
 
-            # step RNN with SAME input structure as your training: [z_t, a_t] 
+            # step RNN with SAME input structure as training: [z_t, a_t] 
             rnn_in = torch.cat([z_t, a_t], dim=-1)
-            mask_t = _mask_at(t, T_ctx)
+            mask_t = _mask_at(t)
             _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, mask_t)
 
             debug["z_obs"].append(z_t)
@@ -1592,10 +1594,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             pi_fut.append(pi_map_k)
             k_fut.append(k_map_k)
             
-
             rnn_in = torch.cat([z_k, a_k], dim=-1)
-            # if you have dones for the rollout part, you can also mask here:
-            mask_k = torch.ones(B, device=device) if dones is None else (1.0 - dones[:, t_abs - 1].float().to(device))
+            if dones is None or dones.shape[1] <= (t_abs - 1):
+                mask_k = torch.ones(B, device=device)
+            else:
+                mask_k = 1.0 - dones[:, t_abs - 1].float().to(device)
+
             _, (h, c_rnn) = self._rnn(rnn_in, h, c_rnn, mask_k)
             h_fut.append(h[-1])
         debug["h_obs"] = torch.stack(debug["h_obs"], dim=1)
@@ -1610,7 +1614,17 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         z_top_flat = z_top.view(B * horizon, C_top, res, res).contiguous()
 
-        latents = [z_top_flat] + [None] * (len(self.vdvae.decoder.dec_blocks) - 1)
+        x_last = initial_obs[:, -1].permute(0,2,3,1).contiguous()
+        acts = self.vdvae.encoder.forward(x_last)
+        _, stats = self.vdvae.decoder.forward(acts, get_latents=True)
+        #lower = [s["z"] for s in stats[1:]]  # skip top
+        lower = [s["posterior_mean"] for s in stats[1:]]
+
+        # when decoding horizon:
+        latents = [z_top_flat] + [
+            z.unsqueeze(1).expand(B, horizon, *z.shape[1:]).reshape(B*horizon, *z.shape[1:])
+            for z in lower
+        ]
         px_z = self.vdvae.decoder.forward_manual_latents(B * horizon, latents, t=None)  
 
         if decode_mode == "mean":
@@ -1619,7 +1633,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             recon = mean_from_discretized_mix_logistic(dmol, self.vdvae.H.num_mixtures)  # [B*horizon,H,W,C]
             pred = recon.permute(0, 3, 1, 2).contiguous()
         elif decode_mode == "sample":
-            # uint8 NHWC -> float NCHW in [-1,1] (same conversion as your sample wrapper)
+            # uint8 NHWC -> float NCHW in [-1,1] 
             out_uint8 = self.vdvae.decoder.out_net.sample(px_z)  # uint8 NHWC
             pred = torch.from_numpy(out_uint8).to(device=device, dtype=torch.float32).permute(0, 3, 1, 2).contiguous() / 127.5 - 1.0
         else:

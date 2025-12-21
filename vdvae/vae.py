@@ -371,9 +371,8 @@ class VDVAE(HModule):
                 prior_params=prior_params,
                 n_samples=self.prior_kl_mc_samples,
             )  # scalar (average over N tokens and MC samples)
-
-            # Convert to "per-pixel" rate to match VDVAE convention
-            dp_rate = self.top_kl_weight * dp_kl / ndims  # scalar
+            tokens_per_img = Ht * Wt
+            dp_rate = self.top_kl_weight * (dp_kl * tokens_per_img) / ndims
 
         # 5) Total rate and ELBO
         total_rate_per_pixel = rate_gauss + dp_rate  # [B] + scalar
