@@ -1168,6 +1168,7 @@ class DMCVBTrainer:
                     )
                      })
             save_path = str(self.ckpt_dir / f"dpgmm_prior_tsne_epoch_{epoch:04d}.png")
+            
             visualize_dpgmm_clustering(
                 model=self.model,
                 dataloader=self.eval_loader,
@@ -1175,8 +1176,9 @@ class DMCVBTrainer:
                 max_batches=15,       # keep it cheap
                 max_samples=8000,
                 perplexity=30.0,
+                tsne_dims=3,
                 save_path=save_path,
-                image_level=True,     # start with image_level
+                image_level=False,     # start with image_level
                 t_select=0,            # choose which frame from the sequence
                 use_rnn_context= True
             )
@@ -1747,15 +1749,15 @@ def main():
         
         # Model settings
         'max_components': 17,
-        'latent_dim': 48,
+        'latent_dim': 56,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
-        'prior_alpha': 15.0,  # Hyperparameters for prior
+        'prior_alpha': 20.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 28,
+        'batch_size': 27,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 2,
@@ -1766,10 +1768,10 @@ def main():
         'n_epochs': 200,
         'num_workers': 4,
 
-        'beta_min': 0.3,
+        'beta_min': 0.75,
         'beta_max': 1.0,
-        'beta_warmup_epochs': 20,  # 20–50 is common
-        'beta_eval': 1.0,          # force eval to use full KL (recommended)
+        'beta_warmup_epochs': 25,  # 20–50 is common
+        'beta_eval': 1.0,          # force eval to use full KL 
         
         # Loss weights
         'beta': 1.0,

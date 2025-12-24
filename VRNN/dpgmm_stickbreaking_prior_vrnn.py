@@ -297,7 +297,7 @@ class AdaptiveStickBreaking(nn.Module):
         pi = pi / (pi.sum(dim=-1, keepdim=True) + eps)
         return pi
     
-    def forward(self, h: torch.Tensor, use_rand_perm: bool = True, truncation_threshold: float = 0.995) -> Tuple[torch.Tensor, Dict]:
+    def forward(self, h: torch.Tensor, use_rand_perm: bool = True, truncation_threshold: float = 0.999) -> Tuple[torch.Tensor, Dict]:
        
         # Generate stick-breaking proportions
         # Get Kumaraswamy parameters
@@ -309,27 +309,34 @@ class AdaptiveStickBreaking(nn.Module):
         # Initialize mixing proportions
         pi = self.compute_stick_breaking_proportions(v, perm)
         # Adaptive truncation: find where cumulative sum exceeds threshold
-        pi_sorted, sort_idx = torch.sort(pi, dim=-1, descending=True)
+        pi_sorted, sort_idx = torch.sort(pi.float(), dim=-1, descending=True)
         pi_cumsum = torch.cumsum(pi_sorted, dim=-1)
+        K = pi_sorted.size(-1)
         
         # Find truncation point for each sample
-        truncation_mask = pi_cumsum < truncation_threshold
-        # Add one more component to exceed threshold
-        truncation_mask[:, 1:] = truncation_mask[:, 1:] | truncation_mask[:, :-1]
+        truncation_mask = (pi_cumsum >= truncation_threshold)
+        T = truncation_mask.float().argmax(dim=-1)
+        T = torch.where(~truncation_mask.any(dim=-1), torch.full_like(T, K-1), T).long()  # [B]
+        idx = torch.arange(K, device=pi.device)[None, :] 
+        truncation_mask = idx <= T[:, None]  # [B, K]
         
         # Zero out unused components
         pi_truncated = pi_sorted * truncation_mask.float()
         
         # Restore original order
-        _, unsort_idx = torch.sort(sort_idx, dim=-1)
+        leftover =1.0 - pi_truncated.sum(dim=-1, keepdim=True)
+        pi_truncated.scatter_add_(1, T[:, None], leftover)
+        unsort_idx = torch.argsort(sort_idx, dim=-1)
         pi_final = torch.gather(pi_truncated, 1, unsort_idx)
+        assert torch.isfinite(pi_final).all()
+        assert ((pi_final.sum(dim=-1) - 1).abs() < 1e-6).all()
+        assert (pi_final >= 0).all()
         
-        # Renormalize
-        pi_final = pi_final / (pi_final.sum(dim=-1, keepdim=True) + torch.finfo(torch.float32).eps )
-        
-        return pi, {
+        return pi_final, {
             'kumar_a': torch.exp(log_kumar_a),
             'kumar_b': torch.exp(log_kumar_b),
+            "pi_raw": pi,
+            "pi_final": pi_final,
             'v': v,
             'perm':perm,
             'active_components': truncation_mask.sum(dim=-1).float().mean(),  # Count active components
@@ -557,6 +564,48 @@ class DPGMMPrior(nn.Module):
         cumsum = torch.cumsum(sorted_pi, dim=-1)
         return torch.sum(cumsum < (1.0 - threshold), dim=-1) + 1
 
+    @staticmethod
+    def compute_responsibilities(
+        z_tokens: torch.Tensor,              # [N, D]
+        prior_params: dict,                  # must contain pi, means, log_vars
+        eps: float = 1e-8,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        r_{nk} ∝ pi_{nk} * N(z_n | mu_{nk}, diag(var_{nk})).
+        Returns:
+          resp: [N, K]
+        """
+        pi = prior_params["pi"]
+        means = prior_params["means"]
+        log_vars = prior_params["log_vars"]
+
+        assert z_tokens.dim() == 2, f"z_tokens must be [N,D], got {z_tokens.shape}"
+        N, D = z_tokens.shape
+        K = pi.shape[-1]
+
+        # If prior params are per-image, repeat to match N tokens
+        if pi.shape[0] != N:
+            B_img = pi.shape[0]
+            assert N % B_img == 0, f"N={N} not divisible by B_img={B_img}"
+            rep = N // B_img
+            pi = pi.repeat_interleave(rep, dim=0)            # [N,K]
+            means = means.repeat_interleave(rep, dim=0)      # [N,K,D]
+            log_vars = log_vars.repeat_interleave(rep, dim=0)# [N,K,D]
+
+        # log N(z|mu,var) for diagonal Gaussian:
+        # -0.5 * [ D log(2π) + sum_d logvar + sum_d (z-mu)^2 * exp(-logvar) ]
+        inv_var = torch.exp(-log_vars).clamp_max(1.0 / eps)  # [N,K,D]
+        diff2 = (z_tokens[:, None, :] - means).pow(2)        # [N,K,D]
+        maha = (diff2 * inv_var).sum(dim=-1)                 # [N,K]
+        log_det = log_vars.sum(dim=-1)                       # [N,K]
+        log_gauss = -0.5 * (D * math.log(2.0 * math.pi) + log_det + maha)  # [N,K]
+
+        log_pi = torch.log(pi.clamp_min(eps))                # [N,K]
+        logits = (log_pi + log_gauss) / max(temperature, eps)
+        resp = torch.softmax(logits, dim=-1)                 # [N,K]
+        return resp
+
 
 @contextmanager
 def apply_emas(*emas):
@@ -666,10 +715,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.dataset = 'imagenet64'
         H.num_mixtures = 10
         H.skip_threshold = 300.0
-        # ~9–10 blocks encoder/decoder 
-        H.dec_blocks = "1x1,4m1,4x2,8m4,8x4,16m8,16x6,32m16,32x8,64m32,64x3"
-        H.enc_blocks = "64x3,64d2,32x8,32d2,16x6,16d2,8x4,8d2,4x2,4d4,1x3"
-
+        #H.dec_blocks = "1x1,4m1,4x2,8m4,8x4,16m8,16x6,32m16,32x8,64m32,64x3"
+        #H.enc_blocks = "64x3,64d2,32x8,32d2,16x6,16d2,8x4,8d2,4x2,4d4,1x3"
+        H.dec_blocks = "8x4,16m8,16x4,32m16,32x4,64m32,64x2"
+        H.enc_blocks = "64x2,64d2,32x4,32d2,16x4,16d2,8x4"  
+        H.custom_width_str = "64:256,32:256,16:320,8:384"
+         
         H.no_bias_above = 64
         H.custom_width_str = ""
 
@@ -677,7 +728,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.vdvae = VDVAE(
             H,
             prior=None,              # we'll set self.prior separately
-            top_kl_weight=1.0,
+            top_kl_weight=2.0,
             prior_kl_mc_samples=prior_mc_samples,
         ).to(self.device)
         # ---- 3) Extract top block latent dim & resolution ----
@@ -1019,19 +1070,36 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 prior_params['alpha'], 
                 h_context,
             )
-            pi = prior_params["pi"]  # expected [B, K] (or [K]; handle both)
+            pi_tok = prior_params["pi"]  # expected [B, K] (or [K]; handle both)
             eps_ent = torch.finfo(torch.float32).eps
+            B, C, Ht, Wt = vdvae_out["top_q_mean_map"].shape
+            K = pi_tok.shape[1]
+            tokens_per_img = Ht * Wt
 
-            if pi.dim() == 1:              # [K] -> pretend batch of 1
-                pi_use = pi.unsqueeze(0)
-            else:
-                pi_use = pi               # [B, K]
+            # build z_tokens from posterior q(z|x) at top level (reparameterized sample)
+            top_q_mean_tokens = vdvae_out["top_q_mean_map"].permute(0, 2, 3, 1).reshape(B * tokens_per_img, C)
+            top_q_logvar_tokens = vdvae_out["top_q_logvar_map"].permute(0, 2, 3, 1).reshape(B * tokens_per_img, C)
+
+            noise = torch.randn_like(top_q_mean_tokens)
+            z_tokens = top_q_mean_tokens + noise * torch.exp(0.5 * top_q_logvar_tokens)  # [N,C]
+            eps_ = torch.finfo(z_tokens.dtype).eps
+            # responsibilities under the "prior mixture" for these z_tokens
+            resp = self.prior.compute_responsibilities(
+                z_tokens=z_tokens,
+                prior_params=prior_params,
+                eps=eps_,
+                temperature=1.0,
+            ) # [N,K]
 
             # Marginal entropy: entropy of average usage across batch
-            pi_bar = pi_use.mean(0).clamp(min=eps_ent)   # [K]
-            H_marg_t = -(pi_bar * pi_bar.log()).sum()
+            # token-level MI
+            u = resp.mean(dim=0).clamp_min(eps_)             # [K]
+            H_marg = -(u * u.log()).sum()
+            r = resp.clamp_min(eps_)
+            H_cond = - (r * r.log()).sum(dim=-1).mean()
+            I = H_marg - H_cond
 
-            outputs["component_margin"].append(H_marg_t)
+            outputs["component_margin"].append(I)
             # Stick-breaking KL
             outputs['kumaraswamy_kl_losses'].append(kumar_beta_kl)
             outputs['prior_params'].append(prior_params)
@@ -1462,8 +1530,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         actions: torch.Tensor | None,       # [B, T_total, action_dim] (needs >= T_ctx + horizon)
         horizon: int,
         dones: torch.Tensor | None = None,  # [B, T_ctx] or [B, T_total] bool/int (optional)
-        sample_mode: str = "mode",          # "sample" | "mode" | "mean"
-        temperature: float = 0.7,           # <1 reduces noise
+        decoder_temperature: float = 0.85,           # <1 reduces noise
         decode_mode: str = "mean",        # "sample" | "mean"
     ):
         """
@@ -1493,56 +1560,33 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             return 1.0 - first_t
 
         def sample_top_z_map_and_flat(h_context: torch.Tensor):
-            """
-            h_context: [B, hidden_dim]
-            returns:
-            z_map:  [B, C_top, res, res]
-            z_flat: [B, top_zdim]
-            pi_map: [B, K, res, res]
-            k_map:  [B, res, res] (Long) or sentinel -1 if sample_mode=="mean"
-            """
             B_, Hc = h_context.shape
             N = B_ * res * res
-            # build spatial conditioning map, then add coord exactly like VDVAE.sample does 
+
             h_map = h_context.view(B_, Hc, 1, 1).expand(B_, Hc, res, res).contiguous()
-            h_map = self.vdvae.add_coord_no_proj(h_map, scale=0.05)  
-
+            h_map = self.vdvae.add_coord_no_proj(h_map, scale=0.05)
             h_tokens = h_map.permute(0, 2, 3, 1).reshape(N, Hc)  # [N, Hc]
-            _, prior_params = self.prior(h_tokens)                  # MixtureSameFamily 
-            pi = prior_params["pi"]                       # [N, K]
-            means = prior_params["means"]                 # [N, K, C_top]
-            log_vars = prior_params["log_vars"].clamp(-10, 10)           # [N, K, C_top]
- 
-            K = pi.shape[1]
-            pi_map = pi.view(B_, res, res, K).permute(0, 3, 1, 2).contiguous()  # [B, K, res, res]
-            if sample_mode == "mean":
-                # mixture mean: sum_k pi_k * mu_k
-                z_tokens = (pi.unsqueeze(-1) * means).sum(dim=1)
-                k_map = torch.full((B_, res, res), -1, dtype=torch.long, device=device)  # sentinel -1 for mean
-            else:
-                # "sample" or "mode" but with controllable temperature
-                pi_img = pi.view(B_, res * res, K).mean(dim=1)  # [B, K] average over spatial locations for more stable sampling
-                eps_prob = torch.finfo(pi_img.dtype).eps
-                pi_img = pi_img.clamp(min=eps_prob)
-                pi_img = pi_img / (pi_img.sum(dim=1, keepdim=True)+ eps_prob)  # re-normalize
-                
-                if sample_mode == "mode":
-                    k_img = pi_img.argmax(dim=1)                      # [B]
-                elif sample_mode == "sample":
-                    k_img =Categorical(probs=pi_img).sample()  # [B]
-                else:
-                    raise ValueError(f"Unknown sample_mode {sample_mode}")
-                k = k_img.repeat_interleave(res * res)  # [N]
-                k_map = k.view(B_, res, res).contiguous()         # [B, res, res]
-                idx = torch.arange(N, device=device)
-                mu = means[idx, k]                            # [N, C_top]
-                std = torch.exp(0.5 * log_vars[idx, k])       # [N, C_top]
-                eps = torch.randn_like(mu)
-                z_tokens = mu + (temperature * std) * eps
 
-            z_map = z_tokens.view(B_, res, res, means.shape[-1]).permute(0, 3, 1, 2).contiguous()
+            _, prior_params = self.prior(h_tokens)
+
+            pi = prior_params["pi"]                      # [N, K]  (already normalized)
+            means = prior_params["means"]                # [N, K, C_top]
+            log_vars = prior_params["log_vars"].clamp(-10, 10)  # [N, K, C_top]
+            K = pi.shape[1]
+
+            pi_map = pi.view(B_, res, res, K).permute(0, 3, 1, 2).contiguous()  # [B, K, res, res]
+
+            k_tokens = Categorical(probs=pi).sample()  # [N]
+            idx = torch.arange(N, device=device)
+            mu = means[idx, k_tokens]                                 # [N, C_top]
+            std = torch.exp(0.5 * log_vars[idx, k_tokens])            # [N, C_top]
+            eps = torch.randn_like(mu)
+            z_tokens = mu + (decoder_temperature * std) * eps
+
+            k_map = k_tokens.view(B_, res, res).contiguous()  
+
+            z_map = z_tokens.view(B_, res, res, C_top).permute(0, 3, 1, 2).contiguous()
             z_flat = z_map.view(B_, -1)
-            
             return z_map, z_flat, pi_map, k_map
 
         # -------------------------
@@ -1610,22 +1654,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # -------------------------
         # 3) Decode predicted frames from sampled top-level latents
         # -------------------------
-        z_top = torch.stack(z_top_maps, dim=1)              # [B, horizon, C_top, res, res]
+        z_top = torch.stack(z_top_maps, dim=1).contiguous()              # [B, horizon, C_top, res, res]
 
-        z_top_flat = z_top.view(B * horizon, C_top, res, res).contiguous()
+        z_top_flat = z_top.view(B * horizon, C_top, res, res)
 
-        x_last = initial_obs[:, -1].permute(0,2,3,1).contiguous()
-        acts = self.vdvae.encoder.forward(x_last)
-        _, stats = self.vdvae.decoder.forward(acts, get_latents=True)
-        #lower = [s["z"] for s in stats[1:]]  # skip top
-        lower = [s["posterior_mean"] for s in stats[1:]]
+        n_blocks = len(self.vdvae.decoder.dec_blocks)
+        latents = [z_top_flat] + [None] * (n_blocks - 1)    # <-- NOTHING frozen
 
-        # when decoding horizon:
-        latents = [z_top_flat] + [
-            z.unsqueeze(1).expand(B, horizon, *z.shape[1:]).reshape(B*horizon, *z.shape[1:])
-            for z in lower
-        ]
-        px_z = self.vdvae.decoder.forward_manual_latents(B * horizon, latents, t=None)  
+        px_z = self.vdvae.decoder.forward_manual_latents(B * horizon, latents, t=decoder_temperature)  
 
         if decode_mode == "mean":
             # deterministic, less speckle than sampling
