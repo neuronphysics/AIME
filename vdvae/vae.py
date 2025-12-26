@@ -4,9 +4,11 @@ from torch.nn import functional as F
 from vdvae.vae_helpers import HModule, get_1x1, get_3x3, DmolNet, draw_gaussian_diag_samples, gaussian_analytical_kl
 from collections import defaultdict
 import numpy as np
+import math
 import itertools
 from torch.utils.checkpoint import checkpoint as ckpt
-
+from typing import Dict, Optional, Tuple
+from VRNN.lstm import ConvLSTMCell
 #This code is from this source:https://github.com/openai/vdvae
 
 class Block(nn.Module):
@@ -89,8 +91,8 @@ class Encoder(HModule):
         activations = {}
         activations[x.shape[2]] = x
         for block in self.enc_blocks:
-            if self.train and self.use_checkpoint:
-                x = ckpt(block, x, use_reentrant=False)  
+            if self.training and self.use_checkpoint:
+                x = ckpt(block, x, use_reentrant=False)
             else:
                 x = block(x)
             res = x.shape[2]
@@ -100,7 +102,7 @@ class Encoder(HModule):
 
 
 class DecBlock(nn.Module):
-    def __init__(self, H, res, mixin, n_blocks, is_top=False):
+    def __init__(self, H, res, mixin, n_blocks, is_top=False, use_temporal_prior: bool = False):
         super().__init__()
         self.base = res
         self.mixin = mixin
@@ -113,30 +115,57 @@ class DecBlock(nn.Module):
         cond_width = int(width * H.bottleneck_multiple)
         self.zdim = H.zdim
         self.enc = Block(width * 2, cond_width, H.zdim * 2, residual=False, use_3x3=use_3x3)
-        self.prior = Block(width, cond_width, H.zdim * 2 + width, residual=False, use_3x3=use_3x3, zero_last=True)
+        # --- Temporal prior switch (Option B: no FiLM, no projection) ---
+        # If H.use_temporal_priors is True, every NON-top stochastic block at this resolution
+        # uses a *time-conditioned Gaussian prior*:
+        #
+        #   p(z_t^(r) | x_t^(r), h_{t-1}^(r)) = N(mu(x,h), sigma^2(x,h))
+        #
+        # We implement this by concatenating a broadcasted hidden map to x before the prior convs.
+        self.use_temporal_priors = bool(getattr(H, "use_temporal_priors", False))
+        self.action_dim = int(getattr(H, "action_dim", 0))
+        self.use_temporal_prior = (bool(use_temporal_prior) and self.use_temporal_priors and (not self.is_top) and self.action_dim > 0)
+        prior_in_width = width + (width if self.use_temporal_prior else 0)
+
+        self.prior = Block(prior_in_width, cond_width, H.zdim * 2 + width, residual=False, use_3x3=use_3x3, zero_last=True)
         self.z_proj = get_1x1(H.zdim, width)
         self.z_proj.weight.data *= np.sqrt(1 / n_blocks)
         self.resnet = Block(width, cond_width, width, residual=True, use_3x3=use_3x3)
         self.resnet.c4.weight.data *= np.sqrt(1 / n_blocks)
         self.z_fn = lambda x: self.z_proj(x)
 
+
     def sample(self, x, acts):
+        """Posterior sample z ~ q(z|x,enc_act) and compute Gaussian KL against the block prior.
+        - For the top block, we do not use the Gaussian KL (because top prior is DPGMM).
+          We return kl=0 for the top block, and VDVAE computes the DPGMM KL separately.
+        """
         enc_in = torch.cat([x, acts], dim=1)
-        if self.train and self.use_checkpoint:
+        if self.training and self.use_checkpoint:
             qm, qv = ckpt(self.enc, enc_in, use_reentrant=False).chunk(2, dim=1)
-            feats = ckpt(self.prior, x, use_reentrant=False)
+            feats = self._prior_forward(x, None)
         else:
             qm, qv = self.enc(enc_in).chunk(2, dim=1)
-            feats = self.prior(x)
-        pm, pv, xpp = feats[:, :self.zdim, ...], feats[:, self.zdim:self.zdim * 2, ...], feats[:, self.zdim * 2:, ...]
+            feats = self._prior_forward(x, None)
+
+        pm = feats[:, :self.zdim, ...]
+        pv = feats[:, self.zdim:self.zdim * 2, ...]
+        xpp = feats[:, self.zdim * 2:, ...]
         x = x + xpp
+
         z = draw_gaussian_diag_samples(qm, qv)
-        kl = gaussian_analytical_kl(qm, pm, qv, pv)
+
+        if getattr(self, "is_top", False):
+            kl = torch.zeros_like(qm)
+        else:
+            kl = gaussian_analytical_kl(qm, pm, qv, pv)
+
         return z, x, kl, qm, qv
+
 
     def sample_uncond(self, x, t=None, lvs=None):
         n, c, h, w = x.shape
-        feats = self.prior(x)
+        feats = self._prior_forward(x, None)
         pm, pv, xpp = feats[:, :self.zdim, ...], feats[:, self.zdim:self.zdim * 2, ...], feats[:, self.zdim * 2:, ...]
         x = x + xpp
         if lvs is not None:
@@ -147,6 +176,206 @@ class DecBlock(nn.Module):
             z = draw_gaussian_diag_samples(pm, pv)
         return z, x
 
+    @staticmethod
+    def _z_to_tokens(z_map: torch.Tensor) -> torch.Tensor:
+        """We keep the exact top-level tokenization style:
+          z_map:   [B, C, H, W]
+          z_tokens:[B*H*W, C]
+        - Token form lets us update a token-wise temporal state (one state per spatial location),
+        """
+        B, C, H, W = z_map.shape
+        return z_map.permute(0, 2, 3, 1).contiguous().view(B * H * W, C)
+    
+    def _prior_forward(self, x: torch.Tensor, h_map: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Run the Gaussian prior conv tower.
+        If self.use_temporal_prior is True, the prior is conditioned on:
+          - x:     current decoder feature map            [B, width, H, W]
+          - h_map: temporal hidden map (per-location)     [B, width, H, W]
+        Some call-sites (e.g. unconditional sampling) pass h_map=None.
+        In that case, we fall back to zeros, which degenerates to an unconditional prior.
+        """
+        if self.use_temporal_prior:
+            if h_map is None:
+                h_map = torch.zeros_like(x)
+            else:
+                # Accept token form [B*H*W, C] (from per-location LSTM) and reshape to map.
+                if h_map.dim() == 2:
+                    B, C, H, W = x.shape
+                    if h_map.shape[0] == B * H * W and h_map.shape[1] == C:
+                        h_map = h_map.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+                    else:
+                        raise ValueError(
+                            f"h_map token shape {tuple(h_map.shape)} incompatible with x {tuple(x.shape)}"
+                        )
+                elif h_map.dim() != 4:
+                    raise ValueError(f"h_map must be None, [B,C,H,W], or [B*H*W,C]; got {tuple(h_map.shape)}")
+
+                # If spatial size mismatches, resize (should usually already match).
+                if h_map.shape[2:] != x.shape[2:]:
+                    h_map = F.interpolate(h_map, size=x.shape[2:], mode='nearest')
+
+                if h_map.shape[0] != x.shape[0]:
+                    raise ValueError(f"Batch mismatch: h_map {h_map.shape[0]} vs x {x.shape[0]}")
+                if h_map.shape[1] != x.shape[1]:
+                    raise ValueError(f"Channel mismatch: h_map {h_map.shape[1]} vs x {x.shape[1]}")
+            prior_in = torch.cat([x, h_map], dim=1)   # [B, 2*width, H, W]
+        else:
+            prior_in = x
+        if self.training and self.use_checkpoint:
+            return ckpt(self.prior, prior_in, use_reentrant=False)
+        return self.prior(prior_in)
+ 
+    def sample_temporal(self, x: torch.Tensor, enc_act: torch.Tensor, h_map: torch.Tensor):
+        """Posterior sample + KL against a *time-conditioned* Gaussian prior.
+
+        Args:
+          x:      current decoder feature map at this block/resolution  [B,width,H,W]
+          enc_act:encoder activation for q(z|x)                         [B,width,H,W]
+          h_map:  token-wise temporal hidden map h_{t-1}^(r)           [B,width,H,W]
+
+        Returns:
+          z:  sampled posterior latent map                              [B,zdim,H,W]
+          x:  updated feature map after adding xpp                       [B,width,H,W]
+          kl: per-location Gaussian KL                                   [B,zdim,H,W]
+          qm/qv: posterior parameters                                    [B,zdim,H,W]
+        """
+        enc_in = torch.cat([x, enc_act], dim=1)
+        if self.training and self.use_checkpoint:
+            qm, qv = ckpt(self.enc, enc_in, use_reentrant=False).chunk(2, dim=1)
+            feats = self._prior_forward(x, h_map)
+        else:
+            qm, qv = self.enc(enc_in).chunk(2, dim=1)
+            feats = self._prior_forward(x, h_map)
+
+        pm = feats[:, :self.zdim, ...]
+        pv = feats[:, self.zdim:self.zdim * 2, ...]
+        xpp = feats[:, self.zdim * 2:, ...]
+        x = x + xpp
+
+        # posterior sample
+        z = draw_gaussian_diag_samples(qm, qv)
+
+        # KL(q || p) with temporal prior
+        kl = gaussian_analytical_kl(qm, pm, qv, pv)
+        return z, x, kl, qm, qv
+
+
+    def sample_uncond_temporal(self, x: torch.Tensor, h_map: torch.Tensor, t: Optional[float] = None, lvs=None, temperature: float = 1.0):
+        """Prior sample from a *time-conditioned* Gaussian prior.
+
+        Args:
+          x:     decoder feature map at this block         [B,width,H,W]
+          h_map: temporal hidden map h_{t-1}^(r)           [B,width,H,W]
+        """
+        feats = self._prior_forward(x, h_map)
+        pm = feats[:, :self.zdim, ...]
+        pv = feats[:, self.zdim:self.zdim * 2, ...]
+        xpp = feats[:, self.zdim * 2:, ...]
+        x = x + xpp
+
+        if lvs is not None:
+            z = lvs
+        else:
+            temp_mult = float(temperature)
+            if t is not None:
+                temp_mult *= float(t)
+            if temp_mult != 1.0:
+                pv = pv + torch.ones_like(pv) * math.log(temp_mult)
+            z = draw_gaussian_diag_samples(pm, pv)
+        return z, x
+
+    def forward_temporal(
+        self,
+        xs: Dict[int, torch.Tensor],
+        activations: Dict[int, torch.Tensor],
+        temporal_cell: ConvLSTMCell,
+        temporal_state: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        a_t: torch.Tensor,
+        mask_t: Optional[torch.Tensor] = None,
+        get_latents: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        """Teacher-forced temporal forward for the first stochastic block at a resolution."""
+        x, acts = self.get_inputs(xs, activations)
+        if self.mixin is not None:
+            x = x + F.interpolate(xs[self.mixin][:, :x.shape[1], ...], scale_factor=self.base // self.mixin)
+
+        B, _, H, W = x.shape
+        if temporal_state is None:
+            h_prev = torch.zeros(B, temporal_cell.hidden_dim, H, W, device=x.device, dtype=x.dtype)  #TODO: is self.width correct?
+            c_prev = torch.zeros(B, temporal_cell.hidden_dim, H, W, device=x.device, dtype=x.dtype)
+        else:
+            h_prev, c_prev = temporal_state
+
+        if mask_t is not None:
+            keep = mask_t.view(B, 1, 1, 1).to(device=x.device, dtype=x.dtype)
+            h_prev = h_prev * keep
+            c_prev = c_prev * keep
+
+        z, x, kl, qm, qv = self.sample_temporal(x, acts, h_map=h_prev)
+        stats = {'kl': kl, 'posterior_mean': qm, 'posterior_logvar': qv}
+
+        action_dim = int(a_t.shape[-1])
+        a_map = a_t.view(B, action_dim, 1, 1).to(device=x.device, dtype=x.dtype).expand(B, action_dim, H, W)
+        u_map = torch.cat([z, a_map], dim=1)
+        h_next, c_next = temporal_cell(u_map, h_prev, c_prev)
+
+        x = x + self.z_fn(z)
+        if self.training and self.use_checkpoint:
+            x = ckpt(self.resnet, x, use_reentrant=False)
+        else:
+            x = self.resnet(x)
+
+        xs[self.base] = x
+        if get_latents:
+            stats['z'] = z
+        return xs, stats, (h_next, c_next)
+    def forward_uncond_temporal(
+        self,
+        xs: Dict[int, torch.Tensor],
+        temporal_cell: ConvLSTMCell,
+        temporal_state: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        a_t: torch.Tensor,
+        mask_t: Optional[torch.Tensor] = None,
+        t: Optional[float] = None,
+        lvs: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+    ) -> Tuple[Dict[int, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        """Unconditional temporal forward (generation) for the first stochastic block at a resolution."""
+        try:
+            x = xs[self.base]
+        except KeyError:
+            # Create a zero feature map if this resolution hasn't been created yet
+            ref = xs[min(xs.keys())]
+            x = torch.zeros(ref.shape[0], temporal_cell.hidden_dim, self.base, self.base, device=ref.device, dtype=ref.dtype)
+        if self.mixin is not None:
+            x = x + F.interpolate(xs[self.mixin][:, :x.shape[1], ...], scale_factor=self.base // self.mixin)
+        B, _, H, W = x.shape
+        if temporal_state is None:
+            h_prev = torch.zeros(B, temporal_cell.hidden_dim, H, W, device=x.device, dtype=x.dtype)
+            c_prev = torch.zeros(B, temporal_cell.hidden_dim, H, W, device=x.device, dtype=x.dtype)
+        else:
+            h_prev, c_prev = temporal_state
+
+        if mask_t is not None:
+            keep = mask_t.view(B, 1, 1, 1).to(device=x.device, dtype=x.dtype)
+            h_prev = h_prev * keep
+            c_prev = c_prev * keep
+        # sample z from prior p(z|x, h_prev)
+        z, x = self.sample_uncond_temporal(x, h_prev, t=t, lvs=lvs, temperature=temperature)
+
+        action_dim = int(a_t.shape[-1])
+        a_map = a_t.view(B, action_dim, 1, 1).to(device=x.device, dtype=x.dtype).expand(B, action_dim, H, W)
+        u_map = torch.cat([z, a_map], dim=1)
+        h_next, c_next = temporal_cell(u_map, h_prev, c_prev)
+
+        x = x + self.z_fn(z)
+        if self.training and self.use_checkpoint:
+            x = ckpt(self.resnet, x, use_reentrant=False)
+        else:
+            x = self.resnet(x)
+
+        xs[self.base] = x
+        return xs, (h_next, c_next)
     def get_inputs(self, xs, activations):
         acts = activations[self.base]
         try:
@@ -163,7 +392,7 @@ class DecBlock(nn.Module):
             x = x + F.interpolate(xs[self.mixin][:, :x.shape[1], ...], scale_factor=self.base // self.mixin)
         z, x, kl, qm, qv = self.sample(x, acts)
         x = x + self.z_fn(z)
-        if self.train and self.use_checkpoint:
+        if self.training and self.use_checkpoint:
             x = ckpt(self.resnet, x, use_reentrant=False)
         else:
             x = self.resnet(x)
@@ -198,12 +427,61 @@ class Decoder(HModule):
         self.widths = get_width_settings(H.width, H.custom_width_str)
         blocks = parse_layer_string(H.dec_blocks)
         n_blocks = len(blocks)
+        first_only = bool(getattr(H, "temporal_first_block_only", True))
+        seen_temporal_res = set()
         for idx, (res, mixin) in enumerate(blocks):
             is_top = (idx == 0)
-            dec_blocks.append(DecBlock(H, res, mixin, n_blocks=n_blocks, is_top=is_top))
+            # Temporal priors should apply ONLY to the *first* stochastic block at each resolution (requested).
+            # If temporal_first_block_only=False, we temporalize every non-top stochastic block.
+            use_temporal_here = False
+            if bool(getattr(H, "use_temporal_priors", False)) and (not is_top) and int(getattr(H, "action_dim", 0)) > 0:
+                if (not first_only) or (res not in seen_temporal_res):
+                    use_temporal_here = True
+                    seen_temporal_res.add(res)
+            dec_blocks.append(DecBlock(H, res, mixin, n_blocks=n_blocks, is_top=is_top, use_temporal_prior=use_temporal_here))
             resos.add(res)
         self.resolutions = sorted(resos)
         self.dec_blocks = nn.ModuleList(dec_blocks)
+        # ------------------------------------------------------------
+        # Temporal priors: one LSTM per *resolution* (excluding the top block)
+        #
+        # For each resolution r, we keep a state (h^(r), c^(r)) and condition
+        # the Gaussian prior at that resolution on:
+        #   - current decoder feature map x_t^(r)
+        #   - previous temporal hidden h_{t-1}^(r)
+        #
+        # LSTM input:
+        #   rnn_in = concat(flatten(z_t^(r)), a_t)
+        # ------------------------------------------------------------
+        self.use_temporal_priors = bool(getattr(H, "use_temporal_priors", False)) and int(getattr(H, "action_dim", 0)) > 0
+        self.action_dim = int(getattr(H, "action_dim", 0))
+        self.temporal_n_lstm_layers = int(getattr(H, "temporal_n_lstm_layers", 1))
+        self.temporal_use_orthogonal = bool(getattr(H, "temporal_use_orthogonal", True))
+
+
+        if self.use_temporal_priors:
+            # One ConvLSTMCell per resolution. Only the first stochastic block at each resolution
+            # uses the temporal prior (unless H.temporal_first_block_only is False).
+            action_dim = int(getattr(self.H, "action_dim", 0))
+            if action_dim <= 0:
+                raise ValueError(
+                    "Temporal priors require H.action_dim > 0."
+                )
+
+            self.temporal_cells = nn.ModuleDict()
+            self.temporal_resolutions = sorted({b.base for b in self.dec_blocks if (not b.is_top) and b.use_temporal_prior})
+            for res in self.temporal_resolutions:
+                width_r = int(self.widths[res])
+                input_dim = int(self.H.zdim + action_dim)
+                self.temporal_cells[str(res)] = ConvLSTMCell(
+                    input_dim=input_dim,
+                    hidden_dim=width_r,
+                    kernel_size=int(getattr(H, "temporal_kernel_size",3)),
+                    bias=True,
+                )
+        else:
+            self.temporal_cells = nn.ModuleDict()
+            self.temporal_resolutions = []
         self.bias_xs = nn.ParameterList([nn.Parameter(torch.zeros(1, self.widths[res], res, res)) for res in self.resolutions if res <= H.no_bias_above])
         self.out_net = DmolNet(H)
         self.gain = nn.Parameter(torch.ones(1, H.width, 1, 1))
@@ -241,6 +519,81 @@ class Decoder(HModule):
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
         return xs[self.H.image_size]
 
+
+    def init_temporal_state(self, B: int, device, dtype=torch.float32) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+        """Initialize ConvLSTM states per resolution.
+
+        Returns dict: res(str) -> (h_map, c_map) with shapes [B, width_r, res, res].
+        """
+        if not self.use_temporal_priors:
+            return {}
+
+        state: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        for res in self.temporal_resolutions:
+            r = int(res)
+            width_r = int(self.widths[r])
+            h = torch.zeros(B, width_r, r, r, device=device, dtype=dtype)
+            c = torch.zeros(B, width_r, r, r, device=device, dtype=dtype)
+            state[str(res)] = (h, c)
+        return state
+    def forward_temporal(
+        self,
+        activations: Dict[int, torch.Tensor],
+        temporal_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+        a_t: torch.Tensor,
+        mask_t: torch.Tensor,
+        get_latents: bool = False,
+    ):
+        """Decode ONE frame (teacher-forced) while using temporal priors for lower layers."""
+        xs = {b.shape[2]: b for b in self.bias_xs}
+        stats = []
+        for block in self.dec_blocks:
+            if self.use_temporal_priors and (not getattr(block, "is_top", False)) and block.use_temporal_prior:
+                key = str(block.base)
+                rnn = self.temporal_cells[key]
+                st = temporal_state[key]
+                xs, st_dict, st_new = block.forward_temporal(xs, activations, rnn, st, a_t, mask_t, get_latents=get_latents)
+                temporal_state[key] = st_new
+                stats.append(st_dict)
+            else:
+                xs, st_dict = block(xs, activations, get_latents=get_latents)
+                stats.append(st_dict)
+
+        px_z = self.final_fn(xs[self.H.image_size])
+        return px_z, stats, temporal_state
+
+    def forward_manual_latents_temporal(
+        self,
+        n: int,
+        latents,
+        temporal_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+        a_t: torch.Tensor,
+        mask_t: torch.Tensor,
+        t: Optional[float] = None,
+        temperature : float=1.0,
+    ):
+        """Decode ONE frame from a provided top latent + temporally conditioned lower priors."""
+        xs = {}
+        for bias in self.bias_xs:
+            xs[bias.shape[2]] = bias.repeat(n, 1, 1, 1)
+
+        for block, lvs in itertools.zip_longest(self.dec_blocks, latents):
+            if getattr(block, "is_top", False):
+                xs = block.forward_uncond(xs, t=t, lvs=lvs)
+                continue
+
+            if self.use_temporal_priors and block.use_temporal_prior:
+                key = str(block.base)
+                rnn = self.temporal_cells[key]
+                st = temporal_state[key]
+                xs, st_new = block.forward_uncond_temporal(xs, rnn, st, a_t, mask_t, t=t, lvs=lvs, temperature= temperature)
+                temporal_state[key] = st_new
+            else:
+                xs = block.forward_uncond(xs, t=t, lvs=lvs)
+
+        xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
+        return xs[self.H.image_size], temporal_state
+
 class VDVAE(HModule):
     def __init__(
         self,
@@ -254,10 +607,10 @@ class VDVAE(HModule):
         top_kl_weight:    scalar multiplier for the DPGMM KL term
         prior_kl_mc_samples: number of MC samples used in DPGMM KL estimation
         """
+        super().__init__(H)  # calls self.build()
         self.prior = prior
         self.top_kl_weight = top_kl_weight
         self.prior_kl_mc_samples = prior_kl_mc_samples
-        super().__init__(H)  # calls self.build()
 
     def build(self):
         self.encoder = Encoder(self.H)
@@ -273,6 +626,132 @@ class VDVAE(HModule):
         pos2 = torch.stack([gy, gx], dim=0)                         # [2,H,W]
         posC = pos2.repeat((C + 1) // 2, 1, 1)[:C]                  # [C,H,W] (tile/truncate)
         return z_map + scale * posC.unsqueeze(0)                    # [B,C,H,W]
+    # ======================================================================
+    # Temporal extensions
+    #   - Top block: DPGMM prior conditioned on top-level VRNN hidden state h_context.
+    #   - Lower blocks (each resolution): time-conditioned Gaussian priors, one LSTM per resolution.
+    #       * Prior: p(z_t^(r) | x_t^(r), h_{t-1}^(r))
+    #       * LSTM update: h_t^(r) = LSTM([flatten(z_t^(r)), a_t], h_{t-1}^(r))
+    #       * Masking: if mask_t[b] == 0, the LSTM state for that sample resets.
+    # We flatten the full z map into a vector.
+    # ======================================================================
+
+    def init_temporal_state(self, B: int, device: torch.device, dtype: Optional[torch.dtype] = None):
+        """Initialize temporal states for all lower-resolution LSTMs (one per resolution)."""
+        return self.decoder.init_temporal_state(B, device=device, dtype=dtype)
+
+    def forward_temporal_step(
+        self,
+        x: torch.Tensor,           # [B,H,W,C] NHWC in [-1,1]
+        x_target: torch.Tensor,    # [B,H,W,C] NHWC in [-1,1]
+        h_context: torch.Tensor,   # [B, hidden_dim] top VRNN hidden
+        a_t: torch.Tensor,         # [B, action_dim]
+        mask_t: torch.Tensor,      # [B] float {0,1}
+        temporal_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+        get_latents: bool = False,
+    ):
+        """Teacher-forced forward for ONE time step with temporal lower priors.
+        Returns: (out_dict, temporal_state_updated)
+        """
+        activations = self.encoder.forward(x)
+
+        px_z, stats, temporal_state = self.decoder.forward_temporal(
+            activations=activations,
+            temporal_state=temporal_state,
+            a_t=a_t,
+            mask_t=mask_t,
+            get_latents=get_latents,
+        )
+
+        distortion_per_pixel = self.decoder.out_net.nll(px_z, x_target)
+        ndims = float(np.prod(x_target.shape[1:]))  # C*H*W, used to normalize KL to per-pixel units
+
+        # Sum KLs for all NON-top blocks (already KL(q||p_temporal) if enabled)
+        rate_gauss = torch.zeros_like(distortion_per_pixel)
+        top_q_mean_map = None
+        top_q_logvar_map = None
+        for block, st in zip(self.decoder.dec_blocks, stats):
+            kl_block = st["kl"].sum(dim=(1, 2, 3))
+            if getattr(block, "is_top", False):
+                top_q_mean_map = st.get("posterior_mean", None)
+                top_q_logvar_map = st.get("posterior_logvar", None)
+            else:
+                rate_gauss = rate_gauss + kl_block
+        rate_gauss = rate_gauss / ndims
+
+        
+        dp_rate = torch.zeros_like(distortion_per_pixel)
+        dp_kl = None
+        prior_params = None
+        if (
+            self.prior is not None
+            and top_q_mean_map is not None
+            and top_q_logvar_map is not None
+        ):
+            B, C, Ht, Wt = top_q_mean_map.shape
+            N = B * Ht * Wt
+
+            h_map = h_context.view(B, -1, 1, 1).expand(B, -1, Ht, Wt).contiguous()
+            h_map = self.add_coord_no_proj(h_map, scale=0.05)
+            h_tokens = h_map.permute(0, 2, 3, 1).contiguous().view(N, -1)
+
+            top_q_mean_tokens = top_q_mean_map.permute(0, 2, 3, 1).contiguous().view(N, C)
+            top_q_logvar_tokens = 2* top_q_logvar_map.permute(0, 2, 3, 1).contiguous().view(N, C)
+
+            _, prior_params = self.prior(h_tokens)
+            dp_kl = self.prior.compute_kl_divergence_mc(
+                posterior_mean=top_q_mean_tokens,
+                posterior_logvar=top_q_logvar_tokens,
+                prior_params=prior_params,
+                n_samples=self.prior_kl_mc_samples,
+            )
+            tokens_per_img = Ht * Wt
+            dp_rate = self.top_kl_weight * (dp_kl * float(tokens_per_img)) / ndims
+            dp_rate = dp_rate * torch.ones_like(distortion_per_pixel)
+
+        rate = rate_gauss + dp_rate
+        elbo = distortion_per_pixel + rate
+
+        out = {
+            "elbo": elbo.mean(),
+            "distortion": distortion_per_pixel.mean(),
+            "gauss_rate": rate_gauss.mean(),
+            "rate": rate.mean(),
+            "dp_rate": dp_rate.mean(),
+            "stats": stats,
+            "px_z": px_z,
+            "top_q_mean_map": top_q_mean_map,
+            "top_q_logvar_map": top_q_logvar_map,
+            "prior_params": prior_params,
+        }
+        if dp_kl is not None:
+            out["dp_kl"] = dp_kl
+        return out, temporal_state
+
+    def decode_from_top_latent_temporal(
+        self,
+        z_top_map: torch.Tensor,   # [B,zdim,Ht,Wt]
+        a_t: torch.Tensor,         # [B,action_dim]
+        mask_t: torch.Tensor,      # [B]
+        temporal_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+        t: Optional[float] = None,
+        temperature: float = 1.0,
+    ):
+        """Decode ONE frame from a top z map while sampling lower latents from temporal priors."""
+        n = z_top_map.shape[0]
+        n_blocks = len(self.decoder.dec_blocks)
+        latents = [z_top_map] + [None] * (n_blocks - 1)
+
+        px_z, temporal_state = self.decoder.forward_manual_latents_temporal(
+            n=n,
+            latents=latents,
+            temporal_state=temporal_state,
+            a_t=a_t,
+            mask_t=mask_t,
+            t=t,
+            temperature = temperature
+        )
+        return px_z, temporal_state
 
     def forward(self, x: torch.Tensor, x_target: torch.Tensor, h_context: torch.Tensor):
         """
@@ -328,7 +807,7 @@ class VDVAE(HModule):
         ):
             B, C, Ht, Wt = top_q_mean_map.shape
 
-            # --- (a) Reshape latents: [B, C, Ht, Wt] -> [B*Ht*Wt, C] ---
+            # (a) Reshape latents: [B, C, Ht, Wt] -> [B*Ht*Wt, C]
             # we treat each spatial location as an independent feature vector
             top_q_mean_tokens = (
                 top_q_mean_map.permute(0, 2, 3, 1)   # [B, Ht, Wt, C]
@@ -341,7 +820,7 @@ class VDVAE(HModule):
                 .view(B * Ht * Wt, C)
             )
 
-            # --- (b) Build / validate context and broadcast per token ---
+            # (b) Build / validate context and broadcast per token 
             if h_context.shape[0] != B:
                 raise ValueError(
                     f"h_context batch size {h_context.shape[0]} does not match "
@@ -360,14 +839,14 @@ class VDVAE(HModule):
             h_map = self.add_coord_no_proj(h_map, scale=0.05)                           # [B,Hc,Ht,Wt]
             h_tokens = h_map.permute(0,2,3,1).reshape(B*Ht*Wt, Hc)                 # [N,Hc]
 
-            # --- (c) DPGMM prior over tokens ---
+            #(c) DPGMM prior over tokens 
             prior_dist, prior_params = self.prior(h_tokens)
 
             # Monte Carlo KL between q(z_token|x) and DP-GMM prior p(z_token | h_tokens)
             # posterior_mean, posterior_logvar: [N, C] where N=B*Ht*Wt
             dp_kl = self.prior.compute_kl_divergence_mc(
                 posterior_mean=top_q_mean_tokens,
-                posterior_logvar=top_q_logvar_tokens,
+                posterior_logvar=2* top_q_logvar_tokens, #attention
                 prior_params=prior_params,
                 n_samples=self.prior_kl_mc_samples,
             )  # scalar (average over N tokens and MC samples)
@@ -418,7 +897,6 @@ class VDVAE(HModule):
         h_map = h_context.view(B,1,1,Hc).expand(B,res,res,Hc).permute(0,3,1,2)  # [B,Hc,Ht,Wt]
         h_map = self.add_coord_no_proj(h_map, scale=0.05)                           # [B,Hc,Ht,Wt]
         h_tokens = h_map.permute(0,2,3,1).reshape(B*res*res, Hc)                 # [N,Hc]
-
 
         # DPGMM prior over tokens
         prior_dist, prior_params = self.prior(h_tokens)

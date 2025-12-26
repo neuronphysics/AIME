@@ -14,7 +14,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-
+from umap import UMAP
+import seaborn as sns
 try:
     from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score, adjusted_mutual_info_score
 except Exception:  # pragma: no cover
@@ -542,7 +543,7 @@ def visualize_dpgmm_clustering(
             sc2 = ax2.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=labels_s, cmap="Set1", s=6, alpha=0.75)
             ax2.set_zlabel("t-SNE 3")
         else:
-            sc2 = ax2.scatter(emb[:, 0], emb[:, 1], c=labels_s, cmap="Set1", s=8, alpha=0.75)
+            sc2 = ax2.scatter(emb[:, 0], emb[:, 1], c=labels_s, cmap="Set1", s=5, alpha=0.75)
         cbar = plt.colorbar(sc2, ax=ax2, label="Ground Truth Label")
         if class_names is not None:
             uniq = np.unique(labels_s)
@@ -577,11 +578,11 @@ def visualize_dpgmm_clustering(
     ax4 = fig.add_subplot(2, 3, 4)
     conf_all = pi[np.arange(pi.shape[0]), assignments]
     effk_all = _effective_k(pi)
-    ax4.hist(conf_all, bins=30, alpha=0.75, label="confidence (pi@assigned)")
-    ax4.hist(effk_all, bins=30, alpha=0.75, label="effective-K = exp(H(pi))")
+    sns.histplot(conf_all, bins=30, stat='density', alpha=0.75, label="confidence (pi@assigned)", ax=ax4)
+    sns.histplot(effk_all, bins=30, stat='density', alpha=0.75, label="effective-K = exp(H(pi))", ax=ax4)
     ax4.set_title("Mixture decisiveness diagnostics", fontsize=11)
     ax4.set_xlabel("value")
-    ax4.set_ylabel("count")
+    ax4.set_ylabel("density")
     ax4.legend(fontsize=9)
     ax4.grid(True, alpha=0.25)
 
@@ -589,33 +590,11 @@ def visualize_dpgmm_clustering(
     ax5 = fig.add_subplot(2, 3, 5)
     ex_imgs = data.get("exemplar_images", None)
     ex_sco = data.get("exemplar_scores", None)
-    if ex_imgs is not None and ex_imgs.size > 0:
-        # choose top components by utilization
-        topk = min(8, len(order))
-        show_components = order[:topk]
-        images_for_grid: List[np.ndarray] = []
-        captions: List[str] = []
-        for kk in show_components:
-            # add up to 6 exemplars
-            for j in range(min(6, ex_imgs.shape[1])):
-                im_t = torch.from_numpy(ex_imgs[kk, j])
-                if torch.isnan(torch.tensor(ex_sco[kk, j])).item():
-                    continue
-                im = _to_0_1_for_plot(im_t)
-                images_for_grid.append(im)
-                captions.append(f"k={kk}")
-        if len(images_for_grid) == 0:
-            ax5.text(0.5, 0.5, "No exemplars stored", ha="center", va="center", transform=ax5.transAxes)
-        else:
-            grid = _make_grid(images_for_grid, ncols=6, pad=2)
-            ax5.imshow(grid)
-            ax5.set_title("Exemplar images (top-used components)", fontsize=11)
-        ax5.axis("off")
-    else:
-        ax5.text(0.5, 0.5, "Exemplars not available", ha="center", va="center", transform=ax5.transAxes, fontsize=12)
-        ax5.axis("off")
-        ax5.set_title("Exemplars", fontsize=11)
-
+    umap_emb = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, random_state=42).fit_transform(latents[idx])
+    sc5 = ax5.scatter(umap_emb[:, 0], umap_emb[:, 1], c=assign_s, cmap=cmap, s=8, alpha=0.7)
+    ax5.set_xlabel("UMAP 1"); ax5.set_ylabel("UMAP 2")
+    ax5.set_title("UMAP by DPGMM Component", fontsize=11)
+    plt.colorbar(sc5, ax=ax5, label="Component")
     # (6) Metrics summary
     ax6 = fig.add_subplot(2, 3, 6)
     ax6.axis("off")

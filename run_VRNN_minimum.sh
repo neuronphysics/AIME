@@ -44,6 +44,8 @@ python -m pip install "tensorflow"
 pthonn -m pip install setuptools
 python -m pip install einx
 python -m pip install "timm<1.0.0" --no-deps
+python -m pip install umap-learn
+python -m pip install seaborn
 #python -m pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 
 
