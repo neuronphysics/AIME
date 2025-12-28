@@ -704,28 +704,36 @@ class VDVAE(HModule):
                 posterior_logvar=top_q_logvar_tokens,
                 prior_params=prior_params,
                 n_samples=self.prior_kl_mc_samples,
+                reduction= "token"
             )
             tokens_per_img = Ht * Wt
-            dp_rate = self.top_kl_weight * (dp_kl * float(tokens_per_img)) / ndims
-            dp_rate = dp_rate * torch.ones_like(distortion_per_pixel)
+            dp_kl_img = dp_kl.view(B, tokens_per_img).mean(dim=1)  # [B]
+            dp_rate = self.top_kl_weight * (dp_kl_img * float(tokens_per_img)) / ndims
 
         rate = rate_gauss + dp_rate
         elbo = distortion_per_pixel + rate
+        vm = mask_t.float()                          # [B]
+        den = vm.sum().clamp(min=1.0)                # scalar
+
+        def masked_mean(x):                          # x: [B]
+            return (x * vm).sum() / den
 
         out = {
-            "elbo": elbo.mean(),
-            "distortion": distortion_per_pixel.mean(),
-            "gauss_rate": rate_gauss.mean(),
-            "rate": rate.mean(),
-            "dp_rate": dp_rate.mean(),
+            "elbo": masked_mean(elbo),
+            "distortion": masked_mean(distortion_per_pixel),
+            "gauss_rate": masked_mean(rate_gauss),
+            "rate": masked_mean(rate),
+            "dp_rate": masked_mean(dp_rate),
             "stats": stats,
             "px_z": px_z,
             "top_q_mean_map": top_q_mean_map,
             "top_q_logvar_map": top_q_logvar_map,
             "prior_params": prior_params,
+            "valid_count": den,  # optional, useful for logging
         }
+
         if dp_kl is not None:
-            out["dp_kl"] = dp_kl
+            out["dp_kl"] = masked_mean(dp_kl_img)
         return out, temporal_state
 
     def decode_from_top_latent_temporal(

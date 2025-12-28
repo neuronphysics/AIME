@@ -523,6 +523,7 @@ def visualize_dpgmm_clustering(
     # (1) t-SNE by component
     if tsne_dims == 3:
         ax1 = fig.add_subplot(2, 3, 1, projection="3d")
+        ax1.view_init(elev=25, azim=40)
         sc1 = ax1.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=assign_s, cmap=cmap, s=6, alpha=0.75)
         ax1.set_zlabel("t-SNE 3")
     else:
@@ -535,6 +536,7 @@ def visualize_dpgmm_clustering(
     # (2) t-SNE by ground truth OR confidence
     if tsne_dims == 3:
         ax2 = fig.add_subplot(2, 3, 2, projection="3d")
+        ax2.view_init(elev=30, azim=120)
     else:
         ax2 = fig.add_subplot(2, 3, 2)
 

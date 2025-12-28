@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.distributions import Normal, Gamma, Categorical, Independent, MixtureSameFamily
 from typing import Dict, Tuple, List, Optional, Any
 import sys
-import os
+import os, gc
 from einops import rearrange
 from contextlib import contextmanager
 from itertools import chain
@@ -444,7 +444,8 @@ class DPGMMPrior(nn.Module):
         posterior_mean: torch.Tensor,
         posterior_logvar: torch.Tensor,
         prior_params: Dict[str, torch.Tensor],
-        n_samples: int = 10  # Add n_samples argument
+        n_samples: int = 10,
+        reduction: str ="mean", #mean |token 
     ) -> torch.Tensor:
         """
 
@@ -470,8 +471,8 @@ class DPGMMPrior(nn.Module):
         # Log-posterior: (n_samples, B)
         log_q = -0.5 * (
             D * math.log(2 * math.pi) +
-            posterior_logvar.sum(dim=-1) +
-            ((z - posterior_mean.unsqueeze(0)) ** 2 * torch.exp(-posterior_logvar.unsqueeze(0))
+            posterior_logvar.unsqueeze(0).sum(dim=-1) +
+            ((z - posterior_mean.unsqueeze(0)) ** 2 * torch.exp(-posterior_logvar).unsqueeze(0)
         ).sum(dim=-1))
 
         # Log-prior: (n_samples, B, K) -> (n_samples, B)
@@ -480,15 +481,20 @@ class DPGMMPrior(nn.Module):
             D * math.log(2 * math.pi) +
             prior_logvars.sum(dim=-1).unsqueeze(0) +  # (1, B, K)
             ((z_expanded - prior_means.unsqueeze(0)) ** 2 *
-            torch.exp(-prior_logvars.unsqueeze(0))).sum(dim=-1)
+            torch.exp(-prior_logvars).unsqueeze(0)).sum(dim=-1)
         )
         log_prior_components = log_component_densities + torch.log(prior_weights.unsqueeze(0).clamp(min=eps)+eps)
         log_p = torch.logsumexp(log_prior_components, dim=2)  # (n_samples, B)
 
         # KL divergence: average over samples and batch
-        kl_samples = log_q - log_p  # (n_samples, B)
-        return kl_samples.mean()  # Scalar
-
+        kl_samples = (log_q - log_p)  # (n_samples, B)
+        kl_token = kl_samples.mean(dim=0)
+        if reduction == "token":
+            return kl_token
+        elif reduction == "mean":
+            return kl_token.mean()
+        else:
+            raise ValueError(f"Unknown reduction={reduction}")
 
     def compute_kl_loss(self, params: Dict, alpha: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         """
@@ -648,18 +654,26 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         use_ctx_checkpoint: bool = True,
         use_dwa: bool = False,
         dwa_temperature: float = 2.0,
-        ):
+        rollout_adv_every: int = 10,            # do rollout adversarial every N steps (0 disables)
+        rollout_context_frames: int = 2,        # T_ctx
+        rollout_horizon: int = 4,               # rollout length
+        lambda_rollout_adv: float = 0.5,       # strength of rollout adversarial losses
+        rollout_top_temperature: float = 0.5,   # sampling temperature for top prior
+        rollout_decoder_temperature: float = 1.0,
+        rollout_decode_mode: str = "mean",      # "mean" or "sample"
+    ):
         super().__init__()
-        #core dimensions
+        # core dimensions
         self.input_channels = input_channels
         self.image_size = input_dim
         self.max_K = max_components
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
-        self.action_dim = action_dim ##
-        self.sequence_length = sequence_length ##
+        self.action_dim = action_dim
+        self.sequence_length = sequence_length
         self.device = device
         self.dropout = dropout
+
         # Hyperparameters
         self._lr = learning_rate
         self._grad_clip = grad_clip
@@ -669,31 +683,44 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.use_dwa = use_dwa
         self.use_ctx_checkpoint = use_ctx_checkpoint
         self.eps = torch.finfo(torch.float32).eps
-        #initialization different parts of the model
-        self._init_encoder_decoder(max_components, prior_alpha, prior_beta)
 
+        # rollout GAN attributes
+        self.global_step = 0
+        self.rollout_adv_every = int(rollout_adv_every)
+        self.rollout_context_frames = int(rollout_context_frames)
+        self.rollout_horizon = int(rollout_horizon)
+        self.lambda_rollout_adv = float(lambda_rollout_adv)
+        self.rollout_top_temperature = float(rollout_top_temperature)
+        self.rollout_decoder_temperature = float(rollout_decoder_temperature)
+        self.rollout_decode_mode = str(rollout_decode_mode)
+
+        # initialization different parts of the model
+        self._init_encoder_decoder(max_components, prior_alpha, prior_beta)
         self._init_vrnn_dynamics(use_orthogonal=use_orthogonal,number_lstm_layer=number_lstm_layer)
-        self._init_discriminators( img_disc_layers, patch_size, num_heads= disc_num_heads)
+        self._init_discriminators(img_disc_layers, patch_size, num_heads=disc_num_heads)
+
         if use_dwa:
             self._init_DynamicWeightAverage(dwa_temperature)
 
-        # Initialize weights
-        #self.apply(self.init_weights)
         self.to(device)
+
         # Setup optimizers
         self.has_optimizers = True
         self._setup_optimizers(learning_rate, weight_decay)
 
-
     def _init_DynamicWeightAverage(self, temperature: float = 2.0):
 
         self.total_weighter = DynamicWeightAverage(
-            loss_keys_to_consider=["recon_loss",
+            loss_keys_to_consider=[
+                "recon_loss",
                 "kl_z",
                 "hierarchical_kl",
                 "img_adv_loss",
                 "temporal_adv_loss",
                 "feat_match_loss",
+                "rollout_img_adv_loss",
+                "rollout_temporal_adv_loss",
+                "rollout_feat_match_loss",
             ],
             temperature=temperature,
         )
@@ -721,8 +748,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.dataset = 'imagenet64'
         H.num_mixtures = 10
         H.skip_threshold = 300.0
-        H.dec_blocks = "1x3,4m1,4x4,8m4,8x4,16m8,16x4,32m16,32x6,64m32,64x2"
-        H.enc_blocks = "64x2,64d2,32x6,32d2,16x4,16d2,8x4,8d2,4x4,4d4,1x3"
+        H.dec_blocks = "1x4,4m1,4x4,8m4,8x4,16m8,16x4,32m16,32x4,64m32,64x2"
+        H.enc_blocks = "64x2,64d2,32x4,32d2,16x4,16d2,8x4,8d2,4x4,4d4,1x4"
         H.temporal_n_lstm_layers = 1
         H.temporal_use_orthogonal = True
         H.temporal_kernel_size = 3
@@ -856,69 +883,104 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 elif 'bias' in name:
                     nn.init.constant_(param.data, 0)
 
+
     def contrastive_loss(
         self,
-        real_features: torch.Tensor,  # [B, T, D]
+        real_features: torch.Tensor,   # [B, T, D]
         fake_features: torch.Tensor,   # [B, T, D]
         temperature: float = 0.1,
         alpha: float = 0.7,
-        temporal_margin: int = 5
+        temporal_margin: int = 5,
+        temporal_mask: torch.Tensor | None = None,  # [B, T] bool, True=valid
     ) -> torch.Tensor:
         """
-        Temporal coherence
+        Temporal coherence loss with masking (ignore frames after done / padding).
+
+        temporal_mask:
+        - shape [B,T], bool
+        - True where frame is valid
         """
         B, T, D = real_features.shape
-        if T < 2 or B < 2:
-            return torch.tensor(0.0, device=real_features.device)
+        device = real_features.device
 
-        # 1. Normalize features
+        if T < 2 or B < 2:
+            return torch.tensor(0.0, device=device)
+
+        if temporal_mask is None:
+            temporal_mask = torch.ones(B, T, device=device, dtype=torch.bool)
+        else:
+            temporal_mask = temporal_mask[:, :T].to(device=device, dtype=torch.bool)
+
+        # Normalize
         real_norm = F.normalize(real_features, p=2, dim=-1)
         fake_norm = F.normalize(fake_features, p=2, dim=-1)
 
-        # 2. Intra-video alignment (real_t to fake_t)
-        intra_sim = torch.einsum('btd,btd->bt', real_norm, fake_norm) / temperature
-        intra_loss = -intra_sim.mean()
+        # -------------------------
+        # 1) Intra-video alignment: real_t vs fake_t (masked over t)
+        # -------------------------
+        intra_sim = torch.einsum("btd,btd->bt", real_norm, fake_norm) / temperature  # [B,T]
+        valid_bt = temporal_mask  # [B,T]
+        if valid_bt.any():
+            intra_loss = -intra_sim[valid_bt].mean()
+        else:
+            intra_loss = torch.tensor(0.0, device=device)
 
-        # 3. Inter-video separation - FIXED
-        # Average pool over time dimension
-        real_pooled = real_norm.mean(dim=1)  # [B, D]
-        fake_pooled = fake_norm.mean(dim=1)  # [B, D]
+        # -------------------------
+        # 2) Inter-video separation: pooled (masked mean over time), drop empty samples
+        # -------------------------
+        denom = temporal_mask.float().sum(dim=1, keepdim=True)  # [B,1]
+        keep = denom.squeeze(1) > 0
 
-        # Compute similarity matrix between sequences
-        inter_sim = torch.matmul(real_pooled, fake_pooled.T) / temperature  # [B, B]
+        if keep.sum() >= 2:
+            m = temporal_mask.float().unsqueeze(-1)  # [B,T,1]
+            denom_safe = denom.clamp(min=1.0).unsqueeze(-1)      # [B,1,1]
 
-        # Diagonal should be high (same video), off-diagonal low (different videos)
-        inter_labels = torch.arange(B, device=real_features.device)
-        inter_loss = F.cross_entropy(inter_sim, inter_labels)
+            real_pooled = (real_norm * m).sum(dim=1, keepdim=False) / denom_safe.squeeze(1)  # [B,D]
+            fake_pooled = (fake_norm * m).sum(dim=1, keepdim=False) / denom_safe.squeeze(1)  # [B,D]
 
-        # 4. Temporal coherence with margin-based negatives (THIS PART IS GOOD)
-        anchors = fake_norm[:, :-1]  # [B, T-1, D]
+            real_pooled = real_pooled[keep]
+            fake_pooled = fake_pooled[keep]
+
+            inter_sim = (real_pooled @ fake_pooled.T) / temperature  # [B_keep,B_keep]
+            inter_labels = torch.arange(inter_sim.size(0), device=device)
+            inter_loss = F.cross_entropy(inter_sim, inter_labels)
+        else:
+            inter_loss = torch.tensor(0.0, device=device)
+
+        # -------------------------
+        # 3) Temporal coherence on fake sequence (masked pairs + masked negatives)
+        # -------------------------
+        anchors = fake_norm[:, :-1]   # [B, T-1, D]
         positives = fake_norm[:, 1:]  # [B, T-1, D]
 
-        # Compute similarities
         pos_sim = torch.sum(anchors * positives, dim=-1) / temperature  # [B, T-1]
-        neg_sim = torch.einsum('btd,bkd->btk', anchors, fake_norm) / temperature  # [B, T-1, T]
+        neg_sim = torch.einsum("btd,bkd->btk", anchors, fake_norm) / temperature  # [B, T-1, T]
 
-        # Mask negatives within temporal margin
-        time_indices = torch.arange(T, device=anchors.device)
-        time_diff = torch.abs(time_indices[:-1, None] - time_indices)  # [T-1, T]
-        mask = time_diff >= temporal_margin
-        mask = mask.unsqueeze(0).expand(B, -1, -1)  # [B, T-1, T]
+        # negatives allowed by temporal margin
+        time_idx = torch.arange(T, device=device)
+        time_diff = torch.abs(time_idx[:-1, None] - time_idx[None, :])  # [T-1, T]
+        margin_mask = (time_diff >= temporal_margin)                    # [T-1, T]
+        margin_mask = margin_mask.unsqueeze(0).expand(B, -1, -1)        # [B, T-1, T]
 
-        # Apply mask
-        neg_sim = neg_sim.masked_fill(~mask, -1e4)
+        # also require negative candidate k to be valid
+        cand_valid = temporal_mask.unsqueeze(1).expand(B, T - 1, T)      # [B, T-1, T]
+        neg_mask = margin_mask & cand_valid
 
-        # Combine positive and negative logits
-        logits = torch.cat([pos_sim.unsqueeze(-1), neg_sim], dim=-1)  # [B, T-1, 1+T]
-        labels = torch.zeros(B, T-1, dtype=torch.long, device=logits.device)
+        neg_sim = neg_sim.masked_fill(~neg_mask, -1e4)
 
-        temporal_loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1)
-        )
+        logits = torch.cat([pos_sim.unsqueeze(-1), neg_sim], dim=-1)     # [B, T-1, 1+T]
+        labels = torch.zeros(B, T - 1, dtype=torch.long, device=device)  # positive is index 0
 
-        # Weighted combination
-        return alpha * (intra_loss + inter_loss) + (1 - alpha) * temporal_loss
+        # only compute loss on valid (t,t+1) pairs
+        valid_pairs = temporal_mask[:, :-1] & temporal_mask[:, 1:]       # [B, T-1]
+        if valid_pairs.any():
+            logits_flat = logits.view(-1, logits.size(-1))[valid_pairs.view(-1)]
+            labels_flat = labels.view(-1)[valid_pairs.view(-1)]
+            temporal_loss = F.cross_entropy(logits_flat, labels_flat)
+        else:
+            temporal_loss = torch.tensor(0.0, device=device)
+
+        return alpha * (intra_loss + inter_loss) + (1.0 - alpha) * temporal_loss
 
     def _setup_optimizers(self, learning_rate: float, weight_decay: float) -> None:
         def get_params(*modules, exclude_params=None):
@@ -961,9 +1023,21 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self._rnn,
             self.rnn_layer_norm,
         ]
-        trunk_params = get_params(*trunk_modules)
+        
+        tiny_lr = learning_rate * 5e-5  # e.g. 1000x smaller than base
+        gamma_params = [self.prior.stick_breaking.gamma_a, self.prior.stick_breaking.gamma_b]  
+        trunk_params = get_params(*trunk_modules, exclude_params=gamma_params)
+
+
         if trunk_params:
             gen_param_groups.extend(split_by_weight_decay(trunk_params, weight_decay))
+        gammas = [p for p in gamma_params if isinstance(p, nn.Parameter) and p.requires_grad]
+        if gammas:
+            gen_param_groups.append({
+                "params": gammas,
+                "lr": tiny_lr,
+                "weight_decay": 0.0,   
+            })
 
         # Scalar initial states (h0, c0)
         scalar_params = [self.h0, self.c0]
@@ -992,7 +1066,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if disc_params:
                 self.img_disc_optimizer = torch.optim.Adamax(
                     disc_params,
-                    lr=learning_rate * 0.05,
+                    lr=learning_rate * 0.08,
                     betas=(0.0, 0.9),
                     weight_decay=5e-5,
                 )
@@ -1020,6 +1094,26 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 min_lr=1e-7,
             )
 
+    def _lengths_from_dones(self, dones: torch.Tensor, T: int, assume_padded_after_done: bool = True):
+        """
+        dones: [B, T] where dones[t]=1 means episode terminates AFTER frame t (i.e., t is valid, t+1 invalid).
+        returns:
+        alive_mask: [B, T] bool (True = valid frame)
+        lengths:    [B] long (#valid frames)
+        """
+        B = dones.shape[0]
+        dones = dones[:, :T].bool()
+
+        alive = torch.ones(B, T, device=dones.device, dtype=torch.bool)
+        if assume_padded_after_done:
+            # once done happens at time t, frames t+1, t+2, ... are invalid
+            if T > 1:
+                done_prev = dones[:, :T-1]                        # termination on transition to next frame
+                ended_before = (done_prev.cumsum(dim=1) > 0)      # [B, T-1]
+                alive[:, 1:] = ~ended_before
+
+        lengths = alive.long().sum(dim=1)
+        return alive, lengths
 
     def forward_sequence(self, observations, actions=None, dones=None):
         """        
@@ -1179,12 +1273,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
     def compute_total_loss(
         self,
-        observations,
-        actions=None,
+        observations:torch.Tensor,
+        actions:Optional[torch.Tensor]=None,
+        dones:Optional[torch.Tensor]=None,
         beta: float = 1.0,
         lambda_recon: float = 1.0,
     ):
-        outputs = self.forward_sequence(observations, actions)
+        outputs = self.forward_sequence(observations, actions, dones)
         device = self.device
 
         # --- Reconstruction term ---
@@ -1224,7 +1319,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         return vae_losses, outputs
 
-    def compute_gradient_penalty(self, discriminator, real_x, fake_x, z, device):
+    def compute_gradient_penalty(self, discriminator, real_x, fake_x, z, device: torch.device, sequence_lengths: Optional[torch.Tensor] = None):
         """
         WGAN-GP with conditioning. Interpolates both x and z (optional).
         Shapes:
@@ -1238,7 +1333,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Interpolate z as well (keeps conditioning aligned).
         z_hat = None if z is None else z.detach()
 
-        d_hat = discriminator(x_hat, z=z_hat)["final_score"]  # [B, 1]
+        d_hat = discriminator(x_hat, z=z_hat.detach(), sequence_lengths=sequence_lengths)["final_score"]  # [B, 1]
 
         grads = torch.autograd.grad(
             outputs=d_hat,
@@ -1257,32 +1352,40 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         real_images: torch.Tensor, #[B, T, C, H, W]
         fake_images: torch.Tensor, #[B, T, C, H, W]
         latents: torch.Tensor,  #[B, T, Z]
+        sequence_lengths: Optional[torch.Tensor] = None,
         WGAN_GP_Coeff: float = 5.0,
     ) -> Dict[str, torch.Tensor]:
         """
         Training step for both discriminators
         """
         seq_len = real_images.shape[1]  # Get sequence length from real images
+        if sequence_lengths is not None:
+            sequence_lengths = sequence_lengths.to(real_images.device)
+
         # Temporal Image Discriminator
-        real_img_outputs = self.image_discriminator(real_images, z=latents.detach())
-        fake_img_outputs = self.image_discriminator(fake_images.detach(), z=latents.detach())
+        real_img_outputs = self.image_discriminator(real_images, z=latents.detach(), sequence_lengths=sequence_lengths)
+        fake_img_outputs = self.image_discriminator(fake_images.detach(), z=latents.detach(), sequence_lengths=sequence_lengths)
 
         # Extract final scores
         real_img_score = real_img_outputs['final_score']
         fake_img_score = fake_img_outputs['final_score']
         # Gradient penalty requires computing second-order gradients
-        # Gradient penalty for images (sample random interpolation points in sequence)
         img_gp = self.compute_gradient_penalty(
             self.image_discriminator,
             real_images,
             fake_images.detach(),
             latents,
-            self.device
+            real_images.device,
+            sequence_lengths=sequence_lengths,
         )
 
+        if sequence_lengths is None:
+            denom = real_images.shape[1]
+        else:
+            denom = sequence_lengths.float().mean().clamp(min=1.0)
         img_disc_loss = (
             torch.mean(fake_img_score) - torch.mean(real_img_score) +
-            WGAN_GP_Coeff * img_gp/ seq_len
+            WGAN_GP_Coeff * img_gp/ denom
         )
 
         # Temporal consistency losses
@@ -1306,18 +1409,28 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'img_consistency_loss': img_consistency_loss,
         }
 
-    def compute_feature_matching_loss(self, real_features, fake_features):
+    def compute_feature_matching_loss(self, 
+                                      real_features: torch.Tensor, 
+                                      fake_features: torch.Tensor, 
+                                      temporal_mask: torch.Tensor | None = None):
 
         real_mean = real_features.mean(dim=2)  # [B, T, D]
         fake_mean = fake_features.mean(dim=2)
+         
+        if temporal_mask is None:
+           return F.l1_loss(fake_mean, real_mean.detach())
+        m = temporal_mask.float().unsqueeze(-1) #[B, T, 1]
+        diff = torch.abs(fake_mean - real_mean.detach())  # [B,T,D]
 
-        return F.l1_loss(fake_mean, real_mean.detach())
+        denom = (m.sum() * diff.shape[-1]).clamp(min=1.0)
+        return (diff * m).sum() / denom
 
     def compute_adversarial_losses(
         self,
         x: torch.Tensor, #[B, T, C, H, W  ]
         reconstruction: torch.Tensor, #[B, T, C, H, W]
         z_seq: torch.Tensor, #[B, T, Z]
+        sequence_lengths: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute adversarial losses for both image and latent space
@@ -1327,10 +1440,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         for p in D.parameters():
             p.requires_grad_(False)
 
-        fake_img_outputs = D(reconstruction, z=z_seq.detach(), return_features=True)
-        real_img_outputs = D(x,             z=z_seq.detach(), return_features=True)
+        fake_img_outputs = D(reconstruction, z=z_seq.detach(), return_features=True, sequence_lengths=sequence_lengths)
+        real_img_outputs = D(x,             z=z_seq.detach(), return_features=True, sequence_lengths=sequence_lengths)
         img_adv_loss = -torch.mean(fake_img_outputs['final_score'])
         #reward for generating temporally consistent images
+        temporal_mask = None
+        if sequence_lengths is not None:
+            temporal_mask = torch.arange(x.shape[1], device=x.device)[None, :]
+            temporal_mask = (temporal_mask < sequence_lengths[:, None])
 
         real_frame_features = real_img_outputs['hidden_3d'].mean(dim=2)  # Flatten spatial dimensions
 
@@ -1338,13 +1455,16 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         temporal_loss_frames =self.contrastive_loss(
         real_features=real_frame_features,
-        fake_features=fake_frame_features
+        fake_features=fake_frame_features,
+        temporal_mask =temporal_mask
         )
 
-        # === Feature Matching Loss ===
-        # This helps stabilize training
-        # L1 loss between feature statistics
-        feature_match_loss = self.compute_feature_matching_loss(real_img_outputs['hidden_3d'], fake_img_outputs['hidden_3d'])
+        # Feature Matching Loss:L1 loss between feature statistics
+        feature_match_loss = self.compute_feature_matching_loss(
+            real_features=real_img_outputs["hidden_3d"],
+            fake_features=fake_img_outputs["hidden_3d"],
+            temporal_mask=temporal_mask,
+        )
         # Restore Discriminator parameter gradients
         for p, f in zip(D.parameters(), flags):
             p.requires_grad_(f)
@@ -1384,10 +1504,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         return (images + 1) / 2
 
-
     def training_step_sequence(self,
                             observations: torch.Tensor,
                             actions: torch.Tensor = None,
+                            dones: torch.Tensor = None,
                             beta: float = 1.0,
                             n_critic: int = 3,
                             lambda_img: float = 0.2,
@@ -1395,33 +1515,121 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                             batch_idx: Optional[int] = None,
                             ) -> Dict[str, torch.Tensor]:
         """
-        Supports:
         - Dynamic Weight Averaging (DWA) over either:
             * ELBO / adv  streams (when grad_balance_method != "none"), or
             * all individual loss terms together (when grad_balance_method == "none").
-        - RGB / GradNorm / PCGrad /MGDAmulti-task gradient balancing when requested.
         """
         self.train()
         if getattr(self, "image_discriminator", None) is not None:
             self.image_discriminator.train()
 
+        self.global_step += 1
+
         # 1) Prepare data and compute VAE loss
         warmup_factor = self.get_warmup_factor()
 
         vae_losses, outputs = self.compute_total_loss(
-            observations, actions, beta,
+            observations,
+            actions,
+            dones,
+            beta,
             lambda_recon
         )
-        lambda_img_eff = (lambda_img * warmup_factor) if warmup_factor > 0.0 else 0.0
 
-        # 2) Discriminator updates (n_critic)
+        # z_seq for disc conditioning (teacher-forced)
+        z_seq_tf = torch.cat([outputs["latents"], outputs["hidden_states"]], dim=-1)
+
+        B, seq_len = observations.shape[:2]
+        if dones is not None:
+            _, lengths_full = self._lengths_from_dones(dones, T=seq_len, assume_padded_after_done=True)
+        else:
+            lengths_full = torch.full((B,), seq_len, device=observations.device, dtype=torch.long)
+
+        # 2) Decide whether to do rollout GAN this step
+        T_total = seq_len
+        do_rollout = (
+            self.lambda_rollout_adv > 0.0
+            and self.rollout_adv_every > 0
+            and (self.global_step % self.rollout_adv_every == 0)
+            and (T_total >= 2)
+        )
+
+        rollout_horizon = 0
+        T_ctx = 0
+        real_future = None
+        fake_future_D = None
+        z_seq_roll_D = None
+        seq_len_future = None
+        keep = None
+        actions_slice = None
+        dones_slice = None
+
+        if do_rollout:
+            T_ctx = min(self.rollout_context_frames, T_total - 1)
+            rollout_horizon = min(self.rollout_horizon, T_total - T_ctx)
+
+            if rollout_horizon <= 0:
+                do_rollout = False
+            else:
+                real_future = observations[:, T_ctx:T_ctx + rollout_horizon]
+                actions_slice = actions[:, :T_ctx + rollout_horizon] if actions is not None else None
+                dones_slice = dones[:, :T_ctx + rollout_horizon] if dones is not None else None
+
+                if dones_slice is not None:
+                    alive_slice, _ = self._lengths_from_dones(
+                        dones_slice, T_ctx + rollout_horizon, assume_padded_after_done=True
+                    )
+                    future_alive = alive_slice[:, T_ctx:T_ctx + rollout_horizon]   # [B, H]
+                    future_len = future_alive.long().sum(dim=1)                    # [B]
+                    keep = (future_len > 0)
+                else:
+                    keep = torch.ones(B, device=observations.device, dtype=torch.bool)
+                    future_len = torch.full((B,), rollout_horizon, device=observations.device, dtype=torch.long)
+
+                if keep.sum().item() == 0:
+                    do_rollout = False
+                    real_future = None
+                else:
+                    # Apply keep consistently
+                    real_future = real_future[keep]
+                    seq_len_future = future_len[keep]
+
+                    # Rollout once WITHOUT grad for discriminator updates
+                    dbgD = self.generate_future_sequence(
+                        initial_obs=observations[keep, :T_ctx],
+                        actions=(actions_slice[keep] if actions_slice is not None else None),
+                        horizon=rollout_horizon,
+                        top_temperature=self.rollout_top_temperature,
+                        decoder_temperature=self.rollout_decoder_temperature,
+                        decode_mode=self.rollout_decode_mode,
+                        dones=(dones_slice[keep] if dones_slice is not None else None),
+                        grad=False,
+                    )
+                    fake_future_D = dbgD["vae_future"]   # [B_keep, H, C, H, W]
+                    z_seq_roll_D = dbgD["z_seq"]         # [B_keep, H, Z] (should already be detached inside)
+
+        # 3) Discriminator updates (n_critic)
         disc_losses_list: List[Dict[str, torch.Tensor]] = []
         for _ in range(n_critic):
+            # teacher-forced recon fakes
             disc_loss = self.discriminator_step(
                 real_images=observations,
-                fake_images=outputs['reconstructions'],  # discriminator_step detaches internally
-                latents=torch.cat([outputs['latents'], outputs['hidden_states']], dim=-1)
+                fake_images=outputs["reconstructions"].detach(),
+                latents=z_seq_tf,
+                sequence_lengths=lengths_full,
             )
+
+            # rollout fakes (optional)
+            if do_rollout and (fake_future_D is not None) and (z_seq_roll_D is not None):
+                disc_loss_roll = self.discriminator_step(
+                    real_images=real_future,
+                    fake_images=fake_future_D,
+                    latents=z_seq_roll_D,
+                    sequence_lengths=seq_len_future,
+                )
+                for k, v in disc_loss_roll.items():
+                    disc_loss[f"rollout_{k}"] = v
+
             disc_losses_list.append(disc_loss)
 
         avg_disc_losses: Dict[str, torch.Tensor] = {}
@@ -1431,15 +1639,45 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 for k in disc_losses_list[0].keys()
             }
 
-        # 3) Adversarial generator losses
+        # 4) Generator adversarial losses (teacher-forced)
+        lambda_img_eff = (lambda_img * warmup_factor) if warmup_factor > 0.0 else 0.0
+
         img_adv_loss, temporal_adv_loss, feat_match_loss = self.compute_adversarial_losses(
             x=observations,
-            reconstruction=outputs['reconstructions'],
-            z_seq=torch.cat([outputs['latents'], outputs['hidden_states']], dim=-1),
+            reconstruction=outputs["reconstructions"],
+            z_seq=z_seq_tf,
+            sequence_lengths=lengths_full
         )
 
-        # 4) Combine losses with DWA
-        if self.use_dwa :
+        # 5) Generator adversarial losses (rollout) — SAVP-style prior realism
+        rollout_img_adv_loss = torch.zeros((), device=observations.device)
+        rollout_temporal_adv_loss = torch.zeros((), device=observations.device)
+        rollout_feat_match_loss = torch.zeros((), device=observations.device)
+
+        if do_rollout and rollout_horizon > 0:
+            # Rollout again WITH grad for generator update
+            dbgG = self.generate_future_sequence(
+                initial_obs=observations[keep, :T_ctx],
+                actions=(actions_slice[keep] if actions_slice is not None else None),
+                horizon=rollout_horizon,
+                top_temperature=self.rollout_top_temperature,
+                decoder_temperature=self.rollout_decoder_temperature,
+                decode_mode="mean",  # IMPORTANT: keep rollout differentiable
+                dones=(dones_slice[keep] if dones_slice is not None else None),
+                grad=True,
+            )
+            fake_future_G = dbgG["vae_future"]      # [B_keep, H, C, H, W] (requires grad)
+            z_seq_roll_G = dbgG["z_seq"].detach()   # keep conditioning stable + save memory
+
+            rollout_img_adv_loss, rollout_temporal_adv_loss, rollout_feat_match_loss = self.compute_adversarial_losses(
+                x=real_future,
+                reconstruction=fake_future_G,
+                z_seq=z_seq_roll_G,
+                sequence_lengths=seq_len_future,
+            )
+
+        # 6) Combine losses with DWA or fixed weights
+        if self.use_dwa:
             total_components = {
                 "recon_loss":      vae_losses["recon_loss"].reshape([]),
                 "kl_z":            vae_losses["kl_z"].reshape([]),
@@ -1447,66 +1685,79 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "img_adv_loss":      (warmup_factor * img_adv_loss).reshape([]),
                 "temporal_adv_loss": (warmup_factor * temporal_adv_loss).reshape([]),
                 "feat_match_loss":   feat_match_loss.reshape([]),
+
+                "rollout_img_adv_loss":      (self.lambda_rollout_adv * warmup_factor * rollout_img_adv_loss).reshape([]),
+                "rollout_temporal_adv_loss": (self.lambda_rollout_adv * warmup_factor * rollout_temporal_adv_loss).reshape([]),
+                "rollout_feat_match_loss":   (self.lambda_rollout_adv * rollout_feat_match_loss).reshape([]),
+
                 "component_margin": vae_losses["component_margin"].reshape([]),
             }
             total_gen_loss = self.total_weighter.reduce_losses(total_components, batch_idx)
-
         else:
-            # No DWA: fixed scalar weights
             adv_base = (
                 lambda_img_eff * img_adv_loss
                 + warmup_factor * temporal_adv_loss
                 + lambda_img * feat_match_loss
             )
-            elbo_loss = (
-                lambda_recon * vae_losses['recon_loss']
-                + beta * vae_losses['kl_z']
-                + beta * vae_losses['hierarchical_kl']
-                - vae_losses['component_margin']  # encourage diverse component usage
+            adv_roll = self.lambda_rollout_adv * (
+                lambda_img_eff * rollout_img_adv_loss
+                + warmup_factor * rollout_temporal_adv_loss
+                + lambda_img * rollout_feat_match_loss
             )
+            elbo_loss = (
+                lambda_recon * vae_losses["recon_loss"]
+                + beta * vae_losses["kl_z"]
+                + beta * vae_losses["hierarchical_kl"]
+                - vae_losses["component_margin"]
+            )
+            total_gen_loss = elbo_loss + adv_base + adv_roll
 
-            total_gen_loss = elbo_loss + adv_base
-
-        # No multi-task balancer: just backprop total_gen_loss
+        # 7) Backprop generator
+        self.gen_optimizer.zero_grad(set_to_none=True)
         total_gen_loss.backward()
 
-        # Clip and step with standard optimizer
         torch.nn.utils.clip_grad_norm_(
             [p for g in self.gen_optimizer.param_groups for p in g["params"]],
             self._grad_clip,
         )
         self.gen_optimizer.step()
 
-        # Grad norm for logging
+
         grad_norm_sq = 0.0
         for group in self.gen_optimizer.param_groups:
-            for p in group['params']:
+            for p in group["params"]:
                 if p.grad is not None:
                     g = p.grad.data
                     grad_norm_sq = grad_norm_sq + float((g.norm(2)).item() ** 2)
         grad_norm = (grad_norm_sq ** 0.5) if grad_norm_sq > 0 else 0.0
 
-        # 6) EMA updates for encoder/decoder
+        # 8) EMA updates for encoder/decoder
         with torch.no_grad():
             self.ema_vdvae.update()
 
-        eff_comp = outputs['prior_params'][0]['pi'].max(1)[0].mean().item()
-        top6_cov = outputs['prior_params'][0]['pi'].topk(6, dim=-1)[0].sum(dim=-1).mean().item()
+        eff_comp = outputs["prior_params"][0]["pi"].max(1)[0].mean().item()
+        top6_cov = outputs["prior_params"][0]["pi"].topk(6, dim=-1)[0].sum(dim=-1).mean().item()
 
+        del outputs, z_seq_tf, real_future, fake_future_D, z_seq_roll_D, actions_slice, dones_slice, keep
+
+        if do_rollout:
+          del dbgG, dbgD, fake_future_G       
         return {
-            # VAE & auxiliaries
             **vae_losses,
-            # Discriminators
             **avg_disc_losses,
-            # Adversarial gen (cast to float for logging)
-            'img_adv_loss': float(img_adv_loss.item()),
-            'temporal_adv_loss': float(temporal_adv_loss.item()),
-            'feat_match_loss': float(feat_match_loss.item()),
-            # Training stats
-            'total_gen_loss': float(total_gen_loss.item()),
-            'grad_norm': float(grad_norm),
-            'effective_components': eff_comp,
-            'Top 6 coverage': top6_cov,
+
+            "img_adv_loss": float(img_adv_loss.item()),
+            "temporal_adv_loss": float(temporal_adv_loss.item()),
+            "feat_match_loss": float(feat_match_loss.item()),
+            "rollout_img_adv_loss": float(rollout_img_adv_loss.item()),
+            "rollout_temporal_adv_loss": float(rollout_temporal_adv_loss.item()),
+            "rollout_feat_match_loss": float(rollout_feat_match_loss.item()),
+            "did_rollout_adv": float(1.0 if do_rollout else 0.0),
+
+            "total_gen_loss": float(total_gen_loss.item()),
+            "grad_norm": float(grad_norm),
+            "effective_components": eff_comp,
+            "Top 6 coverage": top6_cov,
         }
 
     def set_epoch(self, epoch: int):
@@ -1543,7 +1794,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         x = torch.from_numpy(x_np).permute(0, 3, 1, 2).contiguous().float()/ 127.5 - 1.0
         return x
 
-    @torch.no_grad()
     def generate_future_sequence(
         self,
         initial_obs: torch.Tensor,          # [B, T_ctx, C, H, W] in [-1, 1]
@@ -1553,6 +1803,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         decoder_temperature: float = 1.0,
         dones: torch.Tensor | None = None,  # [B, T_ctx] or [B, T_total]
         decode_mode: str = "mean",          # "mean" | "sample"
+        grad: bool = True,
     ):
         """Generate future frames using:
           1) teacher-forced scan over context frames to warm up both:
@@ -1567,113 +1818,115 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         device = initial_obs.device
         dtype = initial_obs.dtype
 
-        if actions is None:
-            actions = torch.zeros(B, T_ctx + horizon, self.action_dim, device=device, dtype=dtype)
-        assert actions.shape[1] >= T_ctx + horizon, "actions must have length >= T_ctx + horizon"
-
-        # --- init states ---
-        h = self.h0.expand(self.number_lstm_layer, B, -1).contiguous()
-        c = self.c0.expand(self.number_lstm_layer, B, -1).contiguous()
-        temporal_state = self.vdvae.init_temporal_state(B, device=device, dtype=dtype)
-
         def compute_mask_t(t: int) -> torch.Tensor | None:
             if dones is None:
-                return torch.ones(B, device=device, dtype=dtype)
+                return torch.ones(B, device=device, dtype=torch.float32)
             # match training logic: first at t=0, else dones[:, t-1]
             if t == 0:
-                return torch.ones(B, device=device, dtype=dtype)
+                return torch.ones(B, device=device, dtype=torch.float32)
             
             return 1.0 - dones[:, t - 1].float()
+        with torch.set_grad_enabled(grad):
+            if actions is None:
+                actions = torch.zeros(B, T_ctx + horizon, self.action_dim, device=device, dtype=dtype)
+            assert actions.shape[1] >= T_ctx + horizon, "actions must have length >= T_ctx + horizon"
 
-        # --- context scan ---
-        for t in range(T_ctx):
-            x_t = initial_obs[:, t]
-            a_t = actions[:, t]
-            mask_t = compute_mask_t(t)
+            # --- init states ---
+            h = self.h0.expand(self.number_lstm_layer, B, -1).contiguous()
+            c = self.c0.expand(self.number_lstm_layer, B, -1).contiguous()
+            temporal_state = self.vdvae.init_temporal_state(B, device=device, dtype=dtype)
+            # --- context scan ---
+            for t in range(T_ctx):
+                x_t = initial_obs[:, t]
+                a_t = actions[:, t]
+                mask_t = compute_mask_t(t)
 
-            h_context = h[-1]
-            x_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
+                h_context = h[-1]
+                x_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
 
-            vdvae_out, temporal_state = self.vdvae.forward_temporal_step(
-                x_nhwc,
-                x_nhwc,
-                h_context=h_context,
-                a_t=a_t,
-                mask_t=mask_t,
-                temporal_state=temporal_state,
-            )
+                vdvae_out, temporal_state = self.vdvae.forward_temporal_step(
+                    x_nhwc,
+                    x_nhwc,
+                    h_context=h_context,
+                    a_t=a_t,
+                    mask_t=mask_t,
+                    temporal_state=temporal_state,
+                )
 
-            # Update top-level LSTM with posterior mean top-latent (teacher forced)
-            top_q_mean_map = vdvae_out["top_q_mean_map"]
-            _, zdim, topH, topW = top_q_mean_map.shape
-            z_flat = top_q_mean_map.permute(0, 2, 3, 1).reshape(B, topH * topW * zdim)
-            rnn_in = torch.cat([z_flat, a_t], dim=-1)
-            _, (h, c) = self.rnn(rnn_in, h, c, mask_t)
+                # Update top-level LSTM with posterior mean top-latent (teacher forced)
+                top_q_mean_map = vdvae_out["top_q_mean_map"]
+                _, zdim, topH, topW = top_q_mean_map.shape
+                z_flat = top_q_mean_map.permute(0, 2, 3, 1).reshape(B, topH * topW * zdim)
+                rnn_in = torch.cat([z_flat, a_t], dim=-1)
+                _, (h, c) = self.rnn(rnn_in, h, c, mask_t)
 
-        # --- future rollout ---
-        pred_imgs = []
-        debug = {"z_top": [], "c_top": []}
+            # --- future rollout ---
+            pred_imgs = []
+            hidden_state =[]
+            latent_state =[]
+            debug = {"z_top": [], "c_top": []}
 
-        for k in range(horizon):
-            t = T_ctx + k
-            a_t = actions[:, t]
-            mask_t = compute_mask_t(t)
+            for k in range(horizon):
+                t = T_ctx + k
+                a_t = actions[:, t]
+                mask_t = compute_mask_t(t)
 
-            h_context = h[-1]
+                h_context = h[-1]
 
-            # Token-wise DPGMM sampling for top latent map
-            topH, topW = self.top_H, self.top_W
-            Hc = h_context.shape[1]
-            h_map = h_context.view(B, Hc, 1, 1).expand(B, Hc, topH, topW).contiguous()  # [B,Hc,topH,topW]
-            h_map = self.vdvae.add_coord_no_proj(h_map, scale=0.05)                     # [B,Hc(+coords),topH,topW]
-            h_flat = h_map.permute(0, 2, 3, 1).reshape(B * topH * topW, -1)             # [N, Hc(+coords)]
+                # Token-wise DPGMM sampling for top latent map
+                topH, topW = self.top_H, self.top_W
+                Hc = h_context.shape[1]
+                h_map = h_context.view(B, Hc, 1, 1).expand(B, Hc, topH, topW).contiguous()  # [B,Hc,topH,topW]
+                h_map = self.vdvae.add_coord_no_proj(h_map, scale=0.05)                     # [B,Hc(+coords),topH,topW]
+                h_flat = h_map.permute(0, 2, 3, 1).reshape(B * topH * topW, -1)             # [N, Hc(+coords)]
 
-            _, prior_params = self.prior(h_flat)
-            K = prior_params['pi'].shape[-1]
-            pi_tok = prior_params['pi'].view(B, topH * topW, K)
-            mu_tok = prior_params['means'].view(B, topH * topW, K, self.zdim)
-            var_tok = torch.exp(prior_params['log_vars']).view(B, topH * topW, K, self.zdim)
+                _, prior_params = self.prior(h_flat)
+                K = prior_params['pi'].shape[-1]
+                pi_tok = prior_params['pi'].view(B, topH * topW, K)
+                mu_tok = prior_params['means'].view(B, topH * topW, K, self.zdim)
+                var_tok = torch.exp(prior_params['log_vars']).view(B, topH * topW, K, self.zdim)
 
-            # Sample component per token, then sample z from that Gaussian
-            # (simple categorical + Gaussian sampling)
-            cat = torch.distributions.Categorical(probs=pi_tok)
-            c_tok = cat.sample()  # [B, Ttok]
-            mu_sel = torch.gather(mu_tok, 2, c_tok[..., None, None].expand(B, topH * topW, 1, self.zdim)).squeeze(2)
-            var_sel = torch.gather(var_tok, 2, c_tok[..., None, None].expand(B, topH * topW, 1, self.zdim)).squeeze(2)
-            eps = torch.randn_like(mu_sel)
-            z_tok = mu_sel + top_temperature * eps * torch.sqrt(var_sel.clamp_min(self.eps))  # [B, Ttok, zdim]
+                # Sample component per token, then sample z from that Gaussian
+                # (simple categorical + Gaussian sampling)
+                cat = torch.distributions.Categorical(probs=pi_tok)
+                c_tok = cat.sample()  # [B, Ttok]
+                mu_sel = torch.gather(mu_tok, 2, c_tok[..., None, None].expand(B, topH * topW, 1, self.zdim)).squeeze(2)
+                var_sel = torch.gather(var_tok, 2, c_tok[..., None, None].expand(B, topH * topW, 1, self.zdim)).squeeze(2)
+                eps = torch.randn_like(mu_sel)
+                z_tok = mu_sel + top_temperature * eps * torch.sqrt(var_sel.clamp_min(self.eps))  # [B, Ttok, zdim]
 
-            z_top_map = z_tok.reshape(B, topH, topW, self.zdim).permute(0, 3, 1, 2).contiguous()
+                z_top_map = z_tok.reshape(B, topH, topW, self.zdim).permute(0, 3, 1, 2).contiguous()
 
-            # Decode through temporal VDVAE
-            px_z, temporal_state = self.vdvae.decode_from_top_latent_temporal(
-                z_top_map,
-                a_t=a_t,
-                mask_t=mask_t,
-                temporal_state=temporal_state,
-                t=None,
-                temperature=decoder_temperature,
-            )
+                # Decode through temporal VDVAE
+                px_z, temporal_state = self.vdvae.decode_from_top_latent_temporal(
+                    z_top_map,
+                    a_t=a_t,
+                    mask_t=mask_t,
+                    temporal_state=temporal_state,
+                    t=None,
+                    temperature=decoder_temperature,
+                )
 
-            dmol_out = self.vdvae.decoder.out_net.forward(px_z)
-            if decode_mode == "mean":
-                x_hat = mean_from_discretized_mix_logistic(dmol_out, self.vdvae.decoder.out_net.H.num_mixtures)
-            elif decode_mode == "sample":
-                x_hat = sample_from_discretized_mix_logistic(dmol_out, self.vdvae.decoder.out_net.H.num_mixtures)
-            else:
-                raise ValueError(f"decode_mode must be 'mean' or 'sample', got {decode_mode}")
+                dmol_out = self.vdvae.decoder.out_net.forward(px_z)
+                if decode_mode == "mean":
+                    x_hat = mean_from_discretized_mix_logistic(dmol_out, self.vdvae.decoder.out_net.H.num_mixtures)
+                elif decode_mode == "sample":
+                    x_hat = sample_from_discretized_mix_logistic(dmol_out, self.vdvae.decoder.out_net.H.num_mixtures)
+                else:
+                    raise ValueError(f"decode_mode must be 'mean' or 'sample', got {decode_mode}")
 
-            x_hat = x_hat.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
-            pred_imgs.append(x_hat)
+                x_hat = x_hat.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+                pred_imgs.append(x_hat)
 
-            # Update top-level LSTM with sampled top latent (flattened) + action
-            z_flat = z_top_map.permute(0, 2, 3, 1).reshape(B, topH * topW * self.zdim)
-            rnn_in = torch.cat([z_flat, a_t], dim=-1)
-            _, (h, c) = self.rnn(rnn_in, h, c, mask_t)
+                # Update top-level LSTM with sampled top latent (flattened) + action
+                z_flat = z_top_map.permute(0, 2, 3, 1).reshape(B, topH * topW * self.zdim)
+                rnn_in = torch.cat([z_flat, a_t], dim=-1)
+                _, (h, c) = self.rnn(rnn_in, h, c, mask_t)
+                latent_state.append(z_flat.detach())
+                hidden_state.append(h[-1].detach())
 
-            debug["z_top"].append(z_top_map)
-            debug["c_top"].append(c_tok.reshape(B, topH, topW))
-
-        pred_imgs = torch.stack(pred_imgs, dim=1)  # [B, horizon, C, H, W]
-        debug["vae_future"] = pred_imgs
-        return debug
+                debug["c_top"].append(c_tok.reshape(B, topH, topW).detach())
+            debug["z_seq"] =torch.cat([torch.stack(latent_state, dim=1),torch.stack(hidden_state, dim=1)], dim=-1)
+            pred_imgs = torch.stack(pred_imgs, dim=1)  # [B, horizon, C, H, W]
+            debug["vae_future"] = pred_imgs
+            return debug

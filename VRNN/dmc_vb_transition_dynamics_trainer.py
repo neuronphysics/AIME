@@ -14,6 +14,7 @@ import time, contextlib
 import tensorflow as tf
 import argparse
 import wandb
+
 try:
     # completely disable TF GPUs (safest, simplest)
     tf.config.set_visible_devices([], 'GPU')
@@ -50,7 +51,6 @@ print("Script dir:", SCRIPT_DIR)
 print("Parent dir:", PARENT_DIR)
 matplotlib.use("Agg", force=True)
 plt.ioff()
-
 
 
 @contextmanager
@@ -438,9 +438,10 @@ class TFRecordConverter:
         
         return episode_data
     
+
 class DMCVBDataset(Dataset):
     """PyTorch Dataset for DMC Vision Benchmark data"""
-    
+
     def __init__(
         self,
         data_dir: str,
@@ -456,10 +457,9 @@ class DMCVBDataset(Dataset):
         add_state: bool = False,
         add_rewards: bool = True,
         transform: Optional[callable] = None,
-
     ):
         super().__init__()
-        
+
         self.data_dir = Path(data_dir)
         self.domain_name = domain_name
         self.task_name = task_name
@@ -473,59 +473,63 @@ class DMCVBDataset(Dataset):
         self.add_state = add_state
         self.add_rewards = add_rewards
         self.transform = transform
-        
+
         # Get dataset info
         self.action_dim = DMCVBInfo.get_action_dim(domain_name)
         self.state_dim = DMCVBInfo.get_state_dim(domain_name)
         self.cameras = DMCVBInfo.get_camera_fields(domain_name)
-        
-        # Load episode paths
-        self.episodes = self._load_all_episodes()
-        self.min_episode_length = self._compute_min_episode_length()
-        
-        # Create sequence indices
-        self.sequence_indices = self._create_sequence_indices()
-        print(f"Loaded {len(self.episodes)} episodes")
-        print(f"Minimum episode length (at first done): {self.min_episode_length}")
-        print(f"Total sequences available: {len(self.sequence_indices)}")
-        
 
-    def _load_episode_paths(self, training_percent: float =0.7) -> List[Path]:
+        # Load episodes
+        self.episodes = self._load_all_episodes()
+
+        # Compute usable per-episode lengths (safe alignment)
+        self.episode_lengths = self._compute_episode_lengths()
+        self.min_episode_length = int(min(self.episode_lengths)) if len(self.episode_lengths) > 0 else 0
+
+        # Create safe sequence indices per episode
+        self.sequence_indices = self._create_sequence_indices()
+
+        print(f"Loaded {len(self.episodes)} episodes")
+        print(f"Minimum usable episode length (clipped to first done & array lengths): {self.min_episode_length}")
+        print(f"Total sequences available: {len(self.sequence_indices)}")
+
+    def _load_episode_paths(self, training_percent: float = 0.7) -> List[Path]:
         """Load all episode file paths"""
         all_episode_files = []
-        policy_levels = ['expert', 'medium', 'mixed']
-        subfolders =['none', 'dynamic_medium', 'static_medium']
+
+        # Respect user-specified policy_level if it's one of the known ones; else load all
+        if self.policy_level in ['expert', 'medium', 'mixed']:
+            policy_levels = [self.policy_level]
+        else:
+            policy_levels = ['expert', 'medium', 'mixed']
+
+        subfolders = ['none', 'dynamic_medium', 'static_medium']
         base_dir = self.data_dir / "dmc_vb" / f"{self.domain_name}_{self.task_name}"
-        # Collect episodes from all combinations
+
         for policy_level in policy_levels:
             for subfolder in subfolders:
                 episode_dir = base_dir / policy_level / subfolder
-                
                 if not episode_dir.exists():
-                    print(f"Skipping non-existent directory: {episode_dir}")
+                    # silently skip or print if you want
                     continue
-                
-                # Get all tfrecord files from this directory
+
                 episode_files = sorted(episode_dir.glob("distracting_control-*.tfrecord-*"))
-                
                 if len(episode_files) == 0:
-                    # Try general tfrecord pattern as fallback
                     episode_files = sorted(episode_dir.glob("*.tfrecord*"))
-                
+
                 if len(episode_files) > 0:
-                    print(f"Found {len(episode_files)} episodes in {policy_level}/{subfolder}")
                     all_episode_files.extend(episode_files)
-        
+
         if len(all_episode_files) == 0:
-            raise ValueError(f"No episode files found in any directory under {base_dir}")
-        
-        # Shuffle all episodes to mix expert and medium data
-        random.shuffle(all_episode_files)
-        
-        # Split into train/eval
+            raise ValueError(f"No episode files found under {base_dir}")
+
+        # IMPORTANT: make split deterministic so eval is stable across runs
+        rng = random.Random(0)
+        rng.shuffle(all_episode_files)
+
         n_episodes = len(all_episode_files)
-        n_train = int(training_percent * n_episodes) # 70% for training
-        
+        n_train = int(training_percent * n_episodes)
+
         if self.split == 'train':
             return all_episode_files[:n_train]
         else:
@@ -535,7 +539,7 @@ class DMCVBDataset(Dataset):
         """Load all episodes into memory"""
         episode_paths = self._load_episode_paths()
         episodes = []
-        
+
         print(f"Loading {len(episode_paths)} episodes...")
         for ep_path in tqdm(episode_paths):
             try:
@@ -545,9 +549,9 @@ class DMCVBDataset(Dataset):
             except Exception as e:
                 print(f"Error loading {ep_path}: {e}")
                 continue
-        
+
         return episodes
-    
+
     def _load_episode_data(self, episode_path: Path) -> Optional[Dict[str, np.ndarray]]:
         """Load episode data from file"""
         if episode_path.suffix == '.h5':
@@ -558,148 +562,206 @@ class DMCVBDataset(Dataset):
             return self._load_npz_episode(episode_path)
         else:
             raise ValueError(f"Unsupported file format: {episode_path.suffix}")
-    
+
     def _load_h5_episode(self, h5_path: Path) -> Dict[str, np.ndarray]:
         """Load episode from HDF5 file"""
         data = {}
-        
+
         with h5py.File(h5_path, 'r') as f:
-            # Load observations
             if 'observation_pixels' in f:
                 data['observation_pixels'] = f['observation_pixels'][:]
             elif 'pixels' in f:
                 data['observation_pixels'] = f['pixels'][:]
-            
-            # Load actions
+            else:
+                raise KeyError("No observation pixels found in H5 episode.")
+
             if 'action' in f:
                 data['action'] = f['action'][:]
-            
-            # Load rewards
+            else:
+                raise KeyError("No actions found in H5 episode.")
+
             if 'reward' in f and self.add_rewards:
                 data['reward'] = f['reward'][:]
-            
-            # Load or create done flags
+
             if 'done' in f:
                 data['done'] = f['done'][:]
             elif 'is_last' in f:
                 data['done'] = f['is_last'][:].astype(np.float32)
             else:
-                # Create done flag - mark last timestep as done
+                # done length aligned with actions
                 data['done'] = np.zeros(len(data['action']), dtype=np.float32)
                 data['done'][-1] = 1.0
-        
+
         return data
-    
-    def _compute_min_episode_length(self) -> int:
-        """Compute minimum episode length across all episodes (up to first done)"""
-        min_length = float('inf')
-        valid_episodes = 0
 
-        for episode in self.episodes:
-            if 'done' not in episode or len(episode['done']) == 0:
+    def _load_npz_episode(self, npz_path: Path) -> Dict[str, np.ndarray]:
+        """Basic NPZ loader (kept for completeness)."""
+        d = dict(np.load(npz_path))
+        # Try common keys
+        if 'observation_pixels' not in d and 'pixels' in d:
+            d['observation_pixels'] = d['pixels']
+        if 'done' not in d and 'is_last' in d:
+            d['done'] = d['is_last'].astype(np.float32)
+        if 'done' not in d:
+            d['done'] = np.zeros(len(d['action']), dtype=np.float32)
+            d['done'][-1] = 1.0
+        return d
+
+    def _compute_episode_lengths(self) -> List[int]:
+        """
+        Compute per-episode usable length:
+        - clipped by min(len(obs), len(action), len(done))
+        - clipped by first done (inclusive)
+        This guarantees any sampled sequence stays within one episode and consecutive frames exist.
+        """
+        lengths = []
+        for ep in self.episodes:
+            if 'observation_pixels' not in ep or 'action' not in ep or 'done' not in ep:
                 continue
-                
-            # Find first done flag
-            done_indices = np.where(episode['done'] > 0)[0]
-            if len(done_indices) > 0:
-                episode_length = done_indices[0] + 1
-            else:
-                episode_length = len(episode['done'])
-            
-            if episode_length > 0:  # Only consider non-empty episodes
-                valid_episodes += 1
-                min_length = min(min_length, episode_length)
 
-        if valid_episodes == 0:
-            raise RuntimeError(f"No valid episodes found out of {len(self.episodes)} total")
+            obs_len = len(ep['observation_pixels'])
+            act_len = len(ep['action'])
+            done_len = len(ep['done'])
 
-        min_required = self.sequence_length + self.frame_stack
-        if min_length < min_required:
-            raise ValueError(f"Min episode length ({min_length}) < required ({min_required})")
+            # Align to the shortest available array.
+            # If obs_len is act_len+1, this safely clips to act_len (still fine).
+            ep_len = int(min(obs_len, act_len, done_len))
 
-        return int(min_length)        
+            if ep_len <= 0:
+                continue
+
+            # Clip to first done (inclusive)
+            done_clip = ep['done'][:ep_len]
+            done_idx = np.where(done_clip > 0)[0]
+            if len(done_idx) > 0:
+                ep_len = int(min(ep_len, done_idx[0] + 1))
+
+            # Must be long enough to build one sample
+            min_required = self.sequence_length + self.frame_stack - 1
+            if ep_len < min_required:
+                continue
+
+            lengths.append(ep_len)
+
+        if len(lengths) == 0:
+            raise RuntimeError("No valid episodes long enough for (sequence_length + frame_stack - 1).")
+
+        return lengths
+
     def _create_sequence_indices(self) -> List[Tuple[int, int]]:
-        """Create indices for all valid sequences based on minimum episode length"""
-        indices = []
-        
-        for ep_idx in range(len(self.episodes)):
-            # Use minimum episode length to ensure consistency
-            max_start = self.min_episode_length - self.sequence_length - self.frame_stack + 1
-            
+        """Create safe indices for all valid sequences per episode."""
+        indices: List[Tuple[int, int]] = []
+
+        # We recompute usable length per episode in the same way to stay consistent
+        for ep_idx, ep in enumerate(self.episodes):
+            if 'observation_pixels' not in ep or 'action' not in ep or 'done' not in ep:
+                continue
+
+            obs_len = len(ep['observation_pixels'])
+            act_len = len(ep['action'])
+            done_len = len(ep['done'])
+            ep_len = int(min(obs_len, act_len, done_len))
+            if ep_len <= 0:
+                continue
+
+            done_clip = ep['done'][:ep_len]
+            done_idx = np.where(done_clip > 0)[0]
+            if len(done_idx) > 0:
+                ep_len = int(min(ep_len, done_idx[0] + 1))
+
+            min_required = self.sequence_length + self.frame_stack - 1
+            if ep_len < min_required:
+                continue
+
+            # last frame index used is start + (sequence_length + frame_stack - 2)
+            max_start = ep_len - min_required + 1  # number of valid start positions
             for start_idx in range(max_start):
                 indices.append((ep_idx, start_idx))
-        
+
         return indices
-    
+
     def _process_observation(self, obs: np.ndarray) -> torch.Tensor:
-        """Process observation: normalize and convert to tensor"""
-        # Ensure correct shape [H, W, C]
-        if obs.shape != (self.img_height, self.img_width, 3):
-            # Simple resize if needed
-            obs = obs[:self.img_height, :self.img_width]  # Crop
-        
-        # Normalize to [-1, 1] if needed
+        """Process observation: normalize and convert to tensor [C,H,W]"""
+        # Crop if needed
+        if obs.shape[0] < self.img_height or obs.shape[1] < self.img_width:
+            # If smaller, just crop what exists (avoid crashing)
+            obs = obs[:min(obs.shape[0], self.img_height), :min(obs.shape[1], self.img_width)]
+        else:
+            obs = obs[:self.img_height, :self.img_width]
+
+        # Normalize to [-1, 1]
         if self.normalize_images:
             if obs.dtype == np.uint8:
                 obs = obs.astype(np.float32) / 255.0
+            else:
+                # Robust: if float but looks like 0..255, scale down
+                if obs.max() > 1.5:
+                    obs = obs.astype(np.float32) / 255.0
+                else:
+                    obs = obs.astype(np.float32)
+
             obs = (obs * 2.0) - 1.0
             obs = np.clip(obs, -1.0, 1.0)
-        # Convert to channels first [C, H, W]
+
+        # [H,W,C] -> [C,H,W]
         obs = np.transpose(obs, (2, 0, 1))
-        
         return torch.from_numpy(obs).float()
- 
-    
+
     def __len__(self) -> int:
         return len(self.sequence_indices)
-    
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a sequence of data"""
+        """Get a sequence of data (consecutive frames from the same episode)."""
         ep_idx, start_idx = self.sequence_indices[idx]
         episode_data = self.episodes[ep_idx]
-        
-        # Extract sequence (clipped to min_episode_length)
-        end_idx = min(start_idx + self.sequence_length + self.frame_stack, self.min_episode_length)
-        
-        # Stack observations from pixels
+
+        # We need exactly (sequence_length + frame_stack - 1) raw frames to build sequence_length stacked frames
+        end_idx = start_idx + self.sequence_length + self.frame_stack - 1  # exclusive
+
+        # Slice raw pixels from ONE episode (consecutive in time)
         observations = episode_data['observation_pixels'][start_idx:end_idx]
-        
-        # Process observations with frame stacking
+
+        # Pre-process all frames once
+        frames = [self._process_observation(observations[i]) for i in range(len(observations))]
+
+        # Build stacked observations:
+        # each stacked obs is frames[t-frame_stack : t] concatenated over channel dim
         processed_obs = []
-        for t in range(self.frame_stack, end_idx - start_idx):
-            # Stack frames
-            stacked_frames = []
-            for f in range(self.frame_stack):
-                frame = self._process_observation(observations[t - self.frame_stack + f + 1])
-                stacked_frames.append(frame)
-            stacked = torch.cat(stacked_frames, dim=0)  # Stack along channel dimension
+        for t in range(self.frame_stack, len(frames) + 1):
+            stacked_frames = frames[t - self.frame_stack : t]  # list of [C,H,W]
+            stacked = torch.cat(stacked_frames, dim=0)         # [C*frame_stack, H, W]
             processed_obs.append(stacked)
-        
-        observations_tensor = torch.stack(processed_obs)
-        
-        # Get actions
+
+        observations_tensor = torch.stack(processed_obs, dim=0)  # [T, C*frame_stack, H, W]
+
+        # Actions aligned with the LAST frame of each stack
         action_start = start_idx + self.frame_stack - 1
         action_end = action_start + len(processed_obs)
+
         actions = episode_data['action'][action_start:action_end]
         actions_tensor = torch.from_numpy(actions).float()
-        
+
         sample = {
             'observations': observations_tensor,
             'actions': actions_tensor,
         }
-        
+
         # Add rewards if available
         if self.add_rewards and 'reward' in episode_data:
             rewards = episode_data['reward'][action_start:action_end]
             sample['rewards'] = torch.from_numpy(rewards).float()
-        
+
         # Add done flags
         done_flags = episode_data['done'][action_start:action_end]
         sample['done'] = torch.from_numpy(done_flags).float()
-        
+
+        # Optional: return debug info (does NOT break your existing API usage)
+        sample['episode_idx'] = torch.tensor(ep_idx, dtype=torch.long)
+        sample['start_idx'] = torch.tensor(start_idx, dtype=torch.long)
+
         if self.transform:
             sample = self.transform(sample)
-        
+
         return sample
 
 def list_frozen_params(model):
@@ -816,8 +878,6 @@ class GradientMonitor:
             'discriminators': ['image_discriminator']
         }
     
-
-
     def compute_component_gradients(
         self,
         update_global_step: bool = True,
@@ -950,6 +1010,14 @@ class DMCVBTrainer:
         default_ckpt_dir = PARENT_DIR / "results" / "dpgmm_vrnn_dmc_vb" / "checkpoints"
         self.ckpt_dir = Path(config.get("ckpt_dir", default_ckpt_dir))
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        common_transform =HumanoidAwareZoomTransform(
+                    zoom_prob=0.8,
+                    area_range=(0.35, 0.65),
+                    center_key="attn_center",  # optional; must be normalized [-1,1] xy
+                    interpolation="lanczos",
+                    corner_min=0.80,
+                    corner_max=0.95,
+                )
         # Setup datasets
         self.train_dataset = DMCVBDataset(
             data_dir=data_dir,
@@ -960,14 +1028,7 @@ class DMCVBTrainer:
             img_height=config['img_height'],
             img_width=config['img_width'],
             add_state= False,
-            transform = HumanoidAwareZoomTransform(
-                    zoom_prob=0.6,
-                    area_range=(0.6, 0.85),
-                    center_key="attn_center",  # optional; must be normalized [-1,1] xy
-                    interpolation="lanczos",
-                    corner_min=0.70,
-                    corner_max=0.85,
-                )
+            transform = common_transform
         )
         
         self.eval_dataset = DMCVBDataset(
@@ -978,7 +1039,8 @@ class DMCVBTrainer:
             frame_stack=config['frame_stack'],
             img_height=config['img_height'],
             img_width=config['img_width'],
-            add_state= False
+            add_state= False,
+            transform = common_transform
         )
         
         # Setup dataloaders
@@ -999,7 +1061,14 @@ class DMCVBTrainer:
             collate_fn=safe_collate,
             pin_memory=True
         )
-        
+        self.viz_loader = DataLoader(
+            self.eval_dataset,
+            batch_size=config['batch_size'],
+            shuffle=False,
+            num_workers=0,              # critical
+            collate_fn=safe_collate,
+            pin_memory=False            # critical
+        )
         # Initialize metrics tracking
         self.metrics_history = defaultdict(list)
         self.best_eval_loss = float('inf')
@@ -1062,11 +1131,12 @@ class DMCVBTrainer:
             # Move batch to device
             observations = batch['observations'].to(self.device)
             actions = batch['actions'].to(self.device)
-            
+            dones = batch['done'].to(self.device)
             # Training step
             losses = self.model.training_step_sequence(
                 observations=observations,
                 actions=actions,
+                dones= dones,
                 beta=beta_t,
                 n_critic=self.config['n_critic'],
                 lambda_img=self.config['lambda_img'],
@@ -1091,7 +1161,7 @@ class DMCVBTrainer:
                 if isinstance(value, torch.Tensor):
                     value = value.item()
                 epoch_metrics[key].append(value)
-            total_loss.append(losses['total_gen_loss'])
+            total_loss.append(losses['total_gen_loss'].item() if torch.is_tensor(losses['total_gen_loss']) else float(losses['total_gen_loss']))
             # Update progress bar
             pbar.set_postfix({
                 'total_loss': losses['total_gen_loss'],
@@ -1126,6 +1196,8 @@ class DMCVBTrainer:
         """Evaluate model performance"""
         self.model.eval()
         eval_metrics = defaultdict(list)
+        print(f"Examine code to see if I am getting consecutive frames within each sample.")
+        
         
         with torch.no_grad():
             pbar = tqdm(self.eval_loader, desc=f'Epoch {epoch} [Eval]')
@@ -1133,11 +1205,13 @@ class DMCVBTrainer:
             for batch in pbar:
                 observations = batch['observations'].to(self.device)
                 actions = batch['actions'].to(self.device)
+                dones = batch['done'].to(self.device)
                 
                 # Forward pass and compute losses
                 vae_losses, outputs = self.model.compute_total_loss(
                     observations=observations,
                     actions=actions,
+                    dones=dones,
                     beta=self.config.get('beta_eval', self.config.get('beta_max', 1.0)),
                     lambda_recon =self.config['lambda_recon'],
                 )
@@ -1148,13 +1222,10 @@ class DMCVBTrainer:
                         value = value.item()
                     eval_metrics[key].append(value)
                 
-                # Additional evaluation metrics
-                
                 # 1. Reconstruction quality (PSNR)
                 recon = outputs['reconstructions']
                 psnr = self.compute_psnr(observations, recon)
-                eval_metrics['psnr'].append(psnr.item())
-                
+                eval_metrics['psnr'].append(psnr.item())       
                 
         if epoch %10 == 0:
             with torch.no_grad():
@@ -1171,7 +1242,7 @@ class DMCVBTrainer:
             
             visualize_dpgmm_clustering(
                 model=self.model,
-                dataloader=self.eval_loader,
+                dataloader=self.viz_loader,
                 device=self.device,
                 max_batches=15,       # keep it cheap
                 max_samples=8000,
@@ -1219,6 +1290,7 @@ class DMCVBTrainer:
             actions=actions[:,:T_ctx + horizon],
             horizon=horizon,
             dones=dones[:, :T_ctx + horizon] if dones is not None else None,
+            grad=False,
         )
 
         def denorm(x):
@@ -1236,14 +1308,16 @@ class DMCVBTrainer:
 
         for i in range(num_rows):
             # Last context frame
-            ctx_last = denorm(observations[i, T_ctx - 1, :3])
-            gt_t1    = denorm(observations[i, T_ctx,     :3])
-            gt_t2    = denorm(observations[i, T_ctx + 1, :3])
+            ctx_last = denorm(observations[i, T_ctx - 1, -3:])
+            gt_t1    = denorm(observations[i, T_ctx,     -3:])
+            gt_t2    = denorm(observations[i, T_ctx + 1, -3:])
 
             # VAE-decoder predictions
-            vae_t1   = denorm(futures["vae_future"][i, 0, :3])
-            vae_t2   = denorm(futures["vae_future"][i, 1, :3])
 
+            vae_t1   = denorm(futures["vae_future"][i, 0, -3:])
+            vae_t2   = denorm(futures["vae_future"][i, 1, -3:])
+            C = futures["vae_future"].shape[2]
+            print("DEBUG: vae_future C =", C)
             def show(ax, img, title):
                 ax.imshow(img.permute(1, 2, 0).detach().cpu().numpy())
                 ax.set_title(title)
@@ -1294,6 +1368,9 @@ class DMCVBTrainer:
             act = batch["actions"][:max_B, :max_T].contiguous().to(
                 self.device, non_blocking=True
             )
+            done = batch["done"][:max_B, :max_T].contiguous().to(
+                self.device, non_blocking=True
+            )
 
             # Clear any stale grads
             self.model.zero_grad(set_to_none=True)
@@ -1308,6 +1385,7 @@ class DMCVBTrainer:
                 vae_losses, outputs = self.model.compute_total_loss(
                     obs,
                     act,
+                    done,
                     beta=self.config["beta"],
                     lambda_recon=self.config["lambda_recon"],
                 )
@@ -1420,6 +1498,7 @@ class DMCVBTrainer:
                 actions=actions[:, :T_ctx + 2],
                 horizon=2,
                 dones=dones[:, :T_ctx + 2],
+                grad=False,
             )
 
             # PSNR per step (reuse your compute_psnr which handles [-1,1])
@@ -1457,6 +1536,7 @@ class DMCVBTrainer:
         train_batch = next(iter(self.train_loader))
         train_obs    = train_batch['observations'].to(self.device)
         train_actions= train_batch['actions'].to(self.device)
+        train_dones = train_batch['done'].to(self.device)
 
         # random eval minibatch
         batch_idx = random.randint(0, len(self.eval_loader) - 1)
@@ -1465,6 +1545,7 @@ class DMCVBTrainer:
                 break
         eval_obs     = eval_batch['observations'].to(self.device)
         eval_actions = eval_batch['actions'].to(self.device)
+        eval_dones = eval_batch['done'].to(self.device)
 
         batch_size = min(train_obs.shape[0], eval_obs.shape[0], 4)  # cap at 4 rows per split
         n_cols = 3
@@ -1474,14 +1555,14 @@ class DMCVBTrainer:
 
 
         with torch.no_grad():
-            for split_idx, (observations, actions, split_name) in enumerate([
-                (train_obs[:batch_size], train_actions[:batch_size], "Train"),
-                (eval_obs[:batch_size],  eval_actions[:batch_size],  "Eval")
+            for split_idx, (observations, actions, dones, split_name) in enumerate([
+                (train_obs[:batch_size], train_actions[:batch_size], train_dones[:batch_size], "Train"),
+                (eval_obs[:batch_size],  eval_actions[:batch_size], eval_dones[:batch_size], "Eval")
             ]):
                 observations = observations.clamp(-1.0, 1.0)
 
                 # run model once to populate outputs and the posterior's slot maps/assignments
-                _, outputs = self.model.compute_total_loss(observations=observations, actions=actions)
+                _, outputs = self.model.compute_total_loss(observations=observations, actions=actions, dones=dones)
                 
 
                 for i in range(batch_size):
@@ -1578,7 +1659,6 @@ class DMCVBTrainer:
         print(f"Train dataset size: {len(self.train_dataset)}")
         print(f"Eval dataset size: {len(self.eval_dataset)}")
         # Register EMA model
-        self.model.ema_vdvae.register()
         self.model.ema_vdvae.register()
 
         for epoch in range(n_epochs):
@@ -1748,12 +1828,12 @@ def main():
         'policy_level': 'expert',
         
         # Model settings
-        'max_components': 17,
+        'max_components': 18,
         'latent_dim': 56,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
-        'prior_alpha': 20.0,  # Hyperparameters for prior
-        'prior_beta': 2.0,
+        'prior_alpha': 12.0,  # Hyperparameters for prior
+        'prior_beta': 1.0,
         'dropout': 0.1,
 
         # Training settings
@@ -1768,9 +1848,9 @@ def main():
         'n_epochs': 200,
         'num_workers': 4,
 
-        'beta_min': 0.75,
+        'beta_min': 0.7,
         'beta_max': 1.0,
-        'beta_warmup_epochs': 25,  # 20–50 is common
+        'beta_warmup_epochs': 20,  # 20–50 is common
         'beta_eval': 1.0,          # force eval to use full KL 
         
         # Loss weights

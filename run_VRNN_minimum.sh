@@ -51,6 +51,18 @@ python -m pip install seaborn
 
 #pip install -r requirements.txt --no-deps
 #gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium /home/memole/scratch/AIME/transition_data/dmc_vb/humanoid_walk
+python -X faulthandler - <<'PY'
+import os, torch
+print("python ok")
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+print("gpu:", torch.cuda.get_device_name(0))
+x = torch.randn(1024,1024, device="cuda")
+y = x @ x
+print("matmul ok:", y.mean().item())
+PY
+
 echo "pretrain VQVAE ....."
 #CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.pretrain_vqvae
 echo "finished pretraining and start training world model dpgmm vrnn model... " 
