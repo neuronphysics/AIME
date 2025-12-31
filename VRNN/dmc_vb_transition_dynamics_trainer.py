@@ -1023,6 +1023,7 @@ class DMCVBTrainer:
             data_dir=data_dir,
             domain_name=config['domain_name'],
             split='train',
+            policy_level =config['policy_level'],
             sequence_length=config['sequence_length'],
             frame_stack=config['frame_stack'],
             img_height=config['img_height'],
@@ -1240,19 +1241,20 @@ class DMCVBTrainer:
                      })
             save_path = str(self.ckpt_dir / f"dpgmm_prior_tsne_epoch_{epoch:04d}.png")
             
-            visualize_dpgmm_clustering(
-                model=self.model,
-                dataloader=self.viz_loader,
-                device=self.device,
-                max_batches=15,       # keep it cheap
-                max_samples=8000,
-                perplexity=30.0,
-                tsne_dims=3,
-                save_path=save_path,
-                image_level=False,     # start with image_level
-                t_select=0,            # choose which frame from the sequence
-                use_rnn_context= True
+            fig = visualize_dpgmm_clustering(
+                    model=self.model,
+                    dataloader=self.viz_loader,
+                    device=self.device,
+                    max_batches=15,       # keep it cheap
+                    max_samples=5000,
+                    perplexity=30.0,
+                    tsne_dims=3,
+                    save_path=save_path,
+                    image_level=False,     # start with image_level
+                    t_select=5,            # choose which frame from the sequence
+                    use_rnn_context= True
             )
+            plt.close(fig)
         # Compute averages
         avg_metrics = {f'eval/{k}': np.mean(v) for k, v in eval_metrics.items()}
         pred_metrics = self.evaluate_two_step_prediction(num_batches=5, T_ctx=8) 
@@ -1291,6 +1293,7 @@ class DMCVBTrainer:
             horizon=horizon,
             dones=dones[:, :T_ctx + horizon] if dones is not None else None,
             grad=False,
+            decode_mode="sample",
         )
 
         def denorm(x):
@@ -1316,8 +1319,7 @@ class DMCVBTrainer:
 
             vae_t1   = denorm(futures["vae_future"][i, 0, -3:])
             vae_t2   = denorm(futures["vae_future"][i, 1, -3:])
-            C = futures["vae_future"].shape[2]
-            print("DEBUG: vae_future C =", C)
+            
             def show(ax, img, title):
                 ax.imshow(img.permute(1, 2, 0).detach().cpu().numpy())
                 ax.set_title(title)
@@ -1499,6 +1501,7 @@ class DMCVBTrainer:
                 horizon=2,
                 dones=dones[:, :T_ctx + 2],
                 grad=False,
+                decode_mode="sample",
             )
 
             # PSNR per step (reuse your compute_psnr which handles [-1,1])
@@ -1727,7 +1730,7 @@ def parse_args():
     parser.add_argument("--task_name", type=str, default=None,
                         help="DMC task name (e.g. walk)")
     parser.add_argument("--policy_level", type=str, default=None,
-                        help="dataset policy level (expert / medium / random)")
+                        help="dataset policy level (expert / medium / random/ all)")
 
     # --- model ---
     parser.add_argument("--max_components", type=int, default=None)
@@ -1740,13 +1743,7 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--n_epochs", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
-    parser.add_argument(
-        "--grad_balance_method",
-        type=str,
-        choices=["mgda", "gradnorm", "rgb", "pcgrad", "none"],
-        default=None,
-        help="How to balance gradients across losses.",
-    )
+
     parser.add_argument("--use_dynamic_weight_average", type=str2bool, default=False )
 
     parser.add_argument("--beta_min", type=float, default=None)
@@ -1825,15 +1822,15 @@ def main():
         'data_dir': PARENT_DIR / "transition_data",
         'domain_name': 'humanoid',
         'task_name': 'walk',
-        'policy_level': 'expert',
+        'policy_level': 'all',
         
         # Model settings
         'max_components': 18,
         'latent_dim': 56,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
-        'prior_alpha': 12.0,  # Hyperparameters for prior
-        'prior_beta': 1.0,
+        'prior_alpha': 16.0,  # Hyperparameters for prior
+        'prior_beta': 2.0,
         'dropout': 0.1,
 
         # Training settings
@@ -1844,7 +1841,7 @@ def main():
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
-        'learning_rate': 0.0006,
+        'learning_rate': 0.00065,
         'n_epochs': 200,
         'num_workers': 4,
 

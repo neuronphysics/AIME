@@ -114,18 +114,20 @@ class DecBlock(nn.Module):
         use_3x3 = res > 2
         cond_width = int(width * H.bottleneck_multiple)
         self.zdim = H.zdim
-        self.enc = Block(width * 2, cond_width, H.zdim * 2, residual=False, use_3x3=use_3x3)
+        self.use_edge_conditioning = bool(getattr(H, "use_edge_conditioning", False))
+        # Set this to match e_warp channels (typically 1 for edge map, 2 for flow, etc.)
+        self.edge_channels = int(getattr(H, "edge_channels", 1))
+        enc_in_width = width * 2 + (self.edge_channels if self.use_edge_conditioning else 0)
+        self.enc = Block(enc_in_width, cond_width, H.zdim * 2, residual=False, use_3x3=use_3x3)
         # --- Temporal prior switch (Option B: no FiLM, no projection) ---
         # If H.use_temporal_priors is True, every NON-top stochastic block at this resolution
         # uses a *time-conditioned Gaussian prior*:
-        #
         #   p(z_t^(r) | x_t^(r), h_{t-1}^(r)) = N(mu(x,h), sigma^2(x,h))
-        #
         # We implement this by concatenating a broadcasted hidden map to x before the prior convs.
         self.use_temporal_priors = bool(getattr(H, "use_temporal_priors", False))
         self.action_dim = int(getattr(H, "action_dim", 0))
         self.use_temporal_prior = (bool(use_temporal_prior) and self.use_temporal_priors and (not self.is_top) and self.action_dim > 0)
-        prior_in_width = width + (width if self.use_temporal_prior else 0)
+        prior_in_width = width + (width if self.use_temporal_prior else 0) + (self.edge_channels if self.use_edge_conditioning else 0)
 
         self.prior = Block(prior_in_width, cond_width, H.zdim * 2 + width, residual=False, use_3x3=use_3x3, zero_last=True)
         self.z_proj = get_1x1(H.zdim, width)
@@ -133,20 +135,51 @@ class DecBlock(nn.Module):
         self.resnet = Block(width, cond_width, width, residual=True, use_3x3=use_3x3)
         self.resnet.c4.weight.data *= np.sqrt(1 / n_blocks)
         self.z_fn = lambda x: self.z_proj(x)
+        self.use_edge_conditioning = bool(getattr(H, "use_edge_conditioning", False))
+        self.edge_proj = get_1x1(self.edge_channels, width) if self.use_edge_conditioning else None
 
+    def _prep_edge(self, edge_guide: Optional[torch.Tensor], x: torch.Tensor) -> Optional[torch.Tensor]:
+        """edge_guide: [B,Ce,H0,W0] or [B,H0,W0,Ce] -> edge_map [B,Ce,H,W] matching x spatial size."""
+        if not self.use_edge_conditioning:
+            return None
+        if edge_guide is None:
+            # t=0 / reset: keep channel dims consistent by using zeros
+            return torch.zeros(x.shape[0], self.edge_channels, x.shape[2], x.shape[3],device=x.device, dtype=x.dtype )           
+        if edge_guide.dim() != 4:
+            raise ValueError(f"edge_guide must be 4D, got {tuple(edge_guide.shape)}")
 
-    def sample(self, x, acts):
+        # Accept NCHW or NHWC
+        if edge_guide.shape[1] == self.edge_channels:
+            edge = edge_guide
+        elif edge_guide.shape[-1] == self.edge_channels:
+            edge = edge_guide.permute(0, 3, 1, 2).contiguous()
+        else:
+            raise ValueError(
+                f"edge_guide channel mismatch: expected Ce={self.edge_channels}, got {tuple(edge_guide.shape)}"
+            )
+
+        edge = edge.to(device=x.device, dtype=x.dtype)
+        if edge.shape[2:] != x.shape[2:]:
+            edge = F.interpolate(edge, size=x.shape[2:], mode="nearest")
+        return edge
+
+    def sample(self, x, acts, edge_guide: Optional[torch.Tensor] = None):
+
         """Posterior sample z ~ q(z|x,enc_act) and compute Gaussian KL against the block prior.
         - For the top block, we do not use the Gaussian KL (because top prior is DPGMM).
           We return kl=0 for the top block, and VDVAE computes the DPGMM KL separately.
         """
         enc_in = torch.cat([x, acts], dim=1)
+        edge_map = self._prep_edge(edge_guide, x)
+        if edge_map is not None:
+            enc_in = torch.cat([enc_in, edge_map], dim=1)
+
         if self.training and self.use_checkpoint:
             qm, qv = ckpt(self.enc, enc_in, use_reentrant=False).chunk(2, dim=1)
-            feats = self._prior_forward(x, None)
+            feats = self._prior_forward(x, None, edge_map =edge_map)
         else:
             qm, qv = self.enc(enc_in).chunk(2, dim=1)
-            feats = self._prior_forward(x, None)
+            feats = self._prior_forward(x, None, edge_map =edge_map)
 
         pm = feats[:, :self.zdim, ...]
         pv = feats[:, self.zdim:self.zdim * 2, ...]
@@ -163,9 +196,10 @@ class DecBlock(nn.Module):
         return z, x, kl, qm, qv
 
 
-    def sample_uncond(self, x, t=None, lvs=None):
+    def sample_uncond(self, x, t=None, lvs=None, edge_guide: Optional[torch.Tensor] = None):
         n, c, h, w = x.shape
-        feats = self._prior_forward(x, None)
+        edge_map = self._prep_edge(edge_guide, x)
+        feats = self._prior_forward(x, None, edge_map =edge_map)
         pm, pv, xpp = feats[:, :self.zdim, ...], feats[:, self.zdim:self.zdim * 2, ...], feats[:, self.zdim * 2:, ...]
         x = x + xpp
         if lvs is not None:
@@ -186,7 +220,7 @@ class DecBlock(nn.Module):
         B, C, H, W = z_map.shape
         return z_map.permute(0, 2, 3, 1).contiguous().view(B * H * W, C)
     
-    def _prior_forward(self, x: torch.Tensor, h_map: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _prior_forward(self, x: torch.Tensor, h_map: Optional[torch.Tensor] = None, edge_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Run the Gaussian prior conv tower.
         If self.use_temporal_prior is True, the prior is conditioned on:
           - x:     current decoder feature map            [B, width, H, W]
@@ -221,11 +255,17 @@ class DecBlock(nn.Module):
             prior_in = torch.cat([x, h_map], dim=1)   # [B, 2*width, H, W]
         else:
             prior_in = x
+        if self.use_edge_conditioning:
+            if edge_map is None:
+                # if enabled but missing, use zeros so shapes stay consistent
+                edge_map = torch.zeros(x.shape[0], self.edge_channels, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
+            prior_in = torch.cat([prior_in, edge_map], dim=1)
+            
         if self.training and self.use_checkpoint:
             return ckpt(self.prior, prior_in, use_reentrant=False)
         return self.prior(prior_in)
  
-    def sample_temporal(self, x: torch.Tensor, enc_act: torch.Tensor, h_map: torch.Tensor):
+    def sample_temporal(self, x: torch.Tensor, enc_act: torch.Tensor, h_map: torch.Tensor, edge_guide: Optional[torch.Tensor] = None):
         """Posterior sample + KL against a *time-conditioned* Gaussian prior.
 
         Args:
@@ -240,12 +280,16 @@ class DecBlock(nn.Module):
           qm/qv: posterior parameters                                    [B,zdim,H,W]
         """
         enc_in = torch.cat([x, enc_act], dim=1)
+        edge_map = self._prep_edge(edge_guide, x)
+        if edge_map is not None:
+            enc_in = torch.cat([enc_in, edge_map], dim=1)
+
         if self.training and self.use_checkpoint:
             qm, qv = ckpt(self.enc, enc_in, use_reentrant=False).chunk(2, dim=1)
-            feats = self._prior_forward(x, h_map)
+            feats = self._prior_forward(x, h_map, edge_map =edge_map)
         else:
             qm, qv = self.enc(enc_in).chunk(2, dim=1)
-            feats = self._prior_forward(x, h_map)
+            feats = self._prior_forward(x, h_map, edge_map=edge_map)
 
         pm = feats[:, :self.zdim, ...]
         pv = feats[:, self.zdim:self.zdim * 2, ...]
@@ -260,14 +304,15 @@ class DecBlock(nn.Module):
         return z, x, kl, qm, qv
 
 
-    def sample_uncond_temporal(self, x: torch.Tensor, h_map: torch.Tensor, t: Optional[float] = None, lvs=None, temperature: float = 1.0):
+    def sample_uncond_temporal(self, x: torch.Tensor, h_map: torch.Tensor, t: Optional[float] = None, lvs=None, temperature: float = 1.0, edge_guide: Optional[torch.Tensor] = None):
         """Prior sample from a *time-conditioned* Gaussian prior.
 
         Args:
           x:     decoder feature map at this block         [B,width,H,W]
           h_map: temporal hidden map h_{t-1}^(r)           [B,width,H,W]
         """
-        feats = self._prior_forward(x, h_map)
+        edge_map = self._prep_edge(edge_guide, x)
+        feats = self._prior_forward(x, h_map, edge_map=edge_map)
         pm = feats[:, :self.zdim, ...]
         pv = feats[:, self.zdim:self.zdim * 2, ...]
         xpp = feats[:, self.zdim * 2:, ...]
@@ -292,6 +337,7 @@ class DecBlock(nn.Module):
         temporal_state: Optional[Tuple[torch.Tensor, torch.Tensor]],
         a_t: torch.Tensor,
         mask_t: Optional[torch.Tensor] = None,
+        edge_guide: Optional[torch.Tensor] = None,
         get_latents: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """Teacher-forced temporal forward for the first stochastic block at a resolution."""
@@ -301,7 +347,7 @@ class DecBlock(nn.Module):
 
         B, _, H, W = x.shape
         if temporal_state is None:
-            h_prev = torch.zeros(B, temporal_cell.hidden_dim, H, W, device=x.device, dtype=x.dtype)  #TODO: is self.width correct?
+            h_prev = torch.zeros(B, temporal_cell.hidden_dim, H, W, device=x.device, dtype=x.dtype)  
             c_prev = torch.zeros(B, temporal_cell.hidden_dim, H, W, device=x.device, dtype=x.dtype)
         else:
             h_prev, c_prev = temporal_state
@@ -311,7 +357,7 @@ class DecBlock(nn.Module):
             h_prev = h_prev * keep
             c_prev = c_prev * keep
 
-        z, x, kl, qm, qv = self.sample_temporal(x, acts, h_map=h_prev)
+        z, x, kl, qm, qv = self.sample_temporal(x, acts, h_map=h_prev, edge_guide =edge_guide)
         stats = {'kl': kl, 'posterior_mean': qm, 'posterior_logvar': qv}
 
         action_dim = int(a_t.shape[-1])
@@ -336,6 +382,7 @@ class DecBlock(nn.Module):
         temporal_state: Optional[Tuple[torch.Tensor, torch.Tensor]],
         a_t: torch.Tensor,
         mask_t: Optional[torch.Tensor] = None,
+        edge_guide: Optional[torch.Tensor] = None,
         t: Optional[float] = None,
         lvs: Optional[torch.Tensor] = None,
         temperature: float = 1.0,
@@ -361,7 +408,7 @@ class DecBlock(nn.Module):
             h_prev = h_prev * keep
             c_prev = c_prev * keep
         # sample z from prior p(z|x, h_prev)
-        z, x = self.sample_uncond_temporal(x, h_prev, t=t, lvs=lvs, temperature=temperature)
+        z, x = self.sample_uncond_temporal(x, h_prev, t=t, lvs=lvs, temperature=temperature, edge_guide=edge_guide)
 
         action_dim = int(a_t.shape[-1])
         a_map = a_t.view(B, action_dim, 1, 1).to(device=x.device, dtype=x.dtype).expand(B, action_dim, H, W)
@@ -386,11 +433,11 @@ class DecBlock(nn.Module):
             x = x.repeat(acts.shape[0], 1, 1, 1)
         return x, acts
 
-    def forward(self, xs, activations, get_latents=False):
+    def forward(self, xs, activations, edge_guide: Optional[torch.Tensor] = None, get_latents=False):
         x, acts = self.get_inputs(xs, activations)
         if self.mixin is not None:
             x = x + F.interpolate(xs[self.mixin][:, :x.shape[1], ...], scale_factor=self.base // self.mixin)
-        z, x, kl, qm, qv = self.sample(x, acts)
+        z, x, kl, qm, qv = self.sample(x, acts, edge_guide=edge_guide)
         x = x + self.z_fn(z)
         if self.training and self.use_checkpoint:
             x = ckpt(self.resnet, x, use_reentrant=False)
@@ -403,7 +450,7 @@ class DecBlock(nn.Module):
             return xs, stats
         return xs, stats
 
-    def forward_uncond(self, xs, t=None, lvs=None):
+    def forward_uncond(self, xs, t=None, lvs=None, edge_guide: Optional[torch.Tensor] = None):
         try:
             x = xs[self.base]
         except KeyError:
@@ -411,7 +458,7 @@ class DecBlock(nn.Module):
             x = torch.zeros(dtype=ref.dtype, size=(ref.shape[0], self.widths[self.base], self.base, self.base), device=ref.device)
         if self.mixin is not None:
             x = x + F.interpolate(xs[self.mixin][:, :x.shape[1], ...], scale_factor=self.base // self.mixin)
-        z, x = self.sample_uncond(x, t, lvs=lvs)
+        z, x = self.sample_uncond(x, t, lvs=lvs, edge_guide=edge_guide)
         x = x + self.z_fn(z)
         x = self.resnet(x)
         xs[self.base] = x
@@ -488,11 +535,11 @@ class Decoder(HModule):
         self.bias = nn.Parameter(torch.zeros(1, H.width, 1, 1))
         self.final_fn = lambda x: x * self.gain + self.bias
 
-    def forward(self, activations, get_latents=False):
+    def forward(self, activations, edge_guide: Optional[torch.Tensor] = None, get_latents=False):
         stats = []
         xs = {a.shape[2]: a for a in self.bias_xs}
         for block in self.dec_blocks:
-            xs, block_stats = block(xs, activations, get_latents=get_latents)
+            xs, block_stats = block(xs, activations, edge_guide=edge_guide, get_latents=get_latents)
             stats.append(block_stats)
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
         return xs[self.H.image_size], stats
@@ -542,6 +589,7 @@ class Decoder(HModule):
         temporal_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
         a_t: torch.Tensor,
         mask_t: torch.Tensor,
+        edge_guide: Optional[torch.Tensor] = None,
         get_latents: bool = False,
     ):
         """Decode ONE frame (teacher-forced) while using temporal priors for lower layers."""
@@ -552,11 +600,11 @@ class Decoder(HModule):
                 key = str(block.base)
                 rnn = self.temporal_cells[key]
                 st = temporal_state[key]
-                xs, st_dict, st_new = block.forward_temporal(xs, activations, rnn, st, a_t, mask_t, get_latents=get_latents)
+                xs, st_dict, st_new = block.forward_temporal(xs, activations, rnn, st, a_t, mask_t, edge_guide=edge_guide, get_latents=get_latents)
                 temporal_state[key] = st_new
                 stats.append(st_dict)
             else:
-                xs, st_dict = block(xs, activations, get_latents=get_latents)
+                xs, st_dict = block(xs, activations, edge_guide=edge_guide, get_latents=get_latents)
                 stats.append(st_dict)
 
         px_z = self.final_fn(xs[self.H.image_size])
@@ -569,6 +617,7 @@ class Decoder(HModule):
         temporal_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
         a_t: torch.Tensor,
         mask_t: torch.Tensor,
+        edge_guide: Optional[torch.Tensor] = None,
         t: Optional[float] = None,
         temperature : float=1.0,
     ):
@@ -579,17 +628,17 @@ class Decoder(HModule):
 
         for block, lvs in itertools.zip_longest(self.dec_blocks, latents):
             if getattr(block, "is_top", False):
-                xs = block.forward_uncond(xs, t=t, lvs=lvs)
+                xs = block.forward_uncond(xs, t=t, lvs=lvs, edge_guide=edge_guide)
                 continue
 
             if self.use_temporal_priors and block.use_temporal_prior:
                 key = str(block.base)
                 rnn = self.temporal_cells[key]
                 st = temporal_state[key]
-                xs, st_new = block.forward_uncond_temporal(xs, rnn, st, a_t, mask_t, t=t, lvs=lvs, temperature= temperature)
+                xs, st_new = block.forward_uncond_temporal(xs, rnn, st, a_t, mask_t, edge_guide=edge_guide, t=t, lvs=lvs, temperature= temperature)
                 temporal_state[key] = st_new
             else:
-                xs = block.forward_uncond(xs, t=t, lvs=lvs)
+                xs = block.forward_uncond(xs, t=t, lvs=lvs, edge_guide=edge_guide)
 
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
         return xs[self.H.image_size], temporal_state
@@ -648,6 +697,7 @@ class VDVAE(HModule):
         a_t: torch.Tensor,         # [B, action_dim]
         mask_t: torch.Tensor,      # [B] float {0,1}
         temporal_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+        edge_guide: Optional[torch.Tensor] = None,
         get_latents: bool = False,
     ):
         """Teacher-forced forward for ONE time step with temporal lower priors.
@@ -660,6 +710,7 @@ class VDVAE(HModule):
             temporal_state=temporal_state,
             a_t=a_t,
             mask_t=mask_t,
+            edge_guide=edge_guide,
             get_latents=get_latents,
         )
 
@@ -742,6 +793,7 @@ class VDVAE(HModule):
         a_t: torch.Tensor,         # [B,action_dim]
         mask_t: torch.Tensor,      # [B]
         temporal_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+        e_warp: Optional[torch.Tensor] = None,
         t: Optional[float] = None,
         temperature: float = 1.0,
     ):
@@ -756,6 +808,7 @@ class VDVAE(HModule):
             temporal_state=temporal_state,
             a_t=a_t,
             mask_t=mask_t,
+            edge_guide=e_warp,
             t=t,
             temperature = temperature
         )

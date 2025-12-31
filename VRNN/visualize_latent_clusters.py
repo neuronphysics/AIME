@@ -441,9 +441,7 @@ def extract_latents_and_assignments(
     return out
 
 
-# -----------------------------
 # Main visualization
-# -----------------------------
 def visualize_dpgmm_clustering(
     model,
     dataloader,
@@ -465,10 +463,8 @@ def visualize_dpgmm_clustering(
       (2) t-SNE by ground truth label (if available) OR confidence map
       (3) component utilization
       (4) assignment confidence + effective-K distribution
-      (5) exemplar grid (most-used components)
+      (5) UMAP by component
       (6) metrics summary
-
-    Note: `tsne_dims=3` gives 3D Matplotlib scatter; for nicer 3D, pass `save_html_path`.
     """
     model.eval()
 
@@ -485,32 +481,87 @@ def visualize_dpgmm_clustering(
         n_exemplars_per_component=6,
     )
 
-    latents = data["latents"]
-    assignments = data["assignments"].astype(np.int64)
-    pi = data["pi"].astype(np.float32)
+    # --- Load arrays ---
+    latents = np.asarray(data["latents"], dtype=np.float32)
+    assignments = np.asarray(data["assignments"], dtype=np.int64)
+    pi = np.asarray(data["pi"], dtype=np.float32)
     labels = data.get("labels", None)
+    if labels is not None:
+        labels = np.asarray(labels)
 
+    # --- Sanity checks: pi must align with latents ---
+    if pi.ndim != 2:
+        raise ValueError(f"[viz] Expected pi to be 2D [N,K], got pi.shape={pi.shape}")
+    if latents.ndim != 2:
+        raise ValueError(f"[viz] Expected latents to be 2D [N,D], got latents.shape={latents.shape}")
+    if pi.shape[0] != latents.shape[0] or assignments.shape[0] != latents.shape[0]:
+        raise ValueError(
+            f"[viz] Shape mismatch: latents={latents.shape}, assignments={assignments.shape}, pi={pi.shape}"
+        )
+
+    N = latents.shape[0]
+    K = pi.shape[1]
+
+    # --- Mask out any bad rows (NaN/Inf) + invalid assignment indices ---
+    finite_lat = np.isfinite(latents).all(axis=1)                 # [N]
+    finite_pi  = np.isfinite(pi).all(axis=1)                      # [N]
+    valid_asg  = (assignments >= 0) & (assignments < K)           # [N]
+
+    mask = finite_lat & finite_pi & valid_asg
+
+    if labels is not None:
+        # support labels as [N] or [N, ...]
+        if labels.shape[0] != N:
+            raise ValueError(f"[viz] labels has wrong first dim: labels.shape={labels.shape}, expected {N}")
+        finite_lab = np.isfinite(labels).all(axis=1) if labels.ndim > 1 else np.isfinite(labels)
+        mask &= finite_lab
+
+    dropped = int((~mask).sum())
+    if dropped > 0:
+        print(f"[viz] Dropping {dropped}/{N} points due to NaN/Inf or invalid assignment.")
+
+        latents = latents[mask]
+        assignments = assignments[mask]
+        pi = pi[mask]
+        if labels is not None:
+            labels = labels[mask]
+
+    latents = np.ascontiguousarray(latents, dtype=np.float32)
+    pi = np.ascontiguousarray(pi, dtype=np.float32)
+
+    # Not enough points?
     if latents.shape[0] < 5:
-        raise ValueError("Not enough points for t-SNE. Increase max_batches or ensure dataloader yields data.")
+        raise ValueError("[viz] Not enough valid points for t-SNE after filtering. (Need >= 5)")
 
-    # t-SNE (2D or 3D)
+    # --- t-SNE dims ---
     tsne_dims = int(2 if tsne_dims is None else tsne_dims)
     tsne_dims = 3 if tsne_dims == 3 else 2
+
+    # --- Clamp perplexity to safe range for current N ---
+    # sklearn t-SNE requires perplexity < n_samples
+    n_pts = latents.shape[0]
+    max_perp = max(2.0, (n_pts - 1) / 3.0)
+    if perplexity > max_perp:
+        print(f"[viz] Clamping perplexity {perplexity:.2f} -> {max_perp:.2f} (n_points={n_pts}).")
+        perplexity = float(max_perp)
+
+    # --- t-SNE embedding ---
     emb, idx = compute_tsne_embedding(
         latents,
         max_samples=max_samples,
-        perplexity=perplexity,
+        perplexity=float(perplexity),
         pca_dims=50,
         random_state=42,
         n_components=tsne_dims,
         standardize=True,
     )
 
+    # idx indexes into *filtered* arrays (latents/assignments/pi/labels)
     assign_s = assignments[idx]
     pi_s = pi[idx]
     labels_s = labels[idx] if labels is not None else None
 
-    n_components = pi_s.shape[-1]
+    n_components = pi_s.shape[-1]  # should be K
 
     # Colors
     colors = plt.cm.tab20(np.linspace(0, 1, min(20, max(1, n_components))))
@@ -553,7 +604,6 @@ def visualize_dpgmm_clustering(
             cbar.set_ticklabels([class_names[int(u)] for u in uniq])
         ax2.set_title("t-SNE by Ground Truth Label", fontsize=11)
     else:
-        # Confidence: pi at assigned component
         conf = pi_s[np.arange(pi_s.shape[0]), assign_s]
         if tsne_dims == 3:
             sc2 = ax2.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=conf, cmap="viridis", s=6, alpha=0.75)
@@ -565,7 +615,7 @@ def visualize_dpgmm_clustering(
 
     ax2.set_xlabel("t-SNE 1"); ax2.set_ylabel("t-SNE 2")
 
-    # (3) Component utilization
+    # (3) Component utilization (use ALL filtered points, not just idx)
     ax3 = fig.add_subplot(2, 3, 3)
     counts = np.bincount(assignments, minlength=max(1, n_components)).astype(np.float64)
     frac = counts / max(1.0, counts.sum())
@@ -588,15 +638,14 @@ def visualize_dpgmm_clustering(
     ax4.legend(fontsize=9)
     ax4.grid(True, alpha=0.25)
 
-    # (5) Exemplars (top-used components)
+    # (5) UMAP by component (on the same sampled points idx used for t-SNE)
     ax5 = fig.add_subplot(2, 3, 5)
-    ex_imgs = data.get("exemplar_images", None)
-    ex_sco = data.get("exemplar_scores", None)
     umap_emb = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, random_state=42).fit_transform(latents[idx])
     sc5 = ax5.scatter(umap_emb[:, 0], umap_emb[:, 1], c=assign_s, cmap=cmap, s=8, alpha=0.7)
     ax5.set_xlabel("UMAP 1"); ax5.set_ylabel("UMAP 2")
     ax5.set_title("UMAP by DPGMM Component", fontsize=11)
     plt.colorbar(sc5, ax=ax5, label="Component")
+
     # (6) Metrics summary
     ax6 = fig.add_subplot(2, 3, 6)
     ax6.axis("off")
@@ -606,7 +655,7 @@ def visualize_dpgmm_clustering(
     util_entropy = float(_entropy(frac[frac > 0])[()] / math.log(max(2, (frac > 0).sum()))) if (frac > 0).sum() > 1 else 0.0
 
     metrics_text = [
-        f"Points (used for t-SNE): {emb.shape[0]} / total: {latents.shape[0]}",
+        f"Points (used for t-SNE): {emb.shape[0]} / total(valid): {latents.shape[0]}",
         f"K (seen): {n_components}",
         f"Active K (> {active_thresh*100:.0f}%): {k_active}",
         f"Mean confidence: {float(np.nanmean(conf_all)):.3f}",
@@ -625,8 +674,10 @@ def visualize_dpgmm_clustering(
         ami = float(adjusted_mutual_info_score(labels.astype(int), assignments.astype(int)))
         metrics_text.append(f"AMI(label, cluster): {ami:.3f}")
 
-    ax6.text(0.05, 0.95, "Clustering diagnostics", fontsize=14, fontweight="bold", va="top", transform=ax6.transAxes)
-    ax6.text(0.05, 0.85, "\n".join(metrics_text), fontsize=10.5, family="monospace", va="top", transform=ax6.transAxes)
+    ax6.text(0.05, 0.95, "Clustering diagnostics", fontsize=14, fontweight="bold",
+             va="top", transform=ax6.transAxes)
+    ax6.text(0.05, 0.85, "\n".join(metrics_text), fontsize=10.5, family="monospace",
+             va="top", transform=ax6.transAxes)
 
     title = f"DPGMM Latent Space (image_level={image_level}, t={t_select}, tsne_dims={tsne_dims})"
     if nmi is not None:
@@ -638,16 +689,14 @@ def visualize_dpgmm_clustering(
     if save_path is not None:
         fig.savefig(save_path, dpi=200, bbox_inches="tight")
 
-
-
     # Avoid leaking figures in long-running training jobs (common when using Agg).
     try:
-        if save_path is not None and "agg" in matplotlib.get_backend().lower():
+        if "agg" in matplotlib.get_backend().lower():
             plt.close(fig)
     except Exception:
         pass
-    return fig
 
+    return fig
 
 
 # -----------------------------
