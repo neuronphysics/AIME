@@ -731,7 +731,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
     def _init_motion_scaffold(self, flow_proj:int=64):
         # 1) differentiable canny (returns continuous thin edges)
-        self.canny = CannyFilter(use_cuda=(self.device.type == "cuda"))
+        self.canny = CannyFilter(k_gaussian=3, sigma=1.5, use_cuda=(self.device.type == "cuda"))
         
         for p in self.canny.parameters():  # redundant but explicit
             p.requires_grad_(False)
@@ -776,17 +776,20 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.image_channels = self.input_channels   # usually 3
         H.zdim = self.latent_dim                 # or set explicitly (e.g., 16)
         H.bottleneck_multiple = 0.25
-        H.width = 256
+        H.width = 196
         H.image_size = self.image_size          # e.g. 64
         H.dataset = 'imagenet64'
         H.num_mixtures = 10
         H.skip_threshold = 300.0
-        H.dec_blocks = "1x4,4m1,4x4,8m4,8x4,16m8,16x4,32m16,32x4,64m32,64x2"
-        H.enc_blocks = "64x2,64d2,32x4,32d2,16x4,16d2,8x4,8d2,4x4,4d4,1x4"
+        H.dec_blocks = "4x2,8m4,8x4,16m8,16x4,32m16,32x4,64m32,64x2"
+        H.enc_blocks = "64x2,64d2,32x4,32d2,16x4,16d2,8x4,8d2,4x2"
+
         H.temporal_n_lstm_layers = 1
         H.temporal_use_orthogonal = True
         H.temporal_kernel_size = 3
         H.use_edge_conditioning = True
+        H.edge_condition_min_res = 32
+
         H.edge_channels = 1 
         H.no_bias_above = 64
         H.custom_width_str = ""
@@ -1122,7 +1125,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if disc_params:
                 self.img_disc_optimizer = torch.optim.Adamax(
                     disc_params,
-                    lr=learning_rate * 0.25,
+                    lr=learning_rate * 0.2,
                     betas=(0.0, 0.9),
                     weight_decay=5e-5,
                 )
@@ -1231,14 +1234,19 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 with torch.no_grad():
                     x_prev = observations[:, t - 1]  # [B,C,H,W] in [-1,1]
                     x_prev01 = self.denormalize_generated_images(x_prev).clamp(0.0, 1.0)
-                    e_prev = self.canny(x_prev01)  # [B,1,H,W] in [0,1]
+                    e_prev = self.canny(
+                        x_prev01,
+                        low_threshold=0.145,
+                        high_threshold=0.228,
+                        hysteresis=True,
+                    )
                     B_, _, H_, W_ = x_prev.shape
-                    ctx = self.flow_ctx_proj(h_context).view(B_, -1, 1, 1).expand(B_, -1, H_, W_)
-                    flow_in = torch.cat([x_prev01, e_prev, ctx], dim=1)
-                    max_flow = 0.25 * float(max(H_, W_))
-                    flow = torch.tanh(self.flow_head(flow_in)) * max_flow
-                    edge_guide = self.warp(e_prev, flow) #[B,1,H,W]
-                    edge_guide = edge_guide * mask_t.view(batch_size, 1, 1, 1) 
+                ctx = self.flow_ctx_proj(h_context).view(B_, -1, 1, 1).expand(B_, -1, H_, W_)
+                flow_in = torch.cat([x_prev01.detach(), e_prev, ctx], dim=1)
+                max_flow = 0.25 * float(max(H_, W_))
+                flow = torch.tanh(self.flow_head(flow_in)) * max_flow
+                edge_guide = self.warp(e_prev, flow) #[B,1,H,W]
+                edge_guide = edge_guide * mask_t.view(batch_size, 1, 1, 1) 
             elif self.use_edge_conditioning and (t == 0):
                 B_, _, H_, W_ = x_t.shape
                 with torch.no_grad():
@@ -1427,7 +1435,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         fake_images: torch.Tensor, #[B, T, C, H, W]
         latents: torch.Tensor,  #[B, T, Z]
         sequence_lengths: Optional[torch.Tensor] = None,
-        WGAN_GP_Coeff: float = 5.0,
+        WGAN_GP_Coeff: float = 10.0,
     ) -> Dict[str, torch.Tensor]:
         """
         Training step for both discriminators
@@ -1584,9 +1592,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                             dones: torch.Tensor = None,
                             beta: float = 1.0,
                             n_critic: int = 3,
-                            lambda_img: float = 0.2,
+                            lambda_img: float = 0.5,
                             lambda_recon: float = 1.0,
-                            lambda_edge: float = 0.05,
+                            lambda_edge: float = 0.4,
                             batch_idx: Optional[int] = None,
                             ) -> Dict[str, torch.Tensor]:
         """
@@ -1754,8 +1762,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             fake_flat = fake01.reshape(Bf * Tf, C, H, W)
             real_flat = real01.reshape(Bf * Tf, C, H, W)
 
-            edge_fake = self.canny(fake_flat)   # [Bf*Tf,1,H,W]
-            edge_real = self.canny(real_flat)
+            edge_fake = self.canny(fake_flat,
+                                    low_threshold=0.145,
+                                    high_threshold=0.228,
+                                    hysteresis=True,
+                                    )   # [Bf*Tf,1,H,W]
+            edge_real = self.canny(real_flat, low_threshold=0.145, high_threshold=0.228,hysteresis=True)
 
             # mask out padded future frames using seq_len_future
             t = torch.arange(Tf, device=observations.device)[None, :]          # [1,Tf]
@@ -2017,7 +2029,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 #  2) motion scaffold: predict flow + mask from (x_prev, edges(x_prev), h_context) 
                 # CannyFilter returns continuous thin edges [B,1,H,W]. 
                 x_prev01 =self.denormalize_generated_images(x_prev).clamp(0.0, 1.0)
-                e_prev = self.canny(x_prev01).detach()
+                e_prev = self.canny(x_prev01,
+                                    low_threshold=0.145,
+                                    high_threshold=0.228,
+                                    hysteresis=True,).detach()
 
                 ctx = self.flow_ctx_proj(h_context)  # [B, flow_ctx_dim]
                 ctx_map = ctx[:, :, None, None].expand(-1, -1, x_prev.shape[2], x_prev.shape[3])

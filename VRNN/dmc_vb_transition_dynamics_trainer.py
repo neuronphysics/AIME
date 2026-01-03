@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 import wandb
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 from collections import defaultdict
 import time, contextlib
 import tensorflow as tf
@@ -50,7 +49,45 @@ PARENT_DIR = SCRIPT_DIR.parent
 print("Script dir:", SCRIPT_DIR)
 print("Parent dir:", PARENT_DIR)
 matplotlib.use("Agg", force=True)
+import matplotlib.pyplot as plt
 plt.ioff()
+
+def print_vdvae_edge_report(model):
+    H = model.vdvae.H
+    min_res = int(getattr(H, "edge_condition_min_res", 32))
+    print(f"\n[VDVAE edge report] use_edge_conditioning={getattr(H,'use_edge_conditioning',False)} "
+          f"edge_condition_min_res={min_res}\n")
+
+    for i, blk in enumerate(model.decoder.dec_blocks):
+        res = int(getattr(blk, "base", -1))
+        is_top = bool(getattr(blk, "is_top", False))
+        edge_on = bool(getattr(blk, "use_edge_conditioning", False))
+        edge_ch = int(getattr(blk, "edge_channels", -1))
+
+        # width at this resolution (DecBlock stores widths dict)
+        width = blk.widths[res] if hasattr(blk, "widths") and res in blk.widths else None
+
+        enc_in  = blk.enc.c1.in_channels
+        prior_in = blk.prior.c1.in_channels
+
+        edge_proj = getattr(blk, "edge_proj", None)
+        edge_proj_state = "None" if edge_proj is None else "ON"
+
+        print(f"[{i:02d}] res={res:>3} is_top={is_top} edge={edge_on} edge_ch={edge_ch} "
+              f"enc_in={enc_in} prior_in={prior_in} edge_proj={edge_proj_state}")
+
+        # Strong sanity checks for your rule: NO edges when res < 32
+        if res < min_res:
+            if edge_on or edge_proj is not None:
+                print("   !!! ERROR: edge conditioning is enabled here but should be OFF (res < min_res)")
+            if width is not None and enc_in != 2 * width:
+                print(f"   !!! ERROR: enc_in should be {2*width} (width*2) when edge is OFF")
+            # prior_in may include temporal width if you use temporal priors at this res
+            # so only check the ">= width" and "not including edges" aspect:
+            if width is not None and prior_in < width:
+                print(f"   !!! ERROR: prior_in looks too small (expected at least width={width})")
+
+    print("")
 
 
 @contextmanager
@@ -993,6 +1030,39 @@ def pick_bt(tensor_bt, i, t):
     else:
         raise ValueError(f"Unexpected ndim={tensor_bt.ndim} in pick_bt")
 
+
+def _to_01(x: torch.Tensor, name: str, tol: float = 1e-3, verbose: bool = False):
+    """
+    Convert an image tensor to [0,1] if it appears to be in [-1,1] or [0,255].
+    Leaves it unchanged if it already appears in [0,1].
+    """
+    x = x.float()
+    mn = x.amin().item()
+    mx = x.amax().item()
+
+    mode = "as_is_[0,1]"
+    x01 = x
+
+    # uint8 or clearly 0..255-ish
+    if x.dtype == torch.uint8 or mx > 1.5:
+        # common case: 0..255
+        scale = 255.0 if mx <= 255.0 + tol else mx
+        x01 = x / scale
+        mode = f"scaled_[0,{int(scale)}]->[0,1]"
+
+    # [-1,1]-ish
+    elif mn < -0.1:
+        x01 = (x + 1.0) * 0.5
+        mode = "scaled_[-1,1]->[0,1]"
+
+    # else: assume [0,1]
+    x01 = x01.clamp(0.0, 1.0)
+
+    if verbose:
+        print(f"[PSNR] {name}: min={mn:.4f}, max={mx:.4f}, mode={mode}")
+
+    return x01
+
 class DMCVBTrainer:
     """Trainer for DPGMM-VRNN on DMC Vision Benchmark"""
     
@@ -1011,12 +1081,12 @@ class DMCVBTrainer:
         self.ckpt_dir = Path(config.get("ckpt_dir", default_ckpt_dir))
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         common_transform =HumanoidAwareZoomTransform(
-                    zoom_prob=0.8,
-                    area_range=(0.35, 0.65),
+                    zoom_prob=0.6,
+                    area_range=(0.6, 0.85),
                     center_key="attn_center",  # optional; must be normalized [-1,1] xy
                     interpolation="lanczos",
-                    corner_min=0.80,
-                    corner_max=0.95,
+                    corner_min=0.70,
+                    corner_max=0.85,
                 )
         # Setup datasets
         self.train_dataset = DMCVBDataset(
@@ -1225,7 +1295,7 @@ class DMCVBTrainer:
                 
                 # 1. Reconstruction quality (PSNR)
                 recon = outputs['reconstructions']
-                psnr = self.compute_psnr(observations, recon)
+                psnr = self.compute_psnr(observations, recon, dones)
                 eval_metrics['psnr'].append(psnr.item())       
                 
         if epoch %10 == 0:
@@ -1241,7 +1311,8 @@ class DMCVBTrainer:
                      })
             save_path = str(self.ckpt_dir / f"dpgmm_prior_tsne_epoch_{epoch:04d}.png")
             
-            fig = visualize_dpgmm_clustering(
+            try:
+                fig = visualize_dpgmm_clustering(
                     model=self.model,
                     dataloader=self.viz_loader,
                     device=self.device,
@@ -1252,9 +1323,12 @@ class DMCVBTrainer:
                     save_path=save_path,
                     image_level=False,     # start with image_level
                     t_select=5,            # choose which frame from the sequence
-                    use_rnn_context= True
-            )
-            plt.close(fig)
+                    use_rnn_context=True,
+                )
+                plt.close(fig)
+            except Exception as e:
+                # Never crash training because a diagnostic plot failed.
+                print(f"[eval] Warning: visualize_dpgmm_clustering failed at epoch {epoch}: {type(e).__name__}: {e}")
         # Compute averages
         avg_metrics = {f'eval/{k}': np.mean(v) for k, v in eval_metrics.items()}
         pred_metrics = self.evaluate_two_step_prediction(num_batches=5, T_ctx=8) 
@@ -1462,12 +1536,34 @@ class DMCVBTrainer:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
-    def compute_psnr(self, original: torch.Tensor, reconstructed: torch.Tensor) -> torch.Tensor:
-        """Compute Peak Signal-to-Noise Ratio"""
-        mse = F.mse_loss(reconstructed, original)
-        psnr = 20 * torch.log10(2.0 / torch.sqrt(mse))  # Assuming images in [-1, 1]
-        return psnr
-    
+
+    def compute_psnr(self, obs, recon, dones=None, eps=1e-10, verbose=False):
+        # Allow [B,C,H,W] by auto-adding T=1
+        if obs.ndim == 4:
+            obs = obs.unsqueeze(1)
+        if recon.ndim == 4:
+            recon = recon.unsqueeze(1)
+
+        assert obs.ndim == 5 and recon.ndim == 5, f"Expected 5D after fix, got {obs.shape} and {recon.shape}"
+        assert obs.shape == recon.shape, f"Shape mismatch: obs {obs.shape}, recon {recon.shape}"
+
+        obs01 = _to_01(obs, "obs", verbose=verbose)
+        rec01 = _to_01(recon, "recon", verbose=verbose)
+
+        # Per-frame MSE: [B,T]
+        mse_bt = (obs01 - rec01).pow(2).mean(dim=(-3, -2, -1))
+
+        if dones is not None:
+            if dones.ndim == 1:
+                dones = dones.unsqueeze(1)
+            valid = torch.ones_like(dones, dtype=mse_bt.dtype, device=mse_bt.device)
+            valid[:, 1:] = torch.cumprod(1.0 - dones[:, :-1].float(), dim=1)
+            mse = (mse_bt * valid).sum() / valid.sum().clamp_min(1.0)
+        else:
+            mse = mse_bt.mean()
+
+        return 10.0 * torch.log10(1.0 / mse.clamp_min(eps))
+
 
     @torch.no_grad()
     def evaluate_two_step_prediction(
@@ -1825,8 +1921,8 @@ def main():
         'policy_level': 'all',
         
         # Model settings
-        'max_components': 18,
-        'latent_dim': 56,
+        'max_components': 17,
+        'latent_dim': 64,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 16.0,  # Hyperparameters for prior
@@ -1841,7 +1937,7 @@ def main():
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
-        'learning_rate': 0.00065,
+        'learning_rate': 0.0008,
         'n_epochs': 200,
         'num_workers': 4,
 
@@ -1854,7 +1950,7 @@ def main():
         'beta': 1.0,
         'lambda_img': 1.0,
         'lambda_recon': 1.0,
-        'grad_clip': 2.0,
+        'grad_clip': 1.0,
         'n_critic': 1,       
         "use_dynamic_weight_average": False,
         # Logging
@@ -1902,7 +1998,7 @@ def main():
 
     outputs = count_parameters(model, print_details=True)
     list_frozen_params(model)
-
+    print_vdvae_edge_report(model)
     # Initialize trainer
     trainer = DMCVBTrainer(
         model=model,

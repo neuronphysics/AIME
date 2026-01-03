@@ -197,7 +197,7 @@ class CannyFilter(nn.Module):
 
         # -------- Soft thresholds (no hard > / ==) --------
         if low_threshold is not None:
-            tau_thr = 1.0
+            tau_thr = 0.02
 
             # low_gate ≈ 1 if thin_edges >> low_threshold, else ≈ 0
             low_gate = torch.sigmoid((thin_edges - low_threshold) / tau_thr)

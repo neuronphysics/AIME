@@ -114,7 +114,9 @@ class DecBlock(nn.Module):
         use_3x3 = res > 2
         cond_width = int(width * H.bottleneck_multiple)
         self.zdim = H.zdim
-        self.use_edge_conditioning = bool(getattr(H, "use_edge_conditioning", False))
+        global_edge = bool(getattr(H, "use_edge_conditioning", False))
+        min_edge_res = int(getattr(H, "edge_condition_min_res", 32))
+        self.use_edge_conditioning = global_edge and (res >= min_edge_res)
         # Set this to match e_warp channels (typically 1 for edge map, 2 for flow, etc.)
         self.edge_channels = int(getattr(H, "edge_channels", 1))
         enc_in_width = width * 2 + (self.edge_channels if self.use_edge_conditioning else 0)
@@ -135,32 +137,55 @@ class DecBlock(nn.Module):
         self.resnet = Block(width, cond_width, width, residual=True, use_3x3=use_3x3)
         self.resnet.c4.weight.data *= np.sqrt(1 / n_blocks)
         self.z_fn = lambda x: self.z_proj(x)
-        self.use_edge_conditioning = bool(getattr(H, "use_edge_conditioning", False))
         self.edge_proj = get_1x1(self.edge_channels, width) if self.use_edge_conditioning else None
 
     def _prep_edge(self, edge_guide: Optional[torch.Tensor], x: torch.Tensor) -> Optional[torch.Tensor]:
         """edge_guide: [B,Ce,H0,W0] or [B,H0,W0,Ce] -> edge_map [B,Ce,H,W] matching x spatial size."""
         if not self.use_edge_conditioning:
             return None
+
+        B, _, H, W = x.shape  # x is [B,C,H,W]
+        Ce = self.edge_channels
+
         if edge_guide is None:
             # t=0 / reset: keep channel dims consistent by using zeros
-            return torch.zeros(x.shape[0], self.edge_channels, x.shape[2], x.shape[3],device=x.device, dtype=x.dtype )           
+            return torch.zeros(B, Ce, H, W, device=x.device, dtype=x.dtype)
+
         if edge_guide.dim() != 4:
             raise ValueError(f"edge_guide must be 4D, got {tuple(edge_guide.shape)}")
 
         # Accept NCHW or NHWC
-        if edge_guide.shape[1] == self.edge_channels:
+        if edge_guide.shape[1] == Ce:
             edge = edge_guide
-        elif edge_guide.shape[-1] == self.edge_channels:
+        elif edge_guide.shape[-1] == Ce:
             edge = edge_guide.permute(0, 3, 1, 2).contiguous()
         else:
             raise ValueError(
-                f"edge_guide channel mismatch: expected Ce={self.edge_channels}, got {tuple(edge_guide.shape)}"
+                f"edge_guide channel mismatch: expected Ce={Ce}, got {tuple(edge_guide.shape)}"
             )
 
         edge = edge.to(device=x.device, dtype=x.dtype)
-        if edge.shape[2:] != x.shape[2:]:
-            edge = F.interpolate(edge, size=x.shape[2:], mode="nearest")
+
+        src_h, src_w = edge.shape[2], edge.shape[3]
+        tgt_h, tgt_w = H, W
+
+        if (src_h, src_w) != (tgt_h, tgt_w):
+            # define block resolution r (your blocks are typically square)
+            r = min(tgt_h, tgt_w)
+
+            # only treat as downsampling if both dims shrink (or stay)
+            downsample = (tgt_h <= src_h) and (tgt_w <= src_w)
+
+            if downsample and r < 32:
+                # anti-aliased downsample (keeps thin edges from disappearing as often)
+                edge = F.interpolate(edge, size=(tgt_h, tgt_w), mode="area")
+
+                # Alternative if one wants "edge presence" (keeps any edge in each cell):
+                # edge = F.adaptive_max_pool2d(edge, output_size=(tgt_h, tgt_w))
+            else:
+                # keep edges crisp for higher resolutions, or when upsampling
+                edge = F.interpolate(edge, size=(tgt_h, tgt_w), mode="nearest")
+
         return edge
 
     def sample(self, x, acts, edge_guide: Optional[torch.Tensor] = None):

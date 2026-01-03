@@ -125,9 +125,6 @@ def compute_responsibilities(
     return resp, k
 
 
-# -----------------------------
-# t-SNE
-# -----------------------------
 def compute_tsne_embedding(
     latents: np.ndarray,
     max_samples: int = 10000,
@@ -138,57 +135,106 @@ def compute_tsne_embedding(
     standardize: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
+    Robust t-SNE embedding with safety checks for NaN/Inf, duplicates, and sklearn edge-cases.
+
     Returns:
         emb: [M, n_components]
-        idx: [M] indices of original points used (downsampled if needed)
+        idx: [M] indices of original points used (downsampled + filtered if needed)
     """
-    rng = np.random.default_rng(random_state)
-    n = latents.shape[0]
+    rng = np.random.default_rng(int(random_state))
+    n = int(latents.shape[0])
 
     if n == 0:
-        return np.zeros((0, n_components)), np.zeros((0,), dtype=np.int64)
+        return np.zeros((0, int(n_components))), np.zeros((0,), dtype=np.int64)
 
-    if n > max_samples:
-        idx = rng.choice(n, size=max_samples, replace=False)
+    # Downsample first (keeps plotting cheap / stable)
+    if n > int(max_samples):
+        idx = rng.choice(n, size=int(max_samples), replace=False).astype(np.int64, copy=False)
     else:
         idx = np.arange(n, dtype=np.int64)
 
-    X = latents[idx].astype(np.float32, copy=False)
+    # Use float64 here: avoids some rare neighbor-graph edge cases on float32
+    X = np.asarray(latents[idx], dtype=np.float64)
+
+    # Drop rows with NaN/Inf (should already be filtered upstream, but keep this defensive)
+    finite = np.isfinite(X).all(axis=1)
+    if not finite.all():
+        idx = idx[finite]
+        X = X[finite]
+
+    if X.shape[0] < 5:
+        return np.zeros((0, int(n_components))), np.zeros((0,), dtype=np.int64)
 
     if standardize:
         mu = X.mean(axis=0, keepdims=True)
-        sd = X.std(axis=0, keepdims=True) + 1e-6
+        sd = X.std(axis=0, keepdims=True)
+        # avoid divide-by-zero on constant dims
+        sd = np.where(sd < 1e-12, 1.0, sd)
         X = (X - mu) / sd
 
     # PCA pre-reduction
-    if pca_dims is not None and pca_dims > 0 and X.shape[1] > pca_dims:
-        pca_dims_eff = int(min(pca_dims, X.shape[1], max(2, X.shape[0] - 1)))
-        X = PCA(n_components=pca_dims_eff, random_state=random_state).fit_transform(X)
+    if pca_dims is not None and int(pca_dims) > 0 and X.shape[1] > int(pca_dims):
+        pca_dims_eff = int(min(int(pca_dims), X.shape[1], max(2, X.shape[0] - 1)))
+        X = PCA(n_components=pca_dims_eff, random_state=int(random_state)).fit_transform(X)
 
+    # Tiny jitter if there are (near-)duplicate rows; helps avoid rare kNN reshape issues
+    if X.shape[0] >= 2:
+        Xr = np.round(X, decimals=6)
+        if np.unique(Xr, axis=0).shape[0] < Xr.shape[0]:
+            X = X + (1e-6 * rng.standard_normal(X.shape))
+
+    # Clamp perplexity to sklearn constraints: 2 <= perp < n_samples
+    n_pts = int(X.shape[0])
+    perp = float(perplexity)
+    perp = min(perp, (n_pts - 1) / 3.0)  # common rule-of-thumb for stable kNN
+    perp = max(2.0, perp)
+    # must be strictly < n_samples
+    perp = min(perp, float(n_pts - 1) - 1e-3)
+
+    def _make_tsne(method: str, init: str):
+        # sklearn changed `n_iter` -> `max_iter` around 1.2
+        try:
+            return TSNE(
+                n_components=int(n_components),
+                perplexity=perp,
+                init=init,
+                learning_rate="auto",
+                random_state=int(random_state),
+                method=method,
+                max_iter=1000,
+            )
+        except TypeError:
+            return TSNE(
+                n_components=int(n_components),
+                perplexity=perp,
+                init=init,
+                random_state=int(random_state),
+                method=method,
+                n_iter=1000,
+            )
+
+    # First try the fast default; if it hits the sklearn neighbor-graph reshape edge-case,
+    # retry with a safer configuration.
     try:
-        tsne = TSNE(
-            n_components=int(n_components),
-            perplexity=float(min(perplexity, max(5.0, (X.shape[0] - 1) / 3.0))),
-            init="pca" if X.shape[0] > 10 else "random",
-            learning_rate="auto",
-            random_state=int(random_state),
-            max_iter=1000,   # newer sklearn
-        )
-    except TypeError:
-        # older sklearn
-        tsne = TSNE(
-            n_components=int(n_components),
-            perplexity=float(min(perplexity, max(5.0, (X.shape[0] - 1) / 3.0))),
-            init="pca" if X.shape[0] > 10 else "random",
-            random_state=int(random_state),
-            n_iter=1000,     # older sklearn
-        )
-    emb = tsne.fit_transform(X)
+        tsne = _make_tsne(method="barnes_hut", init="pca" if X.shape[0] > 10 else "random")
+        emb = tsne.fit_transform(X)
+    except ValueError as e:
+        msg = str(e)
+        # This specific failure can happen with some sklearn/numpy builds in kNN graph construction.
+        if "cannot reshape array" in msg or "reshape" in msg:
+            # Safer retry: slightly smaller perplexity + exact method (no kNN graph)
+            perp2 = max(2.0, min(perp, 20.0, float(n_pts - 1) - 1e-3))
+            perp = perp2  # update for the retry
+            tsne = _make_tsne(method="exact", init="random")
+            emb = tsne.fit_transform(X)
+        else:
+            raise
+
     return emb, idx
 
 
 # -----------------------------
-# RNN context helper (as in your original file)
+# RNN context helper 
 # -----------------------------
 @torch.no_grad()
 def _compute_rnn_context(model, batch: Dict, device: torch.device, t_select: int) -> torch.Tensor:
@@ -217,8 +263,10 @@ def _compute_rnn_context(model, batch: Dict, device: torch.device, t_select: int
         h_context = h[-1]                           # [B,H]
         vdvae_out = model.vdvae(x_t_nhwc, x_t_nhwc, h_context)
         top_q_mean_map = vdvae_out["top_q_mean_map"]  # [B,C_top,res,res]
-        z_t = top_q_mean_map.mean(dim=(2, 3))         # [B,C_top]
-
+        B2, C, Ht, Wt = top_q_mean_map.shape
+        assert B2 == B, f"Batch mismatch: obs batch={B}, vdvae batch={B2}"
+        # Match training: flatten spatial map -> [B, C*Ht*Wt]
+        z_flat = top_q_mean_map.permute(0, 2, 3, 1).contiguous().view(B2, Ht * Wt * C)
         if actions is not None and actions.dim() >= 2 and actions.shape[1] > t:
             a_t = actions[:, t]
         else:
@@ -228,12 +276,16 @@ def _compute_rnn_context(model, batch: Dict, device: torch.device, t_select: int
             mask_t = 1.0 - dones[:, t - 1].float()
         else:
             mask_t = torch.ones(B, device=device)
+        rnn_in = torch.cat([z_flat, a_t], dim=-1)
 
-        rnn_in = torch.cat([z_t, a_t], dim=-1)
+        # (optional sanity check)
+        expected = model._rnn.lstm.input_size
+        if rnn_in.size(-1) != expected:
+            raise RuntimeError(f"RNN input mismatch: got {rnn_in.size(-1)}, expected {expected}")
+
         _, (h, c) = model._rnn(rnn_in, h, c, mask_t)
 
     return h[-1]  # [B,H]
-
 
 # -----------------------------
 # Latent extraction (+ exemplars)
@@ -328,6 +380,7 @@ def extract_latents_and_assignments(
 
         # VDVAE encoder (top layer)
         vdvae_out = model.vdvae(images_nhwc, images_nhwc, h_context)
+
         top_q_mean_map = vdvae_out["top_q_mean_map"]  # [B, C_top, res, res]
 
         # tokens: [B*res*res, C_top]
@@ -692,7 +745,7 @@ def visualize_dpgmm_clustering(
     # Avoid leaking figures in long-running training jobs (common when using Agg).
     try:
         if "agg" in matplotlib.get_backend().lower():
-            plt.close(fig)
+            plt.close("all")
     except Exception:
         pass
 
