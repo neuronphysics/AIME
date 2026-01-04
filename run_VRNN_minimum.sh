@@ -23,6 +23,7 @@ module load opencv/4.10.0
 module load mujoco/3.3.0
 module load mpi4py/3.1.6
 module load arrow
+export TF_CPP_MIN_LOG_LEVEL=2
 
 #virtualenv --no-download --clear /home/memole/D2E
 source /home/memole/D2E/bin/activate
@@ -66,5 +67,6 @@ PY
 echo "pretrain VQVAE ....."
 #CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.pretrain_vqvae
 echo "finished pretraining and start training world model dpgmm vrnn model... " 
+python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_physical_devices('GPU'))"
 
 CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.dmc_vb_transition_dynamics_trainer 

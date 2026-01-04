@@ -58,7 +58,7 @@ def print_vdvae_edge_report(model):
     print(f"\n[VDVAE edge report] use_edge_conditioning={getattr(H,'use_edge_conditioning',False)} "
           f"edge_condition_min_res={min_res}\n")
 
-    for i, blk in enumerate(model.decoder.dec_blocks):
+    for i, blk in enumerate(model.vdvae.decoder.dec_blocks):
         res = int(getattr(blk, "base", -1))
         is_top = bool(getattr(blk, "is_top", False))
         edge_on = bool(getattr(blk, "use_edge_conditioning", False))
@@ -1922,7 +1922,7 @@ def main():
         
         # Model settings
         'max_components': 17,
-        'latent_dim': 64,
+        'latent_dim': 56,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 16.0,  # Hyperparameters for prior
@@ -1937,7 +1937,7 @@ def main():
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
-        'learning_rate': 0.0008,
+        'learning_rate': 0.0007,
         'n_epochs': 200,
         'num_workers': 4,
 

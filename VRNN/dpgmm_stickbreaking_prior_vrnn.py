@@ -783,16 +783,28 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.skip_threshold = 300.0
         H.dec_blocks = "4x2,8m4,8x4,16m8,16x4,32m16,32x4,64m32,64x2"
         H.enc_blocks = "64x2,64d2,32x4,32d2,16x4,16d2,8x4,8d2,4x2"
+        H.attn_resolutions = [8, 16, 32]
+        H.use_spatial_attn = True
+        H.attn_where = "last"
 
         H.temporal_n_lstm_layers = 1
         H.temporal_use_orthogonal = True
         H.temporal_kernel_size = 3
         H.use_edge_conditioning = True
-        H.edge_condition_min_res = 32
+        H.edge_condition_min_res = 64
 
         H.edge_channels = 1 
         H.no_bias_above = 64
         H.custom_width_str = ""
+        # --- Attention defaults ---
+        H.attn_num_layers = 1
+        H.attn_num_heads = 4
+        H.attn_widening_factor = 1
+        H.attn_dropout = 0.0
+        H.attn_residual_dropout = 0.0
+        H.attn_gn_groups = 32
+        H.attn_use_pos_enc = True
+        H.attn_pos_num_bands = 6
 
         # ---- 2) Instantiate VDVAE (no prior yet) ----
         self.vdvae = VDVAE(
@@ -1234,12 +1246,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 with torch.no_grad():
                     x_prev = observations[:, t - 1]  # [B,C,H,W] in [-1,1]
                     x_prev01 = self.denormalize_generated_images(x_prev).clamp(0.0, 1.0)
-                    e_prev = self.canny(
-                        x_prev01,
-                        low_threshold=0.145,
-                        high_threshold=0.228,
-                        hysteresis=True,
-                    )
+                    e_prev = self.canny(x_prev01)
                     B_, _, H_, W_ = x_prev.shape
                 ctx = self.flow_ctx_proj(h_context).view(B_, -1, 1, 1).expand(B_, -1, H_, W_)
                 flow_in = torch.cat([x_prev01.detach(), e_prev, ctx], dim=1)
@@ -1762,12 +1769,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             fake_flat = fake01.reshape(Bf * Tf, C, H, W)
             real_flat = real01.reshape(Bf * Tf, C, H, W)
 
-            edge_fake = self.canny(fake_flat,
-                                    low_threshold=0.145,
-                                    high_threshold=0.228,
-                                    hysteresis=True,
-                                    )   # [Bf*Tf,1,H,W]
-            edge_real = self.canny(real_flat, low_threshold=0.145, high_threshold=0.228,hysteresis=True)
+            edge_fake = self.canny(fake_flat)   # [Bf*Tf,1,H,W]
+            edge_real = self.canny(real_flat)
 
             # mask out padded future frames using seq_len_future
             t = torch.arange(Tf, device=observations.device)[None, :]          # [1,Tf]
@@ -2029,10 +2032,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 #  2) motion scaffold: predict flow + mask from (x_prev, edges(x_prev), h_context) 
                 # CannyFilter returns continuous thin edges [B,1,H,W]. 
                 x_prev01 =self.denormalize_generated_images(x_prev).clamp(0.0, 1.0)
-                e_prev = self.canny(x_prev01,
-                                    low_threshold=0.145,
-                                    high_threshold=0.228,
-                                    hysteresis=True,).detach()
+                e_prev = self.canny(x_prev01).detach()
 
                 ctx = self.flow_ctx_proj(h_context)  # [B, flow_ctx_dim]
                 ctx_map = ctx[:, :, None, None].expand(-1, -1, x_prev.shape[2], x_prev.shape[3])
@@ -2055,13 +2055,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     a_t=a_t,
                     mask_t=mask_t,
                     temporal_state=temporal_state,
-                    e_warp=e_warp.detach(),
+                    e_warp=e_warp,
                     t=None,
                     temperature=decoder_temperature,
                 )
 
                 if self.use_edge_conditioning and getattr(self, "add_edge_to_pxz", False):
-                    px_z = px_z +self.edge_cond_proj(e_warp.detach())
+                    px_z = px_z +self.edge_cond_proj(e_warp)
                 dmol_out = self.vdvae.decoder.out_net.forward(px_z)
 
                 # ---- 1) scratch prediction (what you already had) ----

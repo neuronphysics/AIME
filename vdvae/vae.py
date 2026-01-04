@@ -9,6 +9,8 @@ import itertools
 from torch.utils.checkpoint import checkpoint as ckpt
 from typing import Dict, Optional, Tuple
 from VRNN.lstm import ConvLSTMCell
+from VRNN.perceiver.modules import SelfAttentionBlock
+from VRNN.perceiver.position import FourierPositionEncoding
 #This code is from this source:https://github.com/openai/vdvae
 
 class Block(nn.Module):
@@ -67,6 +69,92 @@ def get_width_settings(width, s):
             mapping[int(k)] = int(v)
     return mapping
 
+class SpatialSelfAttention(nn.Module):
+    """
+    (B,C,H,W) -> tokens (B,HW,C) -> SelfAttentionBlock -> (B,C,H,W)
+    With gated residual + gated Fourier pos enc for maximum stability.
+    """
+    def __init__(self, channels: int, res: int, H):
+        super().__init__()
+        self.channels = int(channels)
+        self.res = int(res)
+
+        # --- defaults ---
+        num_layers = int(getattr(H, "attn_num_layers", 1))
+        num_heads  = int(getattr(H, "attn_num_heads", 4))
+        widening   = int(getattr(H, "attn_widening_factor", 1))
+        dropout    = float(getattr(H, "attn_dropout", 0.0))
+        res_drop   = float(getattr(H, "attn_residual_dropout", 0.0))
+
+        # Heads must divide qk/v channels 
+        num_heads = min(num_heads, self.channels)
+        while num_heads > 1 and (self.channels % num_heads != 0):
+            num_heads -= 1
+
+        # pick qk/v = channels (simple + safe), ensure divisible
+        num_qk = self.channels
+        num_v  = self.channels
+
+        # optional pre-norm on attention branch (does NOT affect identity path)
+        gn_groups = int(getattr(H, "attn_gn_groups", 32))
+        gn_groups = max(1, min(gn_groups, self.channels))
+        while self.channels % gn_groups != 0 and gn_groups > 1:
+            gn_groups -= 1
+        self.pre_norm = nn.GroupNorm(gn_groups, self.channels, eps=1e-6, affine=True)
+
+        self.attn = SelfAttentionBlock(
+            num_layers=num_layers,
+            num_heads=num_heads,
+            num_channels=self.channels,
+            num_qk_channels=num_qk,
+            num_v_channels=num_v,
+            widening_factor=widening,
+            dropout=dropout,
+            residual_dropout=res_drop,
+            activation_checkpointing=bool(getattr(H, "attn_activation_checkpointing", False)),
+            activation_offloading=bool(getattr(H, "attn_activation_offloading", False)),
+        )
+
+        # --- Fourier 2D positional encoding (gated) ---
+        self.use_pos = bool(getattr(H, "attn_use_pos_enc", True))
+        if self.use_pos:
+            n_bands = int(getattr(H, "attn_pos_num_bands", 6))
+            self.pos_enc = FourierPositionEncoding((self.res, self.res), num_frequency_bands=n_bands)
+            pos_dim = self.pos_enc.num_position_encoding_channels(include_positions=True) 
+            self.pos_proj = nn.Linear(pos_dim, self.channels, bias=True)
+            nn.init.normal_(self.pos_proj.weight, std=1e-3)
+            nn.init.zeros_(self.pos_proj.bias)
+            self.pos_gate = nn.Parameter(torch.zeros(()))  # init 0 => no pos effect
+        else:
+            self.pos_enc = None
+            self.pos_proj = None
+            self.pos_gate = None
+
+        # --- attention residual gate (init 0 => exact identity) ---
+        self.attn_gate = nn.Parameter(torch.zeros(()))  # init 0 => output == input
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,C,H,W]
+        B, C, H, W = x.shape
+        assert C == self.channels, f"channels mismatch: got {C}, expected {self.channels}"
+        assert H == self.res and W == self.res, f"res mismatch: got {H}x{W}, expected {self.res}x{self.res}"
+
+        # attention branch
+        xn = self.pre_norm(x)
+        tok = xn.flatten(2).transpose(1, 2)  # [B, HW, C]
+
+        if self.use_pos:
+            # FourierPositionEncoding.forward repeats [B,HW,pos_dim] 
+            pos = self.pos_enc(B).to(device=tok.device, dtype=tok.dtype)
+            pos = self.pos_proj(pos)
+            tok = tok + self.pos_gate * pos
+
+        out = self.attn(tok).last_hidden_state  
+        out = out.transpose(1, 2).reshape(B, C, H, W)
+
+        # gated residual: x + g*(out - x); g=0 => identity (safest)
+        g = torch.tanh(self.attn_gate)
+        return x + g * (out - x)
 
 class Encoder(HModule):
     def build(self):
@@ -75,28 +163,53 @@ class Encoder(HModule):
         self.use_checkpoint = getattr(H, "use_checkpoint", False)
         self.in_conv = get_3x3(H.image_channels, H.width)
         self.widths = get_width_settings(H.width, H.custom_width_str)
-        enc_blocks = []
+        
+        self.attn_resolutions = set(getattr(self.H, "attn_resolutions", [8, 16]))
+        use_spatial_attn = bool(getattr(H, "use_spatial_attn", True))
+        attn_where = getattr(H, "attn_where", "last")  # options:"first" or "last"
         blockstr = parse_layer_string(H.enc_blocks)
-        for res, down_rate in blockstr:
+        enc_blocks = []
+        out_res_list = []
+
+        for i, (res, down_rate) in enumerate(blockstr):
             use_3x3 = res > 2  # Don't use 3x3s for 1x1, 2x2 patches
             enc_blocks.append(Block(self.widths[res], int(self.widths[res] * H.bottleneck_multiple), self.widths[res], down_rate=down_rate, residual=True, use_3x3=use_3x3))
+            out_res = res // down_rate if down_rate is not None else res
+            
+            out_res_list.append(out_res)
+        stage_idxs = defaultdict(list)
+        for i, r in enumerate(out_res_list):
+            stage_idxs[r].append(i)
+
+        # default: no attention anywhere
+        enc_attn = [nn.Identity() for _ in enc_blocks]
+
+        # place exactly one attention per requested resolution
+        if use_spatial_attn:
+            for r in self.attn_resolutions:
+                if r in stage_idxs:
+                    idx = stage_idxs[r][0] if attn_where == "first" else stage_idxs[r][-1]
+                    enc_attn[idx] = SpatialSelfAttention(self.widths[r], r, H)
+
         n_blocks = len(blockstr)
         for b in enc_blocks:
             b.c4.weight.data *= np.sqrt(1 / n_blocks)
         self.enc_blocks = nn.ModuleList(enc_blocks)
+        self.enc_attn = nn.ModuleList(enc_attn)
 
     def forward(self, x):
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.in_conv(x)
         activations = {}
         activations[x.shape[2]] = x
-        for block in self.enc_blocks:
+        for i, block in enumerate(self.enc_blocks):
             if self.training and self.use_checkpoint:
                 x = ckpt(block, x, use_reentrant=False)
             else:
                 x = block(x)
             res = x.shape[2]
             x = x if x.shape[1] == self.widths[res] else pad_channels(x, self.widths[res])
+            x = self.enc_attn[i](x)
             activations[res] = x
         return activations
 
@@ -137,7 +250,6 @@ class DecBlock(nn.Module):
         self.resnet = Block(width, cond_width, width, residual=True, use_3x3=use_3x3)
         self.resnet.c4.weight.data *= np.sqrt(1 / n_blocks)
         self.z_fn = lambda x: self.z_proj(x)
-        self.edge_proj = get_1x1(self.edge_channels, width) if self.use_edge_conditioning else None
 
     def _prep_edge(self, edge_guide: Optional[torch.Tensor], x: torch.Tensor) -> Optional[torch.Tensor]:
         """edge_guide: [B,Ce,H0,W0] or [B,H0,W0,Ce] -> edge_map [B,Ce,H,W] matching x spatial size."""
@@ -498,10 +610,16 @@ class Decoder(HModule):
         dec_blocks = []
         self.widths = get_width_settings(H.width, H.custom_width_str)
         blocks = parse_layer_string(H.dec_blocks)
+        # --- Decoder self-attn placement (mirrors encoder idea) ---
+        self.attn_resolutions = set(getattr(H, "attn_resolutions", [8, 16]))
+        use_spatial_attn = bool(getattr(H, "use_spatial_attn", True))
+        attn_where = getattr(H, "attn_where", "last")  # "first" or "last"       
         n_blocks = len(blocks)
         first_only = bool(getattr(H, "temporal_first_block_only", True))
         seen_temporal_res = set()
+        stage_idxs = defaultdict(list)
         for idx, (res, mixin) in enumerate(blocks):
+            stage_idxs[res].append(idx)
             is_top = (idx == 0)
             # Temporal priors should apply ONLY to the *first* stochastic block at each resolution (requested).
             # If temporal_first_block_only=False, we temporalize every non-top stochastic block.
@@ -513,6 +631,19 @@ class Decoder(HModule):
             dec_blocks.append(DecBlock(H, res, mixin, n_blocks=n_blocks, is_top=is_top, use_temporal_prior=use_temporal_here))
             resos.add(res)
         self.resolutions = sorted(resos)
+        dec_attn = [nn.Identity() for _ in blocks]
+
+        # choose exactly one block per requested resolution
+        self.dec_attn_indices = {}  # optional: for debugging/logging
+        if use_spatial_attn:
+            for r in self.attn_resolutions:
+                if r in stage_idxs:
+                    idx = stage_idxs[r][0] if attn_where == "first" else stage_idxs[r][-1]
+                    dec_attn[idx] = SpatialSelfAttention(self.widths[r], r, H)
+                    self.dec_attn_indices[r] = idx
+
+        self.dec_attn = nn.ModuleList(dec_attn)
+
         self.dec_blocks = nn.ModuleList(dec_blocks)
         # ------------------------------------------------------------
         # Temporal priors: one LSTM per *resolution* (excluding the top block)
@@ -563,8 +694,9 @@ class Decoder(HModule):
     def forward(self, activations, edge_guide: Optional[torch.Tensor] = None, get_latents=False):
         stats = []
         xs = {a.shape[2]: a for a in self.bias_xs}
-        for block in self.dec_blocks:
+        for idx, block in enumerate(self.dec_blocks):
             xs, block_stats = block(xs, activations, edge_guide=edge_guide, get_latents=get_latents)
+            xs[block.base] = self.dec_attn[idx](xs[block.base]) #attention
             stats.append(block_stats)
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
         return xs[self.H.image_size], stats
@@ -579,6 +711,7 @@ class Decoder(HModule):
             except TypeError:
                 temp = t
             xs = block.forward_uncond(xs, temp)
+            xs[block.base] = self.dec_attn[idx](xs[block.base])
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
         return xs[self.H.image_size]
 
@@ -586,8 +719,9 @@ class Decoder(HModule):
         xs = {}
         for bias in self.bias_xs:
             xs[bias.shape[2]] = bias.repeat(n, 1, 1, 1)
-        for block, lvs in itertools.zip_longest(self.dec_blocks, latents):
+        for idx, (block, lvs) in enumerate(itertools.zip_longest(self.dec_blocks, latents)):
             xs = block.forward_uncond(xs, t, lvs=lvs)
+            xs[block.base] = self.dec_attn[idx](xs[block.base])  #attention
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
         return xs[self.H.image_size]
 
@@ -608,6 +742,7 @@ class Decoder(HModule):
             c = torch.zeros(B, width_r, r, r, device=device, dtype=dtype)
             state[str(res)] = (h, c)
         return state
+
     def forward_temporal(
         self,
         activations: Dict[int, torch.Tensor],
@@ -620,16 +755,18 @@ class Decoder(HModule):
         """Decode ONE frame (teacher-forced) while using temporal priors for lower layers."""
         xs = {b.shape[2]: b for b in self.bias_xs}
         stats = []
-        for block in self.dec_blocks:
+        for idx, block in enumerate(self.dec_blocks):
             if self.use_temporal_priors and (not getattr(block, "is_top", False)) and block.use_temporal_prior:
                 key = str(block.base)
                 rnn = self.temporal_cells[key]
                 st = temporal_state[key]
                 xs, st_dict, st_new = block.forward_temporal(xs, activations, rnn, st, a_t, mask_t, edge_guide=edge_guide, get_latents=get_latents)
                 temporal_state[key] = st_new
+                xs[block.base] = self.dec_attn[idx](xs[block.base])
                 stats.append(st_dict)
             else:
                 xs, st_dict = block(xs, activations, edge_guide=edge_guide, get_latents=get_latents)
+                xs[block.base] = self.dec_attn[idx](xs[block.base])
                 stats.append(st_dict)
 
         px_z = self.final_fn(xs[self.H.image_size])
@@ -651,9 +788,10 @@ class Decoder(HModule):
         for bias in self.bias_xs:
             xs[bias.shape[2]] = bias.repeat(n, 1, 1, 1)
 
-        for block, lvs in itertools.zip_longest(self.dec_blocks, latents):
+        for idx,(block, lvs) in enumerate(itertools.zip_longest(self.dec_blocks, latents)):
             if getattr(block, "is_top", False):
                 xs = block.forward_uncond(xs, t=t, lvs=lvs, edge_guide=edge_guide)
+                xs[block.base] = self.dec_attn[idx](xs[block.base])
                 continue
 
             if self.use_temporal_priors and block.use_temporal_prior:
@@ -662,8 +800,10 @@ class Decoder(HModule):
                 st = temporal_state[key]
                 xs, st_new = block.forward_uncond_temporal(xs, rnn, st, a_t, mask_t, edge_guide=edge_guide, t=t, lvs=lvs, temperature= temperature)
                 temporal_state[key] = st_new
+                xs[block.base] = self.dec_attn[idx](xs[block.base])
             else:
                 xs = block.forward_uncond(xs, t=t, lvs=lvs, edge_guide=edge_guide)
+                xs[block.base] = self.dec_attn[idx](xs[block.base])
 
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
         return xs[self.H.image_size], temporal_state
