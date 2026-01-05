@@ -1396,7 +1396,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         
         B, T, C, H, W = real_images.shape
-        temporal_mask = self._make_temporal_mask(B, T, real_images.device, sequence_length )         # [B,T] bool
+        temporal_mask = self._make_temporal_mask(B, T, real_images.device, sequence_lengths )         # [B,T] bool
         # For per-frame PatchGAN losses
         mask_flat = None
         if temporal_mask is not None:
@@ -1428,11 +1428,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         img_consistency_loss = torch.zeros((), device=self.device)
         if fake_img_outputs['per_frame_scores'] is not None and fake_img_outputs['per_frame_scores'].numel() > 1:
             diffs = (fake_img_outputs['per_frame_scores'][:,1:] - fake_img_outputs['per_frame_scores'][:,:-1]).abs()
-            if temporal_mask is not None:
-                md = (temporal_mask[:, 1:] & temporal_mask[:, :-1]).float()
-                img_consistency_loss = self._masked_mean(diffs, md)
-            else:
-                img_consistency_loss = diffs.mean()
+            diffs = diffs.squeeze(-1)  # [B, T-1]
+            md = (temporal_mask[:, 1:] & temporal_mask[:, :-1]).float()  # [B, T-1]
+            img_consistency_loss = self._masked_mean(diffs, md)
         
         real_frames = real_images.reshape(B * T, C, H, W)
         fake_frames = fake_images.reshape(B * T, C, H, W)
