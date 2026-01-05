@@ -1483,12 +1483,43 @@ class attentionBlock(nn.Module):
         super().__init__()
         self.norm = nn.GroupNorm(4, n_emb)
         self.attention = nn.MultiheadAttention(
-            embed_dim=n_emb,
-            num_heads=n_heads,
-            bias=True,
-            batch_first=True,
-            dropout=0.0,
+            embed_dim=n_emb, num_heads=n_heads, bias=True,
+            batch_first=True, dropout=0.0
         )
+        self._pe_cache = {}  # (H,W,C,device,dtype) -> [1, HW, C]
+    @staticmethod
+    def _sincos2d_pe(H: int, W: int, C: int, device, dtype):
+        # robust: works for any C by computing the largest multiple of 4 and padding the rest with zeros
+        C4 = (C // 4) * 4
+        if C4 == 0:
+            return torch.zeros((1, H * W, C), device=device, dtype=dtype)
+
+        dim = C4 // 4
+        # frequencies
+        omega = torch.arange(dim, device=device, dtype=dtype)
+        omega = 1.0 / (10000 ** (omega / max(1, dim)))
+
+        y = torch.arange(H, device=device, dtype=dtype)
+        x = torch.arange(W, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")  # [H,W]
+
+        out_x = (xx[..., None] * omega).reshape(H * W, dim)
+        out_y = (yy[..., None] * omega).reshape(H * W, dim)
+
+        pe = torch.cat([out_x.sin(), out_x.cos(), out_y.sin(), out_y.cos()], dim=1)  # [HW, C4]
+
+        if C4 < C:
+            pe = torch.cat([pe, torch.zeros((H * W, C - C4), device=device, dtype=dtype)], dim=1)
+
+        return pe.unsqueeze(0)  # [1, HW, C]
+
+    def _get_pe(self, H, W, C, device, dtype):
+        key = (H, W, C, device, dtype)
+        pe = self._pe_cache.get(key, None)
+        if pe is None:
+            pe = self._sincos2d_pe(H, W, C, device, dtype)
+            self._pe_cache[key] = pe
+        return pe
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, H, W]
@@ -1499,7 +1530,9 @@ class attentionBlock(nn.Module):
         # [B, C, H, W] -> [B, HW, C]
         x = x.flatten(2).transpose(1, 2).contiguous()
 
-        # Do NOT request attention weights (saves memory, avoids extra tensors)
+        # add position info (no extra layers)
+        x = x + self._get_pe(H, W, C, x.device, x.dtype)
+
         x, _ = self.attention(x, x, x, need_weights=False)
 
         # [B, HW, C] -> [B, C, H, W]
@@ -1714,7 +1747,7 @@ class ImageDiscriminator(nn.Module):
         if get_features:
             return self.get_features(x)
 
-        use_ckpt = self.use_checkpoint and self.training and x.requires_grad
+        use_ckpt = self.use_checkpoint and self.training and torch.is_grad_enabled()
 
         if use_ckpt:
             x = torch.utils.checkpoint.checkpoint(
