@@ -1432,8 +1432,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             md = (temporal_mask[:, 1:] & temporal_mask[:, :-1]).float()  # [B, T-1]
             img_consistency_loss = self._masked_mean(diffs, md)
         
-        real_frames = real_images.reshape(B * T, C, H, W)
-        fake_frames = fake_images.reshape(B * T, C, H, W)
+        real_frames = real_images.reshape(B * T, C, H, W).contiguous()
+        fake_frames = fake_images.reshape(B * T, C, H, W).contiguous()
 
         real_logits = self.patch_discriminator(real_frames)                 # [B*T,1,h,w]
         fake_logits = self.patch_discriminator(fake_frames)                 # [B*T,1,h,w]
@@ -1510,11 +1510,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         mask_flat = None
         if sequence_lengths is not None:
             mask_flat = temporal_mask.reshape(B * T).float()      # [B*T]
-        def masked_mean_1(x_bt, m_bt):
-            if m_bt is None:
-                return x_bt.mean()
-            denom = m_bt.sum().clamp(min=1.0)
-            return (x_bt * m_bt).sum() / denom
 
         flags = [p.requires_grad for p in D.parameters()] #freeze Discriminator parameters
         for p in D.parameters():
@@ -1540,7 +1535,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         for p in Dpatch.parameters():
             p.requires_grad_(False)
 
-        fake_frames = reconstruction.reshape(B * T, C, H, W)
+        fake_frames = reconstruction.reshape(B * T, C, H, W).contiguous()
         patch_logits = Dpatch(fake_frames)                 # [B*T,1,h,w]
         patch_scores = patch_logits.mean(dim=(1,2,3))       # [B*T]
         img_adv_loss = -self._masked_mean(patch_scores, mask_flat)

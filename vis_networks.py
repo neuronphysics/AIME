@@ -1479,23 +1479,33 @@ class LinearResidual(nn.Module):
 
 
 class attentionBlock(nn.Module):
-    def __init__(self, n_emb, n_heads=4):
+    def __init__(self, n_emb: int, n_heads: int = 4):
         super().__init__()
-        self.flatten = nn.Flatten(2)
-        #self.n_input = n_input
-        self.n_emb = n_emb
         self.norm = nn.GroupNorm(4, n_emb)
-        self.attention = nn.MultiheadAttention(n_emb, n_heads, bias=True,  batch_first=True)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=n_emb,
+            num_heads=n_heads,
+            bias=True,
+            batch_first=True,
+            dropout=0.0,
+        )
 
-    def forward(self, x):
-        batch_size, n_channels, h, w = x.size()
-        residue = x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, H, W]
+        B, C, H, W = x.shape
+        residual = x
         x = self.norm(x)
-        x = x.view(batch_size, n_channels, -1).permute(0, 2, 1)
-        x, _ = self.attention(x, x, x)
-        x = x.permute(0, 2, 1).view(batch_size, n_channels, h, w)
-        
-        return x + residue
+
+        # [B, C, H, W] -> [B, HW, C]
+        x = x.flatten(2).transpose(1, 2).contiguous()
+
+        # Do NOT request attention weights (saves memory, avoids extra tensors)
+        x, _ = self.attention(x, x, x, need_weights=False)
+
+        # [B, HW, C] -> [B, C, H, W]
+        x = x.transpose(1, 2).reshape(B, C, H, W).contiguous()
+        return x + residual
+
 
 class ActNorm(nn.Module):
     def __init__(self, num_features, logdet=False, affine=True,
@@ -1583,31 +1593,33 @@ class ActNorm(nn.Module):
 
 
 class ImageDiscriminator(nn.Module):
-    """Defines a PatchGAN discriminator as in Pix2Pix
-        --> see https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/models/networks.py
+    """
+    https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/models/networks.py
     """
     def __init__(
         self,
         input_nc=3,
         ndf=16,
         n_layers=5,
-        norm_type="group",          #  "batch" | "instance" | "group" | "actnorm"
-        gn_groups=32,               #  used when norm_type="group"
-        use_checkpoint=False,       #  activation checkpointing
-        checkpoint_use_reentrant=False,  # keep False 
-        device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        norm_type="group",
+        gn_groups=32,
+        use_checkpoint=False,
+        checkpoint_use_reentrant=False,  # keep False (as you prefer)
+        use_attn=True,                  
+        attn_heads=4,
+        device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"),
     ):
-        super(ImageDiscriminator, self).__init__()
+        super().__init__()
 
         self.use_checkpoint = bool(use_checkpoint)
         self.checkpoint_use_reentrant = bool(checkpoint_use_reentrant)
+        self.use_attn = bool(use_attn)
 
         def make_norm(ch: int) -> nn.Module:
             nonlocal gn_groups
             if norm_type == "batch":
                 return nn.BatchNorm2d(ch)
             elif norm_type == "instance":
-                # affine=True is usually better for GAN Ds than affine=False
                 return nn.InstanceNorm2d(ch, affine=True, track_running_stats=False)
             elif norm_type == "group":
                 g = int(gn_groups)
@@ -1620,84 +1632,109 @@ class ImageDiscriminator(nn.Module):
             else:
                 raise ValueError(f"Unknown norm_type={norm_type}. Use batch|instance|group|actnorm")
 
-        # With normalization layers, conv bias is typically unnecessary
         use_bias = False
+        kw, padw = 4, 1
 
-        kw = 4
-        padw = 1
-        self.layers = nn.ModuleList()
+        self.pre_layers = nn.ModuleList()
+        self.post_layers = nn.ModuleList()
 
-        # Initial layer (no norm, standard PatchGAN)
-        self.layers.append(
+        # Initial layer
+        self.pre_layers.append(
             nn.Sequential(
                 nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw, bias=True),
-                nn.LeakyReLU(0.2, inplace=False)
+                nn.LeakyReLU(0.2, inplace=False),
             )
         )
 
         nf_mult = 1
         nf_mult_prev = 1
+
+        # Downsampling layers
+        attn_channels = None
         for n in range(1, n_layers):
             nf_mult_prev = nf_mult
             nf_mult = min(2 ** n, 8)
+            out_ch = ndf * nf_mult
 
-            layer = nn.Sequential(
-                nn.Conv2d(
-                    ndf * nf_mult_prev, ndf * nf_mult,
-                    kernel_size=kw, stride=2, padding=padw, bias=use_bias
-                ),
-                make_norm(ndf * nf_mult),
+            block = nn.Sequential(
+                nn.Conv2d(ndf * nf_mult_prev, out_ch, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
+                make_norm(out_ch),
                 nn.LeakyReLU(0.2, inplace=False),
             )
+            self.pre_layers.append(block)
 
             if n == (n_layers - 1):
-                layer.add_module("attn", attentionBlock(ndf * nf_mult))
+                attn_channels = out_ch
 
-            self.layers.append(layer)
+        self.attn = attentionBlock(attn_channels, n_heads=attn_heads) if (self.use_attn and attn_channels is not None) else None
 
+        # Stride-1 conv (PatchGAN “head”)
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
-        self.layers.append(
+        self.post_layers.append(
             nn.Sequential(
-                nn.Conv2d(
-                    ndf * nf_mult_prev, ndf * nf_mult,
-                    kernel_size=kw, stride=1, padding=padw, bias=use_bias
-                ),
+                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
                 make_norm(ndf * nf_mult),
                 nn.LeakyReLU(0.2, inplace=False),
             )
         )
 
         # Final patch logits
-        self.layers.append(
+        self.post_layers.append(
             nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw, bias=True)
         )
 
         self.to(device)
 
-    def get_features(self, x):
-        """Extract features from intermediate layers"""
-        features = []
-        for layer in self.layers:
-            x = layer(x)
-            features.append(x)
-        return features
-
-    def _forward_layers(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
+    # ---- checkpointable chunks ----
+    def _forward_pre(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.pre_layers:
             x = layer(x)
         return x
 
-    def forward(self, x, get_features=False):
-        """Forward pass with option to return intermediate features"""
+    def _forward_post(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.post_layers:
+            x = layer(x)
+        return x
+
+    def get_features(self, x: torch.Tensor):
+        feats = []
+        for layer in self.pre_layers:
+            x = layer(x)
+            feats.append(x)
+        if self.attn is not None:
+            x = self.attn(x)
+            feats.append(x)
+        for layer in self.post_layers:
+            x = layer(x)
+            feats.append(x)
+        return feats
+
+    def forward(self, x: torch.Tensor, get_features: bool = False):
         if get_features:
             return self.get_features(x)
 
-        # Checkpoint only when it can save memory (training + grads)
-        if self.use_checkpoint and self.training and x.requires_grad:
-            return torch.utils.checkpoint.checkpoint(self._forward_layers, x, use_reentrant=self.checkpoint_use_reentrant)
+        use_ckpt = self.use_checkpoint and self.training and x.requires_grad
+
+        if use_ckpt:
+            x = torch.utils.checkpoint.checkpoint(
+                self._forward_pre, x, use_reentrant=self.checkpoint_use_reentrant
+            )
         else:
-            return self._forward_layers(x)
+            x = self._forward_pre(x)
+
+        # Attention OUTSIDE checkpoint (this is the key change)
+        if self.attn is not None:
+            x = self.attn(x)
+
+        if use_ckpt:
+            x = torch.utils.checkpoint.checkpoint(
+                self._forward_post, x, use_reentrant=self.checkpoint_use_reentrant
+            )
+        else:
+            x = self._forward_post(x)
+
+        return x
 
 
 class LatentDiscriminator(nn.Module):
