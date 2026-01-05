@@ -14,6 +14,7 @@ from torch.autograd import Function
 import collections.abc as abc
 import timm
 from torch.nn.utils.spectral_norm import spectral_norm as SpectralNorm
+from torch.nn.attention import SDPBackend, sdpa_kernel 
 class AddEpsilon(nn.Module):
     def __init__(self, eps):
         super().__init__()
@@ -1532,8 +1533,8 @@ class attentionBlock(nn.Module):
 
         # add position info (no extra layers)
         x = x + self._get_pe(H, W, C, x.device, x.dtype)
-
-        x, _ = self.attention(x, x, x, need_weights=False)
+        with sdpa_kernel(SDPBackend.MATH):
+            x, _ = self.attention(x, x, x, need_weights=False)
 
         # [B, HW, C] -> [B, C, H, W]
         x = x.transpose(1, 2).reshape(B, C, H, W).contiguous()
