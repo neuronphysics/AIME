@@ -70,16 +70,11 @@ def print_vdvae_edge_report(model):
         enc_in  = blk.enc.c1.in_channels
         prior_in = blk.prior.c1.in_channels
 
-        edge_proj = getattr(blk, "edge_proj", None)
-        edge_proj_state = "None" if edge_proj is None else "ON"
 
-        print(f"[{i:02d}] res={res:>3} is_top={is_top} edge={edge_on} edge_ch={edge_ch} "
-              f"enc_in={enc_in} prior_in={prior_in} edge_proj={edge_proj_state}")
+        print(f"[{i:02d}] res={res:>3} is_top={is_top} edge={edge_on} edge_ch={edge_ch} enc_in={enc_in} prior_in={prior_in}")
 
         # Strong sanity checks for your rule: NO edges when res < 32
         if res < min_res:
-            if edge_on or edge_proj is not None:
-                print("   !!! ERROR: edge conditioning is enabled here but should be OFF (res < min_res)")
             if width is not None and enc_in != 2 * width:
                 print(f"   !!! ERROR: enc_in should be {2*width} (width*2) when edge is OFF")
             # prior_in may include temporal width if you use temporal priors at this res
@@ -1191,7 +1186,7 @@ class DMCVBTrainer:
         # Calculate alpha for gradient normalization this epoch
         
         epoch_metrics = defaultdict(list)
-        self.epoch_disc_losses = {'image': [], 'latent': []}
+        self.epoch_disc_losses = {'image': []}
         total_loss =[]
         epoch_component_grads = defaultdict(list)
         
@@ -1222,11 +1217,7 @@ class DMCVBTrainer:
                 losses['img_disc_loss'].item() if torch.is_tensor(losses['img_disc_loss']) 
                 else losses['img_disc_loss']
                 )
-            if 'latent_disc_loss' in losses:
-                self.epoch_disc_losses['latent'].append(
-                    losses['latent_disc_loss'].item() if torch.is_tensor(losses['latent_disc_loss']) 
-                    else losses['latent_disc_loss']
-                )
+            
             # Track metrics
             for key, value in losses.items():
                 if isinstance(value, torch.Tensor):
@@ -1921,7 +1912,7 @@ def main():
         'policy_level': 'all',
         
         # Model settings
-        'max_components': 17,
+        'max_components': 16,
         'latent_dim': 56,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames

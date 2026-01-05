@@ -1586,54 +1586,93 @@ class ImageDiscriminator(nn.Module):
     """Defines a PatchGAN discriminator as in Pix2Pix
         --> see https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/models/networks.py
     """
-    def __init__(self, input_nc=3, ndf=16, n_layers=5, use_actnorm=False, device= torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')):
-
+    def __init__(
+        self,
+        input_nc=3,
+        ndf=16,
+        n_layers=5,
+        norm_type="group",          #  "batch" | "instance" | "group" | "actnorm"
+        gn_groups=32,               #  used when norm_type="group"
+        use_checkpoint=False,       #  activation checkpointing
+        checkpoint_use_reentrant=False,  # keep False 
+        device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    ):
         super(ImageDiscriminator, self).__init__()
-        if not use_actnorm:
-            norm_layer = nn.BatchNorm2d
-        else:
-            norm_layer = ActNorm
-        if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
-            use_bias = norm_layer.func != nn.BatchNorm2d
-        else:
-            use_bias = norm_layer != nn.BatchNorm2d
+
+        self.use_checkpoint = bool(use_checkpoint)
+        self.checkpoint_use_reentrant = bool(checkpoint_use_reentrant)
+
+        def make_norm(ch: int) -> nn.Module:
+            nonlocal gn_groups
+            if norm_type == "batch":
+                return nn.BatchNorm2d(ch)
+            elif norm_type == "instance":
+                # affine=True is usually better for GAN Ds than affine=False
+                return nn.InstanceNorm2d(ch, affine=True, track_running_stats=False)
+            elif norm_type == "group":
+                g = int(gn_groups)
+                g = max(1, min(g, ch))
+                while ch % g != 0 and g > 1:
+                    g -= 1
+                return nn.GroupNorm(g, ch)
+            elif norm_type == "actnorm":
+                return ActNorm(ch)
+            else:
+                raise ValueError(f"Unknown norm_type={norm_type}. Use batch|instance|group|actnorm")
+
+        # With normalization layers, conv bias is typically unnecessary
+        use_bias = False
 
         kw = 4
         padw = 1
         self.layers = nn.ModuleList()
-        
-        # Initial layer
+
+        # Initial layer (no norm, standard PatchGAN)
         self.layers.append(
             nn.Sequential(
-                nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw),
-                nn.LeakyReLU(0.2, inplace=False))
-        )
-        nf_mult = 1
-        nf_mult_prev = 1
-        for n in range(1, n_layers):  
-            nf_mult_prev = nf_mult
-            nf_mult = min(2 ** n, 8)
-            layer=nn.Sequential(
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
-                norm_layer(ndf * nf_mult),
+                nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw, bias=True),
                 nn.LeakyReLU(0.2, inplace=False)
             )
-            if n==(n_layers-1):
-               layer.append(attentionBlock(ndf* nf_mult))
+        )
+
+        nf_mult = 1
+        nf_mult_prev = 1
+        for n in range(1, n_layers):
+            nf_mult_prev = nf_mult
+            nf_mult = min(2 ** n, 8)
+
+            layer = nn.Sequential(
+                nn.Conv2d(
+                    ndf * nf_mult_prev, ndf * nf_mult,
+                    kernel_size=kw, stride=2, padding=padw, bias=use_bias
+                ),
+                make_norm(ndf * nf_mult),
+                nn.LeakyReLU(0.2, inplace=False),
+            )
+
+            if n == (n_layers - 1):
+                layer.add_module("attn", attentionBlock(ndf * nf_mult))
+
             self.layers.append(layer)
 
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
         self.layers.append(
             nn.Sequential(
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
-                norm_layer(ndf * nf_mult),
-                nn.LeakyReLU(0.2, inplace=False)
+                nn.Conv2d(
+                    ndf * nf_mult_prev, ndf * nf_mult,
+                    kernel_size=kw, stride=1, padding=padw, bias=use_bias
+                ),
+                make_norm(ndf * nf_mult),
+                nn.LeakyReLU(0.2, inplace=False),
             )
         )
+
+        # Final patch logits
         self.layers.append(
-            nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw))
-        
+            nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw, bias=True)
+        )
+
         self.to(device)
 
     def get_features(self, x):
@@ -1644,15 +1683,21 @@ class ImageDiscriminator(nn.Module):
             features.append(x)
         return features
 
+    def _forward_layers(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
     def forward(self, x, get_features=False):
         """Forward pass with option to return intermediate features"""
         if get_features:
             return self.get_features(x)
-        
-        # Regular forward pass
-        for layer in self.layers:
-            x = layer(x)
-        return x
+
+        # Checkpoint only when it can save memory (training + grads)
+        if self.use_checkpoint and self.training and x.requires_grad:
+            return torch.utils.checkpoint.checkpoint(self._forward_layers, x, use_reentrant=self.checkpoint_use_reentrant)
+        else:
+            return self._forward_layers(x)
 
 
 class LatentDiscriminator(nn.Module):

@@ -78,7 +78,7 @@ class SpatialSelfAttention(nn.Module):
         super().__init__()
         self.channels = int(channels)
         self.res = int(res)
-
+        self.use_checkpoint = getattr(H, "use_checkpoint", False)
         # --- defaults ---
         num_layers = int(getattr(H, "attn_num_layers", 1))
         num_heads  = int(getattr(H, "attn_num_heads", 4))
@@ -131,28 +131,36 @@ class SpatialSelfAttention(nn.Module):
             self.pos_gate = None
 
         # --- attention residual gate (init 0 => exact identity) ---
-        self.attn_gate = nn.Parameter(torch.zeros(()))  # init 0 => output == input
+        self.attn_gate = nn.Parameter(torch.zeros(()))  
+        self.attn_gate.data.fill_(1e-3)  # 
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B,C,H,W]
         B, C, H, W = x.shape
         assert C == self.channels, f"channels mismatch: got {C}, expected {self.channels}"
         assert H == self.res and W == self.res, f"res mismatch: got {H}x{W}, expected {self.res}x{self.res}"
+        def attn_branch(x_in: torch.Tensor) -> torch.Tensor:
+            # attention branch only (returns [B,C,H,W])
+            xn = self.pre_norm(x_in)
+            tok = xn.flatten(2).transpose(1, 2)  # [B, HW, C]
 
-        # attention branch
-        xn = self.pre_norm(x)
-        tok = xn.flatten(2).transpose(1, 2)  # [B, HW, C]
+            if self.use_pos:
+                pos = self.pos_enc(B).to(device=tok.device, dtype=tok.dtype)  # [B,HW,pos_dim]
+                pos = self.pos_proj(pos)
+                tok = tok + self.pos_gate * pos
 
-        if self.use_pos:
-            # FourierPositionEncoding.forward repeats [B,HW,pos_dim] 
-            pos = self.pos_enc(B).to(device=tok.device, dtype=tok.dtype)
-            pos = self.pos_proj(pos)
-            tok = tok + self.pos_gate * pos
-
-        out = self.attn(tok).last_hidden_state  
-        out = out.transpose(1, 2).reshape(B, C, H, W)
-
-        # gated residual: x + g*(out - x); g=0 => identity (safest)
+            tok_out = self.attn(tok).last_hidden_state  # MUST be Tensor for checkpoint
+            out_img = tok_out.transpose(1, 2).reshape(B, C, H, W)
+            return out_img
+        # Only checkpoint when it can actually save memory (training + grads)
+        if self.use_checkpoint and self.training and x.requires_grad:
+            out = ckpt(
+                attn_branch,
+                x,
+                use_reentrant=False,  
+            )
+        else:
+            out = attn_branch(x)
         g = torch.tanh(self.attn_gate)
         return x + g * (out - x)
 
