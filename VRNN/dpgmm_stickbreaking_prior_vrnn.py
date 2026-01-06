@@ -700,7 +700,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.rollout_top_temperature = float(rollout_top_temperature)
         self.rollout_decoder_temperature = float(rollout_decoder_temperature)
         self.rollout_decode_mode = str(rollout_decode_mode)
-
+        # warp params: warp pyramid up to 1/64 = 2**6
+        self.warp_max_level = 10
+        # learnable fusion weights over pyramid levels (global, shared across channels)
+        # softmax(self.warp_fuse_alpha[:L]) gives weights that sum to 1
+        self.warp_fuse_alpha = torch.nn.Parameter(torch.zeros(self.warp_max_level + 1))
+        # cache base grids so you don't rebuild meshgrid every call (big speedup)
+        self._warp_grid_cache = {}
+ 
         # initialization different parts of the model
         self._init_encoder_decoder(max_components, prior_alpha, prior_beta)
         self._init_vrnn_dynamics(use_orthogonal=use_orthogonal,number_lstm_layer=number_lstm_layer)
@@ -946,25 +953,89 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 elif 'bias' in name:
                     nn.init.constant_(param.data, 0)
 
-    def warp(self, x, flow):
-        # x: [B,C,H,W], flow: [B,2,H,W] in pixels (dx,dy)
-        B, C, H, W = x.shape
-        # base grid in pixel coords
-        yy, xx = torch.meshgrid(
-            torch.arange(H, device=x.device),
-            torch.arange(W, device=x.device),
-            indexing="ij",
-        )
-        grid = torch.stack([xx, yy], dim=0).float()  # [2,H,W]
-        grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)  # [B,2,H,W]
-        coords = grid + flow  # [B,2,H,W]
+    def _get_base_grid(self, H, W, device, dtype):
+        """Returns [1,2,H,W] grid with (x,y) pixel coordinates, cached per (device,H,W,dtype)."""
+        key = (str(device), str(dtype), H, W)
+        if key not in self._warp_grid_cache:
+            yy, xx = torch.meshgrid(
+                torch.arange(H, device=device),
+                torch.arange(W, device=device),
+                indexing="ij",
+            )
+            grid = torch.stack([xx, yy], dim=0).to(dtype=dtype)  # [2,H,W]
+            self._warp_grid_cache[key] = grid.unsqueeze(0)       # [1,2,H,W]
+        return self._warp_grid_cache[key]
 
-        # normalize to [-1,1]
+    def _warp_single_scale(self, x, flow):
+        """Warp x with flow at the SAME resolution. x:[B,C,H,W], flow:[B,2,H,W]"""
+        B, C, H, W = x.shape
+        flow = flow.to(dtype=x.dtype)
+
+        base = self._get_base_grid(H, W, x.device, x.dtype)      # [1,2,H,W]
+        coords = base.expand(B, -1, -1, -1) + flow               # [B,2,H,W]
+
+        # normalize to [-1, 1]
         coords_x = 2.0 * (coords[:, 0] / (W - 1)) - 1.0
         coords_y = 2.0 * (coords[:, 1] / (H - 1)) - 1.0
-        grid_norm = torch.stack([coords_x, coords_y], dim=-1)  # [B,H,W,2]
+        grid_norm = torch.stack([coords_x, coords_y], dim=-1)    # [B,H,W,2]
 
-        return F.grid_sample(x, grid_norm, mode="bilinear", padding_mode="border", align_corners=True)
+        return F.grid_sample(
+            x, grid_norm,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True
+        )
+
+    def warp(self, x, flow):
+        """
+        Multi-scale pyramid warp + learnable fusion.
+        Inputs:
+        x:    [B,C,H,W]
+        flow: [B,2,H,W] in pixels (dx,dy) at full resolution
+
+        Output:
+        x_warped: [B,C,H,W]
+        """
+        B, C, H, W = x.shape
+        warped_levels = []
+
+        # Build pyramid: levels 0..6 => scales 1,1/2,...,1/64 (stop if too small)
+        for lvl in range(self.warp_max_level + 1):
+            s = 2 ** lvl
+            h = H // s
+            w = W // s
+            if h < 2 or w < 2:
+                break  # can't go smaller safely
+
+            if lvl == 0:
+                x_l = x
+                flow_l = flow
+            else:
+                # downsample image
+                x_l = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
+
+                # downsample flow and scale magnitude (pixels shrink by s)
+                flow_l = F.interpolate(flow, size=(h, w), mode="bilinear", align_corners=True) / s
+
+            # warp at that scale
+            w_l = self._warp_single_scale(x_l, flow_l)
+
+            # upsample back to full-res for fusion
+            if lvl != 0:
+                w_l = F.interpolate(w_l, size=(H, W), mode="bilinear", align_corners=False)
+
+            warped_levels.append(w_l)
+
+        # Stack: [B,C,H,W,L]
+        warped_stack = torch.stack(warped_levels, dim=-1)
+        L = warped_stack.shape[-1]
+
+        # Learnable fusion weights (softmax over levels)
+        alpha = self.warp_fuse_alpha[:L].to(dtype=warped_stack.dtype, device=warped_stack.device)
+        weights = torch.softmax(alpha, dim=0).view(1, 1, 1, 1, L)  # broadcast
+
+        x_warped = (warped_stack * weights).sum(dim=-1)
+        return x_warped
 
  
     def _setup_optimizers(self, learning_rate: float, weight_decay: float) -> None:

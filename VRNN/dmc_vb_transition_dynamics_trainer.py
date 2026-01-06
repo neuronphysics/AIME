@@ -1932,7 +1932,7 @@ def main():
         'n_epochs': 200,
         'num_workers': 4,
 
-        'beta_min': 0.7,
+        'beta_min': 0.5,
         'beta_max': 1.0,
         'beta_warmup_epochs': 20,  # 20–50 is common
         'beta_eval': 1.0,          # force eval to use full KL 
