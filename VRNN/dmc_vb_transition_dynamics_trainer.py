@@ -1179,7 +1179,69 @@ class DMCVBTrainer:
         ramp = 0.5 * (1.0 - math.cos(math.pi * p))
         return beta_min + (beta_max - beta_min) * ramp
 
-        
+
+    @torch.no_grad()
+    def tb_log_warp_panel(self, epoch: int, b: int = 0, t: int = 1, tag: str = "warp/teacher_forced_panel"):
+        """
+        Logs a 2x3 panel to TensorBoard (epoch as x-axis):
+          [x_prev, x_tgt, x_warp;
+           e_prev, e_tgt, e_warp]
+        """
+
+        if self.writer is None:
+            return
+
+        self.model.eval()
+
+        # Use a stable batch across epochs (so comparisons are meaningful)
+        if not hasattr(self, "_tb_viz_batch") or self._tb_viz_batch is None:
+            self._tb_viz_batch = next(iter(self.eval_loader))
+
+        batch = self._tb_viz_batch
+        observations = batch["observations"].to(self.device)  # [B,T,C,H,W]
+        actions      = batch["actions"].to(self.device)       # [B,T,A]
+        dones        = batch.get("done", None)
+        if dones is not None:
+            dones = dones.to(self.device)
+
+        # teacher-forced forward to get hidden_states
+        out = self.model.forward_sequence(observations, actions, dones)
+
+        # guard
+        T = observations.shape[1]
+        t = max(1, min(t, T - 1))
+
+        x_prev = observations[b, t-1:t]                  # [1,C,H,W] in [-1,1]
+        x_tgt  = observations[b, t:t+1]                  # [1,C,H,W] in [-1,1]
+        h_ctx  = out["hidden_states"][b:b+1, t-1]        # [1,H]
+
+        x_prev01 = self.model.denormalize_generated_images(x_prev).clamp(0, 1)
+        x_tgt01  = self.model.denormalize_generated_images(x_tgt ).clamp(0, 1)
+
+        e_prev = self.model.canny(x_prev01).clamp(0, 1)  # [1,1,H,W]
+        e_tgt  = self.model.canny(x_tgt01 ).clamp(0, 1)  # [1,1,H,W]
+
+        _, _, H, W = x_prev01.shape
+        ctx = self.model.flow_ctx_proj(h_ctx).view(1, -1, 1, 1).expand(1, -1, H, W)
+        flow_in = torch.cat([x_prev01, e_prev, ctx], dim=1)
+
+        warp_out = self.model.moe_warp(flow_in, e_prev=e_prev, max_flow_full=max(H, W) * 0.25)
+        e_warp = warp_out["e_warp"].clamp(0, 1)
+
+        x_warp01 = self.model.moe_warp.warp_blend_tensor(
+            x_prev01, warp_out["flows_sel"], warp_out["topk_w"], factor=1
+        ).clamp(0, 1)
+
+        # edges to 3-channel for nicer display
+        e_prev3 = e_prev.repeat(1, 3, 1, 1)
+        e_tgt3  = e_tgt.repeat(1, 3, 1, 1)
+        e_warp3 = e_warp.repeat(1, 3, 1, 1)
+
+        imgs = torch.cat([x_prev01, x_tgt01, x_warp01, e_prev3, e_tgt3, e_warp3], dim=0)  # [6,3,H,W]
+        grid = torchvision.utils.make_grid(imgs, nrow=3, padding=2)  # [3,Hg,Wg]
+
+        self.writer.add_image(tag, grid, epoch)
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
         self.model.train()
@@ -1787,6 +1849,8 @@ class DMCVBTrainer:
             if epoch % self.config['visualize_every'] == 0:
                 self.visualize_results(epoch)
                 self.visualize_two_step_prediction(epoch, T_ctx=8)
+                self.tb_log_warp_panel(epoch=epoch, b=0, t=1, tag="warp/teacher_forced_panel")
+                
 
             
             # Save checkpoint

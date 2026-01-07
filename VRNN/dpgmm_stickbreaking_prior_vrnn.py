@@ -22,7 +22,7 @@ from vdvae.vae import VDVAE
 from vdvae.hps import Hyperparams
 from vdvae.vae_helpers import mean_from_discretized_mix_logistic, sample_from_discretized_mix_logistic, draw_gaussian_diag_samples 
 from VRNN.utils.canny_net import CannyFilter
-from VRNN.update import FlowHead
+from VRNN.warp import PyramidMoEWarp
 from VRNN.Kumaraswamy import KumaraswamyStable
 def beta_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
@@ -700,13 +700,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.rollout_top_temperature = float(rollout_top_temperature)
         self.rollout_decoder_temperature = float(rollout_decoder_temperature)
         self.rollout_decode_mode = str(rollout_decode_mode)
-        # warp params: warp pyramid up to 1/64 = 2**6
-        self.warp_max_level = 10
-        # learnable fusion weights over pyramid levels (global, shared across channels)
-        # softmax(self.warp_fuse_alpha[:L]) gives weights that sum to 1
-        self.warp_fuse_alpha = torch.nn.Parameter(torch.zeros(self.warp_max_level + 1))
-        # cache base grids so you don't rebuild meshgrid every call (big speedup)
-        self._warp_grid_cache = {}
  
         # initialization different parts of the model
         self._init_encoder_decoder(max_components, prior_alpha, prior_beta)
@@ -737,6 +730,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "rollout_feat_match_loss",
                 "rollout_edge_loss",
                 "rollout_warp_edge_loss",
+                "warp_lb_loss",
+                "warp_tv_gate_loss",
+                "warp_disagree_loss",
+                "warp_edge_tf_loss",
+                "warp_rgb_tf_loss",
+                "warp_edge_pyr_loss",
+                "warp_rgb_pyr_loss",
             ],
             temperature=temperature,
         )
@@ -763,13 +763,23 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Set to False for ablations
         self.use_edge_conditioning = True
         self.add_edge_to_pxz = False
-        # 3) flow head: input = [x_prev (C), edge(1), ctx(64)] => C+1+64
+        # 3) PyramidMoEWarp: predicts per-expert flow + sparse router (top-k) + confidence
+        #    input = [x_prev (C), edge(1), ctx(flow_ctx_dim)] => C+1+flow_ctx_dim
         flow_in_dim = self.input_channels + 1 + self.flow_ctx_dim
-        self.flow_head = FlowHead(input_dim=flow_in_dim, hidden_dim=256)  # FlowHead outputs 2-ch flow 
-
-        nn.init.zeros_(self.flow_head.conv2.weight)
-        nn.init.zeros_(self.flow_head.conv2.bias)
-
+        self.moe_warp = PyramidMoEWarp(
+            flow_in_dim=flow_in_dim,
+            hidden_dim=self.hidden_dim,
+            K=4,
+            top_k=2,
+            lb_weight=25e-2,
+            tv_gate_weight=1.0 / 1024.0,
+            disagree_weight=1.0 / 1024.0,
+            use_confidence=True,
+            conf_floor=0.25,
+            conf_ceil=0.95,
+            use_checkpoint=self.use_ctx_checkpoint,
+            checkpoint_use_reentrant=False,
+        )
 
     def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int = 200):
         """
@@ -804,7 +814,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.use_edge_conditioning = True
         H.edge_condition_min_res = 64
 
-        H.edge_channels = 1 
+        H.edge_channels = 4 
         H.no_bias_above = 64
         H.custom_width_str = ""
         # --- Attention defaults ---
@@ -953,90 +963,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 elif 'bias' in name:
                     nn.init.constant_(param.data, 0)
 
-    def _get_base_grid(self, H, W, device, dtype):
-        """Returns [1,2,H,W] grid with (x,y) pixel coordinates, cached per (device,H,W,dtype)."""
-        key = (str(device), str(dtype), H, W)
-        if key not in self._warp_grid_cache:
-            yy, xx = torch.meshgrid(
-                torch.arange(H, device=device),
-                torch.arange(W, device=device),
-                indexing="ij",
-            )
-            grid = torch.stack([xx, yy], dim=0).to(dtype=dtype)  # [2,H,W]
-            self._warp_grid_cache[key] = grid.unsqueeze(0)       # [1,2,H,W]
-        return self._warp_grid_cache[key]
-
-    def _warp_single_scale(self, x, flow):
-        """Warp x with flow at the SAME resolution. x:[B,C,H,W], flow:[B,2,H,W]"""
-        B, C, H, W = x.shape
-        flow = flow.to(dtype=x.dtype)
-
-        base = self._get_base_grid(H, W, x.device, x.dtype)      # [1,2,H,W]
-        coords = base.expand(B, -1, -1, -1) + flow               # [B,2,H,W]
-
-        # normalize to [-1, 1]
-        coords_x = 2.0 * (coords[:, 0] / (W - 1)) - 1.0
-        coords_y = 2.0 * (coords[:, 1] / (H - 1)) - 1.0
-        grid_norm = torch.stack([coords_x, coords_y], dim=-1)    # [B,H,W,2]
-
-        return F.grid_sample(
-            x, grid_norm,
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=True
-        )
-
-    def warp(self, x, flow):
-        """
-        Multi-scale pyramid warp + learnable fusion.
-        Inputs:
-        x:    [B,C,H,W]
-        flow: [B,2,H,W] in pixels (dx,dy) at full resolution
-
-        Output:
-        x_warped: [B,C,H,W]
-        """
-        B, C, H, W = x.shape
-        warped_levels = []
-
-        # Build pyramid: levels 0..6 => scales 1,1/2,...,1/64 (stop if too small)
-        for lvl in range(self.warp_max_level + 1):
-            s = 2 ** lvl
-            h = H // s
-            w = W // s
-            if h < 2 or w < 2:
-                break  # can't go smaller safely
-
-            if lvl == 0:
-                x_l = x
-                flow_l = flow
-            else:
-                # downsample image
-                x_l = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
-
-                # downsample flow and scale magnitude (pixels shrink by s)
-                flow_l = F.interpolate(flow, size=(h, w), mode="bilinear", align_corners=True) / s
-
-            # warp at that scale
-            w_l = self._warp_single_scale(x_l, flow_l)
-
-            # upsample back to full-res for fusion
-            if lvl != 0:
-                w_l = F.interpolate(w_l, size=(H, W), mode="bilinear", align_corners=False)
-
-            warped_levels.append(w_l)
-
-        # Stack: [B,C,H,W,L]
-        warped_stack = torch.stack(warped_levels, dim=-1)
-        L = warped_stack.shape[-1]
-
-        # Learnable fusion weights (softmax over levels)
-        alpha = self.warp_fuse_alpha[:L].to(dtype=warped_stack.dtype, device=warped_stack.device)
-        weights = torch.softmax(alpha, dim=0).view(1, 1, 1, 1, L)  # broadcast
-
-        x_warped = (warped_stack * weights).sum(dim=-1)
-        return x_warped
-
  
     def _setup_optimizers(self, learning_rate: float, weight_decay: float) -> None:
         def get_params(*modules, exclude_params=None):
@@ -1079,7 +1005,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self._rnn,
             self.rnn_layer_norm,
             self.flow_ctx_proj,
-            self.flow_head,
+            self.moe_warp,
             self.edge_cond_proj,
         ]
         
@@ -1209,11 +1135,18 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "kumaraswamy_kl_losses": [],
             "K_eff": [],
             "component_margin": [],
+            "warp_lb_loss": [],
+            "warp_tv_gate_loss": [],
+            "warp_disagree_loss": [],
+            "warp_edge_tf_loss": [],
+            "warp_rgb_tf_loss": [],
+            "warp_edge_pyr_loss": [],
+            "warp_rgb_pyr_loss": [],
         }
 
         for t in range(seq_len):
             x_t = observations[:, t]  # [B, C, H, W]
-            x_target = x_t
+
             a_t = actions[:, t]       # [B, action_dim]
 
             if dones is None:
@@ -1228,24 +1161,85 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             h_context = h[-1]
             edge_guide = None
             if self.use_edge_conditioning and (t > 0):
-                # Warp STRUCTURE (edges) from x_{t-1} -> x_t. No RGB copying.
-                with torch.no_grad():
-                    x_prev = observations[:, t - 1]  # [B,C,H,W] in [-1,1]
-                    x_prev01 = self.denormalize_generated_images(x_prev).clamp(0.0, 1.0)
-                    e_prev = self.canny(x_prev01)
-                    B_, _, H_, W_ = x_prev.shape
+                # Warp STRUCTURE (edges) from x_(t-1) -> x_t using PyramidMoEWarp (learned MoE flow).
+                x_prev = observations[:, t - 1]  # [B,C,H,W] in [-1,1]
+                x_prev01 = self.denormalize_generated_images(x_prev).clamp(0.0, 1.0)
+                e_prev = self.canny(x_prev01).detach()  # [B,1,H,W]
+                B_, _, H_, W_ = x_prev.shape
                 ctx = self.flow_ctx_proj(h_context).view(B_, -1, 1, 1).expand(B_, -1, H_, W_)
                 flow_in = torch.cat([x_prev01.detach(), e_prev, ctx], dim=1)
                 max_flow = 0.25 * float(max(H_, W_))
-                flow = torch.tanh(self.flow_head(flow_in)) * max_flow
-                edge_guide = self.warp(e_prev, flow) #[B,1,H,W]
-                edge_guide = edge_guide * mask_t.view(batch_size, 1, 1, 1) 
-            elif self.use_edge_conditioning and (t == 0):
-                B_, _, H_, W_ = x_t.shape
-                with torch.no_grad():
-                    edge_guide = torch.zeros(B_, 1, H_, W_, device=x_t.device, dtype=x_t.dtype)
+                warp_out = self.moe_warp(flow_in, e_prev=e_prev, max_flow_full=max_flow)
+                # Target frame for supervision / guide (convert x_t from [-1,1] -> [0,1])
+                x_t01 = self.denormalize_generated_images(x_t).clamp(0.0, 1.0).to(x_prev01.dtype)
+                e_tgt = self.canny(x_t01).detach().to(x_prev01.dtype)
+
+                # ----- multi-scale pyramid supervision -----
+                warp_edge_pyr_loss = 0.0
+                warp_rgb_pyr_loss  = 0.0
+
+                # pick which scales you actually want (64 -> 1x1 if H=W=64, often not useful)
+                pyr_factors = (1, 2, 4, 8, 16, 32)
+
+                for f in pyr_factors:
+                    # Edge: use PyramidMoEWarp's precomputed warped edges at that scale
+                    e_warp_f = warp_out["e_warp_by_factor"][f]               # [B,1,H/f,W/f]
+                    e_tgt_f  = torch.nn.functional.interpolate(
+                        e_tgt, size=e_warp_f.shape[-2:], mode="bilinear", align_corners=False
+                    )
+
+                    # RGB: compute warped RGB at that scale using the SAME flows+weights
+                    x_warp_f = self.moe_warp.warp_blend_tensor(
+                        x_prev01, warp_out["flows_sel"], warp_out["topk_w"], factor=f
+                    )                                                        # [B,3,H/f,W/f]
+                    x_tgt_f  = torch.nn.functional.interpolate(
+                        x_t01, size=x_warp_f.shape[-2:], mode="bilinear", align_corners=False
+                    )
+
+                    # weights: emphasize high-res, but still guide coarse alignment
+                    w = 1.0 / (f ** 0.5)   # simple, stable default
+
+                    warp_edge_pyr_loss = warp_edge_pyr_loss + w * (e_warp_f - e_tgt_f).abs().mean()
+                    warp_rgb_pyr_loss  = warp_rgb_pyr_loss  + w * (x_warp_f - x_tgt_f).abs().mean()
+
+                outputs["warp_edge_pyr_loss"].append(warp_edge_pyr_loss.float())
+                outputs["warp_rgb_pyr_loss"].append(warp_rgb_pyr_loss.float())
+
+                # Detach edge_guide to avoid backprop through VDVAE (keeps memory stable);
+                x_warp01 = self.moe_warp.warp_blend_tensor(
+                    x_prev01, warp_out["flows_sel"], warp_out["topk_w"], factor=1
+                )
+
+                edge_guide = torch.cat([warp_out["e_warp"], x_warp01], dim=1).detach()  # [B,4,H,W] 
+                edge_guide = edge_guide * mask_t.view(batch_size, 1, 1, 1)
+                outputs['warp_lb_loss'].append(warp_out['lb_loss'].float())
+                outputs['warp_tv_gate_loss'].append(warp_out['tv_gate_loss'].float())
+                outputs['warp_disagree_loss'].append(warp_out['disagree_loss'].float())
+                # --- teacher-forced warp supervision ---
+                # (x_t01, e_tgt already computed above for pyramid + TF supervision)
+
+                # L1 per-sample, masked by done
+                l_edge = (warp_out["e_warp"] - e_tgt).abs().mean(dim=(1, 2, 3))
+                l_edge = (l_edge * mask_t).sum() / (mask_t.sum() + self.eps)
+                outputs["warp_edge_tf_loss"].append(l_edge)
+
+                l_rgb = (x_warp01 - x_t01).abs().mean(dim=(1, 2, 3))
+                l_rgb = (l_rgb * mask_t).sum() / (mask_t.sum() + self.eps)
+                outputs["warp_rgb_tf_loss"].append(l_rgb)
+
+            else:
+                # keep list lengths aligned even when warp isn't used
+                #TODO: Do I need to initialize edge_guide
+                outputs['warp_lb_loss'].append(torch.zeros((), device=x_t.device))
+                outputs['warp_tv_gate_loss'].append(torch.zeros((), device=x_t.device))
+                outputs['warp_disagree_loss'].append(torch.zeros((), device=x_t.device))
+                outputs["warp_edge_tf_loss"].append(torch.zeros((), device=x_t.device))
+                outputs["warp_rgb_tf_loss"].append(torch.zeros((), device=x_t.device))
+                outputs["warp_edge_pyr_loss"].append(torch.zeros((), device=x_t.device))
+                outputs["warp_rgb_pyr_loss"].append(torch.zeros((), device=x_t.device))
+
             x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
-            x_target_nhwc = x_target.permute(0, 2, 3, 1).contiguous()
+            x_target_nhwc = x_t_nhwc
 
             vdvae_out, temporal_state = self.vdvae.forward_temporal_step(
                 x_t_nhwc,
@@ -1377,10 +1371,45 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             component_margin = torch.stack(outputs["component_margin"]).mean()
         else:
             component_margin = torch.zeros((), device=device)
+        # PyramidMoEWarp regularizers (already weighted inside the module)
+        if len(outputs["warp_lb_loss"]) > 0:
+            warp_lb_loss = torch.stack(outputs["warp_lb_loss"]).mean()
+            warp_tv_gate_loss = torch.stack(outputs["warp_tv_gate_loss"]).mean()
+            warp_disagree_loss = torch.stack(outputs["warp_disagree_loss"]).mean()
+        else:
+            warp_lb_loss = torch.zeros((), device=device)
+            warp_tv_gate_loss = torch.zeros((), device=device)
+            warp_disagree_loss = torch.zeros((), device=device)
+        warp_reg_loss = warp_lb_loss + warp_tv_gate_loss + warp_disagree_loss
+
+        # Teacher-forced warp supervision losses (may be empty if warp disabled)
+        if len(outputs.get("warp_edge_tf_loss", [])) > 0:
+            warp_edge_tf_loss = torch.stack(outputs["warp_edge_tf_loss"]).mean()
+        else:
+            warp_edge_tf_loss = torch.zeros((), device=device)
+
+        if len(outputs.get("warp_rgb_tf_loss", [])) > 0:
+            warp_rgb_tf_loss = torch.stack(outputs["warp_rgb_tf_loss"]).mean()
+        else:
+            warp_rgb_tf_loss = torch.zeros((), device=device)
+
+
+        # Pyramid warp supervision losses (may be empty if warp disabled)
+        if len(outputs.get("warp_edge_pyr_loss", [])) > 0:
+            warp_edge_pyr_loss = torch.stack(outputs["warp_edge_pyr_loss"]).mean()
+        else:
+            warp_edge_pyr_loss = torch.zeros((), device=device)
+
+        if len(outputs.get("warp_rgb_pyr_loss", [])) > 0:
+            warp_rgb_pyr_loss = torch.stack(outputs["warp_rgb_pyr_loss"]).mean()
+        else:
+            warp_rgb_pyr_loss = torch.zeros((), device=device)
+
         total_vae_loss = (
             lambda_recon * recon_loss
             + beta * (kl_z + hierarchical_kl)
             - component_margin # encourage diverse component usage (maximize margin entropy)
+            + warp_reg_loss
         )
 
         vae_losses = {
@@ -1388,7 +1417,15 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "kl_z": kl_z,
             "hierarchical_kl": hierarchical_kl,
             "component_margin": component_margin,
+            "warp_lb_loss": warp_lb_loss,
+            "warp_tv_gate_loss": warp_tv_gate_loss,
+            "warp_disagree_loss": warp_disagree_loss,
+            "warp_reg_loss": warp_reg_loss,
             "total_vae_loss": total_vae_loss,
+            "warp_edge_tf_loss": warp_edge_tf_loss,
+            "warp_rgb_tf_loss": warp_rgb_tf_loss,
+            "warp_edge_pyr_loss": warp_edge_pyr_loss,
+            "warp_rgb_pyr_loss": warp_rgb_pyr_loss,
         }
 
         return vae_losses, outputs
@@ -1618,7 +1655,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         return img_adv_loss , temporal_adv_loss, feature_match_loss
 
 
-
     def denormalize_generated_images(self, images):
         """
         Convert generated images from [-1, 1] back to [0, 1] for visualization
@@ -1634,6 +1670,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                             lambda_img: float = 0.5,
                             lambda_recon: float = 1.0,
                             lambda_edge: float = 0.4,
+                            lambda_warp_rgb_pyr: float =1.0,
+                            lambda_warp_edge_pyr: float =1.0,
                             batch_idx: Optional[int] = None,
                             ) -> Dict[str, torch.Tensor]:
         """
@@ -1845,6 +1883,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "component_margin": (-vae_losses["component_margin"]).reshape([]),
                 "rollout_edge_loss": (warmup_factor * lambda_edge * rollout_edge_loss).reshape([]),
                 "rollout_warp_edge_loss": (warmup_factor * lambda_edge * rollout_warp_edge_loss).reshape([]),
+                "warp_lb_loss": (warmup_factor * vae_losses["warp_lb_loss"]).reshape([]),
+                "warp_tv_gate_loss": (warmup_factor * vae_losses["warp_tv_gate_loss"]).reshape([]),
+                "warp_disagree_loss": (warmup_factor * vae_losses["warp_disagree_loss"]).reshape([]),
+                "warp_edge_tf_loss": (warmup_factor * lambda_edge * vae_losses["warp_edge_tf_loss"]).reshape([]),
+                "warp_rgb_tf_loss":  (warmup_factor * vae_losses["warp_rgb_tf_loss"]).reshape([]),  # or multiply by a lambda_warp_rgb
+                "warp_edge_pyr_loss": (lambda_warp_edge_pyr * vae_losses["warp_edge_pyr_loss"]).reshape([]),
+                "warp_rgb_pyr_loss":(lambda_warp_rgb_pyr  * vae_losses["warp_rgb_pyr_loss"]).reshape([]),
             }
             total_gen_loss = self.total_weighter.reduce_losses(total_components, batch_idx)
         else:
@@ -1858,15 +1903,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 + warmup_factor * rollout_temporal_adv_loss
                 + lambda_img * rollout_feat_match_loss
             )
-            elbo_loss = (
-                lambda_recon * vae_losses["recon_loss"]
-                + beta * vae_losses["kl_z"]
-                + beta * vae_losses["hierarchical_kl"]
-                - vae_losses["component_margin"]
-            )
+            elbo_loss = vae_losses["total_vae_loss"]
             total_gen_loss = elbo_loss + adv_base + adv_roll
             total_gen_loss = total_gen_loss + warmup_factor * lambda_edge * rollout_edge_loss
             total_gen_loss = total_gen_loss + warmup_factor * lambda_edge * rollout_warp_edge_loss
+            total_gen_loss = total_gen_loss + warmup_factor * (0.25 * lambda_edge) * vae_losses["warp_edge_tf_loss"]
+            total_gen_loss = total_gen_loss + warmup_factor * 0.001 * vae_losses["warp_rgb_tf_loss"]
+            total_gen_loss = total_gen_loss + lambda_warp_edge_pyr * vae_losses["warp_edge_pyr_loss"]
+            total_gen_loss = total_gen_loss + lambda_warp_rgb_pyr  * vae_losses["warp_rgb_pyr_loss"]
 
 
         # 7) Backprop generator
@@ -1975,6 +2019,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         B, T_ctx = initial_obs.shape[:2]
         device = initial_obs.device
         dtype = initial_obs.dtype
+
         def compute_mask_t(t: int) -> torch.Tensor:
             if dones is None:
                 return torch.ones(B, device=device, dtype=torch.float32)
@@ -1996,6 +2041,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             h = self.h0.expand(self.number_lstm_layer, B, -1).contiguous()
             c = self.c0.expand(self.number_lstm_layer, B, -1).contiguous()
             temporal_state = self.vdvae.init_temporal_state(B, device=device, dtype=dtype)
+
             # --- context scan ---
             for t in range(T_ctx):
                 x_t = initial_obs[:, t]
@@ -2005,12 +2051,38 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 h_context = h[-1]
                 x_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
 
+                # Align warmup with training: use the edge_guide conditioning during context scan
+                edge_guide = None
+                if self.use_edge_conditioning:
+                    _, _, H_, W_ = x_t.shape
+                    if t == 0:
+                        edge_guide = None
+                    else:
+                        x_prev_ctx = initial_obs[:, t - 1]
+                        x_prev01 = self.denormalize_generated_images(x_prev_ctx).clamp(0.0, 1.0).to(dtype)
+                        e_prev = self.canny(x_prev01).detach().to(dtype)
+
+                        ctx = self.flow_ctx_proj(h_context).view(B, -1, 1, 1).expand(B, -1, H_, W_).to(dtype)
+                        flow_in = torch.cat([x_prev01.detach(), e_prev, ctx], dim=1)
+
+                        max_flow = 0.25 * float(max(H_, W_))
+                        warp_out = self.moe_warp(flow_in, e_prev=e_prev, max_flow_full=max_flow)
+
+                        # RGB warp (same flows + weights)
+                        x_warp01 = self.moe_warp.warp_blend_tensor(
+                            x_prev01, warp_out["flows_sel"], warp_out["topk_w"], factor=1
+                        )
+                        # 4-channel guide for VDVAE
+                        guide4 = torch.cat([warp_out["e_warp"], x_warp01], dim=1)   # [B,4,H,W]
+                        edge_guide = guide4.detach() * mask_t.view(B, 1, 1, 1)
+
                 vdvae_out, temporal_state = self.vdvae.forward_temporal_step(
                     x_nhwc,
                     x_nhwc,
                     h_context=h_context,
                     a_t=a_t,
                     mask_t=mask_t,
+                    edge_guide=edge_guide,
                     temporal_state=temporal_state,
                 )
 
@@ -2020,14 +2092,16 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 z_flat = top_q_mean_map.permute(0, 2, 3, 1).reshape(B, topH * topW * zdim)
                 rnn_in = torch.cat([z_flat, a_t], dim=-1)
                 _, (h, c) = self.rnn(rnn_in, h, c, mask_t)
+
             assert T_ctx >= 1, "Need at least 1 context frame (T_ctx>=1)"
 
             x_prev = initial_obs[:, T_ctx - 1]  # [B,C,H,W]
-            # future rollout 
+
+            # future rollout
             pred_imgs = []
-            hidden_state =[]
-            latent_state =[]
-            debug = {"z_top": [], "c_top": [], "flow": [], "edge_warp": []}
+            hidden_state = []
+            latent_state = []
+            debug = {"c_top": [], "flow": [], "edge_warp": []}
 
             for k in range(horizon):
                 t = T_ctx + k
@@ -2050,7 +2124,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 var_tok = torch.exp(prior_params['log_vars']).view(B, topH * topW, K, self.zdim)
 
                 # Sample component per token, then sample z from that Gaussian
-                # (simple categorical + Gaussian sampling)
                 cat = torch.distributions.Categorical(probs=pi_tok)
                 c_tok = cat.sample()  # [B, Ttok]
                 mu_sel = torch.gather(mu_tok, 2, c_tok[..., None, None].expand(B, topH * topW, 1, self.zdim)).squeeze(2)
@@ -2060,40 +2133,44 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
                 z_top_map = z_tok.reshape(B, topH, topW, self.zdim).permute(0, 3, 1, 2).contiguous()
 
-               
-                #  2) motion scaffold: predict flow + mask from (x_prev, edges(x_prev), h_context) 
-                # CannyFilter returns continuous thin edges [B,1,H,W]. 
-                x_prev01 =self.denormalize_generated_images(x_prev).clamp(0.0, 1.0)
-                e_prev = self.canny(x_prev01).detach()
+                #  2) motion scaffold: predict flow + mask from (x_prev, edges(x_prev), h_context)
+                x_prev01 = self.denormalize_generated_images(x_prev).clamp(0.0, 1.0).to(dtype)
+                e_prev = self.canny(x_prev01).detach().to(dtype)
 
-                ctx = self.flow_ctx_proj(h_context)  # [B, flow_ctx_dim]
-                ctx_map = ctx[:, :, None, None].expand(-1, -1, x_prev.shape[2], x_prev.shape[3])
+                ctx = self.flow_ctx_proj(h_context).to(dtype)  # [B, flow_ctx_dim]
+                ctx_map = ctx[:, :, None, None].expand(-1, -1, x_prev.shape[2], x_prev.shape[3]).to(dtype)
 
                 flow_in = torch.cat([x_prev01, e_prev, ctx_map], dim=1)  # [B, C+1+ctx, H, W]
 
-                flow_raw = self.flow_head(flow_in)   # [B,2,H,W] 
+                max_flow = 0.25 * float(max(x_prev.shape[2], x_prev.shape[3]))
+                warp_out = self.moe_warp(flow_in, e_prev=e_prev, max_flow_full=max_flow)
+                flow = warp_out['flow_blended']
+                e_warp = warp_out['e_warp']
 
-                # bound the flow (CRITICAL for stability)
-                Himg, Wimg = x_prev.shape[2], x_prev.shape[3]
-                max_flow = 0.25 * float(max(Himg, Wimg))     # e.g. 16 for 64x64
-                flow = torch.tanh(flow_raw) * max_flow
-
-                e_warp =self.warp(e_prev, flow)
                 debug["flow"].append(flow if grad else flow.detach())
                 debug["edge_warp"].append(e_warp if grad else e_warp.detach())
-                 # Decode through temporal VDVAE
+
+                # RGB warp (same flows + weights) -> build 4-channel guide
+                x_warp01 = self.moe_warp.warp_blend_tensor(
+                    x_prev01, warp_out["flows_sel"], warp_out["topk_w"], factor=1
+                )
+                guide4 = torch.cat([e_warp, x_warp01], dim=1)  # [B,4,H,W]
+                guide4 = guide4 * mask_t.view(B, 1, 1, 1)
+
+                # Decode through temporal VDVAE
                 px_z, temporal_state = self.vdvae.decode_from_top_latent_temporal(
                     z_top_map=z_top_map,
                     a_t=a_t,
                     mask_t=mask_t,
                     temporal_state=temporal_state,
-                    e_warp=e_warp,
+                    e_warp=guide4,
                     t=None,
                     temperature=decoder_temperature,
                 )
 
                 if self.use_edge_conditioning and getattr(self, "add_edge_to_pxz", False):
-                    px_z = px_z +self.edge_cond_proj(e_warp)
+                    px_z = px_z + self.edge_cond_proj(e_warp)
+
                 dmol_out = self.vdvae.decoder.out_net.forward(px_z)
 
                 # ---- 1) scratch prediction (what you already had) ----
@@ -2107,14 +2184,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     )
                 else:
                     raise ValueError(f"decode_mode must be 'mean' or 'sample', got {decode_mode}")
+
                 x_scratch = x_scratch.permute(0, 3, 1, 2).contiguous()  # [B,C,H,W]
                 # ---- 2) decode from latent as usual ----
                 pred_imgs.append(x_scratch)
 
-                #  4) update x_prev safely with dones-mask 
+                #  4) update x_prev safely with dones-mask
                 vm = mask_t.view(B, 1, 1, 1).float()
                 x_prev = vm * x_scratch + (1.0 - vm) * x_prev
-
                 x_prev = x_prev if grad else x_prev.detach()
 
                 # Update top-level LSTM with sampled top latent (flattened) + action
@@ -2125,9 +2202,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 hidden_state.append(h[-1].detach())
 
                 debug["c_top"].append(c_tok.reshape(B, topH, topW).detach())
-            debug["z_seq"] =torch.cat([torch.stack(latent_state, dim=1),torch.stack(hidden_state, dim=1)], dim=-1)
+
+            debug["z_seq"] = torch.cat([torch.stack(latent_state, dim=1), torch.stack(hidden_state, dim=1)], dim=-1)
             pred_imgs = torch.stack(pred_imgs, dim=1)  # [B, horizon, C, H, W]
             debug["vae_future"] = pred_imgs
+
             if len(debug.get("flow", [])) > 0:
                 debug["flow"] = torch.stack(debug["flow"], dim=1)
             if len(debug.get("edge_warp", [])) > 0:
