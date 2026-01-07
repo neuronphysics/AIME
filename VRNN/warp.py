@@ -78,6 +78,28 @@ class ConfHead(nn.Module):
 def GN(c, g=8):
     return nn.GroupNorm(num_groups=min(g, c), num_channels=c)
 
+def sobel_dxdy(x: torch.Tensor):
+    """
+    x: (B, C, H, W) float
+    returns dx, dy: (B, C, H, W)
+    """
+    B, C, H, W = x.shape
+    wx = x.new_tensor([[-1, 0, 1],
+                       [-2, 0, 2],
+                       [-1, 0, 1]]).view(1, 1, 3, 3)
+    wy = x.new_tensor([[-1, -2, -1],
+                       [ 0,  0,  0],
+                       [ 1,  2,  1]]).view(1, 1, 3, 3)
+
+    # apply same kernel to each channel using groups=C
+    wx = wx.expand(C, 1, 3, 3).contiguous()
+    wy = wy.expand(C, 1, 3, 3).contiguous()
+
+    x_pad = F.pad(x, (1, 1, 1, 1), mode="replicate")
+    dx = F.conv2d(x_pad, wx, groups=C)
+    dy = F.conv2d(x_pad, wy, groups=C)
+    return dx, dy
+    
 # Final Warp Class
 class PyramidMoEWarp(nn.Module):
     """
@@ -95,18 +117,18 @@ class PyramidMoEWarp(nn.Module):
         hidden_dim: int = 48,
         K: int = 4,
         code_dim: int = 8,
-        up_factor: int = 8,
+        up_factor: int = 4,
 
         # refinement pyramid: factors relative to full-res (H/f, W/f)
-        pyramid_factors: Sequence[int] = (32, 16, 8),
-        iters_per_level: Sequence[int] = (1, 1, 2),
+        pyramid_factors: Sequence[int] = (32, 16, 8, 4),
+        iters_per_level: Sequence[int] = (1, 1, 2, 2),
 
         # output pyramid (6 levels like you asked)
-        out_factors: Sequence[int] = (1, 2, 4, 8, 16, 32, 64),
+        out_factors: Sequence[int] = (1, 2, 4, 8, 16, 32),
 
         # routing
         top_k: int = 2,
-        gate_temperature: float = 1.0,
+        gate_temperature: float = 0.3,
 
         # regularizers
         lb_weight: float = 2e-2,
@@ -115,8 +137,8 @@ class PyramidMoEWarp(nn.Module):
 
         # confidence
         use_confidence: bool = True,
-        conf_floor: float = 0.25,   # prevents "dead" experts from making weights explode
-        conf_ceil: float = 0.95,
+        conf_floor: float = 0.75,   # prevents "dead" experts from making weights explode
+        conf_ceil: float = 0.99,
         use_checkpoint: bool = True,
         checkpoint_use_reentrant: bool = False,
         device: torch.device | str | None = None,
@@ -245,7 +267,7 @@ class PyramidMoEWarp(nn.Module):
         yg = 2.0 * grid[:, 1] / max(H - 1, 1) - 1.0
         grid_norm = torch.stack([xg, yg], dim=-1)
         return F.grid_sample(x, grid_norm, mode="bilinear", padding_mode="border", align_corners=True)
-        
+
     def warp_blend_tensor(
         self,
         x_prev: torch.Tensor,               # [B,C,H,W]
@@ -341,7 +363,7 @@ class PyramidMoEWarp(nn.Module):
             prev_factor = factor
 
             gate_logits = self._maybe_checkpoint(self.router, net_inp)  # [B,K,h_l,w_l]
-            gate_probs = torch.softmax(gate_logits / max(self.gate_temperature, 1e-6), dim=1)
+            gate_probs = torch.softmax(gate_logits / self.gate_temperature, dim=1)
             lb_losses.append(self._lb_loss(gate_probs))
             gate_logits_pyr.append(gate_logits)
 

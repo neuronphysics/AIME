@@ -95,6 +95,7 @@ PyOpenGL
 pyparsing
 python-dateutil
 pytorch-ranger
+pytorch3d
 pytz
 PyYAML
 regex

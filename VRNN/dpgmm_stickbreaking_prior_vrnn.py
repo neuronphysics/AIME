@@ -15,14 +15,13 @@ from collections import OrderedDict
 from torch.utils.checkpoint import checkpoint as ckpt
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from vis_networks import EMA, TemporalDiscriminator, AddEpsilon, check_tensor, ImageDiscriminator
-
 from VRNN.RGB import DynamicWeightAverage
 from VRNN.lstm import LSTMLayer
 from vdvae.vae import VDVAE
 from vdvae.hps import Hyperparams
 from vdvae.vae_helpers import mean_from_discretized_mix_logistic, sample_from_discretized_mix_logistic, draw_gaussian_diag_samples 
 from VRNN.utils.canny_net import CannyFilter
-from VRNN.warp import PyramidMoEWarp
+from VRNN.warp import PyramidMoEWarp, sobel_dxdy
 from VRNN.Kumaraswamy import KumaraswamyStable
 def beta_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
@@ -768,14 +767,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         flow_in_dim = self.input_channels + 1 + self.flow_ctx_dim
         self.moe_warp = PyramidMoEWarp(
             flow_in_dim=flow_in_dim,
-            hidden_dim=self.hidden_dim,
+            hidden_dim=self.hidden_dim*2,
             K=4,
             top_k=2,
-            lb_weight=25e-2,
+            lb_weight=2e-2,
             tv_gate_weight=1.0 / 1024.0,
             disagree_weight=1.0 / 1024.0,
             use_confidence=True,
-            conf_floor=0.25,
+            conf_floor=0.5,
             conf_ceil=0.95,
             use_checkpoint=self.use_ctx_checkpoint,
             checkpoint_use_reentrant=False,
@@ -1219,12 +1218,18 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 # (x_t01, e_tgt already computed above for pyramid + TF supervision)
 
                 # L1 per-sample, masked by done
+
                 l_edge = (warp_out["e_warp"] - e_tgt).abs().mean(dim=(1, 2, 3))
+
                 l_edge = (l_edge * mask_t).sum() / (mask_t.sum() + self.eps)
                 outputs["warp_edge_tf_loss"].append(l_edge)
 
                 l_rgb = (x_warp01 - x_t01).abs().mean(dim=(1, 2, 3))
-                l_rgb = (l_rgb * mask_t).sum() / (mask_t.sum() + self.eps)
+                dx_w, dy_w = sobel_dxdy(x_warp01)
+                dx_t, dy_t = sobel_dxdy(x_t01)
+                grad = (dx_w - dx_t).abs().mean(dim=(1, 2, 3)) + (dy_w - dy_t).abs().mean(dim=(1, 2, 3))
+                l_rgb = ((l_rgb + 0.2 * grad) * mask_t).sum() / (mask_t.sum() + self.eps)
+
                 outputs["warp_rgb_tf_loss"].append(l_rgb)
 
             else:

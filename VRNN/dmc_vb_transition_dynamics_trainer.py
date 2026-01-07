@@ -1179,21 +1179,31 @@ class DMCVBTrainer:
         ramp = 0.5 * (1.0 - math.cos(math.pi * p))
         return beta_min + (beta_max - beta_min) * ramp
 
-
     @torch.no_grad()
-    def tb_log_warp_panel(self, epoch: int, b: int = 0, t: int = 1, tag: str = "warp/teacher_forced_panel"):
+    def tb_log_warp_panel(
+        self,
+        epoch: int,
+        b: int = 0,
+        t: int = 1,
+        tag: str = "warp/teacher_forced_panel",
+        max_flow_frac: float = 0.25,
+    ):
         """
-        Logs a 2x3 panel to TensorBoard (epoch as x-axis):
-          [x_prev, x_tgt, x_warp;
-           e_prev, e_tgt, e_warp]
-        """
+        Logs:
+        Main 2x3:
+            [x_prev, x_tgt, x_warp_blend;
+            e_prev, e_tgt, e_warp_blend]
 
+        Extra diag panel (2x4):
+            [x_warp_top1, x_warp_blend, rgb_err, w_top1;
+            flow_mag, gate_entropy, top1_expert, edge_err]
+        """
         if self.writer is None:
             return
 
         self.model.eval()
 
-        # Use a stable batch across epochs (so comparisons are meaningful)
+        # stable batch across epochs
         if not hasattr(self, "_tb_viz_batch") or self._tb_viz_batch is None:
             self._tb_viz_batch = next(iter(self.eval_loader))
 
@@ -1204,43 +1214,101 @@ class DMCVBTrainer:
         if dones is not None:
             dones = dones.to(self.device)
 
-        # teacher-forced forward to get hidden_states
+        # teacher-forced forward for hidden state
         out = self.model.forward_sequence(observations, actions, dones)
 
-        # guard
-        T = observations.shape[1]
-        t = max(1, min(t, T - 1))
+        B, T, C, H, W = observations.shape
+        b = int(max(0, min(b, B - 1)))
+        t = int(max(1, min(t, T - 1)))
 
         x_prev = observations[b, t-1:t]                  # [1,C,H,W] in [-1,1]
         x_tgt  = observations[b, t:t+1]                  # [1,C,H,W] in [-1,1]
-        h_ctx  = out["hidden_states"][b:b+1, t-1]        # [1,H]
+        h_ctx  = out["hidden_states"][b:b+1, t-1]        # [1,Hdim]
 
+        # to [0,1]
         x_prev01 = self.model.denormalize_generated_images(x_prev).clamp(0, 1)
         x_tgt01  = self.model.denormalize_generated_images(x_tgt ).clamp(0, 1)
 
+        # edges in [0,1]
         e_prev = self.model.canny(x_prev01).clamp(0, 1)  # [1,1,H,W]
         e_tgt  = self.model.canny(x_tgt01 ).clamp(0, 1)  # [1,1,H,W]
 
-        _, _, H, W = x_prev01.shape
+        # flow conditioning
         ctx = self.model.flow_ctx_proj(h_ctx).view(1, -1, 1, 1).expand(1, -1, H, W)
         flow_in = torch.cat([x_prev01, e_prev, ctx], dim=1)
 
-        warp_out = self.model.moe_warp(flow_in, e_prev=e_prev, max_flow_full=max(H, W) * 0.25)
-        e_warp = warp_out["e_warp"].clamp(0, 1)
+        max_flow_full = max(H, W) * float(max_flow_frac)
+        warp_out = self.model.moe_warp(flow_in, e_prev=e_prev, max_flow_full=max_flow_full)
 
-        x_warp01 = self.model.moe_warp.warp_blend_tensor(
+        # blended outputs
+        e_warp = (warp_out["e_warp"] if warp_out["e_warp"] is not None else torch.zeros_like(e_prev)).clamp(0, 1)
+        x_warp_blend = self.model.moe_warp.warp_blend_tensor(
             x_prev01, warp_out["flows_sel"], warp_out["topk_w"], factor=1
         ).clamp(0, 1)
 
-        # edges to 3-channel for nicer display
-        e_prev3 = e_prev.repeat(1, 3, 1, 1)
-        e_tgt3  = e_tgt.repeat(1, 3, 1, 1)
-        e_warp3 = e_warp.repeat(1, 3, 1, 1)
+        # --- extra: top-1 (hard) warp ---
+        topk_w = warp_out["topk_w"]                       # [1,ksel,H,W]
+        flows_sel = warp_out["flows_sel"]                 # [1,ksel,2,H,W]
+        w_one = torch.zeros_like(topk_w)
+        w_one[:, 0] = 1.0
+        x_warp_top1 = self.model.moe_warp.warp_blend_tensor(x_prev01, flows_sel, w_one, factor=1).clamp(0, 1)
+        e_warp_top1 = self.model.moe_warp.warp_blend_tensor(e_prev,   flows_sel, w_one, factor=1).clamp(0, 1)
 
-        imgs = torch.cat([x_prev01, x_tgt01, x_warp01, e_prev3, e_tgt3, e_warp3], dim=0)  # [6,3,H,W]
-        grid = torchvision.utils.make_grid(imgs, nrow=3, padding=2)  # [3,Hg,Wg]
+        # --- diagnostic maps ---
+        rgb_err = (x_warp_blend - x_tgt01).abs().mean(dim=1, keepdim=True).clamp(0, 1)  # [1,1,H,W]
+        edge_err = (e_warp - e_tgt).abs().clamp(0, 1)
 
-        self.writer.add_image(tag, grid, epoch)
+        # flow magnitude (from blended debug flow)
+        flow_blended = warp_out.get("flow_blended", None)  # [1,2,H,W]
+        if flow_blended is None:
+            flow_mag = torch.zeros_like(edge_err)
+        else:
+            flow_mag = torch.sqrt((flow_blended ** 2).sum(dim=1, keepdim=True) + 1e-8)
+            flow_mag = (flow_mag / (max_flow_full + 1e-6)).clamp(0, 1)
+
+        # gate entropy + top1 expert id map
+        gate_probs = warp_out.get("gate_probs_full", None)  # [1,K,H,W]
+        if gate_probs is None:
+            gate_ent = torch.zeros_like(edge_err)
+            top1_exp = torch.zeros_like(edge_err)
+        else:
+            ent = -(gate_probs * (gate_probs + 1e-8).log()).sum(dim=1, keepdim=True)  # [1,1,H,W]
+            ent = ent / (torch.log(torch.tensor(gate_probs.shape[1], device=ent.device, dtype=ent.dtype)) + 1e-6)
+            gate_ent = ent.clamp(0, 1)
+
+            top1 = gate_probs.argmax(dim=1, keepdim=True).to(gate_probs.dtype)  # [1,1,H,W] as float
+            top1_exp = (top1 / max(gate_probs.shape[1] - 1, 1)).clamp(0, 1)      # normalize to [0,1]
+
+        # top1 weight map (shows “blending strength”)
+        w_top1 = topk_w[:, 0:1].clamp(0, 1)  # [1,1,H,W]
+
+        # edges/maps to 3ch for display
+        def to3(x1):  # x1: [1,1,H,W] or [1,3,H,W]
+            if x1.shape[1] == 3:
+                return x1
+            return x1.repeat(1, 3, 1, 1)
+
+        # --- main 2x3 panel ---
+        main_imgs = torch.cat([
+            x_prev01, x_tgt01, x_warp_blend,
+            to3(e_prev), to3(e_tgt), to3(e_warp),
+        ], dim=0)  # [6,3,H,W]
+        main_grid = torchvision.utils.make_grid(main_imgs, nrow=3, padding=2)
+        self.writer.add_image(tag, main_grid, epoch)
+
+        # --- diag 2x4 panel ---
+        diag_imgs = torch.cat([
+            x_warp_top1, x_warp_blend, to3(rgb_err), to3(w_top1),
+            to3(flow_mag), to3(gate_ent), to3(top1_exp), to3(edge_err),
+        ], dim=0)  # [8,3,H,W]
+        diag_grid = torchvision.utils.make_grid(diag_imgs, nrow=4, padding=2)
+        self.writer.add_image(tag + "_diag", diag_grid, epoch)
+
+        # scalars (quick sanity)
+        self.writer.add_scalar(tag + "/rgb_l1", (x_warp_blend - x_tgt01).abs().mean().item(), epoch)
+        self.writer.add_scalar(tag + "/edge_l1", (e_warp - e_tgt).abs().mean().item(), epoch)
+        self.writer.add_scalar(tag + "/w_top1_mean", w_top1.mean().item(), epoch)
+        self.writer.add_scalar(tag + "/gate_entropy_mean", gate_ent.mean().item(), epoch)
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
@@ -1985,7 +2053,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 27,
+        'batch_size': 30,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 2,
