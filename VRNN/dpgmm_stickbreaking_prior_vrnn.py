@@ -1184,7 +1184,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 for f in pyr_factors:
                     # Edge: use PyramidMoEWarp's precomputed warped edges at that scale
                     e_warp_f = warp_out["e_warp_by_factor"][f]               # [B,1,H/f,W/f]
-                    e_tgt_f  = torch.nn.functional.interpolate(
+                    e_tgt_f  = F.interpolate(
                         e_tgt, size=e_warp_f.shape[-2:], mode="bilinear", align_corners=False
                     )
 
@@ -1192,7 +1192,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     x_warp_f = self.moe_warp.warp_blend_tensor(
                         x_prev01, warp_out["flows_sel"], warp_out["topk_w"], factor=f
                     )                                                        # [B,3,H/f,W/f]
-                    x_tgt_f  = torch.nn.functional.interpolate(
+                    x_tgt_f  = F.interpolate(
                         x_t01, size=x_warp_f.shape[-2:], mode="bilinear", align_corners=False
                     )
 
