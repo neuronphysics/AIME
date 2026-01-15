@@ -256,7 +256,8 @@ class PyramidMoEWarp(nn.Module):
             self._grid_cache[key] = _coords_grid(1, H, W, device, dtype)
         return self._grid_cache[key].repeat(B, 1, 1, 1)
 
-    def _warp(self, x: torch.Tensor, flow_px: torch.Tensor) -> torch.Tensor:
+    def _warp(self, x: torch.Tensor, flow_px: torch.Tensor, padding_mode: str = "border") -> torch.Tensor:
+
         """
         x: [B,C,H,W], flow_px: [B,2,H,W] in pixels at that resolution
         """
@@ -266,7 +267,7 @@ class PyramidMoEWarp(nn.Module):
         xg = 2.0 * grid[:, 0] / max(W - 1, 1) - 1.0
         yg = 2.0 * grid[:, 1] / max(H - 1, 1) - 1.0
         grid_norm = torch.stack([xg, yg], dim=-1)
-        return F.grid_sample(x, grid_norm, mode="bilinear", padding_mode="border", align_corners=True)
+        return F.grid_sample(x, grid_norm, mode="bilinear", padding_mode=padding_mode, align_corners=True)
 
     def warp_blend_tensor(
         self,
@@ -297,7 +298,7 @@ class PyramidMoEWarp(nn.Module):
         x_rep = x_r.unsqueeze(1).expand(B, ksel, C, h_r, w_r).reshape(B * ksel, C, h_r, w_r)
         f_rep = flows_r.reshape(B * ksel, 2, h_r, w_r)
 
-        warped_rep = warp(x_rep, f_rep).reshape(B, ksel, C, h_r, w_r)
+        warped_rep = warp(x_rep, f_rep, padding_mode="zeros").reshape(B, ksel, C, h_r, w_r)
         x_warp = (w_r_eff.unsqueeze(2) * warped_rep).sum(dim=1)
         return x_warp
 
@@ -480,7 +481,7 @@ class PyramidMoEWarp(nn.Module):
                 e_rep = e_r.unsqueeze(1).expand(B, ksel, Cx, h_r, w_r).reshape(B * ksel, Cx, h_r, w_r)
                 f_rep = flows_r.reshape(B * ksel, 2, h_r, w_r)
 
-                warped_rep = warp(e_rep, f_rep).reshape(B, ksel, Cx, h_r, w_r)
+                warped_rep = warp(e_rep, f_rep, padding_mode="zeros").reshape(B, ksel, Cx, h_r, w_r)
                 e_r_warp = (w_r_eff.unsqueeze(2) * warped_rep).sum(dim=1)
 
                 e_warp_by_factor[factor] = e_r_warp

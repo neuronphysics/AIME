@@ -1058,6 +1058,67 @@ def _to_01(x: torch.Tensor, name: str, tol: float = 1e-3, verbose: bool = False)
 
     return x01
 
+
+def flow_to_hsv_rgb(flow_bchw: torch.Tensor, mag_percentile: float = 99.0, eps: float = 1e-6):
+    """
+    flow_bchw: [B, 2, H, W] with channels (u, v) in pixels
+    returns:   [B, 3, H, W] RGB in [0,1]
+    """
+    assert flow_bchw.ndim == 4 and flow_bchw.shape[1] == 2, f"Expected [B,2,H,W], got {flow_bchw.shape}"
+
+    u = flow_bchw[:, 0]
+    v = flow_bchw[:, 1]
+
+    # angle in [-pi, pi] -> hue in [0,1]
+    ang = torch.atan2(v, u)
+    h = (ang + torch.pi) / (2 * torch.pi)
+
+    # magnitude -> value in [0,1] (robust normalization)
+    mag = torch.sqrt(u * u + v * v)
+
+    # robust per-batch max using percentile
+    B = mag.shape[0]
+    mag_flat = mag.reshape(B, -1)
+    N = mag_flat.shape[1]
+    k = int(round((mag_percentile / 100.0) * (N - 1))) + 1  # 1..N
+    k = max(1, min(N, k))
+    mag_max = torch.kthvalue(mag_flat, k, dim=1).values  # [B]
+    mag_max = mag_max.view(B, 1, 1).clamp_min(eps)
+
+    v_val = (mag / mag_max).clamp(0.0, 1.0)
+    s = torch.ones_like(v_val)
+
+    # HSV -> RGB (vectorized)
+    # Based on standard conversion with h in [0,1]
+    h6 = h * 6.0
+    i = torch.floor(h6).to(torch.int64) % 6
+    f = h6 - torch.floor(h6)
+
+    p = v_val * (1.0 - s)
+    q = v_val * (1.0 - s * f)
+    t = v_val * (1.0 - s * (1.0 - f))
+
+    r = torch.zeros_like(v_val)
+    g = torch.zeros_like(v_val)
+    b = torch.zeros_like(v_val)
+
+    mask0 = (i == 0)
+    mask1 = (i == 1)
+    mask2 = (i == 2)
+    mask3 = (i == 3)
+    mask4 = (i == 4)
+    mask5 = (i == 5)
+
+    r[mask0], g[mask0], b[mask0] = v_val[mask0], t[mask0], p[mask0]
+    r[mask1], g[mask1], b[mask1] = q[mask1], v_val[mask1], p[mask1]
+    r[mask2], g[mask2], b[mask2] = p[mask2], v_val[mask2], t[mask2]
+    r[mask3], g[mask3], b[mask3] = p[mask3], q[mask3], v_val[mask3]
+    r[mask4], g[mask4], b[mask4] = t[mask4], p[mask4], v_val[mask4]
+    r[mask5], g[mask5], b[mask5] = v_val[mask5], p[mask5], q[mask5]
+
+    rgb = torch.stack([r, g, b], dim=1)  # [B,3,H,W]
+    return rgb
+
 class DMCVBTrainer:
     """Trainer for DPGMM-VRNN on DMC Vision Benchmark"""
     
@@ -1260,6 +1321,7 @@ class DMCVBTrainer:
 
         # flow magnitude (from blended debug flow)
         flow_blended = warp_out.get("flow_blended", None)  # [1,2,H,W]
+        
         if flow_blended is None:
             flow_mag = torch.zeros_like(edge_err)
         else:
@@ -1303,6 +1365,17 @@ class DMCVBTrainer:
         ], dim=0)  # [8,3,H,W]
         diag_grid = torchvision.utils.make_grid(diag_imgs, nrow=4, padding=2)
         self.writer.add_image(tag + "_diag", diag_grid, epoch)
+        flow_tgt2prev = warp_out["flow_blended"]
+        l_edge, stats = self.model.edge_line_align_loss(
+            E_prev=e_prev, E_tgt=e_tgt, flow=flow_tgt2prev,
+            x_prev01=x_prev01, x_tgt01=x_tgt01,
+            return_stats=True,
+        )
+        self.writer.add_images("warp/flow_hsv",  flow_to_hsv_rgb(warp_out["flow_blended"].detach()), epoch)
+        self.writer.add_scalar(tag + "/line_mu_abs_mean", stats["mu_abs_mean"], epoch)
+        self.writer.add_scalar(tag + "/line_sigma_mean", stats["sigma_mean"], epoch)
+        self.writer.add_scalar(tag + "/line_resid_abs_mean", stats["resid_abs_mean"], epoch)
+        self.writer.add_scalar(tag + "/line_edge_evidence_mean", stats["edge_evidence_mean"], epoch)
 
         # scalars (quick sanity)
         self.writer.add_scalar(tag + "/rgb_l1", (x_warp_blend - x_tgt01).abs().mean().item(), epoch)
@@ -2053,7 +2126,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 30,
+        'batch_size': 31,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 2,

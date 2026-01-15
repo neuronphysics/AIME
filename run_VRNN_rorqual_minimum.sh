@@ -28,6 +28,12 @@ export TF_CPP_MIN_LOG_LEVEL=2
 #virtualenv --no-download --clear /home/memole/links/D2E
 source /home/memole/links/D2E/bin/activate
 ### FORCE SINGLE-THREAD BLAS / OMP / TORCH
+# ---- VRAM allocator / fragmentation fixes ----
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:256
+export CUDA_MODULE_LOADING=LAZY
+
+# If TensorFlow is imported anywhere in the SAME training process:
+export TF_FORCE_GPU_ALLOW_GROWTH=true
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1

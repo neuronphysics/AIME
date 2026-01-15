@@ -21,6 +21,8 @@ from vdvae.vae import VDVAE
 from vdvae.hps import Hyperparams
 from vdvae.vae_helpers import mean_from_discretized_mix_logistic, sample_from_discretized_mix_logistic, draw_gaussian_diag_samples 
 from VRNN.utils.canny_net import CannyFilter
+from VRNN.utils.edge_line_alignment_loss import LineAlignCfg, HeteroscedasticLineAlignmentLoss
+from VRNN.utils.chamfer import WarpEdgeChamfer, edt_2d_squared
 from VRNN.warp import PyramidMoEWarp, sobel_dxdy
 from VRNN.Kumaraswamy import KumaraswamyStable
 def beta_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -764,6 +766,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.add_edge_to_pxz = False
         # 3) PyramidMoEWarp: predicts per-expert flow + sparse router (top-k) + confidence
         #    input = [x_prev (C), edge(1), ctx(flow_ctx_dim)] => C+1+flow_ctx_dim
+
         flow_in_dim = self.input_channels + 1 + self.flow_ctx_dim
         self.moe_warp = PyramidMoEWarp(
             flow_in_dim=flow_in_dim,
@@ -779,6 +782,34 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             use_checkpoint=self.use_ctx_checkpoint,
             checkpoint_use_reentrant=False,
         )
+        # ---- Robust line-alignment edge loss (flow-centered, heteroscedastic) ----
+        self.line_align_cfg = LineAlignCfg(
+            flow_direction="tgt2prev",   # matches warp.py base + flow sampling
+            center_on_flow=True,
+            search_radius=6,
+            n_points=2048,
+            beta=12.0,
+            sigma0=0.5,
+            robust_delta=1.0,
+            motion_gate=True,
+            motion_gate_thresh=0.03,
+            use_photometric_gating=True,
+            photo_gate_thresh=0.20,
+            detach_edges=True,
+        )
+        self.edge_line_align_loss = HeteroscedasticLineAlignmentLoss(self.line_align_cfg)
+        self.warp_edge_chamfer = WarpEdgeChamfer(
+            edge_thresh=0.3,     # tune a bit depending on edge map range
+            trunc_dist=10.0,
+            n_points=512,
+            radius=3,
+            beta=12.0,
+            dist_gamma=0.2,
+            w_p2g=1.0,
+            w_g2p=1.0,
+            eps=self.eps,
+        )
+
 
     def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int = 200):
         """
@@ -796,13 +827,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.image_channels = self.input_channels   # usually 3
         H.zdim = self.latent_dim                 # or set explicitly (e.g., 16)
         H.bottleneck_multiple = 0.25
-        H.width = 192
+        H.width = 152
         H.image_size = self.image_size          # e.g. 64
         H.dataset = 'imagenet64'
         H.num_mixtures = 10
         H.skip_threshold = 100.0
-        H.dec_blocks = "4x2,8m4,8x4,16m8,16x4,32m16,32x4,64m32,64x2"
-        H.enc_blocks = "64x2,64d2,32x4,32d2,16x4,16d2,8x4,8d2,4x2"
+        H.dec_blocks = "4x3,8m4,8x4,16m8,16x4,32m16,32x4,64m32,64x2"
+        H.enc_blocks = "64x2,64d2,32x4,32d2,16x4,16d2,8x4,8d2,4x3"
         H.attn_resolutions = [8, 16, 32]
         H.use_spatial_attn = True
         H.attn_where = "last"
@@ -1105,7 +1136,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         Returns a dict of per-timestep lists.
         """
-        batch_size, seq_len = observations.shape[:2]
+        batch_size, seq_len, C, H, W = observations.shape
 
         if actions is None:
             actions = torch.zeros(batch_size, seq_len, self.action_dim, device=observations.device, dtype=observations.dtype)
@@ -1141,7 +1172,20 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "warp_rgb_tf_loss": [],
             "warp_edge_pyr_loss": [],
             "warp_rgb_pyr_loss": [],
+            "warp_edge_ch_tf_loss":[],
+            "warp_line_mu_abs_mean": [],
+            "warp_line_sigma_mean": [],
+            "warp_line_resid_abs_mean": [],
+            "warp_line_edge_evidence_mean": [],
         }
+        obs01_all = self.denormalize_generated_images(observations).clamp(0.0, 1.0).to(observations.dtype)  # [B,T,C,H,W]
+
+        # Precompute all edges once (300 frames for your case)
+        e_all = self.canny(obs01_all.reshape(batch_size * seq_len, C, H, W)).detach().to(obs01_all.dtype)  # [B*T,1,H,W]
+        e_all = e_all.reshape(batch_size, seq_len, 1, H, W)  # [B,T,1,H,W]
+
+        # Precompute all GT EDT once (single GPU->CPU sync per batch)
+        d2_all = edt_2d_squared(e_all, edge_thresh=self.warp_edge_chamfer.edge_thresh, out_dtype=obs01_all.dtype)  # [B,T,1,H,W]
 
         for t in range(seq_len):
             x_t = observations[:, t]  # [B, C, H, W]
@@ -1162,22 +1206,40 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if self.use_edge_conditioning and (t > 0):
                 # Warp STRUCTURE (edges) from x_(t-1) -> x_t using PyramidMoEWarp (learned MoE flow).
                 x_prev = observations[:, t - 1]  # [B,C,H,W] in [-1,1]
-                x_prev01 = self.denormalize_generated_images(x_prev).clamp(0.0, 1.0)
-                e_prev = self.canny(x_prev01).detach()  # [B,1,H,W]
+                x_prev01 = obs01_all[:, t - 1]   # [B,3,H,W]
+                x_t01    = obs01_all[:, t]       # [B,3,H,W]
+                e_prev   = e_all[:, t - 1]       # [B,1,H,W]
+                e_tgt    = e_all[:, t]           # [B,1,H,W]
+                d2_tgt   = d2_all[:, t]          # [B,1,H,W]
                 B_, _, H_, W_ = x_prev.shape
                 ctx = self.flow_ctx_proj(h_context).view(B_, -1, 1, 1).expand(B_, -1, H_, W_)
                 flow_in = torch.cat([x_prev01.detach(), e_prev, ctx], dim=1)
                 max_flow = 0.25 * float(max(H_, W_))
                 warp_out = self.moe_warp(flow_in, e_prev=e_prev, max_flow_full=max_flow)
-                # Target frame for supervision / guide (convert x_t from [-1,1] -> [0,1])
-                x_t01 = self.denormalize_generated_images(x_t).clamp(0.0, 1.0).to(x_prev01.dtype)
-                e_tgt = self.canny(x_t01).detach().to(x_prev01.dtype)
+                with torch.no_grad():
+                    thr_e = float(self.warp_edge_chamfer.edge_thresh)
 
+                    # 1 where GT has edges (includes background edges too if present)
+                    edge_mask = (e_tgt > thr_e).to(e_tgt.dtype)   # [B,1,H,W]
+
+                    # dilate to make a thicker band (helps pyramid losses not be too sparse)
+                    k = 7  # try 7 or 9
+                    chamfer_mask = F.max_pool2d(edge_mask, kernel_size=k, stride=1, padding=k // 2)
+
+                    # optional: zero borders
+                    r = int(self.warp_edge_chamfer.radius)
+                    if r > 0:
+                        chamfer_mask[:, :, :r, :] = 0
+                        chamfer_mask[:, :, -r:, :] = 0
+                        chamfer_mask[:, :, :, :r] = 0
+                        chamfer_mask[:, :, :, -r:] = 0
+     
                 # ----- multi-scale pyramid supervision -----
-                warp_edge_pyr_loss = 0.0
-                warp_rgb_pyr_loss  = 0.0
+                warp_edge_pyr_loss = x_prev01.new_zeros(batch_size)
+                warp_rgb_pyr_loss  = x_prev01.new_zeros(batch_size)
 
-                # pick which scales you actually want (64 -> 1x1 if H=W=64, often not useful)
+
+                # pick which scales that we actually want (64 -> 1x1 if H=W=64, often not useful)
                 pyr_factors = (1, 2, 4, 8, 16, 32)
 
                 for f in pyr_factors:
@@ -1198,9 +1260,23 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     # weights: emphasize high-res, but still guide coarse alignment
                     w = 1.0 / (f ** 0.5)   # simple, stable default
 
-                    warp_edge_pyr_loss = warp_edge_pyr_loss + w * (e_warp_f - e_tgt_f).abs().mean()
-                    warp_rgb_pyr_loss  = warp_rgb_pyr_loss  + w * (x_warp_f - x_tgt_f).abs().mean()
+                    #warp_edge_pyr_loss = warp_edge_pyr_loss + w * (e_warp_f - e_tgt_f).abs().mean(dim=(1,2,3))
+                    #warp_rgb_pyr_loss  = warp_rgb_pyr_loss  + w * (x_warp_f - x_tgt_f).abs().mean(dim=(1,2,3))
+                    m_f = F.interpolate(chamfer_mask, size=e_warp_f.shape[-2:], mode="nearest")  # [B,1,h,w]
 
+                    edge_err = (e_warp_f - e_tgt_f).abs() * m_f
+                    warp_edge_pyr_loss = warp_edge_pyr_loss + w * (
+                        edge_err.sum(dim=(1,2,3)) / (m_f.sum(dim=(1,2,3)) + self.eps)
+                    )
+
+                    m_rgb = F.interpolate(chamfer_mask, size=x_warp_f.shape[-2:], mode="nearest")  # [B,1,h,w]
+                    rgb_err = (x_warp_f - x_tgt_f).abs().mean(dim=1, keepdim=True) * m_rgb
+                    warp_rgb_pyr_loss = warp_rgb_pyr_loss + w * (
+                        rgb_err.sum(dim=(1,2,3)) / (m_rgb.sum(dim=(1,2,3)) + self.eps)
+                    )
+
+                warp_edge_pyr_loss = (warp_edge_pyr_loss * mask_t).sum() / (mask_t.sum() + self.eps)
+                warp_rgb_pyr_loss  = (warp_rgb_pyr_loss  * mask_t).sum() / (mask_t.sum() + self.eps)
                 outputs["warp_edge_pyr_loss"].append(warp_edge_pyr_loss.float())
                 outputs["warp_rgb_pyr_loss"].append(warp_rgb_pyr_loss.float())
 
@@ -1217,13 +1293,27 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 # --- teacher-forced warp supervision ---
                 # (x_t01, e_tgt already computed above for pyramid + TF supervision)
 
-                # L1 per-sample, masked by done
+                flow_tgt2prev = warp_out["flow_blended"]  # <-- use the blended flow directly
 
-                l_edge = (warp_out["e_warp"] - e_tgt).abs().mean(dim=(1, 2, 3))
+                l_edge, edge_stats = self.edge_line_align_loss(
+                    E_prev=e_prev,
+                    E_tgt=e_tgt,
+                    flow=flow_tgt2prev,
+                    x_prev01=x_prev01,
+                    x_tgt01=x_t01,
+                    return_stats=True,
+                    sample_mask=mask_t,
+                )
+                outputs["warp_line_mu_abs_mean"].append(torch.tensor(edge_stats["mu_abs_mean"], device=x_prev.device))
+                outputs["warp_line_sigma_mean"].append(torch.tensor(edge_stats["sigma_mean"], device=x_prev.device))
+                outputs["warp_line_resid_abs_mean"].append(torch.tensor(edge_stats["resid_abs_mean"], device=x_prev.device))
+                outputs["warp_line_edge_evidence_mean"].append(torch.tensor(edge_stats["edge_evidence_mean"], device=x_prev.device))
 
-                l_edge = (l_edge * mask_t).sum() / (mask_t.sum() + self.eps)
                 outputs["warp_edge_tf_loss"].append(l_edge)
-
+                
+                #chamfer loss
+                ch_tf, ch_stats = self.warp_edge_chamfer(warp_out["e_warp"], e_tgt, sample_mask=mask_t, d2_gt=d2_tgt, spatial_mask=chamfer_mask, )
+                outputs["warp_edge_ch_tf_loss"].append(ch_tf.float())
                 l_rgb = (x_warp01 - x_t01).abs().mean(dim=(1, 2, 3))
                 dx_w, dy_w = sobel_dxdy(x_warp01)
                 dx_t, dy_t = sobel_dxdy(x_t01)
@@ -1242,6 +1332,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 outputs["warp_rgb_tf_loss"].append(torch.zeros((), device=x_t.device))
                 outputs["warp_edge_pyr_loss"].append(torch.zeros((), device=x_t.device))
                 outputs["warp_rgb_pyr_loss"].append(torch.zeros((), device=x_t.device))
+                outputs["warp_edge_ch_tf_loss"].append(torch.zeros((), device=x_t.device))
+                outputs["warp_line_mu_abs_mean"].append(torch.zeros((), device=x_t.device))
+                outputs["warp_line_sigma_mean"].append(torch.zeros((), device=x_t.device))
+                outputs["warp_line_resid_abs_mean"].append(torch.zeros((), device=x_t.device))
+                outputs["warp_line_edge_evidence_mean"].append(torch.zeros((), device=x_t.device))
 
             x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
             x_target_nhwc = x_t_nhwc
@@ -1409,6 +1504,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             warp_rgb_pyr_loss = torch.stack(outputs["warp_rgb_pyr_loss"]).mean()
         else:
             warp_rgb_pyr_loss = torch.zeros((), device=device)
+        
+        if len(outputs.get("warp_edge_ch_tf_loss", [])) > 0:
+            warp_chamfer_loss = torch.stack(outputs["warp_edge_ch_tf_loss"]).mean()
+        else:
+            warp_chamfer_loss = torch.zeros((), device=device, dtype=dtype)
 
         total_vae_loss = (
             lambda_recon * recon_loss
@@ -1417,7 +1517,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             + warp_reg_loss
         )
 
-        vae_losses = {
+
+        vae_losses= {
             "recon_loss": recon_loss,
             "kl_z": kl_z,
             "hierarchical_kl": hierarchical_kl,
@@ -1431,7 +1532,23 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "warp_rgb_tf_loss": warp_rgb_tf_loss,
             "warp_edge_pyr_loss": warp_edge_pyr_loss,
             "warp_rgb_pyr_loss": warp_rgb_pyr_loss,
+            "warp_edge_ch_tf_loss": warp_chamfer_loss,
         }
+        stat_keys = [
+            "warp_line_mu_abs_mean",
+            "warp_line_sigma_mean",
+            "warp_line_resid_abs_mean",
+            "warp_line_edge_evidence_mean",
+        ]
+
+        for k in stat_keys:
+            vals = outputs.get(k, [])
+            if len(vals) > 0:
+                # robust if vals contain floats sometimes
+                vals = [v if torch.is_tensor(v) else torch.as_tensor(v, device=device) for v in vals]
+                vae_losses[k] = torch.stack(vals).mean().detach()
+            else:
+                vae_losses[k] = torch.zeros((), device=device)
 
         return vae_losses, outputs
 
@@ -1677,6 +1794,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                             lambda_edge: float = 0.4,
                             lambda_warp_rgb_pyr: float =1.0,
                             lambda_warp_edge_pyr: float =1.0,
+                            lambda_warp_chamfer: float =0.5,
                             batch_idx: Optional[int] = None,
                             ) -> Dict[str, torch.Tensor]:
         """
@@ -1895,6 +2013,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "warp_rgb_tf_loss":  (warmup_factor * vae_losses["warp_rgb_tf_loss"]).reshape([]),  # or multiply by a lambda_warp_rgb
                 "warp_edge_pyr_loss": (lambda_warp_edge_pyr * vae_losses["warp_edge_pyr_loss"]).reshape([]),
                 "warp_rgb_pyr_loss":(lambda_warp_rgb_pyr  * vae_losses["warp_rgb_pyr_loss"]).reshape([]),
+                "warp_edge_ch_tf_loss": (warmup_factor * lambda_warp_chamfer * vae_losses["warp_edge_ch_tf_loss"]).reshape([]),
             }
             total_gen_loss = self.total_weighter.reduce_losses(total_components, batch_idx)
         else:
@@ -1916,6 +2035,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             total_gen_loss = total_gen_loss + warmup_factor * 0.001 * vae_losses["warp_rgb_tf_loss"]
             total_gen_loss = total_gen_loss + lambda_warp_edge_pyr * vae_losses["warp_edge_pyr_loss"]
             total_gen_loss = total_gen_loss + lambda_warp_rgb_pyr  * vae_losses["warp_rgb_pyr_loss"]
+            total_gen_loss = total_gen_loss + warmup_factor * lambda_warp_chamfer * vae_losses["warp_edge_ch_tf_loss"]
 
 
         # 7) Backprop generator
@@ -2178,7 +2298,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
                 dmol_out = self.vdvae.decoder.out_net.forward(px_z)
 
-                # ---- 1) scratch prediction (what you already had) ----
+                # ---- 1) scratch prediction  ----
                 if decode_mode == "mean":
                     x_scratch = mean_from_discretized_mix_logistic(
                         dmol_out, self.vdvae.decoder.out_net.H.num_mixtures
