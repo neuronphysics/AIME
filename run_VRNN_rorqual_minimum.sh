@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=15
 #SBATCH --mem=100G
-#SBATCH --time=01-07:59:59
+#SBATCH --time=01-11:59:59
 #SBATCH --account=def-irina
 #SBATCH --output=/home/memole/links/projects/def-irina/memole/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.out
 #SBATCH --error=/home/memole/links/projects/def-irina/memole/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.err

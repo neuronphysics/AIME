@@ -2388,7 +2388,6 @@ def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
         down = (down, down)
     if len(pad) == 2:
         pad = (pad[0], pad[1], pad[0], pad[1])
-    
     # Use custom autograd Function
     out = UpFirDn2d.apply(input, kernel, up, down, pad)
     return out

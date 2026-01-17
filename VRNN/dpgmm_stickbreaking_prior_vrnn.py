@@ -658,11 +658,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         use_dwa: bool = False,
         dwa_temperature: float = 2.0,
         rollout_adv_every: int = 1,            # do rollout adversarial every N steps (0 disables)
-        rollout_context_frames: int = 3,        # T_ctx
-        rollout_horizon: int = 4,               # rollout length
-        lambda_rollout_adv: float = 0.5,       # strength of rollout adversarial losses
-        rollout_top_temperature: float = 0.5,   # sampling temperature for top prior
-        rollout_decoder_temperature: float = 1.0,
+        rollout_context_frames: int = 4,        # T_ctx
+        rollout_horizon: int = 3,               # rollout length
+        lambda_rollout_adv: float = 2.0,       # strength of rollout adversarial losses
+        rollout_top_temperature: float = 0.2,   # sampling temperature for top prior
+        rollout_decoder_temperature: float = 0.5,
         rollout_decode_mode: str = "mean",      # "mean" or "sample"
         hidden_flow_proj=96,
         patch_disc_layers=4,
@@ -2126,7 +2126,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         initial_obs: torch.Tensor,          # [B, T_ctx, C, H, W] in [-1, 1]
         actions: torch.Tensor | None,       # [B, T_total, action_dim] (needs >= T_ctx + horizon)
         horizon: int,
-        top_temperature: float = 1.0,
+        top_temperature: float = 0.5,
         decoder_temperature: float = 1.0,
         dones: torch.Tensor | None = None,  # [B, T_ctx] or [B, T_total]
         decode_mode: str = "mean",          # "mean" | "sample"
@@ -2249,12 +2249,25 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 var_tok = torch.exp(prior_params['log_vars']).view(B, topH * topW, K, self.zdim)
 
                 # Sample component per token, then sample z from that Gaussian
-                cat = torch.distributions.Categorical(probs=pi_tok)
-                c_tok = cat.sample()  # [B, Ttok]
-                mu_sel = torch.gather(mu_tok, 2, c_tok[..., None, None].expand(B, topH * topW, 1, self.zdim)).squeeze(2)
-                var_sel = torch.gather(var_tok, 2, c_tok[..., None, None].expand(B, topH * topW, 1, self.zdim)).squeeze(2)
-                eps = torch.randn_like(mu_sel)
-                z_tok = mu_sel + top_temperature * eps * torch.sqrt(var_sel.clamp_min(self.eps))  # [B, Ttok, zdim]
+                #
+                pi = pi_tok.clamp_min(1e-8)
+                pi = pi / pi.sum(dim=-1, keepdim=True)
+                logits = pi.log()  # [B, Ttok, K]
+
+                # 2) differentiable soft component weights
+                tau = 0.7  # try 1.0 at start, anneal to 0.5 -> 0.3
+                y = F.gumbel_softmax(logits, tau=top_temperature, hard=False, dim=-1)  # [B, Ttok, K]
+
+                # 3) mix means/vars (differentiable)
+                mu_mix  = (y[..., None] * mu_tok).sum(dim=2)                            # [B, Ttok, zdim]
+                var_mix = (y[..., None] * var_tok).sum(dim=2)                           # [B, Ttok, zdim]
+
+                # 4) sample z (still differentiable wrt mu/var/y)
+                eps = torch.randn_like(mu_mix)
+                z_tok = mu_mix + top_temperature * eps * torch.sqrt(var_mix.clamp_min(self.eps))  # [B, Ttok, zdim]
+
+                # (optional) for logging only
+                c_tok = y.argmax(dim=-1)  # [B, Ttok]
 
                 z_top_map = z_tok.reshape(B, topH, topW, self.zdim).permute(0, 3, 1, 2).contiguous()
 
