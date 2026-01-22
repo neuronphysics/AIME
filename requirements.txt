@@ -97,6 +97,7 @@ python-dateutil
 pytorch-ranger
 pytorch3d
 pytz
+PyWavelets
 PyYAML
 regex
 requests

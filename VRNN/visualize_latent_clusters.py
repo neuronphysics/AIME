@@ -16,6 +16,8 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from umap import UMAP
 import seaborn as sns
+from vdvae.vae_helpers import draw_gaussian_diag_samples 
+
 try:
     from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score, adjusted_mutual_info_score
 except Exception:  # pragma: no cover
@@ -234,58 +236,100 @@ def compute_tsne_embedding(
 
 
 # -----------------------------
-# RNN context helper 
+# Teacher-forced context (SpatioTemporalCore + temporal VDVAE)
 # -----------------------------
+
+
 @torch.no_grad()
-def _compute_rnn_context(model, batch: Dict, device: torch.device, t_select: int) -> torch.Tensor:
-    obs = batch["observations"].to(device)  # expect [B,T,C,H,W]
+def _get_vdvae_out_at_t(
+    model,
+    batch: Dict,
+    device: torch.device,
+    t_select: int = 0,
+) -> Tuple[Dict[str, Any], torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+        vdvae_out at timestep t_select (teacher-forced, consistent with forward_sequence),
+        the corresponding input frame x_t in [-1,1] as [B,C,H,W],
+        and the context map h_context_map used at that timestep as [B,Hctx,Ht,Wt].
+    Works for:
+        - sequential batches: batch['observations'] = [B,T,C,H,W]
+        - image batches:      batch['observations'] = [B,C,H,W] (treated as T=1)
+    """
+    # --- get observations ---
+    if not (isinstance(batch, dict) and "observations" in batch):
+        raise ValueError("Expected a dict batch with key 'observations'.")
+
+    obs = batch["observations"].to(device)
+    obs = _to_minus1_1(obs)
+
+    if obs.dim() == 4:
+        # [B,C,H,W] -> [B,1,C,H,W]
+        obs = obs[:, None, ...]
     if obs.dim() != 5:
-        B = obs.shape[0]
-        return model.h0[-1].expand(B, -1).to(device)
+        raise ValueError(f"Expected observations to be 4D or 5D, got shape={tuple(obs.shape)}")
 
-    actions = batch.get("actions", None)
-    dones = batch.get("done", None)
-    if actions is not None:
-        actions = actions.to(device)
-    if dones is not None:
-        dones = dones.to(device)
-
-    B, T = obs.shape[:2]
+    B, T, C, H, W = obs.shape
     t_select = int(max(0, min(int(t_select), T - 1)))
 
-    h = model.h0.expand(model.number_lstm_layer, B, -1).contiguous()
-    c = model.c0.expand(model.number_lstm_layer, B, -1).contiguous()
+    # --- optional actions/dones ---
+    actions = batch.get("actions", None)
+    if actions is not None:
+        actions = actions.to(device)
+        if actions.dim() == 2:
+            actions = actions[:, None, ...]  # [B,1,A]
+    dones = batch.get("done", batch.get("dones", None))
+    if dones is not None:
+        dones = dones.to(device)
+        if dones.dim() == 1:
+            dones = dones[:, None, ...]  # [B,1]
 
-    for t in range(t_select):
-        x_t = _to_minus1_1(obs[:, t])               # [B,C,H,W]
+    # --- init spatiotemporal core + temporal vdvae state ---
+    core_state = model.rnn.init_state(
+        B,
+        model.top_H, model.top_W,
+        device=device,
+        dtype=obs.dtype,
+    )
+    h_context_map = model.rnn.out_norm(core_state[0])  # [B,Hdim,Ht,Wt]
+
+    temporal_state = model.vdvae.init_temporal_state(B, device=device, dtype=obs.dtype)
+
+    # teacher-force up to t_select
+    for t in range(t_select + 1):
+        x_t = obs[:, t]  # [B,C,H,W]
         x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
 
-        h_context = h[-1]                           # [B,H]
-        vdvae_out = model.vdvae(x_t_nhwc, x_t_nhwc, h_context)
-        top_q_mean_map = vdvae_out["top_q_mean_map"]  # [B,C_top,res,res]
-        B2, C, Ht, Wt = top_q_mean_map.shape
-        assert B2 == B, f"Batch mismatch: obs batch={B}, vdvae batch={B2}"
-        # Match training: flatten spatial map -> [B, C*Ht*Wt]
-        z_flat = top_q_mean_map.permute(0, 2, 3, 1).contiguous().view(B2, Ht * Wt * C)
-        if actions is not None and actions.dim() >= 2 and actions.shape[1] > t:
+        if actions is not None and actions.shape[1] > t:
             a_t = actions[:, t]
         else:
-            a_t = torch.zeros(B, model.action_dim, device=device)
+            a_t = torch.zeros(B, model.action_dim, device=device, dtype=obs.dtype)
 
-        if dones is not None and dones.dim() >= 2 and t > 0:
-            mask_t = 1.0 - dones[:, t - 1].float()
+        if dones is None or t == 0:
+            mask_t = torch.ones(B, device=device, dtype=obs.dtype)
         else:
-            mask_t = torch.ones(B, device=device)
-        rnn_in = torch.cat([z_flat, a_t], dim=-1)
+            mask_t = 1.0 - dones[:, t - 1].float()
 
-        # (optional sanity check)
-        expected = model._rnn.lstm.input_size
-        if rnn_in.size(-1) != expected:
-            raise RuntimeError(f"RNN input mismatch: got {rnn_in.size(-1)}, expected {expected}")
+        vdvae_out, temporal_state = model.vdvae.forward_temporal_step(
+            x_t_nhwc,
+            x_t_nhwc,
+            h_context=h_context_map,
+            a_t=a_t,
+            mask_t=mask_t,
+            edge_guide=None,           # keep viz simple / cheap; doesn't affect top encoder latents
+            temporal_state=temporal_state,
+        )
 
-        _, (h, c) = model._rnn(rnn_in, h, c, mask_t)
+        # Update context for the NEXT step only (so vdvae_out at t uses the right prev context)
+        if t < t_select:
+            z_mean = vdvae_out["top_q_mean_map"]
+            z_logsigma = vdvae_out["top_q_logvar_map"]  # log std
+            z_map = draw_gaussian_diag_samples(z_mean, z_logsigma)
 
-    return h[-1]  # [B,H]
+            h_context_map, core_state = model.rnn(z_map, a_t, state=core_state, mask_t=mask_t)
+
+    return vdvae_out, x_t, h_context_map
+
 
 # -----------------------------
 # Latent extraction (+ exemplars)
@@ -330,10 +374,9 @@ def extract_latents_and_assignments(
     exemplar_scores = None
     exemplar_counts = None
 
-    # Model dims
-    top_block = model.vdvae.decoder.dec_blocks[0]
-    C_top = int(top_block.zdim)
-    res = int(top_block.base)
+    # Model dims (inferred on first batch)
+    C_top = None
+    res = None
 
     total_points = 0
     K_global = None
@@ -372,31 +415,40 @@ def extract_latents_and_assignments(
         images = _to_minus1_1(images)
         images_nhwc = images.permute(0, 2, 3, 1).contiguous()
 
-        # RNN context
-        if use_rnn_context and isinstance(batch, dict) and "observations" in batch and batch["observations"].dim() == 5:
-            h_context = _compute_rnn_context(model, batch, device, t_select)
+                # --- teacher-forced VDVAE at t_select (matches SpatioTemporalCore + temporal decoding) ---
+        if isinstance(batch, dict) and "observations" in batch:
+            vdvae_out, images_tf, hctx_map = _get_vdvae_out_at_t(model, batch, device, t_select)
         else:
-            h_context = model.h0[-1].expand(B, -1).to(device)
+            # non-sequence batches: treat as single-step
+            vdvae_out, images_tf, hctx_map = _get_vdvae_out_at_t(model, {"observations": images}, device, 0)
 
-        # VDVAE encoder (top layer)
-        vdvae_out = model.vdvae(images_nhwc, images_nhwc, h_context)
+        # Use the teacher-forced frame for exemplars (still in [-1,1])
+        images = images_tf
 
+        # Top-level posterior mean map (used as a stable embedding for clustering)
         top_q_mean_map = vdvae_out["top_q_mean_map"]  # [B, C_top, res, res]
+
+        # Prior params are already tokenized consistently inside forward_temporal_step
+        prior_params = vdvae_out["prior_params"]
+        pi_tok   = prior_params["pi"]        # [N, K]
+        means    = prior_params["means"]     # [N, K, C_top]
+        log_vars = prior_params["log_vars"]  # [N, K, C_top]
+
+        B2, C_top, res_h, res_w = top_q_mean_map.shape
+        assert B2 == B, f"Batch mismatch: expected B={B}, got {B2}"
+        assert res_h == res_w, f"Expected square top map, got {res_h}x{res_w}"
+        res = int(res_h)
 
         # tokens: [B*res*res, C_top]
         z_tokens = top_q_mean_map.permute(0, 2, 3, 1).reshape(B * res * res, C_top)
 
-        # h_tokens with coord encoding
-        Hc = int(h_context.shape[1])
-        h_map = h_context.view(B, Hc, 1, 1).expand(B, Hc, res, res).contiguous()
-        h_map = model.vdvae.add_coord_no_proj(h_map, scale=0.05)
-        h_tokens = h_map.permute(0, 2, 3, 1).reshape(B * res * res, Hc)
+        # (optional) store a compact context summary for downstream analysis
+        if hctx_map is not None:
+            # [B,Hctx,Ht,Wt] -> [B,Hctx]
+            h_context = hctx_map.mean(dim=(2, 3))
+        else:
+            h_context = None
 
-        # DPGMM prior params
-        _, prior_params = model.prior(h_tokens)
-        pi_tok = prior_params["pi"]                # [N,K]
-        means = prior_params["means"]              # [N,K,C_top]
-        log_vars = prior_params["log_vars"]        # [N,K,C_top]
         N, K = pi_tok.shape[:2]
         if K_global is None:
             K_global = int(K)
@@ -452,7 +504,7 @@ def extract_latents_and_assignments(
 
     out: Dict[str, Any] = {}
     if len(z_all) == 0:
-        out["latents"] = np.zeros((0, C_top), dtype=np.float32)
+        out["latents"] = np.zeros((0, int(C_top or 0)), dtype=np.float32)
         out["assignments"] = np.zeros((0,), dtype=np.int64)
         out["pi"] = np.zeros((0, int(K_global or 0)), dtype=np.float32)
         out["labels"] = None

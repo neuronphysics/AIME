@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from typing import List, Optional, Tuple, Union
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
 """LSTM modules."""
 
 class LSTMLayer(nn.Module):
@@ -379,3 +381,159 @@ class ConvLSTM(nn.Module):
             return out, (h_list, c_list)
         else:
             return h_list[-1], (h_list, c_list)
+
+
+class SpatioTemporalLSTMCell(nn.Module):
+    def __init__(self, in_channel, num_hidden, height, width, filter_size, stride, layer_norm):
+        super(SpatioTemporalLSTMCell, self).__init__()
+
+        self.num_hidden = num_hidden
+        self.padding = filter_size // 2
+        self._forget_bias = 1.0
+        self.conv_x = nn.Sequential(
+            nn.Conv2d(in_channel, num_hidden * 7, kernel_size=filter_size, stride=stride, padding=self.padding),
+            nn.LayerNorm([num_hidden * 7, height, width])
+        )
+        self.conv_h = nn.Sequential(
+            nn.Conv2d(num_hidden, num_hidden * 4, kernel_size=filter_size, stride=stride, padding=self.padding),
+            nn.LayerNorm([num_hidden * 4, height, width])
+        )
+        self.conv_m = nn.Sequential(
+            nn.Conv2d(num_hidden, num_hidden * 3, kernel_size=filter_size, stride=stride, padding=self.padding),
+            nn.LayerNorm([num_hidden * 3, height, width])
+        )
+        self.conv_o = nn.Sequential(
+            nn.Conv2d(num_hidden * 2, num_hidden, kernel_size=filter_size, stride=stride, padding=self.padding),
+            nn.LayerNorm([num_hidden, height, width])
+        )
+        self.conv_last = nn.Conv2d(num_hidden * 2, num_hidden, kernel_size=1, stride=1, padding=0)
+
+
+    def forward(self, x_t, h_t, c_t, m_t):
+        x_concat = self.conv_x(x_t)
+        h_concat = self.conv_h(h_t)
+        m_concat = self.conv_m(m_t)
+        i_x, f_x, g_x, i_x_prime, f_x_prime, g_x_prime, o_x = torch.split(x_concat, self.num_hidden, dim=1)
+        i_h, f_h, g_h, o_h = torch.split(h_concat, self.num_hidden, dim=1)
+        i_m, f_m, g_m = torch.split(m_concat, self.num_hidden, dim=1)
+
+        i_t = torch.sigmoid(i_x + i_h)
+        f_t = torch.sigmoid(f_x + f_h + self._forget_bias)
+        g_t = torch.tanh(g_x + g_h)
+
+        c_new = f_t * c_t + i_t * g_t
+
+        i_t_prime = torch.sigmoid(i_x_prime + i_m)
+        f_t_prime = torch.sigmoid(f_x_prime + f_m + self._forget_bias)
+        g_t_prime = torch.tanh(g_x_prime + g_m)
+
+        m_new = f_t_prime * m_t + i_t_prime * g_t_prime
+
+        mem = torch.cat((c_new, m_new), 1)
+        o_t = torch.sigmoid(o_x + o_h + self.conv_o(mem))
+        h_new = o_t * torch.tanh(self.conv_last(mem))
+
+        return h_new, c_new, m_new
+
+
+
+def safe_groups(C, max_groups=8):
+    for g in range(min(max_groups, C), 0, -1):
+        if C % g == 0:
+            return g
+    return 1
+
+class SpatioTemporalCore(nn.Module):
+    """Top-level spatiotemporal recurrence over the *top latent map*.
+
+    Expected shapes:
+      - z_map: [B, zdim, topH, topW]
+      - a_t :  [B, action_dim]
+      - state = (h,c,m): each [B, hidden_dim, topH, topW]
+    """
+
+    def __init__(
+        self,
+        zdim: int,
+        action_dim: int,
+        hidden_dim: int,
+        *,
+        height: int = 4,
+        width: int = 4,
+        kernel: int = 5,
+        layer_norm: bool = True,
+        init_std: float = 0.0,
+        use_checkpoint: bool = False
+    ):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.action_dim = int(action_dim)
+        self.height = int(height)
+        self.width = int(width)
+        self.use_checkpoint = use_checkpoint
+
+        # Conv-only action projection (no Linear)
+        g = safe_groups(self.action_dim, 8)
+        self.action_proj = nn.Sequential(
+            nn.Conv2d(self.action_dim, self.action_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(g, self.action_dim),
+        )
+
+        self.cell = SpatioTemporalLSTMCell(
+            in_channel=int(zdim) + self.action_dim,
+            num_hidden=self.hidden_dim,
+            height=self.height,
+            width=self.width,
+            filter_size=int(kernel),
+            stride=1,
+            layer_norm=bool(layer_norm),
+        )
+
+        self.out_norm = nn.GroupNorm(num_groups=safe_groups(self.hidden_dim, 8), num_channels=self.hidden_dim)
+
+        # Learnable init states
+        self.h0 = nn.Parameter(torch.zeros(1, self.hidden_dim, self.height, self.width))
+        self.c0 = nn.Parameter(torch.zeros(1, self.hidden_dim, self.height, self.width))
+        self.m0 = nn.Parameter(torch.zeros(1, self.hidden_dim, self.height, self.width))
+        if float(init_std) > 0.0:
+            nn.init.normal_(self.h0, std=float(init_std))
+            nn.init.normal_(self.c0, std=float(init_std))
+            nn.init.normal_(self.m0, std=float(init_std))
+
+    def init_state(self, B: int, H: int, W: int, device, dtype):
+        h = self.h0.expand(B, -1, -1, -1).to(device=device, dtype=dtype)
+        c = self.c0.expand(B, -1, -1, -1).to(device=device, dtype=dtype)
+        m = self.m0.expand(B, -1, -1, -1).to(device=device, dtype=dtype)
+        return h, c, m
+
+    def forward(self, z_map, a_t, state=None, mask_t=None):
+        B, _, H, W = z_map.shape
+        if state is None:
+            h, c, m = self.init_state(B, H, W, z_map.device, z_map.dtype)
+        else:
+            h, c, m = state
+
+        if mask_t is not None:
+            keep = mask_t.view(B, 1, 1, 1).to(z_map.dtype)
+            h0, c0, m0 = self.init_state(B, H, W, z_map.device, z_map.dtype)
+            h = h * keep + h0 * (1.0 - keep)
+            c = c * keep + c0 * (1.0 - keep)
+            m = m * keep + m0 * (1.0 - keep)
+
+        a_1x1 = a_t.view(B, self.action_dim, 1, 1).to(device=z_map.device, dtype=z_map.dtype)
+        a_emb = self.action_proj(a_1x1)
+        a_map = a_emb.expand(B, self.action_dim, H, W)
+
+        x_t = torch.cat([z_map, a_map], dim=1)
+        if self.use_checkpoint and self.training:
+            def cell_fn(x, h_in, c_in, m_in):
+                h_new, c_new, m_new = self.cell(x, h_in, c_in, m_in)
+                return h_new, c_new, m_new
+
+            h_new, c_new, m_new = checkpoint(cell_fn, x_t, h, c, m, use_reentrant=False)
+        else:
+            h_new, c_new, m_new = self.cell(x_t, h, c, m)
+        c_new = c_new.clamp(-10.0, 10.0)
+        m_new = m_new.clamp(-10.0, 10.0)
+
+        return self.out_norm(h_new), (h_new, c_new, m_new)

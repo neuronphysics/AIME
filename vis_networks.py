@@ -1,4 +1,4 @@
-import torch
+import torch, pywt
 import torch.nn as nn
 import math
 from typing import Optional, Tuple, Dict, Union, List
@@ -2444,7 +2444,6 @@ class InverseHaarTransform(nn.Module):
         hh = upfirdn2d(hh, self.hh, up=2, pad=(1, 0, 1, 0))
         
         return ll + lh + hl + hh    
-    
 
 class ResidualBlock(nn.Module):
     def __init__(

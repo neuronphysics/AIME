@@ -354,16 +354,6 @@ class DecBlock(nn.Module):
                 pv = pv + torch.ones_like(pv) * np.log(t)
             z = draw_gaussian_diag_samples(pm, pv)
         return z, x
-
-    @staticmethod
-    def _z_to_tokens(z_map: torch.Tensor) -> torch.Tensor:
-        """We keep the exact top-level tokenization style:
-          z_map:   [B, C, H, W]
-          z_tokens:[B*H*W, C]
-        - Token form lets us update a token-wise temporal state (one state per spatial location),
-        """
-        B, C, H, W = z_map.shape
-        return z_map.permute(0, 2, 3, 1).contiguous().view(B * H * W, C)
     
     def _prior_forward(self, x: torch.Tensor, h_map: Optional[torch.Tensor] = None, edge_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Run the Gaussian prior conv tower.
@@ -833,21 +823,85 @@ class VDVAE(HModule):
         self.prior = prior
         self.top_kl_weight = top_kl_weight
         self.prior_kl_mc_samples = prior_kl_mc_samples
+        # Fourier PE for conditioning DP-GMM prior at top resolution.
+        base = getattr(self.decoder.dec_blocks[0], "base", 4)
+        if isinstance(base, (tuple, list)):
+            top_h, top_w = int(base[0]), int(base[1])
+        else:
+            top_h = top_w = int(base)
+
+        if self.prior is not None:
+            C = int(self.prior.hidden_dim)
+            D = 2  # (top_h, top_w)
+            num_bands = max(1, int((C - D) // (2 * D)))
+        else:
+            num_bands = 2
+
+        self.top_pe = FourierPositionEncoding(input_shape=(top_h, top_w), num_frequency_bands=num_bands)
 
     def build(self):
         self.encoder = Encoder(self.H)
         self.decoder = Decoder(self.H)
 
     @staticmethod
-    def add_coord_no_proj(z_map: torch.Tensor, scale: float = 0.05):
-        # z_map: [B, C, H, W]
-        B, C, H, W = z_map.shape
-        ys = torch.linspace(-1.0, 1.0, H, device=z_map.device, dtype=z_map.dtype)
-        xs = torch.linspace(-1.0, 1.0, W, device=z_map.device, dtype=z_map.dtype)
-        gy, gx = torch.meshgrid(ys, xs, indexing="ij")              # [H,W]
-        pos2 = torch.stack([gy, gx], dim=0)                         # [2,H,W]
-        posC = pos2.repeat((C + 1) // 2, 1, 1)[:C]                  # [C,H,W] (tile/truncate)
-        return z_map + scale * posC.unsqueeze(0)                    # [B,C,H,W]
+    def add_PosEncode(x: torch.Tensor, pe: nn.Module, scale: float = 0.05) -> torch.Tensor:
+        """
+        x: [B, C, H, W]
+        pe(B) must return [B, H*W, Cpos]
+        returns: [B, C, H, W] (no dim change, no projection)
+        """
+        B, C, H, W = x.shape
+
+        enc = pe(B)  # [B, H*W, Cpos]
+        enc = enc.view(B, H, W, -1).permute(0, 3, 1, 2).contiguous()  # [B, Cpos, H, W]
+        Cpos = enc.shape[1]
+
+        # tile/truncate to match C channels
+        if Cpos >= C:
+            encC = enc[:, :C]
+        else:
+            encC = x.new_zeros(B, C, H, W)
+            encC[:, :Cpos] = enc
+
+        return x + (scale * encC)
+
+    def _coerce_h_context_map(self, h_context: torch.Tensor, Ht: int, Wt: int) -> torch.Tensor:
+
+        """Coerce h_context into a spatial map [B, Hc, Ht, Wt] WITHOUT pooling/summing.
+        Supported inputs:
+          - [B, Hc, Ht, Wt] : already a spatial map (preferred; matches SpatioTemporalCore output)
+          - [B, Hc]         : broadcast to all spatial locations (no information is destroyed; just repeated)
+          - [B, Hc*Ht*Wt]   : reshaped into a map (legacy flattened-map path)
+        If spatial size mismatches Ht/Wt we use interpolation (not pooling) to match.
+
+        """
+        assert self.prior is not None, "h_context is only used when self.prior is not None"
+
+        Hc = int(self.prior.hidden_dim)
+        if h_context.dim() == 4:
+            # [B, Hc, H?, W?]
+            h_map = h_context
+            if h_map.shape[1] != Hc:
+                raise ValueError(f"h_context channels {h_map.shape[1]} != prior.hidden_dim {Hc}")
+        elif h_context.dim() == 2:
+            B, D = h_context.shape
+            if D == Hc:
+                # Broadcast vector -> map (no pooling).
+                h_map = h_context[:, :, None, None].expand(B, Hc, Ht, Wt).contiguous()
+            elif D == Hc * Ht * Wt:
+                # Legacy flattened map.
+                h_map = h_context.view(B, Hc, Ht, Wt).contiguous()
+            else:
+                raise ValueError(f"h_context dim {D} is incompatible with prior.hidden_dim={Hc} and (Ht,Wt)=({Ht},{Wt}).")
+        else:
+            raise ValueError(f"h_context must be [B,Hc,Ht,Wt] or [B,Hc] or [B,Hc*Ht*Wt], got {tuple(h_context.shape)}")
+
+        if h_map.shape[2] != Ht or h_map.shape[3] != Wt:
+            # Match spatial size without destroying channel information.
+            h_map = F.interpolate(h_map, size=(Ht, Wt), mode="bilinear", align_corners=False)
+
+        return h_map
+
     # ======================================================================
     # Temporal extensions
     #   - Top block: DPGMM prior conditioned on top-level VRNN hidden state h_context.
@@ -866,7 +920,7 @@ class VDVAE(HModule):
         self,
         x: torch.Tensor,           # [B,H,W,C] NHWC in [-1,1]
         x_target: torch.Tensor,    # [B,H,W,C] NHWC in [-1,1]
-        h_context: torch.Tensor,   # [B, hidden_dim] top VRNN hidden
+        h_context: torch.Tensor,   # [B, hidden_dim, H, W] top VRNN hidden
         a_t: torch.Tensor,         # [B, action_dim]
         mask_t: torch.Tensor,      # [B] float {0,1}
         temporal_state: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
@@ -915,9 +969,9 @@ class VDVAE(HModule):
             B, C, Ht, Wt = top_q_mean_map.shape
             N = B * Ht * Wt
 
-            h_map = h_context.view(B, -1, 1, 1).expand(B, -1, Ht, Wt).contiguous()
-            h_map = self.add_coord_no_proj(h_map, scale=0.05)
-            h_tokens = h_map.permute(0, 2, 3, 1).contiguous().view(N, -1)
+            h_map = self._coerce_h_context_map(h_context, Ht=Ht, Wt=Wt)
+            h_map = self.add_PosEncode(h_map, self.top_pe, scale=0.05)
+            h_tokens = h_map.permute(0, 2, 3, 1).contiguous().view(N, h_map.shape[1])
 
             top_q_mean_tokens = top_q_mean_map.permute(0, 2, 3, 1).contiguous().view(N, C)
             top_q_logvar_tokens = 2* top_q_logvar_map.permute(0, 2, 3, 1).contiguous().view(N, C)
@@ -987,12 +1041,12 @@ class VDVAE(HModule):
         )
         return px_z, temporal_state
 
-    def forward(self, x: torch.Tensor, x_target: torch.Tensor, h_context: torch.Tensor):
+    def forward(self, x: torch.Tensor, x_target: torch.Tensor, h_context: Optional[torch.Tensor] = None):
         """
         x:        [B, H, W, C]
         x_target: same as x
 
-        h_context: optional [B, hidden_dim] conditioning vector for the DPGMM prior.
+        h_context: optional [B, hidden_dim, H, W] conditioning vector for the DPGMM prior.
 
         IMPORTANT: for the DPGMM we treat the top-level spatial latents
         z_top[b, c, h, w] as a *bag of feature vectors* of shape [C],
@@ -1030,6 +1084,8 @@ class VDVAE(HModule):
 
         # 4) DPGMM KL at the top level, using spatial tokens [B*Ht*Wt, C]
         dp_kl = None
+        prior_params = None
+
         dp_rate = torch.zeros(
             1, device=distortion_per_pixel.device, dtype=distortion_per_pixel.dtype
         ).squeeze(0)
@@ -1065,13 +1121,11 @@ class VDVAE(HModule):
                     f"h_context dim {h_context.shape[1]} does not match "
                     f"prior.hidden_dim={self.prior.hidden_dim}."
                 )
-            # [B, hidden_dim]
 
-            B_h, Hc = h_context.shape
-            assert B_h == B
-            h_map = h_context.view(B,1,1,Hc).expand(B,Ht,Wt,Hc).permute(0,3,1,2)  # [B,Hc,Ht,Wt]
-            h_map = self.add_coord_no_proj(h_map, scale=0.05)                           # [B,Hc,Ht,Wt]
-            h_tokens = h_map.permute(0,2,3,1).reshape(B*Ht*Wt, Hc)                 # [N,Hc]
+            h_map = self._coerce_h_context_map(h_context, Ht=Ht, Wt=Wt)  # [B,Hc,Ht,Wt]
+            h_map = self.add_PosEncode(h_map, self.top_pe, scale=0.05)
+            h_tokens = h_map.permute(0, 2, 3, 1).contiguous().view(B * Ht * Wt, h_map.shape[1])
+                        # [N,Hc]
 
             #(c) DPGMM prior over tokens 
             prior_dist, prior_params = self.prior(h_tokens)
@@ -1112,7 +1166,7 @@ class VDVAE(HModule):
         """
         Sample from the model using the DPGMM at the top level.
 
-        h_context: [B, hidden_dim], where B == n_batch
+        h_context: [B, hidden_dim, H, W], where B == n_batch
         """
         assert self.prior is not None, "VDVAE.sample requires a DPGMMPrior."
         assert h_context.shape[0] == n_batch, (
@@ -1127,10 +1181,10 @@ class VDVAE(HModule):
         res = top_block.base  # top resolution Ht = Wt
 
         B = n_batch
-        Hc = h_context.shape[1]
-        h_map = h_context.view(B,1,1,Hc).expand(B,res,res,Hc).permute(0,3,1,2)  # [B,Hc,Ht,Wt]
-        h_map = self.add_coord_no_proj(h_map, scale=0.05)                           # [B,Hc,Ht,Wt]
-        h_tokens = h_map.permute(0,2,3,1).reshape(B*res*res, Hc)                 # [N,Hc]
+        
+        h_map = self._coerce_h_context_map(h_context, Ht=res, Wt=res)  # [B,Hc,Ht,Wt]
+        h_map = self.add_PosEncode(h_map, self.top_pe, scale=0.05)
+        h_tokens = h_map.permute(0,2,3,1).reshape(B*res*res,  h_map.shape[1])                 # [N,Hc]
 
         # DPGMM prior over tokens
         prior_dist, prior_params = self.prior(h_tokens)

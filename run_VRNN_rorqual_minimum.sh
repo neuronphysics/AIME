@@ -12,6 +12,7 @@
 #SBATCH --mail-user=sheikhbahaee@gmail.com              # notification for job conditions
 #SBATCH --mail-type=END
 #SBATCH --mail-type=FAIL
+set -euo pipefail
 
 #Start clean
 module load StdEnv/2023
@@ -54,6 +55,7 @@ export PYTHONNOUSERSITE=1
 #python -m pip install --no-deps umap-learn
 #python -m pip install --no-deps seaborn
 #python -m pip install git+https://github.com/richzhang/PerceptualSimilarity.git
+#python -m pip install PyWavelets
 
 
 #pip install -r requirements.txt --no-deps
@@ -69,6 +71,15 @@ x = torch.randn(1024,1024, device="cuda")
 y = x @ x
 print("matmul ok:", y.mean().item())
 PY
+cd /home/memole/links/projects/def-irina/memole/AIME
+#mkdir -p results/pretrained_weights
+#wget https://raw.githubusercontent.com/richzhang/PerceptualSimilarity/master/lpips/weights/v0.1/alex.pth -O results/pretrained_weights/lpips_alex.pth
+
+#wget https://raw.githubusercontent.com/richzhang/PerceptualSimilarity/master/lpips/weights/v0.1/vgg.pth -O results/pretrained_weights/lpips_vgg.pth
+#wget https://download.pytorch.org/models/alexnet-owt-7be5be79.pth -O results/pretrained_weights/hub/checkpoints/alexnet-owt-7be5be79.pth
+
+# Download VGG16 (alternative, often better)
+#wget https://download.pytorch.org/models/vgg16-397923af.pth -O results/pretrained_weights/hub/checkpoints/vgg16-397923af.pth
 
 echo "pretrain VQVAE ....."
 #CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.pretrain_vqvae

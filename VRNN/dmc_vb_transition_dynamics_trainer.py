@@ -1275,16 +1275,26 @@ class DMCVBTrainer:
         if dones is not None:
             dones = dones.to(self.device)
 
-        # teacher-forced forward for hidden state
-        out = self.model.forward_sequence(observations, actions, dones)
-
         B, T, C, H, W = observations.shape
         b = int(max(0, min(b, B - 1)))
-        t = int(max(1, min(t, T - 1)))
+        t = int(max(1, min(t, T - 1)))   # need t>=1 for prev frame
 
-        x_prev = observations[b, t-1:t]                  # [1,C,H,W] in [-1,1]
-        x_tgt  = observations[b, t:t+1]                  # [1,C,H,W] in [-1,1]
-        h_ctx  = out["hidden_states"][b:b+1, t-1]        # [1,Hdim]
+        # run only prefix up to t so temporal_state is correct AND it's cheaper than full sequence
+        obs_short  = observations[:, :t+1]
+        act_short  = actions[:, :t+1]
+        done_short = dones[:, :t+1] if dones is not None else None
+
+        # ask model to capture the *real* warp ctx_map used in training (from temporal_state["64"])
+        out = self.model.forward_sequence(
+            obs_short,
+            act_short,
+            done_short,
+            capture_flow_ctx=(b, t),
+        )
+
+        # frames
+        x_prev = observations[b, t-1:t]  # [1,C,H,W] in [-1,1]
+        x_tgt  = observations[b, t:t+1]  # [1,C,H,W] in [-1,1]
 
         # to [0,1]
         x_prev01 = self.model.denormalize_generated_images(x_prev).clamp(0, 1)
@@ -1294,8 +1304,20 @@ class DMCVBTrainer:
         e_prev = self.model.canny(x_prev01).clamp(0, 1)  # [1,1,H,W]
         e_tgt  = self.model.canny(x_tgt01 ).clamp(0, 1)  # [1,1,H,W]
 
-        # flow conditioning
-        ctx = self.model.flow_ctx_proj(h_ctx).view(1, -1, 1, 1).expand(1, -1, H, W)
+        # ---- flow conditioning: use captured ctx_map (NOT hidden_states) ----
+        ctx = out.get("captured_flow_ctx", None)  # expected [1, flow_ctx_dim, H, W] on CPU
+
+        if ctx is None:
+            # fallback: keep logging robust if capture didn't happen (e.g., warp disabled)
+            flow_ctx_dim = getattr(self.model, "flow_ctx_dim", self.model.flow_ctx_proj[0].out_channels)
+            ctx = torch.zeros((1, flow_ctx_dim, H, W), device=self.device, dtype=x_prev01.dtype)
+        else:
+            ctx = ctx.to(device=self.device, dtype=x_prev01.dtype)
+
+            # safety: if spatial size differs, resize to match current H,W
+            if (ctx.shape[-2], ctx.shape[-1]) != (H, W):
+                ctx = F.interpolate(ctx, size=(H, W), mode="bilinear", align_corners=False)
+
         flow_in = torch.cat([x_prev01, e_prev, ctx], dim=1)
 
         max_flow_full = max(H, W) * float(max_flow_frac)
@@ -1308,20 +1330,19 @@ class DMCVBTrainer:
         ).clamp(0, 1)
 
         # --- extra: top-1 (hard) warp ---
-        topk_w = warp_out["topk_w"]                       # [1,ksel,H,W]
-        flows_sel = warp_out["flows_sel"]                 # [1,ksel,2,H,W]
+        topk_w = warp_out["topk_w"]        # [1,ksel,H,W]
+        flows_sel = warp_out["flows_sel"]  # [1,ksel,2,H,W]
         w_one = torch.zeros_like(topk_w)
         w_one[:, 0] = 1.0
         x_warp_top1 = self.model.moe_warp.warp_blend_tensor(x_prev01, flows_sel, w_one, factor=1).clamp(0, 1)
         e_warp_top1 = self.model.moe_warp.warp_blend_tensor(e_prev,   flows_sel, w_one, factor=1).clamp(0, 1)
 
         # --- diagnostic maps ---
-        rgb_err = (x_warp_blend - x_tgt01).abs().mean(dim=1, keepdim=True).clamp(0, 1)  # [1,1,H,W]
+        rgb_err  = (x_warp_blend - x_tgt01).abs().mean(dim=1, keepdim=True).clamp(0, 1)  # [1,1,H,W]
         edge_err = (e_warp - e_tgt).abs().clamp(0, 1)
 
         # flow magnitude (from blended debug flow)
         flow_blended = warp_out.get("flow_blended", None)  # [1,2,H,W]
-        
         if flow_blended is None:
             flow_mag = torch.zeros_like(edge_err)
         else:
@@ -1338,17 +1359,14 @@ class DMCVBTrainer:
             ent = ent / (torch.log(torch.tensor(gate_probs.shape[1], device=ent.device, dtype=ent.dtype)) + 1e-6)
             gate_ent = ent.clamp(0, 1)
 
-            top1 = gate_probs.argmax(dim=1, keepdim=True).to(gate_probs.dtype)  # [1,1,H,W] as float
-            top1_exp = (top1 / max(gate_probs.shape[1] - 1, 1)).clamp(0, 1)      # normalize to [0,1]
+            top1 = gate_probs.argmax(dim=1, keepdim=True).to(gate_probs.dtype)  # [1,1,H,W]
+            top1_exp = (top1 / max(gate_probs.shape[1] - 1, 1)).clamp(0, 1)
 
-        # top1 weight map (shows “blending strength”)
+        # top1 weight map
         w_top1 = topk_w[:, 0:1].clamp(0, 1)  # [1,1,H,W]
 
-        # edges/maps to 3ch for display
         def to3(x1):  # x1: [1,1,H,W] or [1,3,H,W]
-            if x1.shape[1] == 3:
-                return x1
-            return x1.repeat(1, 3, 1, 1)
+            return x1 if x1.shape[1] == 3 else x1.repeat(1, 3, 1, 1)
 
         # --- main 2x3 panel ---
         main_imgs = torch.cat([
@@ -1365,17 +1383,20 @@ class DMCVBTrainer:
         ], dim=0)  # [8,3,H,W]
         diag_grid = torchvision.utils.make_grid(diag_imgs, nrow=4, padding=2)
         self.writer.add_image(tag + "_diag", diag_grid, epoch)
-        flow_tgt2prev = warp_out["flow_blended"]
-        l_edge, stats = self.model.edge_line_align_loss(
-            E_prev=e_prev, E_tgt=e_tgt, flow=flow_tgt2prev,
-            x_prev01=x_prev01, x_tgt01=x_tgt01,
-            return_stats=True,
-        )
-        self.writer.add_images("warp/flow_hsv",  flow_to_hsv_rgb(warp_out["flow_blended"].detach()), epoch)
-        self.writer.add_scalar(tag + "/line_mu_abs_mean", stats["mu_abs_mean"], epoch)
-        self.writer.add_scalar(tag + "/line_sigma_mean", stats["sigma_mean"], epoch)
-        self.writer.add_scalar(tag + "/line_resid_abs_mean", stats["resid_abs_mean"], epoch)
-        self.writer.add_scalar(tag + "/line_edge_evidence_mean", stats["edge_evidence_mean"], epoch)
+
+        # line stats + HSV flow
+        flow_tgt2prev = warp_out.get("flow_blended", None)
+        if flow_tgt2prev is not None:
+            l_edge, stats = self.model.edge_line_align_loss(
+                E_prev=e_prev, E_tgt=e_tgt, flow=flow_tgt2prev,
+                x_prev01=x_prev01, x_tgt01=x_tgt01,
+                return_stats=True,
+            )
+            self.writer.add_images("warp/flow_hsv", flow_to_hsv_rgb(flow_tgt2prev.detach()), epoch)
+            self.writer.add_scalar(tag + "/line_mu_abs_mean", stats["mu_abs_mean"], epoch)
+            self.writer.add_scalar(tag + "/line_sigma_mean", stats["sigma_mean"], epoch)
+            self.writer.add_scalar(tag + "/line_resid_abs_mean", stats["resid_abs_mean"], epoch)
+            self.writer.add_scalar(tag + "/line_edge_evidence_mean", stats["edge_evidence_mean"], epoch)
 
         # scalars (quick sanity)
         self.writer.add_scalar(tag + "/rgb_l1", (x_warp_blend - x_tgt01).abs().mean().item(), epoch)
@@ -1492,7 +1513,7 @@ class DMCVBTrainer:
                 psnr = self.compute_psnr(observations, recon, dones)
                 eval_metrics['psnr'].append(psnr.item())       
                 
-        if epoch %10 == 0:
+        if epoch % 20 == 0:
             with torch.no_grad():
                  num_samples = 16
                  samples =self.model.sample(num_samples)
