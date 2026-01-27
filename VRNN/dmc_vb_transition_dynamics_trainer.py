@@ -38,7 +38,7 @@ import matplotlib
 from pathlib import Path
 from distutils.util import strtobool
 from VRNN.visualize_latent_clusters import visualize_dpgmm_clustering
-
+from VRNN.warp import image_warp
 def str2bool(v):
     return bool(strtobool(v))
     
@@ -73,11 +73,11 @@ def print_vdvae_edge_report(model):
 
         print(f"[{i:02d}] res={res:>3} is_top={is_top} edge={edge_on} edge_ch={edge_ch} enc_in={enc_in} prior_in={prior_in}")
 
-        # Strong sanity checks for your rule: NO edges when res < 32
+        # Strong sanity checks: NO edges when res < 32
         if res < min_res:
             if width is not None and enc_in != 2 * width:
                 print(f"   !!! ERROR: enc_in should be {2*width} (width*2) when edge is OFF")
-            # prior_in may include temporal width if you use temporal priors at this res
+            # prior_in may include temporal width if one uses temporal priors at this res
             # so only check the ">= width" and "not including edges" aspect:
             if width is not None and prior_in < width:
                 print(f"   !!! ERROR: prior_in looks too small (expected at least width={width})")
@@ -542,7 +542,6 @@ class DMCVBDataset(Dataset):
             for subfolder in subfolders:
                 episode_dir = base_dir / policy_level / subfolder
                 if not episode_dir.exists():
-                    # silently skip or print if you want
                     continue
 
                 episode_files = sorted(episode_dir.glob("distracting_control-*.tfrecord-*"))
@@ -787,7 +786,6 @@ class DMCVBDataset(Dataset):
         done_flags = episode_data['done'][action_start:action_end]
         sample['done'] = torch.from_numpy(done_flags).float()
 
-        # Optional: return debug info (does NOT break your existing API usage)
         sample['episode_idx'] = torch.tensor(ep_idx, dtype=torch.long)
         sample['start_idx'] = torch.tensor(start_idx, dtype=torch.long)
 
@@ -1296,13 +1294,13 @@ class DMCVBTrainer:
         x_prev = observations[b, t-1:t]  # [1,C,H,W] in [-1,1]
         x_tgt  = observations[b, t:t+1]  # [1,C,H,W] in [-1,1]
 
-        # to [0,1]
-        x_prev01 = self.model.denormalize_generated_images(x_prev).clamp(0, 1)
-        x_tgt01  = self.model.denormalize_generated_images(x_tgt ).clamp(0, 1)
+        # to [0,1] + force float32 for logging robustness
+        x_prev01 = self.model.denormalize_generated_images(x_prev).clamp(0, 1).float()
+        x_tgt01  = self.model.denormalize_generated_images(x_tgt ).clamp(0, 1).float()
 
-        # edges in [0,1]
-        e_prev = self.model.canny(x_prev01).clamp(0, 1)  # [1,1,H,W]
-        e_tgt  = self.model.canny(x_tgt01 ).clamp(0, 1)  # [1,1,H,W]
+        # edges in [0,1] (float32)
+        e_prev = self.model.canny(x_prev01).clamp(0, 1).float()  # [1,1,H,W]
+        e_tgt  = self.model.canny(x_tgt01 ).clamp(0, 1).float()  # [1,1,H,W]
 
         # ---- flow conditioning: use captured ctx_map (NOT hidden_states) ----
         ctx = out.get("captured_flow_ctx", None)  # expected [1, flow_ctx_dim, H, W] on CPU
@@ -1310,9 +1308,9 @@ class DMCVBTrainer:
         if ctx is None:
             # fallback: keep logging robust if capture didn't happen (e.g., warp disabled)
             flow_ctx_dim = getattr(self.model, "flow_ctx_dim", self.model.flow_ctx_proj[0].out_channels)
-            ctx = torch.zeros((1, flow_ctx_dim, H, W), device=self.device, dtype=x_prev01.dtype)
+            ctx = torch.zeros((1, flow_ctx_dim, H, W), device=self.device, dtype=torch.float32)
         else:
-            ctx = ctx.to(device=self.device, dtype=x_prev01.dtype)
+            ctx = ctx.to(device=self.device, dtype=torch.float32)
 
             # safety: if spatial size differs, resize to match current H,W
             if (ctx.shape[-2], ctx.shape[-1]) != (H, W):
@@ -1320,89 +1318,81 @@ class DMCVBTrainer:
 
         flow_in = torch.cat([x_prev01, e_prev, ctx], dim=1)
 
+        # ---------- GRU flow + warp.py ----------
         max_flow_full = max(H, W) * float(max_flow_frac)
-        warp_out = self.model.moe_warp(flow_in, e_prev=e_prev, max_flow_full=max_flow_full)
 
-        # blended outputs
-        e_warp = (warp_out["e_warp"] if warp_out["e_warp"] is not None else torch.zeros_like(e_prev)).clamp(0, 1)
-        x_warp_blend = self.model.moe_warp.warp_blend_tensor(
-            x_prev01, warp_out["flows_sel"], warp_out["topk_w"], factor=1
-        ).clamp(0, 1)
-
-        # --- extra: top-1 (hard) warp ---
-        topk_w = warp_out["topk_w"]        # [1,ksel,H,W]
-        flows_sel = warp_out["flows_sel"]  # [1,ksel,2,H,W]
-        w_one = torch.zeros_like(topk_w)
-        w_one[:, 0] = 1.0
-        x_warp_top1 = self.model.moe_warp.warp_blend_tensor(x_prev01, flows_sel, w_one, factor=1).clamp(0, 1)
-        e_warp_top1 = self.model.moe_warp.warp_blend_tensor(e_prev,   flows_sel, w_one, factor=1).clamp(0, 1)
-
-        # --- diagnostic maps ---
-        rgb_err  = (x_warp_blend - x_tgt01).abs().mean(dim=1, keepdim=True).clamp(0, 1)  # [1,1,H,W]
-        edge_err = (e_warp - e_tgt).abs().clamp(0, 1)
-
-        # flow magnitude (from blended debug flow)
-        flow_blended = warp_out.get("flow_blended", None)  # [1,2,H,W]
-        if flow_blended is None:
-            flow_mag = torch.zeros_like(edge_err)
-        else:
-            flow_mag = torch.sqrt((flow_blended ** 2).sum(dim=1, keepdim=True) + 1e-8)
-            flow_mag = (flow_mag / (max_flow_full + 1e-6)).clamp(0, 1)
-
-        # gate entropy + top1 expert id map
-        gate_probs = warp_out.get("gate_probs_full", None)  # [1,K,H,W]
-        if gate_probs is None:
-            gate_ent = torch.zeros_like(edge_err)
-            top1_exp = torch.zeros_like(edge_err)
-        else:
-            ent = -(gate_probs * (gate_probs + 1e-8).log()).sum(dim=1, keepdim=True)  # [1,1,H,W]
-            ent = ent / (torch.log(torch.tensor(gate_probs.shape[1], device=ent.device, dtype=ent.dtype)) + 1e-6)
-            gate_ent = ent.clamp(0, 1)
-
-            top1 = gate_probs.argmax(dim=1, keepdim=True).to(gate_probs.dtype)  # [1,1,H,W]
-            top1_exp = (top1 / max(gate_probs.shape[1] - 1, 1)).clamp(0, 1)
-
-        # top1 weight map
-        w_top1 = topk_w[:, 0:1].clamp(0, 1)  # [1,1,H,W]
-
-        def to3(x1):  # x1: [1,1,H,W] or [1,3,H,W]
+        def to3(x1):
             return x1 if x1.shape[1] == 3 else x1.repeat(1, 3, 1, 1)
+
+        # Prefer flows captured from forward_sequence (best: matches GRU state used in training)
+        flow_bw = out.get("captured_flow_bw", None)  # expected CPU [1,2,H,W]
+        flow_fw = out.get("captured_flow_fw", None)  # optional (for cycle/extra diag)
+
+        # Fallback if not captured: do a single-step prediction with zero GRU state (viz robustness only)
+        if flow_bw is None:
+            flow_state0 = torch.zeros((1, 128, H, W), device=self.device, dtype=torch.float32)
+            a_t = actions[b:b+1, t - 1]  # same indexing as forward_sequence: predicts between t-1 and t
+            flow_bw, _ = self.model._predict_flow_one_step(
+                x01=x_tgt01, e=e_tgt, ctx=ctx, a_t=a_t,
+                state=flow_state0, first=(t == 1), direction="bw"  # FIXED
+            )
+        else:
+            flow_bw = flow_bw.to(device=self.device, dtype=torch.float32)
+
+        # Backward flow (t -> t-1) used to warp prev -> current via backward-warp convention
+        x_prev_to_cur = image_warp(x_prev01, flow_bw).clamp(0, 1)
+        e_prev_to_cur = self.model.warp_with_mode(e_prev, flow_bw, mode="nearest").clamp(0, 1)
+
+        rgb_err  = (x_prev_to_cur - x_tgt01).abs().mean(dim=1, keepdim=True).clamp(0, 1)
+        edge_err = (e_prev_to_cur - e_tgt).abs().clamp(0, 1)
+
+        flow_mag = torch.sqrt((flow_bw ** 2).sum(dim=1, keepdim=True) + 1e-8)
+        flow_mag = (flow_mag / (max_flow_full + 1e-6)).clamp(0, 1)
+
+        # Optional: cycle-consistency diagnostic if forward flow exists
+        cycle_mag = torch.zeros_like(flow_mag)
+        if flow_fw is not None:
+            flow_fw = flow_fw.to(device=self.device, dtype=torch.float32)
+            # cycle: f_fw + warp(f_bw, f_fw)
+            bw_warped = image_warp(flow_bw, flow_fw)
+            cyc = flow_fw + bw_warped
+            cycle_mag = torch.sqrt((cyc ** 2).sum(dim=1, keepdim=True) + 1e-8)
+            cycle_mag = (cycle_mag / (max_flow_full + 1e-6)).clamp(0, 1)
+
+        # --- flow HSV panel ---
+        flow_bw_rgb = flow_to_hsv_rgb(flow_bw).clamp(0, 1)  # [1,3,H,W]
+        flow_fw_rgb = torch.zeros_like(flow_bw_rgb)
+        if flow_fw is not None:
+            flow_fw_rgb = flow_to_hsv_rgb(flow_fw).clamp(0, 1)
+
+        flow_grid = torchvision.utils.make_grid(
+            torch.cat([flow_bw_rgb, flow_fw_rgb], dim=0),  # [2,3,H,W]
+            nrow=2,
+            padding=2
+        )
+        self.writer.add_image(tag + "_flow_hsv_bw_fw", flow_grid, epoch)
 
         # --- main 2x3 panel ---
         main_imgs = torch.cat([
-            x_prev01, x_tgt01, x_warp_blend,
-            to3(e_prev), to3(e_tgt), to3(e_warp),
-        ], dim=0)  # [6,3,H,W]
+            x_prev01, x_tgt01, x_prev_to_cur,
+            to3(e_prev), to3(e_tgt), to3(e_prev_to_cur),
+        ], dim=0)
         main_grid = torchvision.utils.make_grid(main_imgs, nrow=3, padding=2)
         self.writer.add_image(tag, main_grid, epoch)
 
-        # --- diag 2x4 panel ---
+        # --- diag 2x4 panel (new meaning) ---
         diag_imgs = torch.cat([
-            x_warp_top1, x_warp_blend, to3(rgb_err), to3(w_top1),
-            to3(flow_mag), to3(gate_ent), to3(top1_exp), to3(edge_err),
-        ], dim=0)  # [8,3,H,W]
+            x_prev_to_cur, x_tgt01, to3(rgb_err), to3(flow_mag),
+            to3(e_prev_to_cur), to3(e_tgt), to3(edge_err), to3(cycle_mag),
+        ], dim=0)
         diag_grid = torchvision.utils.make_grid(diag_imgs, nrow=4, padding=2)
         self.writer.add_image(tag + "_diag", diag_grid, epoch)
 
-        # line stats + HSV flow
-        flow_tgt2prev = warp_out.get("flow_blended", None)
-        if flow_tgt2prev is not None:
-            l_edge, stats = self.model.edge_line_align_loss(
-                E_prev=e_prev, E_tgt=e_tgt, flow=flow_tgt2prev,
-                x_prev01=x_prev01, x_tgt01=x_tgt01,
-                return_stats=True,
-            )
-            self.writer.add_images("warp/flow_hsv", flow_to_hsv_rgb(flow_tgt2prev.detach()), epoch)
-            self.writer.add_scalar(tag + "/line_mu_abs_mean", stats["mu_abs_mean"], epoch)
-            self.writer.add_scalar(tag + "/line_sigma_mean", stats["sigma_mean"], epoch)
-            self.writer.add_scalar(tag + "/line_resid_abs_mean", stats["resid_abs_mean"], epoch)
-            self.writer.add_scalar(tag + "/line_edge_evidence_mean", stats["edge_evidence_mean"], epoch)
-
-        # scalars (quick sanity)
-        self.writer.add_scalar(tag + "/rgb_l1", (x_warp_blend - x_tgt01).abs().mean().item(), epoch)
-        self.writer.add_scalar(tag + "/edge_l1", (e_warp - e_tgt).abs().mean().item(), epoch)
-        self.writer.add_scalar(tag + "/w_top1_mean", w_top1.mean().item(), epoch)
-        self.writer.add_scalar(tag + "/gate_entropy_mean", gate_ent.mean().item(), epoch)
+        # HSV flow + scalars
+        self.writer.add_images("warp/flow_hsv", flow_to_hsv_rgb(flow_bw.detach()), epoch)
+        self.writer.add_scalar(tag + "/rgb_l1", (x_prev_to_cur - x_tgt01).abs().mean().item(), epoch)
+        self.writer.add_scalar(tag + "/edge_l1", (e_prev_to_cur - e_tgt).abs().mean().item(), epoch)
+        self.writer.add_scalar(tag + "/cycle_mag_mean", cycle_mag.mean().item(), epoch)
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
@@ -1586,7 +1576,7 @@ class DMCVBTrainer:
         )
 
         def denorm(x):
-            # your images are in [-1,1]
+            # images are in [-1,1]
             return ((x + 1.0) * 0.5).clamp(0.0, 1.0)
 
         num_rows = min(num_examples, B)
@@ -1643,7 +1633,7 @@ class DMCVBTrainer:
         One-shot gradient diagnostics on a tiny (B,T) slice to avoid OOM.
 
         IMPORTANT: This version just measures gradients w.r.t. whatever is currently
-        trainable under your normal training configuration.
+        trainable under normal training configuration.
         """
 
         # Remember original train/eval mode and then use train-mode for diag
@@ -1681,7 +1671,7 @@ class DMCVBTrainer:
                     lambda_recon=self.config["lambda_recon"],
                 )
 
-                # Same ELBO combination you use elsewhere
+                # Same ELBO combination 
                 elbo_loss = (
                     self.config["lambda_recon"] * vae_losses["recon_loss"]
                     + self.config["beta"] * vae_losses["kl_z"]
@@ -1737,7 +1727,7 @@ class DMCVBTrainer:
                 )
 
         finally:
-            # detach outputs if you log them
+            # detach outputs 
             for k, v in list(outputs.items()):
                 if isinstance(v, torch.Tensor):
                     outputs[k] = v.detach().cpu()
@@ -1815,7 +1805,7 @@ class DMCVBTrainer:
                 decode_mode="sample",
             )
 
-            # PSNR per step (reuse your compute_psnr which handles [-1,1])
+            # PSNR per step (reuse compute_psnr which handles [-1,1])
             psnr_1 = self.compute_psnr(observations[:, T_ctx:T_ctx + 2][:, 0], futures["vae_future"][:, 0])  # t+1
             psnr_2 = self.compute_psnr(observations[:, T_ctx:T_ctx + 2][:, 1], futures["vae_future"][:, 1])  # t+2
 
@@ -2180,7 +2170,6 @@ def main():
     }
     config = override_config_from_args(config, args)
 
-    # Optional: print final config so you see what actually ran
     print("=== Final config ===")
     for k, v in config.items():
         print(f"{k}: {v}")

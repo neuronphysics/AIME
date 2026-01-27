@@ -1,504 +1,332 @@
-from __future__ import annotations
-from typing import Dict, Optional, Sequence, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as _checkpoint
-
-from VRNN.update import FlowHead, SepConvGRU
+from functools import lru_cache
 
 
-# helpers
-def topk_gating(logits: torch.Tensor, top_k: int = 2, temperature: float = 1.0):
+def _device_key(device: torch.device) -> str:
+    # stable key for caching
+    if device.type == "cuda":
+        return f"cuda:{device.index}"
+    return device.type
+
+@lru_cache(maxsize=256)
+def _base_grid_cached(device_key: str, dtype_str: str, h: int, w: int):
     """
-    logits: [B,K,H,W]
-    returns topk_idx [B,top_k,H,W], topk_w [B,top_k,H,W], probs [B,K,H,W]
+    Returns base grid in normalized coords [-1,1] with align_corners=True:
+      grid: [1, H, W, 2]
+    Cached on (device,dtype,H,W). Uses torch ops only.
     """
-    K = logits.shape[1]
-    top_k = min(top_k, K)
-    eps= torch.finfo(torch.float32).eps
-    probs = torch.softmax(logits / max(temperature, 1e-6), dim=1)
-    topk_w, topk_idx = torch.topk(probs, k=top_k, dim=1)
-    topk_w = topk_w / (topk_w.sum(dim=1, keepdim=True) + eps)
-    return topk_idx, topk_w, probs
+    # This function is cached, so we rebuild tensors from scratch in the correct device/dtype.
+    # dtype_str is like 'torch.float32'
+    dtype = getattr(torch, dtype_str.split(".")[-1])
+
+    device = torch.device(device_key)
+    xs = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype)
+    ys = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
+    # indexing='ij' gives Y first, X second -> grid shape [H,W]
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")  # yy: [H,W], xx: [H,W]
+    grid = torch.stack([xx, yy], dim=-1).unsqueeze(0)  # [1,H,W,2]
+    return grid
 
 
-def tv_loss_gate(p: torch.Tensor) -> torch.Tensor:
-    """Total-variation loss on gate probabilities p: [B,K,H,W]."""
-    dx = (p[:, :, :, 1:] - p[:, :, :, :-1]).abs().mean()
-    dy = (p[:, :, 1:, :] - p[:, :, :-1, :]).abs().mean()
-    return dx + dy
+def _get_base_grid(image: torch.Tensor):
+    """
+    Returns cached [1,H,W,2] base grid on image.device/image.dtype.
+    """
+    _, _, h, w = image.shape
+    device_key = _device_key(image.device)
+    dtype_str = str(image.dtype)  # e.g. 'torch.float32'
+    return _base_grid_cached(device_key, dtype_str, h, w)
 
 
-def _coords_grid(B: int, H: int, W: int, device, dtype) -> torch.Tensor:
-    y, x = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing="ij",
+# -----------------------------
+# Warp
+# -----------------------------
+
+def image_warp(image, flow):
+    '''
+    image: torch.Size([B, C, H, W])
+    flow: torch.Size([B, 2, H, W]) in *pixel units* (dx, dy)
+    final_grid:  torch.Size([B, H, W, 2]) after normalization
+    '''
+    if image.dim() != 4:
+        raise ValueError("image must be [B,C,H,W]")
+    if flow.dim() != 4 or flow.size(1) != 2:
+        raise ValueError("flow must be [B,2,H,W]")
+
+    b, c, h, w = image.size()
+    device = image.device
+    dtype = image.dtype
+
+    # Ensure flow is on same device/dtype (grid_sample requires float)
+    flow = flow.to(device=device, dtype=dtype)
+
+    # Normalize flow from pixels to normalized grid units for align_corners=True
+    # x_norm = dx / ((W-1)/2), y_norm = dy / ((H-1)/2)
+    flow_norm = torch.cat(
+        [
+            flow[:, 0:1, :, :] / ((w - 1.0) / 2.0),
+            flow[:, 1:2, :, :] / ((h - 1.0) / 2.0),
+        ],
+        dim=1,
     )
-    coords = torch.stack([x, y], dim=0).to(dtype)  # [2,H,W]
-    return coords.unsqueeze(0).repeat(B, 1, 1, 1)  # [B,2,H,W]
+    flow_norm = flow_norm.permute(0, 2, 3, 1)  # [B,H,W,2]
+
+    # Cached base grid [1,H,W,2] -> expand to batch
+    base_grid = _get_base_grid(image).to(device=device, dtype=dtype)  # [1,H,W,2]
+    grid = base_grid + flow_norm  # [B,H,W,2] via broadcasting
+
+    # IMPORTANT: align_corners=True matches the normalization above.
+    output = F.grid_sample(
+        image,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return output
 
 
-def convex_upsample_flow(flow: torch.Tensor, mask: torch.Tensor, up: int) -> torch.Tensor:
+# -----------------------------
+# Forward-backward consistency helpers
+# -----------------------------
+
+def length_sq(x):
+    # x: [B,2,H,W] or [B,C,H,W] -> sum over channel dim 1
+    return torch.sum(torch.square(x), dim=1, keepdim=True)
+
+
+def fbConsistencyCheck(flow_fw, flow_bw, alpha1=0.01, alpha2=0.5):
     """
-    RAFT convex upsampling.
-    flow: [N,2,h,w] low-res pixels
-    mask:[N, up^2*9, h, w]
-    returns [N,2, up*h, up*w] full-res pixels
+    Classic forward-backward check:
+      flow_fw + warp(flow_bw, flow_fw) should be ~0 (non-occluded)
+      flow_bw + warp(flow_fw, flow_bw) should be ~0
     """
-    N, _, h, w = flow.shape
-    mask = mask.view(N, 1, 9, up, up, h, w)
-    mask = torch.softmax(mask, dim=2)
+    flow_bw_warped = image_warp(flow_bw, flow_fw)  # wb(wf(x))
+    flow_fw_warped = image_warp(flow_fw, flow_bw)  # wf(wb(x))
+    flow_diff_fw = flow_fw + flow_bw_warped
+    flow_diff_bw = flow_bw + flow_fw_warped
 
-    up_flow = F.unfold(up * flow, [3, 3], padding=1)  # [N,2*9,h*w]
-    up_flow = up_flow.view(N, 2, 9, 1, 1, h, w)
+    mag_sq_fw = length_sq(flow_fw) + length_sq(flow_bw_warped)
+    mag_sq_bw = length_sq(flow_bw) + length_sq(flow_fw_warped)
+    occ_thresh_fw = alpha1 * mag_sq_fw + alpha2
+    occ_thresh_bw = alpha1 * mag_sq_bw + alpha2
 
-    up_flow = torch.sum(mask * up_flow, dim=2)  # [N,2,up,up,h,w]
-    up_flow = up_flow.permute(0, 1, 4, 2, 5, 3).contiguous()
-    up_flow = up_flow.view(N, 2, up * h, up * w)
-    return up_flow
+    fb_occ_fw = (length_sq(flow_diff_fw) > occ_thresh_fw).float()
+    fb_occ_bw = (length_sq(flow_diff_bw) > occ_thresh_bw).float()
+    return fb_occ_fw, fb_occ_bw
 
 
-class ConfHead(nn.Module):
-    """Predicts per-pixel confidence (logit) for one expert."""
-    def __init__(self, input_dim: int, hidden_dim: int = 128, gn_groups: int = 8):
-        super().__init__()
-        self.conv1 = nn.Conv2d(input_dim, hidden_dim, 3, padding=1)
-        self.gn1 = nn.GroupNorm(num_groups=min(gn_groups, hidden_dim), num_channels=hidden_dim)
-        self.conv2 = nn.Conv2d(hidden_dim, 1, 1)
-        nn.init.zeros_(self.conv2.weight)
-        nn.init.zeros_(self.conv2.bias)
+# -----------------------------
+# Loss utilities
+# -----------------------------
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.gn1(self.conv1(x)), inplace=True)
-        return self.conv2(x)
-
-def GN(c, g=8):
-    return nn.GroupNorm(num_groups=min(g, c), num_channels=c)
-
-def sobel_dxdy(x: torch.Tensor):
+def charbonnier_loss(x, mask=None, beta=255, epsilon=1e-3):
     """
-    x: (B, C, H, W) float
-    returns dx, dy: (B, C, H, W)
+    Charbonnier penalty. Compatible with your calls:
+      charbonnier_loss(im_diff_fw, mask_fw, beta=beta)
+      charbonnier_loss(occ_fw)
     """
-    B, C, H, W = x.shape
-    wx = x.new_tensor([[-1, 0, 1],
-                       [-2, 0, 2],
-                       [-1, 0, 1]]).view(1, 1, 3, 3)
-    wy = x.new_tensor([[-1, -2, -1],
-                       [ 0,  0,  0],
-                       [ 1,  2,  1]]).view(1, 1, 3, 3)
-
-    # apply same kernel to each channel using groups=C
-    wx = wx.expand(C, 1, 3, 3).contiguous()
-    wy = wy.expand(C, 1, 3, 3).contiguous()
-
-    x_pad = F.pad(x, (1, 1, 1, 1), mode="replicate")
-    dx = F.conv2d(x_pad, wx, groups=C)
-    dy = F.conv2d(x_pad, wy, groups=C)
-    return dx, dy
-    
-# Final Warp Class
-class PyramidMoEWarp(nn.Module):
-    """
-    Coarse->fine MoE flow refinement + warp-then-blend.
-
-    Defaults:
-      - top_k=2 (sparse)
-      - confidence enabled
-      - reg weights: 1/1024 for TV and disagreement
-      - returns a warp pyramid (6 levels) via e_warp_by_factor
-    """
-    def __init__(
-        self,
-        flow_in_dim: int,
-        hidden_dim: int = 48,
-        K: int = 4,
-        code_dim: int = 8,
-        up_factor: int = 4,
-
-        # refinement pyramid: factors relative to full-res (H/f, W/f)
-        pyramid_factors: Sequence[int] = (32, 16, 8, 4),
-        iters_per_level: Sequence[int] = (1, 1, 2, 2),
-
-        # output pyramid (6 levels like you asked)
-        out_factors: Sequence[int] = (1, 2, 4, 8, 16, 32),
-
-        # routing
-        top_k: int = 2,
-        gate_temperature: float = 0.3,
-
-        # regularizers
-        lb_weight: float = 2e-2,
-        tv_gate_weight: float = 1.0 / 1024.0,
-        disagree_weight: float = 1.0 / 1024.0,
-
-        # confidence
-        use_confidence: bool = True,
-        conf_floor: float = 0.75,   # prevents "dead" experts from making weights explode
-        conf_ceil: float = 0.99,
-        use_checkpoint: bool = True,
-        checkpoint_use_reentrant: bool = False,
-        device: torch.device | str | None = None,
-    ):
-        super().__init__()
-        self.hidden_dim = int(hidden_dim)
-        self.K = int(K)
-        self.code_dim = int(code_dim)
-        self.up_factor = int(up_factor)
-        self.use_checkpoint = bool(use_checkpoint)
-        self.checkpoint_use_reentrant = bool(checkpoint_use_reentrant)
+    # scale like common optical-flow code (beta=255 for images in [0,255] or to match legacy)
+    x = x / float(beta)
+    loss = torch.sqrt(x * x + epsilon * epsilon)
+    if mask is not None:
+        loss = loss * mask
+        denom = mask.sum().clamp_min(1.0)
+        return loss.sum() / denom
+    return loss.mean()
 
 
-        self.pyramid_factors = tuple(int(x) for x in pyramid_factors)
-        self.iters_per_level = tuple(int(x) for x in iters_per_level)
-        self.out_factors = tuple(int(x) for x in out_factors)
+class FlowWarpingLoss(nn.Module):
+    def __init__(self, metric):
+        super(FlowWarpingLoss, self).__init__()
+        self.metric = metric
 
-        assert len(self.pyramid_factors) == len(self.iters_per_level)
-        assert self.pyramid_factors[-1] == self.up_factor, "pyramid_factors[-1] must equal up_factor"
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            device = torch.device(device)
-
-        self.device = device
-        self.top_k = int(top_k)
-        self.gate_temperature = float(gate_temperature)
-
-        self.lb_weight = float(lb_weight)
-        self.tv_gate_weight = float(tv_gate_weight)
-        self.disagree_weight = float(disagree_weight)
-
-        self.use_confidence = bool(use_confidence)
-        self.conf_floor = float(conf_floor)
-        self.conf_ceil = float(conf_ceil)
-
-        # shared context encoder
-        self.cnet = nn.Sequential(
-            nn.Conv2d(flow_in_dim, 2 * hidden_dim, 3, padding=1),
-            GN(2 * hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(2 * hidden_dim, 2 * hidden_dim, 3, padding=1),
-            GN(2 * hidden_dim),
-        )
-
-        self.router = nn.Sequential(
-            nn.Conv2d(2 * hidden_dim, 64, 3, padding=1),
-            GN(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, K, 1),
-        )
-
-        self.flow_enc = nn.Sequential(
-            nn.Conv2d(2, hidden_dim, 7, padding=3),
-            GN(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
-            GN(hidden_dim),
-            nn.ReLU(inplace=True),
-        )
-
-        # shared GRU
-        self.gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=2 * hidden_dim)
-        self._eps = torch.nn.Parameter(torch.tensor(torch.finfo(torch.float32).eps), requires_grad=False)
-
-        # symmetry breakers
-        self.expert_code = nn.Parameter(torch.randn(K, code_dim))
-        self.level_code = nn.Parameter(torch.randn(len(self.pyramid_factors), code_dim))
-
-        # expert heads
-        head_in = 2 * hidden_dim + 2 * code_dim
-        self.delta_heads = nn.ModuleList(
-            [FlowHead(input_dim=head_in, hidden_dim=max(128, 2 * hidden_dim)) for _ in range(K)]
-        )
-
-        self.conf_heads = nn.ModuleList(
-            [ConfHead(input_dim=head_in, hidden_dim=max(128, 2 * hidden_dim)) for _ in range(K)]
-        )
-
-        # convex upsample mask
-        self.mask_head = nn.Sequential(
-            nn.Conv2d(hidden_dim, 128, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, (up_factor ** 2) * 9, 1),
-        )
-
-        # stable init
-        for head in self.delta_heads:
-            nn.init.zeros_(head.conv2.weight)
-            nn.init.zeros_(head.conv2.bias)
-        nn.init.zeros_(self.mask_head[-1].weight)
-        nn.init.zeros_(self.mask_head[-1].bias)
-
-        self._grid_cache: Dict[Tuple[torch.device, torch.dtype, int, int], torch.Tensor] = {}
-        self.to(self.device)
-
-    def _maybe_checkpoint(self, fn, *args):
-        if (not self.use_checkpoint) or (not self.training) or (not torch.is_grad_enabled()):
-            return fn(*args)
-        # checkpoint needs at least one Tensor input
-        if not any(isinstance(a, torch.Tensor) for a in args):
-            return fn(*args)
-
-        # reentrant checkpoint errors if no input requires grad
-        if self.checkpoint_use_reentrant and not any(
-            isinstance(a, torch.Tensor) and a.requires_grad for a in args
-        ):
-            return fn(*args)
-
-        return _checkpoint(fn, *args, use_reentrant=self.checkpoint_use_reentrant)
-
-    def _coords_grid_cached(self, B: int, H: int, W: int, device, dtype) -> torch.Tensor:
-        key = (device, dtype, H, W)
-        if key not in self._grid_cache:
-            self._grid_cache[key] = _coords_grid(1, H, W, device, dtype)
-        return self._grid_cache[key].repeat(B, 1, 1, 1)
-
-    def _warp(self, x: torch.Tensor, flow_px: torch.Tensor, padding_mode: str = "border") -> torch.Tensor:
-
+    def warp(self, x, flow):
         """
-        x: [B,C,H,W], flow_px: [B,2,H,W] in pixels at that resolution
+        Args:
+            x: torch tensor [b, c, h, w] (c can be 3 for rgb or 2 for flow)
+            flow: torch tensor [b, 2, h, w] in pixel units
+
+        Returns:
+            warped x
         """
-        B, C, H, W = x.shape
-        base = self._coords_grid_cached(B, H, W, x.device, x.dtype)
-        grid = base + flow_px
-        xg = 2.0 * grid[:, 0] / max(W - 1, 1) - 1.0
-        yg = 2.0 * grid[:, 1] / max(H - 1, 1) - 1.0
-        grid_norm = torch.stack([xg, yg], dim=-1)
-        return F.grid_sample(x, grid_norm, mode="bilinear", padding_mode=padding_mode, align_corners=True)
+        return image_warp(x, flow)
 
-    def warp_blend_tensor(
-        self,
-        x_prev: torch.Tensor,               # [B,C,H,W]
-        flows_sel: torch.Tensor,            # [B,ksel,2,H,W]
-        topk_w: torch.Tensor,               # [B,ksel,H,W]
-        factor: int = 1,
-        warp_fn=None,
-    ) -> torch.Tensor:
-        """Warp a generic tensor with the SAME selected expert flows + weights used for edge warping."""
-        warp = self._warp if warp_fn is None else warp_fn
-        B, C, H, W = x_prev.shape
-        B2, ksel, _, Hf, Wf = flows_sel.shape
-        assert B2 == B and Hf == H and Wf == W
-
-        h_r, w_r = H // factor, W // factor
-        x_r = F.interpolate(x_prev, size=(h_r, w_r), mode="bilinear", align_corners=False)
-
-        flows_r = F.interpolate(
-            flows_sel.reshape(B * ksel, 2, H, W),
-            size=(h_r, w_r),
-            mode="bilinear",
-            align_corners=False,
-        ).reshape(B, ksel, 2, h_r, w_r) / float(factor)
-
-        w_r_eff = F.interpolate(topk_w, size=(h_r, w_r), mode="bilinear", align_corners=False)
-
-        x_rep = x_r.unsqueeze(1).expand(B, ksel, C, h_r, w_r).reshape(B * ksel, C, h_r, w_r)
-        f_rep = flows_r.reshape(B * ksel, 2, h_r, w_r)
-
-        warped_rep = warp(x_rep, f_rep, padding_mode="zeros").reshape(B, ksel, C, h_r, w_r)
-        x_warp = (w_r_eff.unsqueeze(2) * warped_rep).sum(dim=1)
-        return x_warp
-
-    def _lb_loss(self, gate_probs: torch.Tensor) -> torch.Tensor:
-        """Simple importance+load balancing on gate probs [B,K,H,W]."""
-        B, K, H, W = gate_probs.shape
-        importance = gate_probs.mean(dim=(0, 2, 3))  # [K]
-        top1 = gate_probs.argmax(dim=1)              # [B,H,W]
-        load = torch.stack([(top1 == k).float().mean() for k in range(K)], dim=0)
-        tgt = 1.0 / float(K)
-        return ((importance - tgt) ** 2).mean() + ((load - tgt) ** 2).mean()
-
-    def _encode_all_expert_flows(self, flows: torch.Tensor) -> torch.Tensor:
-        """flows: [B,K,2,H,W] -> [B,K,Hid,H,W]"""
-        B, K, _, H, W = flows.shape
-        y = self.flow_enc(flows.reshape(B * K, 2, H, W))
-        return y.reshape(B, K, self.hidden_dim, H, W)
-
-    def forward(
-        self,
-        flow_in: torch.Tensor,                 # [B,Cin,H,W]
-        e_prev: Optional[torch.Tensor] = None, # [B,Cx,H,W]
-        warp_fn=None,
-        max_flow_full: Optional[float] = None,
-    ) -> Dict[str, torch.Tensor | Dict[int, torch.Tensor]]:
-        B, _, H, W = flow_in.shape
-        warp = self._warp if warp_fn is None else warp_fn
-
-        flows = None
-        net = None
-        prev_factor = None
-
-        gate_logits_pyr = []
-        lb_losses = []
-
-        # keep last-level tensors for confidence head
-        last_lvl_code = None
-        last_motion_all = None
-        last_net = None
-
-        # coarse features -> fine refinement pyramid 
-        for li, factor in enumerate(self.pyramid_factors):
-            h_l, w_l = H // factor, W // factor
-            x_l = F.interpolate(flow_in, size=(h_l, w_l), mode="bilinear", align_corners=False)
-
-            net_inp = self._maybe_checkpoint(self.cnet, x_l) # [B,2Hid,h_l,w_l]
-            net0, inp0 = net_inp.split(self.hidden_dim, 1)  # each [B,Hid,h_l,w_l]
-            inp = F.relu(inp0)
-
-            if net is None:
-                net = torch.tanh(net0)
-                flows = x_l.new_zeros(B, self.K, 2, h_l, w_l)
-            else:
-                scale = float(prev_factor) / float(factor)  # flow scale when resizing
-                net = F.interpolate(net, size=(h_l, w_l), mode="bilinear", align_corners=False) + torch.tanh(net0)
-                flows = F.interpolate(
-                    flows.reshape(B * self.K, 2, flows.shape[-2], flows.shape[-1]),
-                    size=(h_l, w_l),
-                    mode="bilinear",
-                    align_corners=False,
-                ).reshape(B, self.K, 2, h_l, w_l) * scale
-
-            prev_factor = factor
-
-            gate_logits = self._maybe_checkpoint(self.router, net_inp)  # [B,K,h_l,w_l]
-            gate_probs = torch.softmax(gate_logits / self.gate_temperature, dim=1)
-            lb_losses.append(self._lb_loss(gate_probs))
-            gate_logits_pyr.append(gate_logits)
-
-            lvl_code = self.level_code[li].view(1, -1, 1, 1).expand(B, -1, h_l, w_l)
-            max_flow_l = (max_flow_full / factor) if max_flow_full is not None else None
-
-            for _ in range(self.iters_per_level[li]):
-                # encode current per-expert flows -> motion features
-                motion_all = self._encode_all_expert_flows(flows)     # [B,K,Hid,h_l,w_l]
-                motion_mean = motion_all.mean(dim=1)                  # [B,Hid,h_l,w_l]
-
-                # GRU update (checkpoint-safe)
-                gru_inp = torch.cat([inp, motion_mean], dim=1)        # [B,2*Hid,h_l,w_l]
-                net = self._maybe_checkpoint(self.gru, net, gru_inp)  # [B,Hid,h_l,w_l]
-
-                # compute all expert deltas first (no in-place writes into flows)
-                deltas = []
-                for k, head in enumerate(self.delta_heads):
-                    exp_code = self.expert_code[k].view(1, -1, 1, 1).expand(B, -1, h_l, w_l)   # [B,code_dim,h_l,w_l]
-                    head_in = torch.cat([net, motion_all[:, k], exp_code, lvl_code], dim=1)    # [B,2*Hid+2*code_dim,h_l,w_l]
-                    delta_k = self._maybe_checkpoint(head, head_in)                            # [B,2,h_l,w_l]
-                    deltas.append(delta_k)
-
-                deltas = torch.stack(deltas, dim=1)             # [B,K,2,h_l,w_l]
-                flows = flows + deltas                          # out-of-place update
-
-                if max_flow_l is not None:
-                    flows = max_flow_l * torch.tanh(flows / (max_flow_l + self._eps))
-
-            # keep last-level tensors for confidence heads
-            last_lvl_code = lvl_code
-            last_motion_all = self._encode_all_expert_flows(flows)
-            last_net = net
+    def __call__(self, x, y, flow, mask):
+        """
+        Keep your original API.
+        """
+        warped_x = self.warp(x, flow)
+        loss = self.metric(warped_x * mask, y * mask)
+        return loss
 
 
-        # ---- convex upsample to full-res ----
-        h8, w8 = H // self.up_factor, W // self.up_factor
-        up_mask = 0.25 * self._maybe_checkpoint(self.mask_head, net)  # [B,up^2*9,h8,w8]
+class TVLoss(nn.Module):
+    # Total variation on x
+    def __init__(self):
+        super(TVLoss, self).__init__()
 
-        flows_up = convex_upsample_flow(
-            flows.reshape(B * self.K, 2, h8, w8),
-            up_mask.unsqueeze(1).expand(-1, self.K, -1, -1, -1).reshape(B * self.K, -1, h8, w8),
-            self.up_factor,
-        ).reshape(B, self.K, 2, H, W)
-
-        # ---- full-res gating (no blur) ----
-        gate_logits_low = gate_logits_pyr[-1]  # [B,K,h8,w8]
-        gate_logits_full = F.interpolate(gate_logits_low, size=(H, W), mode="bilinear", align_corners=False)
-
-        topk_idx, topk_w, gate_probs_full = topk_gating(
-            gate_logits_full,
-            top_k=self.top_k,
-            temperature=self.gate_temperature,
+    def __call__(self, x):
+        loss = torch.mean(torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:])) + torch.mean(
+            torch.abs(x[:, :, :-1, :] - x[:, :, 1:, :])
         )
+        return loss
 
-        ksel = topk_idx.shape[1]
-        idx_exp = topk_idx.unsqueeze(2).expand(-1, -1, 2, -1, -1)     # [B,ksel,2,H,W]
-        flows_sel = torch.gather(flows_up, dim=1, index=idx_exp)      # [B,ksel,2,H,W]
 
-        #  confidence 
-        if self.use_confidence:
-            conf_logits_low_list = []
-            for k, chead in enumerate(self.conf_heads):
-                exp_code = self.expert_code[k].view(1, -1, 1, 1).expand(B, -1, h8, w8)
-                conf_in = torch.cat([last_net, last_motion_all[:, k], exp_code, last_lvl_code], dim=1)
-                conf_logits_low_list.append(self._maybe_checkpoint(chead, conf_in))           # [B,1,h8,w8]
-            conf_logits_low = torch.cat(conf_logits_low_list, dim=1)   # [B,K,h8,w8]
-            conf_logits_full = F.interpolate(conf_logits_low, size=(H, W), mode="bilinear", align_corners=False)
-            conf_full = torch.sigmoid(conf_logits_full).clamp(self.conf_floor, self.conf_ceil)  # [B,K,H,W]
-            conf_sel = torch.gather(conf_full, dim=1, index=topk_idx)  # [B,ksel,H,W]
+class WarpLoss(nn.Module):
+    def __init__(self):
+        super(WarpLoss, self).__init__()
+        self.metric = nn.L1Loss()
 
-            topk_w_eff = topk_w * conf_sel
-            topk_w_eff = topk_w_eff / (topk_w_eff.sum(dim=1, keepdim=True) + self._eps)
-        else:
-            conf_full = None
-            topk_w_eff = topk_w
+    def forward(self, flow, mask, img1, img2):
+        """
+        flow indicates the motion from img1 to img2
+        loss compares img1 vs warp(img2, flow) in valid mask region
+        """
+        img2_warped = image_warp(img2, flow)
+        loss = self.metric(img2_warped * mask, img1 * mask)
+        return loss
 
-        # debug blended flow (not used for final warping)
-        flow_blended = (topk_w_eff.unsqueeze(2) * flows_sel).sum(dim=1)  # [B,2,H,W]
 
-        # ---- regularizers ----
-        lb_loss = torch.stack(lb_losses).mean() * self.lb_weight
-        tv_gate = tv_loss_gate(gate_probs_full) * self.tv_gate_weight
+def create_outgoing_mask(flow):
+    """
+    Mask = 1 where (x+u, y+v) stays inside image bounds, else 0.
+    Returns [B,1,H,W]
+    """
+    if flow.dim() != 4 or flow.size(1) != 2:
+        raise ValueError("flow must be [B,2,H,W]")
 
-        disagree = flows_sel.new_tensor(0.0)
-        if self.disagree_weight > 0 and ksel >= 2:
-            # pairwise |flow_i - flow_j| weighted by overlap w_i*w_j
-            diff = (flows_sel[:, :, None] - flows_sel[:, None, :]).abs().sum(dim=3)  # [B,ksel,ksel,H,W]
-            wprod = (topk_w_eff[:, :, None] * topk_w_eff[:, None, :])                # [B,ksel,ksel,H,W]
-            mask = torch.triu(torch.ones(ksel, ksel, device=flows_sel.device, dtype=flows_sel.dtype), diagonal=1)
-            disagree = (diff * wprod * mask[None, :, :, None, None]).sum(dim=(1, 2)).mean()
-            disagree = disagree * self.disagree_weight
+    b, _, h, w = flow.shape
+    device = flow.device
+    dtype = flow.dtype
 
-        # ---- warp pyramid (6 levels) ----
-        e_warp = None
-        e_warp_by_factor: Dict[int, torch.Tensor] = {}
+    # pixel grid (in pixel coordinates)
+    grid_x = torch.arange(w, device=device, dtype=dtype).view(1, 1, 1, w).expand(b, 1, h, w)
+    grid_y = torch.arange(h, device=device, dtype=dtype).view(1, 1, h, 1).expand(b, 1, h, w)
 
-        if e_prev is not None:
-            Cx = e_prev.shape[1]
-            for factor in self.out_factors:
-                h_r, w_r = H // factor, W // factor
-                e_r = F.interpolate(e_prev, size=(h_r, w_r), mode="bilinear", align_corners=False)
+    flow_u, flow_v = torch.split(flow, split_size_or_sections=1, dim=1)  # [B,1,H,W]
+    pos_x = grid_x + flow_u
+    pos_y = grid_y + flow_v
 
-                # flow at this resolution must be in "pixels of that resolution"
-                flows_r = F.interpolate(
-                    flows_sel.reshape(B * ksel, 2, H, W),
-                    size=(h_r, w_r),
-                    mode="bilinear",
-                    align_corners=False,
-                ).reshape(B, ksel, 2, h_r, w_r) / float(factor)
+    inside_x = (pos_x <= (w - 1)) & (pos_x >= 0)
+    inside_y = (pos_y <= (h - 1)) & (pos_y >= 0)
+    inside = inside_x & inside_y
+    return inside  # bool [B,1,H,W]
 
-                w_r_eff = F.interpolate(topk_w_eff, size=(h_r, w_r), mode="bilinear", align_corners=False)
 
-                e_rep = e_r.unsqueeze(1).expand(B, ksel, Cx, h_r, w_r).reshape(B * ksel, Cx, h_r, w_r)
-                f_rep = flows_r.reshape(B * ksel, 2, h_r, w_r)
+def fbLoss(
+    forward_flow,
+    backward_flow,
+    forward_gt_flow,
+    backward_gt_flow,
+    fb_loss_weight,
+    image_warp_loss_weight=0,
+    occ_weight=0,
+    beta=255,
+    first_image=None,
+    second_image=None,
+):
+    """
+    Forward-backward consistency loss + optional photometric warp loss.
 
-                warped_rep = warp(e_rep, f_rep, padding_mode="zeros").reshape(B, ksel, Cx, h_r, w_r)
-                e_r_warp = (w_r_eff.unsqueeze(2) * warped_rep).sum(dim=1)
+    Keeps your original signature, but fixes a common issue:
+      - cycle consistency should use predicted forward/backward flows
+      - GT flows (if provided) are used for occlusion masking (more stable)
+    """
 
-                e_warp_by_factor[factor] = e_r_warp
-                if factor == 1:
-                    e_warp = e_r_warp
+    # outgoing masks (predicted flows)
+    mask_fw = create_outgoing_mask(forward_flow).float()
+    mask_bw = create_outgoing_mask(backward_flow).float()
 
-        return {
-            "e_warp": e_warp,
-            "e_warp_by_factor": e_warp_by_factor,   # keys: 1,2,4,8,16,32
-            "flows_up": flows_up,                   # [B,K,2,H,W]
-            "flows_sel": flows_sel,                 # [B,ksel,2,H,W]
-            "flow_blended": flow_blended,           # debug
-            "gate_probs_full": gate_probs_full,     # [B,K,H,W]
-            "conf_full": conf_full,                 # [B,K,H,W] or None
-            "topk_idx": topk_idx,
-            "topk_w": topk_w_eff,                   # effective weights (gate or gate×conf)
-            "lb_loss": lb_loss,
-            "tv_gate_loss": tv_gate,
-            "disagree_loss": disagree,
-        }
+    # --------
+    # Cycle consistency on predicted flows (this is the main useful term)
+    # --------
+    backward_flow_warped = image_warp(backward_flow, forward_flow)  # f21(x + f12(x))
+    forward_flow_warped  = image_warp(forward_flow, backward_flow)  # f12(x + f21(x))
+
+    flow_diff_fw = forward_flow + backward_flow_warped
+    flow_diff_bw = backward_flow + forward_flow_warped
+
+    # --------
+    # Occlusion masks from GT flows if available; otherwise fall back to predicted (no API change)
+    # --------
+    if forward_gt_flow is None:
+        forward_gt_flow = forward_flow.detach()
+    if backward_gt_flow is None:
+        backward_gt_flow = backward_flow.detach()
+
+    backward_flow_warped_gt = image_warp(backward_gt_flow, forward_gt_flow)
+    forward_flow_warped_gt  = image_warp(forward_gt_flow, backward_gt_flow)
+
+    flow_diff_fw_gt = forward_gt_flow + backward_flow_warped_gt
+    flow_diff_bw_gt = backward_gt_flow + forward_flow_warped_gt
+
+    # occlusion thresholds (classic)
+    mag_sq_fw = length_sq(forward_gt_flow) + length_sq(backward_flow_warped_gt)
+    mag_sq_bw = length_sq(backward_gt_flow) + length_sq(forward_flow_warped_gt)
+    occ_thresh_fw = 0.01 * mag_sq_fw + 0.5
+    occ_thresh_bw = 0.01 * mag_sq_bw + 0.5
+
+    fb_occ_fw = (length_sq(flow_diff_fw_gt) > occ_thresh_fw).float()
+    fb_occ_bw = (length_sq(flow_diff_bw_gt) > occ_thresh_bw).float()
+
+    # remove occluded regions from masks
+    mask_fw = mask_fw * (1.0 - fb_occ_fw)
+    mask_bw = mask_bw * (1.0 - fb_occ_bw)
+
+    occ_fw = 1.0 - mask_fw
+    occ_bw = 1.0 - mask_bw
+
+    # --------
+    # Optional image warp photometric loss (only if enabled)
+    # --------
+    image_warp_loss = 0.0
+    if image_warp_loss_weight != 0:
+        if first_image is None or second_image is None:
+            raise ValueError("first_image and second_image must be provided when image_warp_loss_weight != 0")
+
+        second_image_warped = image_warp(second_image, forward_flow)   # frame2 -> frame1
+        first_image_warped  = image_warp(first_image, backward_flow)   # frame1 -> frame2
+
+        im_diff_fw = first_image - second_image_warped
+        im_diff_bw = second_image - first_image_warped
+
+        occ_loss = occ_weight * (charbonnier_loss(occ_fw, beta=1) + charbonnier_loss(occ_bw, beta=1))
+        image_warp_loss = image_warp_loss_weight * (
+            charbonnier_loss(im_diff_fw, mask_fw, beta=beta) +
+            charbonnier_loss(im_diff_bw, mask_bw, beta=beta)
+        ) + occ_loss
+
+    # --------
+    # Final FB consistency loss
+    # --------
+    fb_loss = fb_loss_weight * (
+        charbonnier_loss(flow_diff_fw, mask_fw, beta=1) +
+        charbonnier_loss(flow_diff_bw, mask_bw, beta=1)
+    )
+
+    return fb_loss + image_warp_loss
+
+def edgeLoss(preds_edges, edges):
+    """
+
+    Args:
+        preds_edges: with shape [b, c, h , w]
+        edges: with shape [b, c, h, w]
+
+    Returns: Edge losses
+
+    """
+    mask = (edges > 0.5).float()
+    b, c, h, w = mask.shape
+    num_pos = torch.sum(mask, dim=[1, 2, 3]).float()
+    num_neg = c * h * w - num_pos
+    neg_weights = (num_neg / (num_pos + num_neg)).unsqueeze(1).unsqueeze(2).unsqueeze(3)
+    pos_weights = (num_pos / (num_pos + num_neg)).unsqueeze(1).unsqueeze(2).unsqueeze(3)
+    weight = neg_weights * mask + pos_weights * (1 - mask)  # weight for debug
+    losses = F.binary_cross_entropy_with_logits(preds_edges.float(), edges.float(), weight=weight, reduction='none')
+    loss = torch.mean(losses)
+    return loss
+

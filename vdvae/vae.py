@@ -298,7 +298,7 @@ class DecBlock(nn.Module):
 
             if downsample and r < 32:
                 # anti-aliased downsample (keeps thin edges from disappearing as often)
-                edge = F.interpolate(edge, size=(tgt_h, tgt_w), mode="area")
+                edge = F.adaptive_max_pool2d(edge, output_size=(tgt_h, tgt_w))
 
                 # Alternative if one wants "edge presence" (keeps any edge in each cell):
                 # edge = F.adaptive_max_pool2d(edge, output_size=(tgt_h, tgt_w))
