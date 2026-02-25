@@ -535,7 +535,8 @@ class DMCVBDataset(Dataset):
         else:
             policy_levels = ['expert', 'medium', 'mixed']
 
-        subfolders = ['none', 'dynamic_medium', 'static_medium']
+        #subfolders = ['none', 'dynamic_medium', 'static_medium']
+        subfolders = ['none', 'static_medium']
         base_dir = self.data_dir / "dmc_vb" / f"{self.domain_name}_{self.task_name}"
 
         for policy_level in policy_levels:
@@ -1325,34 +1326,42 @@ class DMCVBTrainer:
             return x1 if x1.shape[1] == 3 else x1.repeat(1, 3, 1, 1)
 
         # Prefer flows captured from forward_sequence (best: matches GRU state used in training)
-        flow_bw = out.get("captured_flow_bw", None)  # expected CPU [1,2,H,W]
-        flow_fw = out.get("captured_flow_fw", None)  # optional (for cycle/extra diag)
+        flow_fw = out.get("captured_flow_fw", None)  # expected CPU [1,2,H,W]
+        flow_bw = out.get("captured_flow_bw", None)  # optional, for cycle diag
 
-        # Fallback if not captured: do a single-step prediction with zero GRU state (viz robustness only)
-        if flow_bw is None:
+        # Fallback if not captured: predict with zero GRU state (viz robustness only)
+        if flow_fw is None:
             flow_state0 = torch.zeros((1, 128, H, W), device=self.device, dtype=torch.float32)
-            a_t = actions[b:b+1, t - 1]  # same indexing as forward_sequence: predicts between t-1 and t
-            flow_bw, _ = self.model._predict_flow_one_step(
-                x01=x_tgt01, e=e_tgt, ctx=ctx, a_t=a_t,
-                state=flow_state0, first=(t == 1), direction="bw"  # FIXED
+            a_t = actions[b:b+1, t - 1]  # predicts between t-1 and t
+            # For forward flow, condition on prev frame
+            flow_fw, _ = self.model._predict_flow_one_step(
+                x01=x_prev01, e=e_prev, ctx=ctx, a_t=a_t,
+                state=flow_state0, first=(t == 1), direction="fw"
             )
         else:
-            flow_bw = flow_bw.to(device=self.device, dtype=torch.float32)
+            flow_fw = flow_fw.to(device=self.device, dtype=torch.float32)
 
-        # Backward flow (t -> t-1) used to warp prev -> current via backward-warp convention
-        x_prev_to_cur = image_warp(x_prev01, flow_bw).clamp(0, 1)
-        e_prev_to_cur = self.model.warp_with_mode(e_prev, flow_bw, mode="nearest").clamp(0, 1)
+        # --- MATCH TRAINING EDGE GUIDE PATH 1:1 ---
+        # forward splat prev -> current using flow_fw (prev->cur)
+        x_prev_to_cur, denom = self.model.forward_splat_bilinear(x_prev01, flow_fw)
+        x_prev_to_cur = x_prev_to_cur.clamp(0, 1)
+
+        valid = (denom > 0.5).to(x_prev_to_cur.dtype)
+        x_prev_to_cur = x_prev_to_cur * valid
+
+        # edges are computed FROM warped RGB in your model
+        e_prev_to_cur = self.model.canny(x_prev_to_cur.float()).clamp(0, 1).float()
 
         rgb_err  = (x_prev_to_cur - x_tgt01).abs().mean(dim=1, keepdim=True).clamp(0, 1)
         edge_err = (e_prev_to_cur - e_tgt).abs().clamp(0, 1)
 
-        flow_mag = torch.sqrt((flow_bw ** 2).sum(dim=1, keepdim=True) + 1e-8)
+        flow_mag = torch.sqrt((flow_fw ** 2).sum(dim=1, keepdim=True) + 1e-8)
         flow_mag = (flow_mag / (max_flow_full + 1e-6)).clamp(0, 1)
 
-        # Optional: cycle-consistency diagnostic if forward flow exists
+        # Optional: cycle-consistency diagnostic if backward flow exists
         cycle_mag = torch.zeros_like(flow_mag)
-        if flow_fw is not None:
-            flow_fw = flow_fw.to(device=self.device, dtype=torch.float32)
+        if flow_bw is not None:
+            flow_bw = flow_bw.to(device=self.device, dtype=torch.float32)
             # cycle: f_fw + warp(f_bw, f_fw)
             bw_warped = image_warp(flow_bw, flow_fw)
             cyc = flow_fw + bw_warped
@@ -1360,17 +1369,17 @@ class DMCVBTrainer:
             cycle_mag = (cycle_mag / (max_flow_full + 1e-6)).clamp(0, 1)
 
         # --- flow HSV panel ---
-        flow_bw_rgb = flow_to_hsv_rgb(flow_bw).clamp(0, 1)  # [1,3,H,W]
-        flow_fw_rgb = torch.zeros_like(flow_bw_rgb)
-        if flow_fw is not None:
-            flow_fw_rgb = flow_to_hsv_rgb(flow_fw).clamp(0, 1)
+        flow_fw_rgb = flow_to_hsv_rgb(flow_fw).clamp(0, 1)  # [1,3,H,W]
+        flow_bw_rgb = torch.zeros_like(flow_fw_rgb)
+        if flow_bw is not None:
+            flow_bw_rgb = flow_to_hsv_rgb(flow_bw).clamp(0, 1)
 
         flow_grid = torchvision.utils.make_grid(
-            torch.cat([flow_bw_rgb, flow_fw_rgb], dim=0),  # [2,3,H,W]
+            torch.cat([flow_fw_rgb, flow_bw_rgb], dim=0),  # [2,3,H,W]
             nrow=2,
             padding=2
         )
-        self.writer.add_image(tag + "_flow_hsv_bw_fw", flow_grid, epoch)
+        self.writer.add_image(tag + "_flow_hsv_fw_bw", flow_grid, epoch)
 
         # --- main 2x3 panel ---
         main_imgs = torch.cat([
@@ -1380,7 +1389,7 @@ class DMCVBTrainer:
         main_grid = torchvision.utils.make_grid(main_imgs, nrow=3, padding=2)
         self.writer.add_image(tag, main_grid, epoch)
 
-        # --- diag 2x4 panel (new meaning) ---
+        # --- diag 2x4 panel ---
         diag_imgs = torch.cat([
             x_prev_to_cur, x_tgt01, to3(rgb_err), to3(flow_mag),
             to3(e_prev_to_cur), to3(e_tgt), to3(edge_err), to3(cycle_mag),
@@ -1388,11 +1397,12 @@ class DMCVBTrainer:
         diag_grid = torchvision.utils.make_grid(diag_imgs, nrow=4, padding=2)
         self.writer.add_image(tag + "_diag", diag_grid, epoch)
 
-        # HSV flow + scalars
-        self.writer.add_images("warp/flow_hsv", flow_to_hsv_rgb(flow_bw.detach()), epoch)
+        # Scalars (note: now aligned to forward-splat)
+        self.writer.add_images("warp/flow_hsv", flow_to_hsv_rgb(flow_fw.detach()), epoch)
         self.writer.add_scalar(tag + "/rgb_l1", (x_prev_to_cur - x_tgt01).abs().mean().item(), epoch)
         self.writer.add_scalar(tag + "/edge_l1", (e_prev_to_cur - e_tgt).abs().mean().item(), epoch)
         self.writer.add_scalar(tag + "/cycle_mag_mean", cycle_mag.mean().item(), epoch)
+
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
@@ -1503,7 +1513,7 @@ class DMCVBTrainer:
                 psnr = self.compute_psnr(observations, recon, dones)
                 eval_metrics['psnr'].append(psnr.item())       
                 
-        if epoch % 20 == 0:
+        if epoch % 10 == 0:
             with torch.no_grad():
                  num_samples = 16
                  samples =self.model.sample(num_samples)
@@ -1536,7 +1546,7 @@ class DMCVBTrainer:
                 print(f"[eval] Warning: visualize_dpgmm_clustering failed at epoch {epoch}: {type(e).__name__}: {e}")
         # Compute averages
         avg_metrics = {f'eval/{k}': np.mean(v) for k, v in eval_metrics.items()}
-        pred_metrics = self.evaluate_two_step_prediction(num_batches=5, T_ctx=8) 
+        pred_metrics = self.evaluate_two_step_prediction(epoch, num_batches=5, T_ctx=8) 
         if self.config.get("use_wandb", False):
             wandb.log({f"{k}": v for k, v in pred_metrics.items()}, step=epoch)
 
@@ -1773,6 +1783,7 @@ class DMCVBTrainer:
     @torch.no_grad()
     def evaluate_two_step_prediction(
         self,
+        epoch,
         num_batches: int = 10,
         T_ctx: int = 8,
     ) -> Dict[str, float]:
@@ -1819,8 +1830,8 @@ class DMCVBTrainer:
 
         # Optional: log to TensorBoard / wandb
         if self.writer is not None:
-            self.writer.add_scalar("eval/pred_psnr_t+1", metrics["eval/pred_psnr_t+1"])
-            self.writer.add_scalar("eval/pred_psnr_t+2", metrics["eval/pred_psnr_t+2"])
+            self.writer.add_scalar("eval/pred_psnr_t+1", metrics["eval/pred_psnr_t+1"], epoch)
+            self.writer.add_scalar("eval/pred_psnr_t+2", metrics["eval/pred_psnr_t+2"], epoch)
 
         del observations, actions, dones, futures
         torch.cuda.empty_cache()
@@ -2128,8 +2139,8 @@ def main():
         'policy_level': 'all',
         
         # Model settings
-        'max_components': 16,
-        'latent_dim': 56,
+        'max_components': 15,
+        'latent_dim': 64,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 16.0,  # Hyperparameters for prior
@@ -2137,7 +2148,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 31,
+        'batch_size': 28,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 2,

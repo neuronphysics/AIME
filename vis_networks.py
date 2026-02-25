@@ -495,6 +495,7 @@ class Transformer(nn.Module):
         if return_attention:
             return x, attn_map
         return x
+
 class BottleneckFusionManyToOne(nn.Module):
     """Implementation of Bottleneck Fusion for two signals."""
 
@@ -1832,7 +1833,6 @@ def make_temporal_padding_mask(lengths: torch.Tensor, T: int) -> torch.Tensor:
     return ar < lengths.unsqueeze(1)                  # (B, T)
 
 
-
 class CausalConv3d(nn.Module):
     """
     3D convolution that is causal along time: pads only on the "past" side in time,
@@ -1923,8 +1923,54 @@ class RoPEMHA(nn.Module):
         return self.out(y)
 
 
-class SpatialTemporalTokenizer(nn.Module):
+class _CausalTransformerBlock(nn.Module):
+    """
+    A standard Pre-LN Transformer block using PyTorch MultiheadAttention.
+    Supports:
+      - attn_mask: [L, L] bool where True = DISALLOWED attention (PyTorch convention)
+      - key_padding_mask: [B, L] bool where True = PAD (ignored keys)
+    """
+    def __init__(self, dim: int, heads: int, mlp_dim: int, dropout: float):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.drop1 = nn.Dropout(dropout)
 
+        self.ln2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,                         # [B, L, D]
+        *,
+        attn_mask: Optional[torch.Tensor] = None, # [L, L] bool (True=blocked)
+        key_padding_mask: Optional[torch.Tensor] = None,  # [B, L] bool (True=pad)
+    ) -> torch.Tensor:
+        h = self.ln1(x)
+        # MultiheadAttention returns (out, weights)
+        out, _ = self.attn(
+            h, h, h,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = x + self.drop1(out)
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class SpatialTemporalTokenizer(nn.Module):
     def __init__(
         self,
         input_channels: int,
@@ -1932,10 +1978,17 @@ class SpatialTemporalTokenizer(nn.Module):
         patch_size: Tuple[int, int] = (8, 8),
         kernel_t: int = 3,
         stride_t: int = 1,
+        use_checkpoint: bool = True,
     ):
         super().__init__()
         ph, pw = patch_size
         self.patch_size = patch_size
+        self.use_checkpoint = use_checkpoint
+        self.ckpt_use_reentrant = False
+        self.ckpt_preserve_rng = True
+
+        # store for alignment when stride_t != 1
+        self.stride_t = int(stride_t)
 
         # causal 3D conv to form non-overlapping spatial patches, causal along time
         self.patch_embed = CausalConv3d(
@@ -1950,16 +2003,25 @@ class SpatialTemporalTokenizer(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden_dim)
 
+    def _maybe_ckpt(self, fn, *args):
+        if self.use_checkpoint and self.training and any(torch.is_tensor(a) and a.requires_grad for a in args):
+            return torch.utils.checkpoint.checkpoint(
+                fn,
+                *args,
+                use_reentrant=self.ckpt_use_reentrant,
+                preserve_rng_state=self.ckpt_preserve_rng,
+            )
+        return fn(*args)
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
         # x: (B, T, C, H, W) -> (B, C, T, H, W)
         x = x.transpose(1, 2)
-        x = self.patch_embed(x)                   # (B, D, T', H', W')
+        x = self._maybe_ckpt(self.patch_embed, x)  # (B, D, T', H', W')
         B, D, Tn, Hn, Wn = x.shape
-        x = x.permute(0, 2, 3, 4, 1)              # (B, T', H', W', D)
-        x = x.reshape(B, Tn, Hn * Wn, D)          # (B, T', N, D)
+        x = x.permute(0, 2, 3, 4, 1)               # (B, T', H', W', D)
+        x = x.reshape(B, Tn, Hn * Wn, D)           # (B, T', N, D)
         x = self.norm(x)
         return x, (Hn, Wn)
-
 
 
 class TemporalDiscriminator(nn.Module):
@@ -1982,7 +2044,6 @@ class TemporalDiscriminator(nn.Module):
         max_sequence_length: int = 32,
         patch_size: int = 8,
         z_dim: int = 32,
-        film_scale: float = 0.5,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         rope_base: float = 10000.0,
         dropout: float = 0.1,
@@ -1993,20 +2054,21 @@ class TemporalDiscriminator(nn.Module):
         self.max_sequence_length = max_sequence_length
         self.hidden_dim = hidden_dim
         self.patch_size = patch_size
-        self.device = device
         self.z_dim = z_dim
         self.num_patches = (image_size // patch_size) ** 2
+
         self.use_checkpoint = use_checkpoint
         self.ckpt_use_reentrant = False
         self.ckpt_preserve_rng = True
 
-        # --- Spatial–temporal tokenizer (3D conv -> patches) ---
+        # --- Spatial–temporal tokenizer (3D causal conv -> patches) ---
         self.frame_encoder = SpatialTemporalTokenizer(
             input_channels=input_channels,
             hidden_dim=hidden_dim,
             patch_size=(patch_size, patch_size),
             kernel_t=3,
             stride_t=1,
+            use_checkpoint=self.use_checkpoint,
         )
 
         # Learnable temporal embeddings (temporal index)
@@ -2014,7 +2076,7 @@ class TemporalDiscriminator(nn.Module):
             torch.randn(1, max_sequence_length, 1, hidden_dim) * 0.02
         )
 
-        # ---- RoPE for spatial positions (computed once per forward) ----
+        # ---- RoPE for spatial positions ----
         rope_heads_spatial = max(1, n_heads // 2)
         self.spatial_rope = RopePositionEmbedding(
             embed_dim=hidden_dim,
@@ -2026,93 +2088,128 @@ class TemporalDiscriminator(nn.Module):
             dtype=torch.float32,
             device=device,
         )
-
+        self._attn_mask_cache = {}  # (Tn, N, device) -> [L,L] bool mask
         # Spatial attention per frame (RoPE-aware MHA)
         self.spatial_attention = nn.ModuleList(
             [
                 RoPEMHA(
                     embed_dim=hidden_dim,
                     num_heads=rope_heads_spatial,
-                    dropout=0.1,
+                    dropout=dropout,
                 )
                 for _ in range(max(1, n_layers // 2))
             ]
         )
+        self.spatial_norm = nn.LayerNorm(hidden_dim)
 
+        # ---- z concatenation conditioning (NO FiLM) ----
+        self.z_norm = nn.LayerNorm(z_dim)
+        self.z_concat_proj = nn.Linear(hidden_dim + z_dim, hidden_dim)
+
+        # ---- Temporal blocks (causal, no [B,S,S] masks) ----
+        dim_head = hidden_dim // n_heads
+        assert hidden_dim % n_heads == 0, "hidden_dim must be divisible by n_heads"
         self.temporal_layers = nn.ModuleList(
             [
-                Transformer(
+                _CausalTransformerBlock(
                     dim=hidden_dim,
                     heads=n_heads,
-                    dim_head=hidden_dim // n_heads,  # 512 / 8 = 64, etc.
-                    mlp_dim=2 * hidden_dim,          # matches dim_feedforward
-                    dropout=0.1,
-                    drop_path_prob=dropout,              # keep 0.0 so we don't need timm.DropPath
+                    mlp_dim=2 * hidden_dim,
+                    dropout=dropout,
                 )
                 for _ in range(n_layers)
             ]
         )
 
-        # Norms
-        self.spatial_norm = nn.LayerNorm(hidden_dim)
         self.ln_f = nn.LayerNorm(hidden_dim)
-        self.cls_token = nn.Parameter(
-            torch.zeros(1, 1, hidden_dim)
-        )
+
+        # Put CLS at END so it can attend to all past tokens causally
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
 
-        # -------- Conditioning modules (cGAN-style) --------
-        self.film = nn.Sequential(
-            nn.LayerNorm(z_dim),
-            nn.Linear(z_dim, 2 * hidden_dim),
-        )
-        self.film_scale = nn.Parameter(
-            torch.tensor(film_scale, dtype=torch.float32), requires_grad=True
-        )
-
-        # Small conditional residuals for heads
-        self.head_temporal_cond = nn.Sequential(
-            nn.LayerNorm(z_dim), nn.Linear(z_dim, hidden_dim)
-        )
-        self.head_spatial_cond = nn.Sequential(
-            nn.LayerNorm(z_dim), nn.Linear(z_dim, hidden_dim)
-        )
-        self.head_frame_cond = nn.Sequential(
-            nn.LayerNorm(z_dim), nn.Linear(z_dim, hidden_dim)
-        )
-
-        # ---- Heads ----
+        # ---- Heads (concat z, NO additive z) ----
         self.temporal_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim + z_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
         self.spatial_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim + z_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
         self.per_frame_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim + z_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
 
+        # keep behavior similar to your original
         self.to(device)
 
-    # small helper to optionally checkpoint blocks
+    def _get_block_causal_attn_mask(self, Tn: int, N: int, device: torch.device) -> torch.Tensor:
+        """
+        Returns a cached [L, L] bool attention mask for MultiheadAttention,
+        where True = BLOCKED attention.
+        L = Tn*N + 1 (CLS at the end).
+
+        Causality:
+        - patch tokens can attend to patch tokens from times <= their time
+        - patch tokens cannot attend to CLS (CLS is a summary token at the end)
+        - CLS can attend to all patch tokens (and itself)
+        """
+        key = (int(Tn), int(N), device)
+        m = self._attn_mask_cache.get(key, None)
+        if m is not None and m.device == device:
+            return m
+
+        S = Tn * N
+        L = S + 1
+
+        # frame-level causal allow mask: [Tn,Tn], allow if key_time <= query_time
+        allow_time = torch.ones(Tn, Tn, device=device, dtype=torch.bool).tril()  # True=allow
+
+        # expand to patch tokens: [S,S]
+        allow_patch = allow_time.repeat_interleave(N, dim=0).repeat_interleave(N, dim=1)  # True=allow
+
+        # convert to MHA boolean attn_mask: True=blocked
+        block_patch = ~allow_patch  # [S,S]
+
+        # build final [L,L]
+        m = torch.empty(L, L, device=device, dtype=torch.bool)
+        m[:S, :S] = block_patch
+
+        # patch tokens -> CLS blocked
+        m[:S, S] = True
+
+        # CLS -> patch tokens allowed
+        m[S, :S] = False
+
+        # CLS -> CLS allowed
+        m[S, S] = False
+
+        self._attn_mask_cache[key] = m
+        return m
+
     def _maybe_ckpt(self, fn, *args):
-        if self.use_checkpoint and self.training:
+        if (
+            self.use_checkpoint and self.training
+            and any(torch.is_tensor(a) and a.requires_grad for a in args)
+        ):
             return torch.utils.checkpoint.checkpoint(
-                fn,
-                *args,
-                use_reentrant=self.ckpt_use_reentrant,
-                preserve_rng_state=self.ckpt_preserve_rng,
+                fn, *args, use_reentrant=self.ckpt_use_reentrant, preserve_rng_state=self.ckpt_preserve_rng
             )
         return fn(*args)
+
+    @staticmethod
+    def _aligned_lengths(lengths: torch.Tensor, stride_t: int) -> torch.Tensor:
+        # With causal padding and stride, conv time length is ceil(L/stride)
+        if stride_t == 1:
+            return lengths
+        return (lengths + stride_t - 1) // stride_t
 
     def forward(self, x, z=None, sequence_lengths=None, return_features=False):
         """
@@ -2121,168 +2218,209 @@ class TemporalDiscriminator(nn.Module):
         sequence_lengths: [B] with valid timesteps (for padding mask)
         """
         B, T, C, H, W = x.shape
+        dev = x.device
+        dtype = x.dtype
 
-        # ---- sequence lengths & padding mask ----
+        # ---- sequence lengths ----
         if sequence_lengths is None:
-            sequence_lengths = torch.full(
-                (B,),
-                T,
-                device=self.device,
-                dtype=torch.long,
-            )
-        temporal_mask = make_temporal_padding_mask(
-            sequence_lengths, T
-        )  # (B, T) bool, True = valid
+            sequence_lengths = torch.full((B,), T, device=dev, dtype=torch.long)
+        else:
+            sequence_lengths = sequence_lengths.to(device=dev)
 
         # ---- z handling ----
         if z is None:
-            z = torch.zeros(
-                B,
-                T,
-                self.z_dim,
-                device=self.device,
-                dtype=x.dtype,
-            )
+            z = torch.zeros(B, T, self.z_dim, device=dev, dtype=dtype)
         elif z.dim() == 2:
-            # broadcast [B, z_dim] -> [B, T, z_dim]
             z = z.unsqueeze(1).expand(-1, T, -1)
+        else:
+            z = z.to(device=dev, dtype=dtype)
 
-        # 1) Tokenize video into [B, T, N_patches, D]
-        def _frame_encoder(inp):
-            return self.frame_encoder(inp)
-
-        tokens, (Hp, Wp) = self._maybe_ckpt(_frame_encoder, x)
+        # 1) Tokenize: [B, T', N, D]
+        tokens, (Hp, Wp) = self.frame_encoder(x)
         B2, Tn, N, D = tokens.shape
-        assert B2 == B and Tn == T, f"Tokenizer changed T: {T} -> {Tn}"
+        assert B2 == B, "Batch changed unexpectedly in tokenizer"
 
-        # 2) Add learned  temporal pos embeddings
-        tokens = tokens +  self.temporal_pos_embed[:, :T, :, :]
+        # If tokenizer uses stride_t != 1 in time, align z + lengths to Tn
+        stride_t = getattr(self.frame_encoder, "stride_t", 1)
+        if Tn != T:
+            # Subsample z at times 0, stride, 2*stride, ...
+            idx = (torch.arange(Tn, device=dev) * stride_t).clamp(max=T - 1)
+            z = z.index_select(1, idx)
 
-        # 3) FiLM conditioning in latent space
-        film_params = self.film(z)  # [B, T, 2D]
-        gamma, beta = film_params.chunk(2, dim=-1)  # [B, T, D] each
-        gamma = torch.tanh(gamma) * self.film_scale
-        gamma = gamma.unsqueeze(2)  # [B, T, 1, D]
-        beta = beta.unsqueeze(2)
-        tokens = tokens * (1.0 + gamma) + beta  # [B, T, N, D]
+        # aligned lengths and padding mask over Tn
+        aligned_lengths = self._aligned_lengths(sequence_lengths, stride_t)
+        temporal_mask = make_temporal_padding_mask(aligned_lengths, Tn).to(device=dev)  # [B, Tn] bool
+        # zero out z on padded timesteps (important since we concat z)
+        z = z.masked_fill(~temporal_mask.unsqueeze(-1), 0.0)
 
-        # 4) Spatial attention per frame (RoPE)
-        sin_sp, cos_sp = self.spatial_rope(H=Hp, W=Wp)  # [N, D]
-        spatial_feats = []
-        for t in range(T):
-            s = tokens[:, t]  # [B, N, D]
-            for attn in self.spatial_attention:
-                s_norm = self.spatial_norm(s)
-                s = s + attn(s_norm, sin_sp, cos_sp)
-            spatial_feats.append(s)
-        spatial_feats = torch.stack(spatial_feats, dim=1)  # [B, T, N, D]
+        # 2) Add learned temporal embeddings
+        if Tn > self.max_sequence_length:
+            raise ValueError(f"T={Tn} exceeds max_sequence_length={self.max_sequence_length}")
+        tokens = tokens + self.temporal_pos_embed[:, :Tn, :, :].to(device=dev, dtype=tokens.dtype)
 
-        # 5) Temporal processing: flatten tokens across patches
-        flat_tokens = spatial_feats.reshape(B, T * N, D)  # [B, S, D], S = T*N
+        # 3) Spatial attention in parallel over all frames
+        sin_sp, cos_sp = self.spatial_rope(H=Hp, W=Wp)
+        sin_sp = sin_sp.to(device=dev, dtype=tokens.dtype)
+        cos_sp = cos_sp.to(device=dev, dtype=tokens.dtype)
 
-        # Build mask for the patch tokens: [B, S]
-        flat_mask = temporal_mask.unsqueeze(2).expand(-1, -1, N).reshape(B, T * N)
+        # (B,Tn,N,D) -> (B*Tn, N, D)
+        s = tokens.reshape(B * Tn, N, D)
+        for attn in self.spatial_attention:
+            s_norm = self.spatial_norm(s)
+            s = s + attn(s_norm, sin_sp, cos_sp)
+        spatial_feats = s.reshape(B, Tn, N, D)  # [B, Tn, N, D]
 
-        # Add CLS token at position 0
-        cls = self.cls_token.expand(B, 1, D)  # [B, 1, D]
-        h = torch.cat([cls, flat_tokens], dim=1)  # [B, 1+S, D]
+        # 4) Temporal processing: flatten patches
+        S = Tn * N
+        flat_tokens = spatial_feats.reshape(B, S, D)  # [B, S, D]
 
-        # Extend mask: CLS is always valid
-        cls_mask = torch.ones(B, 1, device=self.device, dtype=torch.bool)
-        full_mask = torch.cat([cls_mask, flat_mask], dim=1)  # [B, 1+S]
+        # Build patch-valid mask [B, S]
+        flat_valid = temporal_mask.unsqueeze(2).expand(-1, -1, N).reshape(B, S)  # True=valid
 
-        all_hidden = []
+        # ---- CONCAT z into tokens (NO FiLM) ----
+        z_normed = self.z_norm(z)  # [B, Tn, z_dim]
+        z_patch = z_normed.unsqueeze(2).expand(-1, -1, N, -1).reshape(B, S, self.z_dim)
+        h_tokens = torch.cat([flat_tokens, z_patch], dim=-1)         # [B, S, D+z_dim]
+        h_tokens = self.z_concat_proj(h_tokens)                      # [B, S, D]
 
-        for layer in self.temporal_layers:
-            def _layer(h_in, mask_in):
-                # mask_in: [B, S'], True = valid tokens
-                if mask_in.dtype is not torch.bool:
-                    mask_b = mask_in.bool()
-                else:
-                    mask_b = mask_in
+        # Append CLS at END (causal summary token)
+        # CLS at END, but make it z-conditioned via concatenation (no extra layers)
 
-                # Build attention mask: [B, S', S']
-                attn_mask = mask_b.unsqueeze(1) & mask_b.unsqueeze(2)
+        # last valid timestep index per sequence (aligned to Tn)
+        last_idx = (aligned_lengths - 1).clamp(min=0)  # [B]
+        # gather z_last: [B, z_dim]
+        z_last = z.gather(1, last_idx.view(B, 1, 1).expand(B, 1, self.z_dim)).squeeze(1)
+        z_last = self.z_norm(z_last)  # keep consistent with patch conditioning
 
-                # Our custom Transformer takes `mask`
-                return layer(h_in, mask=attn_mask)
+        # build CLS token input: concat([cls_embed, z_last]) then project with SAME z_concat_proj
+        cls = self.cls_token.expand(B, 1, D).to(device=dev, dtype=h_tokens.dtype)          # [B,1,D]
+        cls_in = torch.cat([cls, z_last.to(dtype=cls.dtype).unsqueeze(1)], dim=-1)         # [B,1,D+z]
+        cls = self.z_concat_proj(cls_in)                                                   # [B,1,D]
 
-            h = self._maybe_ckpt(_layer, h, full_mask)
-            if return_features:
-                all_hidden.append(h)
+        h = torch.cat([h_tokens, cls], dim=1)  # [B, S+1, D]                       
+        L = S + 1
+
+        # Key padding mask for MHA: True = PAD (ignored keys)
+        cls_valid = torch.ones(B, 1, device=dev, dtype=torch.bool)
+        full_valid = torch.cat([flat_valid, cls_valid], dim=1)       # [B, L] True=valid
+        key_padding_mask = ~full_valid                               # [B, L] True=pad
+
+        # ---- Block-causal time mask [L, L] (True = BLOCKED) ----
+
+        # allow[q,k] = (time_k <= time_q)
+        attn_mask = self._get_block_causal_attn_mask(Tn, N, dev)                       # True means disallow
+
+        all_hidden: List[torch.Tensor] = []
+
+        if return_features:
+            # Pure function: returns (final_h, stacked_features) with no side effects.
+            # stacked_features: [n_layers, B, L, D]
+            def _layer_fn_with_feats(h_in: torch.Tensor):
+                feats = []
+                out = h_in
+                for layer in self.temporal_layers:
+                    out = layer(out, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+                    feats.append(out)
+                return out, torch.stack(feats, dim=0)
+
+            # checkpoint is now safe because there are no Python side effects
+            h, feats_stack = self._maybe_ckpt(_layer_fn_with_feats, h)
+            # list length = n_layers, each tensor [B, L, D]
+            all_hidden = [feats_stack[i] for i in range(feats_stack.shape[0])]
+
+        else:
+            # Pure function returning only final_h
+            def _layer_fn(h_in: torch.Tensor):
+                out = h_in
+                for layer in self.temporal_layers:
+                    out = layer(out, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+                return out
+
+            h = self._maybe_ckpt(_layer_fn, h)
 
         # Final norm
-        h = self.ln_f(h)  # [B, 1+S, D]
+        h = self.ln_f(h)                                             # [B, L, D]
 
-        # Separate CLS token and patch tokens
-        cls_out = h[:, 0]          # [B, D]
-        tokens_out = h[:, 1:]      # [B, S, D] = [B, T*N, D]
+        # CLS at end
+        tokens_out = h[:, :S]                                        # [B, S, D]
+        cls_out = h[:, S]                                            # [B, D]
 
-        # Reshape tokens back to [B, T, N, D]
-        h_4d = tokens_out.reshape(B, T, N, D)  # [B, T, N, D]
+        # Reshape back to [B, Tn, N, D]
+        h_4d = tokens_out.reshape(B, Tn, N, D)                       # [B, Tn, N, D]
 
-        # 6) Heads
+        # Per-frame pooled token: mean over patches
+        temporal_tokens = h_4d.mean(dim=2)                            # [B, Tn, D]
 
-        # temporal summary per frame = patch-mean (still used for per-frame stuff)
-        temporal_tokens = h_4d.mean(dim=2)  # [B, T, D]
+        # masked mean z over valid timesteps
+        z_mask_f = temporal_mask.unsqueeze(-1).to(dtype=torch.float32)      # [B, Tn, 1]
+        z_sum = (z * z_mask_f.to(dtype=z.dtype)).sum(dim=1)                 # [B, z_dim]
+        z_count = z_mask_f.sum(dim=1).clamp(min=1.0)                         # [B, 1]
+        z_mean_masked = z_sum / z_count.to(dtype=z_sum.dtype)                # [B, z_dim]
 
-        # a) sequence-level temporal score: use CLS + masked mean z
-        idx = torch.arange(B, device=self.device)
+        # a) temporal score: concat CLS with z_mean (NO additive)
+        temporal_rep = torch.cat([cls_out, z_mean_masked.to(dtype=cls_out.dtype)], dim=-1)
+        temporal_score = self.temporal_head(temporal_rep)              # [B, 1]
 
-        # masked mean of z over valid timesteps
-        z_mask = temporal_mask.unsqueeze(-1).float()  # [B, T, 1]
-        z_sum = (z * z_mask).sum(dim=1)               # [B, z_dim]
-        z_count = z_mask.sum(dim=1).clamp(min=1.0)    # [B, 1]
-        z_mean_masked = z_sum / z_count               # [B, z_dim]
+        # b) spatial score: masked mean over time and patches (NO padding leakage)
+        valid_t = temporal_mask.to(dtype=torch.float32)                # [B, Tn]
+        denom = (valid_t.sum(dim=1, keepdim=True).clamp(min=1.0) * float(N))  # [B,1]
+        pooled_spatial = (h_4d * valid_t[:, :, None, None].to(dtype=h_4d.dtype)).sum(dim=(1, 2)) / denom.to(dtype=h_4d.dtype)
+        spatial_rep = torch.cat([pooled_spatial, z_mean_masked.to(dtype=pooled_spatial.dtype)], dim=-1)
+        spatial_score = self.spatial_head(spatial_rep)                 # [B, 1]
 
-        temporal_rep = cls_out + self.head_temporal_cond(z_mean_masked)  # [B, D]
-        temporal_score = self._maybe_ckpt(self.temporal_head, temporal_rep)  # [B, 1]
-        # b) global spatial score: average over time & patches
-        spatial_rep = h_4d.mean(dim=1).mean(dim=1) + self.head_spatial_cond(
-            z.mean(dim=1)
-        )
-        spatial_score = self._maybe_ckpt(self.spatial_head, spatial_rep)  # [B, 1]
+        # c) per-frame scores: concat per-frame rep with z_t (NO additive)
+        per_frame_rep = torch.cat([temporal_tokens, z.to(dtype=temporal_tokens.dtype)], dim=-1)  # [B,Tn,D+z]
+        per_frame_scores = self.per_frame_head(per_frame_rep)          # [B, Tn, 1]
 
-        # c) per-frame scores (for consistency regularizers)
-        per_frame_rep = temporal_tokens + self.head_frame_cond(z)  # [B, T, D]
-        per_frame_scores = self._maybe_ckpt(self.per_frame_head, per_frame_rep)  # [B, T, 1]
-
-        # mask out padded frames, then average
-        per_frame_scores = per_frame_scores.masked_fill(
-            ~temporal_mask.unsqueeze(-1), 0.0
-        )  # zero padded
-        valid = temporal_mask.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
-        per_frame_avg = per_frame_scores.sum(dim=1) / valid  # [B, 1]
+        # mask padded frames, then average
+        per_frame_scores = per_frame_scores.masked_fill(~temporal_mask.unsqueeze(-1), 0.0)
+        valid = temporal_mask.sum(dim=1, keepdim=True).clamp(min=1)    # [B, 1]
+        per_frame_avg = per_frame_scores.sum(dim=1) / valid            # [B, 1]
 
         out = {
             "temporal_score": temporal_score,
             "spatial_score": spatial_score,
             "per_frame_scores": per_frame_scores,
             "final_score": temporal_score + spatial_score + per_frame_avg,
-            "sequence_lengths": sequence_lengths,
+            "sequence_lengths": aligned_lengths,   # IMPORTANT: matches Tn now
             "spatial_shape": (Hp, Wp),
         }
 
         if return_features:
-            out["features"] = all_hidden   # list of [B, T*N, D]
-            out["hidden_3d"] = h_4d        # [B, T, N, D]
-            out["cls_token"] = cls_out     # [B, D]
+            out["features"] = all_hidden        # list of [B, L, D]
+            out["hidden_3d"] = h_4d             # [B, Tn, N, D]
+            out["cls_token"] = cls_out          # [B, D]
 
         return out
 
-    # handy for feature-matching pipelines
     def extract_features(self, x, z=None):
+        """
+        Returns tokens after temporal-pos embedding + concat-z projection,
+        before spatial and temporal transformers (useful for feature matching).
+        """
         B, T, C, H, W = x.shape
+        dev = x.device
+        dtype = x.dtype
+
         if z is None:
-            z = torch.zeros(B, T, self.z_dim, device=self.device, dtype=x.dtype)
+            z = torch.zeros(B, T, self.z_dim, device=dev, dtype=dtype)
+        elif z.dim() == 2:
+            z = z.unsqueeze(1).expand(-1, T, -1)
+        else:
+            z = z.to(device=dev, dtype=dtype)
 
-        tokens, (Hp, Wp) = self.frame_encoder(x)  # [B, T, N, D]
-        tokens = tokens + self.temporal_pos_embed[:, :T, :, :]
+        tokens, (Hp, Wp) = self.frame_encoder(x)  # [B, Tn, N, D]
+        B2, Tn, N, D = tokens.shape
+        stride_t = getattr(self.frame_encoder, "stride_t", 1)
+        if Tn != T:
+            idx = (torch.arange(Tn, device=dev) * stride_t).clamp(max=T - 1)
+            z = z.index_select(1, idx)
 
-        film_params = self.film(z)
-        gamma, beta = film_params.chunk(2, dim=-1)
-        gamma = torch.tanh(gamma) * self.film_scale
-        tokens = tokens * (1.0 + gamma.unsqueeze(2)) + beta.unsqueeze(2)
+        tokens = tokens + self.temporal_pos_embed[:, :Tn, :, :].to(device=dev, dtype=tokens.dtype)
+
+        z_normed = self.z_norm(z)
+        z_patch = z_normed.unsqueeze(2).expand(-1, -1, N, -1)
+        tokens = self.z_concat_proj(torch.cat([tokens, z_patch.to(dtype=tokens.dtype)], dim=-1))  # [B,Tn,N,D]
 
         return tokens, (Hp, Wp)
 

@@ -444,35 +444,17 @@ def safe_groups(C, max_groups=8):
     return 1
 
 class SpatioTemporalCore(nn.Module):
-    """Top-level spatiotemporal recurrence over the *top latent map*.
-
-    Expected shapes:
-      - z_map: [B, zdim, topH, topW]
-      - a_t :  [B, action_dim]
-      - state = (h,c,m): each [B, hidden_dim, topH, topW]
-    """
-
-    def __init__(
-        self,
-        zdim: int,
-        action_dim: int,
-        hidden_dim: int,
-        *,
-        height: int = 4,
-        width: int = 4,
-        kernel: int = 5,
-        layer_norm: bool = True,
-        init_std: float = 0.0,
-        use_checkpoint: bool = False
-    ):
+    def __init__(self, zdim, action_dim, hidden_dim, *, height=4, width=4,
+                 kernel=5, layer_norm=True, init_std=0.0, use_checkpoint=False,
+                 extra_channels=0):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.action_dim = int(action_dim)
         self.height = int(height)
         self.width = int(width)
-        self.use_checkpoint = use_checkpoint
+        self.use_checkpoint = bool(use_checkpoint)
+        self.extra_channels = int(extra_channels)
 
-        # Conv-only action projection (no Linear)
         g = safe_groups(self.action_dim, 8)
         self.action_proj = nn.Sequential(
             nn.Conv2d(self.action_dim, self.action_dim, kernel_size=1, bias=False),
@@ -480,7 +462,7 @@ class SpatioTemporalCore(nn.Module):
         )
 
         self.cell = SpatioTemporalLSTMCell(
-            in_channel=int(zdim) + self.action_dim,
+            in_channel=int(zdim) + self.action_dim + self.extra_channels,
             num_hidden=self.hidden_dim,
             height=self.height,
             width=self.width,
@@ -489,9 +471,9 @@ class SpatioTemporalCore(nn.Module):
             layer_norm=bool(layer_norm),
         )
 
-        self.out_norm = nn.GroupNorm(num_groups=safe_groups(self.hidden_dim, 8), num_channels=self.hidden_dim)
+        self.out_norm = nn.GroupNorm(num_groups=safe_groups(self.hidden_dim, 8),
+                                     num_channels=self.hidden_dim)
 
-        # Learnable init states
         self.h0 = nn.Parameter(torch.zeros(1, self.hidden_dim, self.height, self.width))
         self.c0 = nn.Parameter(torch.zeros(1, self.hidden_dim, self.height, self.width))
         self.m0 = nn.Parameter(torch.zeros(1, self.hidden_dim, self.height, self.width))
@@ -500,22 +482,24 @@ class SpatioTemporalCore(nn.Module):
             nn.init.normal_(self.c0, std=float(init_std))
             nn.init.normal_(self.m0, std=float(init_std))
 
-    def init_state(self, B: int, H: int, W: int, device, dtype):
+    def init_state(self, B, device, dtype):
         h = self.h0.expand(B, -1, -1, -1).to(device=device, dtype=dtype)
         c = self.c0.expand(B, -1, -1, -1).to(device=device, dtype=dtype)
         m = self.m0.expand(B, -1, -1, -1).to(device=device, dtype=dtype)
         return h, c, m
 
-    def forward(self, z_map, a_t, state=None, mask_t=None):
+    def forward(self, z_map, a_t, state=None, mask_t=None, extra_maps=None):
         B, _, H, W = z_map.shape
+        assert H == self.height and W == self.width, "z_map H/W must match core height/width"
+
         if state is None:
-            h, c, m = self.init_state(B, H, W, z_map.device, z_map.dtype)
+            h, c, m = self.init_state(B, z_map.device, z_map.dtype)
         else:
             h, c, m = state
 
         if mask_t is not None:
             keep = mask_t.view(B, 1, 1, 1).to(z_map.dtype)
-            h0, c0, m0 = self.init_state(B, H, W, z_map.device, z_map.dtype)
+            h0, c0, m0 = self.init_state(B, z_map.device, z_map.dtype)
             h = h * keep + h0 * (1.0 - keep)
             c = c * keep + c0 * (1.0 - keep)
             m = m * keep + m0 * (1.0 - keep)
@@ -525,14 +509,24 @@ class SpatioTemporalCore(nn.Module):
         a_map = a_emb.expand(B, self.action_dim, H, W)
 
         x_t = torch.cat([z_map, a_map], dim=1)
+
+        extra_c = 0
+        if extra_maps is not None:
+            for emap in extra_maps:
+                assert emap.shape[0] == B and emap.shape[2] == H and emap.shape[3] == W, "extra_map shape mismatch"
+                x_t = torch.cat([x_t, emap.to(dtype=z_map.dtype, device=z_map.device)], dim=1)
+                extra_c += int(emap.shape[1])
+
+        assert extra_c == self.extra_channels, f"Expected extra_channels={self.extra_channels}, got {extra_c}"
+
         if self.use_checkpoint and self.training:
             def cell_fn(x, h_in, c_in, m_in):
-                h_new, c_new, m_new = self.cell(x, h_in, c_in, m_in)
-                return h_new, c_new, m_new
-
+                return self.cell(x, h_in, c_in, m_in)
             h_new, c_new, m_new = checkpoint(cell_fn, x_t, h, c, m, use_reentrant=False)
         else:
             h_new, c_new, m_new = self.cell(x_t, h, c, m)
+
+        # Optional stabilization (keep if you need it)
         c_new = c_new.clamp(-10.0, 10.0)
         m_new = m_new.clamp(-10.0, 10.0)
 

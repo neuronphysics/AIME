@@ -287,7 +287,6 @@ def _get_vdvae_out_at_t(
     # --- init spatiotemporal core + temporal vdvae state ---
     core_state = model.rnn.init_state(
         B,
-        model.top_H, model.top_W,
         device=device,
         dtype=obs.dtype,
     )

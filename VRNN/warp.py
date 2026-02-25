@@ -4,6 +4,90 @@ import torch.nn.functional as F
 from functools import lru_cache
 
 
+def downsample_flow(flow_src: torch.Tensor, dst_hw: tuple[int, int]) -> torch.Tensor:
+    """
+    Downsample flow without interpolation.
+    Uses a box filter implemented as depthwise conv + striding.
+
+    flow_src: [B,2,srcH,srcW] in src-grid pixels
+    returns:  [B,2,dstH,dstW] in dst-grid pixels
+    """
+    assert flow_src.ndim == 4 and flow_src.size(1) == 2
+    B, _, srcH, srcW = flow_src.shape
+    dstH, dstW = dst_hw
+
+    # require exact integer downsample (e.g., 64->8, 64->16, 32->8, ...)
+    assert srcH % dstH == 0 and srcW % dstW == 0, \
+        f"downsample_flow requires integer ratio: ({srcH},{srcW})->({dstH},{dstW})"
+
+    sy = srcH // dstH
+    sx = srcW // dstW
+
+    # fixed box filter: average over each (sy,sx) block, applied separately to dx/dy
+    w = flow_src.new_ones((2, 1, sy, sx)) / float(sy * sx)  # [2,1,sy,sx]
+    flow = F.conv2d(flow_src, w, stride=(sy, sx), padding=0, groups=2)  # [B,2,dstH,dstW]
+
+    # unit conversion: src-pixels -> dst-pixels
+    flow[:, 0] *= (dstW / srcW)  # dx
+    flow[:, 1] *= (dstH / srcH)  # dy
+    return flow
+
+def smooth_flow(flow: torch.Tensor, k: int = 3) -> torch.Tensor:
+    assert flow.ndim == 4 and flow.size(1) == 2
+    assert k % 2 == 1, "use odd k"
+    w = flow.new_ones((2, 1, k, k)) / float(k * k)  # depthwise, per-channel
+    pad = k // 2
+    # optional: replicate padding to avoid zero-border bias
+    flow = F.pad(flow, (pad, pad, pad, pad), mode="replicate")
+    return F.conv2d(flow, w, padding=0, groups=2)
+
+def upsample_flow(flow: torch.Tensor, dst_hw: tuple[int, int], k: int = 3) -> torch.Tensor:
+    assert flow.ndim == 4 and flow.size(1) == 2
+    B, _, Hs, Ws = flow.shape
+    Hd, Wd = int(dst_hw[0]), int(dst_hw[1])
+    assert Hd % Hs == 0 and Wd % Ws == 0, f"integer ratio required: ({Hs},{Ws})->({Hd},{Wd})"
+    sy = Hd // Hs
+    sx = Wd // Ws
+
+    w = flow.new_ones((2, 1, sy, sx))  # [2,1,sy,sx]
+    up = F.conv_transpose2d(flow, w, stride=(sy, sx), padding=0, groups=2)  # [B,2,Hd,Wd]
+
+    # unit conversion: src-grid pixels -> dst-grid pixels
+    up[:, 0] *= sx
+    up[:, 1] *= sy
+
+    return smooth_flow(up, k=k)
+
+def upsample_flow_raft(flow: torch.Tensor, mask: torch.Tensor, scale: int) -> torch.Tensor:
+    """
+    RAFT-style learned convex upsampling.
+
+    flow: [B,2,H,W] (low-res flow in low-res pixel units)
+    mask: [B, 9*scale*scale, H, W] (learned weights)
+    returns: [B,2,H*scale,W*scale] (high-res flow in high-res pixel units)
+    """
+    assert flow.ndim == 4 and flow.size(1) == 2
+    B, _, H, W = flow.shape
+    s = int(scale)
+
+    assert mask.shape == (B, 9 * s * s, H, W), (mask.shape, (B, 9 * s * s, H, W))
+
+    # Mask: [B, 9*s*s, H, W] -> [B,1,9,s,s,H,W], softmax over 9 neighbors
+    mask = mask.view(B, 1, 9, s, s, H, W)
+    mask = torch.softmax(mask, dim=2)
+    # Unfold 3x3 neighborhoods: [B, 2*9, H, W] -> [B,2,9,H,W]
+    flow_unfold = F.unfold(s*flow, kernel_size=3, padding=1)
+    flow_unfold = flow_unfold.view(B, 2, 9, 1, 1, H, W)
+    # Weighted sum over 9 neighbors -> [B,2,s,s,H,W]
+    up = torch.sum(mask * flow_unfold, dim=2)
+
+    # Rearrange to [B,2,H*s,W*s]
+    up = up.permute(0, 1, 4, 2, 5, 3).contiguous()
+    up = up.view(B, 2, H * s, W * s)
+
+    return up
+
+
 def _device_key(device: torch.device) -> str:
     # stable key for caching
     if device.type == "cuda":
@@ -82,7 +166,7 @@ def image_warp(image, flow):
         image,
         grid,
         mode="bilinear",
-        padding_mode="zeros",
+        padding_mode="border",
         align_corners=True,
     )
     return output
@@ -91,6 +175,106 @@ def image_warp(image, flow):
 # -----------------------------
 # Forward-backward consistency helpers
 # -----------------------------
+def abs_robust_loss(diff, eps=0.01, q=0.4):
+  """The so-called robust loss used by DDFlow."""
+  return (torch.abs(diff) + eps) ** q
+
+def rgb2gray(img):
+    # img: [..., 3, H, W]  (channels in dim -3)
+    r = img[..., 0, :, :]
+    g = img[..., 1, :, :]
+    b = img[..., 2, :, :]
+    img_gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
+    return img_gray.unsqueeze(-3)
+
+class SSIM(object):
+    def __init__(self):
+        self.C1 = 0.01 ** 2
+        self.C2 = 0.03 ** 2
+
+    def __call__(self, x, y, mu_x=None, mu_x_sq=None):
+
+        if mu_x == None:
+            mu_x = nn.AvgPool2d(3, 1)(x)
+            mu_x_sq = torch.pow(mu_x, 2)
+        mu_y = nn.AvgPool2d(3, 1)(y)
+        mu_x_mu_y = mu_x * mu_y
+        mu_y_sq = mu_y.pow(2)
+
+        sigma_x = nn.AvgPool2d(3, 1)(x * x) - mu_x_sq
+        sigma_y = nn.AvgPool2d(3, 1)(y * y) - mu_y_sq
+        sigma_xy = nn.AvgPool2d(3, 1)(x * y) - mu_x_mu_y
+
+        SSIM_n = (2 * mu_x_mu_y + self.C1) * (2 * sigma_xy + self.C2)
+        SSIM_d = (mu_x_sq + mu_y_sq + self.C1) * (sigma_x + sigma_y + self.C2)
+        SSIM = SSIM_n / SSIM_d
+
+        SSIM_img = torch.clamp((1 - SSIM) / 2, 0, 1)
+
+        return F.pad(SSIM_img, pad=(1, 1, 1, 1), mode='constant', value=0)
+
+
+class CensusTransform(nn.Module):
+    def __init__(self):
+        super(CensusTransform, self).__init__()
+        self.patch_size = 7
+        self.num_pix_per_patch = self.patch_size ** 2
+        self.pad_size = self.patch_size // 2
+        self.conv2d = nn.Unfold(self.patch_size, padding=self.pad_size)
+        # self.conv2d = nn.Conv2d(1, self.patch_size**2, self.patch_size, padding=self.pad_size, padding_mode='zeros', bias=False)
+        # kernel = torch.eye(self.patch_size ** 2).view(self.patch_size, self.patch_size, 1, self.patch_size * self.patch_size).permute(3, 2, 1, 0)
+        # self.conv2d.weight = nn.Parameter(kernel, requires_grad=False)
+
+    def get_neighbors(self, x):
+        dims = x.size()
+        return self.conv2d(x.view(-1, *dims[-3:])).view(*dims[:-3], -1, *dims[-2:])
+
+    def census(self, img):
+        intensities = rgb2gray(img)
+        neighbors = self.get_neighbors(intensities)
+        diff = neighbors - intensities
+        diff_norm = diff / (.81 + diff**2)**0.5
+        return diff_norm
+
+    def forward(self, x):
+        return self.census(x)
+
+
+class CensusLoss(CensusTransform):
+    def __init__(self, args, device):
+        super(CensusLoss, self).__init__()
+        self.args = args
+        self.sequence_weights = args.sequence_weight ** torch.arange(args.iters, dtype=torch.float, device=device).unsqueeze(0).unsqueeze(1)
+        self.compute_loss = self.compute_loss_sequential if args.sequentially else self.compute_loss_parallel
+
+    def soft_hamming(self, x, y, mask, thresh=.1):
+        sq_dist = (x - y) ** 2
+        soft_thresh_dist = sq_dist / (thresh + sq_dist)
+        return soft_thresh_dist.sum(dim=-3, keepdims=True), self.zero_mask_border(mask)
+
+    def zero_mask_border(self, mask):
+        """Used to ignore border effects from census_transform."""
+        mask = mask[..., self.pad_size:-self.pad_size, self.pad_size:-self.pad_size]
+        return F.pad(mask, (self.pad_size, self.pad_size, self.pad_size, self.pad_size))
+
+    def compute_loss_sequential(self, census_ims, ims_warp, masks):
+        census_ims_warps = self.census(ims_warp)
+        hamming, masks = self.soft_hamming(census_ims, census_ims_warps, masks)
+        diff = (abs_robust_loss(hamming) * masks).sum((-3, -2, -1)) / (masks.sum(dim=(-3, -2, -1)).clamp_min(1e-5))
+        return diff.mean()
+
+    def compute_loss_parallel(self, ims, ims_warp, masks):
+        census_ims = self.census(ims)
+        census_ims_warps = self.census(ims_warp)
+        hamming, masks = self.soft_hamming(census_ims.unsqueeze(-4), census_ims_warps, masks)
+        diff = (abs_robust_loss(hamming) * masks).sum((-3, -2, -1)) / (masks.sum(dim=(-3, -2, -1)).clamp_min(1e-5))
+        T = diff.shape[1]
+        w = (self.args.sequence_weight ** torch.arange(T, device=diff.device, dtype=diff.dtype))  # [T]
+        return (diff * w[None, :]).sum(dim=1).mean()
+
+    def forward(self, ims, ims_warps, mask, covs=None):
+        return self.compute_loss(ims, ims_warps, mask)
+
 
 def length_sq(x):
     # x: [B,2,H,W] or [B,C,H,W] -> sum over channel dim 1
@@ -329,4 +513,3 @@ def edgeLoss(preds_edges, edges):
     losses = F.binary_cross_entropy_with_logits(preds_edges.float(), edges.float(), weight=weight, reduction='none')
     loss = torch.mean(losses)
     return loss
-

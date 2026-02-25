@@ -7,8 +7,8 @@
 #SBATCH --mem=100G
 #SBATCH --time=01-11:59:59
 #SBATCH --account=def-irina
-#SBATCH --output=/home/memole/links/projects/def-irina/memole/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.out
-#SBATCH --error=/home/memole/links/projects/def-irina/memole/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.err
+#SBATCH --output=/home/memole/links/projects/def-irina/memole/AIME/logs/dpgmm-robomimic-transit-run-seed-1_%N-%j.out
+#SBATCH --error=/home/memole/links/projects/def-irina/memole/AIME/logs/dpgmm-robomimic-transit-run-seed-1_%N-%j.err
 #SBATCH --mail-user=sheikhbahaee@gmail.com              # notification for job conditions
 #SBATCH --mail-type=END
 #SBATCH --mail-type=FAIL
@@ -31,6 +31,7 @@ source /home/memole/links/D2E/bin/activate
 ### FORCE SINGLE-THREAD BLAS / OMP / TORCH
 # ---- VRAM allocator / fragmentation fixes ----
 export PYTORCH_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:256
+
 export CUDA_MODULE_LOADING=LAZY
 
 # If TensorFlow is imported anywhere in the SAME training process:
@@ -89,6 +90,15 @@ echo "pretrain VQVAE ....."
 #CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.pretrain_vqvae
 echo "finished pretraining and start training world model dpgmm vrnn model... " 
 python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_physical_devices('GPU'))"
+##Dowload dataset
 #python -m pip install -U "huggingface_hub[cli]"
-#hf download ml-jku/meta-world --local-dir /home/memole/links/scratch/transition_data/LiRE/meta-world --repo-type dataset
-CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.dmc_vb_transition_dynamics_trainer --data_dir /home/memole/links/scratch/transition_data/
+#DEST=/home/memole/links/scratch/transition_data/robomimic_v1.5
+#mkdir -p "$DEST"
+
+#hf download amandlek/robomimic --repo-type dataset --include "v1.5/**" --local-dir "$DEST"
+#IN=/home/memole/links/scratch/transition_data/robomimic_v1.5/v1.5/can/mg/demo_v15.hdf5
+#OUT=/home/memole/links/scratch/transition_data/robomimic_v1.5/v1.5/can/mg/image64_v15.hdf5
+
+#python -m VRNN.dataset_states_to_obs --dataset "$IN" --output_name "$OUT" --done_mode 2 --camera_names agentview robot0_eye_in_hand --camera_height 64 --camera_width 64 --compress
+
+CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.robomimic_transition_dynamics_trainer --hdf5 /home/memole/links/scratch/transition_data/robomimic_v1.5/v1.5/can/mg/image64_v15.hdf5 --obs_keys agentview_image --run_name robomimic_can_agentview --logger tensorboard --sequence_length 12

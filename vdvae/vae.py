@@ -459,6 +459,9 @@ class DecBlock(nn.Module):
             temp_mult = float(temperature)
             if t is not None:
                 temp_mult *= float(t)
+            if temp_mult == 0.0: # TODO: is this ok?
+                z = pm
+                return z, x            
             if temp_mult != 1.0:
                 pv = pv + torch.ones_like(pv) * math.log(temp_mult)
             z = draw_gaussian_diag_samples(pm, pv)

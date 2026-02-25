@@ -19,6 +19,8 @@ from contextlib import contextmanager
 from itertools import chain
 import numpy as np
 import math, inspect
+from dataclasses import dataclass
+from types import SimpleNamespace
 from collections import OrderedDict
 from torch.utils.checkpoint import checkpoint as ckpt
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,15 +29,15 @@ from VRNN.RGB import DynamicWeightAverage
 from VRNN.lstm import LSTMLayer, SpatioTemporalCore
 from vdvae.vae import VDVAE
 from vdvae.hps import Hyperparams
-from vdvae.vae_helpers import mean_from_discretized_mix_logistic, sample_from_discretized_mix_logistic, draw_gaussian_diag_samples 
+from vdvae.vae_helpers import mean_from_discretized_mix_logistic, sample_from_discretized_mix_logistic, draw_gaussian_diag_samples
 from VRNN.utils.canny_net import CannyFilter
 from VRNN.warp import (
     image_warp, FlowWarpingLoss, TVLoss, WarpLoss, fbLoss,
-    fbConsistencyCheck, create_outgoing_mask, edgeLoss
+    fbConsistencyCheck, create_outgoing_mask, edgeLoss,
+    charbonnier_loss, CensusLoss, rgb2gray, downsample_flow, upsample_flow, upsample_flow_raft,
 )
-from VRNN.flow_predict import get_gru_encoder, get_gru_decoder, coords_grid
+from VRNN.flow_predict import get_gru_encoder, get_gru_decoder, coords_grid, FlowUpsampleMask, HFToTop, ConvPatchTokenizer, LatentFlowHead, HFMapPredictor, EdgeToTop, TokenTransporter, TokensToTopMap, FlowRefiner, MaxDeltaCalibrator, AntiAliasInterpolation2d, HFTopUpsampler
 from VRNN.Kumaraswamy import KumaraswamyStable
-from torchvision.models import AlexNet_Weights
 
 def beta_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
@@ -91,7 +93,7 @@ class GammaPosterior(nn.Module):
             ('gamma_ln', nn.LayerNorm(hidden_dim)),
             ('gamma_relu', nn.GELU()),
             ('gamma_out', nn.utils.spectral_norm(nn.Linear(hidden_dim, 2))),
-            ('gamma_ln_out', nn.LayerNorm(2, eps=1e-6)),
+            #('gamma_ln_out', nn.LayerNorm(2, eps=1e-6)),
             ('gamma_softplus', nn.Softplus(beta=0.5)),
             ('gamma_eps', AddEpsilon(eps))  # Ensure positive parameters
         ]))
@@ -175,7 +177,6 @@ class KumaraswamyNetwork(nn.Module):
             ('kumar_a_ln', nn.LayerNorm(hidden_dim, eps=1e-6)),
             ('kumar_a_relu', nn.GELU()),
             ('kumar_a_out', nn.utils.spectral_norm(kumar_a_out)),
-            ('kumar_a_ln_out', nn.LayerNorm(self.K - 1)),
         ]))
 
 
@@ -184,8 +185,6 @@ class KumaraswamyNetwork(nn.Module):
             ('kumar_b_ln', nn.LayerNorm(hidden_dim, eps=1e-6)),
             ('kumar_b_relu', nn.GELU()),
             ('kumar_b_out', nn.utils.spectral_norm(kumar_b_out)),
-            ('kumar_b_ln_out', nn.LayerNorm(self.K - 1)),
-
         ]))
         self.to(device)
 
@@ -460,7 +459,7 @@ class DPGMMPrior(nn.Module):
         posterior_logvar: torch.Tensor,
         prior_params: Dict[str, torch.Tensor],
         n_samples: int = 10,
-        reduction: str ="mean", #mean |token 
+        reduction: str ="mean", #mean |token
     ) -> torch.Tensor:
         """
 
@@ -635,6 +634,56 @@ def apply_emas(*emas):
     finally:
         for e in reversed(emas): e.restore()
 
+@dataclass
+class FlowCfg:
+    input_channels: int = 3
+    flow_ctx_dim: int = 64
+    flow_state_channels: int = 64
+    flow_dec_feat_channels: int = 128
+
+    # Edge weighting
+    thr_e: float = 0.2
+    edge_temp: float = 0.05
+    eps: float = 1e-6
+
+    # Warping
+    warp_padding_mode: str = "border"   # key fix vs zeros artifacts
+    rgb_warp_mode: str = "bilinear"
+    edge_warp_mode: str = "bilinear"
+
+    # Loss weights
+    w_edge: float = 0.2
+    w_photo: float = 1.0
+    w_tv: float = 0.1
+
+    # Visibility imbalance: occluded pixels are rare, upweight negatives (v_target=0)
+    vis_neg_weight: float = 5.0
+
+    # Residual should not "invent" stuff where warp is valid
+    w_res_suppress: float = 0.05
+
+    # Scheduled sampling: early use v_target, later switch to v_pred
+    blend_use_target_steps: int = 2000
+
+    # FB schedule
+    fb_warmup_steps: int = 40
+    w_fb: float = 0.1
+    w_fb_photo: float = 0.3
+    fb_alpha1: float = 0.01
+    fb_alpha2: float = 0.5
+
+    # Charbonnier epsilon
+    charbonnier_eps: float = 1e-3
+
+    # Optional extra losses
+    w_census: float = 0.1
+    w_grad: float = 0.1
+
+    # visibility + residual inpainting
+    w_vis: float = 0.2
+    w_inpaint_photo: float = 0.5
+    w_vis_area: float = 0.0
+
 ##############################
 ### Main DPGMMVRNN Class #####
 
@@ -657,27 +706,48 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         patch_size: int = 16,
         input_channels: int = 3,  # Number of input channels (e.g., RGB images)
         learning_rate: float = 1e-5,
-        grad_clip:float =10.0,
+        grad_clip:float = 10.0,
         prior_alpha: float = 1.0,  # Add these parameters
         prior_beta: float = 10.0,
         weight_decay: float = 0.00001,
         use_orthogonal: bool = True,  # Use orthogonal initialization for LSTM,
         number_lstm_layer: int = 3,  # Number of LSTM layers
-        warmup_epochs=25,
+        warmup_epochs: int = 25,
         dropout: float = 0.1,
         use_ctx_checkpoint: bool = True,
         use_dwa: bool = False,
         dwa_temperature: float = 2.0,
         rollout_adv_every: int = 1,            # do rollout adversarial every N steps (0 disables)
-        rollout_context_frames: int = 4,        # T_ctx
+        rollout_context_frames: int = 3,        # T_ctx
         rollout_horizon: int = 4,               # rollout length
         lambda_rollout_adv: float = 1.0,       # strength of rollout adversarial losses
         rollout_top_temperature: float = 0.2,   # sampling temperature for top prior
         rollout_decoder_temperature: float = 0.4,
         rollout_decode_mode: str = "mean",      # "mean" or "sample"
-        hidden_flow_proj=96,
-        patch_disc_layers=4,
-        patch_disc_ndf =32
+        flow_ctx_dim: int = 64,
+        patch_disc_layers: int = 2,
+        patch_disc_ndf:int = 32,
+        hf_top_channels: int = 64,
+        motion_ctx_channels: int = 64,
+        motion_token_dim: int = 144,
+        num_motion_tokens: int = 64,
+        motion_token_heads: int = 4,
+        hf_token_patch: int = 4,
+        edge_top_channels: int = 16,
+        latent_flow_hidden: int = 64,
+        warp_core_state: bool =True,
+        lambda_lat_feat: float = 0.5,
+        lambda_lat_distill:float = 0.5,
+        lambda_top_bottom_warp: float = 0.5,
+        beta_flow_agree: float = 0.1,
+        # --- LatentWarp on top z (LatentWarp paper-style) ---
+        lambda_z_lw: float = 0.5,          # weight of single top-z temporal consistency loss
+        lw_alpha: float = 5.0,             # residual penalty in keep score
+        lw_threshold: float = 0.6,         # keep threshold in keep score
+        lw_tau: float = 0.15,              # temperature for soft keep mask (smaller = sharper)
+        lw_blend: float = 1.0,             # 1.0=hard replace in kept regions; <1 keeps gradients
+        lw_hard_mask: bool = False,        # True -> hard (0/1) keep mask; False -> soft mask
+        lw_detach_flow: bool = True        # True -> LatentWarp does NOT backprop into flow nets
     ):
         super().__init__()
         # core dimensions
@@ -690,7 +760,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.sequence_length = sequence_length
         self.device = device
         self.dropout = dropout
-
+        
         # Hyperparameters
         self._lr = learning_rate
         self._grad_clip = grad_clip
@@ -705,12 +775,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # KL overshooting
         self.overshoot_mc_samples = 50
         self.overshoot_w_decay = 0.9
-        self.lambda_overshoot = 0.5
+        self.lambda_overshoot = 0.75
         self.warp_edge_tf_weight = 1.0
         self.warp_rgb_tf_weight = 1.0
-
+        self.flow_ctx_dim = int(flow_ctx_dim)
+        self.warp_mode = "bilinear"
         # rollout GAN attributes
-        self.global_step = 0
+        self.register_buffer("global_step", torch.zeros((), dtype=torch.long), persistent=True)
+
         self.rollout_adv_every = int(rollout_adv_every)
         self.rollout_context_frames = int(rollout_context_frames)
         self.rollout_horizon = int(rollout_horizon)
@@ -718,19 +790,47 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.rollout_top_temperature = float(rollout_top_temperature)
         self.rollout_decoder_temperature = float(rollout_decoder_temperature)
         self.rollout_decode_mode = str(rollout_decode_mode)
- 
+        self.hf_top_channels = hf_top_channels
+        self.motion_ctx_channels = motion_ctx_channels
+        self.motion_token_dim = motion_token_dim
+        self.num_motion_tokens = num_motion_tokens
+        self.motion_token_heads = motion_token_heads
+        self.hf_token_patch = hf_token_patch
+        self.edge_top_channels = edge_top_channels
+        self.latent_flow_hidden = latent_flow_hidden
+        self.beta_flow_agree = beta_flow_agree
+
+        self.warp_core_state = warp_core_state
+
+        self.extra_channels = (2 * hf_top_channels + motion_ctx_channels + edge_top_channels)
+
+        self.lambda_lat_feat = lambda_lat_feat
+        self.lambda_lat_distill = lambda_lat_distill
+        self.lambda_top_bottom_warp = float(lambda_top_bottom_warp)
+
+        # --- LatentWarp (top-z alignment) ---
+        self.lambda_z_lw = float(lambda_z_lw)
+        self.lw_alpha = float(lw_alpha)
+        self.lw_threshold = float(lw_threshold)
+        self.lw_tau = float(lw_tau)
+        self.lw_blend = float(lw_blend)
+        self.lw_hard_mask = bool(lw_hard_mask)
+        self.lw_detach_flow = bool(lw_detach_flow)
+
+
         # initialization different parts of the model
         self._init_encoder_decoder(max_components, prior_alpha, prior_beta)
-        self._init_vrnn_dynamics(use_orthogonal=use_orthogonal,number_lstm_layer=number_lstm_layer)
+        # default: allow up to one full top-grid width/height in pixels
+        self._init_vrnn_dynamics(use_orthogonal=use_orthogonal,number_lstm_layer=number_lstm_layer, extra_channels=self.extra_channels)
         self._init_discriminators(img_disc_layers, patch_size, num_heads=disc_num_heads)
-        self._init_motion_scaffold(hidden_flow_proj)
+        self._init_motion_scaffold()
+        self._init_latent_motion_conditioners() #should be after initialization of encoder, decoder
         #
         self.fb_w = 1.0
         self.tv_w = 1.0
         self.disagree_w = 1.0
         self.thr_e = 0.2
         self.dilate_k = 7
-        
 
         if use_dwa:
             self._init_DynamicWeightAverage(dwa_temperature)
@@ -755,13 +855,17 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "rollout_feat_match_loss",
                 "rollout_edge_loss",
                 "rollout_warp_edge_loss",
+                #"warp_sanity_total",
                 "warp_lb_loss",
                 "warp_tv_gate_loss",
                 "warp_disagree_loss",
                 "warp_edge_tf_loss",
                 "warp_rgb_tf_loss",
-                "overshoot_kl",           # 
-                "rollout_lpips_loss",     # 
+                "lat_feat",
+                "lat_distill",
+                #"lat_distill64",
+                "top_bottom_warp_consistency",
+                "overshoot_kl",           #
             ],
             temperature=temperature,
         )
@@ -771,228 +875,912 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         return torch.log(p) - torch.log1p(-p)
 
     @staticmethod
-    def warp_with_mode(image, flow, mode="bilinear"):
-        B,C,H,W = image.shape
-        yy, xx = torch.meshgrid(
-            torch.arange(H, device=image.device, dtype=image.dtype),
-            torch.arange(W, device=image.device, dtype=image.dtype),
-            indexing="ij"
+    def to01(x: torch.Tensor) -> torch.Tensor:
+        # Commonly observations are in [-1, 1]
+        return (x * 0.5 + 0.5).clamp(0.0, 1.0)
+
+    @staticmethod
+    def warp_with_mode(
+        img: torch.Tensor,
+        flow_pix: torch.Tensor,
+        mode: str = "bilinear",
+        padding_mode: str = "border",
+        align_corners: bool = True,
+    ) -> torch.Tensor:
+        """
+        Backward warp convention: sample img at base_coords + flow_pix (flow in pixel units).
+        """
+        if img.dim() != 4:
+            raise ValueError("img must be [B,C,H,W]")
+        if flow_pix.dim() != 4 or flow_pix.size(1) != 2:
+            raise ValueError("flow_pix must be [B,2,H,W]")
+
+        b, c, h, w = img.shape
+        base = coords_grid(b, h, w, device=img.device, dtype=img.dtype)  # [B,2,H,W] pixel coords
+        coords = base + flow_pix
+
+        x = 2.0 * (coords[:, 0] / (w - 1.0)) - 1.0
+        y = 2.0 * (coords[:, 1] / (h - 1.0)) - 1.0
+        grid = torch.stack([x, y], dim=-1)  # [B,H,W,2]
+
+        return F.grid_sample(img, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+
+    @staticmethod
+    def _length_sq(x: torch.Tensor) -> torch.Tensor:
+        return torch.sum(x * x, dim=1, keepdim=True)
+
+    @staticmethod
+    def _img_grads_gray(x_gray: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x_gray: [B,1,H,W]
+        dx = x_gray[..., :, 1:] - x_gray[..., :, :-1]
+        dy = x_gray[..., 1:, :] - x_gray[..., :-1, :]
+        dx = F.pad(dx, (0, 1, 0, 0))
+        dy = F.pad(dy, (0, 0, 0, 1))
+        return dx, dy
+
+    def _fb_occlusion_masks_from_pred(
+        self,
+        flow_fw: torch.Tensor,
+        flow_bw: torch.Tensor,
+        *,
+        alpha1: float = 0.01,
+        alpha2: float = 0.5,
+        padding_mode: str = "border",
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute occlusion masks via forward-backward check using predicted flows.
+        Returns occ_fw, occ_bw in {0,1}, shape [B,1,H,W] (1=occluded).
+        """
+        flow_bw_warped = self.warp_with_mode(flow_bw, flow_fw, mode="bilinear", padding_mode=padding_mode)
+        flow_fw_warped = self.warp_with_mode(flow_fw, flow_bw, mode="bilinear", padding_mode=padding_mode)
+
+        flow_diff_fw = flow_fw + flow_bw_warped
+        flow_diff_bw = flow_bw + flow_fw_warped
+
+        mag_sq_fw = self._length_sq(flow_fw) + self._length_sq(flow_bw_warped)
+        mag_sq_bw = self._length_sq(flow_bw) + self._length_sq(flow_fw_warped)
+
+        occ_thresh_fw = alpha1 * mag_sq_fw + alpha2
+        occ_thresh_bw = alpha1 * mag_sq_bw + alpha2
+
+        occ_fw = (self._length_sq(flow_diff_fw) > occ_thresh_fw).float()
+        occ_bw = (self._length_sq(flow_diff_bw) > occ_thresh_bw).float()
+        return occ_fw, occ_bw
+
+    # -----------------------------
+    # LatentWarp (top-z) helpers
+    # -----------------------------
+    def _pool_to_top(self, x: torch.Tensor, top_hw: tuple[int, int], *, mode: str = "avg") -> torch.Tensor:
+        """Pool a full-res [B,C,H,W] tensor down to [B,C,topH,topW] using integer ratio."""
+        topH, topW = int(top_hw[0]), int(top_hw[1])
+        H, W = int(x.shape[-2]), int(x.shape[-1])
+        assert (H % topH) == 0 and (W % topW) == 0, f"pool requires integer ratio: ({H},{W})->({topH},{topW})"
+        sy, sx = H // topH, W // topW
+        if mode == "avg":
+            return F.avg_pool2d(x, kernel_size=(sy, sx), stride=(sy, sx))
+        elif mode == "max":
+            return F.max_pool2d(x, kernel_size=(sy, sx), stride=(sy, sx))
+        else:
+            raise ValueError(f"Unknown pool mode: {mode}")
+
+    def _latentwarp_build_keep_top(
+        self,
+        *,
+        x_prev01: torch.Tensor,      # [B,3,H,W] in [0,1]
+        x_cur01: torch.Tensor,       # [B,3,H,W] in [0,1]
+        flow_fw: torch.Tensor,       # [B,2,H,W] prev->cur (pixel units)
+        flow_bw: torch.Tensor,       # [B,2,H,W] cur->prev (pixel units)
+        top_hw: tuple[int, int],     # (topH, topW)
+        mask_t: torch.Tensor,        # [B]
+        padding_mode: str = "border",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """LatentWarp keep mask (paper-style): keep = sigmoid((vis - alpha*resid - thr)/tau).
+        Returns:
+          flow_bw_top: [B,2,topH,topW] in *top-grid* pixel units
+          keep_top:    [B,1,topH,topW] in [0,1] (soft or hard depending on lw_hard_mask)
+        """
+        if self.lw_detach_flow:
+            flow_fw = flow_fw.detach()
+            flow_bw = flow_bw.detach()
+
+        # forward-backward occlusion (1=occluded)
+        occ_fw, occ_bw = self._fb_occlusion_masks_from_pred(
+            flow_fw, flow_bw,
+            alpha1=float(self.flow_cfg.fb_alpha1) if self.flow_cfg is not None else 0.01,
+            alpha2=float(self.flow_cfg.fb_alpha2) if self.flow_cfg is not None else 0.5,
+            padding_mode=padding_mode,
         )
-        base = torch.stack([xx,yy], dim=0).unsqueeze(0).expand(B,2,H,W)
-        vgrid = base + flow
+        vis = (1.0 - occ_bw).clamp(0.0, 1.0)  # [B,1,H,W]
 
-        vgrid_x = 2.0 * vgrid[:,0] / max(W-1,1) - 1.0
-        vgrid_y = 2.0 * vgrid[:,1] / max(H-1,1) - 1.0
-        grid = torch.stack([vgrid_x, vgrid_y], dim=-1)
+        # residual: warp prev frame into current coords using backward flow
+        x_prev_in_cur = self.warp_with_mode(
+            x_prev01, flow_bw,
+            mode="bilinear",
+            padding_mode=padding_mode,
+        )
+        resid = (x_prev_in_cur - x_cur01).abs().mean(dim=1, keepdim=True)  # [B,1,H,W]
 
-        return F.grid_sample(image, grid, mode=mode, padding_mode="zeros", align_corners=True)
+        # score -> pooled to top grid
+        score = vis - (self.lw_alpha * resid)
+        score_top = self._pool_to_top(score, top_hw, mode="avg")
+
+        # keep mask (soft by default)
+        keep_top = torch.sigmoid((score_top - self.lw_threshold) / max(self.lw_tau, 1e-6))
+        if self.lw_hard_mask:
+            keep_top = (keep_top > 0.5).to(dtype=keep_top.dtype)
+
+        # episode boundary mask
+        B = keep_top.shape[0]
+        keep_top = keep_top * mask_t.view(B, 1, 1, 1).to(dtype=keep_top.dtype, device=keep_top.device)
+
+        # downsample flow to top grid (with correct unit conversion)
+        flow_bw_top = downsample_flow(flow_bw, (int(top_hw[0]), int(top_hw[1])))
+        return flow_bw_top, keep_top
+
+    def _latentwarp_align_top_z(
+        self,
+        *,
+        z_cur: torch.Tensor,         # [B,C,topH,topW]
+        z_prev: torch.Tensor,        # [B,C,topH,topW] (typically detached)
+        flow_bw_top: torch.Tensor,   # [B,2,topH,topW]
+        keep_top: torch.Tensor,      # [B,1,topH,topW] in [0,1]
+    ) -> torch.Tensor:
+        """Align previous top-z into current coords and blend (LatentWarp-style)."""
+        z_prev_w = self.warp_with_mode(
+            z_prev, flow_bw_top,
+            mode="bilinear",
+            padding_mode="border",
+        )
+        # residual blend form keeps gradients on z_cur even if keep_top=1 when lw_blend<1
+        return z_cur + (self.lw_blend * keep_top) * (z_prev_w - z_cur)
 
 
     def _coords_to_flow_pix(self, coords: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = coords.shape
+        base = coords_grid(b, h, w, device=coords.device, dtype=coords.dtype)
+        return coords - base
+
+    def _latent_motion_step(
+        self,
+        *,
+        temporal_state: dict,
+        h_context_map: torch.Tensor,
+        motion_tokens: torch.Tensor,
+        y_warp_in: torch.Tensor,
+        a_in: torch.Tensor,
+        a_fwd: torch.Tensor = None,
+        flow_teacher_fw_64: torch.Tensor = None,
+        edge_fullres: torch.Tensor = None,
+        mask_t: torch.Tensor = None,
+        step: int = 0,
+        h64_override: torch.Tensor = None,
+    ):
+        """Build the canonical 64->tokens->top bridge at one timestep.
+
+        Returns:
+          hf_top_map      : [B,Chf,topH,topW]
+          motion_ctx_map  : [B,Cmot,topH,topW]
+          flow_lat        : [B,2,topH,topW]   (top-grid pixels)
+          y_warp_next     : [B,Chf,topH,topW] (forward-splat hf_top_map with flow_lat)
+          motion_tokens   : [B,N,D]
+          extra_maps      : list of feature maps (constant channels)
+          stats           : dict of scalars for logging
         """
-        coords_norm: [B,2,H,W] in [-1,1] (like flow_predict outputs)
-        returns flow_pix: [B,2,H,W] in pixel units (dx,dy)
+        if a_fwd is None:
+            a_fwd = a_in
+
+        B = h_context_map.size(0)
+        # Reset motion tokens on episode boundaries (mask_t==0)
+        if mask_t is not None:
+            if mask_t.dim() == 2 and mask_t.shape[1] == 1:
+                m = mask_t
+            elif mask_t.dim() == 1:
+                m = mask_t[:, None]
+            else:
+                raise ValueError(f"mask_t must be [B] or [B,1], got {tuple(mask_t.shape)}")
+            
+            keep = m.to(device=motion_tokens.device, dtype=motion_tokens.dtype).view(B, 1, 1)
+            base = self.motion_tokens_base.expand(B, -1, -1)
+            motion_tokens = motion_tokens * keep + base * (1.0 - keep)
+
+        topH, topW = self.top_H, self.top_W
+
+        # 1) Get 64 features from temporal state (or override for rollout/overshoot parity)
+        if h64_override is not None:
+            h64_t = h64_override
+        else:
+            h64_t = temporal_state["64"][0]  # [B,C64,64,64]
+        assert h64_t.ndim == 4 and h64_t.shape[-2:] == (64, 64), f"expected h64 [B,C,64,64], got {tuple(h64_t.shape)}"
+
+        # 2) Project HF -> top grid
+        hf_top_map = self.hf_to_top(h64_t)
+        # 3) Tokenize current HF (grid tokens)
+        hf_tokens, token_hw, _xy_tok = self.hf_tokenizer(h64_t)
+
+        Ht, Wt = token_hw
+        assert (Ht, Wt) == (64 // self.hf_token_patch, 64 // self.hf_token_patch), \
+            (token_hw, self.hf_token_patch)
+
+        # 4) Displacement prior from teacher flow (prev->cur) in 64-grid pixels
+        dest_xy_prior = None
+        if flow_teacher_fw_64 is not None:
+            if flow_teacher_fw_64.shape[-2:] != (64, 64):
+                Htch, Wtch = flow_teacher_fw_64.shape[-2:]
+                assert Htch >= 64 and Wtch >= 64 and (Htch % 64 == 0) and (Wtch % 64 == 0), \
+                    f"teacher flow must be >=64 and divisible to downsample, got {(Htch, Wtch)}"
+                flow_teacher_fw_64 = downsample_flow(flow_teacher_fw_64, (64, 64))
+
+            dest_xy_prior, _, _ = self._token_dest_from_flow(flow_teacher_fw_64, token_hw, self.hf_token_patch)
+        # 5) Transport tokens with prior bias 
+        motion_tokens = self.token_transporter(motion_tokens, hf_tokens, dest_xy_prior=dest_xy_prior, token_hw=token_hw)
+        # 6) Tokens -> top map
+        motion_ctx_map = self.tokens_to_top(motion_tokens)
+        assert motion_ctx_map.shape[-2:] == (topH, topW), (motion_ctx_map.shape, (topH, topW))
+
+        # 7) Edge top map (or zeros)
+        if edge_fullres is None:
+            # t=0 / reset / edge disabled upstream: keep shapes consistent
+            edge_top = h64_t.new_zeros((B, self.edge_top_channels, topH, topW))
+
+        else:
+            if edge_fullres.shape[1] == 1:
+                edge_in = edge_fullres
+            elif edge_fullres.shape[-1] == 1:
+                edge_in = edge_fullres.permute(0, 3, 1, 2).contiguous()
+            else:
+                raise ValueError(f"edge_fullres channel mismatch, expected 1ch, got {tuple(edge_fullres.shape)}")
+
+            # Optional but usually correct: zero out edges for reset items in the batch
+            if mask_t is not None:
+                if mask_t.dim() == 1:
+                    vm = mask_t.view(B, 1, 1, 1).to(dtype=edge_in.dtype, device=edge_in.device)
+                else:
+                    # if mask_t is already spatial or broadcastable
+                    vm = mask_t.to(dtype=edge_in.dtype, device=edge_in.device)
+                edge_in = edge_in * vm
+
+            edge_in = edge_in.to(device=h64_t.device, dtype=h64_t.dtype)
+            edge_top = self.edge_to_top(edge_in) #(B, self.edge_top_channels, topH, topW)
+
+        # 8) Predict latent top flow (current->next) and warp HF for next-step input
+        a_fwd_map = a_fwd.view(B, -1, 1, 1).expand(B, -1, topH, topW)
+        flow_lat = self.latent_flow_head(hf_top_map, motion_ctx_map, a_fwd_map, edge_top)  # [B,2,topH,topW]
+        y_warp_next, _den = self.forward_splat_bilinear(hf_top_map, flow_lat)
+
+        # 9) Build extra maps (constant list)
+        extra_maps = [y_warp_in, hf_top_map, motion_ctx_map, edge_top]
+
+        # stats
+        with torch.no_grad():
+            mag = flow_lat.square().sum(dim=1).sqrt().mean()
+        stats = {"flow_mag": mag}
+
+        return hf_top_map, motion_ctx_map, flow_lat, y_warp_next, motion_tokens, extra_maps, stats
+
+    def _token_dest_from_flow(
+        self,
+        flow_teacher_fw: torch.Tensor,  # [B,2,64,64] pixel units
+        token_hw: tuple,
+        patch: int,
+    ):
         """
-        B, _, H, W = coords.shape
-        c0 = coords_grid(B, H, W, device=coords.device, dtype=coords.dtype)  
-        return coords - c0
+        Per-token displacement prior from teacher flow using NEAREST pixel lookup.
+        Returns:
+        dest_xy_prior [B,N,2] in token units (float)
+        dest_idx      [B,N]   long (rounded/clamped)
+        valid         [B,N]   bool (in-bounds before clamp)
+        """
+        B, _, H, W = flow_teacher_fw.shape
+        Ht, Wt = int(token_hw[0]), int(token_hw[1])
+        N = Ht * Wt
+        assert Ht * patch == H and Wt * patch == W, (H, W, Ht, Wt, patch)
+
+        device = flow_teacher_fw.device
+        # token grid coords
+        xs = torch.arange(Wt, device=device, dtype=torch.float32)
+        ys = torch.arange(Ht, device=device, dtype=torch.float32)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        x_tok = xx.reshape(-1)  # [N]
+        y_tok = yy.reshape(-1)
+
+        # pixel centers (nearest lookup)
+        cx = (x_tok * patch + (patch // 2)).round().long().clamp(0, W - 1)  # [N]
+        cy = (y_tok * patch + (patch // 2)).round().long().clamp(0, H - 1)
+
+        # gather flow at centers: [B,N]
+        fu = flow_teacher_fw[:, 0, cy, cx]  # advanced indexing, no interpolation
+        fv = flow_teacher_fw[:, 1, cy, cx]
+
+        # dest in token units (float)
+        dest_x = x_tok.view(1, N) + fu / float(patch)
+        dest_y = y_tok.view(1, N) + fv / float(patch)
+        dest_xy = torch.stack([dest_x, dest_y], dim=-1)  # [B,N,2]
+
+        # rounded index target
+        dxr = torch.round(dest_x).long()
+        dyr = torch.round(dest_y).long()
+
+        valid = (dxr >= 0) & (dxr < Wt) & (dyr >= 0) & (dyr < Ht)
+        dxr = dxr.clamp(0, Wt - 1)
+        dyr = dyr.clamp(0, Ht - 1)
+        dest_idx = dyr * Wt + dxr  # [B,N]
+        return dest_xy, dest_idx, valid
+
+    def _maybe_ckpt(self, fn, *args):
+        if self.use_ctx_checkpoint and self.training:
+            return ckpt(fn, *args, use_reentrant=False)
+        return fn(*args)
 
     def _predict_flow_one_step(
         self,
-        x01: torch.Tensor,       # [B,3,H,W] in [0,1]
-        e: torch.Tensor,         # [B,1,H,W] in [0,1]
-        ctx: torch.Tensor,       # [B,ctx_dim,H,W]
-        a_t: torch.Tensor,       # [B,action_dim]
-        state: torch.Tensor,     # [B,128,H,W]
+        *,
+        x01: torch.Tensor,
+        e: torch.Tensor,
+        ctx: torch.Tensor,
+        a_t: torch.Tensor,
+        state: torch.Tensor,
         first: bool,
-        direction: str= "fw",          # "fw" or "bw"
-    ):
+        direction: str,
+        x2: Optional[torch.Tensor] = None,
+        e2: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict flow in pixel units.
+
+        Training (teacher-forced): pass x2/e2 explicitly (pairwise).
+        Rollout: one can omit x2/e2 (defaults to x01/e).
+        """
+        if x2 is None:
+            x2 = x01
+        if e2 is None:
+            e2 = e
 
         if direction == "fw":
             feat_net = self.flow_feat_net_fw
             enc = self.flow_enc_fw
-            dec = self.flow_dec_fw
             dec_in = self.flow_dec_in_fw
-        else:
+            dec = self.flow_dec_fw
+        elif direction == "bw":
             feat_net = self.flow_feat_net_bw
             enc = self.flow_enc_bw
-            dec = self.flow_dec_bw
             dec_in = self.flow_dec_in_bw
-        def _run(x01, e, ctx, a_t, state):
-            flow_feat = feat_net(torch.cat([x01, e, ctx], dim=1))     # [B,64,H,W]
-            state_out = enc(state, flow_feat, flag=first, action=a_t) # [B,128,H,W]
-            dec_feat  = dec_in(state_out)                             # [B,128,H,W]
-            coords_list = dec(dec_feat, action=a_t)["f_flows"]         # list of [B,2,H,W]
-            flow_pix = self._coords_to_flow_pix(coords_list[-1])       # [B,2,H,W]
-            return flow_pix, state_out
-        if self.use_ctx_checkpoint and self.training and torch.is_grad_enabled() and (x01.requires_grad or e.requires_grad or ctx.requires_grad or a_t.requires_grad or state.requires_grad):
-            flow_pix, state = ckpt(_run, x01, e, ctx, a_t, state, use_reentrant=False)
+            dec = self.flow_dec_bw
         else:
-            flow_pix, state = _run(x01, e, ctx, a_t, state)
-        return flow_pix, state
+            raise ValueError(direction)
 
-    def forward_splat_nearest(self, src, flow):
-        """
-        src:  [B,C,H,W]
-        flow: [B,2,H,W] in pixel units, mapping src coords -> target coords (forward splat)
-        returns:
-        out:   [B,C,H,W] (averaged when collisions happen)
-        denom: [B,1,H,W] (counts)
-        """
-        B, C, H, W = src.shape
-        device = src.device
-        dtype  = src.dtype
+        def _feat(x01_, x2_, e1_, e2_, ctx_):
+            return feat_net(torch.cat([x01_, x2_, e1_, e2_, ctx_], dim=1))
+        def _dec_in(x):
+            return dec_in(x)
 
-        yy, xx = torch.meshgrid(
-            torch.arange(H, device=device, dtype=dtype),
-            torch.arange(W, device=device, dtype=dtype),
-            indexing="ij",
+        def _core(x01_, x2_, e1_, e2_, ctx_, a_t_, state_, first_):
+            flow_feat = self._maybe_ckpt(_feat, x01_, x2_, e1_, e2_, ctx_)
+            state_out = enc(state_, flow_feat, flag=first_, action=a_t_)
+            dec_feat = self._maybe_ckpt(_dec_in, state_out)
+            coords_list = dec(dec_feat, action=a_t_)["f_flows"]
+            flow_pix = self._coords_to_flow_pix(coords_list[-1])
+            return flow_pix, state_out
+
+        # checkpoint knob
+        flow_pix, state_out = _core(x01, x2, e, e2, ctx, a_t, state, first)
+
+        return flow_pix, state_out
+
+
+    def _predict_vis_and_residual(
+        self,
+        *,
+        x_cur01: torch.Tensor,
+        x_cur_to_prev: torch.Tensor,
+        rgb_err: torch.Tensor,
+        e_prev: torch.Tensor,
+        e_cur_to_prev: torch.Tensor,
+        flow_fw: torch.Tensor,
+        out_fw: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict:
+        v_pred: [B,1,H,W] in [0,1] (warp validity)
+        r_pred: [B,3,H,W] in [0,1] (inpaint RGB)
+        """
+        feat = torch.cat(
+            [
+                x_cur01.detach(),
+                x_cur_to_prev.detach(),
+                rgb_err.detach(),
+                e_prev.detach(),
+                e_cur_to_prev.detach(),
+                flow_fw.detach(),
+                out_fw.detach(),
+            ],
+            dim=1,
         )
-        xx = xx[None, None].expand(B, -1, -1, -1)  # [B,1,H,W]
-        yy = yy[None, None].expand(B, -1, -1, -1)
+        h = self._maybe_ckpt(self.inpaint_trunk, feat)
 
-        x_t = xx + flow[:, 0:1]
-        y_t = yy + flow[:, 1:2]
+        v_pred = torch.sigmoid(self.vis_head(h))
+        r_pred = torch.sigmoid(self.rgb_head(h))
+        return v_pred, r_pred
 
-        x_n = torch.round(x_t).long()
-        y_n = torch.round(y_t).long()
 
-        valid = (x_n >= 0) & (x_n < W) & (y_n >= 0) & (y_n < H)
-        idx = (y_n * W + x_n).view(B, 1, H * W)  # [B,1,HW]
-
-        src_flat = src.view(B, C, H * W)
-        out_flat = torch.zeros(B, C, H * W, device=device, dtype=dtype)
-        den_flat = torch.zeros(B, 1, H * W, device=device, dtype=dtype)
-
-        # scatter add where valid
-        valid_flat = valid.view(B, 1, H * W)
-        idx_safe = idx.clone()
-        idx_safe[~valid_flat] = 0
-
-        out_flat.scatter_add_(2, idx_safe.expand(-1, C, -1), src_flat * valid_flat.to(dtype))
-        den_flat.scatter_add_(2, idx_safe, valid_flat.to(dtype))
-
-        den = den_flat.view(B, 1, H, W)
-        out = out_flat.view(B, C, H, W) / (den.clamp_min(1.0))
-
-        return out, den
-
-    def forward_splat_bilinear(self, x: torch.Tensor, flow: torch.Tensor):
+    def _compute_flow_warp_losses_pair01(
+        self,
+        *,
+        x_prev01: torch.Tensor,     # [B,3,H,W] in [0,1]
+        x_cur01: torch.Tensor,      # [B,3,H,W] in [0,1]
+        a_t: torch.Tensor,          # [B,action_dim]
+        ctx_map: torch.Tensor,      # [B,ctx_dim,H,W]
+        flow_state_fw: torch.Tensor,
+        flow_state_bw: torch.Tensor,
+        first: bool,
+        step: int,
+        mask_t: Optional[torch.Tensor] = None,  # [B] or [B,1,1,1] ok
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Forward-splat x using forward flow (defined on source pixels).
-        x:    [B,C,H,W]
-        flow: [B,2,H,W] in pixels, mapping source -> destination
-        returns:
-        y:     [B,C,H,W]
-        denom: [B,1,H,W] accumulated weights (useful for debugging)
-        Note: indices are piecewise-constant wrt flow (fine for rollout guidance).
-        """
-        B, C, H, W = x.shape
-        device, dtype = x.device, x.dtype
-        N = H * W
+        Exact loss stack from flow_warp_sanity.py, adapted to this class.
 
-        yy, xx = torch.meshgrid(
-            torch.arange(H, device=device, dtype=dtype),
-            torch.arange(W, device=device, dtype=dtype),
-            indexing="ij",
+        Returns:
+        total_loss,
+        stats (tensors),
+        extras (tensors),
+        flow_fw, flow_bw,
+        flow_state_fw, flow_state_bw
+        """
+        cfg = self.flow_cfg
+        B, _, H, W = x_prev01.shape
+        dtype = x_prev01.dtype
+        device = x_prev01.device
+
+        # vm mask
+        if mask_t is None:
+            vm = torch.ones((B, 1, H, W), device=device, dtype=dtype)
+        else:
+            vm = mask_t
+            if vm.ndim == 1:
+                vm = vm[:, None, None, None]
+            if vm.shape[-2:] != (H, W):
+                vm = vm.expand(B, 1, H, W)
+            vm = vm.to(dtype=dtype)
+
+        # edges (normalize per-sample)
+        e_prev = self.canny(x_prev01.float()).float()
+        e_cur  = self.canny(x_cur01.float()).float()
+        e_prev = e_prev / (e_prev.amax(dim=(-2, -1), keepdim=True) + cfg.eps)
+        e_cur  = e_cur  / (e_cur.amax(dim=(-2, -1), keepdim=True) + cfg.eps)
+        e_prev = e_prev.to(dtype)
+        e_cur  = e_cur.to(dtype)
+
+        # flows
+        flow_fw, flow_state_fw = self._predict_flow_one_step(
+            x01=x_prev01, x2=x_cur01,
+            e=e_prev, e2=e_cur,
+            ctx=ctx_map, a_t=a_t,
+            state=flow_state_fw, first=first, direction="fw"
         )
-        base = torch.stack([xx, yy], dim=0).unsqueeze(0).expand(B, 2, H, W)  # [B,2,H,W]
-        dest = base + flow  # [B,2,H,W]
-
-        x_dst = dest[:, 0].view(B, N)
-        y_dst = dest[:, 1].view(B, N)
-
-        x0 = torch.floor(x_dst)
-        y0 = torch.floor(y_dst)
-        x1 = x0 + 1
-        y1 = y0 + 1
-
-        wx1 = (x_dst - x0).clamp(0, 1)
-        wy1 = (y_dst - y0).clamp(0, 1)
-        wx0 = 1.0 - wx1
-        wy0 = 1.0 - wy1
-
-        def splat_at(ix, iy, w):
-            # valid mask
-            valid = (ix >= 0) & (ix <= (W - 1)) & (iy >= 0) & (iy <= (H - 1))
-            ix = ix.clamp(0, W - 1).long()
-            iy = iy.clamp(0, H - 1).long()
-            w = w * valid.to(w.dtype)
-
-            idx = (iy * W + ix).view(B, N)  # [B,N]
-            idxC = idx.unsqueeze(1).expand(B, C, N)  # [B,C,N]
-            wC = w.unsqueeze(1)                      # [B,1,N]
-
-            return idxC, wC
-
-        x_flat = x.view(B, C, N)
-
-        out = torch.zeros(B, C, N, device=device, dtype=dtype)
-        denom = torch.zeros(B, 1, N, device=device, dtype=dtype)
-
-        for ix, iy, w in [
-            (x0, y0, wx0 * wy0),
-            (x1, y0, wx1 * wy0),
-            (x0, y1, wx0 * wy1),
-            (x1, y1, wx1 * wy1),
-        ]:
-            idxC, wC = splat_at(ix, iy, w)
-            out.scatter_add_(2, idxC, x_flat * wC)
-            denom.scatter_add_(2, idxC[:, :1], wC)
-
-        out = out / (denom + self.eps)
-        return out.view(B, C, H, W), denom.view(B, 1, H, W)
-
-    def _init_motion_scaffold(self, flow_proj:int=64):
-        """
-        description:the flow GRU is predictive (uses previous frame + ctx + action), 
-        so it can run in rollout mode when there is no access to true future frames
-        """
-        # 1) differentiable canny (returns continuous thin edges)
-        self.canny = CannyFilter(k_gaussian=3, sigma=1.5, use_cuda=(self.device.type == "cuda"))
-        
-        for p in self.canny.parameters():  # redundant but explicit
-            p.requires_grad_(False)
-        # 2) compress h_context so we can broadcast it spatially (keeps channels reasonable)
-        self.flow_ctx_dim = flow_proj
-        width64 = int(self.vdvae.decoder.widths[64])
-        
-        self.flow_ctx_proj = nn.Sequential(
-             nn.Conv2d(width64, self.flow_ctx_dim, 1, bias=False),
-             nn.GroupNorm(8, self.flow_ctx_dim, eps=self.eps),
-             nn.SiLU(),
+        flow_bw, flow_state_bw = self._predict_flow_one_step(
+            x01=x_cur01, x2=x_prev01,
+            e=e_cur, e2=e_prev,
+            ctx=ctx_map, a_t=a_t,
+            state=flow_state_bw, first=first, direction="bw"
         )
-        flow_in_dim = self.input_channels + 1 + self.flow_ctx_dim
-        def make_feat_net():
-            return nn.Sequential(
-                nn.Conv2d(flow_in_dim, 64, kernel_size=3, stride=1, padding=1),
-                nn.GroupNorm(8, 64, eps=self.eps),
-                nn.SiLU(),
-                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-                nn.GroupNorm(8, 64, eps=self.eps),
-                nn.SiLU(),
+
+        flow_fw = flow_fw * vm
+        flow_bw = flow_bw * vm
+
+        # backward warp x_cur -> x_prev (using flow_fw prev->cur)
+        x_cur_to_prev = self.warp_with_mode(
+            x_cur01, flow_fw, mode=cfg.rgb_warp_mode, padding_mode=cfg.warp_padding_mode
+        )
+        e_cur_to_prev = self.warp_with_mode(
+            e_cur, flow_fw, mode=cfg.edge_warp_mode, padding_mode=cfg.warp_padding_mode
+        )
+
+        # in-bounds mask
+        out_fw = create_outgoing_mask(flow_fw) * vm
+        m_valid = out_fw.float()
+
+        # occlusion after warmup
+        occ_fw = torch.zeros_like(m_valid)
+        occ_bw = torch.zeros_like(m_valid)
+        if step >= cfg.fb_warmup_steps:
+            occ_fw, occ_bw = self._fb_occlusion_masks_from_pred(
+                flow_fw, flow_bw,
+                alpha1=cfg.fb_alpha1,
+                alpha2=cfg.fb_alpha2,
+                padding_mode=cfg.warp_padding_mode,
             )
 
-        # Forward flow modules (t-1 -> t)
-        self.flow_feat_net_fw = make_feat_net()
-        self.flow_enc_fw = get_gru_encoder(action_dim=self.action_dim)          # -> state [B,128,H,W]
-        self.flow_dec_fw = get_gru_decoder(future_len=1, action_dim=self.action_dim)
-        self.flow_dec_in_fw = nn.Conv2d(128, 128, kernel_size=1)
+        # pseudo-target visibility
+        v_target = (m_valid * (1.0 - occ_fw)).clamp(0.0, 1.0).detach()
+        m_sup = v_target
 
-        # Backward flow modules (t -> t-1) for fb-consistency loss (training-time regularizer)
-        self.flow_feat_net_bw = make_feat_net()
-        self.flow_enc_bw = get_gru_encoder(action_dim=self.action_dim)
-        self.flow_dec_bw = get_gru_decoder(future_len=1, action_dim=self.action_dim)
-        self.flow_dec_in_bw = nn.Conv2d(128, 128, kernel_size=1)
+        # census loss (masked)
+        ims = x_prev01.float().unsqueeze(1)                            # [B,1,3,H,W]
+        ims_warp = x_cur_to_prev.float().unsqueeze(1).unsqueeze(2)     # [B,1,1,3,H,W]
+        mask_c = m_sup.float().unsqueeze(1).unsqueeze(2)               # [B,1,1,1,H,W]
+        census_loss = self.census_loss(ims, ims_warp, mask_c).to(dtype)
 
-        # losses from warp.py
-        self.fb_loss_fn = fbLoss
-        self.edge_loss_fn = edgeLoss
+        # gradient loss (masked)
+        g_prev = rgb2gray(x_prev01.float()).to(dtype)                  # [B,1,H,W]
+        g_warp = rgb2gray(x_cur_to_prev.float()).to(dtype)
+        dx1, dy1 = self._img_grads_gray(g_prev)
+        dx2, dy2 = self._img_grads_gray(g_warp)
+        grad_loss = 0.5 * (
+            charbonnier_loss(dx2 - dx1, mask=m_sup, beta=1.0, epsilon=cfg.charbonnier_eps) +
+            charbonnier_loss(dy2 - dy1, mask=m_sup, beta=1.0, epsilon=cfg.charbonnier_eps)
+        )
+
+        # edge/photo losses (masked)
+        edge_w = torch.sigmoid((e_prev - cfg.thr_e) / max(cfg.edge_temp, 1e-6)).to(dtype)
+        edge_w = edge_w * vm
+        weights = (0.2 + 0.8 * edge_w).clamp(min=0.0)
+        weights_valid = weights * m_sup
+
+        edge_loss = charbonnier_loss(
+            e_cur_to_prev - e_prev,
+            mask=weights_valid,
+            beta=1.0,
+            epsilon=cfg.charbonnier_eps,
+        )
+        photo_diff = (x_cur_to_prev - x_prev01)
+        photo_loss = charbonnier_loss(
+            photo_diff,
+            mask=weights_valid.expand(-1, 3, -1, -1),
+            beta=1.0,
+            epsilon=cfg.charbonnier_eps,
+        )
+
+        # visibility + residual branch
+        rgb_err = photo_diff.abs().mean(dim=1, keepdim=True)
+        v_pred, r_pred = self._predict_vis_and_residual(
+            x_cur01=x_cur01,
+            x_cur_to_prev=x_cur_to_prev,
+            rgb_err=rgb_err,
+            e_prev=e_prev,
+            e_cur_to_prev=e_cur_to_prev,
+            flow_fw=flow_fw,
+            out_fw=m_valid,
+        )
+
+        # visibility BCE with imbalance
+        bce = F.binary_cross_entropy(v_pred, v_target, reduction="none")
+        w_vis_pix = v_target * 1.0 + (1.0 - v_target) * cfg.vis_neg_weight
+        vis_w = w_vis_pix * vm  # vm is [B,1,1,1] broadcastable
+        vis_loss = (bce * vis_w).sum() / (vis_w.sum() + self.eps)
+
+        # scheduled sampling blend
+        use_target = (step < cfg.blend_use_target_steps)
+        v_blend = v_target if use_target else v_pred
+
+        warp_det = x_cur_to_prev.detach()
+        x_hat_prev_infer = v_pred * warp_det + (1.0 - v_pred) * r_pred
+        x_hat_prev_train = v_blend * warp_det + (1.0 - v_blend) * r_pred
+
+        # inpaint only where invalid
+        invalid = (1.0 - v_target) * vm
+        inpaint_photo_loss = charbonnier_loss(
+            r_pred - x_prev01,
+            mask=invalid.expand(-1, 3, -1, -1),
+            beta=1.0,
+            epsilon=cfg.charbonnier_eps,
+        )
+
+        # suppress hallucination where valid
+        valid = v_target * vm
+        res_suppress_loss = charbonnier_loss(
+            r_pred - warp_det,
+            mask=valid.expand(-1, 3, -1, -1),
+            beta=1.0,
+            epsilon=cfg.charbonnier_eps,
+        )
+
+        vis_area_loss = (v_pred * vm).sum() / (vm.sum() + self.eps)
+
+        # TV smoothness
+        tv_loss = self.flow_tv_loss_fn(flow_fw) + self.flow_tv_loss_fn(flow_bw)
+
+        # optional FB consistency after warmup
+        fb_flow_loss = torch.zeros((), device=device, dtype=dtype)
+        fb_photo_loss = torch.zeros((), device=device, dtype=dtype)
+        fb_enabled = (step >= cfg.fb_warmup_steps) and (cfg.w_fb > 0.0 or cfg.w_fb_photo > 0.0)
+
+        if fb_enabled:
+            mask_fw = create_outgoing_mask(flow_fw) * (1.0 - occ_fw) * vm
+            mask_bw = create_outgoing_mask(flow_bw) * (1.0 - occ_bw) * vm
+
+            flow_bw_warped = self.warp_with_mode(flow_bw, flow_fw, mode="bilinear", padding_mode=cfg.warp_padding_mode)
+            flow_fw_warped = self.warp_with_mode(flow_fw, flow_bw, mode="bilinear", padding_mode=cfg.warp_padding_mode)
+
+            fb_flow_loss = 0.5 * (
+                charbonnier_loss(flow_fw + flow_bw_warped, mask=mask_fw, beta=1.0, epsilon=cfg.charbonnier_eps) +
+                charbonnier_loss(flow_bw + flow_fw_warped, mask=mask_bw, beta=1.0, epsilon=cfg.charbonnier_eps)
+            )
+
+            if cfg.w_fb_photo > 0.0:
+                x2_to_1 = self.warp_with_mode(x_cur01, flow_fw, mode="bilinear", padding_mode=cfg.warp_padding_mode)
+                x1_to_2 = self.warp_with_mode(x_prev01, flow_bw, mode="bilinear", padding_mode=cfg.warp_padding_mode)
+                fb_photo_loss = 0.5 * (
+                    charbonnier_loss(x_prev01 - x2_to_1, mask=mask_fw.expand(-1, 3, -1, -1), beta=1.0, epsilon=cfg.charbonnier_eps) +
+                    charbonnier_loss(x_cur01 - x1_to_2,   mask=mask_bw.expand(-1, 3, -1, -1), beta=1.0, epsilon=cfg.charbonnier_eps)
+                )
+
+        total_loss = (
+            cfg.w_edge * edge_loss +
+            cfg.w_photo * photo_loss +
+            cfg.w_vis * vis_loss +
+            cfg.w_inpaint_photo * inpaint_photo_loss +
+            cfg.w_res_suppress * res_suppress_loss +
+            cfg.w_vis_area * vis_area_loss +
+            cfg.w_tv * tv_loss +
+            cfg.w_fb * fb_flow_loss +
+            cfg.w_fb_photo * fb_photo_loss +
+            cfg.w_census * census_loss +
+            cfg.w_grad * grad_loss
+        )
+
+        stats = {
+            "warp_photo": photo_loss.detach(),
+            "warp_edge": edge_loss.detach(),
+            "warp_tv": tv_loss.detach(),
+            "warp_census": census_loss.detach(),
+            "warp_grad": grad_loss.detach(),
+            "warp_vis": vis_loss.detach(),
+            "warp_inpaint_photo": inpaint_photo_loss.detach(),
+            "warp_res_suppress": res_suppress_loss.detach(),
+            "warp_fb_flow": fb_flow_loss.detach(),
+            "warp_fb_photo": fb_photo_loss.detach(),
+            "warp_v_target_mean": v_target.mean().detach(),
+            "warp_v_pred_mean": v_pred.mean().detach(),
+            "warp_use_target_blend": torch.tensor(int(use_target), device=device),
+            "warp_fb_enabled": torch.tensor(int(fb_enabled), device=device),
+        }
+
+        extras = {
+            "x_cur_to_prev": x_cur_to_prev.detach(),
+            "x_hat_prev": x_hat_prev_infer.detach(),
+            "x_hat_prev_train": x_hat_prev_train.detach(),
+            "flow_fw": flow_fw.detach(),
+            "flow_bw": flow_bw.detach(),
+            "v_target": v_target.detach(),
+            "v_pred": v_pred.detach(),
+            "r_pred": r_pred.detach(),
+            "out_fw": out_fw.detach(),
+        }
+
+        return total_loss, stats, extras, flow_fw, flow_bw, flow_state_fw, flow_state_bw
+
+    def forward_splat_bilinear(
+        self,
+        x: torch.Tensor,
+        flow: torch.Tensor,
+        metric: torch.Tensor | None = None,
+        *,
+        radius: float = 1.0,
+        normalize: bool = True,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Robust differentiable forward splat (optional soft-splat + optional tent radius).
+
+        Args:
+        x:      [B,C,H,W] source features
+        flow:   [B,2,H,W] forward flow (dx,dy) in pixel units, source->dest
+        metric: [B,1,H,W] optional log-importance; soft-splat uses exp(clamped(metric))
+        radius: 1.0 -> standard bilinear (4 corners)
+                >1.0 -> separable 2D tent kernel over (2*ceil(radius)+1)^2 neighborhood
+
+        Returns:
+        out:   [B,C,H,W] (normalized if normalize=True)
+        denom: [B,1,H,W] accumulated mass / importance mass (float32)
+        """
+        assert x.ndim == 4 and flow.ndim == 4 and flow.size(1) == 2
+        B, C, H, W = x.shape
+        N = H * W
+        device = x.device
+
+        # Accumulate in fp32 for stability even under AMP/bf16.
+        acc_dtype = torch.float32
+        x_acc = x.to(acc_dtype)
+        flow_acc = flow.to(acc_dtype)
+
+        # --- base grid ---
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=device, dtype=acc_dtype),
+            torch.arange(W, device=device, dtype=acc_dtype),
+            indexing="ij",
+        )
+        base_x = xx.unsqueeze(0).expand(B, H, W)
+        base_y = yy.unsqueeze(0).expand(B, H, W)
+
+        dst_x = (base_x + flow_acc[:, 0]).reshape(B, N)
+        dst_y = (base_y + flow_acc[:, 1]).reshape(B, N)
+
+        finite = torch.isfinite(dst_x) & torch.isfinite(dst_y)
+
+        # --- metric importance (soft-splat) ---
+        if metric is not None:
+            m = metric.to(acc_dtype).reshape(B, N)
+            m = m.clamp(-20.0, 20.0)
+            src_w = m.exp()  # [B,N]
+        else:
+            src_w = None
+
+        src = x_acc.reshape(B, C, N)
+
+        def _lin(xi: torch.Tensor, yi: torch.Tensor) -> torch.Tensor:
+            xi = xi.clamp(0, W - 1).to(torch.long)
+            yi = yi.clamp(0, H - 1).to(torch.long)
+            return yi * W + xi  # [B,*]
+
+        out = torch.zeros(B, C, N, device=device, dtype=acc_dtype)
+        denom = torch.zeros(B, 1, N, device=device, dtype=acc_dtype)
+
+        if radius <= 1.0 + 1e-6:
+            # ---- Standard bilinear (4 corners) ----
+            x0 = torch.floor(dst_x)
+            y0 = torch.floor(dst_y)
+            x1 = x0 + 1
+            y1 = y0 + 1
+
+            wa = (x1 - dst_x) * (y1 - dst_y)  # (x0,y0)
+            wb = (x1 - dst_x) * (dst_y - y0)  # (x0,y1)
+            wc = (dst_x - x0) * (y1 - dst_y)  # (x1,y0)
+            wd = (dst_x - x0) * (dst_y - y0)  # (x1,y1)
+
+            def _valid(xi, yi):
+                return finite & (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
+
+            va = _valid(x0, y0)
+            vb = _valid(x0, y1)
+            vc = _valid(x1, y0)
+            vd = _valid(x1, y1)
+
+            wa = wa * va.to(acc_dtype)
+            wb = wb * vb.to(acc_dtype)
+            wc = wc * vc.to(acc_dtype)
+            wd = wd * vd.to(acc_dtype)
+
+            ia = _lin(x0, y0)
+            ib = _lin(x0, y1)
+            ic = _lin(x1, y0)
+            id_ = _lin(x1, y1)
+
+            all_idx = torch.cat([ia, ib, ic, id_], dim=1)  # [B,4N]
+            all_w = torch.cat([wa, wb, wc, wd], dim=1)     # [B,4N]
+
+            if src_w is not None:
+                all_w = all_w * src_w.repeat(1, 4)
+
+            src4 = src.repeat(1, 1, 4)
+            all_idx_C = all_idx.unsqueeze(1).expand(B, C, 4 * N)
+            all_idx_1 = all_idx.unsqueeze(1)
+
+            out.scatter_add_(2, all_idx_C, src4 * all_w.unsqueeze(1))
+            denom.scatter_add_(2, all_idx_1, all_w.unsqueeze(1))
+
+        else:
+            # ---- Tent kernel over neighborhood ----
+            r = float(radius)
+            r_int = int(math.ceil(r))
+            offs = torch.arange(-r_int, r_int + 1, device=device, dtype=acc_dtype)  # [K]
+            K = offs.numel()
+            KK = K * K
+
+            # Center candidates on floor(dst) to avoid discontinuity at .5 boundaries.
+            xbase = torch.floor(dst_x)
+            ybase = torch.floor(dst_y)
+
+            xi = xbase.unsqueeze(-1) + offs.view(1, 1, K)  # [B,N,K]
+            yi = ybase.unsqueeze(-1) + offs.view(1, 1, K)  # [B,N,K]
+
+            wx = (1.0 - (dst_x.unsqueeze(-1) - xi).abs() / r).clamp(min=0.0)  # [B,N,K]
+            wy = (1.0 - (dst_y.unsqueeze(-1) - yi).abs() / r).clamp(min=0.0)  # [B,N,K]
+
+            w2 = (wx.unsqueeze(-1) * wy.unsqueeze(-2)).reshape(B, N, KK)  # [B,N,KK]
+
+            xi2 = xi.unsqueeze(-1).expand(B, N, K, K).reshape(B, N, KK)
+            yi2 = yi.unsqueeze(-2).expand(B, N, K, K).reshape(B, N, KK)
+
+            v = finite.unsqueeze(-1) & (xi2 >= 0) & (xi2 < W) & (yi2 >= 0) & (yi2 < H)
+            w2 = w2 * v.to(acc_dtype)
+
+            if src_w is not None:
+                w2 = w2 * src_w.unsqueeze(-1)
+
+            idx = _lin(xi2, yi2).reshape(B, N * KK)   # [B,KK*N]
+            w = w2.reshape(B, N * KK)                 # [B,KK*N]
+
+            src_rep = src.repeat(1, 1, KK)            # [B,C,KK*N]
+            idx_C = idx.unsqueeze(1).expand(B, C, idx.size(1))
+            idx_1 = idx.unsqueeze(1)
+
+            out.scatter_add_(2, idx_C, src_rep * w.unsqueeze(1))
+            denom.scatter_add_(2, idx_1, w.unsqueeze(1))
+
+        if normalize:
+            out = out / (denom + self.eps)
+
+        out = out.view(B, C, H, W).to(x.dtype)
+        denom = denom.view(B, 1, H, W)  # keep float32 for stable thresholding
+        return out, denom
+
+    def _init_motion_scaffold(self):
+        """
+        Motion scaffold matching :
+        - fw/bw flow prediction with pairwise inputs (x1,x2,e1,e2,ctx)
+        - occlusion masks via forward-backward check
+        - visibility head v_pred and residual head r_pred for disocclusions
+        - masked photo/edge/census/grad + TV + optional FB consistency losses
+        """
+        # config container
+        self.flow_cfg = FlowCfg(input_channels=self.input_channels, flow_ctx_dim=self.flow_ctx_dim)
+
+        cfg = self.flow_cfg
+
+        # Canny (frozen)
+        self.canny = CannyFilter(k_gaussian=3, sigma=1.5, use_cuda=self.device.type == "cuda").to(self.device)
+        for p in self.canny.parameters():
+            p.requires_grad_(False)
+        hidden_flow_proj = int(self.vdvae.decoder.widths[64])
+        
+        # Context projection from the VDVAE 64-resolution ConvLSTM hidden state
+        self.flow_ctx_proj = nn.Sequential(
+            nn.Conv2d(hidden_flow_proj, cfg.flow_ctx_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=8, num_channels=cfg.flow_ctx_dim, eps=cfg.eps),
+            nn.SiLU(inplace=False),
+        ).to(self.device)
+
+        # Pairwise flow input: [x1,x2,e1,e2,ctx]
+        flow_in_dim = 2 * cfg.input_channels + 2 + cfg.flow_ctx_dim
+
+        def make_feat_net(inputs):
+            return nn.Sequential(
+                nn.Conv2d(inputs, 64, kernel_size=3, stride=1, padding=1),
+                nn.GroupNorm(num_groups=8, num_channels=64, eps=cfg.eps),
+                nn.SiLU(inplace=False),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+                nn.GroupNorm(num_groups=8, num_channels=64, eps=cfg.eps),
+                nn.SiLU(inplace=False),
+            )
+
+        self.flow_feat_net_fw = make_feat_net(inputs =flow_in_dim).to(self.device)
+        self.flow_feat_net_bw = make_feat_net(inputs =flow_in_dim).to(self.device)
+
+        self.flow_enc_fw = get_gru_encoder(action_dim=self.action_dim).to(self.device)
+        self.flow_enc_bw = get_gru_encoder(action_dim=self.action_dim).to(self.device)
+
+        self.flow_dec_in_fw = nn.Conv2d(cfg.flow_state_channels, cfg.flow_dec_feat_channels, kernel_size=1).to(self.device)
+        self.flow_dec_in_bw = nn.Conv2d(cfg.flow_state_channels, cfg.flow_dec_feat_channels, kernel_size=1).to(self.device)
+
+        self.flow_dec_fw = get_gru_decoder(future_len=1, action_dim=self.action_dim).to(self.device)
+        self.flow_dec_bw = get_gru_decoder(future_len=1, action_dim=self.action_dim).to(self.device)
+
+        # Keep these (existing fields used elsewhere)
+        self.flow_loss_fn = FlowWarpingLoss(metric=torch.nn.L1Loss(reduction="mean"))
         self.flow_tv_loss_fn = TVLoss()
+        self.fb_loss_fn = fbLoss
 
+        # Visibility + residual/inpaint head (NEW)
+        in_ch = 3 + 3 + 1 + 1 + 1 + 2 + 1  # x_cur, warp(x_cur), rgb_err, e_prev, warp(e_cur), flow_fw, out_fw
+        self.inpaint_trunk = nn.Sequential(
+            nn.Conv2d(in_ch, 64, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups=8, num_channels=64, eps=cfg.eps),
+            nn.SiLU(inplace=False),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups=8, num_channels=64, eps=cfg.eps),
+            nn.SiLU(inplace=False),
+        ).to(self.device)
+        self.vis_head = nn.Conv2d(64, 1, kernel_size=3, padding=1).to(self.device)
+        self.rgb_head = nn.Conv2d(64, 3, kernel_size=3, padding=1).to(self.device)
+        self.flow_res = max(int(r) for r in self.vdvae.decoder.temporal_resolutions)  # e.g. 64
+        scale = float(self.flow_res) / float(self.image_size)
+        self.down_img_to64 = AntiAliasInterpolation2d(channels=3, scale=scale).to(self.device)  # 128->64
 
+        self.hf_top_upsampler = HFTopUpsampler( channels=self.hf_top_channels, target=self.flow_res, min_top=self.top_H, use_checkpoint=self.use_ctx_checkpoint).to(self.device)
+        self.mot_top_upsampler = HFTopUpsampler(channels=self.motion_ctx_channels, target=self.flow_res, min_top=self.top_H, use_checkpoint=self.use_ctx_checkpoint).to(self.device)
+        # CensusLoss (NEW; used masked like in sanity script)
+        cargs = SimpleNamespace(sequence_weight=1.0, iters=1, sequentially=False)
+        self.census_loss = CensusLoss(cargs, device=self.device)
 
-    def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int = 200):
+    def _init_encoder_decoder(self, max_components: int, prior_alpha: float, prior_beta: float, prior_mc_samples: int = 80):
         """
         Initialize VDVAE + DPGMM prior.
 
@@ -1008,14 +1796,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.image_channels = self.input_channels   # usually 3
         H.zdim = self.latent_dim                 # or set explicitly (e.g., 16)
         H.bottleneck_multiple = 0.25
-        H.width = 152
+        H.width = 72
         H.image_size = self.image_size          # e.g. 64
         H.dataset = 'imagenet64'
         H.num_mixtures = 10
         H.skip_threshold = 100.0
-        H.dec_blocks = "4x3,8m4,8x4,16m8,16x4,32m16,32x3,64m32,64x2"
-        H.enc_blocks = "64x2,64d2,32x3,32d2,16x4,16d2,8x4,8d2,4x3"
-        H.attn_resolutions = [8, 16, 32]
+        H.enc_blocks = "64x2,64d2,32x2,32d2,16x2,16d2,8x2"   # +2 blocks at 8
+        H.dec_blocks = "8x2,16m8,16x2,32m16,32x2,64m32,64x2"
+        H.attn_resolutions = [16, 32]
         H.use_spatial_attn = True
         H.attn_where = "last"
 
@@ -1025,7 +1813,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.use_edge_conditioning = True
         H.edge_condition_min_res = 64
 
-        H.edge_channels = 4 
+        H.edge_channels = 4
         H.no_bias_above = 64
         H.custom_width_str = ""
         # --- Attention defaults ---
@@ -1067,6 +1855,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # EMA for VDVAE
         self.ema_decay = 0.999
         self.ema_vdvae = EMA(self.vdvae, decay=self.ema_decay)
+        self.C64 = int(self.vdvae.decoder.widths[64])
 
         # Attach prior to VDVAE so its forward() computes dp_kl / dp_rate
         self.vdvae.prior = self.prior
@@ -1088,7 +1877,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 patch_size=patch_size,
                 z_dim= self.top_zdim + (self.hidden_dim * self.top_H * self.top_W),
                 device=self.device,
-                use_checkpoint=False,
+                use_checkpoint= False,
             )
         self.patch_discriminator = ImageDiscriminator(
                 input_nc=self.input_channels,
@@ -1100,27 +1889,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 checkpoint_use_reentrant=False,
                 device=self.device,
             )
-        torch_home = os.environ.get('TORCH_HOME', 'NOT SET')
-        alexnet_path = Path(torch_home) / "hub" /"checkpoints"/ "alexnet-owt-7be5be79.pth"
-        
-        print(f"TORCH_HOME: {torch_home}")
-        print(f"AlexNet weights exist: {alexnet_path.exists()}")
-        
-        if not alexnet_path.exists():
-            raise FileNotFoundError(
-                f"AlexNet weights not found at {alexnet_path}\n"
-                f"Run on login node:\n"
-                f"  wget https://download.pytorch.org/models/alexnet-owt-7be5be79.pth -O {alexnet_path}"
-            )
-        
-        # Now LPIPS will find cached weights
-        import lpips
-        self.loss_fn_alex = lpips.LPIPS(net="alex", model_path=alexnet_path, verbose=False).to(self.device)
-        self.loss_fn_alex.eval()
-        for p in self.loss_fn_alex.parameters():
-            p.requires_grad_(False)
 
-    def _init_vrnn_dynamics(self,use_orthogonal: bool = True, number_lstm_layer: int = 1):
+
+    def _init_vrnn_dynamics(self,use_orthogonal: bool = True, number_lstm_layer: int = 1, extra_channels: int =0):
         """Initialize VRNN components with context conditioning"""
         # Feature extractors
 
@@ -1134,71 +1905,126 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             kernel=5,
             layer_norm=True,
             use_checkpoint=self.use_ctx_checkpoint,
+            extra_channels=extra_channels
         )
+
+    def _init_latent_motion_conditioners(self, base_dim: int = 64):
+        # (A) HF feature projection to top grid
+        self.hf_to_top = HFToTop(
+            in_ch=self.C64,
+            out_ch=self.hf_top_channels,
+            mid_ch=64,
+            target_hw=(self.top_H, self.top_W),
+            use_checkpoint=self.use_ctx_checkpoint,
+        )
+
+        # (B) Edge projection 
+        self.edge_to_top = EdgeToTop(
+            out_ch=self.edge_top_channels,
+            target_hw=(self.top_H, self.top_W),
+            use_checkpoint=self.use_ctx_checkpoint,
+        )
+
+        # (C) Tokenization + transport + token->top mapping (canonical bridge)
+        self.hf_tokenizer = ConvPatchTokenizer(
+            in_ch=self.C64,
+            d_tok=self.motion_token_dim,
+            patch=self.hf_token_patch,
+            use_checkpoint=self.use_ctx_checkpoint,
+        )
+
+        self.token_transporter = TokenTransporter(
+            d_tok=self.motion_token_dim,
+            n_heads=self.motion_token_heads,
+            sigma=1.5,
+            use_checkpoint=self.use_ctx_checkpoint,
+        )
+
+        Ht = 64 // self.hf_token_patch
+        Wt = 64 // self.hf_token_patch
+
+        self.tokens_to_top = TokensToTopMap(
+            in_ch=self.motion_token_dim,
+            out_ch=self.motion_ctx_channels,
+            token_hw=(Ht, Wt),
+            top_hw=(self.top_H, self.top_W),
+            use_checkpoint=self.use_ctx_checkpoint,
+        )
+
+        # Base motion tokens used for resets (mask_t==0). Shape is fixed by (64//patch)^2.
+        assert 64 % self.hf_token_patch == 0, f"hf_token_patch must divide 64, got {self.hf_token_patch}"
+        
+        N = Ht * Wt
+        self.motion_tokens_base = nn.Parameter(torch.zeros(1, N, self.motion_token_dim))
+        latent_flow_max = 1.0
+
+        # (D) Top flow head: predicts flow in *top-grid pixels* (8x8 by default)
+        self.latent_flow_head = LatentFlowHead(
+            hf_ch=self.hf_top_channels,
+            mot_ch=self.motion_ctx_channels,
+            act_dim=self.action_dim,
+            edge_ch=self.edge_top_channels,
+            hidden=self.latent_flow_hidden,
+            max_flow=latent_flow_max,
+            use_checkpoint=self.use_ctx_checkpoint,
+        )
+
+        # (E) Predict next-step 64×64 feature map without future RGB (used for self-supervised flow training)
+        hf64_ch = int(self.vdvae.decoder.widths[64])
+        self.hf_pred_net = HFMapPredictor(
+            z_ch=self.zdim,
+            h_ch=self.hidden_dim,
+            a_ch=self.action_dim,
+            out_ch=hf64_ch,
+            out_hw=(64, 64),
+            base=base_dim,
+            use_checkpoint=self.use_ctx_checkpoint,
+        )
+
+        # (F) Refine upsampled top-grid flow into a dense 64×64 flow field
+        proj_ch = 32
+        g = 8
+        if proj_ch % g != 0:
+            g = 4 if proj_ch % 4 == 0 else 2 if proj_ch % 2 == 0 else 1
+
+        self.flow64_mot_proj = nn.Sequential(
+            nn.Conv2d(self.motion_ctx_channels, proj_ch, 1),
+            nn.GroupNorm(g, proj_ch, eps=self.flow_cfg.eps),
+            nn.SiLU(inplace=False),
+        ).to(self.device)
+
+        self.flow64_feat_proj = nn.Sequential(
+            nn.Conv2d(hf64_ch, proj_ch, kernel_size=1),
+            nn.GroupNorm(num_groups=8, num_channels=proj_ch, eps=self.flow_cfg.eps),
+            nn.SiLU(inplace=False),
+        ).to(self.device)
+
+        self.flow64_hf_proj = nn.Sequential(
+            nn.Conv2d(self.hf_top_channels, proj_ch, kernel_size=1),
+            nn.GroupNorm(num_groups=8, num_channels=proj_ch, eps=self.flow_cfg.eps),
+            nn.SiLU(inplace=False),
+        ).to(self.device)
+
+        self.flow64_scale = 64 // self.top_H
+        self.flow64_upmask = FlowUpsampleMask(
+            in_ch=2 + self.hf_top_channels + self.motion_ctx_channels,
+            scale=self.flow64_scale,
+            use_checkpoint=self.use_ctx_checkpoint,
+        )
+        self.flow64_refiner = FlowRefiner(
+            in_ch=(2 + 3 * proj_ch),
+            base=base_dim,                 
+            num_blocks=8,
+            max_delta=8.0,            # clamp refinement magnitude
+            use_checkpoint=self.use_ctx_checkpoint,
+        )
+        self.max_delta_calib = MaxDeltaCalibrator(q=0.995, frac=0.5, ema=0.98, min_md=2.0, max_md=16.0)
 
 
     @property
     def rnn(self):
         """Property to access the RNN layer."""
         return self._rnn
-
-    def init_weights(self, module: nn.Module):
-        """Initialize the weights using the typical initialization schemes."""
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-        elif isinstance(module, nn.Embedding):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-
-        elif isinstance(module, nn.Conv2d):
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-        elif isinstance(module, nn.ConvTranspose2d):
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-        elif isinstance(module, nn.Conv3d):
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-        elif isinstance(module, nn.ConvTranspose3d):
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-        elif isinstance(module, nn.MultiheadAttention):
-            # qkv packed in in_proj_weight; out proj separate
-            if module.in_proj_weight is not None:
-                nn.init.xavier_uniform_(module.in_proj_weight)
-            if module.out_proj.weight is not None:
-                nn.init.xavier_uniform_(module.out_proj.weight)
-            if module.in_proj_bias is not None:
-                nn.init.zeros_(module.in_proj_bias)
-            if module.out_proj.bias is not None:
-                nn.init.zeros_(module.out_proj.bias)
-
-        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm2d, nn.BatchNorm3d, nn.GroupNorm)):
-            if hasattr(module, 'weight') and module.weight is not None:
-                nn.init.ones_(module.weight)
-            if hasattr(module, 'bias') and module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-        elif isinstance(module, nn.LSTM):
-            for name, param in module.named_parameters():
-                if 'weight_ih' in name:
-                    nn.init.xavier_uniform_(param.data)
-                elif 'weight_hh' in name:
-                    nn.init.orthogonal_(param.data)
-                elif 'bias' in name:
-                    nn.init.constant_(param.data, 0)
 
     def _setup_optimizers(self, learning_rate: float, weight_decay: float) -> None:
         def get_params(*modules, exclude_params=None):
@@ -1241,52 +2067,103 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 groups.append({"params": no_decay, "weight_decay": 0.0})
             return groups
 
+        # Choose LR multipliers
+        base_lr = learning_rate
+        lr_core = base_lr * 1.2
+        lr_flow = base_lr * 15.0                  # stronger for motion scaffold (try 2-5x)
+        lr_inpaint = base_lr * 15.0               # small head, can go higher (try 3-8x)
+
+        wd_core = weight_decay
+        wd_flow = 0.0                            # recommended for flow (often best)
+        wd_inpaint = weight_decay * 0.5          # optional
+
         gen_param_groups = []
 
-        trunk_modules = [
-            self.vdvae.encoder,
-            self.vdvae.decoder,
-            self.prior,
-            self._rnn,
-            self.flow_ctx_proj,
-            #
-            self.flow_feat_net_fw,
-            self.flow_enc_fw,
-            self.flow_dec_in_fw,
-            self.flow_dec_fw,
-            self.flow_feat_net_bw,
-            self.flow_enc_bw,
-            self.flow_dec_in_bw,
-            self.flow_dec_bw,
-        ]
-
+        # These should NOT be duplicated across groups.
         gamma_params = [self.prior.stick_breaking.gamma_a, self.prior.stick_breaking.gamma_b]
         scalar_params = [self.rnn.h0, self.rnn.c0, self.rnn.m0]
+        exclude = gamma_params + scalar_params
 
-        trunk_params = get_params(*trunk_modules, exclude_params=(gamma_params + scalar_params))
-        if trunk_params:
-            gen_param_groups.extend(split_by_weight_decay(trunk_params, weight_decay))
+        # -------------------------
+        # 1) Core world model params
+        # -------------------------
+        core_modules = [
+            self.vdvae,
+            self.rnn,
+        ]
+        core_params = get_params(*core_modules, exclude_params=exclude)
+        if core_params:
+            for g in split_by_weight_decay(core_params, wd_core):
+                g["lr"] = lr_core
+                gen_param_groups.append(g)
 
-        tiny_lr = learning_rate * 5e-5
+        # -------------------------
+        # 2) Motion scaffold (flow + ctx)
+        # -------------------------
+        flow_modules = [
+            self.flow_feat_net_fw,
+            self.flow_feat_net_bw,
+            self.flow_enc_fw,
+            self.flow_enc_bw,
+            self.flow_dec_in_fw,
+            self.flow_dec_in_bw,
+            self.flow_dec_fw,
+            self.flow_dec_bw,
+            self.flow_ctx_proj,
+            self.hf_to_top,
+            self.edge_to_top,
+            self.hf_tokenizer,
+            self.token_transporter,
+            self.tokens_to_top,
+            self.latent_flow_head,
+            self.hf_pred_net,
+            self.flow64_feat_proj,
+            self.flow64_hf_proj,
+            self.flow64_mot_proj,
+            self.flow64_refiner,
+            self.motion_tokens_base,
+        ]
+        flow_params = get_params(*flow_modules, exclude_params=exclude)
+        if flow_params:
+            for g in split_by_weight_decay(flow_params, wd_flow):
+                g["lr"] = lr_flow
+                gen_param_groups.append(g)
+
+        # -------------------------
+        # 3) Visibility + inpaint branch
+        # -------------------------
+        inpaint_modules = [
+            self.inpaint_trunk, self.vis_head, self.rgb_head,
+        ]
+        inpaint_params = get_params(*inpaint_modules, exclude_params=exclude)
+        if inpaint_params:
+            for g in split_by_weight_decay(inpaint_params, wd_inpaint):
+                g["lr"] = lr_inpaint
+                gen_param_groups.append(g)
+
+        # 4) Special tiny LR params
+        tiny_lr = base_lr * 5e-5
         gammas = [p for p in gamma_params if isinstance(p, nn.Parameter) and p.requires_grad]
         if gammas:
             gen_param_groups.append({"params": gammas, "lr": tiny_lr, "weight_decay": 0.0})
 
         scalars = [p for p in scalar_params if isinstance(p, nn.Parameter) and p.requires_grad]
         if scalars:
-            gen_param_groups.append({"params": scalars, "lr": learning_rate, "weight_decay": 1e-5})
+            gen_param_groups.append({"params": scalars, "lr": base_lr, "weight_decay": 1e-5})
 
+        # Optimizer
         self.gen_optimizer = torch.optim.Adamax(
             gen_param_groups,
-            lr=learning_rate * 1.2,   # trunk groups inherit this
+            lr=lr_core,            # default; groups override anyway
             betas=(0.9, 0.999),
             eps=1e-4,
         )
 
+        # Discriminators unchanged
         if hasattr(self, "image_discriminator") and hasattr(self, "patch_discriminator"):
             disc_param_groups = [
-                {"params": self.image_discriminator.parameters(), "lr": learning_rate * 0.2},
-                {"params": self.patch_discriminator.parameters(), "lr": learning_rate * 0.8},
+                {"params": self.image_discriminator.parameters(), "lr": base_lr * 0.2},
+                {"params": self.patch_discriminator.parameters(), "lr": base_lr * 0.8},
             ]
             self.img_disc_optimizer = torch.optim.Adamax(
                 disc_param_groups,
@@ -1355,8 +2232,34 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         z_map = z_tokens.view(B, Ht, Wt, -1).permute(0, 3, 1, 2).contiguous()
         return z_map
 
+    def _upsample_lat_flow_to_64(
+        self,
+        flow_lat: torch.Tensor,         # [B,2,topH,topW]
+        hf_top_map: torch.Tensor,       # [B,Chf,topH,topW]
+        motion_ctx_map: torch.Tensor,   # [B,Cmot,topH,topW]
+        *,
+        mask_t: torch.Tensor | None = None,   # [B] float 0/1
+    ) -> torch.Tensor:
+        topH, topW = flow_lat.shape[-2:]
+        assert 64 % topH == 0 and 64 % topW == 0, f"need integer ratio to 64: {(topH,topW)}"
+        sH = 64 // topH
+        sW = 64 // topW
+        assert sH == sW == self.flow64_scale, (sH, sW, self.flow64_scale)
+
+        # (important) zero-out reset items so you never warp across episode boundaries
+        if mask_t is not None:
+            vm = mask_t.view(flow_lat.size(0), 1, 1, 1).to(dtype=flow_lat.dtype, device=flow_lat.device)
+            flow_lat = flow_lat * vm
+
+        # mask conditioning at top-grid resolution
+        # detaching hf/mot here is optional but often stabilizes training:
+        mask_in = torch.cat([flow_lat, hf_top_map.detach(), motion_ctx_map.detach()], dim=1)
+        up_mask = self.flow64_upmask(mask_in)  # [B,9*s*s,topH,topW]
+
+        return upsample_flow_raft(flow_lat, up_mask, self.flow64_scale)  # [B,2,64,64]
+
     def forward_sequence(self, observations, actions=None, dones=None, capture_flow_ctx=None):
-        """        
+        """
         observations: [B, T, C, H, W] in [-1, 1]
         actions:      [B, T, action_dim]
         dones:        [B, T] optional (expects 'done at t-1')
@@ -1364,30 +2267,34 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         Returns a dict of per-timestep lists.
         """
         batch_size, seq_len, C, H, W = observations.shape
+        device = observations.device
         dtype = observations.dtype
+        B = batch_size
+        capture_b = capture_t = None
+        if capture_flow_ctx is not None:
+            capture_b, capture_t = capture_flow_ctx
 
         if actions is None:
-            actions = torch.zeros(batch_size, seq_len, self.action_dim, device=observations.device, dtype=observations.dtype)
+            actions = torch.zeros(batch_size, seq_len, self.action_dim, device=device, dtype=dtype)
 
-        # Top-level (global) LSTM state (vector)
+        # --- init recurrent states ---
+        core_state = self.rnn.init_state(batch_size, device=device, dtype=dtype)
+        h_context_map = self.rnn.out_norm(core_state[0])  # [B, hidden, topH, topW]
 
-        core_state = self.rnn.init_state(
-            batch_size,
-            self.top_H, self.top_W,
-            device=observations.device,
-            dtype=observations.dtype,
-        )
-        h_context_map = self.rnn.out_norm(core_state[0]) 
-
-        # Spatial ConvLSTM temporal states inside the VDVAE decoder
-        temporal_state = self.vdvae.init_temporal_state(batch_size, device=observations.device, dtype=observations.dtype)
-
+        temporal_state = self.vdvae.init_temporal_state(batch_size, device=device, dtype=dtype)
+        # --- latent motion buffers (persistent across time) ---
+        topH, topW = self.top_H, self.top_W
+        motion_tokens = self.motion_tokens_base.expand(B, -1, -1).to(device=device, dtype=dtype)  # [B,N,D]
+        flow_lat_prev = torch.zeros(B, 2, topH, topW, device=device, dtype=dtype)
+        flow64_base_prev = torch.zeros(B, 2, 64, 64, device=device, dtype=dtype)
+        flow64_prev = torch.zeros(B, 2, 64, 64, device=device, dtype=dtype)
+        y_warp_in = torch.zeros(B, self.hf_top_channels, topH, topW, device=device, dtype=dtype)
         outputs = {
             "reconstructions": [],
             "reconstruction_samples": [],
             "latents": [],
             "hidden_states": [],
-            "core_h_maps": [],  # [B, hidden, Ht, Wt]
+            "core_h_maps": [],
             "core_c_maps": [],
             "core_m_maps": [],
             "prior_params": [],
@@ -1402,169 +2309,244 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "kumaraswamy_kl_losses": [],
             "K_eff": [],
             "component_margin": [],
+
+            # legacy warp slots (kept for logging compatibility)
             "warp_lb_loss": [],
             "warp_tv_gate_loss": [],
             "warp_disagree_loss": [],
             "warp_edge_tf_loss": [],
             "warp_rgb_tf_loss": [],
-            "captured_flow_ctx": None,
-            # Optional debug captures for trainer visualizations
-            "captured_flow_fw": None,
-            "captured_flow_bw": None,
+
+            # sanity total (NEW)
+            "warp_sanity_total_loss": [],
+            "lat_feat_loss": [],
+            "lat_distill_loss": [],
+            #"lat_distill64_loss": [],
+            "lat_flow_mag": [],
+            "motion_tok_ent": [],
+            "motion_ctx_ent": [],
+            "top_bottom_warp_consistency":[],
+
+            # LatentWarp (top-z)
+            "z_lw_loss": [],
+            "lw_keep_frac": [],
         }
-        obs01_all = self.denormalize_generated_images(observations).clamp(0.0, 1.0).to(observations.dtype)  # [B,T,C,H,W]
 
-        # Precompute all edges once 
-        with torch.cuda.amp.autocast(enabled=False):
-            e_all = self.canny(obs01_all.float().reshape(batch_size * seq_len, C, H, W)).detach()
-        e_all = e_all.to(obs01_all.dtype)
+        # teacher-forced images in [0,1] for warp/flow stack
+        obs01_all = self.denormalize_generated_images(observations).clamp(0.0, 1.0)
+        cfg = self.flow_cfg
+        flow_state_C = int(getattr(cfg, "flow_state_channels", 128)) if cfg is not None else 128
+        # flow scaffold states
+        flow_state_fw = torch.zeros(batch_size, flow_state_C, H, W, device=device, dtype=torch.float32)
+        flow_state_bw = torch.zeros(batch_size, flow_state_C, H, W, device=device, dtype=torch.float32)
 
-        e_all = e_all.reshape(batch_size, seq_len, 1, H, W)  # [B,T,1,H,W]
+        step_global = int(self.global_step.item())
 
-        # Precompute all GT EDT once (single GPU->CPU sync per batch)
-        flow_state_fw = torch.zeros(batch_size, 128, H, W, device=observations.device, dtype=torch.float32)
-        flow_state_bw = torch.zeros(batch_size, 128, H, W, device=observations.device, dtype=torch.float32)
+
+        # --- LatentWarp buffers for top z (kept across time, reset by mask_t) ---
+        z_top_prev = torch.zeros(B, self.latent_dim, topH, topW, device=device, dtype=dtype)
+        top_q_mean_prev = torch.zeros(B, self.latent_dim, topH, topW, device=device, dtype=dtype)
+        have_prev_top = False
 
         for t in range(seq_len):
-            x_t = observations[:, t]  # [B, C, H, W]
+            x_t = observations[:, t]  # [-1,1], [B,C,H,W]
 
-            if t == 0:
-                a_t = torch.zeros(batch_size, self.action_dim, device=observations.device, dtype=observations.dtype)
-            else:
-                a_t = actions[:, t-1]
+            a_t = (
+                torch.zeros(batch_size, self.action_dim, device=device, dtype=dtype)
+                if t == 0 else actions[:, t - 1]
+            )
 
-            if dones is None or t==0:
-                mask_t = torch.ones(batch_size, device=observations.device, dtype=observations.dtype)
+            if dones is None or t == 0:
+                mask_t = torch.ones(batch_size, device=device, dtype=torch.float32)
             else:
-                mask_t = 1.0 - dones[:, t-1].float()
-            
-            # reset flow states per-episode using mask_t (per-batch reset)
-            vm = mask_t.view(batch_size, 1, 1, 1)
+                mask_t = (1.0 - dones[:, t - 1].float()).to(torch.float32)
+
+            vm = mask_t.view(batch_size, 1, 1, 1).to(device=device, dtype=dtype)  # float32 mask
+
+            # reset flow states per-episode
             flow_state_fw = flow_state_fw * vm
             flow_state_bw = flow_state_bw * vm
-            # h_context conditions the top DPGMM prior network
-            h_context = h_context_map
+            flow_lat_prev = flow_lat_prev * vm
+            flow64_base_prev = flow64_base_prev * vm
+            flow64_prev   = flow64_prev   * vm
+            y_warp_in     = y_warp_in     * vm
             edge_guide = None
+            flow_fw = None
+            e_warp = None
+
+            # -------------------------
+            # Flow / Warp sanity stack
+            # -------------------------
             if self.use_edge_conditioning and (t > 0):
-                # Warp STRUCTURE (edges) from x_(t-1) -> x_t using PyramidMoEWarp (learned MoE flow).
-                x_prev01 = obs01_all[:, t - 1].float()   # [B,3,H,W]
-                x_t01    = obs01_all[:, t].float()       # [B,3,H,W]
-                e_prev   = e_all[:, t - 1].float()       # [B,1,H,W]
-                e_t    = e_all[:, t].float()           # [B,1,H,W]
-                B_, _, H_, W_ = x_prev01.shape
-                # temporal_state at the start of timestep t is the state AFTER decoding t-1 
-                h64_prev, _ = temporal_state["64"]          # [B, width64, 64, 64]
+                cfg = self.flow_cfg
 
-                ctx64 = self.flow_ctx_proj(h64_prev.float())      # [B, flow_ctx_dim, 64, 64]
+                x_prev01 = obs01_all[:, t - 1].float()  # [B,3,H,W] in [0,1]
+                x_cur01  = obs01_all[:, t].float()
 
-                # if images are 64x64, H_=W_=64 and this is a no-op (no “premature interpolation”)
-                if (ctx64.shape[-2], ctx64.shape[-1]) != (H_, W_):
-                    ctx_map = F.interpolate(ctx64, size=(H_, W_), mode="bilinear", align_corners=False)
+                # ctx_map from 64-res ConvLSTM hidden BEFORE consuming current frame
+                h64_prev, _ = temporal_state["64"]
+                ctx64 = self.flow_ctx_proj(h64_prev.float())
+                if (ctx64.shape[-2], ctx64.shape[-1]) != (H, W):
+                    ctx_map = F.interpolate(ctx64, size=(H, W), mode="bilinear", align_corners=False)
                 else:
                     ctx_map = ctx64
+                vm = mask_t  # [B] 0/1 float/bool
+                vm = vm.view(batch_size, 1, 1, 1).to(flow_state_fw.dtype)  # broadcast mask
 
-                # predict forward flow (prev->t) and backward flow (t->prev)
-                flow_fw, flow_state_fw = self._predict_flow_one_step(
-                    x01=x_prev01, e=e_prev, ctx=ctx_map, a_t=a_t, state=flow_state_fw,
-                    first=(t == 1), direction="fw"
+                # save previous states
+                flow_state_fw_prev = flow_state_fw
+                flow_state_bw_prev = flow_state_bw
+                # exact sanity loss stack (teacher forced)
+                warp_total, stats, extras, flow_fw, flow_bw, flow_state_fw, flow_state_bw = self._compute_flow_warp_losses_pair01(
+                    x_prev01=x_prev01,
+                    x_cur01=x_cur01,
+                    a_t=a_t.float(),
+                    ctx_map=ctx_map.float(),
+                    flow_state_fw=flow_state_fw,
+                    flow_state_bw=flow_state_bw,
+                    first=(t == 1),
+                    step=step_global,
+                    mask_t=vm,  # ok: method expands it
                 )
-                flow_bw, flow_state_bw = self._predict_flow_one_step(
-                    x01=x_t01, e=e_t, ctx=ctx_map, a_t=a_t, state=flow_state_bw,
-                    first=(t == 1), direction="bw"
-                )
-                flow_fw = flow_fw * vm
-                flow_bw = flow_bw * vm
-                # Optional capture for debugging / trainer visualizations
-                if capture_flow_ctx is not None:
-                    cb, ct = capture_flow_ctx
-                    if (t == ct):
-                        outputs["captured_flow_ctx"] = ctx_map[int(cb):int(cb)+1].detach().cpu()
-                        outputs["captured_flow_fw"] = flow_fw[int(cb):int(cb)+1].detach().cpu()
-                        outputs["captured_flow_bw"] = flow_bw[int(cb):int(cb)+1].detach().cpu()
-                
-                # Warp x_t and e_tgt back to prev coords using forward flow (prev->t) (photometric consistency)
-                x_t_to_prev = image_warp(x_t01, flow_fw)
-                e_t_to_prev = self.warp_with_mode(e_t, flow_fw, mode="nearest")
+                flow_state_fw = flow_state_fw * vm + flow_state_fw_prev * (1.0 - vm)
+                flow_state_bw = flow_state_bw * vm + flow_state_bw_prev * (1.0 - vm)
+                # store sanity total and legacy-compatible metrics
+                outputs["warp_sanity_total_loss"].append(warp_total)  # keep float32
+                outputs["warp_edge_tf_loss"].append(stats["warp_edge"].to(torch.float32))
+                outputs["warp_rgb_tf_loss"].append(stats["warp_photo"].to(torch.float32))
+                outputs["warp_tv_gate_loss"].append(stats["warp_tv"].to(torch.float32))
+                outputs["warp_lb_loss"].append(stats.get("warp_fb_flow", torch.zeros((), device=device)).to(torch.float32))
+                outputs["warp_disagree_loss"].append(torch.zeros((), device=device, dtype=torch.float32))
 
-                e_prev_to_cur = self.warp_with_mode(e_prev, flow_bw, mode="nearest")   # crisp edges
-                x_prev_to_cur = image_warp(x_prev01, flow_bw)                          # bilinear RGB
-                x_warp01, denom = self.forward_splat_bilinear(x_prev01, flow_fw)
+                # build edge_guide (matches generate_future_sequence): forward splat prev -> cur
+                x_warp01, denom = self.forward_splat_bilinear(x_prev01, flow_fw)  # already normalized inside
                 x_warp01 = x_warp01.clamp(0.0, 1.0)
-                valid = (denom > 0.5).to(x_warp01.dtype)
-                x_warp01 = x_warp01 * valid
-                e_warp = self.canny(x_warp01).float()
+                valid = (denom > 0.5).to(x_warp01.dtype) * vm  # [B,1,H,W]
+                x_warp01 = x_warp01 * valid + x_prev01 * (1 - valid)  # hole-fill with original where denom is bad
 
-                edge_guide = torch.cat([e_warp, x_warp01], dim=1).to(dtype)
-                edge_guide = (edge_guide * vm).detach()
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    e_warp = self.canny(x_warp01.float()).float()
 
-                # edge mask: dilated edges in prev frame (full res)
-                edge_mask = (e_prev > self.thr_e).to(x_t_to_prev.dtype)
-                edge_mask = F.max_pool2d(edge_mask, kernel_size=self.dilate_k, stride=1, padding=self.dilate_k // 2)
-                edge_mask = edge_mask * vm
+                edge_guide = torch.cat([e_warp.to(dtype), x_warp01.to(dtype)], dim=1)
+                edge_guide = (edge_guide * vm.to(edge_guide.dtype))
 
-                edge_l1 = (torch.abs(e_t_to_prev - e_prev) * edge_mask).sum() / (edge_mask.sum() + self.eps)
-                rgb_err = torch.abs(x_t_to_prev - x_prev01).mean(dim=1, keepdim=True)
-                rgb_l1  = (rgb_err * edge_mask).sum() / (edge_mask.sum() + self.eps)
-
-                outputs["warp_edge_tf_loss"].append(edge_l1.to(dtype))
-                outputs["warp_rgb_tf_loss"].append(rgb_l1.to(dtype))
-
-                # -------- flow regularizers (fills the old PyramidMoEWarp slots) --------
-                fb = self.fb_loss_fn(
-                    forward_flow=flow_fw, backward_flow=flow_bw,
-                    forward_gt_flow=None, backward_gt_flow=None,
-                    fb_loss_weight=1.0, image_warp_loss_weight=0.0,
-                    beta=1, first_image=None, second_image=None,         
-                )
-                tv = self.flow_tv_loss_fn(flow_fw) + self.flow_tv_loss_fn(flow_bw)
-
-                # optional extra symmetry penalty (lightweight)
-                disagree = (flow_fw + image_warp(flow_bw, flow_fw)).abs().mean()
-                disagree = disagree + (flow_bw + image_warp(flow_fw, flow_bw)).abs().mean()
-
-                outputs["warp_lb_loss"].append((fb).to(dtype))
-                outputs["warp_tv_gate_loss"].append((tv).to(dtype))
-                outputs["warp_disagree_loss"].append((disagree).to(dtype))
+                # optional debug capture for trainer
+                if (capture_b is not None) and (capture_t is not None) and (t == capture_t):
+                    b = max(0, min(batch_size - 1, capture_b))
+                    outputs["captured_flow_ctx"] = ctx_map[b:b + 1].detach()
+                    outputs["captured_flow_fw"] = flow_fw[b:b + 1].detach()
+                    outputs["captured_flow_bw"] = flow_bw[b:b + 1].detach()
 
             else:
-                # keep list lengths aligned even when warp isn't used
-                #TODO: Do I need to initialize edge_guide
-                outputs['warp_lb_loss'].append(torch.zeros((), device=x_t.device, dtype=dtype))
-                outputs['warp_tv_gate_loss'].append(torch.zeros((), device=x_t.device, dtype=dtype))
-                outputs['warp_disagree_loss'].append(torch.zeros((), device=x_t.device, dtype=dtype))
-                outputs["warp_edge_tf_loss"].append(torch.zeros((), device=x_t.device, dtype=dtype))
-                outputs["warp_rgb_tf_loss"].append(torch.zeros((), device=x_t.device, dtype=dtype))
+                # keep list lengths aligned (zeros are tensors, not python floats)
+                z = torch.zeros((), device=device, dtype=torch.float32)
+                outputs["warp_sanity_total_loss"].append(z)
+                outputs["warp_lb_loss"].append(z)
+                outputs["warp_tv_gate_loss"].append(z)
+                outputs["warp_disagree_loss"].append(z)
+                outputs["warp_edge_tf_loss"].append(z)
+                outputs["warp_rgb_tf_loss"].append(z)
 
+            # -------------------------
+            # Warp core state early (t-1 -> t) so VDVAE conditioning is aligned
+            # -------------------------
+            if self.warp_core_state and t > 0:
+                h, c, m_ = core_state
+                vm_map = mask_t.view(batch_size, 1, 1, 1).to(h.dtype)  # [B,1,1,1]
+
+                # forward-splat warp (t-1 -> t)
+                h_w, den_h = self.forward_splat_bilinear(h,  flow_lat_prev)
+                c_w, den_c = self.forward_splat_bilinear(c,  flow_lat_prev)
+                m_w, den_m = self.forward_splat_bilinear(m_, flow_lat_prev)
+
+                # hole-fill: use warped where denom is good, else keep original
+                vh = (den_h > 0.5).to(h.dtype) * vm_map
+                vc = (den_c > 0.5).to(h.dtype) * vm_map
+                vmh = (den_m > 0.5).to(h.dtype) * vm_map
+
+                h  = h_w * vh  + h  * (1 - vh)
+                c  = c_w * vc  + c  * (1 - vc)
+                m_ = m_w * vmh + m_ * (1 - vmh)
+
+                core_state = (h, c, m_)
+
+            # update context map AFTER warp
+            h_context_map = self.rnn.out_norm(core_state[0])
+            # -------------------------
+            # VDVAE temporal step
+            # -------------------------
             x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
-            x_target_nhwc = x_t_nhwc
-
             vdvae_out, temporal_state = self.vdvae.forward_temporal_step(
                 x_t_nhwc,
-                x_target_nhwc,
-                h_context=h_context,
+                x_t_nhwc,
+                h_context=h_context_map,
                 a_t=a_t,
-                mask_t=mask_t,
-                edge_guide=edge_guide,
+                mask_t=mask_t,         # [B] float32
+                edge_guide=edge_guide, # [B,4,H,W] or None
                 temporal_state=temporal_state,
             )
             prior_params = vdvae_out["prior_params"]
 
             # --- (A) Pull prior params safely ---
-            pi_tok = prior_params["pi"]                  # [N,K] or [B,K]
-            mu_tok = prior_params["means"]               # [N,K,C]
-            logvar_tok = prior_params["log_vars"]        # [N,K,C]  (this is log-variance)
-            var_tok = torch.exp(logvar_tok)
-
-            # --- (B) top posterior maps ---
-            top_q_mean_map = vdvae_out["top_q_mean_map"]       # [B,C,Ht,Wt]
-            top_q_logsigma_map = vdvae_out["top_q_logvar_map"] # NOTE: this is log-sigma 
+            pi_tok = prior_params["pi"]
+            top_q_mean_map = vdvae_out["top_q_mean_map"]          # [B,C,Ht,Wt]
+            top_q_logsig_map = vdvae_out["top_q_logvar_map"]      # comment: log-sigma
 
             B2, zdim, Ht, Wt = top_q_mean_map.shape
-            tokens_per_img = Ht * Wt
-            N = B2 * tokens_per_img
+            N = B2 * Ht * Wt
 
-            # --- (C) token samples for MI term  ---
-            z_top_map = draw_gaussian_diag_samples(top_q_mean_map, top_q_logsigma_map)
+            # --- (C) token samples for MI term ---
+            z_top_map = draw_gaussian_diag_samples(top_q_mean_map, top_q_logsig_map)
+            # --- LatentWarp top-z alignment (training path) ---
+            # Always apply episode-boundary reset to the LatentWarp buffers.
+            vm_map = mask_t.view(B, 1, 1, 1).to(dtype=z_top_prev.dtype, device=z_top_prev.device)
+            z_top_prev = z_top_prev * vm_map
+            top_q_mean_prev = top_q_mean_prev * vm_map
+
+            z_used = z_top_map
+            z_lw = z_top_map.new_zeros(())
+            keep_frac = z_top_map.new_zeros(())
+
+            # Alignment blend and consistency loss are independent:
+            # - Blend is controlled by lw_blend (can be enabled even if lambda_z_lw=0)
+            # - Loss is controlled by lambda_z_lw
+            do_lw = have_prev_top and (self.lw_blend > 0.0) and (flow_fw is not None) and (flow_bw is not None)
+            if do_lw:
+                flow_bw_top, keep_top = self._latentwarp_build_keep_top(
+                    x_prev01=obs01_all[:, t - 1].float(),
+                    x_cur01=obs01_all[:, t].float(),
+                    flow_fw=flow_fw,
+                    flow_bw=flow_bw,
+                    top_hw=(Ht, Wt),
+                    mask_t=mask_t,
+                    padding_mode=cfg.warp_padding_mode if cfg is not None else "border",
+                )
+
+                # Keep detachment behavior symmetric across alignment and loss.
+                flow_bw_top_use = flow_bw_top.detach() if self.lw_detach_flow else flow_bw_top
+                keep_top_use = keep_top.detach() if self.lw_detach_flow else keep_top
+
+                z_used = self._latentwarp_align_top_z(
+                    z_cur=z_top_map,
+                    z_prev=z_top_prev.detach(),
+                    flow_bw_top=flow_bw_top_use,
+                    keep_top=keep_top_use,
+                )
+                keep_frac = keep_top_use.mean().detach()
+
+                if self.lambda_z_lw > 0.0:
+                    # single consistency loss (posterior mean only)
+                    q_prev_w = self.warp_with_mode(
+                        top_q_mean_prev.detach(),
+                        flow_bw_top_use,
+                        mode="bilinear",
+                        padding_mode="border",
+                    )
+                    denom = (keep_top_use.sum().clamp_min(1.0) * float(zdim))
+                    z_lw = ((top_q_mean_map - q_prev_w).pow(2) * keep_top_use).sum() / denom
+
+            outputs["z_lw_loss"].append(z_lw)
+            outputs["lw_keep_frac"].append(keep_frac)
 
             z_tokens = z_top_map.permute(0, 2, 3, 1).contiguous().view(N, zdim)
 
@@ -1574,72 +2556,231 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 prior_params=prior_params,
                 eps=eps_,
                 temperature=1.0,
-            )  # [N,K]
-            # a mutual-information-style “component usage / separation” metric
+            )
+
             u = resp.mean(dim=0).clamp_min(eps_)
             H_marg = -(u * u.log()).sum()
             r = resp.clamp_min(eps_)
-            H_cond = - (r * r.log()).sum(dim=-1).mean()
+            H_cond = -(r * r.log()).sum(dim=-1).mean()
             I = H_marg - H_cond
             outputs["component_margin"].append(I)
 
-            # (D) Kumaraswamy KL: build token-wise h_tokens 
-            h_map = self.vdvae._coerce_h_context_map(h_context, Ht=Ht, Wt=Wt)  # [B,Hc,Ht,Wt]
+            # (D) Kumaraswamy KL
+            h_map = self.vdvae._coerce_h_context_map(h_context_map, Ht=Ht, Wt=Wt)
             h_map = self.vdvae.add_PosEncode(h_map, self.vdvae.top_pe, scale=0.05)
             h_tokens = h_map.permute(0, 2, 3, 1).contiguous().view(N, h_map.shape[1])
-
 
             kumar_beta_kl = self.prior.compute_kl_loss(prior_params, prior_params["alpha"], h_tokens)
             outputs["kumaraswamy_kl_losses"].append(kumar_beta_kl)
 
-            K_eff = self.prior.get_effective_components(pi_tok)  # token-level is OK; or average per-image first
+            K_eff = self.prior.get_effective_components(pi_tok)
             outputs["K_eff"].append(K_eff.float().mean())
 
-            # --- (E) sample z_top_map correctly (logσ!) ---
+            # store z_flat for disc conditioning
+            z_flat = z_used.permute(0, 2, 3, 1).contiguous().view(B2, Ht * Wt * zdim)
 
-            z_flat = z_top_map.permute(0, 2, 3, 1).contiguous().view(B2, Ht * Wt * zdim)
-            
-            h_context_map, core_state = self.rnn(z_top_map, a_t, state=core_state, mask_t=mask_t)
+            # update top-level RNN
+            extra_maps = None
+            flow_teacher_fw_64 = flow_fw if (flow_fw is not None) else None
+            edge_fullres = e_warp if (e_warp is not None) else None
+            a_fwd = actions[:, t] if t < (seq_len - 1) else torch.zeros_like(a_t)
 
-            # store filtered state at time t 
+            hf_top_map, motion_ctx_map, flow_lat_cur, y_warp_next, motion_tokens, extra_maps, lat_stats = self._latent_motion_step(
+                temporal_state=temporal_state,
+                h_context_map=h_context_map,
+                motion_tokens=motion_tokens,
+                y_warp_in=y_warp_in,
+                a_in=a_t,
+                a_fwd=a_fwd,
+                flow_teacher_fw_64=flow_teacher_fw_64,
+                edge_fullres=edge_fullres,
+                mask_t=mask_t,
+                step=t,
+            )
+
+            # motion token / context entropies (for logging)
+            tok_ent = getattr(self.token_transporter, "last_attn_entropy", None)
+            if tok_ent is None:
+                tok_ent = hf_top_map.new_zeros(())
+            outputs["motion_tok_ent"].append(tok_ent.detach() if tok_ent.requires_grad else tok_ent)
+
+            with torch.no_grad():
+                p_ctx = torch.softmax(motion_ctx_map.float(), dim=1).clamp_min(1e-8)
+                ctx_ent = -(p_ctx * p_ctx.log()).sum(dim=1).mean()
+            outputs["motion_ctx_ent"].append(ctx_ent.to(dtype=hf_top_map.dtype))
+
+            # refine top-grid flow to dense 64×64 flow (pixel units) for feature transport + distillation
+            flow64_base = self._upsample_lat_flow_to_64(
+                flow_lat_cur, hf_top_map, motion_ctx_map, mask_t=mask_t
+            )
+
+            hf_top_up = self.hf_top_upsampler(hf_top_map)
+
+            mot_up = self.mot_top_upsampler(motion_ctx_map)
+
+            h64_t = temporal_state["64"][0]
+
+            flow64_in = torch.cat([flow64_base, self.flow64_feat_proj(h64_t), self.flow64_hf_proj(hf_top_up), self.flow64_mot_proj(mot_up)], dim=1)
+            md = self.max_delta_calib.update(flow64_base)
+            self.flow64_refiner.max_delta = md
+            flow64_cur = flow64_base + self.flow64_refiner(flow64_in)
+
+            # Top/bottom warp consistency loss (prev->cur at 64×64):
+            #   - base flow:   upsample_flow(flow_lat_prev)  (coarse 8×8 -> 64×64)
+            #   - refined flow: flow64_prev                  (refined 64×64)
+            # We warp x_{t-1} to predict x_t using BOTH flows, then:
+            #   (1) enforce base and refined warps agree (agree_l1)
+            #   (2) encourage refined to be no worse than base vs ground truth (hinge)
+            # This is computed only for t>0 because we need (t-1, t) frames and prev flow.
+
+            if (t > 0) and (float(getattr(self, "lambda_top_bottom_warp", 0.0)) > 0.0):
+                # Previous and current frames in [0,1], shape [B,3,H,W]
+                x_prev01 = obs01_all[:, t - 1].float()
+                x_cur01  = obs01_all[:, t].float()
+
+                # Ensure we compare everything on the same 64×64 grid (the grid where flow64 lives).
+                if x_prev01.shape[-2:] == (64, 64):
+                    x_prev64 = x_prev01
+                    x_cur64  = x_cur01
+                else:
+                    # Resize images to 64×64 so they match the flow grid.
+                    x_prev64 = self.down_img_to64(x_prev01)
+                    x_cur64  = self.down_img_to64(x_cur01)
+
+                # Build the "base" 64×64 flow from the previous-step latent flow (t-1 -> t).
+                # upsample_flow also scales magnitudes appropriately for the grid ratio.
+                #TODO: Should I use upsample_flow_raft here instead, for better quality? It is more expensive but might be worth it for a stronger consistency signal.
+
+                # Warp x_{t-1} forward with:
+                #   - base flow (coarse upsampled)
+                #   - refined flow 
+                # forward_splat_bilinear returns:
+                #   x_warp: [B,3,64,64] and denom: [B,1,64,64]
+                x_base, den_b = self.forward_splat_bilinear(x_prev64, flow64_base_prev)
+                x_ref,  den_r = self.forward_splat_bilinear(x_prev64, flow64_prev)
+
+                # Validity mask: require both splats to have "enough mass" at that pixel.
+                # denom>0.5 is a practical threshold that rejects holes from forward splatting.
+                valid = ((den_b > 0.5) & (den_r > 0.5)).to(x_base.dtype)  # [B,1,64,64]
+                valid2 = valid.expand(-1, 2, -1, -1)                        # [B,2,64,64]
+                valid2 = valid2 * mask_t.view(batch_size,1,1,1).to(valid2.dtype)
+
+                flow_agree_l1 = ((flow64_base_prev - flow64_prev).abs() * valid2).sum() / (valid2.sum() + self.eps)
+
+                # add it into loss_flow64 with a small coefficient
+                # residual map: where the refined warp actually matches the current frame
+                resid = (x_ref - x_cur64).abs().mean(dim=1, keepdim=True)  # [B,1,64,64]
+
+                # confidence mask: "valid splat" AND "small residual"
+                thr = 0.15  # in [0,1] space; tune 0.10–0.25
+                conf = ((den_b > 0.5) & (den_r > 0.5) & (resid < thr)).to(x_base.dtype)  # [B,1,64,64]
+                conf3 = conf.expand(-1, 3, -1, -1)
+
+                vm = mask_t.view(batch_size,1,1,1).to(x_base.dtype)
+                conf3 = conf3 * vm
+
+                # then use conf3 instead of valid3 for agree/err terms:
+                agree_l1 = (x_base.sub(x_ref).abs() * conf3).sum() / (conf3.sum() + self.eps)
+                err_base = (x_base.sub(x_cur64).abs() * conf3).sum() / (conf3.sum() + self.eps)
+                err_ref  = (x_ref .sub(x_cur64).abs() * conf3).sum() / (conf3.sum() + self.eps)
+
+                # Penalize refined only when it is worse than base; otherwise no penalty.
+                loss_flow64 = agree_l1 + F.relu(err_ref - err_base) + self.beta_flow_agree * flow_agree_l1
+
+                # Store per-step loss (later averaged in compute_total_loss via _mean_or_zero).
+                outputs["top_bottom_warp_consistency"].append(loss_flow64)
+            else:
+                # Keep list lengths consistent across timesteps.
+                outputs["top_bottom_warp_consistency"].append(
+                    torch.zeros((), device=device, dtype=torch.float32)
+                )
+
+            # feature transport supervision at 64 (rollout-safe)
+            if t < (seq_len - 1):
+                h64_t = temporal_state["64"][0]
+                h64_w, den = self.forward_splat_bilinear(h64_t, flow64_cur)
+                hf_pred_next = self.hf_pred_net(z_map=z_used, h_context_map=h_context_map, a_t=a_fwd, hf_prev=h64_t)
+                v = (den > 0.5).to(h64_t.dtype)
+                h64_warp_next = h64_w * v + h64_t * (1 - v)
+                diff = (h64_warp_next - hf_pred_next).abs()                
+
+                if dones is None:
+                    outputs["lat_feat_loss"].append(diff.mean())
+                else:
+                    # mask transition t->t+1 if episode ends at t
+                    mask_fwd = (1.0 - dones[:, t].float()).to(device=device, dtype=diff.dtype)  # [B]
+                    m = mask_fwd.view(batch_size, 1, 1, 1)  # [B,1,1,1]
+                    denom = m.sum() * diff.shape[1] * diff.shape[2] * diff.shape[3] + self.eps
+                    outputs["lat_feat_loss"].append((diff * m).sum() / denom)
+            else:
+                outputs["lat_feat_loss"].append(hf_top_map.new_zeros(()))
+            if t > 0 and flow_teacher_fw_64 is not None:
+                flow_teacher_top = downsample_flow(flow_teacher_fw_64, (self.top_H, self.top_W))
+                m_prev = mask_t.view(batch_size, 1, 1, 1).to(dtype=flow_lat_prev.dtype, device=device)
+                den_top = m_prev.sum() * flow_lat_prev.shape[1] * flow_lat_prev.shape[2] * flow_lat_prev.shape[3] + self.eps
+                #den_64  = m_prev.sum() * flow64_prev.shape[1]   * flow64_prev.shape[2]   * flow64_prev.shape[3]   + self.eps
+
+                outputs["lat_distill_loss"].append(((flow_lat_prev - flow_teacher_top.detach()).abs() * m_prev).sum() / den_top)
+                teacher_flow64 = flow_teacher_fw_64 if flow_teacher_fw_64.shape[-2:] == (64, 64) else downsample_flow(flow_teacher_fw_64, (64, 64))
+                #outputs["lat_distill64_loss"].append(((flow64_prev - teacher_flow64.detach()).abs() * m_prev).sum() / den_64)
+            else:
+                outputs["lat_distill_loss"].append(hf_top_map.new_zeros(()))
+                #outputs["lat_distill64_loss"].append(hf_top_map.new_zeros(()))
+            outputs["lat_flow_mag"].append(lat_stats["flow_mag"])
+            h_context_map, core_state = self.rnn(z_used, a_t, state=core_state, mask_t=mask_t, extra_maps=extra_maps)
+            # update LatentWarp buffers for next step
+            z_top_prev = z_used.detach()
+            top_q_mean_prev = top_q_mean_map.detach()
+            have_prev_top = True
+            flow_lat_prev = flow_lat_cur
+            flow64_prev = flow64_cur
+            flow64_base_prev = flow64_base
+            y_warp_in = y_warp_next
+
+            # store states
             outputs["core_h_maps"].append(core_state[0].detach())
             outputs["core_c_maps"].append(core_state[1].detach())
             outputs["core_m_maps"].append(core_state[2].detach())
 
-            outputs["prior_params"].append({
-                "pi": pi_tok.detach(),   # [N, K]
-            })
+            outputs["prior_params"].append({"pi": pi_tok.detach()})
             outputs["top_q_mean_map"].append(top_q_mean_map)
-            outputs["top_q_logvar_map"].append(top_q_logsigma_map)
-            with torch.no_grad():
-                sample = self.vdvae.decoder.out_net.sample(vdvae_out["px_z"])   # [B, H, W, C] uint8
-                sample = torch.from_numpy(sample).to(device=observations.device, dtype=torch.float32)
-                sample = sample.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
-            
-            dmol_out = self.vdvae.decoder.out_net.forward(vdvae_out["px_z"])  # [B, H, W, 10*nr_mix]
-            recon_mean = mean_from_discretized_mix_logistic(dmol_out, self.vdvae.H.num_mixtures)  # [B,H,W,3]
-            #print(f"image reconstruction range: min {recon_mean.min().item()}, max {recon_mean.max().item()}")
-            recon_mean = recon_mean.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
-            outputs["reconstructions"].append(recon_mean)
+            outputs["top_q_logvar_map"].append(top_q_logsig_map)
 
+            # reconstructions
+            with torch.no_grad():
+                sample = self.vdvae.decoder.out_net.sample(vdvae_out["px_z"])
+                sample = torch.from_numpy(sample).to(device=device, dtype=torch.float32)
+                sample = sample.permute(0, 3, 1, 2).contiguous()
+
+            dmol_out = self.vdvae.decoder.out_net.forward(vdvae_out["px_z"])
+            recon_mean = mean_from_discretized_mix_logistic(dmol_out, self.vdvae.H.num_mixtures)
+            recon_mean = recon_mean.permute(0, 3, 1, 2).contiguous()
+
+            outputs["reconstructions"].append(recon_mean)
             outputs["reconstruction_samples"].append(sample)
             outputs["latents"].append(z_flat)
-            outputs["hidden_states"].append( h_context_map.permute(0, 2, 3, 1).contiguous().view(batch_size, Ht * Wt * self.hidden_dim))
+            outputs["hidden_states"].append(
+                h_context_map.permute(0, 2, 3, 1).contiguous().view(batch_size, Ht * Wt * self.hidden_dim)
+            )
             outputs["reconstruction_losses"].append(vdvae_out["distortion"])
             outputs["gauss_rate"].append(vdvae_out["gauss_rate"])
             outputs["dp_rate"].append(vdvae_out["dp_rate"])
             outputs["kl_latents"].append(vdvae_out["rate"])
             outputs["elbo"].append(vdvae_out["elbo"])
             outputs["pi_token"].append(pi_tok)
+
+        # stack some outputs
         for k in ["core_h_maps", "core_c_maps", "core_m_maps"]:
             if len(outputs[k]) > 0:
-                outputs[k] = torch.stack(outputs[k], dim=1)  # [B, T, hidden, Ht, Wt]
+                outputs[k] = torch.stack(outputs[k], dim=1)  # [B,T,hidden,Ht,Wt]
 
         for key in ["reconstructions", "latents", "hidden_states", "reconstruction_samples"]:
             if len(outputs[key]) > 0 and isinstance(outputs[key][0], torch.Tensor):
-                outputs[key] = torch.stack(outputs[key], dim=1)  # [B, T, ...]
-        outputs["top_q_mean_maps"]  = torch.stack(outputs["top_q_mean_map"],  dim=1)  # [B,T,C,Ht,Wt]
+                outputs[key] = torch.stack(outputs[key], dim=1)  # [B,T,...]
+
+        outputs["top_q_mean_maps"] = torch.stack(outputs["top_q_mean_map"], dim=1)
         outputs["top_q_logvar_maps"] = torch.stack(outputs["top_q_logvar_map"], dim=1)
+
         if outputs["K_eff"]:
             outputs["K_eff"] = torch.stack(outputs["K_eff"]).mean()
         return outputs
@@ -1685,6 +2826,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         h = core_h_seq[:, anchors].reshape(B * A, -1, Ht, Wt).contiguous()
         c = core_c_seq[:, anchors].reshape(B * A, -1, Ht, Wt).contiguous()
         m = core_m_seq[:, anchors].reshape(B * A, -1, Ht, Wt).contiguous()
+
+        # latent motion buffers for imagined rollouts (B*A batch)
+        BA = B * A
+        topH, topW = self.top_H, self.top_W
+        motion_tokens = self.motion_tokens_base.expand(BA, -1, -1).to(device=device, dtype=top_q_mean_maps.dtype)
+        flow_lat_prev = torch.zeros(BA, 2, topH, topW, device=device, dtype=top_q_mean_maps.dtype)
+        y_warp_in = torch.zeros(BA, self.hf_top_channels, topH, topW, device=device, dtype=top_q_mean_maps.dtype)
+        hf_prev_64 = torch.zeros(BA, self.C64, 64, 64, device=device, dtype=top_q_mean_maps.dtype)
 
         loss = torch.zeros((), device=device)
         denom = torch.zeros((), device=device)
@@ -1735,91 +2884,152 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
             # advance imagined state (still required!)
             z_samp = self._sample_top_from_prior(mix, BHW).detach()
-            _, (h, c, m) = self.rnn(z_samp, a_ba, state=(h, c, m), mask_t=mask_f)
+            extra_maps = None
+            # predict HF(64) from (z_samp, h_context_map, a_ba) and build canonical extra maps
+            hf_64 = self.hf_pred_net(z_map=z_samp, h_context_map=h_context_map, a_t=a_ba, hf_prev=hf_prev_64)
+            temporal_fake = {"64": (hf_64, torch.zeros_like(hf_64))}
+            t_fwd = t_idx.clamp(max=T - 1)
+            a_fwd = actions[:, t_fwd].reshape(B * A, -1).contiguous()
 
-        if denom.item() <= 0:
-            return torch.zeros((), device=device)
+            # if t_idx is the last frame, there is no valid "forward" transition; zero it out
+            valid_fwd = (t_idx < (T - 1)).view(1, A).expand(B, A).reshape(B * A, 1).to(a_fwd.dtype)
+            a_fwd = a_fwd * valid_fwd
+
+            hf_top_map, motion_ctx_map, flow_lat_cur, y_warp_next, motion_tokens, extra_maps, _ = self._latent_motion_step(
+                temporal_state=temporal_fake,
+                h_context_map=h_context_map,
+                motion_tokens=motion_tokens,
+                y_warp_in=y_warp_in,
+                a_in=a_ba,
+                a_fwd=a_fwd,
+                flow_teacher_fw_64=None,
+                edge_fullres=None,
+                mask_t=mask_f,
+                step=int(k),
+                h64_override=hf_64,
+            )
+            if self.warp_core_state and k > 1:
+                h, _ = self.forward_splat_bilinear(h, flow_lat_prev)
+                c, _ = self.forward_splat_bilinear(c, flow_lat_prev)
+                m, _ = self.forward_splat_bilinear(m, flow_lat_prev)
+            flow_lat_prev = flow_lat_cur
+            y_warp_in = y_warp_next
+            hf_prev_64 = hf_64
+
+            h_context_map, (h, c, m) = self.rnn(z_samp, a_ba, state=(h, c, m), mask_t=mask_f, extra_maps=extra_maps)
+
         return loss / denom
-
 
     def compute_total_loss(
         self,
-        observations:torch.Tensor,
-        actions:Optional[torch.Tensor]=None,
-        dones:Optional[torch.Tensor]=None,
+        observations: torch.Tensor,
+        actions: Optional[torch.Tensor] = None,
+        dones: Optional[torch.Tensor] = None,
         beta: float = 1.0,
         lambda_recon: float = 1.0,
     ):
         outputs = self.forward_sequence(observations, actions, dones)
-        device = self.device
+        device = observations.device
 
         # --- Reconstruction term ---
-        if len(outputs["reconstruction_losses"]) > 0:
-            recon_loss = torch.stack(outputs["reconstruction_losses"]).mean()
-        else:
-            recon_loss = torch.zeros((), device=device)
-        if isinstance(outputs["reconstructions"], list):
-            outputs["reconstructions"] = torch.stack(outputs["reconstructions"], dim=1)
+        recon_loss = (
+            torch.stack(outputs["reconstruction_losses"]).mean()
+            if len(outputs["reconstruction_losses"]) > 0
+            else torch.zeros((), device=device)
+        )
 
-        if isinstance(outputs["reconstruction_samples"], list):
+        # ensure stacked tensors for downstream (forward_sequence already stacks, but keep safe)
+        if isinstance(outputs.get("reconstructions", None), list):
+            outputs["reconstructions"] = torch.stack(outputs["reconstructions"], dim=1)
+        if isinstance(outputs.get("reconstruction_samples", None), list):
             outputs["reconstruction_samples"] = torch.stack(outputs["reconstruction_samples"], dim=1)
 
-
-        # --- Latent KL (Gaussian + DP at top) ---
-        if len(outputs["kl_latents"]) > 0:
-            kl_z = torch.stack(outputs["kl_latents"]).mean()
-        else:
-            kl_z = torch.zeros((), device=device)
-
-        # --- Stick-breaking / hierarchical KL (Kumaraswamy + alpha prior) ---
-        if len(outputs["kumaraswamy_kl_losses"]) > 0:
-            hierarchical_kl = torch.stack(outputs["kumaraswamy_kl_losses"]).mean()
-        else:
-            hierarchical_kl = torch.zeros((), device=device)
-        if len(outputs["component_margin"]) > 0:
-            component_margin = torch.stack(outputs["component_margin"]).mean()
-        else:
-            component_margin = torch.zeros((), device=device)
-        # PyramidMoEWarp regularizers (already weighted inside the module)
-        if len(outputs["warp_lb_loss"]) > 0:
-            warp_lb_loss = torch.stack(outputs["warp_lb_loss"]).mean()
-            warp_tv_gate_loss = torch.stack(outputs["warp_tv_gate_loss"]).mean()
-            warp_disagree_loss = torch.stack(outputs["warp_disagree_loss"]).mean()
-        else:
-            warp_lb_loss = torch.zeros((), device=device)
-            warp_tv_gate_loss = torch.zeros((), device=device)
-            warp_disagree_loss = torch.zeros((), device=device)
-        warp_reg_loss = self.fb_w * warp_lb_loss + self.tv_w * warp_tv_gate_loss + self.disagree_w * warp_disagree_loss
-
-        # Teacher-forced warp supervision losses (may be empty if warp disabled)
-        if len(outputs.get("warp_edge_tf_loss", [])) > 0:
-            warp_edge_tf_loss = torch.stack(outputs["warp_edge_tf_loss"]).mean()
-        else:
-            warp_edge_tf_loss = torch.zeros((), device=device)
-
-        if len(outputs.get("warp_rgb_tf_loss", [])) > 0:
-            warp_rgb_tf_loss = torch.stack(outputs["warp_rgb_tf_loss"]).mean()
-        else:
-            warp_rgb_tf_loss = torch.zeros((), device=device)
-
+        # --- Latent KLs ---
+        kl_z = (
+            torch.stack(outputs["kl_latents"]).mean()
+            if len(outputs["kl_latents"]) > 0
+            else torch.zeros((), device=device)
+        )
+        hierarchical_kl = (
+            torch.stack(outputs["kumaraswamy_kl_losses"]).mean()
+            if len(outputs["kumaraswamy_kl_losses"]) > 0
+            else torch.zeros((), device=device)
+        )
+        component_margin = (
+            torch.stack(outputs["component_margin"]).mean()
+            if len(outputs["component_margin"]) > 0
+            else torch.zeros((), device=device)
+        )
 
         total_vae_loss = (
             lambda_recon * recon_loss
             + beta * (kl_z + hierarchical_kl)
-            - component_margin # encourage diverse component usage (maximize margin entropy)
-            + warp_reg_loss
+            - component_margin
         )
 
+        # Warp / Flow losses
+        z0 = torch.zeros((), device=device)
+
+        def _mean_or_zero(key: str):
+            xs = outputs.get(key, [])
+            if xs is None or len(xs) == 0:
+                return z0
+            return torch.stack(xs).mean()
+
+        # sanity total always present after the forward fix (but keep robust)
+        use_sanity = ("warp_sanity_total_loss" in outputs) and (len(outputs["warp_sanity_total_loss"]) > 0)
+
+        warp_sanity_total = _mean_or_zero("warp_sanity_total_loss") if use_sanity else z0
+
+        # legacy-compatible scalars
+        warp_edge_tf_loss = _mean_or_zero("warp_edge_tf_loss")
+        warp_rgb_tf_loss  = _mean_or_zero("warp_rgb_tf_loss")
+        warp_lb_loss      = _mean_or_zero("warp_lb_loss")
+        warp_tv_gate_loss = _mean_or_zero("warp_tv_gate_loss")
+        warp_disagree_loss = _mean_or_zero("warp_disagree_loss")
+
+        if use_sanity:
+            # for logging: define "tf" and "reg" in a reasonable way
+            cfg = getattr(self, "flow_cfg", None)
+            if cfg is not None:
+                warp_tf_loss = cfg.w_edge * warp_edge_tf_loss + cfg.w_photo * warp_rgb_tf_loss
+            else:
+                warp_tf_loss = warp_edge_tf_loss + warp_rgb_tf_loss
+
+            warp_reg_loss = (warp_sanity_total - warp_tf_loss).detach()  # diagnostic
+            total_vae_loss = total_vae_loss + warp_sanity_total
+        else:
+            # fallback to old weighting scheme (keep tensors)
+            warp_tf_loss = self.warp_edge_tf_weight * warp_edge_tf_loss + self.warp_rgb_tf_weight * warp_rgb_tf_loss
+            warp_reg_loss = (
+                self.fb_w * warp_lb_loss
+                + self.tv_w * warp_tv_gate_loss
+                + self.disagree_w * warp_disagree_loss
+            )
+            total_vae_loss = total_vae_loss + warp_tf_loss + warp_reg_loss
+
+        # Latent-motion distillation / feature transport losses (always active when enabled)
+        lat_feat = self.lambda_lat_feat * _mean_or_zero("lat_feat_loss")
+        
+        lat_distill = self.lambda_lat_distill * _mean_or_zero("lat_distill_loss")
+        #lat_distill64 = self.lambda_lat_distill * _mean_or_zero("lat_distill64_loss")
+        top_bottom_warp_consistency = self.lambda_top_bottom_warp * _mean_or_zero("top_bottom_warp_consistency")
+
+        z_lw = self.lambda_z_lw * _mean_or_zero("z_lw_loss")
+        total_vae_loss = total_vae_loss + lat_feat + lat_distill + top_bottom_warp_consistency + z_lw
+        # -------------------------
+        # Overshoot KL (unchanged)
+        # -------------------------
         overshoot_kl = torch.zeros((), device=device)
         if getattr(self, "lambda_overshoot", 0.0) > 0.0:
             T = outputs["top_q_mean_maps"].shape[1]
             K_effect = min(self.overshoot_K, T - 2)
             overshoot_kl = self.compute_multistep_kl_overshoot(
                 outputs["top_q_mean_maps"],
-                outputs["top_q_logvar_maps"],  # TODO: ensure this really is log-sigma ( Verify log-sigma vs log-variance in VDVAE DecBlock????)
+                outputs["top_q_logvar_maps"],
                 actions,
                 dones=dones,
-                K= K_effect,
+                K=K_effect,
                 n_anchors=self.overshoot_n_anchors,
                 mc_samples=self.overshoot_mc_samples,
                 w_decay=self.overshoot_w_decay,
@@ -1828,27 +3038,32 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             topH, topW = outputs["top_q_mean_maps"].shape[-2:]
             _, _, C, H, W = observations.shape
             overshoot_kl = overshoot_kl * (topH * topW) / float(C * H * W)
-        total_vae_loss = total_vae_loss +  self.lambda_overshoot * overshoot_kl
 
-        warp_tf_loss = (
-            self.warp_edge_tf_weight * warp_edge_tf_loss +
-            self.warp_rgb_tf_weight  * warp_rgb_tf_loss
-        )
-        total_vae_loss = total_vae_loss + warp_tf_loss
+        total_vae_loss = total_vae_loss + self.lambda_overshoot * overshoot_kl
 
-        vae_losses= {
+        vae_losses = {
             "recon_loss": recon_loss,
             "kl_z": kl_z,
             "hierarchical_kl": hierarchical_kl,
             "component_margin": component_margin,
+            "lat_feat": lat_feat,
+            "lat_distill": lat_distill,
+            #"lat_distill64": lat_distill64,
+            "top_bottom_warp_consistency": top_bottom_warp_consistency,
+            "z_lw": z_lw,
+
+            "warp_sanity_total": warp_sanity_total,
+            "warp_tf_loss": warp_tf_loss,
+            "warp_reg_loss": warp_reg_loss,
+
+            "warp_edge_tf_loss": warp_edge_tf_loss,
+            "warp_rgb_tf_loss": warp_rgb_tf_loss,
             "warp_lb_loss": warp_lb_loss,
             "warp_tv_gate_loss": warp_tv_gate_loss,
             "warp_disagree_loss": warp_disagree_loss,
-            "warp_reg_loss": warp_reg_loss,
+
+            "overshoot_kl": overshoot_kl,
             "total_vae_loss": total_vae_loss,
-            "warp_edge_tf_loss": warp_edge_tf_loss,
-            "warp_rgb_tf_loss": warp_rgb_tf_loss,
-            "overshoot_kl": overshoot_kl
         }
 
         return vae_losses, outputs
@@ -1925,7 +3140,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         Training step for both discriminators
         """
-        
+
         B, T, C, H, W = real_images.shape
         temporal_mask = self._make_temporal_mask(B, T, real_images.device, sequence_lengths )         # [B,T] bool
         # For per-frame PatchGAN losses
@@ -1934,7 +3149,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             mask_flat = temporal_mask.reshape(B * T).float()  # [B*T]
 
         disc_losses: Dict[str, torch.Tensor] = {}
-        
+
         # Temporal Image Discriminator
         real_img_outputs = self.image_discriminator(real_images, z=latents.detach(), sequence_lengths=sequence_lengths)
         fake_img_outputs = self.image_discriminator(fake_images.detach(), z=latents.detach(), sequence_lengths=sequence_lengths)
@@ -1962,7 +3177,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             diffs = diffs.squeeze(-1)  # [B, T-1]
             md = (temporal_mask[:, 1:] & temporal_mask[:, :-1]).float()  # [B, T-1]
             img_consistency_loss = self._masked_mean(diffs, md)
-        
+
         real_frames = real_images.reshape(B * T, C, H, W).contiguous()
         fake_frames = fake_images.reshape(B * T, C, H, W).contiguous()
 
@@ -1970,9 +3185,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         fake_logits = self.patch_discriminator(fake_frames)                 # [B*T,1,h,w]
         real_frame_score = real_logits.mean(dim=(1,2,3))  # [B*T]
         fake_frame_score = fake_logits.mean(dim=(1,2,3))  # [B*T]
-        
+
         patch_disc_loss = self._masked_mean(fake_frame_score, mask_flat) - self._masked_mean(real_frame_score, mask_flat)
-       
+
         patch_gp = self.compute_gradient_penalty_patch(
             D2d=self.patch_discriminator,
             real_x=real_frames,
@@ -2000,7 +3215,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'temporal_disc_real': real_img_score.mean().detach(),
             'temporal_disc_fake': fake_img_score.mean().detach(),
             'temporal_consistency_loss': img_consistency_loss.detach(),  # Renamed
-            # PatchGAN metrics  
+            # PatchGAN metrics
             'patch_disc_loss': patch_disc_loss.detach(),  # New key
             'patch_gp': patch_gp.detach(),
             'patch_disc_real': real_frame_score.mean().detach(),
@@ -2008,14 +3223,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         })
         return  disc_losses
 
-    def compute_feature_matching_loss(self, 
-                                      real_features: torch.Tensor, 
-                                      fake_features: torch.Tensor, 
+    def compute_feature_matching_loss(self,
+                                      real_features: torch.Tensor,
+                                      fake_features: torch.Tensor,
                                       temporal_mask: torch.Tensor | None = None):
 
         real_mean = real_features.mean(dim=2)  # [B, T, D]
         fake_mean = fake_features.mean(dim=2)
-         
+
         if temporal_mask is None:
            return F.l1_loss(fake_mean, real_mean.detach())
         m = temporal_mask.float().unsqueeze(-1) #[B, T, 1]
@@ -2048,7 +3263,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         fake_img_outputs = D(reconstruction, z=z_seq.detach(), sequence_lengths=sequence_lengths, return_features=True)
 
         real_img_outputs = D(x,             z=z_seq.detach(), sequence_lengths=sequence_lengths, return_features= True)
-        
+
         temporal_adv_loss = -self._masked_mean(fake_img_outputs['final_score'], temporal_mask)
 
         # Feature Matching Loss:L1 loss between feature statistics
@@ -2084,6 +3299,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """
         return (images + 1) / 2
 
+    def denormalize(self, images):
+        return self.denormalize_generated_images(images)
+
     def training_step_sequence(self,
                             observations: torch.Tensor,
                             actions: torch.Tensor = None,
@@ -2093,7 +3311,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                             lambda_img: float = 0.5,
                             lambda_recon: float = 1.0,
                             lambda_edge: float = 0.4,
-                            lambda_lpips = 0.1,
                             batch_idx: Optional[int] = None,
                             ) -> Dict[str, torch.Tensor]:
         """
@@ -2105,7 +3322,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if getattr(self, "image_discriminator", None) is not None:
             self.image_discriminator.train()
 
-        self.global_step += 1
 
         # 1) Prepare data and compute VAE loss
         warmup_factor = self.get_warmup_factor()
@@ -2237,7 +3453,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         rollout_feat_match_loss = torch.zeros((), device=observations.device)
         rollout_edge_loss = torch.zeros((), device=observations.device)
         rollout_warp_edge_loss = torch.zeros((), device=observations.device)
-        rollout_lpips_loss = torch.zeros((), device=observations.device)
 
         if do_rollout and rollout_horizon > 0:
             # Rollout again WITH grad for generator update
@@ -2272,25 +3487,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             # mask out padded future frames using seq_len_future
             t = torch.arange(Tf, device=observations.device)[None, :]          # [1,Tf]
             mask_t = (t < seq_len_future[:, None]).float()                     # [Bf,Tf]
-            # LPIPS (expects RGB in [-1,1])
-            if (lambda_lpips > 0.0) and (getattr(self, "loss_fn_alex", None) is not None):
-                # mask_t: [Bf, Tf] already computed from seq_len_future
-                Bf, Tf = fake_future_G.shape[:2]
 
-                with torch.cuda.amp.autocast(enabled=False):
-                    lp = self.loss_fn_alex(fake_bt.float(), real_bt.float())  # usually [Bf*Tf,1,1,1]
-
-                lp = lp.reshape(Bf, Tf, -1).mean(dim=-1)  # -> [Bf, Tf]
-                rollout_lpips_loss = (lp * mask_t).sum() / mask_t.sum().clamp(min=1.0)
-            
             # edge_fake/edge_real: [Bf*Tf, 1, H, W]
             diff = (edge_fake - edge_real).abs().view(Bf, Tf, 1, H, W).mean(dim=(2,3,4))  # [Bf,Tf]
             rollout_edge_loss = (diff * mask_t).sum() / mask_t.sum().clamp(min=1.0)
             # Warp-edge supervision: teach flow to move STRUCTURE (edges) correctly
             # Compare warped edges (from previous frame + predicted flow) to true edges at t+1.
-            edge_warp = dbgG.get("edge_warp", None)
-            if isinstance(edge_warp, list):
-                edge_warp = torch.stack(dbgG["edge_warp"], dim=1)                 # [Bf,Tf,1,H,W]
+            edge_warp = dbgG.get("edge_warp", None)                 # [Bf,Tf,1,H,W]
             if (edge_warp is not None) and (edge_warp.ndim == 5) and (edge_warp.shape[1] == Tf):
                 edge_real_seq = edge_real.view(Bf, Tf, 1, H, W)                    # [Bf,Tf,1,H,W]
                 diff_warp = (edge_warp - edge_real_seq).abs().mean(dim=(2, 3, 4))  # [Bf,Tf]
@@ -2308,8 +3511,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             total_components = {
                 "recon_loss":      vae_losses["recon_loss"].reshape([]),
                 "kl_z":            vae_losses["kl_z"].reshape([]),
-                "overshoot_kl":   vae_losses["overshoot_kl"].reshape([]),
                 "hierarchical_kl": vae_losses["hierarchical_kl"].reshape([]),
+                "overshoot_kl":    vae_losses["overshoot_kl"].reshape([]),
+                "component_margin": (-vae_losses["component_margin"]).reshape([]),
+
                 "img_adv_loss":      (warmup_factor * img_adv_loss).reshape([]),
                 "temporal_adv_loss": (warmup_factor * temporal_adv_loss).reshape([]),
                 "feat_match_loss":   feat_match_loss.reshape([]),
@@ -2317,18 +3522,26 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "rollout_img_adv_loss":      (self.lambda_rollout_adv * warmup_factor * rollout_img_adv_loss).reshape([]),
                 "rollout_temporal_adv_loss": (self.lambda_rollout_adv * warmup_factor * rollout_temporal_adv_loss).reshape([]),
                 "rollout_feat_match_loss":   (self.lambda_rollout_adv * rollout_feat_match_loss).reshape([]),
-                "rollout_lpips_loss": (lambda_lpips * warmup_factor * rollout_lpips_loss).reshape([]),
 
-                "component_margin": (-vae_losses["component_margin"]).reshape([]),
-                "rollout_edge_loss": (warmup_factor * lambda_edge * rollout_edge_loss).reshape([]),
+                # single warp term
+                #"warp_sanity_total": vae_losses["warp_sanity_total"].reshape([]),
+                "warp_lb_loss":       vae_losses["warp_lb_loss"].reshape([]),
+                "warp_tv_gate_loss":  vae_losses["warp_tv_gate_loss"].reshape([]),
+                "warp_disagree_loss": vae_losses["warp_disagree_loss"].reshape([]),
+                "warp_edge_tf_loss":  vae_losses["warp_edge_tf_loss"].reshape([]),
+                "warp_rgb_tf_loss":   vae_losses["warp_rgb_tf_loss"].reshape([]),
+                "lat_feat":      vae_losses["lat_feat"].reshape([]),
+                "lat_distill":   vae_losses["lat_distill"].reshape([]),
+                #"lat_distill64": vae_losses["lat_distill64"].reshape([]),
+                "top_bottom_warp_consistency": vae_losses["top_bottom_warp_consistency"].reshape([]),
+
+                "rollout_edge_loss":      (warmup_factor * lambda_edge * rollout_edge_loss).reshape([]),
                 "rollout_warp_edge_loss": (warmup_factor * lambda_edge * rollout_warp_edge_loss).reshape([]),
-                "warp_lb_loss": (warmup_factor * vae_losses["warp_lb_loss"]).reshape([]),
-                "warp_tv_gate_loss": (warmup_factor * vae_losses["warp_tv_gate_loss"]).reshape([]),
-                "warp_disagree_loss": (warmup_factor * vae_losses["warp_disagree_loss"]).reshape([]),
-                "warp_edge_tf_loss": (warmup_factor * lambda_edge * vae_losses["warp_edge_tf_loss"]).reshape([]),
-                "warp_rgb_tf_loss":  (warmup_factor * vae_losses["warp_rgb_tf_loss"]).reshape([]),  # or multiply by a lambda_warp_rgb
             }
+
             total_gen_loss = self.total_weighter.reduce_losses(total_components, batch_idx)
+            # LatentWarp z loss: keep fixed weight (not DWA-weighted)
+            total_gen_loss = total_gen_loss + vae_losses.get("z_lw", total_gen_loss.new_zeros(()))
         else:
             adv_base = (
                 lambda_img_eff * img_adv_loss
@@ -2344,7 +3557,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             total_gen_loss = elbo_loss + adv_base + adv_roll
             total_gen_loss = total_gen_loss + warmup_factor * lambda_edge * rollout_edge_loss
             total_gen_loss = total_gen_loss + warmup_factor * lambda_edge * rollout_warp_edge_loss
-            total_gen_loss = total_gen_loss + lambda_lpips * warmup_factor * rollout_lpips_loss
 
         # 7) Backprop generator
         self.gen_optimizer.zero_grad(set_to_none=True)
@@ -2355,8 +3567,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self._grad_clip,
         )
         self.gen_optimizer.step()
-
-
+        self.global_step += 1
         grad_norm_sq = 0.0
         for group in self.gen_optimizer.param_groups:
             for p in group["params"]:
@@ -2375,7 +3586,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         del outputs, z_seq_tf, real_future, fake_future_D, z_seq_roll_D, actions_slice, dones_slice, keep
 
         if do_rollout:
-          del dbgG, dbgD, fake_future_G       
+          del dbgG, dbgD, fake_future_G
         return {
             **vae_losses,
             **avg_disc_losses,
@@ -2386,7 +3597,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "rollout_img_adv_loss": float(rollout_img_adv_loss.item()),
             "rollout_temporal_adv_loss": float(rollout_temporal_adv_loss.item()),
             "rollout_feat_match_loss": float(rollout_feat_match_loss.item()),
-            "rollout_lpips_loss": float(rollout_lpips_loss.item()),
             "did_rollout_adv": float(1.0 if do_rollout else 0.0),
             "rollout_edge_loss": float(rollout_edge_loss.item()),
             "rollout_warp_edge_loss": float(rollout_warp_edge_loss.item()),
@@ -2412,14 +3622,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         Unconditional-ish samples: pick a context vector h_context, sample top z from DP-GMM prior,
         decode with VDVAE. Returns float tensor in [-1,1], NCHW.
         """
-        device = self.device        
+        device = self.device
         # (A) Choose an initial *spatial* context for the top prior / decoder.
 
         # With SpatioTemporalCore, h_context is a feature map at the top latent resolution.
         dtype = next(self.parameters()).dtype
         core_state = self.rnn.init_state(
             num_samples,
-            self.top_H, self.top_W,
             device=device,
             dtype=dtype,
         )
@@ -2438,265 +3647,481 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         x = torch.from_numpy(x_np).permute(0, 3, 1, 2).contiguous().float()/ 127.5 - 1.0
         return x
 
+    def init_core_state(self, B: int, *, device: torch.device, dtype: torch.dtype):
+        return self.rnn.init_state(B, device=device, dtype=dtype)
+
+    def reset_core_state_with_mask(self, core_state, mask_t: torch.Tensor):
+        if mask_t is None:
+            return core_state
+        if mask_t.ndim == 1:
+            m = mask_t.view(-1, 1, 1, 1)
+        else:
+            m = mask_t.view(mask_t.size(0), 1, 1, 1)
+        m = m.to(dtype=core_state[0].dtype, device=core_state[0].device)
+        base = self.rnn.init_state(core_state[0].size(0), device=core_state[0].device, dtype=core_state[0].dtype)
+        return tuple(s * m + b * (1.0 - m) for s, b in zip(core_state, base))
+
     def generate_future_sequence(
         self,
-        initial_obs: torch.Tensor,          # [B, T_ctx, C, H, W] in [-1, 1]
-        actions: torch.Tensor | None,       # [B, T_total, action_dim] (needs >= T_ctx + horizon)
-        horizon: int,
-        top_temperature: float = 0.5,
+        initial_obs: torch.Tensor,
+        actions: Optional[torch.Tensor] = None,
+        horizon: int = 15,
+        top_temperature: float = 1.0,
         decoder_temperature: float = 1.0,
-        dones: torch.Tensor | None = None,  # [B, T_ctx] or [B, T_total]
-        decode_mode: str = "mean",          # "mean" | "sample"
-        grad: bool = True,
-    ):
-        """Generate future frames using:
-          1) teacher-forced scan over context frames to warm up both:
-             - top-level LSTM state (vector)
-             - VDVAE decoder ConvLSTM temporal states (spatial)
-          2) for each future step:
-             - sample top latent map from token-wise DPGMM conditioned on h_context
-             - decode with temporal VDVAE (ConvLSTM-conditioned lower priors)
-             - update both temporal_state and top-level LSTM
+        decode_mode: str = "sample",
+        dones: Optional[torch.Tensor] = None,
+        grad: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        - Warmup on initial_obs with teacher forcing to build temporal/core state.
+        - Then sample top latents from the DP-GMM prior and decode forward for `horizon`.
+        - Uses forward splatting for state transport (same convention as training).
         """
         B, T_ctx, C, H, W = initial_obs.shape
         device = initial_obs.device
         dtype = initial_obs.dtype
 
-        def compute_mask_t(t: int) -> torch.Tensor:
-            if dones is None:
-                return torch.ones(B, device=device, dtype=torch.float32)
+        if actions is None:
+            actions = torch.zeros(B, T_ctx + horizon, self.action_dim, device=device, dtype=dtype)
+        elif actions.shape[1] < (T_ctx + horizon):
+            pad = (T_ctx + horizon) - actions.shape[1]
+            actions = torch.cat(
+                [actions, torch.zeros(B, pad, actions.shape[2], device=device, dtype=actions.dtype)],
+                dim=1,
+            )
 
-            if t == 0:
-                return torch.ones(B, device=device, dtype=torch.float32)
+        if dones is not None and dones.shape[1] < (T_ctx + horizon):
+            pad = (T_ctx + horizon) - dones.shape[1]
+            dones = torch.cat([dones, torch.zeros(B, pad, device=device, dtype=dones.dtype)], dim=1)
 
-            # Safe for both dones shapes: [B, T_ctx] or [B, T_total]
-            L = dones.shape[1]
-            idx = min(t - 1, L - 1)   # clamp index so we never go out of range
-            return 1.0 - dones[:, idx].float()
+        def mask_at(t_abs: int) -> torch.Tensor:
+            if dones is None or t_abs == 0:
+                return torch.ones(B, device=device, dtype=torch.float32)
+            return (1.0 - dones[:, t_abs - 1].float()).to(torch.float32)
+
+        # initial_obs is in [-1,1] → convert once for edge guidance
+        initial_obs01 = (initial_obs * 0.5 + 0.5).clamp(0.0, 1.0)
+
+        # flow scaffold states for edge-guidance during context warmup
+        cfg = self.flow_cfg
+        flow_state_C = int(getattr(cfg, "flow_state_channels", 128)) if cfg is not None else 128
+        flow_state_fw = torch.zeros(B, flow_state_C, H, W, device=device, dtype=torch.float32)
+        flow_state_bw = torch.zeros(B, flow_state_C, H, W, device=device, dtype=torch.float32)
+        step_global = int(self.global_step.item())
+
+        core_state = self.rnn.init_state(B, device=device, dtype=dtype)
+        h_context_map = self.rnn.out_norm(core_state[0])
+        temporal_state = self.vdvae.init_temporal_state(B, device=device, dtype=dtype)
+
+        topH, topW = self.top_H, self.top_W
+        motion_tokens = self.motion_tokens_base.expand(B, -1, -1).to(device=device, dtype=dtype)
+        flow_lat_prev = torch.zeros(B, 2, topH, topW, device=device, dtype=dtype)
+        flow64_base_prev = torch.zeros(B, 2, 64, 64, device=device, dtype=dtype)
+        flow64_prev = torch.zeros(B, 2, 64, 64, device=device, dtype=dtype)
+        y_warp_in = torch.zeros(B, self.hf_top_channels, topH, topW, device=device, dtype=dtype)
+
+        # LatentWarp top-z propagation buffers (imagination path)
+        z_top_prev = torch.zeros(B, self.latent_dim, topH, topW, device=device, dtype=dtype)
+        have_prev_top = False
+        z_conf = torch.zeros(B, 1, topH, topW, device=device, dtype=dtype)  # imagination confidence
+
+        pred_imgs: List[torch.Tensor] = []
+        z_seq: List[torch.Tensor] = []
+        pi_seq: List[torch.Tensor] = []
+        edge_warp_seq: List[torch.Tensor] = []
+
+        prev_img01 = initial_obs01[:, -1]  # [B,3,H,W] last context frame in [0,1]
 
         with torch.set_grad_enabled(grad):
-            if actions is None:
-                actions = torch.zeros(B, T_ctx + horizon, self.action_dim, device=device, dtype=dtype)
-            assert actions.shape[1] >= T_ctx + horizon, "actions must have length >= T_ctx + horizon"
-
-            # --- init states ---
-            core_state = self.rnn.init_state(
-                B,
-                self.top_H, self.top_W,
-                device=device,
-                dtype=dtype,
-            )
-            h_context_map = self.rnn.out_norm(core_state[0])  # [B, hidden_dim, 4, 4]
-
-            temporal_state = self.vdvae.init_temporal_state(B, device=device, dtype=dtype)
-            # flow states
-            flow_state_fw = torch.zeros(B, 128, H, W, device=device, dtype=torch.float32)
-            flow_state_bw = torch.zeros(B, 128, H, W, device=device, dtype=torch.float32)
-
-            # precompute full-res ctx images/edges for context
-            obs01_ctx = self.denormalize_generated_images(initial_obs).clamp(0.0, 1.0)
-            e_ctx = self.canny(obs01_ctx.reshape(B * T_ctx, C, H, W).float()).detach()
-            e_ctx = e_ctx.to(dtype).reshape(B, T_ctx, 1, H, W)
-            # --- context scan ---
+            # ---- context warmup (teacher-forced) ----
             for t in range(T_ctx):
                 x_t = initial_obs[:, t]
-                if t == 0:
-                   a_t = torch.zeros(B, self.action_dim, device=device, dtype=dtype)
-                else:
-                   a_t = actions[:, t-1]
-                mask_t = compute_mask_t(t)
-                vm = mask_t.view(B, 1, 1, 1)
+                mask_t = mask_at(t)
+                a_t = torch.zeros(B, self.action_dim, device=device, dtype=dtype) if t == 0 else actions[:, t - 1]
 
-                flow_state_fw = flow_state_fw * vm
-                flow_state_bw = flow_state_bw * vm
+                # reset latent-motion buffers on episode boundaries
+                vm_tok = mask_t.view(B, 1, 1)
+                base_tok = self.motion_tokens_base.expand(B, -1, -1).to(device=device, dtype=dtype)
+                motion_tokens = motion_tokens * vm_tok + base_tok * (1.0 - vm_tok)
 
-                # Align warmup with training: use the edge_guide conditioning during context scan
+                vm_map = mask_t.view(B, 1, 1, 1)
+                flow_lat_prev = flow_lat_prev * vm_map
+                flow64_prev = flow64_prev * vm_map
+                flow64_base_prev = flow64_base_prev * vm_map
+                y_warp_in = y_warp_in * vm_map
+
+                flow_fw = None
+                flow_bw = None
+                e_warp = None
                 edge_guide = None
+
                 if self.use_edge_conditioning and (t > 0):
-                    
-                    x_prev01 = obs01_ctx[:, t-1].float()
-                    x_t01    = obs01_ctx[:, t].float()
-                    e_prev   = e_ctx[:, t - 1].float()
-                    e_tgt    = e_ctx[:, t].float()
+                    x_prev01 = initial_obs01[:, t - 1].float()
+                    x_cur01 = initial_obs01[:, t].float()
 
+                    # ctx_map from 64-res ConvLSTM hidden BEFORE consuming current frame
                     h64_prev, _ = temporal_state["64"]
-                    ctx  = self.flow_ctx_proj(h64_prev.float())
-                    if (ctx.shape[-2], ctx.shape[-1]) != (H, W):
-                        ctx_map = F.interpolate(ctx, size=(H, W), mode="bilinear", align_corners=False)
+                    ctx64 = self.flow_ctx_proj(h64_prev.float())
+                    if (ctx64.shape[-2], ctx64.shape[-1]) != (H, W):
+                        ctx_map = F.interpolate(ctx64, size=(H, W), mode="bilinear", align_corners=False)
                     else:
-                        ctx_map = ctx
+                        ctx_map = ctx64
 
+                    vm = mask_t.view(B, 1, 1, 1).to(flow_state_fw.dtype)
+
+                    flow_state_fw_prev = flow_state_fw
+                    flow_state_bw_prev = flow_state_bw
+
+                    # edges (normalize per-sample)
+                    with torch.no_grad():
+                        e_prev = self.canny(x_prev01.float()).float()
+                        e_cur = self.canny(x_cur01.float()).float()
+                    e_prev = e_prev / (e_prev.amax(dim=(-2, -1), keepdim=True) + cfg.eps)
+                    e_cur = e_cur / (e_cur.amax(dim=(-2, -1), keepdim=True) + cfg.eps)
+                    e_prev = e_prev.to(x_prev01.dtype)
+                    e_cur = e_cur.to(x_prev01.dtype)
+
+                    # flows
                     flow_fw, flow_state_fw = self._predict_flow_one_step(
-                        x01=x_prev01, e=e_prev, ctx=ctx_map.float(), a_t=a_t.float(),
-                        state=flow_state_fw, first=(t == 1), direction="fw"
+                        x01=x_prev01,
+                        x2=x_cur01,
+                        e=e_prev,
+                        e2=e_cur,
+                        ctx=ctx_map,
+                        a_t=a_t,
+                        state=flow_state_fw,
+                        first=(t == 1),
+                        direction="fw",
                     )
                     flow_bw, flow_state_bw = self._predict_flow_one_step(
-                        x01=x_t01, e=e_tgt, ctx=ctx_map.float(), a_t=a_t.float(),
-                        state=flow_state_bw, first=(t == 1), direction="bw"
+                        x01=x_cur01,
+                        x2=x_prev01,
+                        e=e_cur,
+                        e2=e_prev,
+                        ctx=ctx_map,
+                        a_t=a_t,
+                        state=flow_state_bw,
+                        first=(t == 1),
+                        direction="bw",
                     )
 
-                    e_prev_to_cur = self.warp_with_mode(e_prev, flow_bw, mode="nearest")
-                    x_prev_to_cur = image_warp(x_prev01, flow_bw)
-                    edge_guide = torch.cat([e_prev_to_cur, x_prev_to_cur], dim=1).to(dtype)
-                    edge_guide = (edge_guide * vm).detach()
+                    flow_fw = flow_fw * vm
+                    flow_bw = flow_bw * vm
+
+                    flow_state_fw = flow_state_fw * vm + flow_state_fw_prev * (1.0 - vm)
+                    flow_state_bw = flow_state_bw * vm + flow_state_bw_prev * (1.0 - vm)
+
+                    # build edge_guide: (edge + warped RGB) → 4ch
+                    x_warp01, denom = self.forward_splat_bilinear(x_prev01, flow_fw)
+                    x_warp01 = x_warp01.clamp(0.0, 1.0)
+                    valid = (denom > 0.5).to(x_warp01.dtype) * vm
+                    x_warp01 = x_warp01 * valid + x_prev01 * (1 - valid)  # hole-fill with original where denom is bad
+
+                    with torch.amp.autocast(device_type="cuda", enabled=False):
+                        e_warp = self.canny(x_warp01.float()).float()
+
+                    edge_guide = torch.cat([e_warp.to(dtype), x_warp01.to(dtype)], dim=1)
+                    edge_guide = edge_guide * vm.to(edge_guide.dtype)
+
+                # --- warp core_state early (t-1 -> t) so conditioning is aligned ---
+                if self.warp_core_state and (t > 0):
+                    h, c, m_ = core_state
+                    vm_map_h = mask_t.view(B, 1, 1, 1).to(h.dtype)
+                    h, c, m_ = h * vm_map_h, c * vm_map_h, m_ * vm_map_h
+
+                    h_w, den_h = self.forward_splat_bilinear(h, flow_lat_prev)
+                    c_w, den_c = self.forward_splat_bilinear(c, flow_lat_prev)
+                    m_w, den_m = self.forward_splat_bilinear(m_, flow_lat_prev)
+
+                    vh = (den_h > 0.5).to(h.dtype) * vm_map_h
+                    vc = (den_c > 0.5).to(h.dtype) * vm_map_h
+                    vmh = (den_m > 0.5).to(h.dtype) * vm_map_h
+
+                    h = h_w * vh + h * (1 - vh)
+                    c = c_w * vc + c * (1 - vc)
+                    m_ = m_w * vmh + m_ * (1 - vmh)
+                    core_state = (h, c, m_)
+
+                h_context_map = self.rnn.out_norm(core_state[0])
 
                 x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
                 vdvae_out, temporal_state = self.vdvae.forward_temporal_step(
-                    x_t_nhwc, x_t_nhwc,
-                    h_context=h_context_map, a_t=a_t, mask_t=mask_t,
-                    edge_guide=edge_guide, temporal_state=temporal_state,
+                    x_t_nhwc,
+                    x_t_nhwc,
+                    h_context=h_context_map,
+                    a_t=a_t,
+                    mask_t=mask_t,
+                    edge_guide=edge_guide,
+                    temporal_state=temporal_state,
                 )
 
-                # Update top-level LSTM with posterior mean top-latent (teacher forced)
-                top_q_mean_map = vdvae_out["top_q_mean_map"]        # [B, zdim, topH, topW]
-                top_q_logsig_map = vdvae_out["top_q_logvar_map"]    # IMPORTANT: this is log-sigma 
-                z_top_map = draw_gaussian_diag_samples(top_q_mean_map, top_q_logsig_map)
+                z_top_map = draw_gaussian_diag_samples(
+                    vdvae_out["top_q_mean_map"], vdvae_out["top_q_logvar_map"]
+                )
+                # LatentWarp top-z propagation using predicted top-grid forward flow (flow_lat_prev)
+                z_used = z_top_map
+                if have_prev_top and (self.lw_blend > 0.0):
+                    # Prefer true LatentWarp backward-warp during warmup when full-res flow is available.
+                    if (t > 0) and (flow_fw is not None) and (flow_bw is not None):
+                        flow_bw_top, keep_top = self._latentwarp_build_keep_top(
+                            x_prev01=initial_obs01[:, t - 1].float(),
+                            x_cur01=initial_obs01[:, t].float(),
+                            flow_fw=flow_fw,
+                            flow_bw=flow_bw,
+                            top_hw=(topH, topW),
+                            mask_t=mask_t,
+                            padding_mode=cfg.warp_padding_mode if cfg is not None else "border",
+                        )
+                        flow_bw_top_use = flow_bw_top.detach() if self.lw_detach_flow else flow_bw_top
+                        keep_top_use = keep_top.detach() if self.lw_detach_flow else keep_top
+                        z_used = self._latentwarp_align_top_z(
+                            z_cur=z_top_map,
+                            z_prev=z_top_prev.detach(),
+                            flow_bw_top=flow_bw_top_use,
+                            keep_top=keep_top_use,
+                        )
+                    else:
+                        # Fallback: propagate with predicted top-grid forward flow (hole-aware).
+                        z_prop, denom = self.forward_splat_bilinear(z_top_prev, flow_lat_prev)
+                        keep = (denom > 0.5).to(dtype=z_top_map.dtype) * mask_t.view(B, 1, 1, 1).to(dtype=z_top_map.dtype)
+                        z_used = z_top_map + (self.lw_blend * keep) * (z_prop - z_top_map)
+
+                z_top_prev = z_used.detach()
+                have_prev_top = True
+
+
+                a_fwd = actions[:, t] if t < (T_ctx + horizon - 1) else a_t
+                hf_top_map, motion_ctx_map, flow_lat_cur, y_warp_next, motion_tokens, extra_maps, _ = self._latent_motion_step(
+                    temporal_state=temporal_state,
+                    h_context_map=h_context_map,
+                    motion_tokens=motion_tokens,
+                    y_warp_in=y_warp_in,
+                    a_in=a_t,
+                    a_fwd=a_fwd,
+                    flow_teacher_fw_64=flow_fw if (flow_fw is not None) else None,
+                    edge_fullres=e_warp if (e_warp is not None) else None,
+                    mask_t=mask_t,
+                    step=t,
+                )
+
+                # refine top-grid flow to dense 64×64
+                flow64_base = self._upsample_lat_flow_to_64(
+                    flow_lat_cur, hf_top_map, motion_ctx_map, mask_t=mask_t
+                )
+                hf_top_up = self.hf_top_upsampler(hf_top_map)
+                mot_up = self.mot_top_upsampler(motion_ctx_map)
+                h64_t = temporal_state["64"][0]
+
+                flow64_in = torch.cat(
+                    [
+                        flow64_base,
+                        self.flow64_feat_proj(h64_t),
+                        self.flow64_hf_proj(hf_top_up),
+                        self.flow64_mot_proj(mot_up),
+                    ],
+                    dim=1,
+                )
+                md = self.max_delta_calib.update(flow64_base)
+                self.flow64_refiner.max_delta = md
+                flow64_cur = flow64_base + self.flow64_refiner(flow64_in)
+
                 h_context_map, core_state = self.rnn(
-                    z_top_map,          # [B, zdim, topH, topW]
-                    a_t,                # [B, action_dim]
-                    state=core_state,   # (h,c,m), each [B, hidden_dim, topH, topW]
-                    mask_t=mask_t,      # [B] keep mask (1 keep, 0 reset)
+                    z_used, a_t, state=core_state, mask_t=mask_t, extra_maps=extra_maps
                 )
-                
 
-            assert T_ctx >= 1, "Need at least 1 context frame (T_ctx>=1)"
+                flow_lat_prev = flow_lat_cur
+                flow64_prev = flow64_cur
+                y_warp_in = y_warp_next
+                prev_img01 = initial_obs01[:, t]  # keep consistent with GT in warmup
 
-            x_prev = initial_obs[:, T_ctx - 1]  # [B,C,H,W]
-
-            # future rollout
-            pred_imgs: list[torch.Tensor] = []
-            latent_state: list[torch.Tensor] = []
-            hidden_state: list[torch.Tensor] = []
-            debug = {"c_top": [], "flow": [], "edge_warp": []}
-            topH, topW = self.top_H, self.top_W
+            # ---- imagination ----
             for k in range(horizon):
-                t = T_ctx + k
-                a_t = actions[:, t-1]
-                mask_t = compute_mask_t(t)
-                vm = mask_t.view(B, 1, 1, 1)
+                t_abs = T_ctx + k
+                mask_t = mask_at(t_abs)
+                a_t = actions[:, t_abs - 1]
 
-                h_map = self.vdvae._coerce_h_context_map(h_context_map, Ht=topH, Wt=topW)
-                h_map = self.vdvae.add_PosEncode(h_map, self.vdvae.top_pe, scale=0.05)
-                h_tokens = h_map.permute(0, 2, 3, 1).contiguous().view(B * topH * topW, h_map.shape[1])
+                vm_tok = mask_t.view(B, 1, 1)
+                base_tok = self.motion_tokens_base.expand(B, -1, -1).to(device=device, dtype=dtype)
+                motion_tokens = motion_tokens * vm_tok + base_tok * (1.0 - vm_tok)
 
-                _, prior_params = self.prior(h_tokens)
-                K = prior_params['pi'].shape[-1]
-                pi_tok = prior_params['pi'].view(B, topH * topW, K).clamp_min(self.eps)
+                vm_map = mask_t.view(B, 1, 1, 1)
+                flow_lat_prev = flow_lat_prev * vm_map
+                flow64_prev = flow64_prev * vm_map
+                y_warp_in = y_warp_in * vm_map
+
+                # --- warp core_state early (t-1 -> t) before prior sampling ---
+                if self.warp_core_state and (t_abs > 0):
+                    h, c, m_ = core_state
+                    vm_map_h = mask_t.view(B, 1, 1, 1).to(h.dtype)
+                    h, c, m_ = h * vm_map_h, c * vm_map_h, m_ * vm_map_h
+
+                    h_w, den_h = self.forward_splat_bilinear(h, flow_lat_prev)
+                    c_w, den_c = self.forward_splat_bilinear(c, flow_lat_prev)
+                    m_w, den_m = self.forward_splat_bilinear(m_, flow_lat_prev)
+
+                    vh = (den_h > 0.5).to(h.dtype) * vm_map_h
+                    vc = (den_c > 0.5).to(h.dtype) * vm_map_h
+                    vmh = (den_m > 0.5).to(h.dtype) * vm_map_h
+
+                    h = h_w * vh + h * (1 - vh)
+                    c = c_w * vc + c * (1 - vc)
+                    m_ = m_w * vmh + m_ * (1 - vmh)
+                    core_state = (h, c, m_)
+
+                h_context_map = self.rnn.out_norm(core_state[0])
+
+                # warp temporal_state["64"] forward (hole-fill)
+                if t_abs > 0:
+                    h64_prev, c64_prev = temporal_state["64"]
+
+                    h64_w, den = self.forward_splat_bilinear(h64_prev, flow64_prev)
+                    v = (den > 0.5).to(h64_prev.dtype) * vm_map.to(h64_prev.dtype)
+                    h64_prev = h64_w * v + h64_prev * (1 - v)
+
+                    c64_w, den = self.forward_splat_bilinear(c64_prev, flow64_prev)
+                    v = (den > 0.5).to(c64_prev.dtype) * vm_map.to(c64_prev.dtype)
+                    c64_prev = c64_w * v + c64_prev * (1 - v)
+
+                    temporal_state["64"] = (h64_prev, c64_prev)
+
+                # imagination edge_guide: (edge + warped RGB) → 4ch
+                edge_guide = None
+                e_warp = None
+                if self.use_edge_conditioning:
+                    flow_img = flow64_prev
+                    if (H, W) != (64, 64):
+                        if (H % 64 == 0) and (W % 64 == 0):
+                            flow_img = upsample_flow(flow64_prev, (H, W))
+                        else:
+                            flow_img = F.interpolate(flow64_prev, size=(H, W), mode="bilinear", align_corners=False)
+                            flow_img[:, 0] = flow_img[:, 0] * (float(W) / 64.0)
+                            flow_img[:, 1] = flow_img[:, 1] * (float(H) / 64.0)
+
+                    x_warp01, denom = self.forward_splat_bilinear(prev_img01, flow_img)
+                    x_warp01 = x_warp01.clamp(0.0, 1.0)
+                    vm_map = mask_t.view(B,1,1,1).to(x_warp01.dtype)
+                    valid = (denom > 0.5).to(x_warp01.dtype) * vm_map
+                    x_warp01 = x_warp01 * valid + prev_img01 * (1 - valid)  # hole-fill with previous frame where denom is bad
+
+                    with torch.amp.autocast(device_type="cuda", enabled=False):
+                        e_warp = self.canny(x_warp01.float()).float()
+
+                    edge_warp_seq.append(e_warp * vm_map.to(e_warp.dtype))
+                    edge_guide = torch.cat([e_warp.to(dtype), x_warp01.to(dtype)], dim=1)
+                    edge_guide = edge_guide * vm_map.to(edge_guide.dtype)
+
+                mix, prior_params, _ = self._top_prior_from_h_context_map(h_context_map)
+
+                K = prior_params["pi"].shape[-1]
+                pi_tok = prior_params["pi"].view(B, topH * topW, K).clamp_min(self.eps)
                 pi_tok = pi_tok / pi_tok.sum(dim=-1, keepdim=True)
-                mu_tok = prior_params['means'].view(B, topH * topW, K, self.zdim)
-                var_tok = torch.exp(prior_params['log_vars']).view(B, topH * topW, K, self.zdim)
-                if grad:
-                    # differentiable mixture selection
-                    logits = (pi_tok + self.eps).log()
-                    y = F.gumbel_softmax(logits, tau=top_temperature, hard=False, dim=-1)  # [B,T,K]
-                    mu_sel  = (y[..., None] * mu_tok).sum(dim=2)
-                    var_sel = (y[..., None] * var_tok).sum(dim=2)
-                    c_tok = y.argmax(dim=-1)
-                else:
-                    # exact categorical + gather (temperature applied to logits)
-                    logits = (pi_tok + self.eps).log() 
-                    pi_adj = F.softmax(logits, dim=-1)
-                    c_tok = torch.distributions.Categorical(probs=pi_adj).sample()  # [B,T]
+                pi_map = prior_params["pi"].view(B, topH, topW, K).permute(0, 3, 1, 2).contiguous()
+                pi_seq.append(pi_map.detach())
 
+                mu_tok = prior_params["means"].view(B, topH * topW, K, self.zdim)
+                var_tok = torch.exp(prior_params["log_vars"]).view(B, topH * topW, K, self.zdim)
+
+                logits = (pi_tok + self.eps).log()
+                if grad:
+                    y = F.gumbel_softmax(logits, tau=max(top_temperature, 1e-4), hard=False, dim=-1)
+                    mu_sel = (y[..., None] * mu_tok).sum(dim=2)
+                    var_sel = (y[..., None] * var_tok).sum(dim=2)
+                else:
+                    if top_temperature != 1.0:
+                        logits = logits / max(top_temperature, 1e-4)
+                    pi_adj = F.softmax(logits, dim=-1)
+                    c_tok = torch.distributions.Categorical(probs=pi_adj).sample()
                     idx = c_tok.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.zdim)
-                    mu_sel  = mu_tok.gather(2, idx).squeeze(2)
+                    mu_sel = mu_tok.gather(2, idx).squeeze(2)
                     var_sel = var_tok.gather(2, idx).squeeze(2)
 
-                eps_z = torch.normal(mean=0.0, std=0.5, size=mu_sel.shape, device=mu_sel.device, dtype=mu_sel.dtype)
+                eps_z = torch.randn_like(mu_sel)
                 z_tok = mu_sel + eps_z * torch.sqrt(var_sel.clamp_min(self.eps))
+                z_top_map = z_tok.view(B, topH, topW, self.zdim).permute(0, 3, 1, 2).contiguous()
+                # LatentWarp top-z propagation (imagination): forward-splat prev z using flow_lat_prev
+                z_used = z_top_map
+                if have_prev_top and (self.lw_blend > 0.0):
+                    z_prop, denom = self.forward_splat_bilinear(z_top_prev, flow_lat_prev)
+                    keep = (denom > 0.5).to(dtype=z_top_map.dtype) * mask_t.view(B, 1, 1, 1).to(dtype=z_top_map.dtype)
 
-                z_top_map = (
-                    z_tok.view(B, topH, topW, self.zdim)
-                    .permute(0, 3, 1, 2)
-                    .contiguous()
-                )  # [B, zdim, 4, 4]
+                    # Confidence decay to prevent compounding alignment errors over long rollouts.
+                    conf_decay = 0.85
+                    z_conf = (z_conf * conf_decay * keep).clamp(max=1.0)
+                    z_used = z_top_map + (self.lw_blend * z_conf) * (z_prop - z_top_map)
+                    z_conf = torch.where(keep > 0.5, (z_conf + 0.3).clamp(max=1.0), z_conf)
 
-                c_tok = c_tok.view(B, topH, topW)
+                z_top_prev = z_used.detach()
+                have_prev_top = True
 
-                #  2) motion scaffold: predict flow + mask from (x_prev, edges(x_prev), h_context)
-                x_prev01 = self.denormalize_generated_images(x_prev).clamp(0.0, 1.0).float()
-                if grad:
-                    e_prev = self.canny(x_prev01).float()   # no detach
-                else:
-                    with torch.no_grad():
-                        e_prev = self.canny(x_prev01).float()
-                h64_prev, _ = temporal_state["64"] #TODO is this the hidden state of ConvLSTM in 64 resolution
-                ctx = self.flow_ctx_proj(h64_prev.float())
-                if (ctx.shape[-2], ctx.shape[-1]) != (H, W):
-                    ctx_map = F.interpolate(ctx, size=(H, W), mode="bilinear", align_corners=False)
-                else:
-                    ctx_map = ctx
 
-                flow_fw, flow_state_fw = self._predict_flow_one_step(
-                    x01=x_prev01, e=e_prev, ctx=ctx_map, a_t=a_t.float(),
-                    state=flow_state_fw, first=False, direction="fw"
-                )
-
-                # forward-splat guidance (full-res)
-                x_warp01, denom = self.forward_splat_bilinear(x_prev01, flow_fw)
-                x_warp01 = x_warp01.clamp(0.0, 1.0)
-                valid = (denom > 0.5).to(x_warp01.dtype)
-                x_warp01 = x_warp01 * valid
-                e_warp = self.canny(x_warp01).float()
-
-                debug["flow"].append(flow_fw.detach())
-                debug["edge_warp"].append(e_warp if grad else e_warp.detach())
-
-                # RGB warp (same flows + weights) -> build 4-channel guide
-
-                guide4 = torch.cat([e_warp, x_warp01], dim=1).to(dtype)  # [B,4,H,W]
-                guide4 = guide4 * mask_t.view(B, 1, 1, 1).to(dtype)
-                guide4 = guide4.detach()
-                # Decode through temporal VDVAE
                 px_z, temporal_state = self.vdvae.decode_from_top_latent_temporal(
-                    z_top_map=z_top_map,
+                    z_top_map=z_used,
                     a_t=a_t,
                     mask_t=mask_t,
                     temporal_state=temporal_state,
-                    e_warp=guide4,
-                    t=None,
-                    temperature=decoder_temperature,
+                    e_warp=edge_guide,  # 4ch guide (edge + warped rgb)
+                    temperature=(0.0 if decode_mode == "mean" else decoder_temperature),
                 )
 
                 dmol_out = self.vdvae.decoder.out_net.forward(px_z)
+                x_hat = mean_from_discretized_mix_logistic(dmol_out, self.vdvae.H.num_mixtures)
+                x_hat = x_hat.permute(0, 3, 1, 2).contiguous()
+                pred_imgs.append(x_hat)
+                z_flat = z_used.permute(0, 2, 3, 1).contiguous().view(B, -1)
+                h_flat = h_context_map.permute(0, 2, 3, 1).contiguous().view(B, -1)
+                z_seq.append(torch.cat([z_flat, h_flat], dim=-1))
 
-                # ---- 1) scratch prediction  ----
-                if decode_mode == "mean":
-                    x_next = mean_from_discretized_mix_logistic(
-                        dmol_out, self.vdvae.decoder.out_net.H.num_mixtures
-                    )
-                elif decode_mode == "sample":
-                    x_next = sample_from_discretized_mix_logistic(
-                        dmol_out, self.vdvae.decoder.out_net.H.num_mixtures
-                    )
-                else:
-                    raise ValueError(f"decode_mode must be 'mean' or 'sample', got {decode_mode}")
+                a_fwd = actions[:, t_abs] if t_abs < (T_ctx + horizon - 1) else a_t
+                hf_top_map, motion_ctx_map, flow_lat_cur, y_warp_next, motion_tokens, extra_maps, _ = self._latent_motion_step(
+                    temporal_state=temporal_state,
+                    h_context_map=h_context_map,
+                    motion_tokens=motion_tokens,
+                    y_warp_in=y_warp_in,
+                    a_in=a_t,
+                    a_fwd=a_fwd,
+                    flow_teacher_fw_64=None,
+                    edge_fullres=e_warp if (e_warp is not None) else None,
+                    mask_t=mask_t,
+                    step=t_abs,
+                )
 
-                x_next = x_next.permute(0, 3, 1, 2).contiguous()  # [B,C,H,W]
-                # ---- 2) decode from latent as usual ----
-                pred_imgs.append(x_next)
+                flow64_base = self._upsample_lat_flow_to_64(
+                    flow_lat_cur, hf_top_map, motion_ctx_map, mask_t=mask_t
+                )
+                hf_top_up = self.hf_top_upsampler(hf_top_map)
+                mot_up = self.mot_top_upsampler(motion_ctx_map)
+                h64_t = temporal_state["64"][0]
 
-                #  4) update x_prev safely with dones-mask
-                vm = mask_t.view(B, 1, 1, 1).float()
-                x_prev = vm * x_next + (1.0 - vm) * x_prev
-                x_prev = x_prev if grad else x_prev.detach()
+                flow64_in = torch.cat(
+                    [
+                        flow64_base,
+                        self.flow64_feat_proj(h64_t),
+                        self.flow64_hf_proj(hf_top_up),
+                        self.flow64_mot_proj(mot_up),
+                    ],
+                    dim=1,
+                )
+                md = self.max_delta_calib.update(flow64_base)
+                self.flow64_refiner.max_delta = md
+                flow64_cur = flow64_base + self.flow64_refiner(flow64_in)
 
-                # Update top-level LSTM with sampled top latent (flattened) + action
-                h_context_map, core_state = self.rnn(z_top_map, a_t, state=core_state, mask_t=mask_t)
-                z_flat = z_top_map.permute(0, 2, 3, 1).contiguous().view(B, topH * topW * self.zdim)
+                h_context_map, core_state = self.rnn(
+                    z_used, a_t, state=core_state, mask_t=mask_t, extra_maps=extra_maps
+                )
 
-                latent_state.append(z_flat.detach())
-                hidden_state.append(h_context_map.permute(0, 2, 3, 1).contiguous().view(B, topH * topW * self.hidden_dim).detach()) #TODO: check this
+                flow_lat_prev = flow_lat_cur
+                flow64_prev = flow64_cur
+                y_warp_in = y_warp_next
 
-                debug["c_top"].append(c_tok.reshape(B, topH, topW).detach())
+                prev_img01 = (x_hat * 0.5 + 0.5).clamp(0.0, 1.0)
+                if not grad:
+                    prev_img01 = prev_img01.detach()
 
-            debug["z_seq"] = torch.cat([torch.stack(latent_state, dim=1), torch.stack(hidden_state, dim=1)], dim=-1)
-            pred_imgs = torch.stack(pred_imgs, dim=1)  # [B, horizon, C, H, W]
-            debug["vae_future"] = pred_imgs
+        vae_future = torch.stack(pred_imgs, dim=1) if len(pred_imgs) else initial_obs.new_zeros((B, 0, C, H, W))
+        z_seq_out = torch.stack(z_seq, dim=1) if len(z_seq) else initial_obs.new_zeros((B, 0, 1))
+        pi_seq_out = torch.stack(pi_seq, dim=1) if len(pi_seq) else initial_obs.new_zeros((B, 0, 1))
 
-            if len(debug.get("flow", [])) > 0:
-                debug["flow"] = torch.stack(debug["flow"], dim=1)
-            if len(debug.get("edge_warp", [])) > 0:
-                debug["edge_warp"] = torch.stack(debug["edge_warp"], dim=1)
-
-            return debug
+        out = {"vae_future": vae_future, "z_seq": z_seq_out, "pi_seq": pi_seq_out}
+        if len(edge_warp_seq):
+            out["edge_warp"] = torch.stack(edge_warp_seq, dim=1)
+        return out
