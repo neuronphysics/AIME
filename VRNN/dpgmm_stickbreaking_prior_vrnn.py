@@ -666,7 +666,7 @@ class FlowCfg:
     blend_use_target_steps: int = 2000
 
     # FB schedule
-    fb_warmup_steps: int = 40
+    fb_warmup_steps: int = 15
     w_fb: float = 0.1
     w_fb_photo: float = 0.3
     fb_alpha1: float = 0.01
@@ -738,16 +738,16 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         warp_core_state: bool =True,
         lambda_lat_feat: float = 0.5,
         lambda_lat_distill:float = 0.5,
-        lambda_top_bottom_warp: float = 0.5,
+        lambda_top_bottom_warp: float = 0.75,
         beta_flow_agree: float = 0.1,
-        # --- LatentWarp on top z (LatentWarp paper-style) ---
-        lambda_z_lw: float = 0.5,          # weight of single top-z temporal consistency loss
+        # --- LatentWarp on top z ---
+        lambda_z_lw: float = 0.75,         # weight of single top-z temporal consistency loss
         lw_alpha: float = 5.0,             # residual penalty in keep score
         lw_threshold: float = 0.6,         # keep threshold in keep score
         lw_tau: float = 0.15,              # temperature for soft keep mask (smaller = sharper)
-        lw_blend: float = 1.0,             # 1.0=hard replace in kept regions; <1 keeps gradients
         lw_hard_mask: bool = False,        # True -> hard (0/1) keep mask; False -> soft mask
-        lw_detach_flow: bool = True        # True -> LatentWarp does NOT backprop into flow nets
+        lw_detach_flow: bool = True,       # True -> LatentWarp does NOT backprop into flow nets
+        lambda_roll_prop: float = 0.25     # rollout cosine alignment between prior mean and warped latent
     ):
         super().__init__()
         # core dimensions
@@ -813,9 +813,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.lw_alpha = float(lw_alpha)
         self.lw_threshold = float(lw_threshold)
         self.lw_tau = float(lw_tau)
-        self.lw_blend = float(lw_blend)
         self.lw_hard_mask = bool(lw_hard_mask)
         self.lw_detach_flow = bool(lw_detach_flow)
+        self.lambda_roll_prop = float(lambda_roll_prop)
 
 
         # initialization different parts of the model
@@ -1017,22 +1017,28 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         flow_bw_top = downsample_flow(flow_bw, (int(top_hw[0]), int(top_hw[1])))
         return flow_bw_top, keep_top
 
-    def _latentwarp_align_top_z(
+    def _masked_cosine_align(
         self,
         *,
-        z_cur: torch.Tensor,         # [B,C,topH,topW]
-        z_prev: torch.Tensor,        # [B,C,topH,topW] (typically detached)
-        flow_bw_top: torch.Tensor,   # [B,2,topH,topW]
-        keep_top: torch.Tensor,      # [B,1,topH,topW] in [0,1]
+        pred_map: torch.Tensor,
+        target_map: torch.Tensor,
+        weight_map: torch.Tensor,
+        detach_target: bool = True,
     ) -> torch.Tensor:
-        """Align previous top-z into current coords and blend (LatentWarp-style)."""
-        z_prev_w = self.warp_with_mode(
-            z_prev, flow_bw_top,
-            mode="bilinear",
-            padding_mode="border",
-        )
-        # residual blend form keeps gradients on z_cur even if keep_top=1 when lw_blend<1
-        return z_cur + (self.lw_blend * keep_top) * (z_prev_w - z_cur)
+        """
+        Masked cosine-alignment loss between a predicted top-latent map and a warped target map.
+        This aligns direction only and avoids the norm inflation problem of raw dot products.
+        """
+        tgt = target_map.detach() if detach_target else target_map
+
+        pred = F.normalize(pred_map, dim=1, eps=self.eps)
+        tgt = F.normalize(tgt, dim=1, eps=self.eps)
+
+        sim = (pred * tgt).sum(dim=1, keepdim=True)  # [B,1,H,W]
+        w = weight_map.detach().to(sim.dtype)
+
+        denom = w.sum().clamp_min(1.0)
+        return -(sim * w).sum() / denom
 
 
     def _coords_to_flow_pix(self, coords: torch.Tensor) -> torch.Tensor:
@@ -2246,7 +2252,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         sW = 64 // topW
         assert sH == sW == self.flow64_scale, (sH, sW, self.flow64_scale)
 
-        # (important) zero-out reset items so you never warp across episode boundaries
+        # (important) zero-out reset items in order to never warp across episode boundaries
         if mask_t is not None:
             vm = mask_t.view(flow_lat.size(0), 1, 1, 1).to(dtype=flow_lat.dtype, device=flow_lat.device)
             flow_lat = flow_lat * vm
@@ -2344,7 +2350,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
 
         # --- LatentWarp buffers for top z (kept across time, reset by mask_t) ---
-        z_top_prev = torch.zeros(B, self.latent_dim, topH, topW, device=device, dtype=dtype)
         top_q_mean_prev = torch.zeros(B, self.latent_dim, topH, topW, device=device, dtype=dtype)
         have_prev_top = False
 
@@ -2497,20 +2502,16 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
             # --- (C) token samples for MI term ---
             z_top_map = draw_gaussian_diag_samples(top_q_mean_map, top_q_logsig_map)
-            # --- LatentWarp top-z alignment (training path) ---
+            # --- LatentWarp top-z consistency (training path; no latent correction) ---
             # Always apply episode-boundary reset to the LatentWarp buffers.
-            vm_map = mask_t.view(B, 1, 1, 1).to(dtype=z_top_prev.dtype, device=z_top_prev.device)
-            z_top_prev = z_top_prev * vm_map
+            vm_map = mask_t.view(B, 1, 1, 1).to(dtype=top_q_mean_prev.dtype, device=top_q_mean_prev.device)
             top_q_mean_prev = top_q_mean_prev * vm_map
 
-            z_used = z_top_map
+            z_rnn = z_top_map
             z_lw = z_top_map.new_zeros(())
             keep_frac = z_top_map.new_zeros(())
 
-            # Alignment blend and consistency loss are independent:
-            # - Blend is controlled by lw_blend (can be enabled even if lambda_z_lw=0)
-            # - Loss is controlled by lambda_z_lw
-            do_lw = have_prev_top and (self.lw_blend > 0.0) and (flow_fw is not None) and (flow_bw is not None)
+            do_lw = have_prev_top and (flow_fw is not None) and (flow_bw is not None)
             if do_lw:
                 flow_bw_top, keep_top = self._latentwarp_build_keep_top(
                     x_prev01=obs01_all[:, t - 1].float(),
@@ -2522,16 +2523,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     padding_mode=cfg.warp_padding_mode if cfg is not None else "border",
                 )
 
-                # Keep detachment behavior symmetric across alignment and loss.
                 flow_bw_top_use = flow_bw_top.detach() if self.lw_detach_flow else flow_bw_top
                 keep_top_use = keep_top.detach() if self.lw_detach_flow else keep_top
-
-                z_used = self._latentwarp_align_top_z(
-                    z_cur=z_top_map,
-                    z_prev=z_top_prev.detach(),
-                    flow_bw_top=flow_bw_top_use,
-                    keep_top=keep_top_use,
-                )
                 keep_frac = keep_top_use.mean().detach()
 
                 if self.lambda_z_lw > 0.0:
@@ -2577,7 +2570,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             outputs["K_eff"].append(K_eff.float().mean())
 
             # store z_flat for disc conditioning
-            z_flat = z_used.permute(0, 2, 3, 1).contiguous().view(B2, Ht * Wt * zdim)
+            z_flat = z_rnn.permute(0, 2, 3, 1).contiguous().view(B2, Ht * Wt * zdim)
 
             # update top-level RNN
             extra_maps = None
@@ -2699,7 +2692,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if t < (seq_len - 1):
                 h64_t = temporal_state["64"][0]
                 h64_w, den = self.forward_splat_bilinear(h64_t, flow64_cur)
-                hf_pred_next = self.hf_pred_net(z_map=z_used, h_context_map=h_context_map, a_t=a_fwd, hf_prev=h64_t)
+                hf_pred_next = self.hf_pred_net(z_map=z_rnn, h_context_map=h_context_map, a_t=a_fwd, hf_prev=h64_t)
                 v = (den > 0.5).to(h64_t.dtype)
                 h64_warp_next = h64_w * v + h64_t * (1 - v)
                 diff = (h64_warp_next - hf_pred_next).abs()                
@@ -2727,9 +2720,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 outputs["lat_distill_loss"].append(hf_top_map.new_zeros(()))
                 #outputs["lat_distill64_loss"].append(hf_top_map.new_zeros(()))
             outputs["lat_flow_mag"].append(lat_stats["flow_mag"])
-            h_context_map, core_state = self.rnn(z_used, a_t, state=core_state, mask_t=mask_t, extra_maps=extra_maps)
+            h_context_map, core_state = self.rnn(z_rnn, a_t, state=core_state, mask_t=mask_t, extra_maps=extra_maps)
             # update LatentWarp buffers for next step
-            z_top_prev = z_used.detach()
             top_q_mean_prev = top_q_mean_map.detach()
             have_prev_top = True
             flow_lat_prev = flow_lat_cur
@@ -3453,6 +3445,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         rollout_feat_match_loss = torch.zeros((), device=observations.device)
         rollout_edge_loss = torch.zeros((), device=observations.device)
         rollout_warp_edge_loss = torch.zeros((), device=observations.device)
+        rollout_prop_cosine = torch.zeros((), device=observations.device)
+        rollout_prop_reg = torch.zeros((), device=observations.device)
 
         if do_rollout and rollout_horizon > 0:
             # Rollout again WITH grad for generator update
@@ -3505,6 +3499,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 z_seq=z_seq_roll_G,
                 sequence_lengths=seq_len_future,
             )
+            rollout_prop_cosine = dbgG.get("rollout_prop_cosine", torch.zeros((), device=observations.device))
+            rollout_prop_reg = warmup_factor * self.lambda_roll_prop * rollout_prop_cosine
 
         # 6) Combine losses with DWA or fixed weights
         if self.use_dwa:
@@ -3542,6 +3538,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             total_gen_loss = self.total_weighter.reduce_losses(total_components, batch_idx)
             # LatentWarp z loss: keep fixed weight (not DWA-weighted)
             total_gen_loss = total_gen_loss + vae_losses.get("z_lw", total_gen_loss.new_zeros(()))
+            total_gen_loss = total_gen_loss + rollout_prop_reg
         else:
             adv_base = (
                 lambda_img_eff * img_adv_loss
@@ -3557,6 +3554,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             total_gen_loss = elbo_loss + adv_base + adv_roll
             total_gen_loss = total_gen_loss + warmup_factor * lambda_edge * rollout_edge_loss
             total_gen_loss = total_gen_loss + warmup_factor * lambda_edge * rollout_warp_edge_loss
+            total_gen_loss = total_gen_loss + rollout_prop_reg
 
         # 7) Backprop generator
         self.gen_optimizer.zero_grad(set_to_none=True)
@@ -3600,6 +3598,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "did_rollout_adv": float(1.0 if do_rollout else 0.0),
             "rollout_edge_loss": float(rollout_edge_loss.item()),
             "rollout_warp_edge_loss": float(rollout_warp_edge_loss.item()),
+            "rollout_prop_cosine": float(rollout_prop_cosine.item()),
+            "rollout_prop_reg": float(rollout_prop_reg.item()),
             "total_gen_loss": float(total_gen_loss.item()),
             "grad_norm": float(grad_norm),
             "effective_components": eff_comp,
@@ -3611,7 +3611,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.current_epoch = epoch
 
     def get_warmup_factor(self) -> float:
-        """Calculate warmup factor for adversarial losses"""
+        """Calculate warmup factor for adversarial and flow-alignment losses."""
         if self.current_epoch < self.warmup_epochs:
             return self.current_epoch / self.warmup_epochs
         return 1.0
@@ -3720,15 +3720,15 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         flow64_prev = torch.zeros(B, 2, 64, 64, device=device, dtype=dtype)
         y_warp_in = torch.zeros(B, self.hf_top_channels, topH, topW, device=device, dtype=dtype)
 
-        # LatentWarp top-z propagation buffers (imagination path)
-        z_top_prev = torch.zeros(B, self.latent_dim, topH, topW, device=device, dtype=dtype)
+        # Top-latent propagation target buffer (imagination path)
+        mu_top_prev = torch.zeros(B, self.latent_dim, topH, topW, device=device, dtype=dtype)
         have_prev_top = False
-        z_conf = torch.zeros(B, 1, topH, topW, device=device, dtype=dtype)  # imagination confidence
 
         pred_imgs: List[torch.Tensor] = []
         z_seq: List[torch.Tensor] = []
         pi_seq: List[torch.Tensor] = []
         edge_warp_seq: List[torch.Tensor] = []
+        rollout_prop_terms: List[torch.Tensor] = []
 
         prev_img01 = initial_obs01[:, -1]  # [B,3,H,W] last context frame in [0,1]
 
@@ -3749,6 +3749,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 flow64_prev = flow64_prev * vm_map
                 flow64_base_prev = flow64_base_prev * vm_map
                 y_warp_in = y_warp_in * vm_map
+                mu_top_prev = mu_top_prev * vm_map
 
                 flow_fw = None
                 flow_bw = None
@@ -3858,37 +3859,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 z_top_map = draw_gaussian_diag_samples(
                     vdvae_out["top_q_mean_map"], vdvae_out["top_q_logvar_map"]
                 )
-                # LatentWarp top-z propagation using predicted top-grid forward flow (flow_lat_prev)
                 z_used = z_top_map
-                if have_prev_top and (self.lw_blend > 0.0):
-                    # Prefer true LatentWarp backward-warp during warmup when full-res flow is available.
-                    if (t > 0) and (flow_fw is not None) and (flow_bw is not None):
-                        flow_bw_top, keep_top = self._latentwarp_build_keep_top(
-                            x_prev01=initial_obs01[:, t - 1].float(),
-                            x_cur01=initial_obs01[:, t].float(),
-                            flow_fw=flow_fw,
-                            flow_bw=flow_bw,
-                            top_hw=(topH, topW),
-                            mask_t=mask_t,
-                            padding_mode=cfg.warp_padding_mode if cfg is not None else "border",
-                        )
-                        flow_bw_top_use = flow_bw_top.detach() if self.lw_detach_flow else flow_bw_top
-                        keep_top_use = keep_top.detach() if self.lw_detach_flow else keep_top
-                        z_used = self._latentwarp_align_top_z(
-                            z_cur=z_top_map,
-                            z_prev=z_top_prev.detach(),
-                            flow_bw_top=flow_bw_top_use,
-                            keep_top=keep_top_use,
-                        )
-                    else:
-                        # Fallback: propagate with predicted top-grid forward flow (hole-aware).
-                        z_prop, denom = self.forward_splat_bilinear(z_top_prev, flow_lat_prev)
-                        keep = (denom > 0.5).to(dtype=z_top_map.dtype) * mask_t.view(B, 1, 1, 1).to(dtype=z_top_map.dtype)
-                        z_used = z_top_map + (self.lw_blend * keep) * (z_prop - z_top_map)
-
-                z_top_prev = z_used.detach()
+                mu_top_prev = vdvae_out["top_q_mean_map"].detach()
                 have_prev_top = True
-
 
                 a_fwd = actions[:, t] if t < (T_ctx + horizon - 1) else a_t
                 hf_top_map, motion_ctx_map, flow_lat_cur, y_warp_next, motion_tokens, extra_maps, _ = self._latent_motion_step(
@@ -3948,6 +3921,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 flow_lat_prev = flow_lat_prev * vm_map
                 flow64_prev = flow64_prev * vm_map
                 y_warp_in = y_warp_in * vm_map
+                mu_top_prev = mu_top_prev * vm_map
 
                 # --- warp core_state early (t-1 -> t) before prior sampling ---
                 if self.warp_core_state and (t_abs > 0):
@@ -4035,24 +4009,29 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     mu_sel = mu_tok.gather(2, idx).squeeze(2)
                     var_sel = var_tok.gather(2, idx).squeeze(2)
 
-                eps_z = torch.randn_like(mu_sel)
-                z_tok = mu_sel + eps_z * torch.sqrt(var_sel.clamp_min(self.eps))
-                z_top_map = z_tok.view(B, topH, topW, self.zdim).permute(0, 3, 1, 2).contiguous()
-                # LatentWarp top-z propagation (imagination): forward-splat prev z using flow_lat_prev
+                mu_sel_map = mu_sel.view(B, topH, topW, self.zdim).permute(0, 3, 1, 2).contiguous()
+                var_sel_map = var_sel.view(B, topH, topW, self.zdim).permute(0, 3, 1, 2).contiguous()
+
+                eps_z = torch.randn_like(mu_sel_map)
+                z_top_map = mu_sel_map + eps_z * torch.sqrt(var_sel_map.clamp_min(self.eps))
+
+                # Pure prior rollout: decoder and RNN only see the sampled prior latent.
                 z_used = z_top_map
-                if have_prev_top and (self.lw_blend > 0.0):
-                    z_prop, denom = self.forward_splat_bilinear(z_top_prev, flow_lat_prev)
+
+                roll_prop_step = z_top_map.new_zeros(())
+                if have_prev_top and grad and (self.lambda_roll_prop > 0.0):
+                    z_prop, denom = self.forward_splat_bilinear(mu_top_prev, flow_lat_prev)
                     keep = (denom > 0.5).to(dtype=z_top_map.dtype) * mask_t.view(B, 1, 1, 1).to(dtype=z_top_map.dtype)
+                    roll_prop_step = self._masked_cosine_align(
+                        pred_map=mu_sel_map,
+                        target_map=z_prop,
+                        weight_map=keep,
+                        detach_target=True,
+                    )
+                rollout_prop_terms.append(roll_prop_step)
 
-                    # Confidence decay to prevent compounding alignment errors over long rollouts.
-                    conf_decay = 0.85
-                    z_conf = (z_conf * conf_decay * keep).clamp(max=1.0)
-                    z_used = z_top_map + (self.lw_blend * z_conf) * (z_prop - z_top_map)
-                    z_conf = torch.where(keep > 0.5, (z_conf + 0.3).clamp(max=1.0), z_conf)
-
-                z_top_prev = z_used.detach()
+                mu_top_prev = mu_sel_map.detach()
                 have_prev_top = True
-
 
                 px_z, temporal_state = self.vdvae.decode_from_top_latent_temporal(
                     z_top_map=z_used,
@@ -4121,7 +4100,18 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         z_seq_out = torch.stack(z_seq, dim=1) if len(z_seq) else initial_obs.new_zeros((B, 0, 1))
         pi_seq_out = torch.stack(pi_seq, dim=1) if len(pi_seq) else initial_obs.new_zeros((B, 0, 1))
 
-        out = {"vae_future": vae_future, "z_seq": z_seq_out, "pi_seq": pi_seq_out}
+        rollout_prop_cosine = (
+            torch.stack(rollout_prop_terms).mean()
+            if len(rollout_prop_terms)
+            else initial_obs.new_zeros(())
+        )
+
+        out = {
+            "vae_future": vae_future,
+            "z_seq": z_seq_out,
+            "pi_seq": pi_seq_out,
+            "rollout_prop_cosine": rollout_prop_cosine,
+        }
         if len(edge_warp_seq):
             out["edge_warp"] = torch.stack(edge_warp_seq, dim=1)
         return out
