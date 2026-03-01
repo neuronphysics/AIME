@@ -1832,7 +1832,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.attn_use_pos_enc = True
         H.attn_pos_num_bands = 6
         H.overshoot_K = 8
-        H.overshoot_n_anchors = 5
 
         # ---- 2) Instantiate VDVAE (no prior yet) ----
         self.vdvae = VDVAE(
@@ -1868,7 +1867,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.use_edge_conditioning = bool(getattr(H, "use_edge_conditioning", False))
         self.edge_condition_min_res = int(getattr(H, "edge_condition_min_res", 64))
         self.overshoot_K = int(getattr(H, "overshoot_K", 8))
-        self.overshoot_n_anchors = int(getattr(H, "overshoot_n_anchors", 4))
 
 
     def _init_discriminators(self, img_disc_layers:int, patch_size: int, num_heads: int = 4):
@@ -2784,7 +2782,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         actions,              # [B,T,A]
         dones=None,
         K=15,
-        n_anchors=6,
         mc_samples=50,
         w_decay=0.9,
         core_state_maps=None,  # (h,c,m): [B,T,hidden,Ht,Wt]
@@ -2793,7 +2790,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         B, T, zdim, Ht, Wt = top_q_mean_maps.shape
 
         if dones is not None:
-            alive, _ = self._lengths_from_dones(dones, T, assume_padded_after_done=True)  # [B,T] bool
+            alive, _ = self._lengths_from_dones(dones, T, assume_padded_after_done=True)
         else:
             alive = torch.ones(B, T, device=device, dtype=torch.bool)
 
@@ -2801,25 +2798,21 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if max_anchor < 0:
             return torch.zeros((), device=device)
 
-        # weights
-        w = torch.tensor([w_decay ** (k - 1) for k in range(1, K + 1)], device=device)
-
-        # choose anchors
-        A = int(min(n_anchors, max_anchor + 1))
-        anchors = torch.randint(0, max_anchor + 1, (A,), device=device)  # [A]
-
-        # require cached states to avoid re-filter compute
         if core_state_maps is None:
             raise ValueError("Pass core_state_maps=(core_h,core_c,core_m) from forward_sequence to avoid redundant filtering.")
 
-        core_h_seq, core_c_seq, core_m_seq = core_state_maps  # each [B,T,hidden,Ht,Wt]
+        # use all full-horizon anchors, deterministically
+        A = max_anchor + 1
+        anchors = torch.arange(A, device=device)
 
-        # Gather anchor states: [B,A,hidden,Ht,Wt] -> [B*A,hidden,Ht,Wt]
+        w = torch.tensor([w_decay ** (k - 1) for k in range(1, K + 1)], device=device, dtype=top_q_mean_maps.dtype)
+
+        core_h_seq, core_c_seq, core_m_seq = core_state_maps
+
         h = core_h_seq[:, anchors].reshape(B * A, -1, Ht, Wt).contiguous()
         c = core_c_seq[:, anchors].reshape(B * A, -1, Ht, Wt).contiguous()
         m = core_m_seq[:, anchors].reshape(B * A, -1, Ht, Wt).contiguous()
 
-        # latent motion buffers for imagined rollouts (B*A batch)
         BA = B * A
         topH, topW = self.top_H, self.top_W
         motion_tokens = self.motion_tokens_base.expand(BA, -1, -1).to(device=device, dtype=top_q_mean_maps.dtype)
@@ -2827,67 +2820,61 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         y_warp_in = torch.zeros(BA, self.hf_top_channels, topH, topW, device=device, dtype=top_q_mean_maps.dtype)
         hf_prev_64 = torch.zeros(BA, self.C64, 64, 64, device=device, dtype=top_q_mean_maps.dtype)
 
-        loss = torch.zeros((), device=device)
-        denom = torch.zeros((), device=device)
+        numer = torch.zeros((), device=device, dtype=top_q_mean_maps.dtype)
+        denom = torch.zeros((), device=device, dtype=top_q_mean_maps.dtype)
 
-        # Precompute base indices for advanced indexing
-        # We will index time t = anchors + k for each k.
         for k in range(1, K + 1):
-            t_idx = anchors + k  # [A]
+            t_idx = anchors + k
             if (t_idx >= T).all():
                 break
 
-            # gather masks/actions/targets at those times for each anchor
-            # shapes: [B, A, ...] -> [B*A, ...]
-            mask_ba = alive[:, t_idx].reshape(B * A)  # bool
+            mask_ba = alive[:, t_idx].reshape(B * A)
             if not mask_ba.any():
-                break
+                continue
 
             if actions is None:
                 a_ba = torch.zeros(B * A, self.action_dim, device=device, dtype=top_q_mean_maps.dtype)
             else:
                 a_ba = actions[:, t_idx - 1].reshape(B * A, -1).contiguous()
 
-            # prior from imagined state
             h_context_map = self.rnn.out_norm(h)
-            mix, prior_params, BHW = self._top_prior_from_h_context_map(h_context_map)  # BHW = (B*A, Ht, Wt)
+            mix, prior_params, BHW = self._top_prior_from_h_context_map(h_context_map)
 
-            # posterior targets at time t (STOP-GRAD)
             q_mu = top_q_mean_maps[:, t_idx].detach().reshape(B * A, zdim, Ht, Wt).contiguous()
             q_logsig = top_q_logsig_maps[:, t_idx].detach().reshape(B * A, zdim, Ht, Wt).contiguous()
             q_logvar = 2.0 * q_logsig
 
-            # tokenize
             N = (B * A) * Ht * Wt
             q_mu_tok = q_mu.permute(0, 2, 3, 1).reshape(N, zdim)
             q_lv_tok = q_logvar.permute(0, 2, 3, 1).reshape(N, zdim)
 
-            # KL per-token -> per-(B*A) -> masked mean
             kl_tok = self.prior.compute_kl_divergence_mc(
                 q_mu_tok, q_lv_tok, prior_params, n_samples=mc_samples, reduction="token"
-            )  # [N]
-            kl_ba = kl_tok.view(B * A, Ht * Wt).mean(dim=1)  # [B*A]
+            )
+            kl_ba = kl_tok.view(B * A, Ht * Wt).mean(dim=1)
 
             mask_f = mask_ba.float()
-            kl_step = (kl_ba * mask_f).sum() / mask_f.sum().clamp(min=1.0)
+            wk = w[k - 1]
 
-            loss = loss + w[k - 1] * kl_step
-            denom = denom + w[k - 1]
+            # true weighted reduction over all valid anchor-step pairs
+            numer = numer + wk * (kl_ba * mask_f).sum()
+            denom = denom + wk * mask_f.sum()
 
-            # advance imagined state (still required!)
             z_samp = self._sample_top_from_prior(mix, BHW).detach()
             extra_maps = None
-            # predict HF(64) from (z_samp, h_context_map, a_ba) and build canonical extra maps
+
             hf_64 = self.hf_pred_net(z_map=z_samp, h_context_map=h_context_map, a_t=a_ba, hf_prev=hf_prev_64)
             temporal_fake = {"64": (hf_64, torch.zeros_like(hf_64))}
-            t_fwd = t_idx.clamp(max=T - 1)
-            a_fwd = actions[:, t_fwd].reshape(B * A, -1).contiguous()
 
-            # if t_idx is the last frame, there is no valid "forward" transition; zero it out
-            valid_fwd = (t_idx < (T - 1)).view(1, A).expand(B, A).reshape(B * A, 1).to(a_fwd.dtype)
-            a_fwd = a_fwd * valid_fwd
+            if actions is None:
+                a_fwd = torch.zeros(B * A, self.action_dim, device=device, dtype=top_q_mean_maps.dtype)
+            else:
+                t_fwd = t_idx.clamp(max=T - 1)
+                a_fwd = actions[:, t_fwd].reshape(B * A, -1).contiguous()
+                valid_fwd = (t_idx < (T - 1)).view(1, A).expand(B, A).reshape(B * A, 1).to(a_fwd.dtype)
+                a_fwd = a_fwd * valid_fwd
 
-            hf_top_map, motion_ctx_map, flow_lat_cur, y_warp_next, motion_tokens, extra_maps, _ = self._latent_motion_step(
+            _, _, flow_lat_cur, y_warp_next, motion_tokens, extra_maps, _ = self._latent_motion_step(
                 temporal_state=temporal_fake,
                 h_context_map=h_context_map,
                 motion_tokens=motion_tokens,
@@ -2900,17 +2887,22 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 step=int(k),
                 h64_override=hf_64,
             )
+
             if self.warp_core_state and k > 1:
                 h, _ = self.forward_splat_bilinear(h, flow_lat_prev)
                 c, _ = self.forward_splat_bilinear(c, flow_lat_prev)
                 m, _ = self.forward_splat_bilinear(m, flow_lat_prev)
+
             flow_lat_prev = flow_lat_cur
             y_warp_in = y_warp_next
             hf_prev_64 = hf_64
 
             h_context_map, (h, c, m) = self.rnn(z_samp, a_ba, state=(h, c, m), mask_t=mask_f, extra_maps=extra_maps)
 
-        return loss / denom
+        if denom.item() == 0:
+            return torch.zeros((), device=device, dtype=top_q_mean_maps.dtype)
+
+        return numer / denom
 
     def compute_total_loss(
         self,
@@ -3022,7 +3014,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 actions,
                 dones=dones,
                 K=K_effect,
-                n_anchors=self.overshoot_n_anchors,
                 mc_samples=self.overshoot_mc_samples,
                 w_decay=self.overshoot_w_decay,
                 core_state_maps=(outputs["core_h_maps"], outputs["core_c_maps"], outputs["core_m_maps"]),
