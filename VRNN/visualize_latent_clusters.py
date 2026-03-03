@@ -237,29 +237,14 @@ def compute_tsne_embedding(
 
 # -----------------------------
 # Teacher-forced context (SpatioTemporalCore + temporal VDVAE)
-# -----------------------------
-
-
+ 
 @torch.no_grad()
 def _get_vdvae_out_at_t(
     model,
     batch: Dict,
     device: torch.device,
     t_select: int = 0,
-) -> Tuple[Dict[str, Any], torch.Tensor, torch.Tensor]:
-    """
-    Returns:
-        vdvae_out at timestep t_select (teacher-forced, consistent with forward_sequence),
-        the corresponding input frame x_t in [-1,1] as [B,C,H,W],
-        and the context map h_context_map used at that timestep as [B,Hctx,Ht,Wt].
-    Works for:
-        - sequential batches: batch['observations'] = [B,T,C,H,W]
-        - image batches:      batch['observations'] = [B,C,H,W] (treated as T=1)
-    """
-    # --- get observations ---
-    if not (isinstance(batch, dict) and "observations" in batch):
-        raise ValueError("Expected a dict batch with key 'observations'.")
-
+):
     obs = batch["observations"].to(device)
     obs = _to_minus1_1(obs)
 
@@ -269,10 +254,6 @@ def _get_vdvae_out_at_t(
     if obs.dim() != 5:
         raise ValueError(f"Expected observations to be 4D or 5D, got shape={tuple(obs.shape)}")
 
-    B, T, C, H, W = obs.shape
-    t_select = int(max(0, min(int(t_select), T - 1)))
-
-    # --- optional actions/dones ---
     actions = batch.get("actions", None)
     if actions is not None:
         actions = actions.to(device)
@@ -282,25 +263,35 @@ def _get_vdvae_out_at_t(
     if dones is not None:
         dones = dones.to(device)
         if dones.dim() == 1:
-            dones = dones[:, None, ...]  # [B,1]
+            dones = dones[:, None, ...]  # [B,1]v
+            
+    B, T, C, H, W = obs.shape
+    t_select = int(max(0, min(int(t_select), T - 1)))
 
-    # --- init spatiotemporal core + temporal vdvae state ---
-    core_state = model.rnn.init_state(
-        B,
-        device=device,
-        dtype=obs.dtype,
-    )
-    h_context_map = model.rnn.out_norm(core_state[0])  # [B,Hdim,Ht,Wt]
+    # get the exact extra maps from the real forward path
+    extra_maps_seq = None
+    if getattr(model.rnn, "extra_channels", 0) > 0 and t_select > 0:
+        obs_prefix = obs[:, :t_select + 1]
+        act_prefix = actions[:, :t_select + 1] if actions is not None else None
+        done_prefix = dones[:, :t_select + 1] if dones is not None else None
 
+        prefix_out = model.forward_sequence(
+            observations=obs_prefix,
+            actions=act_prefix,
+            dones=done_prefix,
+        )
+        extra_maps_seq = prefix_out.get("extra_maps_seq", None)
+
+    core_state = model.rnn.init_state(B, device=device, dtype=obs.dtype)
+    h_context_map = model.rnn.out_norm(core_state[0])
     temporal_state = model.vdvae.init_temporal_state(B, device=device, dtype=obs.dtype)
 
-    # teacher-force up to t_select
     for t in range(t_select + 1):
-        x_t = obs[:, t]  # [B,C,H,W]
+        x_t = obs[:, t]
         x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
 
         if actions is not None and actions.shape[1] > t:
-            a_t = actions[:, t]
+            a_t = actions[:, t-1]
         else:
             a_t = torch.zeros(B, model.action_dim, device=device, dtype=obs.dtype)
 
@@ -315,22 +306,35 @@ def _get_vdvae_out_at_t(
             h_context=h_context_map,
             a_t=a_t,
             mask_t=mask_t,
-            edge_guide=None,           # keep viz simple / cheap; doesn't affect top encoder latents
+            edge_guide=None,
             temporal_state=temporal_state,
         )
 
-        # Update context for the NEXT step only (so vdvae_out at t uses the right prev context)
         if t < t_select:
             z_mean = vdvae_out["top_q_mean_map"]
-            z_logsigma = vdvae_out["top_q_logvar_map"]  # log std
+            z_logsigma = vdvae_out["top_q_logvar_map"]
             z_map = draw_gaussian_diag_samples(z_mean, z_logsigma)
 
-            h_context_map, core_state = model.rnn(z_map, a_t, state=core_state, mask_t=mask_t)
+            extra_maps_t = None
+            if extra_maps_seq is not None and t < len(extra_maps_seq):
+                saved = extra_maps_seq[t]
+                if saved is not None:
+                    extra_maps_t = [
+                        em.to(device=device, dtype=z_map.dtype) for em in saved
+                    ]
+
+            h_context_map, core_state = model.rnn(
+                z_map,
+                a_t,
+                state=core_state,
+                mask_t=mask_t,
+                extra_maps=extra_maps_t,
+            )
 
     return vdvae_out, x_t, h_context_map
 
 
-# -----------------------------
+
 # Latent extraction (+ exemplars)
 # -----------------------------
 @torch.no_grad()

@@ -1349,7 +1349,7 @@ class DMCVBTrainer:
         valid = (denom > 0.5).to(x_prev_to_cur.dtype)
         x_prev_to_cur = x_prev_to_cur * valid
 
-        # edges are computed FROM warped RGB in your model
+        # edges are computed FROM warped RGB 
         e_prev_to_cur = self.model.canny(x_prev_to_cur.float()).clamp(0, 1).float()
 
         rgb_err  = (x_prev_to_cur - x_tgt01).abs().mean(dim=1, keepdim=True).clamp(0, 1)

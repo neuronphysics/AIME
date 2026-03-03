@@ -2129,22 +2129,22 @@ class TemporalDiscriminator(nn.Module):
 
         # ---- Heads (concat z, NO additive z) ----
         self.temporal_head = nn.Sequential(
-            nn.Linear(hidden_dim + z_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+            nn.Linear(hidden_dim + z_dim, hidden_dim ),
+            nn.LayerNorm(hidden_dim ),
             nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim, 1),
         )
         self.spatial_head = nn.Sequential(
-            nn.Linear(hidden_dim + z_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+            nn.Linear(hidden_dim + z_dim, hidden_dim ),
+            nn.LayerNorm(hidden_dim ),
             nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim, 1),
         )
         self.per_frame_head = nn.Sequential(
-            nn.Linear(hidden_dim + z_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+            nn.Linear(hidden_dim + z_dim, hidden_dim ),
+            nn.LayerNorm(hidden_dim ),
             nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim, 1),
         )
 
         # keep behavior similar to your original

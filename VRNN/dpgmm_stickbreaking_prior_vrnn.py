@@ -405,7 +405,7 @@ class AdaptiveStickBreaking(nn.Module):
 class ComponentNN(nn.Module):
     def __init__(self, hidden_dim, latent_dim, max_components):
         super().__init__()
-        inner_dim = hidden_dim * 2
+        inner_dim = hidden_dim * 4
 
         self.fc1 = nn.Linear(hidden_dim, inner_dim)
         self.ln1 = nn.LayerNorm(inner_dim)
@@ -747,7 +747,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         lw_tau: float = 0.15,              # temperature for soft keep mask (smaller = sharper)
         lw_hard_mask: bool = False,        # True -> hard (0/1) keep mask; False -> soft mask
         lw_detach_flow: bool = True,       # True -> LatentWarp does NOT backprop into flow nets
-        lambda_roll_prop: float = 0.25     # rollout cosine alignment between prior mean and warped latent
+        lambda_roll_prop: float = 0.25,    # rollout cosine alignment between prior mean and warped latent
+        lecam_ema_decay: float = 0.99,    # EMA decay for LeCam regularization anchors
     ):
         super().__init__()
         # core dimensions
@@ -816,7 +817,16 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.lw_hard_mask = bool(lw_hard_mask)
         self.lw_detach_flow = bool(lw_detach_flow)
         self.lambda_roll_prop = float(lambda_roll_prop)
+        self.lecam_ema_decay = float(lecam_ema_decay)
 
+        # scalar EMA anchors for LeCam regularization
+        self.register_buffer("lecam_initialized", torch.tensor(False), persistent=True)
+
+        self.register_buffer("lecam_temporal_real_ema", torch.zeros((), dtype=torch.float32), persistent=True)
+        self.register_buffer("lecam_temporal_fake_ema", torch.zeros((), dtype=torch.float32), persistent=True)
+
+        self.register_buffer("lecam_patch_real_ema", torch.zeros((), dtype=torch.float32), persistent=True)
+        self.register_buffer("lecam_patch_fake_ema", torch.zeros((), dtype=torch.float32), persistent=True)
 
         # initialization different parts of the model
         self._init_encoder_decoder(max_components, prior_alpha, prior_beta)
@@ -839,6 +849,46 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         # Setup optimizers
         self._setup_optimizers(learning_rate, weight_decay)
+
+    @torch.no_grad()
+    def _update_lecam_ema(
+        self,
+        temporal_real_mean: torch.Tensor,
+        temporal_fake_mean: torch.Tensor,
+        patch_real_mean: torch.Tensor,
+        patch_fake_mean: torch.Tensor,
+    ) -> None:
+        tr = temporal_real_mean.detach().to(
+            device=self.lecam_temporal_real_ema.device,
+            dtype=self.lecam_temporal_real_ema.dtype,
+        )
+        tf = temporal_fake_mean.detach().to(
+            device=self.lecam_temporal_fake_ema.device,
+            dtype=self.lecam_temporal_fake_ema.dtype,
+        )
+        pr = patch_real_mean.detach().to(
+            device=self.lecam_patch_real_ema.device,
+            dtype=self.lecam_patch_real_ema.dtype,
+        )
+        pf = patch_fake_mean.detach().to(
+            device=self.lecam_patch_fake_ema.device,
+            dtype=self.lecam_patch_fake_ema.dtype,
+        )
+
+        if not bool(self.lecam_initialized):
+            self.lecam_temporal_real_ema.copy_(tr)
+            self.lecam_temporal_fake_ema.copy_(tf)
+            self.lecam_patch_real_ema.copy_(pr)
+            self.lecam_patch_fake_ema.copy_(pf)
+            self.lecam_initialized.fill_(True)
+            return
+
+        d = self.lecam_ema_decay
+
+        self.lecam_temporal_real_ema.mul_(d).add_(tr, alpha=1.0 - d)
+        self.lecam_temporal_fake_ema.mul_(d).add_(tf, alpha=1.0 - d)
+        self.lecam_patch_real_ema.mul_(d).add_(pr, alpha=1.0 - d)
+        self.lecam_patch_fake_ema.mul_(d).add_(pf, alpha=1.0 - d)
 
     def _init_DynamicWeightAverage(self, temperature: float = 2.0):
 
@@ -1322,7 +1372,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         mask_t: Optional[torch.Tensor] = None,  # [B] or [B,1,1,1] ok
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Exact loss stack from flow_warp_sanity.py, adapted to this class.
+        Compute flow warp losses for a pair of frames (x_prev01, x_cur01).
 
         Returns:
         total_loss,
@@ -1418,7 +1468,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # edge/photo losses (masked)
         edge_w = torch.sigmoid((e_prev - cfg.thr_e) / max(cfg.edge_temp, 1e-6)).to(dtype)
         edge_w = edge_w * vm
-        weights = (0.2 + 0.8 * edge_w).clamp(min=0.0)
+        weights = (0.2 + 0.8 * edge_w).clamp(min=0.0)#TODO: tune these constants or make learnable? What is this even doing?
         weights_valid = weights * m_sup
 
         edge_loss = charbonnier_loss(
@@ -2325,12 +2375,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "warp_sanity_total_loss": [],
             "lat_feat_loss": [],
             "lat_distill_loss": [],
+
             #"lat_distill64_loss": [],
             "lat_flow_mag": [],
             "motion_tok_ent": [],
             "motion_ctx_ent": [],
             "top_bottom_warp_consistency":[],
-
+            "extra_maps_seq": [],
             # LatentWarp (top-z)
             "z_lw_loss": [],
             "lw_keep_frac": [],
@@ -2588,6 +2639,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 mask_t=mask_t,
                 step=t,
             )
+            outputs["extra_maps_seq"].append([m.detach() for m in extra_maps])
 
             # motion token / context entropies (for logging)
             tok_ent = getattr(self.token_transporter, "last_attn_entropy", None)
@@ -2774,6 +2826,22 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if outputs["K_eff"]:
             outputs["K_eff"] = torch.stack(outputs["K_eff"]).mean()
         return outputs
+
+    def compute_lecam_loss(
+        self,
+        logits_real: torch.Tensor,
+        logits_fake: torch.Tensor,
+        ema_logits_real: torch.Tensor,
+        ema_logits_fake: torch.Tensor
+    ) -> torch.Tensor:
+        """Computes the LeCam loss for the given average real and fake logits.
+
+        Returns:
+            lecam_loss -> torch.Tensor: The LeCam loss.
+        """
+        lecam_loss = torch.pow(F.relu(logits_real - ema_logits_fake), 2).mean()
+        lecam_loss += torch.pow(F.relu(ema_logits_real - logits_fake), 2).mean()
+        return lecam_loss
 
     def compute_multistep_kl_overshoot(
         self,
@@ -3119,6 +3187,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         sequence_lengths: Optional[torch.Tensor] = None,
         WGAN_GP_Coeff: float = 10.0,
         lambda_consistency: float = 0.4,
+        lambda_temporal_lecam: float = 0.1,
+        lambda_patch_lecam: float = 0.1,
     ) -> Dict[str, torch.Tensor]:
         """
         Training step for both discriminators
@@ -3178,7 +3248,53 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             device= real_images.device,
             mask_flat=mask_flat,
         )
-        img_disc_loss = temporal_disc_loss + lambda_consistency * img_consistency_loss + WGAN_GP_Coeff *img_gp + patch_disc_loss + WGAN_GP_Coeff * patch_gp
+
+        # --- LeCam inputs ---
+        real_temporal_for_lc = real_img_score.reshape(-1)   # one score per sequence
+        fake_temporal_for_lc = fake_img_score.reshape(-1)
+
+        if mask_flat is not None:
+            valid = mask_flat > 0.5
+            real_patch_for_lc = real_frame_score[valid]
+            fake_patch_for_lc = fake_frame_score[valid]
+        else:
+            real_patch_for_lc = real_frame_score
+            fake_patch_for_lc = fake_frame_score
+
+        # current batch means for anchor updates
+        temporal_real_mean = real_temporal_for_lc.mean()
+        temporal_fake_mean = fake_temporal_for_lc.mean()
+        patch_real_mean = real_patch_for_lc.mean()
+        patch_fake_mean = fake_patch_for_lc.mean()
+
+        # don't apply LeCam until anchors are initialized
+        if bool(self.lecam_initialized):
+            temporal_lecam_loss = self.compute_lecam_loss(
+                logits_real=real_temporal_for_lc,
+                logits_fake=fake_temporal_for_lc,
+                ema_logits_real=self.lecam_temporal_real_ema.to(
+                    device=real_temporal_for_lc.device, dtype=real_temporal_for_lc.dtype
+                ),
+                ema_logits_fake=self.lecam_temporal_fake_ema.to(
+                    device=fake_temporal_for_lc.device, dtype=fake_temporal_for_lc.dtype
+                ),
+            )
+
+            patch_lecam_loss = self.compute_lecam_loss(
+                logits_real=real_patch_for_lc,
+                logits_fake=fake_patch_for_lc,
+                ema_logits_real=self.lecam_patch_real_ema.to(
+                    device=real_patch_for_lc.device, dtype=real_patch_for_lc.dtype
+                ),
+                ema_logits_fake=self.lecam_patch_fake_ema.to(
+                    device=fake_patch_for_lc.device, dtype=fake_patch_for_lc.dtype
+                ),
+            )
+        else:
+            temporal_lecam_loss = real_temporal_for_lc.new_zeros(())
+            patch_lecam_loss = real_frame_score.new_zeros(())
+
+        img_disc_loss = temporal_disc_loss + lambda_consistency * img_consistency_loss + WGAN_GP_Coeff *img_gp + patch_disc_loss + WGAN_GP_Coeff * patch_gp + lambda_temporal_lecam * temporal_lecam_loss   + lambda_patch_lecam * patch_lecam_loss
 
         if hasattr(self, 'img_disc_optimizer'):
             # Update image discriminator
@@ -3189,6 +3305,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 self._grad_clip
             )
             self.img_disc_optimizer.step()
+            self._update_lecam_ema(
+                temporal_real_mean=temporal_real_mean,
+                temporal_fake_mean=temporal_fake_mean,
+                patch_real_mean=patch_real_mean,
+                patch_fake_mean=patch_fake_mean,
+            )
 
         disc_losses.update({
             'img_disc_loss': img_disc_loss,
@@ -3203,6 +3325,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'patch_gp': patch_gp.detach(),
             'patch_disc_real': real_frame_score.mean().detach(),
             'patch_disc_fake': fake_frame_score.mean().detach(),
+            'temporal_lecam_loss': temporal_lecam_loss.detach(),
+            'patch_lecam_loss': patch_lecam_loss.detach(),
         })
         return  disc_losses
 
@@ -3211,15 +3335,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                                       fake_features: torch.Tensor,
                                       temporal_mask: torch.Tensor | None = None):
 
-        real_mean = real_features.mean(dim=2)  # [B, T, D]
-        fake_mean = fake_features.mean(dim=2)
-
         if temporal_mask is None:
-           return F.l1_loss(fake_mean, real_mean.detach())
-        m = temporal_mask.float().unsqueeze(-1) #[B, T, 1]
-        diff = torch.abs(fake_mean - real_mean.detach())  # [B,T,D]
+           return F.l1_loss(fake_features, real_features.detach())
+        m = temporal_mask.to(dtype=fake_features.dtype).unsqueeze(-1).unsqueeze(-1) #[B, T, 1, 1]
+        diff = torch.abs(fake_features - real_features.detach())  # [B,T,N,D]
 
-        denom = (m.sum() * diff.shape[-1]).clamp(min=1.0)
+        denom = (m.sum() * diff.shape[2] * diff.shape[3]).clamp(min=1.0)
         return (diff * m).sum() / denom
 
     def compute_adversarial_losses(
@@ -3447,7 +3568,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 horizon=rollout_horizon,
                 top_temperature=self.rollout_top_temperature,
                 decoder_temperature=self.rollout_decoder_temperature,
-                decode_mode="mean",  # keep rollout differentiable
+                decode_mode="sample",  # keep rollout differentiable
                 dones=(dones_slice[keep] if dones_slice is not None else None),
                 grad=True,
             )
