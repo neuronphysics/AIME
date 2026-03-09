@@ -199,7 +199,6 @@ class Decoder(nn.Module):
         self.action_dim = int(action_dim)
         self.hidden_dim = int(hidden_dim)
         self.use_checkpoint = bool(use_checkpoint)
-        # CHANGED: StateFlowEncoder convc1 input dim becomes 64 + action_dim when action is provided.
         self.encode = StateFlowEncoder(statedim=64 + self.action_dim, outdim=62)
 
         # same channels as before
@@ -380,7 +379,7 @@ class HFTopUpsampler(nn.Module):
             blk = self.blocks[i]
             # checkpoint only makes sense during training and when grads are enabled
             if self.use_checkpoint and self.training and torch.is_grad_enabled():
-                x = checkpoint(blk, x)
+                x = checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
 
@@ -849,10 +848,13 @@ class LatentFlowHead(nn.Module):
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, hf_top, mot_ctx, a_map, edge_top):
-        a_emb = self.act_embed(a_map)
+        if self.use_checkpoint and self.training and a_map.requires_grad:
+            a_emb = checkpoint(self.act_embed, a_map, use_reentrant=False)
+        else:
+            a_emb = self.act_embed(a_map)
         x = torch.cat([hf_top, mot_ctx, a_emb, edge_top], dim=1)
 
-        if self.use_checkpoint:
+        if self.use_checkpoint and self.training and x.requires_grad:
             # split sequential into segments (tune 2-4 depending on your depth)
             flow = checkpoint_sequential(self.net, segments=3, input=x, use_reentrant=False)
         else:

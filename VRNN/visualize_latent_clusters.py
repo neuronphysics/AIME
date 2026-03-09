@@ -290,7 +290,7 @@ def _get_vdvae_out_at_t(
         x_t = obs[:, t]
         x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
 
-        if actions is not None and actions.shape[1] > t:
+        if actions is not None and actions.shape[1] >= t and t > 0:
             a_t = actions[:, t-1]
         else:
             a_t = torch.zeros(B, model.action_dim, device=device, dtype=obs.dtype)
@@ -348,7 +348,6 @@ def extract_latents_and_assignments(
     max_points: int = 200000,
     chunk: int = 4096,
     use_rnn_context: bool = True,
-    # New (appended) options; existing callers remain compatible:
     collect_exemplars: bool = True,
     n_exemplars_per_component: int = 6,
 ) -> Dict[str, Any]:
@@ -418,7 +417,7 @@ def extract_latents_and_assignments(
         images = _to_minus1_1(images)
         images_nhwc = images.permute(0, 2, 3, 1).contiguous()
 
-                # --- teacher-forced VDVAE at t_select (matches SpatioTemporalCore + temporal decoding) ---
+        # --- teacher-forced VDVAE at t_select (matches SpatioTemporalCore + temporal decoding) ---
         if isinstance(batch, dict) and "observations" in batch:
             vdvae_out, images_tf, hctx_map = _get_vdvae_out_at_t(model, batch, device, t_select)
         else:
@@ -431,11 +430,7 @@ def extract_latents_and_assignments(
         # Top-level posterior mean map (used as a stable embedding for clustering)
         top_q_mean_map = vdvae_out["top_q_mean_map"]  # [B, C_top, res, res]
 
-        # Prior params are already tokenized consistently inside forward_temporal_step
         prior_params = vdvae_out["prior_params"]
-        pi_tok   = prior_params["pi"]        # [N, K]
-        means    = prior_params["means"]     # [N, K, C_top]
-        log_vars = prior_params["log_vars"]  # [N, K, C_top]
 
         B2, C_top, res_h, res_w = top_q_mean_map.shape
         assert B2 == B, f"Batch mismatch: expected B={B}, got {B2}"
@@ -452,55 +447,127 @@ def extract_latents_and_assignments(
         else:
             h_context = None
 
-        N, K = pi_tok.shape[:2]
-        if K_global is None:
-            K_global = int(K)
-            if collect_exemplars and image_level:
-                exemplar_store = [[] for _ in range(K_global)]
-        else:
-            K = int(K_global)
+        # Old token-level prior path vs new image-level prior path
+        prior_is_token_level = (
+            isinstance(prior_params, dict)
+            and "pi" in prior_params
+            and "means" in prior_params
+            and "log_vars" in prior_params
+            and prior_params["pi"].dim() == 2
+            and prior_params["pi"].shape[0] == B * res * res
+            and prior_params["means"].dim() == 3
+            and prior_params["means"].shape[0] == B * res * res
+            and prior_params["means"].shape[-1] == C_top
+        )
 
-        # responsibilities -> assignments for tokens
-        k_tok = torch.empty(N, dtype=torch.long, device=device)
-        for s in range(0, N, chunk):
-            e = min(N, s + chunk)
-            resp, k = compute_responsibilities(z_tokens[s:e], pi_tok[s:e], means[s:e], log_vars[s:e])
-            k_tok[s:e] = k
+        if prior_is_token_level:
+            pi_tok   = prior_params["pi"]        # [N, K]
+            means    = prior_params["means"]     # [N, K, C_top]
+            log_vars = prior_params["log_vars"]  # [N, K, C_top]
 
-        if image_level:
-            z_img = top_q_mean_map.mean(dim=(2, 3))                       # [B, C_top]
-            k_img = k_tok.view(B, res * res)
-            k_img = torch.mode(k_img, dim=1).values                       # [B]
-            pi_img = pi_tok.view(B, res * res, -1).mean(dim=1)            # [B, K]
+            N, K = pi_tok.shape[:2]
+            if K_global is None:
+                K_global = int(K)
+                if collect_exemplars and image_level:
+                    exemplar_store = [[] for _ in range(K_global)]
+            else:
+                K = int(K_global)
 
-            z_all.append(z_img.detach().cpu())
-            k_all.append(k_img.detach().cpu())
-            pi_all.append(pi_img.detach().cpu())
-            if labels is not None and torch.is_tensor(labels):
-                labels_all.append(labels.cpu())
-            h_context_all.append(h_context.detach().cpu())
+            # responsibilities -> assignments for tokens
+            k_tok = torch.empty(N, dtype=torch.long, device=device)
+            for s in range(0, N, chunk):
+                e = min(N, s + chunk)
+                resp, k = compute_responsibilities(z_tokens[s:e], pi_tok[s:e], means[s:e], log_vars[s:e])
+                k_tok[s:e] = k
 
-            total_points += int(B)
-            if collect_exemplars and exemplar_store and images is not None:
-                # score = pi_img at assigned component (confidence)
-                conf = pi_img[torch.arange(B), k_img].detach()
-                for b in range(B):
-                    kk = int(k_img[b].item())
-                    sc = float(conf[b].item())
-                    # keep top-n per component
-                    lst = exemplar_store[kk]
-                    if len(lst) < n_exemplars_per_component:
-                        lst.append((sc, images[b].detach().cpu()))
-                        lst.sort(key=lambda t: t[0], reverse=True)
-                    else:
-                        if sc > lst[-1][0]:
-                            lst[-1] = (sc, images[b].detach().cpu())
+            if image_level:
+                z_img = top_q_mean_map.mean(dim=(2, 3))                       # [B, C_top]
+                k_img = k_tok.view(B, res * res)
+                k_img = torch.mode(k_img, dim=1).values                       # [B]
+                pi_img = pi_tok.view(B, res * res, -1).mean(dim=1)            # [B, K]
+
+                z_all.append(z_img.detach().cpu())
+                k_all.append(k_img.detach().cpu())
+                pi_all.append(pi_img.detach().cpu())
+                if labels is not None and torch.is_tensor(labels):
+                    labels_all.append(labels.cpu())
+                if h_context is not None:
+                    h_context_all.append(h_context.detach().cpu())
+
+                total_points += int(B)
+                if collect_exemplars and exemplar_store and images is not None:
+                    # score = pi_img at assigned component (confidence)
+                    conf = pi_img[torch.arange(B, device=pi_img.device), k_img].detach()
+                    for b in range(B):
+                        kk = int(k_img[b].item())
+                        sc = float(conf[b].item())
+                        # keep top-n per component
+                        lst = exemplar_store[kk]
+                        if len(lst) < n_exemplars_per_component:
+                            lst.append((sc, images[b].detach().cpu()))
                             lst.sort(key=lambda t: t[0], reverse=True)
+                        else:
+                            if sc > lst[-1][0]:
+                                lst[-1] = (sc, images[b].detach().cpu())
+                                lst.sort(key=lambda t: t[0], reverse=True)
+            else:
+                z_all.append(z_tokens.detach().cpu())
+                k_all.append(k_tok.detach().cpu())
+                pi_all.append(pi_tok.detach().cpu())
+                total_points += int(N)
+
         else:
-            z_all.append(z_tokens.detach().cpu())
-            k_all.append(k_tok.detach().cpu())
-            pi_all.append(pi_tok.detach().cpu())
-            total_points += int(N)
+            # New image-level prior path
+            pi_img = prior_params["pi"]  # [B, K]
+
+            N, K = pi_img.shape[:2]
+            if K_global is None:
+                K_global = int(K)
+                if collect_exemplars and image_level:
+                    exemplar_store = [[] for _ in range(K_global)]
+            else:
+                K = int(K_global)
+
+            z_img_full = top_q_mean_map.reshape(B, -1)  # [B, C_top*res*res]
+            resp_img = model.vdvae.prior.compute_responsibilities(
+                z_img=z_img_full,
+                prior_params=prior_params,
+            )
+            k_img = torch.argmax(resp_img, dim=-1)  # [B]
+
+            if image_level:
+                z_img = top_q_mean_map.mean(dim=(2, 3))  # [B, C_top]
+
+                z_all.append(z_img.detach().cpu())
+                k_all.append(k_img.detach().cpu())
+                pi_all.append(pi_img.detach().cpu())
+                if labels is not None and torch.is_tensor(labels):
+                    labels_all.append(labels.cpu())
+                if h_context is not None:
+                    h_context_all.append(h_context.detach().cpu())
+
+                total_points += int(B)
+                if collect_exemplars and exemplar_store and images is not None:
+                    conf = pi_img[torch.arange(B, device=pi_img.device), k_img].detach()
+                    for b in range(B):
+                        kk = int(k_img[b].item())
+                        sc = float(conf[b].item())
+                        lst = exemplar_store[kk]
+                        if len(lst) < n_exemplars_per_component:
+                            lst.append((sc, images[b].detach().cpu()))
+                            lst.sort(key=lambda t: t[0], reverse=True)
+                        else:
+                            if sc > lst[-1][0]:
+                                lst[-1] = (sc, images[b].detach().cpu())
+                                lst.sort(key=lambda t: t[0], reverse=True)
+            else:
+                pi_tok = pi_img[:, None, :].expand(B, res * res, K).reshape(B * res * res, K)
+                k_tok = k_img[:, None].expand(B, res * res).reshape(B * res * res)
+
+                z_all.append(z_tokens.detach().cpu())
+                k_all.append(k_tok.detach().cpu())
+                pi_all.append(pi_tok.detach().cpu())
+                total_points += int(B * res * res)
 
         if total_points >= max_points:
             break
@@ -547,7 +614,6 @@ def extract_latents_and_assignments(
             out["exemplar_counts"] = ex_cnt.numpy()
 
     return out
-
 
 # Main visualization
 def visualize_dpgmm_clustering(

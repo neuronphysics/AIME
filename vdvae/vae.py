@@ -930,9 +930,7 @@ class VDVAE(HModule):
         edge_guide: Optional[torch.Tensor] = None,
         get_latents: bool = False,
     ):
-        """Teacher-forced forward for ONE time step with temporal lower priors.
-        Returns: (out_dict, temporal_state_updated)
-        """
+        """Teacher-forced forward for one time step with an image-level DP-GMM top prior."""
         activations = self.encoder.forward(x)
 
         px_z, stats, temporal_state = self.decoder.forward_temporal(
@@ -944,77 +942,77 @@ class VDVAE(HModule):
             get_latents=get_latents,
         )
 
-        distortion_per_pixel = self.decoder.out_net.nll(px_z, x_target)
-        ndims = float(np.prod(x_target.shape[1:]))  # C*H*W, used to normalize KL to per-pixel units
+        distortion_per_pixel = self.decoder.out_net.nll(px_z, x_target)   # [B]
+        ndims = float(np.prod(x_target.shape[1:]))                        # C * H * W
 
-        # Sum KLs for all NON-top blocks (already KL(q||p_temporal) if enabled)
-        rate_gauss = torch.zeros_like(distortion_per_pixel)
+        rate_gauss = torch.zeros_like(distortion_per_pixel)               # [B]
         top_q_mean_map = None
-        top_q_logvar_map = None
+        top_q_logsig_map = None
+
         for block, st in zip(self.decoder.dec_blocks, stats):
-            kl_block = st["kl"].sum(dim=(1, 2, 3))
+            kl_block = st["kl"].sum(dim=(1, 2, 3))                        # [B]
             if getattr(block, "is_top", False):
                 top_q_mean_map = st.get("posterior_mean", None)
-                top_q_logvar_map = st.get("posterior_logvar", None)
+                top_q_logsig_map = st.get("posterior_logvar", None)       # log-sigma
             else:
                 rate_gauss = rate_gauss + kl_block
+
         rate_gauss = rate_gauss / ndims
 
-        
+        dp_kl_img = None
         dp_rate = torch.zeros_like(distortion_per_pixel)
-        dp_kl = None
         prior_params = None
+
         if (
             self.prior is not None
             and top_q_mean_map is not None
-            and top_q_logvar_map is not None
+            and top_q_logsig_map is not None
         ):
             B, C, Ht, Wt = top_q_mean_map.shape
-            N = B * Ht * Wt
 
             h_map = self._coerce_h_context_map(h_context, Ht=Ht, Wt=Wt)
             h_map = self.add_PosEncode(h_map, self.top_pe, scale=0.05)
-            h_tokens = h_map.permute(0, 2, 3, 1).contiguous().view(N, h_map.shape[1])
 
-            top_q_mean_tokens = top_q_mean_map.permute(0, 2, 3, 1).contiguous().view(N, C)
-            top_q_logvar_tokens = 2* top_q_logvar_map.permute(0, 2, 3, 1).contiguous().view(N, C)
+            top_q_mean_img = top_q_mean_map.contiguous().view(B, C * Ht * Wt)
+            top_q_logvar_img = (2.0 * top_q_logsig_map).contiguous().view(B, C * Ht * Wt)
 
-            _, prior_params = self.prior(h_tokens)
-            dp_kl = self.prior.compute_kl_divergence_mc(
-                posterior_mean=top_q_mean_tokens,
-                posterior_logvar=top_q_logvar_tokens,
+            _, prior_params = self.prior(h_map)
+            dp_kl_img = self.prior.compute_kl_divergence_mc(
+                posterior_mean=top_q_mean_img,
+                posterior_logvar=top_q_logvar_img,
                 prior_params=prior_params,
                 n_samples=self.prior_kl_mc_samples,
-                reduction= "token"
-            )
-            tokens_per_img = Ht * Wt
-            dp_kl_img = dp_kl.view(B, tokens_per_img).mean(dim=1)  # [B]
-            dp_rate = self.top_kl_weight * (dp_kl_img * float(tokens_per_img)) / ndims
+                reduction="image",
+            )  # [B]
 
-        rate = rate_gauss + dp_rate
-        elbo = distortion_per_pixel + rate
-        vm = mask_t.float()                          # [B]
-        den = vm.sum().clamp(min=1.0)                # scalar
+            dp_rate = self.top_kl_weight * dp_kl_img / ndims
 
-        def masked_mean(x):                          # x: [B]
+        total_rate = rate_gauss + dp_rate                                 # [B]
+        elbo_per_sample = distortion_per_pixel + total_rate               # [B]
+
+        vm = mask_t.float()
+        den = vm.sum().clamp(min=1.0)
+
+        def masked_mean(x):
             return (x * vm).sum() / den
 
         out = {
-            "elbo": masked_mean(elbo),
+            "elbo": masked_mean(elbo_per_sample),
             "distortion": masked_mean(distortion_per_pixel),
             "gauss_rate": masked_mean(rate_gauss),
-            "rate": masked_mean(rate),
+            "rate": masked_mean(total_rate),
             "dp_rate": masked_mean(dp_rate),
             "stats": stats,
             "px_z": px_z,
             "top_q_mean_map": top_q_mean_map,
-            "top_q_logvar_map": top_q_logvar_map,
+            "top_q_logvar_map": top_q_logsig_map,
             "prior_params": prior_params,
-            "valid_count": den,  # optional, useful for logging
+            "valid_count": den,
         }
 
-        if dp_kl is not None:
+        if dp_kl_img is not None:
             out["dp_kl"] = masked_mean(dp_kl_img)
+
         return out, temporal_state
 
     def decode_from_top_latent_temporal(
@@ -1046,130 +1044,93 @@ class VDVAE(HModule):
 
     def forward(self, x: torch.Tensor, x_target: torch.Tensor, h_context: Optional[torch.Tensor] = None):
         """
-        x:        [B, H, W, C]
-        x_target: same as x
-
-        h_context: optional [B, hidden_dim, H, W] conditioning vector for the DPGMM prior.
-
-        IMPORTANT: for the DPGMM we treat the top-level spatial latents
-        z_top[b, c, h, w] as a *bag of feature vectors* of shape [C],
-        i.e. we reshape [B, C, Ht, Wt] -> [B * Ht * Wt, C].
+        Non-temporal forward pass with an image-level DP-GMM prior at the top latent.
         """
-
-        # 1) Encode / decode
-        activations = self.encoder.forward(x)                     # encoder expects NHWC
+        activations = self.encoder.forward(x)
         px_z, stats = self.decoder.forward(activations, get_latents=True)
 
-        # 2) Reconstruction loss
         distortion_per_pixel = self.decoder.out_net.nll(px_z, x_target)  # [B]
-        ndims = np.prod(x.shape[1:])  # H * W * C
+        ndims = float(np.prod(x.shape[1:]))
 
-        # 3) Gaussian KL from all NON-top blocks only
-        rate_gauss = torch.zeros_like(distortion_per_pixel)  # [B]
-
-        top_q_mean_map = None   # [B, C, Ht, Wt]
-        top_q_logvar_map = None # [B, C, Ht, Wt]
+        rate_gauss = torch.zeros_like(distortion_per_pixel)
+        top_q_mean_map = None
+        top_q_logsig_map = None
 
         for block, statdict in zip(self.decoder.dec_blocks, stats):
-            kl_block = statdict["kl"].sum(dim=(1, 2, 3))  # [B]
-
+            kl_block = statdict["kl"].sum(dim=(1, 2, 3))
             if getattr(block, "is_top", False):
-                # Top-most stochastic block: we REPLACE its Gaussian prior
-                # with the DPGMM, so we do NOT add its KL here.
                 if "posterior_mean" in statdict and "posterior_logvar" in statdict:
-                    top_q_mean_map = statdict["posterior_mean"]      # [B, C, Ht, Wt]
-                    top_q_logvar_map = statdict["posterior_logvar"]  # [B, C, Ht, Wt]
+                    top_q_mean_map = statdict["posterior_mean"]
+                    top_q_logsig_map = statdict["posterior_logvar"]   # log-sigma
             else:
-                # Standard Gaussian KL for all lower blocks
-                rate_gauss += kl_block
+                rate_gauss = rate_gauss + kl_block
 
-        rate_gauss = rate_gauss / ndims  # [B]
+        rate_gauss = rate_gauss / ndims
 
-        # 4) DPGMM KL at the top level, using spatial tokens [B*Ht*Wt, C]
-        dp_kl = None
+        dp_kl_img = None
         prior_params = None
-
-        dp_rate = torch.zeros(
-            1, device=distortion_per_pixel.device, dtype=distortion_per_pixel.dtype
-        ).squeeze(0)
+        dp_rate = torch.zeros_like(distortion_per_pixel)
 
         if (
             self.prior is not None
             and top_q_mean_map is not None
-            and top_q_logvar_map is not None
+            and top_q_logsig_map is not None
         ):
             B, C, Ht, Wt = top_q_mean_map.shape
 
-            # (a) Reshape latents: [B, C, Ht, Wt] -> [B*Ht*Wt, C]
-            # we treat each spatial location as an independent feature vector
-            top_q_mean_tokens = (
-                top_q_mean_map.permute(0, 2, 3, 1)   # [B, Ht, Wt, C]
-                .contiguous()
-                .view(B * Ht * Wt, C)                # [N, C], N=B*Ht*Wt
-            )
-            top_q_logvar_tokens = (
-                top_q_logvar_map.permute(0, 2, 3, 1)
-                .contiguous()
-                .view(B * Ht * Wt, C)
-            )
-
-            # (b) Build / validate context and broadcast per token 
+            if h_context is None:
+                raise ValueError("h_context must be provided when using the DPGMMPrior.")
             if h_context.shape[0] != B:
                 raise ValueError(
-                    f"h_context batch size {h_context.shape[0]} does not match "
-                    f"top latent batch size {B}."
+                    f"h_context batch size {h_context.shape[0]} does not match top latent batch size {B}."
                 )
             if h_context.shape[1] != self.prior.hidden_dim:
                 raise ValueError(
-                    f"h_context dim {h_context.shape[1]} does not match "
-                    f"prior.hidden_dim={self.prior.hidden_dim}."
+                    f"h_context dim {h_context.shape[1]} does not match prior.hidden_dim={self.prior.hidden_dim}."
                 )
 
-            h_map = self._coerce_h_context_map(h_context, Ht=Ht, Wt=Wt)  # [B,Hc,Ht,Wt]
+            h_map = self._coerce_h_context_map(h_context, Ht=Ht, Wt=Wt)
             h_map = self.add_PosEncode(h_map, self.top_pe, scale=0.05)
-            h_tokens = h_map.permute(0, 2, 3, 1).contiguous().view(B * Ht * Wt, h_map.shape[1])
-                        # [N,Hc]
 
-            #(c) DPGMM prior over tokens 
-            prior_dist, prior_params = self.prior(h_tokens)
+            top_q_mean_img = top_q_mean_map.contiguous().view(B, C * Ht * Wt)
+            top_q_logvar_img = (2.0 * top_q_logsig_map).contiguous().view(B, C * Ht * Wt)
 
-            # Monte Carlo KL between q(z_token|x) and DP-GMM prior p(z_token | h_tokens)
-            # posterior_mean, posterior_logvar: [N, C] where N=B*Ht*Wt
-            dp_kl = self.prior.compute_kl_divergence_mc(
-                posterior_mean=top_q_mean_tokens,
-                posterior_logvar=2* top_q_logvar_tokens, #attention
+            _, prior_params = self.prior(h_map)
+            dp_kl_img = self.prior.compute_kl_divergence_mc(
+                posterior_mean=top_q_mean_img,
+                posterior_logvar=top_q_logvar_img,
                 prior_params=prior_params,
                 n_samples=self.prior_kl_mc_samples,
-            )  # scalar (average over N tokens and MC samples)
-            tokens_per_img = Ht * Wt
-            dp_rate = self.top_kl_weight * (dp_kl * tokens_per_img) / ndims
+                reduction="image",
+            )  # [B]
 
-        # 5) Total rate and ELBO
-        total_rate_per_pixel = rate_gauss + dp_rate  # [B] + scalar
-        elbo = (distortion_per_pixel + total_rate_per_pixel).mean()
+            dp_rate = self.top_kl_weight * dp_kl_img / ndims
+
+        total_rate_per_pixel = rate_gauss + dp_rate
+        elbo_per_sample = distortion_per_pixel + total_rate_per_pixel
+
         out = dict(
-            elbo=elbo,
+            elbo=elbo_per_sample.mean(),
             distortion=distortion_per_pixel.mean(),
             gauss_rate=rate_gauss.mean(),
             rate=total_rate_per_pixel.mean(),
-            dp_kl=dp_kl,
-            dp_rate=dp_rate,
+            dp_rate=dp_rate.mean(),
             prior_params=prior_params,
             px_z=px_z,
             top_q_mean_map=top_q_mean_map,
-            top_q_logvar_map=top_q_logvar_map,
+            top_q_logvar_map=top_q_logsig_map,
         )
 
-        if dp_kl is not None:
-            out["dp_kl"] = dp_kl
-            out["dp_rate"] = dp_rate
+        if dp_kl_img is not None:
+            out["dp_kl"] = dp_kl_img.mean()
+
         return out
 
     def sample(self, n_batch: int, h_context: torch.Tensor):
         """
-        Sample from the model using the DPGMM at the top level.
+        Sample from the image-level DP-GMM top prior and decode the resulting top latent map.
 
-        h_context: [B, hidden_dim, H, W], where B == n_batch
+        h_context: [B, hidden_dim, Ht, Wt], where B == n_batch
         """
         assert self.prior is not None, "VDVAE.sample requires a DPGMMPrior."
         assert h_context.shape[0] == n_batch, (
@@ -1180,33 +1141,24 @@ class VDVAE(HModule):
         )
 
         top_block = self.decoder.dec_blocks[0]
-        C = top_block.zdim    # latent channel dimension
-        res = top_block.base  # top resolution Ht = Wt
-
+        C = top_block.zdim
+        res = top_block.base
         B = n_batch
-        
-        h_map = self._coerce_h_context_map(h_context, Ht=res, Wt=res)  # [B,Hc,Ht,Wt]
+
+        h_map = self._coerce_h_context_map(h_context, Ht=res, Wt=res)
         h_map = self.add_PosEncode(h_map, self.top_pe, scale=0.05)
-        h_tokens = h_map.permute(0,2,3,1).reshape(B*res*res,  h_map.shape[1])                 # [N,Hc]
 
-        # DPGMM prior over tokens
-        prior_dist, prior_params = self.prior(h_tokens)
-        z_tokens = prior_dist.sample()  # [B * res * res, C]
-        N, D = z_tokens.shape
+        prior_dist, _ = self.prior(h_map)
+        z_img = prior_dist.sample()  # [B, C * res * res]
 
-        assert D == C, f"DPGMM latent_dim {D} != top_block.zdim {C}"
-        assert N == B * res * res, (
-            f"Sampled {N} tokens, expected B*res*res = {B * res * res}."
-        )
+        expected_D = C * res * res
+        if z_img.shape != (B, expected_D):
+            raise ValueError(
+                f"Sampled top latent has shape {tuple(z_img.shape)}, expected {(B, expected_D)}"
+            )
 
-        # Reshape back to a spatial map [B, C, res, res]
-        z_top_map = (
-            z_tokens.view(B, res, res, C)
-            .permute(0, 3, 1, 2)
-            .contiguous()
-        )
+        z_top_map = z_img.view(B, C, res, res).contiguous()
 
-        # Feed sampled latents into decoder
         latents = [z_top_map] + [None] * (len(self.decoder.dec_blocks) - 1)
         px_z = self.decoder.forward_manual_latents(n_batch, latents, t=None)
         return self.decoder.out_net.sample(px_z)

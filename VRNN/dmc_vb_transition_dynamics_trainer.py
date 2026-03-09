@@ -2139,8 +2139,8 @@ def main():
         'policy_level': 'all',
         
         # Model settings
-        'max_components': 15,
-        'latent_dim': 64,
+        'max_components': 12,
+        'latent_dim': 56,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 16.0,  # Hyperparameters for prior
@@ -2148,7 +2148,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 24,
+        'batch_size': 20,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 2,
