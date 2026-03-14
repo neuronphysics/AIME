@@ -1317,8 +1317,6 @@ class DMCVBTrainer:
             if (ctx.shape[-2], ctx.shape[-1]) != (H, W):
                 ctx = F.interpolate(ctx, size=(H, W), mode="bilinear", align_corners=False)
 
-        flow_in = torch.cat([x_prev01, e_prev, ctx], dim=1)
-
         # ---------- GRU flow + warp.py ----------
         max_flow_full = max(H, W) * float(max_flow_frac)
 
@@ -1347,7 +1345,7 @@ class DMCVBTrainer:
         x_prev_to_cur = x_prev_to_cur.clamp(0, 1)
 
         valid = (denom > 0.5).to(x_prev_to_cur.dtype)
-        x_prev_to_cur = x_prev_to_cur * valid
+        x_prev_to_cur = x_prev_to_cur * valid + x_prev01 * (1.0 - valid)
 
         # edges are computed FROM warped RGB 
         e_prev_to_cur = self.model.canny(x_prev_to_cur.float()).clamp(0, 1).float()
@@ -1536,9 +1534,7 @@ class DMCVBTrainer:
                     perplexity=30.0,
                     tsne_dims=3,
                     save_path=save_path,
-                    image_level=False,     # start with image_level
                     t_select=5,            # choose which frame from the sequence
-                    use_rnn_context=True,
                 )
                 plt.close(fig)
             except Exception as e:
@@ -1868,7 +1864,6 @@ class DMCVBTrainer:
         if axes.ndim == 1:
             axes = axes.reshape(1, -1)
 
-
         with torch.no_grad():
             for split_idx, (observations, actions, dones, split_name) in enumerate([
                 (train_obs[:batch_size], train_actions[:batch_size], train_dones[:batch_size], "Train"),
@@ -1876,28 +1871,35 @@ class DMCVBTrainer:
             ]):
                 observations = observations.clamp(-1.0, 1.0)
 
-                # run model once to populate outputs and the posterior's slot maps/assignments
-                _, outputs = self.model.compute_total_loss(observations=observations, actions=actions, dones=dones)
-                
+                _, outputs = self.model.compute_total_loss(
+                    observations=observations,
+                    actions=actions,
+                    dones=dones
+                )
 
                 for i in range(batch_size):
                     row = split_idx * batch_size + i
-                    t = 0  # visualize first timestep
+                    t = 0
 
-                    # ---------- 1) Original ----------
-                    orig_img = observations[i, t, :3]  # [3,H,W]
+                    orig_img = observations[i, t, :3]
                     axes[row, 0].imshow(self.denormalize_image(orig_img))
-                    axes[row, 0].set_title(f'{split_name} Original'); axes[row, 0].axis('off')
+                    axes[row, 0].set_title(f'{split_name} Original')
+                    axes[row, 0].axis('off')
 
-                    # ---------- 2) VAE Reconstruction ----------
-                    recon_img = outputs['reconstruction_samples'][i, t, :3]  # [3,H,W]
-                    axes[row, 1].imshow(recon_img.detach().clamp(0, 255).to(torch.uint8).cpu().permute(1,2,0).numpy())
-                    axes[row, 1].set_title('VAE Recon samples'); axes[row, 1].axis('off')
+                    recon_img = outputs['reconstruction_samples'][i, t, :3]
+                    axes[row, 1].imshow(
+                        recon_img.detach().clamp(0, 255).to(torch.uint8).cpu().permute(1, 2, 0).numpy()
+                    )
+                    axes[row, 1].set_title('VAE Recon samples')
+                    axes[row, 1].axis('off')
 
-                    recon_img = outputs['reconstructions'][i, t, :3]  # [3,H,W]
+                    recon_img = outputs['reconstructions'][i, t, :3]
                     axes[row, 2].imshow(self.denormalize_image(recon_img))
-                    axes[row, 2].set_title('VAE Recon'); axes[row, 2].axis('off')
+                    axes[row, 2].set_title('VAE Recon')
+                    axes[row, 2].axis('off')
 
+                del outputs
+                torch.cuda.empty_cache()
 
         plt.tight_layout()
         if self.use_wandb:
@@ -1968,7 +1970,7 @@ class DMCVBTrainer:
             best_path = self.ckpt_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
     
-    def train(self, n_epochs: int):
+    def train(self, n_epochs: int, visualize_steps: int = 8):
         """Main training loop"""
         print(f"Starting training for {n_epochs} epochs...")
         print(f"Train dataset size: {len(self.train_dataset)}")
@@ -1985,7 +1987,7 @@ class DMCVBTrainer:
             
             # Evaluate
             eval_metrics = self.evaluate(epoch)
-            self.run_grad_diag(max_B=1, max_T=self.episode_length, use_amp=False)            
+            self.run_grad_diag(max_B=1, max_T=visualize_steps, use_amp=False)            
             # Combine metrics
             all_metrics = {**train_metrics, **eval_metrics}
             
@@ -2140,10 +2142,10 @@ def main():
         
         # Model settings
         'max_components': 12,
-        'latent_dim': 56,
+        'latent_dim': 48,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
-        'prior_alpha': 16.0,  # Hyperparameters for prior
+        'prior_alpha': 20.0,  # Hyperparameters for prior
         'prior_beta': 2.0,
         'dropout': 0.1,
 

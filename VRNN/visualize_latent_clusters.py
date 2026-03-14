@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import math
@@ -15,7 +14,6 @@ from matplotlib.colors import ListedColormap
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from umap import UMAP
-import seaborn as sns
 from vdvae.vae_helpers import draw_gaussian_diag_samples 
 
 try:
@@ -24,8 +22,6 @@ except Exception:  # pragma: no cover
     normalized_mutual_info_score = None
     adjusted_rand_score = None
     adjusted_mutual_info_score = None
-
-
 # -----------------------------
 # Utils
 # -----------------------------
@@ -235,9 +231,39 @@ def compute_tsne_embedding(
     return emb, idx
 
 
-# -----------------------------
+def sample_prior_image_latent(
+    prior_params: Dict[str, torch.Tensor],
+    temperature: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sample one full image-level latent per image from the image-level DPGMM prior.
+
+    Returns:
+        z_img: [B, D] sampled latent
+        idx:   [B] sampled component index
+        probs: [B, K] sampling probabilities used
+    """
+    pi = prior_params["pi"]
+    means = prior_params["means"]
+    log_vars = prior_params["log_vars"]
+
+    eps = torch.finfo(means.dtype).eps
+    probs = pi.clamp_min(eps)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+
+    tau = max(float(temperature), 1e-4)
+    logits = torch.log(probs)
+    if temperature != 1.0:
+        probs = torch.softmax(logits / tau, dim=-1)
+
+    idx = torch.distributions.Categorical(probs=probs).sample()
+    batch_idx = torch.arange(means.shape[0], device=means.device)
+    mu_img = means[batch_idx, idx]
+    std_img = torch.exp(0.5 * log_vars[batch_idx, idx]).clamp_min(eps)
+    z_img = mu_img + torch.randn_like(mu_img) * std_img
+    return z_img, idx, probs
+
 # Teacher-forced context (SpatioTemporalCore + temporal VDVAE)
- 
 @torch.no_grad()
 def _get_vdvae_out_at_t(
     model,
@@ -259,18 +285,21 @@ def _get_vdvae_out_at_t(
         actions = actions.to(device)
         if actions.dim() == 2:
             actions = actions[:, None, ...]  # [B,1,A]
+
     dones = batch.get("done", batch.get("dones", None))
     if dones is not None:
         dones = dones.to(device)
         if dones.dim() == 1:
-            dones = dones[:, None, ...]  # [B,1]v
-            
+            dones = dones[:, None]  # [B,1]
+
     B, T, C, H, W = obs.shape
     t_select = int(max(0, min(int(t_select), T - 1)))
 
-    # get the exact extra maps from the real forward path
+    # get the exact extra maps / edge guides from the real forward path
     extra_maps_seq = None
-    if getattr(model.rnn, "extra_channels", 0) > 0 and t_select > 0:
+    edge_guide_seq = None
+
+    if t_select > 0:
         obs_prefix = obs[:, :t_select + 1]
         act_prefix = actions[:, :t_select + 1] if actions is not None else None
         done_prefix = dones[:, :t_select + 1] if dones is not None else None
@@ -280,7 +309,12 @@ def _get_vdvae_out_at_t(
             actions=act_prefix,
             dones=done_prefix,
         )
-        extra_maps_seq = prefix_out.get("extra_maps_seq", None)
+
+        if getattr(model.rnn, "extra_channels", 0) > 0:
+            extra_maps_seq = prefix_out.get("extra_maps_seq", None)
+
+        if bool(getattr(model, "use_edge_conditioning", False)) or bool(getattr(model.vdvae.H, "use_edge_conditioning", False)):
+            edge_guide_seq = prefix_out.get("edge_guide_seq", None)
 
     core_state = model.rnn.init_state(B, device=device, dtype=obs.dtype)
     h_context_map = model.rnn.out_norm(core_state[0])
@@ -291,7 +325,7 @@ def _get_vdvae_out_at_t(
         x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
 
         if actions is not None and actions.shape[1] >= t and t > 0:
-            a_t = actions[:, t-1]
+            a_t = actions[:, t - 1]
         else:
             a_t = torch.zeros(B, model.action_dim, device=device, dtype=obs.dtype)
 
@@ -300,13 +334,19 @@ def _get_vdvae_out_at_t(
         else:
             mask_t = 1.0 - dones[:, t - 1].float()
 
+        edge_guide_t = None
+        if edge_guide_seq is not None and t < len(edge_guide_seq):
+            saved_edge = edge_guide_seq[t]
+            if saved_edge is not None:
+                edge_guide_t = saved_edge.to(device=device, dtype=obs.dtype)
+
         vdvae_out, temporal_state = model.vdvae.forward_temporal_step(
             x_t_nhwc,
             x_t_nhwc,
             h_context=h_context_map,
             a_t=a_t,
             mask_t=mask_t,
-            edge_guide=None,
+            edge_guide=edge_guide_t,
             temporal_state=temporal_state,
         )
 
@@ -333,8 +373,6 @@ def _get_vdvae_out_at_t(
 
     return vdvae_out, x_t, h_context_map
 
-
-
 # Latent extraction (+ exemplars)
 # -----------------------------
 @torch.no_grad()
@@ -344,50 +382,50 @@ def extract_latents_and_assignments(
     device: torch.device,
     max_batches: int = 50,
     t_select: int = 0,
-    image_level: bool = True,
     max_points: int = 200000,
     chunk: int = 4096,
-    use_rnn_context: bool = True,
     collect_exemplars: bool = True,
     n_exemplars_per_component: int = 6,
+    store_h_context: bool = False,
 ) -> Dict[str, Any]:
     """
-    Extract latent representations and DPGMM component assignments.
+    Extract both posterior and true prior whole-image latents for the top image-level DPGMM.
 
     Returns dict with keys:
-        latents:     [M, D] numpy array
-        assignments: [M] numpy array
-        pi:          [M, K] numpy array (image-level if image_level=True)
-        labels:      [M] numpy array or None
-        h_contexts:  [M, H] numpy array (if image_level=True)
+        posterior_latents: [M, D] numpy array, posterior encoder mean latents
+        posterior_assignments: [M] numpy array, argmax responsibilities of posterior latents under the prior
+        posterior_pi: [M, K] numpy array
+        prior_latents: [M, D] numpy array, true samples from p(z_top | h)
+        prior_assignments: [M] numpy array, sampled prior component indices
+        prior_pi: [M, K] numpy array, sampling probabilities used for the prior samples
+        labels: [M] numpy array or None
+        h_contexts: [M, Hctx*Ht*Wt] numpy array (optional, only if store_h_context=True)
         exemplar_images: [K, n, C, H, W] float32 (optional)
         exemplar_scores: [K, n] float32 (optional)
         exemplar_counts: [K] int64 (optional)
+
+        Backward-compatible aliases:
+            latents -> posterior_latents
+            assignments -> posterior_assignments
+            pi -> posterior_pi
     """
     model.eval()
 
-    z_all: List[torch.Tensor] = []
-    k_all: List[torch.Tensor] = []
-    pi_all: List[torch.Tensor] = []
+    posterior_z_all: List[torch.Tensor] = []
+    posterior_k_all: List[torch.Tensor] = []
+    posterior_pi_all: List[torch.Tensor] = []
+    prior_z_all: List[torch.Tensor] = []
+    prior_k_all: List[torch.Tensor] = []
+    prior_pi_all: List[torch.Tensor] = []
     labels_all: List[torch.Tensor] = []
     h_context_all: List[torch.Tensor] = []
 
-    exemplar_images = None
-    exemplar_scores = None
-    exemplar_counts = None
-
-    # Model dims (inferred on first batch)
-    C_top = None
-    res = None
-
     total_points = 0
-    K_global = None
-
-    # Temporary exemplar stores: list per component of (score, image_tensor)
+    K_global: Optional[int] = None
     exemplar_store: List[List[Tuple[float, torch.Tensor]]] = []
 
     for bi, batch in enumerate(tqdm(dataloader, desc="Extracting latents")):
-        if bi >= max_batches:
+        if bi >= max_batches or total_points >= max_points:
             break
 
         labels = None
@@ -413,202 +451,163 @@ def extract_latents_and_assignments(
         if labels is not None and torch.is_tensor(labels):
             labels = labels.detach().cpu()
 
-        images = images.to(device)  # [B,C,H,W]
+        images = images.to(device)            # [B, C, H, W]
         images = _to_minus1_1(images)
-        images_nhwc = images.permute(0, 2, 3, 1).contiguous()
 
-        # --- teacher-forced VDVAE at t_select (matches SpatioTemporalCore + temporal decoding) ---
+        # Teacher-forced temporal forward to the selected timestep.
         if isinstance(batch, dict) and "observations" in batch:
-            vdvae_out, images_tf, hctx_map = _get_vdvae_out_at_t(model, batch, device, t_select)
+            vdvae_out, images_tf, hctx_map = _get_vdvae_out_at_t(
+                model, batch, device, t_select
+            )
         else:
-            # non-sequence batches: treat as single-step
-            vdvae_out, images_tf, hctx_map = _get_vdvae_out_at_t(model, {"observations": images}, device, 0)
+            vdvae_out, images_tf, hctx_map = _get_vdvae_out_at_t(
+                model, {"observations": images}, device, 0
+            )
 
-        # Use the teacher-forced frame for exemplars (still in [-1,1])
+        # Use the exact teacher-forced frame returned by the helper for exemplars.
         images = images_tf
 
-        # Top-level posterior mean map (used as a stable embedding for clustering)
-        top_q_mean_map = vdvae_out["top_q_mean_map"]  # [B, C_top, res, res]
-
+        top_q_mean_map = vdvae_out["top_q_mean_map"]   # [B, C_top, Ht, Wt]
         prior_params = vdvae_out["prior_params"]
 
-        B2, C_top, res_h, res_w = top_q_mean_map.shape
-        assert B2 == B, f"Batch mismatch: expected B={B}, got {B2}"
-        assert res_h == res_w, f"Expected square top map, got {res_h}x{res_w}"
-        res = int(res_h)
+        if prior_params is None:
+            continue
 
-        # tokens: [B*res*res, C_top]
-        z_tokens = top_q_mean_map.permute(0, 2, 3, 1).reshape(B * res * res, C_top)
+        B2, C_top, Ht, Wt = top_q_mean_map.shape
+        if B2 != B:
+            raise ValueError(f"Batch mismatch: expected B={B}, got B2={B2}")
 
-        # (optional) store a compact context summary for downstream analysis
-        if hctx_map is not None:
-            # [B,Hctx,Ht,Wt] -> [B,Hctx]
-            h_context = hctx_map.mean(dim=(2, 3))
-        else:
-            h_context = None
+        # This visualization is for the image-level DPGMM prior only.
+        if (
+            not isinstance(prior_params, dict)
+            or "pi" not in prior_params
+            or "means" not in prior_params
+            or "log_vars" not in prior_params
+            or prior_params["pi"].dim() != 2
+            or prior_params["pi"].shape[0] != B
+            or prior_params["means"].dim() != 3
+            or prior_params["means"].shape[0] != B
+            or prior_params["means"].shape[-1] != C_top * Ht * Wt
+        ):
+            raise ValueError(
+                "extract_latents_and_assignments now expects an image-level DPGMM prior "
+                "with pi:[B,K], means/log_vars:[B,K,C_top*Ht*Wt]."
+            )
 
-        # Old token-level prior path vs new image-level prior path
-        prior_is_token_level = (
-            isinstance(prior_params, dict)
-            and "pi" in prior_params
-            and "means" in prior_params
-            and "log_vars" in prior_params
-            and prior_params["pi"].dim() == 2
-            and prior_params["pi"].shape[0] == B * res * res
-            and prior_params["means"].dim() == 3
-            and prior_params["means"].shape[0] == B * res * res
-            and prior_params["means"].shape[-1] == C_top
+        # Posterior whole-image latent used by the actual image-level DPGMM code.
+        top_q_logsigma_map = vdvae_out["top_q_logvar_map"]
+        z_top_sample_map = draw_gaussian_diag_samples(top_q_mean_map, top_q_logsigma_map)
+        z_img_full = z_top_sample_map.reshape(B, -1).contiguous()
+
+        # Posterior responsibilities under the image-level DPGMM prior.
+        resp_img = model.vdvae.prior.compute_responsibilities(
+            z_img=z_img_full,
+            prior_params=prior_params,
+        )   # [B, K]
+        k_img = torch.argmax(resp_img, dim=-1)   # [B]
+
+        # True prior sample z ~ p(z_top | h) plus the sampled component index.
+        z_prior_img, k_prior_img, pi_prior_img = sample_prior_image_latent(
+            prior_params=prior_params,
+            temperature=1.0,
         )
 
-        if prior_is_token_level:
-            pi_tok   = prior_params["pi"]        # [N, K]
-            means    = prior_params["means"]     # [N, K, C_top]
-            log_vars = prior_params["log_vars"]  # [N, K, C_top]
+        K = int(resp_img.shape[1])
+        if K_global is None:
+            K_global = K
+            if collect_exemplars:
+                exemplar_store = [[] for _ in range(K_global)]
+        elif K != K_global:
+            raise ValueError(f"Inconsistent K across batches: got {K}, expected {K_global}")
 
-            N, K = pi_tok.shape[:2]
-            if K_global is None:
-                K_global = int(K)
-                if collect_exemplars and image_level:
-                    exemplar_store = [[] for _ in range(K_global)]
-            else:
-                K = int(K_global)
+        posterior_z_all.append(z_img_full.detach().cpu())
+        posterior_k_all.append(k_img.detach().cpu())
+        posterior_pi_all.append(resp_img.detach().cpu())
+        prior_z_all.append(z_prior_img.detach().cpu())
+        prior_k_all.append(k_prior_img.detach().cpu())
+        prior_pi_all.append(pi_prior_img.detach().cpu())
 
-            # responsibilities -> assignments for tokens
-            k_tok = torch.empty(N, dtype=torch.long, device=device)
-            for s in range(0, N, chunk):
-                e = min(N, s + chunk)
-                resp, k = compute_responsibilities(z_tokens[s:e], pi_tok[s:e], means[s:e], log_vars[s:e])
-                k_tok[s:e] = k
+        if labels is not None and torch.is_tensor(labels):
+            labels_all.append(labels)
 
-            if image_level:
-                z_img = top_q_mean_map.mean(dim=(2, 3))                       # [B, C_top]
-                k_img = k_tok.view(B, res * res)
-                k_img = torch.mode(k_img, dim=1).values                       # [B]
-                pi_img = pi_tok.view(B, res * res, -1).mean(dim=1)            # [B, K]
+        if store_h_context and hctx_map is not None:
+            # Keep the full context map, not a spatial mean.
+            h_context_all.append(hctx_map.reshape(B, -1).detach().cpu())
 
-                z_all.append(z_img.detach().cpu())
-                k_all.append(k_img.detach().cpu())
-                pi_all.append(pi_img.detach().cpu())
-                if labels is not None and torch.is_tensor(labels):
-                    labels_all.append(labels.cpu())
-                if h_context is not None:
-                    h_context_all.append(h_context.detach().cpu())
+        total_points += int(B)
 
-                total_points += int(B)
-                if collect_exemplars and exemplar_store and images is not None:
-                    # score = pi_img at assigned component (confidence)
-                    conf = pi_img[torch.arange(B, device=pi_img.device), k_img].detach()
-                    for b in range(B):
-                        kk = int(k_img[b].item())
-                        sc = float(conf[b].item())
-                        # keep top-n per component
-                        lst = exemplar_store[kk]
-                        if len(lst) < n_exemplars_per_component:
-                            lst.append((sc, images[b].detach().cpu()))
-                            lst.sort(key=lambda t: t[0], reverse=True)
-                        else:
-                            if sc > lst[-1][0]:
-                                lst[-1] = (sc, images[b].detach().cpu())
-                                lst.sort(key=lambda t: t[0], reverse=True)
-            else:
-                z_all.append(z_tokens.detach().cpu())
-                k_all.append(k_tok.detach().cpu())
-                pi_all.append(pi_tok.detach().cpu())
-                total_points += int(N)
-
-        else:
-            # New image-level prior path
-            pi_img = prior_params["pi"]  # [B, K]
-
-            N, K = pi_img.shape[:2]
-            if K_global is None:
-                K_global = int(K)
-                if collect_exemplars and image_level:
-                    exemplar_store = [[] for _ in range(K_global)]
-            else:
-                K = int(K_global)
-
-            z_img_full = top_q_mean_map.reshape(B, -1)  # [B, C_top*res*res]
-            resp_img = model.vdvae.prior.compute_responsibilities(
-                z_img=z_img_full,
-                prior_params=prior_params,
-            )
-            k_img = torch.argmax(resp_img, dim=-1)  # [B]
-
-            if image_level:
-                z_img = top_q_mean_map.mean(dim=(2, 3))  # [B, C_top]
-
-                z_all.append(z_img.detach().cpu())
-                k_all.append(k_img.detach().cpu())
-                pi_all.append(pi_img.detach().cpu())
-                if labels is not None and torch.is_tensor(labels):
-                    labels_all.append(labels.cpu())
-                if h_context is not None:
-                    h_context_all.append(h_context.detach().cpu())
-
-                total_points += int(B)
-                if collect_exemplars and exemplar_store and images is not None:
-                    conf = pi_img[torch.arange(B, device=pi_img.device), k_img].detach()
-                    for b in range(B):
-                        kk = int(k_img[b].item())
-                        sc = float(conf[b].item())
-                        lst = exemplar_store[kk]
-                        if len(lst) < n_exemplars_per_component:
-                            lst.append((sc, images[b].detach().cpu()))
-                            lst.sort(key=lambda t: t[0], reverse=True)
-                        else:
-                            if sc > lst[-1][0]:
-                                lst[-1] = (sc, images[b].detach().cpu())
-                                lst.sort(key=lambda t: t[0], reverse=True)
-            else:
-                pi_tok = pi_img[:, None, :].expand(B, res * res, K).reshape(B * res * res, K)
-                k_tok = k_img[:, None].expand(B, res * res).reshape(B * res * res)
-
-                z_all.append(z_tokens.detach().cpu())
-                k_all.append(k_tok.detach().cpu())
-                pi_all.append(pi_tok.detach().cpu())
-                total_points += int(B * res * res)
-
-        if total_points >= max_points:
-            break
+        if collect_exemplars and images is not None:
+            conf = resp_img[torch.arange(B, device=resp_img.device), k_img].detach()
+            for b in range(B):
+                kk = int(k_img[b].item())
+                sc = float(conf[b].item())
+                lst = exemplar_store[kk]
+                if len(lst) < n_exemplars_per_component:
+                    lst.append((sc, images[b].detach().cpu()))
+                    lst.sort(key=lambda t: t[0], reverse=True)
+                else:
+                    if sc > lst[-1][0]:
+                        lst[-1] = (sc, images[b].detach().cpu())
+                        lst.sort(key=lambda t: t[0], reverse=True)
 
     out: Dict[str, Any] = {}
-    if len(z_all) == 0:
-        out["latents"] = np.zeros((0, int(C_top or 0)), dtype=np.float32)
-        out["assignments"] = np.zeros((0,), dtype=np.int64)
-        out["pi"] = np.zeros((0, int(K_global or 0)), dtype=np.float32)
+
+    if len(posterior_z_all) == 0:
+        out["posterior_latents"] = np.zeros((0, 0), dtype=np.float32)
+        out["posterior_assignments"] = np.zeros((0,), dtype=np.int64)
+        out["posterior_pi"] = np.zeros((0, 0), dtype=np.float32)
+        out["prior_latents"] = np.zeros((0, 0), dtype=np.float32)
+        out["prior_assignments"] = np.zeros((0,), dtype=np.int64)
+        out["prior_pi"] = np.zeros((0, 0), dtype=np.float32)
+        out["latents"] = out["posterior_latents"]
+        out["assignments"] = out["posterior_assignments"]
+        out["pi"] = out["posterior_pi"]
         out["labels"] = None
+        if store_h_context:
+            out["h_contexts"] = np.zeros((0, 0), dtype=np.float32)
         return out
 
-    out["latents"] = torch.cat(z_all, dim=0).numpy()
-    out["assignments"] = torch.cat(k_all, dim=0).numpy()
-    out["pi"] = torch.cat(pi_all, dim=0).numpy()
-
+    out["posterior_latents"] = torch.cat(posterior_z_all, dim=0).numpy()
+    out["posterior_assignments"] = torch.cat(posterior_k_all, dim=0).numpy()
+    out["posterior_pi"] = torch.cat(posterior_pi_all, dim=0).numpy()
+    out["prior_latents"] = torch.cat(prior_z_all, dim=0).numpy()
+    out["prior_assignments"] = torch.cat(prior_k_all, dim=0).numpy()
+    out["prior_pi"] = torch.cat(prior_pi_all, dim=0).numpy()
+    out["latents"] = out["posterior_latents"]
+    out["assignments"] = out["posterior_assignments"]
+    out["pi"] = out["posterior_pi"]
     out["labels"] = torch.cat(labels_all, dim=0).numpy() if len(labels_all) > 0 else None
-    if len(h_context_all) > 0:
-        out["h_contexts"] = torch.cat(h_context_all, dim=0).numpy()
 
-    # Finalize exemplars into dense arrays for easier plotting
-    if collect_exemplars and image_level and exemplar_store and K_global is not None:
+    if store_h_context:
+        out["h_contexts"] = (
+            torch.cat(h_context_all, dim=0).numpy()
+            if len(h_context_all) > 0
+            else np.zeros((out["latents"].shape[0], 0), dtype=np.float32)
+        )
+
+    # Finalize exemplars
+    if collect_exemplars and K_global is not None and len(exemplar_store) > 0:
         K = int(K_global)
-        # infer C,H,W from first non-empty
         C = H = W = None
         for k in range(K):
             if len(exemplar_store[k]) > 0:
                 im = exemplar_store[k][0][1]
                 C, H, W = int(im.shape[0]), int(im.shape[1]), int(im.shape[2])
                 break
+
         if C is not None:
             n = int(n_exemplars_per_component)
             ex_imgs = torch.zeros((K, n, C, H, W), dtype=torch.float32)
             ex_sco = torch.full((K, n), float("nan"), dtype=torch.float32)
             ex_cnt = torch.zeros((K,), dtype=torch.long)
+
             for k in range(K):
                 lst = exemplar_store[k]
                 ex_cnt[k] = len(lst)
                 for j, (sc, im) in enumerate(lst[:n]):
                     ex_imgs[k, j] = im
                     ex_sco[k, j] = sc
+
             out["exemplar_images"] = ex_imgs.numpy()
             out["exemplar_scores"] = ex_sco.numpy()
             out["exemplar_counts"] = ex_cnt.numpy()
@@ -624,21 +623,19 @@ def visualize_dpgmm_clustering(
     max_samples: int = 10000,
     perplexity: float = 30.0,
     save_path: Optional[str] = None,
-    class_names: Optional[List[str]] = None,
-    image_level: bool = True,
     t_select: int = 0,
-    use_rnn_context: bool = True,
-    figsize: Tuple[int, int] = (18, 14),
-    tsne_dims: int = 2,
+    figsize: Tuple[int, int] = (20, 16),
+    tsne_dims: int = 3,
 ) -> plt.Figure:
     """
-    Create a 2x3 "best of" dashboard:
-      (1) t-SNE by component (2D or 3D)
-      (2) t-SNE by ground truth label (if available) OR confidence map
-      (3) component utilization
-      (4) assignment confidence + effective-K distribution
-      (5) UMAP by component
-      (6) metrics summary
+    Create a 2x2 dashboard with true prior vs posterior embeddings:
+      (1) 3D t-SNE of posterior latents, colored by component
+      (2) 3D t-SNE of prior samples, colored by component
+      (3) 2D UMAP of posterior latents, colored by component
+      (4) 2D UMAP of prior samples, colored by component
+
+    Posterior latents come from the encoder top posterior mean.
+    Prior latents are true samples z ~ p(z_top | h) from the image-level DPGMM prior.
     """
     model.eval()
 
@@ -648,222 +645,186 @@ def visualize_dpgmm_clustering(
         device=device,
         max_batches=max_batches,
         t_select=t_select,
-        image_level=image_level,
-        use_rnn_context=use_rnn_context,
-        max_points=max_samples * 3,   # allow some headroom before t-SNE sampling
+        max_points=max_samples * 3,
         collect_exemplars=True,
         n_exemplars_per_component=6,
     )
 
-    # --- Load arrays ---
-    latents = np.asarray(data["latents"], dtype=np.float32)
-    assignments = np.asarray(data["assignments"], dtype=np.int64)
-    pi = np.asarray(data["pi"], dtype=np.float32)
-    labels = data.get("labels", None)
-    if labels is not None:
-        labels = np.asarray(labels)
+    posterior_latents = np.asarray(data["posterior_latents"], dtype=np.float32)
+    posterior_assignments = np.asarray(data["posterior_assignments"], dtype=np.int64)
+    posterior_pi = np.asarray(data["posterior_pi"], dtype=np.float32)
 
-    # --- Sanity checks: pi must align with latents ---
-    if pi.ndim != 2:
-        raise ValueError(f"[viz] Expected pi to be 2D [N,K], got pi.shape={pi.shape}")
-    if latents.ndim != 2:
-        raise ValueError(f"[viz] Expected latents to be 2D [N,D], got latents.shape={latents.shape}")
-    if pi.shape[0] != latents.shape[0] or assignments.shape[0] != latents.shape[0]:
+    prior_latents = np.asarray(data["prior_latents"], dtype=np.float32)
+    prior_assignments = np.asarray(data["prior_assignments"], dtype=np.int64)
+    prior_pi = np.asarray(data["prior_pi"], dtype=np.float32)
+
+    if posterior_latents.ndim != 2 or prior_latents.ndim != 2:
         raise ValueError(
-            f"[viz] Shape mismatch: latents={latents.shape}, assignments={assignments.shape}, pi={pi.shape}"
+            f"[viz] Expected 2D latent arrays, got posterior={posterior_latents.shape}, prior={prior_latents.shape}"
+        )
+    if posterior_pi.ndim != 2 or prior_pi.ndim != 2:
+        raise ValueError(
+            f"[viz] Expected 2D pi arrays, got posterior={posterior_pi.shape}, prior={prior_pi.shape}"
         )
 
-    N = latents.shape[0]
-    K = pi.shape[1]
+    if posterior_latents.shape[0] < 5 or prior_latents.shape[0] < 5:
+        raise ValueError("[viz] Not enough valid points for visualization. Need at least 5 posterior and 5 prior points.")
 
-    # --- Mask out any bad rows (NaN/Inf) + invalid assignment indices ---
-    finite_lat = np.isfinite(latents).all(axis=1)                 # [N]
-    finite_pi  = np.isfinite(pi).all(axis=1)                      # [N]
-    valid_asg  = (assignments >= 0) & (assignments < K)           # [N]
+    K = int(max(posterior_pi.shape[1], prior_pi.shape[1]))
 
-    mask = finite_lat & finite_pi & valid_asg
+    def _filter_valid(latents: np.ndarray, assignments: np.ndarray, pi: np.ndarray):
+        finite_lat = np.isfinite(latents).all(axis=1)
+        finite_pi = np.isfinite(pi).all(axis=1)
+        valid_asg = (assignments >= 0) & (assignments < pi.shape[1])
+        mask = finite_lat & finite_pi & valid_asg
+        latents_f = np.ascontiguousarray(latents[mask], dtype=np.float32)
+        assignments_f = np.asarray(assignments[mask], dtype=np.int64)
+        pi_f = np.ascontiguousarray(pi[mask], dtype=np.float32)
+        return latents_f, assignments_f, pi_f, int((~mask).sum())
 
-    if labels is not None:
-        # support labels as [N] or [N, ...]
-        if labels.shape[0] != N:
-            raise ValueError(f"[viz] labels has wrong first dim: labels.shape={labels.shape}, expected {N}")
-        finite_lab = np.isfinite(labels).all(axis=1) if labels.ndim > 1 else np.isfinite(labels)
-        mask &= finite_lab
-
-    dropped = int((~mask).sum())
-    if dropped > 0:
-        print(f"[viz] Dropping {dropped}/{N} points due to NaN/Inf or invalid assignment.")
-
-        latents = latents[mask]
-        assignments = assignments[mask]
-        pi = pi[mask]
-        if labels is not None:
-            labels = labels[mask]
-
-    latents = np.ascontiguousarray(latents, dtype=np.float32)
-    pi = np.ascontiguousarray(pi, dtype=np.float32)
-
-    # Not enough points?
-    if latents.shape[0] < 5:
-        raise ValueError("[viz] Not enough valid points for t-SNE after filtering. (Need >= 5)")
-
-    # --- t-SNE dims ---
-    tsne_dims = int(2 if tsne_dims is None else tsne_dims)
-    tsne_dims = 3 if tsne_dims == 3 else 2
-
-    # --- Clamp perplexity to safe range for current N ---
-    # sklearn t-SNE requires perplexity < n_samples
-    n_pts = latents.shape[0]
-    max_perp = max(2.0, (n_pts - 1) / 3.0)
-    if perplexity > max_perp:
-        print(f"[viz] Clamping perplexity {perplexity:.2f} -> {max_perp:.2f} (n_points={n_pts}).")
-        perplexity = float(max_perp)
-
-    # --- t-SNE embedding ---
-    emb, idx = compute_tsne_embedding(
-        latents,
-        max_samples=max_samples,
-        perplexity=float(perplexity),
-        pca_dims=50,
-        random_state=42,
-        n_components=tsne_dims,
-        standardize=True,
+    posterior_latents, posterior_assignments, posterior_pi, post_dropped = _filter_valid(
+        posterior_latents, posterior_assignments, posterior_pi
+    )
+    prior_latents, prior_assignments, prior_pi, prior_dropped = _filter_valid(
+        prior_latents, prior_assignments, prior_pi
     )
 
-    # idx indexes into *filtered* arrays (latents/assignments/pi/labels)
-    assign_s = assignments[idx]
-    pi_s = pi[idx]
-    labels_s = labels[idx] if labels is not None else None
+    if post_dropped > 0:
+        print(f"[viz] Dropping {post_dropped} posterior points due to NaN/Inf or invalid assignment.")
+    if prior_dropped > 0:
+        print(f"[viz] Dropping {prior_dropped} prior points due to NaN/Inf or invalid assignment.")
 
-    n_components = pi_s.shape[-1]  # should be K
+    if posterior_latents.shape[0] < 5 or prior_latents.shape[0] < 5:
+        raise ValueError("[viz] Not enough valid points after filtering. Need at least 5 posterior and 5 prior points.")
 
-    # Colors
-    colors = plt.cm.tab20(np.linspace(0, 1, min(20, max(1, n_components))))
-    if n_components > 20:
-        colors = plt.cm.turbo(np.linspace(0, 1, n_components))
+    colors = plt.cm.tab20(np.linspace(0, 1, min(20, max(1, K))))
+    if K > 20:
+        colors = plt.cm.turbo(np.linspace(0, 1, K))
     cmap = ListedColormap(colors)
+
+    def _embed_tsne_3d(latents: np.ndarray, seed: int):
+        n_pts = latents.shape[0]
+        max_perp = max(2.0, (n_pts - 1) / 3.0)
+        perp = float(min(float(perplexity), max_perp))
+        return compute_tsne_embedding(
+            latents,
+            max_samples=max_samples,
+            perplexity=perp,
+            pca_dims=50,
+            random_state=seed,
+            n_components=3,
+            standardize=True,
+        )
+
+    def _embed_umap_2d(latents: np.ndarray, seed: int):
+        n = int(latents.shape[0])
+        rng = np.random.default_rng(seed)
+        if n > int(max_samples):
+            idx = rng.choice(n, size=int(max_samples), replace=False).astype(np.int64, copy=False)
+        else:
+            idx = np.arange(n, dtype=np.int64)
+        X = np.asarray(latents[idx], dtype=np.float32)
+        finite = np.isfinite(X).all(axis=1)
+        idx = idx[finite]
+        X = X[finite]
+        if X.shape[0] < 2:
+            return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+        emb = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, random_state=seed).fit_transform(X)
+        return emb, idx
+
+    post_tsne_3d, post_tsne_idx = _embed_tsne_3d(posterior_latents, seed=42)
+    prior_tsne_3d, prior_tsne_idx = _embed_tsne_3d(prior_latents, seed=43)
+    post_umap_2d, post_umap_idx = _embed_umap_2d(posterior_latents, seed=52)
+    prior_umap_2d, prior_umap_idx = _embed_umap_2d(prior_latents, seed=53)
+
+    if post_tsne_3d.shape[0] == 0 or prior_tsne_3d.shape[0] == 0:
+        raise ValueError("[viz] t-SNE embedding failed to produce enough points.")
+    if post_umap_2d.shape[0] == 0 or prior_umap_2d.shape[0] == 0:
+        raise ValueError("[viz] UMAP embedding failed to produce enough points.")
 
     fig = plt.figure(figsize=figsize)
 
-    # (1) t-SNE by component
-    if tsne_dims == 3:
-        ax1 = fig.add_subplot(2, 3, 1, projection="3d")
-        ax1.view_init(elev=25, azim=40)
-        sc1 = ax1.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=assign_s, cmap=cmap, s=6, alpha=0.75)
-        ax1.set_zlabel("t-SNE 3")
-    else:
-        ax1 = fig.add_subplot(2, 3, 1)
-        sc1 = ax1.scatter(emb[:, 0], emb[:, 1], c=assign_s, cmap=cmap, s=8, alpha=0.75)
+    ax1 = fig.add_subplot(2, 2, 1, projection="3d")
+    ax1.view_init(elev=25, azim=40)
+    sc1 = ax1.scatter(
+        post_tsne_3d[:, 0],
+        post_tsne_3d[:, 1],
+        post_tsne_3d[:, 2],
+        c=posterior_assignments[post_tsne_idx],
+        cmap=cmap,
+        s=6,
+        alpha=0.75,
+        vmin=0,
+        vmax=max(K - 1, 0),
+    )
     plt.colorbar(sc1, ax=ax1, label="DPGMM Component")
-    ax1.set_title("t-SNE by DPGMM Component", fontsize=11)
-    ax1.set_xlabel("t-SNE 1"); ax1.set_ylabel("t-SNE 2")
+    ax1.set_title("Posterior Latent 3D t-SNE", fontsize=11)
+    ax1.set_xlabel("t-SNE 1")
+    ax1.set_ylabel("t-SNE 2")
+    ax1.set_zlabel("t-SNE 3")
 
-    # (2) t-SNE by ground truth OR confidence
-    if tsne_dims == 3:
-        ax2 = fig.add_subplot(2, 3, 2, projection="3d")
-        ax2.view_init(elev=30, azim=120)
-    else:
-        ax2 = fig.add_subplot(2, 3, 2)
+    ax2 = fig.add_subplot(2, 2, 2, projection="3d")
+    ax2.view_init(elev=25, azim=40)
+    sc2 = ax2.scatter(
+        prior_tsne_3d[:, 0],
+        prior_tsne_3d[:, 1],
+        prior_tsne_3d[:, 2],
+        c=prior_assignments[prior_tsne_idx],
+        cmap=cmap,
+        s=6,
+        alpha=0.75,
+        vmin=0,
+        vmax=max(K - 1, 0),
+    )
+    plt.colorbar(sc2, ax=ax2, label="DPGMM Component")
+    ax2.set_title("Prior Latent 3D t-SNE", fontsize=11)
+    ax2.set_xlabel("t-SNE 1")
+    ax2.set_ylabel("t-SNE 2")
+    ax2.set_zlabel("t-SNE 3")
 
-    if labels_s is not None:
-        if tsne_dims == 3:
-            sc2 = ax2.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=labels_s, cmap="Set1", s=6, alpha=0.75)
-            ax2.set_zlabel("t-SNE 3")
-        else:
-            sc2 = ax2.scatter(emb[:, 0], emb[:, 1], c=labels_s, cmap="Set1", s=5, alpha=0.75)
-        cbar = plt.colorbar(sc2, ax=ax2, label="Ground Truth Label")
-        if class_names is not None:
-            uniq = np.unique(labels_s)
-            cbar.set_ticks(uniq)
-            cbar.set_ticklabels([class_names[int(u)] for u in uniq])
-        ax2.set_title("t-SNE by Ground Truth Label", fontsize=11)
-    else:
-        conf = pi_s[np.arange(pi_s.shape[0]), assign_s]
-        if tsne_dims == 3:
-            sc2 = ax2.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=conf, cmap="viridis", s=6, alpha=0.75)
-            ax2.set_zlabel("t-SNE 3")
-        else:
-            sc2 = ax2.scatter(emb[:, 0], emb[:, 1], c=conf, cmap="viridis", s=8, alpha=0.75)
-        plt.colorbar(sc2, ax=ax2, label="assignment confidence")
-        ax2.set_title("t-SNE colored by assignment confidence", fontsize=11)
+    ax3 = fig.add_subplot(2, 2, 3)
+    sc3 = ax3.scatter(
+        post_umap_2d[:, 0],
+        post_umap_2d[:, 1],
+        c=posterior_assignments[post_umap_idx],
+        cmap=cmap,
+        s=8,
+        alpha=0.75,
+        vmin=0,
+        vmax=max(K - 1, 0),
+    )
+    plt.colorbar(sc3, ax=ax3, label="DPGMM Component")
+    ax3.set_title("Posterior Latent 2D UMAP", fontsize=11)
+    ax3.set_xlabel("UMAP 1")
+    ax3.set_ylabel("UMAP 2")
 
-    ax2.set_xlabel("t-SNE 1"); ax2.set_ylabel("t-SNE 2")
+    ax4 = fig.add_subplot(2, 2, 4)
+    sc4 = ax4.scatter(
+        prior_umap_2d[:, 0],
+        prior_umap_2d[:, 1],
+        c=prior_assignments[prior_umap_idx],
+        cmap=cmap,
+        s=8,
+        alpha=0.75,
+        vmin=0,
+        vmax=max(K - 1, 0),
+    )
+    plt.colorbar(sc4, ax=ax4, label="DPGMM Component")
+    ax4.set_title("Prior Latent 2D UMAP", fontsize=11)
+    ax4.set_xlabel("UMAP 1")
+    ax4.set_ylabel("UMAP 2")
 
-    # (3) Component utilization (use ALL filtered points, not just idx)
-    ax3 = fig.add_subplot(2, 3, 3)
-    counts = np.bincount(assignments, minlength=max(1, n_components)).astype(np.float64)
-    frac = counts / max(1.0, counts.sum())
-    order = np.argsort(frac)[::-1]
-    ax3.bar(np.arange(len(frac)), frac[order])
-    ax3.set_title("Component utilization (fraction)", fontsize=11)
-    ax3.set_xlabel("component (sorted)")
-    ax3.set_ylabel("fraction")
-    ax3.grid(True, alpha=0.25)
+    title = (
+        f"DPGMM Prior vs Posterior Latent Embeddings (t={t_select}) | "
+        f"posterior N={posterior_latents.shape[0]}, prior N={prior_latents.shape[0]}, K={K}"
+    )
+    fig.suptitle(title, fontsize=13, y=0.99)
 
-    # (4) Confidence + effective-K distributions
-    ax4 = fig.add_subplot(2, 3, 4)
-    conf_all = pi[np.arange(pi.shape[0]), assignments]
-    effk_all = _effective_k(pi)
-    sns.histplot(conf_all, bins=30, stat='density', alpha=0.75, label="confidence (pi@assigned)", ax=ax4)
-    sns.histplot(effk_all, bins=30, stat='density', alpha=0.75, label="effective-K = exp(H(pi))", ax=ax4)
-    ax4.set_title("Mixture decisiveness diagnostics", fontsize=11)
-    ax4.set_xlabel("value")
-    ax4.set_ylabel("density")
-    ax4.legend(fontsize=9)
-    ax4.grid(True, alpha=0.25)
-
-    # (5) UMAP by component (on the same sampled points idx used for t-SNE)
-    ax5 = fig.add_subplot(2, 3, 5)
-    umap_emb = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, random_state=42).fit_transform(latents[idx])
-    sc5 = ax5.scatter(umap_emb[:, 0], umap_emb[:, 1], c=assign_s, cmap=cmap, s=8, alpha=0.7)
-    ax5.set_xlabel("UMAP 1"); ax5.set_ylabel("UMAP 2")
-    ax5.set_title("UMAP by DPGMM Component", fontsize=11)
-    plt.colorbar(sc5, ax=ax5, label="Component")
-
-    # (6) Metrics summary
-    ax6 = fig.add_subplot(2, 3, 6)
-    ax6.axis("off")
-
-    active_thresh = 0.01  # 1% usage
-    k_active = int((frac > active_thresh).sum())
-    util_entropy = float(_entropy(frac[frac > 0])[()] / math.log(max(2, (frac > 0).sum()))) if (frac > 0).sum() > 1 else 0.0
-
-    metrics_text = [
-        f"Points (used for t-SNE): {emb.shape[0]} / total(valid): {latents.shape[0]}",
-        f"K (seen): {n_components}",
-        f"Active K (> {active_thresh*100:.0f}%): {k_active}",
-        f"Mean confidence: {float(np.nanmean(conf_all)):.3f}",
-        f"Mean effective-K: {float(np.nanmean(effk_all)):.2f}",
-        f"Utilization entropy (normalized): {util_entropy:.3f}",
-    ]
-
-    nmi = ari = ami = None
-    if labels is not None and normalized_mutual_info_score is not None:
-        nmi = float(normalized_mutual_info_score(labels.astype(int), assignments.astype(int)))
-        metrics_text.append(f"NMI(label, cluster): {nmi:.3f}")
-    if labels is not None and adjusted_rand_score is not None:
-        ari = float(adjusted_rand_score(labels.astype(int), assignments.astype(int)))
-        metrics_text.append(f"ARI(label, cluster): {ari:.3f}")
-    if labels is not None and adjusted_mutual_info_score is not None:
-        ami = float(adjusted_mutual_info_score(labels.astype(int), assignments.astype(int)))
-        metrics_text.append(f"AMI(label, cluster): {ami:.3f}")
-
-    ax6.text(0.05, 0.95, "Clustering diagnostics", fontsize=14, fontweight="bold",
-             va="top", transform=ax6.transAxes)
-    ax6.text(0.05, 0.85, "\n".join(metrics_text), fontsize=10.5, family="monospace",
-             va="top", transform=ax6.transAxes)
-
-    title = f"DPGMM Latent Space (image_level={image_level}, t={t_select}, tsne_dims={tsne_dims})"
-    if nmi is not None:
-        title += f" | NMI={nmi:.3f}"
-    fig.suptitle(title, fontsize=13, y=1.02)
-
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
 
     if save_path is not None:
         fig.savefig(save_path, dpi=200, bbox_inches="tight")
 
-    # Avoid leaking figures in long-running training jobs (common when using Agg).
     try:
         if "agg" in matplotlib.get_backend().lower():
             plt.close("all")
@@ -873,10 +834,6 @@ def visualize_dpgmm_clustering(
     return fig
 
 
-# -----------------------------
-# Optional: temporal evolution (kept from original intent)
-# -----------------------------
-@torch.no_grad()
 def visualize_component_evolution(
     model,
     dataloader,
@@ -885,13 +842,14 @@ def visualize_component_evolution(
     max_batches: int = 50,
     save_path: Optional[str] = None,
 ) -> plt.Figure:
-    """
-    Plot how often each component is selected at different timesteps t=0..n_timesteps-1.
-    Useful to see whether components map to temporal phases.
-    """
     model.eval()
 
-    counts_per_t: List[np.ndarray] = []
+    post_list = []
+    prior_list = []
+    keff_post = []
+    keff_prior = []
+
+    Kmax = 0
     for t in range(n_timesteps):
         data = extract_latents_and_assignments(
             model=model,
@@ -899,29 +857,58 @@ def visualize_component_evolution(
             device=device,
             max_batches=max_batches,
             t_select=t,
-            image_level=True,
-            use_rnn_context=True,
             max_points=200000,
             collect_exemplars=False,
         )
-        a = data["assignments"].astype(np.int64)
-        K = int(a.max() + 1) if a.size > 0 else 0
-        counts = np.bincount(a, minlength=max(1, K)).astype(np.float64)
-        counts_per_t.append(counts)
 
-    # Pad to same K
-    Kmax = max(c.shape[0] for c in counts_per_t)
-    mat = np.zeros((n_timesteps, Kmax), dtype=np.float64)
-    for t, c in enumerate(counts_per_t):
-        mat[t, :c.shape[0]] = c / max(1.0, c.sum())
+        post_pi = np.asarray(data["posterior_pi"], dtype=np.float64)   # [N,K]
+        prior_pi = np.asarray(data["prior_pi"], dtype=np.float64)      # [N,K]
 
-    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
-    im = ax.imshow(mat, aspect="auto")
-    ax.set_title("Component utilization over time (fraction)")
-    ax.set_xlabel("component index")
-    ax.set_ylabel("timestep")
-    plt.colorbar(im, ax=ax, label="fraction")
-    plt.tight_layout()
+        if post_pi.ndim != 2 or prior_pi.ndim != 2 or post_pi.shape[0] == 0:
+            post_mean = np.zeros((1,), dtype=np.float64)
+            prior_mean = np.zeros((1,), dtype=np.float64)
+            kpost = 0.0
+            kprior = 0.0
+        else:
+            post_mean = post_pi.mean(axis=0)
+            prior_mean = prior_pi.mean(axis=0)
+            kpost = float(_effective_k(post_pi).mean())
+            kprior = float(_effective_k(prior_pi).mean())
+
+        Kmax = max(Kmax, post_mean.shape[0], prior_mean.shape[0])
+        post_list.append(post_mean)
+        prior_list.append(prior_mean)
+        keff_post.append(kpost)
+        keff_prior.append(kprior)
+
+    post_mat = np.zeros((n_timesteps, Kmax), dtype=np.float64)
+    prior_mat = np.zeros((n_timesteps, Kmax), dtype=np.float64)
+
+    for t in range(n_timesteps):
+        post_mat[t, :post_list[t].shape[0]] = post_list[t]
+        prior_mat[t, :prior_list[t].shape[0]] = prior_list[t]
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), constrained_layout=True)
+
+    im0 = axes[0].imshow(post_mat, aspect="auto")
+    axes[0].set_title("Mean posterior soft responsibility over time")
+    axes[0].set_xlabel("component index")
+    axes[0].set_ylabel("timestep")
+    plt.colorbar(im0, ax=axes[0], label="mean posterior responsibility")
+
+    im1 = axes[1].imshow(prior_mat, aspect="auto")
+    axes[1].set_title("Mean prior soft mixture weights over time")
+    axes[1].set_xlabel("component index")
+    axes[1].set_ylabel("timestep")
+    plt.colorbar(im1, ax=axes[1], label="mean prior weight")
+
+    axes[2].plot(np.arange(n_timesteps), keff_post, label="posterior K_eff")
+    axes[2].plot(np.arange(n_timesteps), keff_prior, label="prior K_eff")
+    axes[2].set_title("Effective number of active components over time")
+    axes[2].set_xlabel("timestep")
+    axes[2].set_ylabel("exp(H)")
+    axes[2].legend()
+
     if save_path is not None:
         fig.savefig(save_path, dpi=200, bbox_inches="tight")
     return fig
