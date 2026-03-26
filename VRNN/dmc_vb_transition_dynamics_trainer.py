@@ -1341,12 +1341,11 @@ class DMCVBTrainer:
 
         # --- MATCH TRAINING EDGE GUIDE PATH 1:1 ---
         # forward splat prev -> current using flow_fw (prev->cur)
-        x_prev_to_cur, denom = self.model.forward_splat_bilinear(x_prev01, flow_fw)
-        x_prev_to_cur = x_prev_to_cur.clamp(0, 1)
+        x_prev_to_cur_raw, denom = self.model.forward_splat_bilinear(x_prev01, flow_fw)
+        x_prev_to_cur_raw = x_prev_to_cur_raw.clamp(0, 1)
 
-        valid = (denom > 0.5).to(x_prev_to_cur.dtype)
-        x_prev_to_cur = x_prev_to_cur * valid + x_prev01 * (1.0 - valid)
-
+        valid = (denom > 0.5).to(x_prev_to_cur_raw.dtype)
+        x_prev_to_cur = x_prev_to_cur_raw * valid + x_prev01 * (1.0 - valid)
         # edges are computed FROM warped RGB 
         e_prev_to_cur = self.model.canny(x_prev_to_cur.float()).clamp(0, 1).float()
 
@@ -1874,7 +1873,8 @@ class DMCVBTrainer:
                 _, outputs = self.model.compute_total_loss(
                     observations=observations,
                     actions=actions,
-                    dones=dones
+                    dones=dones,
+                    store_reconstruction_samples=True,
                 )
 
                 for i in range(batch_size):
@@ -2014,7 +2014,7 @@ class DMCVBTrainer:
             if epoch % self.config['visualize_every'] == 0:
                 self.visualize_results(epoch)
                 self.visualize_two_step_prediction(epoch, T_ctx=8)
-                self.tb_log_warp_panel(epoch=epoch, b=0, t=1, tag="warp/teacher_forced_panel")
+                self.tb_log_warp_panel(epoch=epoch, b=np.random.randint(0, self.config["batch_size"]), t=5, tag="warp/teacher_forced_panel")
                 
 
             
@@ -2141,8 +2141,8 @@ def main():
         'policy_level': 'all',
         
         # Model settings
-        'max_components': 12,
-        'latent_dim': 48,
+        'max_components': 15,
+        'latent_dim': 56,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
         'prior_alpha': 20.0,  # Hyperparameters for prior
@@ -2150,7 +2150,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 20,
+        'batch_size': 23,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 2,

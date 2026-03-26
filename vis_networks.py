@@ -1924,14 +1924,17 @@ class RoPEMHA(nn.Module):
 
 
 class _CausalTransformerBlock(nn.Module):
-    """
-    A standard Pre-LN Transformer block using PyTorch MultiheadAttention.
-    Supports:
-      - attn_mask: [L, L] bool where True = DISALLOWED attention (PyTorch convention)
-      - key_padding_mask: [B, L] bool where True = PAD (ignored keys)
-    """
-    def __init__(self, dim: int, heads: int, mlp_dim: int, dropout: float):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        mlp_dim: int,
+        dropout: float,
+        use_checkpoint: bool = False,
+    ):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
+
         self.ln1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(
             embed_dim=dim,
@@ -1950,15 +1953,17 @@ class _CausalTransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
+    def _mlp_residual(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.mlp(self.ln2(x))
+
     def forward(
         self,
-        x: torch.Tensor,                         # [B, L, D]
+        x: torch.Tensor,  # [B, L, D]
         *,
-        attn_mask: Optional[torch.Tensor] = None, # [L, L] bool (True=blocked)
-        key_padding_mask: Optional[torch.Tensor] = None,  # [B, L] bool (True=pad)
+        attn_mask: Optional[torch.Tensor] = None,         # [L, L], True = blocked
+        key_padding_mask: Optional[torch.Tensor] = None,  # [B, L], True = pad
     ) -> torch.Tensor:
         h = self.ln1(x)
-        # MultiheadAttention returns (out, weights)
         out, _ = self.attn(
             h, h, h,
             attn_mask=attn_mask,
@@ -1966,9 +1971,17 @@ class _CausalTransformerBlock(nn.Module):
             need_weights=False,
         )
         x = x + self.drop1(out)
-        x = x + self.mlp(self.ln2(x))
-        return x
 
+        if self.use_checkpoint and self.training and x.requires_grad:
+            x = torch.utils.checkpoint.checkpoint(
+                self._mlp_residual,
+                x,
+                use_reentrant=False,
+            )
+        else:
+            x = self._mlp_residual(x)
+
+        return x
 
 class SpatialTemporalTokenizer(nn.Module):
     def __init__(
@@ -2046,7 +2059,7 @@ class TemporalDiscriminator(nn.Module):
         z_dim: int = 32,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         rope_base: float = 10000.0,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
         use_checkpoint: bool = False,
     ):
         super().__init__()
@@ -2116,6 +2129,7 @@ class TemporalDiscriminator(nn.Module):
                     heads=n_heads,
                     mlp_dim=2 * hidden_dim,
                     dropout=dropout,
+                    use_checkpoint=self.use_checkpoint,
                 )
                 for _ in range(n_layers)
             ]
@@ -2311,32 +2325,14 @@ class TemporalDiscriminator(nn.Module):
         attn_mask = self._get_block_causal_attn_mask(Tn, N, dev)                       # True means disallow
 
         all_hidden: List[torch.Tensor] = []
+        out = h
+        for layer in self.temporal_layers:
+            out = layer(out, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
 
-        if return_features:
-            # Pure function: returns (final_h, stacked_features) with no side effects.
-            # stacked_features: [n_layers, B, L, D]
-            def _layer_fn_with_feats(h_in: torch.Tensor):
-                feats = []
-                out = h_in
-                for layer in self.temporal_layers:
-                    out = layer(out, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
-                    feats.append(out)
-                return out, torch.stack(feats, dim=0)
+            if return_features:
+                all_hidden.append(out)
 
-            # checkpoint is now safe because there are no Python side effects
-            h, feats_stack = self._maybe_ckpt(_layer_fn_with_feats, h)
-            # list length = n_layers, each tensor [B, L, D]
-            all_hidden = [feats_stack[i] for i in range(feats_stack.shape[0])]
-
-        else:
-            # Pure function returning only final_h
-            def _layer_fn(h_in: torch.Tensor):
-                out = h_in
-                for layer in self.temporal_layers:
-                    out = layer(out, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
-                return out
-
-            h = self._maybe_ckpt(_layer_fn, h)
+        h = out
 
         # Final norm
         h = self.ln_f(h)                                             # [B, L, D]

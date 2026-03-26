@@ -30,7 +30,7 @@ export TF_CPP_MIN_LOG_LEVEL=2
 source /home/memole/links/D2E/bin/activate
 ### FORCE SINGLE-THREAD BLAS / OMP / TORCH
 # ---- VRAM allocator / fragmentation fixes ----
-export PYTORCH_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:256
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
 export CUDA_MODULE_LOADING=LAZY
 
 # If TensorFlow is imported anywhere in the SAME training process:

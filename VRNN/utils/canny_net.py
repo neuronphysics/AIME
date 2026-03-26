@@ -3,6 +3,8 @@ import cv2
 import torch
 import torch.nn as nn
 import numpy as np
+import torch.nn.functional as F
+
 def get_gaussian_kernel(k=3, mu=0, sigma=1, normalize=True):
     # compute 1 dimension gaussian
     gaussian_1D = np.linspace(-1, 1, k)
@@ -226,3 +228,135 @@ class CannyFilter(nn.Module):
                 thin_edges = thin_edges * low_gate
 
         return thin_edges
+
+
+class SoftCanny(nn.Module):
+    """
+    Use only as a secondary component for sharpening.
+    """
+    def __init__(self, k_gauss: int = 5, sigma: float = 1.5):
+        super().__init__()
+        assert k_gauss % 2 == 1 and k_gauss >= 3
+
+        self.k_gauss = k_gauss
+        self.sigma = sigma
+
+        g = self._gaussian_kernel(k_gauss, sigma)
+        sx = torch.tensor(
+            [[[-1.0, 0.0, 1.0],
+              [-2.0, 0.0, 2.0],
+              [-1.0, 0.0, 1.0]]],
+            dtype=torch.float32
+        )
+        sy = sx.transpose(-1, -2)
+
+        self.gauss = nn.Conv2d(1, 1, k_gauss, padding=k_gauss // 2, bias=False)
+        self.sx = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+        self.sy = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+
+        with torch.no_grad():
+            self.gauss.weight[:] = g
+            self.sx.weight[:] = sx.unsqueeze(0)
+            self.sy.weight[:] = sy.unsqueeze(0)
+
+        for m in [self.gauss, self.sx, self.sy]:
+            for p in m.parameters():
+                p.requires_grad = False
+
+        dk = torch.tensor([
+            [[0, 0,-1],[0, 1, 0],[0, 0, 0]],
+            [[0,-1, 0],[0, 1, 0],[0, 0, 0]],
+            [[-1,0, 0],[0, 1, 0],[0, 0, 0]],
+            [[0, 0, 0],[-1,1, 0],[0, 0, 0]],
+            [[0, 0, 0],[0, 1,-1],[0, 0, 0]],
+            [[0, 0, 0],[0, 1, 0],[-1,0, 0]],
+            [[0, 0, 0],[0, 1, 0],[0,-1, 0]],
+            [[0, 0, 0],[0, 1, 0],[0, 0,-1]],
+        ], dtype=torch.float32)
+
+        self.dk = nn.Conv2d(1, 8, 3, padding=1, bias=False)
+        with torch.no_grad():
+            self.dk.weight[:] = dk[:, None]
+        for p in self.dk.parameters():
+            p.requires_grad = False
+
+    @staticmethod
+    def _gaussian_kernel(k: int, sigma: float) -> torch.Tensor:
+        pts = torch.linspace(-1.0, 1.0, k)
+        y, x = torch.meshgrid(pts, pts, indexing="ij")
+        g = torch.exp(-(x * x + y * y) / (2.0 * sigma * sigma))
+        g = g / g.sum()
+        return g.view(1, 1, k, k)
+
+    @staticmethod
+    def _rgb_to_gray(x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1] == 1:
+            return x
+        r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+        return 0.2989 * r + 0.5870 * g + 0.1140 * b
+
+    @staticmethod
+    def _normalize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        return x / (x.amax(dim=(-2, -1), keepdim=True) + eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gray = self._rgb_to_gray(x)
+        blur = self.gauss(gray)
+        gx = self.sx(blur)
+        gy = self.sy(blur)
+
+        mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
+
+        # Corrected radians -> degrees
+        orient = torch.atan2(gy, gx + 1e-8) * (180.0 / math.pi) + 180.0
+        orient = torch.remainder(orient, 360.0)
+
+        dirs = torch.arange(0, 360, 45, device=x.device, dtype=x.dtype).view(1, 8, 1, 1)
+        theta = orient.repeat(1, 8, 1, 1)
+        delta = ((theta - dirs + 180.0) % 360.0) - 180.0
+        weights = torch.softmax(-(delta ** 2) / (2.0 * 30.0 ** 2), dim=1)
+
+        dir_resp = self.dk(mag)
+        nms_score = (dir_resp * weights).sum(dim=1, keepdim=True)
+        gate = torch.sigmoid(nms_score / 0.05)
+
+        thin = mag * gate
+        return self._normalize(thin)
+
+
+class BoundaryDetector(nn.Module):
+    """
+    Full-resolution edge detector.
+
+    Input:
+        x: [B,C,H,W] with C=1 or C=3
+    Output:
+        edge: [B,1,H,W] in [0,1]
+    """
+    def __init__(self, r: int = 1, eps: float = 1e-8):
+        super().__init__()
+        self.r = int(r)
+        self.eps = float(eps)
+
+    @staticmethod
+    def _to_gray(x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise ValueError(f"Expected [B,C,H,W], got {tuple(x.shape)}")
+        if x.shape[1] == 1:
+            return x
+        if x.shape[1] == 3:
+            r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+            return 0.2989 * r + 0.5870 * g + 0.1140 * b
+        raise ValueError(f"Expected 1 or 3 channels, got C={x.shape[1]}")
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x / (x.amax(dim=(-2, -1), keepdim=True) + self.eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gray = self._to_gray(x)
+        s = 2 * self.r + 1
+        dil = F.max_pool2d(gray, kernel_size=s, stride=1, padding=self.r)
+        ero = -F.max_pool2d(-gray, kernel_size=s, stride=1, padding=self.r)
+        edge = (dil - ero).clamp_min(0.0)
+        return self._normalize(edge)
+

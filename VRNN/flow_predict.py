@@ -1,7 +1,9 @@
 import torch
+
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Tuple, Optional, Dict
 from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 # ----------------------------
 # Helpers
@@ -63,26 +65,7 @@ def coords_grid(batch, ht, wd, device, dtype):
 # ----------------------------
 # Blocks 
 # ----------------------------
-class FlowUpsampleMask(nn.Module):
-    def __init__(self, in_ch: int, scale: int, hidden: int = 128, use_checkpoint: bool = False):
-        super().__init__()
-        self.scale = int(scale)
-        self.use_checkpoint = bool(use_checkpoint)
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, hidden, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, hidden, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, 9 * self.scale * self.scale, 1, padding=0),
-        )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
 
-    def forward(self, feat):
-        if self.use_checkpoint and self.training and feat.requires_grad:
-            return checkpoint(self.net, feat, use_reentrant=False)
-        else:
-            return self.net(feat)
 
 class Hidden_state_conv(nn.Module):
     def __init__(self, input_dim=64, hidden_dim=128):
@@ -182,11 +165,14 @@ class FlowHead(nn.Module):
     def __init__(self, input_dim=64, hidden_dim=128):
         super().__init__()
         self.conv1 = nn.Conv2d(input_dim, hidden_dim, 3, padding=1, bias=True)
+        self.gn = nn.GroupNorm(8, hidden_dim)
         self.conv2 = nn.Conv2d(hidden_dim, 2, 3, padding=1, bias=True)
         self.relu = nn.ReLU(inplace=False)
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
 
     def forward(self, x):
-        return self.conv2(self.relu(self.conv1(x)))
+        return self.conv2(self.relu(self.gn(self.conv1(x))))
 
 class Decoder(nn.Module):
     """
@@ -264,6 +250,104 @@ def get_gru_decoder(future_len: int, action_dim: int = 0):
 # ============================================================
 # Latent motion conditioning (attention -> latent flow -> warp)
 # ============================================================
+
+class ConvGNAct(nn.Module):
+    """Conv -> GroupNorm -> SiLU """
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=None, groups=8, inplace_act=False):
+        super().__init__()
+        if p is None:
+            p = k // 2
+        self.conv = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
+        g = min(groups, out_ch)
+        while out_ch % g != 0 and g > 1:
+            g -= 1
+        self.gn = nn.GroupNorm(g, out_ch)
+        self.act = nn.SiLU(inplace=inplace_act)  # <= safer off when checkpointing
+
+    def forward(self, x):
+        return self.act(self.gn(self.conv(x)))
+
+
+class EdgeMapToTop(nn.Module):
+    """
+    Map an already-computed 1-channel edge map [B,1,H,W] to top grid
+    [B,out_ch,topH,topW] using:
+
+      1) average pooling to target grid
+      2) normalize
+      3) gamma boost
+      4) normalize again
+      5) trainable 1x1 projection
+    """
+    def __init__(
+        self,
+        out_ch: int = 16,
+        target_hw=(8, 8),
+        gamma: float = 0.8,
+        use_checkpoint: bool = False,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.target_hw = (int(target_hw[0]), int(target_hw[1]))
+        self.gamma = float(gamma)
+        self.use_checkpoint = bool(use_checkpoint)
+        self.eps = float(eps)
+
+        groups = min(8, int(out_ch))
+        while groups > 1 and (int(out_ch) % groups != 0):
+            groups -= 1
+
+        self.proj = nn.Sequential(
+            nn.Conv2d(1, int(out_ch), kernel_size=1, bias=True),
+            nn.GroupNorm(groups, int(out_ch)),
+            nn.SiLU(inplace=False),
+        )
+
+    def _maybe_ckpt(self, fn, x: torch.Tensor) -> torch.Tensor:
+        if self.use_checkpoint and self.training and x.requires_grad:
+            return checkpoint(fn, x, use_reentrant=False)
+        return fn(x)
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x / (x.amax(dim=(-2, -1), keepdim=True) + self.eps)
+
+    def _coerce_edge_shape(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise ValueError(f"edge map must be 4D, got {tuple(x.shape)}")
+
+        # Accept [B,1,H,W] or [B,H,W,1]
+        if x.shape[1] == 1:
+            return x
+        if x.shape[-1] == 1:
+            return x.permute(0, 3, 1, 2).contiguous()
+
+        raise ValueError(f"Expected [B,1,H,W] or [B,H,W,1], got {tuple(x.shape)}")
+
+    def _pool_to_target(self, x: torch.Tensor) -> torch.Tensor:
+        th, tw = self.target_hw
+        h, w = x.shape[-2:]
+
+        if (h, w) == (th, tw):
+            return x
+
+        if (h % th == 0) and (w % tw == 0):
+            sy, sx = h // th, w // tw
+            return F.avg_pool2d(x, kernel_size=(sy, sx), stride=(sy, sx))
+
+        return F.adaptive_avg_pool2d(x, self.target_hw)
+
+    def forward(self, edge_map: torch.Tensor) -> torch.Tensor:
+        edge_map = self._coerce_edge_shape(edge_map)
+
+        # 1) map to top grid with avg pooling
+        e_top = self._pool_to_target(edge_map)
+
+        # 2) normalize -> gamma boost -> normalize again
+        e_top = self._normalize(e_top).clamp_min(self.eps).pow(self.gamma)
+        e_top = self._normalize(e_top)
+
+        # 3) always use trainable projection
+        return self._maybe_ckpt(self.proj, e_top)
 
 
 class PixelShuffleUpBlock(nn.Module):
@@ -344,10 +428,13 @@ class HFTopUpsampler(nn.Module):
         self.max_steps = int(math.log2(max_scale))
         self.blocks = nn.ModuleList([PixelShuffleUpBlock(self.channels) for _ in range(self.max_steps)])
 
+        g = min(32, self.channels)
+        while g > 1 and (self.channels % g != 0):
+            g -= 1
         # optional final “polish” conv to reduce any remaining checkerboard / subpixel texture
         self.final = nn.Sequential(
             nn.Conv2d(self.channels, self.channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=min(32, self.channels), num_channels=self.channels),
+            nn.GroupNorm(num_groups=g, num_channels=self.channels),
             nn.SiLU(inplace=True),
         )
 
@@ -385,6 +472,7 @@ class HFTopUpsampler(nn.Module):
 
         x = self.final(x)
         return x
+        
 
 class AntiAliasInterpolation2d(nn.Module):
     """
@@ -435,82 +523,7 @@ class AntiAliasInterpolation2d(nn.Module):
 
         return out
 
-class ConvGNAct(nn.Module):
-    """Conv -> GroupNorm -> SiLU """
-    def __init__(self, in_ch, out_ch, k=3, s=1, p=None, groups=8, inplace_act=False):
-        super().__init__()
-        if p is None:
-            p = k // 2
-        self.conv = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
-        g = min(groups, out_ch)
-        while out_ch % g != 0 and g > 1:
-            g -= 1
-        self.gn = nn.GroupNorm(g, out_ch)
-        self.act = nn.SiLU(inplace=inplace_act)  # <= safer off when checkpointing
 
-    def forward(self, x):
-        return self.act(self.gn(self.conv(x)))
-
-
-class HFToTop(nn.Module):
-    """
-    High-frequency (e.g. 64x64) -> top grid using ONLY strided convs + optional interpolate.
-    Adds activation checkpointing (no pooling, no gating).
-    """
-    def __init__(
-        self,
-        in_ch,
-        out_ch,
-        mid_ch,
-        target_hw,
-        max_down_blocks=6,
-        *,
-        use_checkpoint: bool = False,
-    ):
-        super().__init__()
-        self.target_hw = tuple(int(x) for x in target_hw)
-        self.use_checkpoint = bool(use_checkpoint)
-
-        blocks = []
-        ch = in_ch
-        for _ in range(max_down_blocks):
-            blocks.append(nn.Sequential(
-                ConvGNAct(ch, mid_ch, k=3, s=2),
-                ConvGNAct(mid_ch, mid_ch, k=3, s=1),
-            ))
-            ch = mid_ch
-        self.down_blocks = nn.ModuleList(blocks)
-
-        self.final = nn.Sequential(
-            ConvGNAct(ch, out_ch, k=3, s=1),
-            nn.Conv2d(out_ch, out_ch, 1, 1, 0, bias=True),
-        )
-
-    def _ckpt(self, fn, x):
-        """
-        Activation checkpointing: saves memory by re-running `fn(x)` on backward.
-        Only enabled during training and when gradients are needed.
-        """
-        if self.use_checkpoint and self.training and x.requires_grad:
-            # use_reentrant=False is recommended for modern PyTorch.
-            return checkpoint(fn, x, use_reentrant=False)
-        return fn(x)
-
-    def forward(self, x):
-        th, tw = self.target_hw
-        y = x
-
-        # Down blocks (checkpoint each block)
-        for blk in self.down_blocks:
-            if (y.shape[-2] <= 2 * th) and (y.shape[-1] <= 2 * tw):
-                break
-            y = self._ckpt(blk, y)
-
-        # Resize (NOT pooling)
-        if (y.shape[-2], y.shape[-1]) != (th, tw):
-            y = F.interpolate(y, size=(th, tw), mode="bilinear", align_corners=False)
-
-        return self._ckpt(self.final, y)
 
 def sinusoidal_2d_pos_embed(H: int, W: int, D: int, device=None, dtype=None) -> torch.Tensor:
     """
@@ -539,194 +552,6 @@ def sinusoidal_2d_pos_embed(H: int, W: int, D: int, device=None, dtype=None) -> 
     emb = torch.cat([emb_x, emb_y], dim=1)  # [H*W, D]
     return emb[None, :, :]
 
-class EdgeToTop(nn.Module):
-    """Project a 1-channel edge map at full resolution to a fixed (topH, topW) feature map.
-
-    No pooling: strided convs + optional final interpolate.
-    """
-    def __init__(
-        self,
-        out_ch: int,
-        *,
-        mid_ch: int = 32,
-        target_hw: tuple[int, int] = (8, 8),
-        use_checkpoint: bool = False,
-    ):
-        super().__init__()
-        self.net = HFToTop(
-            in_ch=1,
-            out_ch=int(out_ch),
-            mid_ch=int(mid_ch),
-            target_hw=(int(target_hw[0]), int(target_hw[1])),
-            use_checkpoint=bool(use_checkpoint),
-        )
-
-    def forward(self, edge_fullres: torch.Tensor) -> torch.Tensor:
-        return self.net(edge_fullres)
-
-class ConvTokenizer(nn.Module):
-    """Convert a feature map into a token grid (patchified conv) + sinusoidal 2D pos-enc."""
-
-    def __init__(
-        self,
-        in_ch: int,
-        token_dim: int,
-        patch: int = 4,
-        *,
-        use_checkpoint: bool = False,
-    ):
-        super().__init__()
-        self.in_ch = int(in_ch)
-        self.token_dim = int(token_dim)
-        self.patch = int(patch)
-        self.use_checkpoint = bool(use_checkpoint)
-
-        self.proj = nn.Sequential(
-            nn.Conv2d(self.in_ch, self.token_dim, kernel_size=self.patch, stride=self.patch),
-            nn.GELU(),
-            nn.Conv2d(self.token_dim, self.token_dim, 1),
-        )
-
-    def forward(self, x: torch.Tensor):
-        B, C, H, W = x.shape
-        assert H % self.patch == 0 and W % self.patch == 0, "H,W must be divisible by patch."
-        Hp, Wp = H // self.patch, W // self.patch
-
-        if self.use_checkpoint and self.training and x.requires_grad:
-            y = checkpoint(self.proj, x, use_reentrant=False)
-        else:
-            y = self.proj(x)
-
-        tok = y.flatten(2).transpose(1, 2)  # [B, N, D]
-        pos = sinusoidal_2d_pos_embed(Hp, Wp, tok.shape[-1], device=tok.device, dtype=tok.dtype)  # [1,N,D]
-        tok = tok + pos
-        return tok, (Hp, Wp)
-
-class MotionTokenBank(nn.Module):
-    """A lightweight recurrent memory of motion tokens.
-
-    Maintains a per-batch token bank and updates it with attention using
-    the current top-grid hidden map + action as context.
-    """
-
-    def __init__(
-        self,
-        n_tokens: int,
-        token_dim: int,
-        action_dim: int,
-        top_hidden_dim: int,
-        *,
-        alpha: float = 0.9,
-        dropout: float = 0.0,
-        layer_norm: bool = True,
-        init_std: float = 0.02,
-    ):
-        super().__init__()
-        self.n_tokens = int(n_tokens)
-        self.token_dim = int(token_dim)
-        self.action_dim = int(action_dim)
-        self.top_hidden_dim = int(top_hidden_dim)
-        self.alpha = float(alpha)
-
-        self.base_tokens = nn.Parameter(init_std * torch.randn(1, self.n_tokens, self.token_dim))
-
-        self.ctx_to_kv = nn.Conv2d(self.top_hidden_dim, 2 * self.token_dim, 1, 1, 0, bias=True)
-        self.action_to_key = nn.Linear(self.action_dim, self.token_dim, bias=True)
-
-        self.attn = nn.MultiheadAttention(
-            embed_dim=self.token_dim,
-            num_heads=max(1, self.token_dim // 64),
-            dropout=float(dropout),
-            batch_first=True,
-        )
-        self.ln = nn.LayerNorm(self.token_dim) if layer_norm else nn.Identity()
-
-    def init_tokens(self, B: int, device=None, dtype=None) -> torch.Tensor:
-        device = device or self.base_tokens.device
-        dtype = dtype or self.base_tokens.dtype
-        return self.base_tokens.to(device=device, dtype=dtype).expand(int(B), -1, -1).contiguous()
-
-    def _maybe_ckpt(self, fn, *args):
-        if self.use_checkpoint and self.training and any(t.requires_grad for t in args):
-            return checkpoint(fn, *args, use_reentrant=False)
-        return fn(*args)
-
-    @staticmethod
-    def _reset_with_mask(tokens: torch.Tensor, base_tokens: torch.Tensor, mask_t: torch.Tensor | None) -> torch.Tensor:
-        if mask_t is None:
-            return tokens
-        if mask_t.dim() == 2 and mask_t.shape[1] == 1:
-            mask = mask_t
-        elif mask_t.dim() == 1:
-            mask = mask_t[:, None]
-        else:
-            raise ValueError(f"mask_t must be [B] or [B,1], got {tuple(mask_t.shape)}")
-        keep = mask.to(device=tokens.device, dtype=tokens.dtype).view(tokens.shape[0], 1, 1)
-        return tokens * keep + base_tokens.expand(tokens.shape[0], -1, -1) * (1.0 - keep)
-
-    def update(
-        self,
-        motion_tokens: torch.Tensor,
-        action: torch.Tensor,
-        h_context_map: torch.Tensor,
-        *,
-        mask_t: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (new_tokens, mean_attention_entropy)."""
-        motion_tokens = self._reset_with_mask(motion_tokens, self.base_tokens, mask_t)
-        kv = self._maybe_ckpt(self.ctx_to_kv, h_context_map)
-
-        k_map, v_map = kv.chunk(2, dim=1)
-        k = k_map.flatten(2).transpose(1, 2)  # [B,M,D]
-        v = v_map.flatten(2).transpose(1, 2)
-        a_key = self._maybe_ckpt(self.action_to_key, action).unsqueeze(1)  # [B,1,D]
-        k = k + a_key
-
-        upd, attn_w = self.attn(
-            query=motion_tokens,
-            key=k,
-            value=v,
-            need_weights=True,
-            average_attn_weights=False,
-        )
-        p = attn_w.clamp(min=1e-8)
-        ent = -(p * p.log()).sum(dim=-1).mean()
-
-        new_tokens = self.ln(self.alpha * motion_tokens + (1.0 - self.alpha) * upd)
-        return new_tokens, ent
-
-    def spatial_context_map(
-        self,
-        motion_tokens: torch.Tensor,
-        token_hw: tuple[int, int],
-        top_hw: tuple[int, int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert motion tokens to a top-grid map; return (map, entropy)."""
-        Ht, Wt = token_hw
-        topH, topW = top_hw
-        B, N, D = motion_tokens.shape
-        assert N == Ht * Wt, f"N must equal Ht*Wt, got N={N} vs {Ht}*{Wt}"
-        assert D == self.token_dim
-
-        map0 = motion_tokens.transpose(1, 2).reshape(B, D, Ht, Wt)
-        if (Ht, Wt) != (topH, topW):
-            map0 = F.interpolate(map0, size=(topH, topW), mode="bilinear", align_corners=False)
-
-        # A simple diversity proxy entropy: softmax over per-token norms
-        probs = F.softmax(motion_tokens.norm(dim=-1), dim=-1).clamp(min=1e-8)  # [B,N]
-        ent = -(probs * probs.log()).sum(dim=-1).mean()
-
-        return map0, ent
-
-class _ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.norm = nn.GroupNorm(num_groups=min(16, out_ch), num_channels=out_ch)
-        self.act = nn.GELU()
-    def forward(self, x):
-        return self.act(self.norm(self.conv(x)))
-
 
 class SEBlock2d(nn.Module):
     def __init__(self, c: int, r: int = 16):
@@ -744,100 +569,98 @@ class SEBlock2d(nn.Module):
         return x * self.fc(self.pool(x))
 
 
-class SEResDilatedBlock(nn.Module):
-    def __init__(self, c: int, dilation: int = 1, groups: int = 16):
+class CrossAttention(nn.Module):
+    def __init__(self, query_dim, context_dim, heads=8, dim_head=64):
         super().__init__()
-        g = min(groups, c)
-        self.conv1 = nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation, bias=False)
-        self.gn1   = nn.GroupNorm(g, c)
-        self.conv2 = nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation, bias=False)
-        self.gn2   = nn.GroupNorm(g, c)
-        self.se    = SEBlock2d(c, r=16)
-        self.act   = nn.SiLU(inplace=False)
+        inner_dim = heads * dim_head
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
 
-    def forward(self, x):
-        y = self.act(self.gn1(self.conv1(x)))
-        y = self.gn2(self.conv2(y))
-        y = self.se(y)
-        return self.act(x + y)
+        self.to_q = nn.Conv2d(query_dim, inner_dim, 1, bias=False)
+        self.to_k = nn.Conv2d(context_dim, inner_dim, 1, bias=False)
+        self.to_v = nn.Conv2d(context_dim, inner_dim, 1, bias=False)
+        self.to_out = nn.Conv2d(inner_dim, query_dim, 1, bias=True)
 
-class MaxDeltaCalibrator:
-    def __init__(self, q=0.995, frac=0.5, ema=0.98, min_md=2.0, max_md=16.0):
-        self.q, self.frac, self.ema = q, frac, ema
-        self.min_md, self.max_md = min_md, max_md
-        self.p_ema = None
+    def forward(self, x, context):
+        """
+        x:       [B, Cq, H, W]   query map
+        context: [B, Cc, H, W]   context map
+        returns: [B, Cq, H, W]
+        """
+        B, _, H, W = x.shape
+        h = self.heads
+        d = self.dim_head
 
-    @torch.no_grad()
-    def update(self, flow64_base):
-        p = torch.quantile(flow64_base.abs().flatten(), self.q).item()
-        self.p_ema = p if self.p_ema is None else (self.ema * self.p_ema + (1 - self.ema) * p)
-        target = self.frac * self.p_ema
-        return float(max(self.min_md, min(self.max_md, target)))
+        q = self.to_q(x)        # [B, h*d, H, W]
+        k = self.to_k(context)  # [B, h*d, H, W]
+        v = self.to_v(context)  # [B, h*d, H, W]
 
+        # [B, h, HW, d]
+        q = q.view(B, h, d, H * W).permute(0, 1, 3, 2)
+        k = k.view(B, h, d, H * W).permute(0, 1, 3, 2)
+        v = v.view(B, h, d, H * W).permute(0, 1, 3, 2)
 
-class FlowRefiner(nn.Module):
-    """
-    Predict delta-flow at same resolution as input:
-      input:  [B, in_ch, H, W]
-      output: [B, 2,    H, W]  (delta flow in pixels)
-    """
-    def __init__(
-        self,
-        in_ch: int,
-        base: int = 128,
-        num_blocks: int = 8,
-        max_delta: float = 8.0,
-        use_checkpoint: bool = False,
-    ):
-        super().__init__()
-        self.max_delta = float(max_delta)
-        self.use_checkpoint = bool(use_checkpoint)
+        # attention scores: [B, h, HW, HW]
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
 
-        g = min(16, base)
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, base, 3, padding=1, bias=False),
-            nn.GroupNorm(g, base),
-            nn.SiLU(inplace=False),
-        )
+        # [B, h, HW, d]
+        out = torch.matmul(attn, v)
 
-        # Dilations cycle to grow receptive field without down/up
-        dilations = [1, 2, 4, 1, 2, 4, 1, 2]
-        dilations = (dilations * ((num_blocks + len(dilations) - 1) // len(dilations)))[:num_blocks]
-        self.blocks = nn.ModuleList([SEResDilatedBlock(base, d) for d in dilations])
+        # [B, h*d, H, W]
+        out = out.permute(0, 1, 3, 2).contiguous().view(B, h * d, H, W)
 
-        self.head = nn.Conv2d(base, 2, 3, padding=1, bias=True)
-
-        # start as "no refinement"
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
-
-    def _maybe_ckpt(self, fn, x):
-        do_ckpt = self.use_checkpoint and self.training and torch.is_grad_enabled() and x.requires_grad
-        return checkpoint(fn, x, use_reentrant=False) if do_ckpt else fn(x)
-
-    def forward(self, x):
-        x = self._maybe_ckpt(self.stem, x)
-        for blk in self.blocks:
-            x = self._maybe_ckpt(blk, x)
-        delta = self.head(x)
-        return self.max_delta * torch.tanh(delta)
+        return self.to_out(out)
 
 
 class LatentFlowHead(nn.Module):
-    """
-    Predict top-grid flow in pixel units: [B,2,topH,topW]
-    """
-    def __init__(self, hf_ch, mot_ch, act_dim, edge_ch, hidden=128, max_flow=8.0, use_checkpoint=False):
+    """Predict coarse canonical flow on the top grid in normalized coordinates."""
+
+    def __init__(
+        self,
+        mot_ch: int,
+        ctx_ch: int,
+        act_dim: int,
+        edge_ch: int,
+        top_hw: Tuple[int, int],
+        hidden: int = 128,
+        max_flow_top_px: float = 1.0,
+        use_checkpoint: bool = False,
+        attn_heads: int = 8,
+        attn_dim_head: int = 32,
+    ):
         super().__init__()
-        self.max_flow = float(max_flow)
         self.use_checkpoint = bool(use_checkpoint)
+        topH, topW = int(top_hw[0]), int(top_hw[1])
+
+        max_dx_norm = 2.0 * float(max_flow_top_px) / max(topW - 1, 1)
+        max_dy_norm = 2.0 * float(max_flow_top_px) / max(topH - 1, 1)
+        self.register_buffer(
+            'max_flow_norm',
+            torch.tensor([max_dx_norm, max_dy_norm], dtype=torch.float32).view(1, 2, 1, 1),
+            persistent=False,
+        )
 
         self.act_embed = nn.Sequential(
             nn.Conv2d(act_dim, 32, 1, 1, 0),
             nn.GroupNorm(8, 32),
             nn.SiLU(inplace=False),
         )
-        in_ch = hf_ch + mot_ch + 32 + edge_ch
+
+        self.motion_hctx_attn = CrossAttention(
+            query_dim=mot_ch,
+            context_dim=ctx_ch,
+            heads=attn_heads,
+            dim_head=attn_dim_head,
+        )
+
+        g_mot = min(8, mot_ch)
+        while mot_ch % g_mot != 0 and g_mot > 1:
+            g_mot -= 1
+        self.mot_fuse_norm = nn.GroupNorm(g_mot, mot_ch)
+
+        in_ch = mot_ch + 32 + edge_ch
         self.net = nn.Sequential(
             ConvGNAct(in_ch, hidden, 3, 1, inplace_act=False),
             ConvGNAct(hidden, hidden, 3, 1, inplace_act=False),
@@ -847,121 +670,215 @@ class LatentFlowHead(nn.Module):
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
-    def forward(self, hf_top, mot_ctx, a_map, edge_top):
-        if self.use_checkpoint and self.training and a_map.requires_grad:
-            a_emb = checkpoint(self.act_embed, a_map, use_reentrant=False)
-        else:
-            a_emb = self.act_embed(a_map)
-        x = torch.cat([hf_top, mot_ctx, a_emb, edge_top], dim=1)
-
-        if self.use_checkpoint and self.training and x.requires_grad:
-            # split sequential into segments (tune 2-4 depending on your depth)
-            flow = checkpoint_sequential(self.net, segments=3, input=x, use_reentrant=False)
-        else:
-            flow = self.net(x)
-
-        return self.max_flow * torch.tanh(flow)
-
-
-
-class _ResGNAct(nn.Module):
-    """Simple residual block: (Conv-GN-SiLU) x2 with skip."""
-    def __init__(self, ch: int, groups: int = 8):
-        super().__init__()
-        g = min(groups, ch)
-        while ch % g != 0 and g > 1:
-            g -= 1
-        self.gn1 = nn.GroupNorm(g, ch)
-        self.gn2 = nn.GroupNorm(g, ch)
-        self.c1 = nn.Conv2d(ch, ch, 3, 1, 1, bias=False)
-        self.c2 = nn.Conv2d(ch, ch, 3, 1, 1, bias=False)
-        self.act = nn.SiLU(inplace=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.act(self.gn1(x))
-        h = self.c1(h)
-        h = self.act(self.gn2(h))
-        h = self.c2(h)
-        return x + h
-
-
-class HFMapPredictor(nn.Module):
-    """Predict a full-res (default 64x64) HF feature map from (z_top, h_context, action).
-
-    Backward compatible with two constructors:
-
-    """
-    def __init__(
-        self,
-        in_ch: int = None,
-        out_ch: int = None,
-        action_dim: int = None,
-        *,
-        z_ch: int = None,
-        h_ch: int = None,
-        a_ch: int = None,
-        out_hw: tuple[int, int] = (64, 64),
-        base: int = 128,
-        use_checkpoint: bool = False,
-        groups: int = 8,
-        n_res: int = 6,
-    ):
-        super().__init__()
-        if (z_ch is not None) or (h_ch is not None) or (a_ch is not None):
-            if (z_ch is None) or (h_ch is None) or (a_ch is None) or (out_ch is None):
-                raise ValueError("HFMapPredictor: when using z_ch/h_ch/a_ch you must also pass out_ch")
-            in_ch = int(z_ch) + int(h_ch)
-            action_dim = int(a_ch)
-            out_ch = int(out_ch)
-        if in_ch is None or out_ch is None or action_dim is None:
-            raise ValueError("HFMapPredictor: missing required channel dims")
-
-        self.out_hw = (int(out_hw[0]), int(out_hw[1]))
-        self.use_checkpoint = bool(use_checkpoint)
-
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_ch + action_dim, int(base), 3, 1, 1, bias=False),
-            nn.GroupNorm(max(1, min(int(groups), int(base))), int(base)),
-            nn.SiLU(inplace=False),
-        )
-
-        # AR path: downsample hf_prev to top grid, project to base, add into stem output
-        self.prev_proj = nn.Conv2d(int(out_ch), int(base), 1, 1, 0, bias=False)
-
-        self.res_blocks = nn.ModuleList([_ResGNAct(int(base), groups=int(groups)) for _ in range(int(n_res))])
-        self.head = nn.Conv2d(int(base), int(out_ch), 3, 1, 1, bias=False)
-
     def _maybe_ckpt(self, fn, *args):
-        if self.use_checkpoint and self.training:
+        if self.use_checkpoint and self.training and any(torch.is_tensor(a) and a.requires_grad for a in args):
             return checkpoint(fn, *args, use_reentrant=False)
         return fn(*args)
 
+    def _cross_attend_motion(self, mot_ctx, h_context_map):
+        return self.motion_hctx_attn(mot_ctx, h_context_map)
+
+    def forward(self, mot_ctx, h_context_map, a_map, edge_top):
+        a_emb = self._maybe_ckpt(self.act_embed, a_map)
+        mot_ctx_attn = self._maybe_ckpt(self._cross_attend_motion, mot_ctx, h_context_map)
+        mot_ctx_fused = self.mot_fuse_norm(mot_ctx + mot_ctx_attn)
+        x = torch.cat([mot_ctx_fused, a_emb, edge_top], dim=1)
+        if self.use_checkpoint and self.training and x.requires_grad:
+            raw = checkpoint_sequential(self.net, segments=3, input=x, use_reentrant=False)
+        else:
+            raw = self.net(x)
+        return self.max_flow_norm.to(device=raw.device, dtype=raw.dtype) * torch.tanh(raw)
+
+def resize_flow_norm(
+    flow_norm: torch.Tensor,
+    dst_hw: Tuple[int, int],
+    mode: str = 'bicubic',
+) -> torch.Tensor:
+    """Resample a canonical flow field in normalized coordinates."""
+    assert flow_norm.ndim == 4 and flow_norm.size(1) == 2
+    Hd, Wd = int(dst_hw[0]), int(dst_hw[1])
+    if flow_norm.shape[-2:] == (Hd, Wd):
+        return flow_norm
+    if mode not in {'bilinear', 'bicubic'}:
+        raise ValueError(f'Unsupported mode={mode}')
+    return F.interpolate(flow_norm, size=(Hd, Wd), mode=mode, align_corners=True)
+
+class FineResidualFlowHead(nn.Module):
+    """
+    Predict a fine residual in canonical normalized coordinates and project it to
+    the high-pass complement of the coarse bicubic function class.
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        fine_hw: Tuple[int, int],
+        coarse_hw: Tuple[int, int],
+        hidden: int = 64,
+        max_fine_flow_norm: float = 0.05,
+        use_checkpoint: bool = False,
+    ):
+        super().__init__()
+        self.fine_H, self.fine_W = int(fine_hw[0]), int(fine_hw[1])
+        self.coarse_H, self.coarse_W = int(coarse_hw[0]), int(coarse_hw[1])
+        self.use_checkpoint = bool(use_checkpoint)
+        self.register_buffer('max_norm', torch.tensor(float(max_fine_flow_norm), dtype=torch.float32), persistent=False)
+
+        def _groups(c: int) -> int:
+            g = min(8, c)
+            while c % g != 0 and g > 1:
+                g -= 1
+            return g
+
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, hidden, 3, 1, 1),
+            nn.GroupNorm(_groups(hidden), hidden),
+            nn.SiLU(inplace=False),
+            nn.Conv2d(hidden, hidden, 3, 1, 1),
+            nn.GroupNorm(_groups(hidden), hidden),
+            nn.SiLU(inplace=False),
+            nn.Conv2d(hidden, 2, 3, 1, 1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def _project_highpass(self, residual: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Bicubic projector onto the coarse-representable subspace, then subtract.
+        residual_low = resize_flow_norm(residual, (self.coarse_H, self.coarse_W), mode='bicubic')
+        residual_recon = resize_flow_norm(residual_low, (self.fine_H, self.fine_W), mode='bicubic')
+        residual_high = residual - residual_recon
+        leakage = resize_flow_norm(residual_high, (self.coarse_H, self.coarse_W), mode='bicubic')
+        return residual_high, leakage
+
+    def forward(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if feat.shape[-2:] != (self.fine_H, self.fine_W):
+            feat = F.interpolate(feat, size=(self.fine_H, self.fine_W), mode='bilinear', align_corners=True)
+        if self.use_checkpoint and self.training and feat.requires_grad:
+            raw = checkpoint(self.net, feat, use_reentrant=False)
+        else:
+            raw = self.net(feat)
+        residual = self.max_norm.to(device=raw.device, dtype=raw.dtype) * torch.tanh(raw)
+        residual_high, leakage = self._project_highpass(residual)
+        return residual_high, leakage
+
+def flow_norm_to_px(flow_norm: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
+    """Convert normalized align_corners=True flow to pixel units."""
+    assert flow_norm.ndim == 4 and flow_norm.size(1) == 2
+    H, W = int(hw[0]), int(hw[1])
+
+    sx = max(W - 1, 1) / 2.0
+    sy = max(H - 1, 1) / 2.0
+
+    out = flow_norm.clone()
+    out[:, 0] = out[:, 0] * sx
+    out[:, 1] = out[:, 1] * sy
+    return out
+
+
+class CanonicalFlowField(nn.Module):
+    """
+    Canonical cross-scale flow module.
+    The top-grid flow is the only coarse motion predictor.
+    The target-resolution flow is deterministic bicubic lift plus an optional
+    strictly high-frequency residual.
+    """
+
+    def __init__(
+        self,
+        mot_ch: int,
+        ctx_ch: int,
+        act_dim: int,
+        edge_ch: int,
+        fine_feat_ch: int,
+        top_hw: Tuple[int, int],
+        target_hw: Tuple[int, int],
+        coarse_hidden: int = 128,
+        max_flow_top_px: float = 1.0,
+        use_checkpoint: bool = False,
+        fine_hw: Optional[Tuple[int, int]] = None,
+        fine_hidden: int = 64,
+        max_fine_flow_px: float = 0.5,
+    ):
+        super().__init__()
+        self.top_hw = (int(top_hw[0]), int(top_hw[1]))
+        self.target_hw = (int(target_hw[0]), int(target_hw[1]))
+
+        self.coarse_head = LatentFlowHead(
+            mot_ch=mot_ch,
+            ctx_ch=ctx_ch,
+            act_dim=act_dim,
+            edge_ch=edge_ch,
+            top_hw=self.top_hw,
+            hidden=coarse_hidden,
+            max_flow_top_px=max_flow_top_px,
+            use_checkpoint=use_checkpoint,
+        )
+
+        fine_hw = self.target_hw if fine_hw is None else (int(fine_hw[0]), int(fine_hw[1]))
+        self.fine_head = FineResidualFlowHead(
+            in_ch=fine_feat_ch,
+            fine_hw=fine_hw,
+            coarse_hw=self.top_hw,
+            hidden=fine_hidden,
+            max_fine_flow_norm=max_fine_flow_px,
+            use_checkpoint=use_checkpoint,
+        )
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask_t: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask_t is None:
+            return x.mean()
+        vm = mask_t.view(mask_t.size(0), 1, 1, 1).to(device=x.device, dtype=x.dtype)
+        denom = (vm.sum() * x.shape[1] * x.shape[2] * x.shape[3]).clamp(min=1.0)
+        return (x * vm).sum() / denom
+
     def forward(
         self,
-        *,
-        z_map: torch.Tensor,
-        h_context_map: torch.Tensor,
-        a_t: torch.Tensor,
-        hf_prev: torch.Tensor = None,
-    ) -> torch.Tensor:
-        B, _, topH, topW = z_map.shape
-        a_map = a_t.view(B, -1, 1, 1).expand(B, -1, topH, topW)
-        x = torch.cat([z_map, h_context_map, a_map], dim=1)
+        mot_ctx: torch.Tensor,
+        h_ctx: torch.Tensor,
+        a_map: torch.Tensor,
+        edge_top: torch.Tensor,
+        fine_feat: torch.Tensor,
+        mask_t: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        flow_top_norm = self.coarse_head(mot_ctx, h_ctx, a_map, edge_top)
+        base_target_norm = resize_flow_norm(flow_top_norm, self.target_hw, mode="bicubic")
 
-        x = self._maybe_ckpt(self.stem, x)
+        fine_res_norm, fine_leak = self.fine_head(fine_feat)
+        fine_res_target_norm = resize_flow_norm(fine_res_norm, self.target_hw, mode="bicubic")
+        flow_target_norm = base_target_norm + fine_res_target_norm
+        fine_null_loss = self._masked_mean(fine_leak.abs(), mask_t)
 
-        if hf_prev is not None:
-            hp = F.interpolate(hf_prev, size=(topH, topW), mode="bilinear", align_corners=False)
-            x = x + self._maybe_ckpt(self.prev_proj, hp)
+        flow_back_to_top = resize_flow_norm(flow_target_norm, self.top_hw, mode="bicubic")
+        cross_scale_cycle_loss = self._masked_mean((flow_back_to_top - flow_top_norm).abs(), mask_t) + self._masked_mean((flow_target_norm - base_target_norm).abs(), mask_t)
 
-        # lift to out resolution
-        x = F.interpolate(x, size=self.out_hw, mode="nearest")
+        flow_top_px = flow_norm_to_px(flow_top_norm, self.top_hw)
+        flow_target_px = flow_norm_to_px(flow_target_norm, self.target_hw)
+        base_target_px = flow_norm_to_px(base_target_norm, self.target_hw)
 
-        for blk in self.res_blocks:
-            x = self._maybe_ckpt(blk, x)
+        if mask_t is not None:
+            vm = mask_t.view(mask_t.size(0), 1, 1, 1).to(device=flow_top_px.device, dtype=flow_top_px.dtype)
+            flow_top_px = flow_top_px * vm
+            flow_target_px = flow_target_px * vm
+            base_target_px = base_target_px * vm
+            flow_top_norm = flow_top_norm * vm
+            flow_target_norm = flow_target_norm * vm
+            base_target_norm = base_target_norm * vm
+            fine_res_norm = fine_res_norm * vm
+            fine_res_target_norm = fine_res_target_norm * vm
 
-        x = self._maybe_ckpt(self.head, x)
-        return x
+        return {
+            "flow_top_norm": flow_top_norm,
+            "flow_top_px": flow_top_px,
+            "flow_target_norm": flow_target_norm,
+            "flow_target_px": flow_target_px,
+            "base_target_norm": base_target_norm,
+            "base_target_px": base_target_px,
+            "fine_res_norm": fine_res_norm,
+            "fine_res_target_norm": fine_res_target_norm,
+            "fine_null_loss": fine_null_loss,
+            "cross_scale_cycle_loss": cross_scale_cycle_loss,
+        }
 
 class ConvPatchTokenizer(nn.Module):
     """
@@ -1044,7 +961,6 @@ class TokenTransporter(nn.Module):
         self.ln_kv = nn.LayerNorm(self.d_tok)
 
         self._key_xy_cache = {}  # (Ht,Wt,device_str)->xy [Nk,2]
-        self.last_attn_entropy = None  # scalar tensor set each forward()
 
     def _maybe_ckpt(self, fn, *args):
         if self.use_checkpoint and self.training:
@@ -1095,16 +1011,10 @@ class TokenTransporter(nn.Module):
                 dx = dest_xy_prior[..., 0].unsqueeze(-1) - key_xy[:, 0].view(1, 1, N)
                 dy = dest_xy_prior[..., 1].unsqueeze(-1) - key_xy[:, 1].view(1, 1, N)
                 dist2 = dx * dx + dy * dy
-                bias = -dist2 / (2.0 * (self.sigma ** 2) + 1e-6)  # [B,N,N]
+                bias = -torch.sqrt(dist2  + torch.finfo(torch.float32).eps) / self.sigma # [B,N,N]
                 scores = scores + bias.unsqueeze(1)  # broadcast over heads
 
             attn = torch.softmax(scores, dim=-1)
-
-            # attention entropy for logging (mean over B,heads,queries)
-            with torch.no_grad():
-                p = attn.clamp_min(1e-8)
-                ent = -(p * p.log()).sum(dim=-1)  # [B,H,N]
-                self.last_attn_entropy = ent.mean()
 
             out = torch.matmul(attn, v)  # [B,H,N,dh]
             out = out.transpose(1, 2).contiguous().view(B, N, D)

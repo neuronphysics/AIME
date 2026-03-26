@@ -263,7 +263,7 @@ def sample_prior_image_latent(
     z_img = mu_img + torch.randn_like(mu_img) * std_img
     return z_img, idx, probs
 
-# Teacher-forced context (SpatioTemporalCore + temporal VDVAE)
+# Teacher-forced context (SpatioTemporalCore + VDVAE)
 @torch.no_grad()
 def _get_vdvae_out_at_t(
     model,
@@ -275,7 +275,6 @@ def _get_vdvae_out_at_t(
     obs = _to_minus1_1(obs)
 
     if obs.dim() == 4:
-        # [B,C,H,W] -> [B,1,C,H,W]
         obs = obs[:, None, ...]
     if obs.dim() != 5:
         raise ValueError(f"Expected observations to be 4D or 5D, got shape={tuple(obs.shape)}")
@@ -284,95 +283,58 @@ def _get_vdvae_out_at_t(
     if actions is not None:
         actions = actions.to(device)
         if actions.dim() == 2:
-            actions = actions[:, None, ...]  # [B,1,A]
+            actions = actions[:, None, ...]
 
     dones = batch.get("done", batch.get("dones", None))
     if dones is not None:
         dones = dones.to(device)
         if dones.dim() == 1:
-            dones = dones[:, None]  # [B,1]
+            dones = dones[:, None]
 
     B, T, C, H, W = obs.shape
     t_select = int(max(0, min(int(t_select), T - 1)))
 
-    # get the exact extra maps / edge guides from the real forward path
-    extra_maps_seq = None
-    edge_guide_seq = None
-
+    edge_guide_t = None
     if t_select > 0:
-        obs_prefix = obs[:, :t_select + 1]
-        act_prefix = actions[:, :t_select + 1] if actions is not None else None
-        done_prefix = dones[:, :t_select + 1] if dones is not None else None
-
         prefix_out = model.forward_sequence(
-            observations=obs_prefix,
-            actions=act_prefix,
-            dones=done_prefix,
+            observations=obs[:, :t_select + 1],
+            actions=actions[:, :t_select + 1] if actions is not None else None,
+            dones=dones[:, :t_select + 1] if dones is not None else None,
         )
 
-        if getattr(model.rnn, "extra_channels", 0) > 0:
-            extra_maps_seq = prefix_out.get("extra_maps_seq", None)
-
-        if bool(getattr(model, "use_edge_conditioning", False)) or bool(getattr(model.vdvae.H, "use_edge_conditioning", False)):
-            edge_guide_seq = prefix_out.get("edge_guide_seq", None)
-
-    core_state = model.rnn.init_state(B, device=device, dtype=obs.dtype)
-    h_context_map = model.rnn.out_norm(core_state[0])
-    temporal_state = model.vdvae.init_temporal_state(B, device=device, dtype=obs.dtype)
-
-    for t in range(t_select + 1):
-        x_t = obs[:, t]
-        x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
-
-        if actions is not None and actions.shape[1] >= t and t > 0:
-            a_t = actions[:, t - 1]
+        h_context_maps_seq = prefix_out["h_context_maps_seq"]
+        if isinstance(h_context_maps_seq, torch.Tensor):
+            h_context_map_t = h_context_maps_seq[:, t_select].to(device=device, dtype=obs.dtype)
         else:
-            a_t = torch.zeros(B, model.action_dim, device=device, dtype=obs.dtype)
+            h_context_map_t = h_context_maps_seq[t_select].to(device=device, dtype=obs.dtype)
 
-        if dones is None or t == 0:
-            mask_t = torch.ones(B, device=device, dtype=obs.dtype)
-        else:
-            mask_t = 1.0 - dones[:, t - 1].float()
-
-        edge_guide_t = None
-        if edge_guide_seq is not None and t < len(edge_guide_seq):
-            saved_edge = edge_guide_seq[t]
+        edge_guide_seq = prefix_out.get("edge_guide_seq", None)
+        if edge_guide_seq is not None and t_select < len(edge_guide_seq):
+            saved_edge = edge_guide_seq[t_select]
             if saved_edge is not None:
                 edge_guide_t = saved_edge.to(device=device, dtype=obs.dtype)
+    else:
+        core_state = model.rnn.init_state(B, device=device, dtype=obs.dtype)
+        h_context_map_t = model.rnn.out_norm(core_state[0])
 
-        vdvae_out, temporal_state = model.vdvae.forward_temporal_step(
-            x_t_nhwc,
-            x_t_nhwc,
-            h_context=h_context_map,
-            a_t=a_t,
-            mask_t=mask_t,
-            edge_guide=edge_guide_t,
-            temporal_state=temporal_state,
-        )
+    x_t = obs[:, t_select]
+    x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
 
-        if t < t_select:
-            z_mean = vdvae_out["top_q_mean_map"]
-            z_logsigma = vdvae_out["top_q_logvar_map"]
-            z_map = draw_gaussian_diag_samples(z_mean, z_logsigma)
+    if dones is None or t_select == 0:
+        mask_t = torch.ones(B, device=device, dtype=torch.float32)
+    else:
+        mask_t = 1.0 - dones[:, t_select - 1].float()
 
-            extra_maps_t = None
-            if extra_maps_seq is not None and t < len(extra_maps_seq):
-                saved = extra_maps_seq[t]
-                if saved is not None:
-                    extra_maps_t = [
-                        em.to(device=device, dtype=z_map.dtype) for em in saved
-                    ]
+    vdvae_out = model.vdvae.forward(
+        x_t_nhwc,
+        x_t_nhwc,
+        h_context=h_context_map_t,
+        mask_t=mask_t,
+        edge_guide=edge_guide_t,
+        get_latents=True,
+    )
 
-            h_context_map, core_state = model.rnn(
-                z_map,
-                a_t,
-                state=core_state,
-                mask_t=mask_t,
-                extra_maps=extra_maps_t,
-            )
-
-    return vdvae_out, x_t, h_context_map
-
+    return vdvae_out, x_t, h_context_map_t
 # Latent extraction (+ exemplars)
 # -----------------------------
 @torch.no_grad()
@@ -697,7 +659,7 @@ def visualize_dpgmm_clustering(
     if posterior_latents.shape[0] < 5 or prior_latents.shape[0] < 5:
         raise ValueError("[viz] Not enough valid points after filtering. Need at least 5 posterior and 5 prior points.")
 
-    colors = plt.cm.tab20(np.linspace(0, 1, min(20, max(1, K))))
+    colors = plt.cm.tab20b(np.linspace(0, 1, min(20, max(1, K))))
     if K > 20:
         colors = plt.cm.turbo(np.linspace(0, 1, K))
     cmap = ListedColormap(colors)

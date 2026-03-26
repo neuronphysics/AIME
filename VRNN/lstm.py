@@ -384,26 +384,26 @@ class ConvLSTM(nn.Module):
 
 
 class SpatioTemporalLSTMCell(nn.Module):
-    def __init__(self, in_channel, num_hidden, height, width, filter_size, stride, layer_norm):
+    def __init__(self, in_channel, num_hidden, height, width, filter_size, stride):
         super(SpatioTemporalLSTMCell, self).__init__()
 
         self.num_hidden = num_hidden
         self.padding = filter_size // 2
         self._forget_bias = 1.0
         self.conv_x = nn.Sequential(
-            nn.Conv2d(in_channel, num_hidden * 7, kernel_size=filter_size, stride=stride, padding=self.padding),
+            nn.Conv2d(in_channel, num_hidden * 7, kernel_size=filter_size, stride=stride, padding=self.padding, bias=False),
             nn.LayerNorm([num_hidden * 7, height, width])
         )
         self.conv_h = nn.Sequential(
-            nn.Conv2d(num_hidden, num_hidden * 4, kernel_size=filter_size, stride=stride, padding=self.padding),
+            nn.Conv2d(num_hidden, num_hidden * 4, kernel_size=filter_size, stride=stride, padding=self.padding, bias=False),
             nn.LayerNorm([num_hidden * 4, height, width])
         )
         self.conv_m = nn.Sequential(
-            nn.Conv2d(num_hidden, num_hidden * 3, kernel_size=filter_size, stride=stride, padding=self.padding),
+            nn.Conv2d(num_hidden, num_hidden * 3, kernel_size=filter_size, stride=stride, padding=self.padding, bias=False),
             nn.LayerNorm([num_hidden * 3, height, width])
         )
         self.conv_o = nn.Sequential(
-            nn.Conv2d(num_hidden * 2, num_hidden, kernel_size=filter_size, stride=stride, padding=self.padding),
+            nn.Conv2d(num_hidden * 2, num_hidden, kernel_size=filter_size, stride=stride, padding=self.padding, bias=False),
             nn.LayerNorm([num_hidden, height, width])
         )
         self.conv_last = nn.Conv2d(num_hidden * 2, num_hidden, kernel_size=1, stride=1, padding=0)
@@ -445,7 +445,7 @@ def safe_groups(C, max_groups=8):
 
 class SpatioTemporalCore(nn.Module):
     def __init__(self, zdim, action_dim, hidden_dim, *, height=4, width=4,
-                 kernel=5, layer_norm=True, init_std=0.0, use_checkpoint=False,
+                 kernel=5, init_std=0.0, use_checkpoint=False,
                  extra_channels=0):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -454,12 +454,9 @@ class SpatioTemporalCore(nn.Module):
         self.width = int(width)
         self.use_checkpoint = bool(use_checkpoint)
         self.extra_channels = int(extra_channels)
-
-        g = safe_groups(self.action_dim, 8)
-        self.action_proj = nn.Sequential(
-            nn.Conv2d(self.action_dim, self.action_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(g, self.action_dim),
-        )
+        total_in = int(zdim) + self.action_dim + self.extra_channels
+        
+        self.input_norm = nn.LayerNorm(total_in, eps=1e-5)
 
         self.cell = SpatioTemporalLSTMCell(
             in_channel=int(zdim) + self.action_dim + self.extra_channels,
@@ -468,7 +465,6 @@ class SpatioTemporalCore(nn.Module):
             width=self.width,
             filter_size=int(kernel),
             stride=1,
-            layer_norm=bool(layer_norm),
         )
 
         self.out_norm = nn.GroupNorm(num_groups=safe_groups(self.hidden_dim, 8),
@@ -503,10 +499,9 @@ class SpatioTemporalCore(nn.Module):
             h = h * keep + h0 * (1.0 - keep)
             c = c * keep + c0 * (1.0 - keep)
             m = m * keep + m0 * (1.0 - keep)
-
-        a_1x1 = a_t.view(B, self.action_dim, 1, 1).to(device=z_map.device, dtype=z_map.dtype)
-        a_emb = self.action_proj(a_1x1)
-        a_map = a_emb.expand(B, self.action_dim, H, W)
+        assert a_t.ndim == 2 and a_t.shape[0] == B and a_t.shape[1] == self.action_dim, "a_t shape must be [B, action_dim]"
+        a_map = a_t.to(device=z_map.device, dtype=z_map.dtype)[:, :, None, None]
+        a_map = a_map.expand(B, self.action_dim, H, W)
 
         x_t = torch.cat([z_map, a_map], dim=1)
 
@@ -518,7 +513,8 @@ class SpatioTemporalCore(nn.Module):
                 extra_c += int(emap.shape[1])
 
         assert extra_c == self.extra_channels, f"Expected extra_channels={self.extra_channels}, got {extra_c}"
-
+        
+        x_t = self.input_norm(x_t.permute(0, 2, 3, 1).contiguous()).permute(0, 3, 1, 2).contiguous() #shape [B,C,H,W]
         if self.use_checkpoint and self.training:
             def cell_fn(x, h_in, c_in, m_in):
                 return self.cell(x, h_in, c_in, m_in)
@@ -526,8 +522,5 @@ class SpatioTemporalCore(nn.Module):
         else:
             h_new, c_new, m_new = self.cell(x_t, h, c, m)
 
-        # Optional stabilization (keep if you need it)
-        c_new = c_new.clamp(-10.0, 10.0)
-        m_new = m_new.clamp(-10.0, 10.0)
 
         return self.out_norm(h_new), (h_new, c_new, m_new)

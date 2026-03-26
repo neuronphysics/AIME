@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import lru_cache
+from typing import Tuple, Optional
 
 
-def downsample_flow(flow_src: torch.Tensor, dst_hw: tuple[int, int]) -> torch.Tensor:
+def downsample_flow(flow_src: torch.Tensor, dst_hw: Tuple[int, int]) -> torch.Tensor:
     """
     Downsample flow without interpolation.
     Uses a box filter implemented as depthwise conv + striding.
@@ -175,6 +176,23 @@ def image_warp(image, flow):
 # -----------------------------
 # Forward-backward consistency helpers
 # -----------------------------
+def flow_px_to_norm(flow_px: torch.Tensor, hw: Tuple[int, int] | None = None) -> torch.Tensor:
+    """Convert pixel-unit flow to normalized align_corners=True units."""
+    assert flow_px.ndim == 4 and flow_px.size(1) == 2
+    if hw is None:
+        _, _, H, W = flow_px.shape
+    else:
+        H, W = int(hw[0]), int(hw[1])
+
+    sx = max(W - 1, 1) / 2.0
+    sy = max(H - 1, 1) / 2.0
+
+    out = flow_px.clone()
+    out[:, 0] = out[:, 0] / sx
+    out[:, 1] = out[:, 1] / sy
+    return out
+
+
 def abs_robust_loss(diff, eps=0.01, q=0.4):
   """The so-called robust loss used by DDFlow."""
   return (torch.abs(diff) + eps) ** q
