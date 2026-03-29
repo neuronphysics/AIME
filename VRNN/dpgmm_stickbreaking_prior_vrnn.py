@@ -33,10 +33,11 @@ from vdvae.hps import Hyperparams
 from vdvae.vae_helpers import mean_from_discretized_mix_logistic, sample_from_discretized_mix_logistic, draw_gaussian_diag_samples
 from VRNN.utils.canny_net import BoundaryDetector
 from VRNN.warp import (
-    FlowWarpingLoss, TVLoss, fbLoss, SSIM, create_outgoing_mask, 
-    charbonnier_loss, CensusLoss, rgb2gray, downsample_flow, upsample_flow, 
+    FlowWarpingLoss, TVLoss, fbLoss, SSIM, create_outgoing_mask, LapLoss,
+    charbonnier_loss, CensusLoss, rgb2gray, downsample_flow, upsample_flow, flow_px_to_norm, multi_scale_warp_solver
 )
-from VRNN.flow_predict import get_gru_encoder, get_gru_decoder, coords_grid, EdgeMapToTop, ConvPatchTokenizer, CanonicalFlowField, TokenTransporter, TokensToTopMap, AntiAliasInterpolation2d, HFTopUpsampler
+from VRNN.flow_predict import get_gru_encoder, get_gru_decoder, coords_grid, EdgeMapToTop, ConvPatchTokenizer, CanonicalFlowField, TokenTransporter, TokensToTopMap, AntiAliasInterpolation2d, HFTopUpsampler, flow_norm_to_px
+
 from VRNN.Kumaraswamy import KumaraswamyStable
 
 def beta_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -906,7 +907,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         lambda_top_bottom_warp: float = 0.5,
         beta_flow_agree: float = 0.3,
         # LatentWarp on top z 
-        #lambda_z_lw: float = 0.75,         # weight of single top-z temporal consistency loss
+        lambda_z_lw: float = 0.75,         # weight of single top-z temporal consistency loss
         lw_alpha: float = 5.0,             # residual penalty in keep score
         lw_threshold: float = 0.6,         # keep threshold in keep score
         lw_tau: float = 0.15,              # temperature for soft keep mask (smaller = sharper)
@@ -938,7 +939,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.patch_disc_ndf = patch_disc_ndf
         self.eps = torch.finfo(torch.float32).eps
         # KL overshooting
-        self.overshoot_mc_samples = 200
+        self.overshoot_mc_samples = 35
         self.overshoot_w_decay = 0.9
         self.lambda_overshoot = 1.0
         self.warp_edge_tf_weight = 1.0
@@ -969,7 +970,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.lambda_top_bottom_warp = float(lambda_top_bottom_warp)
 
         # LatentWarp (top-z alignment) hyperparameters
-        #self.lambda_z_lw = float(lambda_z_lw)
+        self.lambda_z_lw = float(lambda_z_lw)
         self.lw_alpha = float(lw_alpha)
         self.lw_threshold = float(lw_threshold)
         self.lw_tau = float(lw_tau)
@@ -996,6 +997,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self._init_discriminators(img_disc_layers, patch_size, num_heads=disc_num_heads)
         self._init_motion_scaffold()
         self._init_latent_motion_conditioners() #should be after initialization of encoder, decoder
+        self.warp_rgb_lap = LapLoss(
+            max_levels=3,
+            k_size=5,
+            sigma=2.0,
+        )
         #
         self.fb_w = 1.0
         self.tv_w = 0.25
@@ -1068,15 +1074,16 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "warp_lb_loss",
                 "warp_tv_gate_loss",
                 #"warp_ssim_loss",
+                "refine_top_loss",
                 "warp_edge_tf_loss",
                 "warp_rgb_tf_loss",
                 "lat_distill",
-                #"z_lw",
+                "z_lw",
                 "canonical_cycle",
                 "canonical_fine_null",
                 "canonical_target_warp",
                 "canonical_top_warp",
-                #"canonical_smooth",
+                "canonical_smooth",
                 "overshoot_kl",
             ],
             temperature=temperature,
@@ -1625,7 +1632,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             beta=1.0,
             epsilon=cfg.charbonnier_eps,
         )
-
+        photo_mask = m_sup.expand(-1, 3, -1, -1)
+        photo_loss = self.warp_rgb_lap(
+            x_cur_to_prev * photo_mask,
+            x_prev01      * photo_mask,
+        ) / photo_mask.mean().clamp_min(cfg.eps)
         # visibility + residual branch
         rgb_err = photo_diff.abs().mean(dim=1, keepdim=True)
         v_pred, r_pred = self._predict_vis_and_residual(
@@ -2167,7 +2178,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             use_checkpoint=self.use_ctx_checkpoint,
             fine_hw=(self.flow_res, self.flow_res),
             fine_hidden= 2 * base_dim,
-            max_fine_flow_px=0.75,
+            max_fine_flow_px=0.2,
         ).to(self.device)
 
         
@@ -2284,7 +2295,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 gen_param_groups.append(g)
 
         # 4) Special tiny LR params
-        tiny_lr = base_lr * 5e-5
+        tiny_lr = base_lr * 5e-4
         gammas = [p for p in gamma_params if isinstance(p, nn.Parameter) and p.requires_grad]
         if gammas:
             gen_param_groups.append({"params": gammas, "lr": tiny_lr, "weight_decay": 0.0})
@@ -2294,11 +2305,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             gen_param_groups.append({"params": scalars, "lr": base_lr, "weight_decay": 1e-5})
 
         # Optimizer
-        self.gen_optimizer = torch.optim.Adamax(
+        self.gen_optimizer = torch.optim.AdamW(
             gen_param_groups,
             lr=lr_core,            # default; groups override anyway
             betas=(0.9, 0.999),
-            eps=1e-4,
+            eps=1e-5,
         )
 
         # Discriminators unchanged
@@ -2436,17 +2447,18 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "warp_sanity_total_loss": [],
             # latent-motion / canonical-flow diagnostics
             "lat_distill_loss": [],
+            "refine_top_loss": [],
             "lat_flow_mag": [],
             "extra_maps_seq": [],
             "edge_guide_seq": [],
             "h_context_maps_seq": [],         # pre-VDVAE context maps at current time
-            #"z_lw_loss": [],
+            "z_lw_loss": [],
             "lw_keep_frac": [],
             "canonical_cycle_loss": [],
             "canonical_fine_null_loss": [],
             "canonical_target_warp_loss": [],
             "canonical_top_warp_loss": [],
-            #"canonical_smooth_loss": [],
+            "canonical_smooth_loss": [],
             # overshoot anchors
             "overshoot_motion_tokens": [],
             "overshoot_y_warp_in": [],
@@ -2613,7 +2625,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             z_rnn = z_top_map
 
             # Optional LatentWarp loss using teacher forward/backward flow
-            #z_lw = z_top_map.new_zeros(())
+            z_lw = z_top_map.new_zeros(())
             keep_frac = z_top_map.new_zeros(())
 
             do_lw = have_prev_top and (flow_fw is not None) and (flow_bw is not None)
@@ -2632,17 +2644,17 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 keep_top_use = keep_top.detach() if self.lw_detach_flow else keep_top
                 keep_frac = keep_top_use.mean().detach()
 
-            #     if self.lambda_z_lw > 0.0:
-            #         q_prev_w = self.warp_with_mode(
-            #             top_q_mean_prev.detach(),
-            #             flow_bw_top_use,
-            #             mode="bilinear",
-            #             padding_mode="border",
-            #         )
-            #         denom = keep_top_use.sum().clamp_min(1.0) * float(zdim)
-            #         z_lw = ((top_q_mean_map - q_prev_w).pow(2) * keep_top_use).sum() / denom
+                if self.lambda_z_lw > 0.0:
+                     q_prev_w = self.warp_with_mode(
+                         top_q_mean_prev.detach(),
+                         flow_bw_top_use,
+                         mode="bilinear",
+                         padding_mode="border",
+                     )
+                     denom = keep_top_use.sum().clamp_min(1.0) * float(zdim)
+                     z_lw = ((top_q_mean_map - q_prev_w).pow(2) * keep_top_use).sum() / denom
 
-            # outputs["z_lw_loss"].append(z_lw)
+            outputs["z_lw_loss"].append(z_lw)
             outputs["lw_keep_frac"].append(keep_frac)
 
             # Compute mixture diagnostics and DP/Kumaraswamy regularizers
@@ -2728,16 +2740,17 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 denom_top = keep_top.sum().clamp_min(1.0) * top_q_mean_map.shape[1]
                 canonical_top_warp = ((z_prev_to_cur - top_q_mean_map).abs() * keep_top).sum() / denom_top
 
-                #canonical_smooth = self.flow_tv_loss_fn(flow_target_cur)
+
+                canonical_smooth = self.flow_tv_loss_fn(flow_target_cur)
 
                 outputs["canonical_target_warp_loss"].append(canonical_target_warp)
                 outputs["canonical_top_warp_loss"].append(canonical_top_warp)
-                #outputs["canonical_smooth_loss"].append(canonical_smooth)
+                outputs["canonical_smooth_loss"].append(canonical_smooth)
             else:
                 z0 = torch.zeros((), device=device, dtype=torch.float32)
                 outputs["canonical_target_warp_loss"].append(z0)
                 outputs["canonical_top_warp_loss"].append(z0)
-                #outputs["canonical_smooth_loss"].append(z0)
+                outputs["canonical_smooth_loss"].append(z0)
 
             # teacher-flow distillation on the top-grid flow in pixel units
             if (t > 0) and (flow_fw is not None):
@@ -2755,7 +2768,40 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 )
             else:
                 outputs["lat_distill_loss"].append(torch.zeros((), device=device, dtype=torch.float32))
+            # compute refinement loss for the current top flow using multi-scale warp solver with teacher forward/backward flows as targets
+            refine_top_loss = torch.zeros((), device=device, dtype=torch.float32)
 
+            if (t > 0) and have_prev_top:
+                m_prev = mask_t.view(batch_size, 1, 1, 1).to(dtype=top_q_mean_map.dtype, device=device)
+
+                with torch.no_grad():
+                    all_warps, _ = multi_scale_warp_solver(
+                        fixed_features=[top_q_mean_prev.detach()],
+                        moving_features=[top_q_mean_map.detach()],
+                        iterations=[3],
+                        loss_function=lambda moved, fixed: charbonnier_loss(
+                            moved - fixed,
+                            mask=m_prev.expand(-1, moved.shape[1], -1, -1),
+                            beta=1.0,
+                            epsilon=cfg.charbonnier_eps,
+                        ),
+                        learning_rate=0.25,
+                        init_warp=flow_px_to_norm(flow_top_cur.detach(), (Ht, Wt)),
+                        hessian_type='ift',  
+                        align_corners=True,
+                    )
+
+                    warp_refined_norm = all_warps[-1].permute(0, 3, 1, 2).contiguous()
+                    flow_refined_px = flow_norm_to_px(warp_refined_norm, (Ht, Wt))
+
+                refine_top_loss = charbonnier_loss(
+                    flow_top_cur - flow_refined_px.detach(),
+                    mask=m_prev.expand_as(flow_top_cur),
+                    beta=1.0,
+                    epsilon=cfg.charbonnier_eps,
+                )
+
+            outputs["refine_top_loss"].append(refine_top_loss)
             # Update recurrent state using current z_t, previous action a_{t-1}, and motion-dependent extra maps
             h_context_next, core_state = self.rnn(
                 z_rnn,
@@ -2779,9 +2825,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             outputs["overshoot_flow_top_prev"].append(flow_top_prev.detach())
 
             # Store recurrent states and latent statistics for this timestep
-            outputs["core_h_maps"].append(core_state[0])
-            outputs["core_c_maps"].append(core_state[1])
-            outputs["core_m_maps"].append(core_state[2])
+            outputs["core_h_maps"].append(core_state[0].detach())
+            outputs["core_c_maps"].append(core_state[1].detach())
+            outputs["core_m_maps"].append(core_state[2].detach())
             outputs["prior_pi"].append(pi_img)
             outputs["top_q_mean_map"].append(top_q_mean_map)
             outputs["top_q_logvar_map"].append(top_q_logsig_map)
@@ -3076,13 +3122,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         warp_sanity_total = _mean_seq("warp_sanity_total_loss")
 
         lat_distill = self.lambda_lat_distill * _mean_seq("lat_distill_loss")
-        #z_lw = self.lambda_z_lw * _mean_seq("z_lw_loss")
-
+        z_lw = self.lambda_z_lw * _mean_seq("z_lw_loss")
+        refine_top_loss = self.lambda_lat_distill * _mean_seq("refine_top_loss")
         canonical_cycle = self.lambda_top_bottom_warp * _mean_seq("canonical_cycle_loss")
         canonical_fine_null = self.lambda_top_bottom_warp * _mean_seq("canonical_fine_null_loss")
         canonical_target_warp = self.lambda_top_bottom_warp * _mean_seq("canonical_target_warp_loss")
         canonical_top_warp = self.lambda_top_bottom_warp * _mean_seq("canonical_top_warp_loss")
-        #canonical_smooth = self.tv_w * _mean_seq("canonical_smooth_loss")
+        canonical_smooth = self.tv_w * _mean_seq("canonical_smooth_loss")
 
         total_vae_loss = (
             lambda_recon * recon_loss
@@ -3106,12 +3152,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         total_vae_loss = (
             total_vae_loss
             + lat_distill
-            #+ z_lw
+            + z_lw
             + canonical_cycle
             + canonical_fine_null
             + canonical_target_warp
             + canonical_top_warp
-            #+ canonical_smooth
+            + canonical_smooth
+            + refine_top_loss
         )
 
         overshoot_kl = z0
@@ -3154,20 +3201,21 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "warp_rgb_tf_loss": warp_rgb_tf_loss,
             "warp_lb_loss": warp_lb_loss,
             "warp_tv_gate_loss": warp_tv_gate_loss,
+            "refine_top_loss": refine_top_loss,
             #"warp_ssim_loss": warp_ssim_loss,
             "lat_distill": lat_distill,
-            #"z_lw": z_lw,
+            "z_lw": z_lw,
             "canonical_cycle": canonical_cycle,
             "canonical_fine_null": canonical_fine_null,
             "canonical_target_warp": canonical_target_warp,
             "canonical_top_warp": canonical_top_warp,
-            #"canonical_smooth": canonical_smooth,
+            "canonical_smooth": canonical_smooth,
             "top_bottom_warp_consistency": (
                 canonical_cycle
                 + canonical_fine_null
                 + canonical_target_warp
                 + canonical_top_warp
-                #+ canonical_smooth
+                + canonical_smooth
             ),
             "overshoot_kl": overshoot_kl,
             "total_vae_loss": total_vae_loss,
@@ -3690,16 +3738,17 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 "warp_lb_loss": vae_losses["warp_lb_loss"].reshape([]),
                 "warp_tv_gate_loss": vae_losses["warp_tv_gate_loss"].reshape([]),
                 #"warp_ssim_loss": (warmup_factor * vae_losses["warp_ssim_loss"]).reshape([]),
+                "refine_top_loss": vae_losses["refine_top_loss"].reshape([]),
                 "warp_edge_tf_loss": vae_losses["warp_edge_tf_loss"].reshape([]),
                 "warp_rgb_tf_loss": vae_losses["warp_rgb_tf_loss"].reshape([]),
 
                 "lat_distill": vae_losses["lat_distill"].reshape([]),
-                #"z_lw": vae_losses["z_lw"].reshape([]),
+                "z_lw": vae_losses["z_lw"].reshape([]),
                 "canonical_cycle": vae_losses["canonical_cycle"].reshape([]),
                 "canonical_fine_null": vae_losses["canonical_fine_null"].reshape([]),
                 "canonical_target_warp": vae_losses["canonical_target_warp"].reshape([]),
                 "canonical_top_warp": vae_losses["canonical_top_warp"].reshape([]),
-                #"canonical_smooth": vae_losses["canonical_smooth"].reshape([]),
+                "canonical_smooth": vae_losses["canonical_smooth"].reshape([]),
                 "overshoot_kl": vae_losses["overshoot_kl"].reshape([]),
             }
 

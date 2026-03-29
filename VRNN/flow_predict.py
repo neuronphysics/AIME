@@ -1,5 +1,5 @@
 import torch
-
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -703,10 +703,85 @@ def resize_flow_norm(
         raise ValueError(f'Unsupported mode={mode}')
     return F.interpolate(flow_norm, size=(Hd, Wd), mode=mode, align_corners=True)
 
+
+
+class SineLayer(nn.Module):
+    # See paper sec. 3.2, final paragraph, and supplement Sec. 1.5 for discussion of omega_0.
+    
+    # If is_first=True, omega_0 is a frequency factor which simply multiplies the activations before the 
+    # nonlinearity. Different signals may require different omega_0 in the first layer - this is a 
+    # hyperparameter.
+    
+    # If is_first=False, then the weights will be divided by omega_0 so as to keep the magnitude of 
+    # activations constant, but boost gradients to the weight matrix (see supplement Sec. 1.5)
+    
+    def __init__(self, in_features, out_features, bias=True,
+                 is_first=False, omega_0=30):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+        self.init_weights()
+    
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / self.in_features, 
+                                             1 / self.in_features)      
+            else:
+                self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, 
+                                             np.sqrt(6 / self.in_features) / self.omega_0)
+        
+    def forward(self, input):
+        return torch.sin(self.omega_0 * self.linear(input))
+
+    
+    
+class Siren(nn.Module):
+    def __init__(self, in_features, hidden_features, hidden_layers, out_features, outermost_linear=False, 
+                 first_omega_0=30, hidden_omega_0=30.):
+        super().__init__()
+        
+        self.net = []
+        self.net.append(SineLayer(in_features, hidden_features[0], 
+                                  is_first=True, omega_0=first_omega_0))
+
+        for i in range(hidden_layers):
+            self.net.append(SineLayer(hidden_features[i], hidden_features[i + 1], 
+                                      is_first=False, omega_0=hidden_omega_0))
+
+        if outermost_linear:
+            final_linear = nn.Linear(hidden_features[-1], out_features)
+            
+            with torch.no_grad():
+                final_linear.weight.uniform_(-np.sqrt(6 / hidden_features[-1]) / hidden_omega_0, 
+                                              np.sqrt(6 / hidden_features[-1]) / hidden_omega_0)
+                
+            self.net.append(final_linear)
+        else:
+            self.net.append(SineLayer(hidden_features[-1], out_features, 
+                                      is_first=False, omega_0=hidden_omega_0))
+        
+        self.net = nn.Sequential(*self.net)
+    
+    def forward(self, coords):
+        # coords = coords.clone().detach().requires_grad_(True) # allows to take derivative w.r.t. input
+        output = self.net(coords)
+        return output     
+    
+    
 class FineResidualFlowHead(nn.Module):
     """
-    Predict a fine residual in canonical normalized coordinates and project it to
-    the high-pass complement of the coarse bicubic function class.
+    Predict a fine residual in canonical normalized coordinates using:
+      - local fine feature context
+      - bicubic coarse base flow at target resolution
+      - 2 sub-cell coordinate channels (relative position inside each coarse cell)
+
+    Then project the residual to the high-pass complement of the coarse bicubic
+    function class, preserving the original cross-scale design.
     """
 
     def __init__(
@@ -717,12 +792,18 @@ class FineResidualFlowHead(nn.Module):
         hidden: int = 64,
         max_fine_flow_norm: float = 0.05,
         use_checkpoint: bool = False,
+        siren_omega_0: float = 30.0,
     ):
         super().__init__()
         self.fine_H, self.fine_W = int(fine_hw[0]), int(fine_hw[1])
         self.coarse_H, self.coarse_W = int(coarse_hw[0]), int(coarse_hw[1])
         self.use_checkpoint = bool(use_checkpoint)
-        self.register_buffer('max_norm', torch.tensor(float(max_fine_flow_norm), dtype=torch.float32), persistent=False)
+
+        self.register_buffer(
+            "max_norm",
+            torch.tensor(float(max_fine_flow_norm), dtype=torch.float32),
+            persistent=False,
+        )
 
         def _groups(c: int) -> int:
             g = min(8, c)
@@ -730,33 +811,117 @@ class FineResidualFlowHead(nn.Module):
                 g -= 1
             return g
 
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, hidden, 3, 1, 1),
-            nn.GroupNorm(_groups(hidden), hidden),
+        # Local spatial context extractor.
+        # It sees both the fine feature and the bicubic coarse base flow.
+        stem_in = in_ch + 2
+        g = _groups(hidden)
+        self.local_ctx = nn.Sequential(
+            nn.Conv2d(stem_in, hidden, 3, 1, 1, bias=True),
+            nn.GroupNorm(g, hidden),
             nn.SiLU(inplace=False),
-            nn.Conv2d(hidden, hidden, 3, 1, 1),
-            nn.GroupNorm(_groups(hidden), hidden),
+
+            nn.Conv2d(hidden, hidden, 3, 1, 1, bias=True),
+            nn.GroupNorm(g, hidden),
             nn.SiLU(inplace=False),
-            nn.Conv2d(hidden, 2, 3, 1, 1),
+
+            nn.Conv2d(hidden, hidden, 3, 1, 1, bias=True),
+            nn.GroupNorm(g, hidden),
+            nn.SiLU(inplace=False),
         )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+
+        # Per-pixel implicit decoder.
+        # Inputs = local context + 2 sub-cell coords + base flow (dx,dy).
+        siren_hidden = [hidden, hidden, hidden * 2]
+        self.imnet = Siren(
+            in_features=hidden + 2 + 2,
+            hidden_features=siren_hidden,
+            hidden_layers=len(siren_hidden) - 1,
+            out_features=2,
+            outermost_linear=True,
+            first_omega_0=siren_omega_0,
+            hidden_omega_0=siren_omega_0,
+        )
+
+        # Make the new branch start near zero so it does not immediately fight
+        # the existing coarse path.
+        if hasattr(self.imnet, "net") and len(self.imnet.net) > 0 and isinstance(self.imnet.net[-1], nn.Linear):
+            nn.init.zeros_(self.imnet.net[-1].weight)
+            nn.init.zeros_(self.imnet.net[-1].bias)
 
     def _project_highpass(self, residual: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Bicubic projector onto the coarse-representable subspace, then subtract.
-        residual_low = resize_flow_norm(residual, (self.coarse_H, self.coarse_W), mode='bicubic')
-        residual_recon = resize_flow_norm(residual_low, (self.fine_H, self.fine_W), mode='bicubic')
+        residual_low = resize_flow_norm(residual, (self.coarse_H, self.coarse_W), mode="bicubic")
+        residual_recon = resize_flow_norm(residual_low, (self.fine_H, self.fine_W), mode="bicubic")
         residual_high = residual - residual_recon
-        leakage = resize_flow_norm(residual_high, (self.coarse_H, self.coarse_W), mode='bicubic')
+        leakage = resize_flow_norm(residual_high, (self.coarse_H, self.coarse_W), mode="bicubic")
         return residual_high, leakage
 
-    def forward(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _subcell_coords(self, batch: int, device, dtype) -> torch.Tensor:
+        """
+        Returns [B,2,H,W] with coordinates in [-1,1] measuring each fine pixel's
+        relative position *inside its coarse top-grid cell*.
+
+        This is more appropriate than absolute x/y for coarse->fine lifting.
+        """
+        y = torch.arange(self.fine_H, device=device, dtype=dtype) + 0.5
+        x = torch.arange(self.fine_W, device=device, dtype=dtype) + 0.5
+
+        # Map fine-pixel centers into coarse-grid coordinates.
+        coarse_y = y * (float(self.coarse_H) / float(self.fine_H)) - 0.5
+        coarse_x = x * (float(self.coarse_W) / float(self.fine_W)) - 0.5
+
+        frac_y = coarse_y - torch.floor(coarse_y)
+        frac_x = coarse_x - torch.floor(coarse_x)
+
+        rel_y = 2.0 * frac_y - 1.0
+        rel_x = 2.0 * frac_x - 1.0
+
+        yy, xx = torch.meshgrid(rel_y, rel_x, indexing="ij")
+        coords = torch.stack([xx, yy], dim=0).unsqueeze(0)  # [1,2,H,W]
+        return coords.expand(batch, -1, -1, -1)
+
+    def _forward_impl(self, feat: torch.Tensor, base_target_norm: torch.Tensor) -> torch.Tensor:
+        B = feat.shape[0]
+
         if feat.shape[-2:] != (self.fine_H, self.fine_W):
-            feat = F.interpolate(feat, size=(self.fine_H, self.fine_W), mode='bilinear', align_corners=True)
-        if self.use_checkpoint and self.training and feat.requires_grad:
-            raw = checkpoint(self.net, feat, use_reentrant=False)
+            feat = F.interpolate(
+                feat, size=(self.fine_H, self.fine_W),
+                mode="bilinear", align_corners=True
+            )
+
+        if base_target_norm.shape[-2:] != (self.fine_H, self.fine_W):
+            base_target_norm = resize_flow_norm(
+                base_target_norm, (self.fine_H, self.fine_W), mode="bicubic"
+            )
+
+        # Local conv context over [fine feature, bicubic coarse base flow]
+        ctx = self.local_ctx(torch.cat([feat, base_target_norm], dim=1))  # [B,C,H,W]
+
+        # Relative coordinates inside coarse cell
+        subcell = self._subcell_coords(B, feat.device, feat.dtype)        # [B,2,H,W]
+
+        # Per-pixel implicit decoding
+        # Inputs: local ctx + subcell coords + base flow at that pixel
+        q = torch.cat([ctx, subcell, base_target_norm], dim=1)            # [B,C+4,H,W]
+        q = q.permute(0, 2, 3, 1).reshape(B * self.fine_H * self.fine_W, -1)
+
+        raw = self.imnet(q)                                               # [B*H*W,2]
+        raw = raw.view(B, self.fine_H, self.fine_W, 2).permute(0, 3, 1, 2).contiguous()
+        return raw
+
+    def forward(
+        self,
+        feat: torch.Tensor,
+        base_target_norm: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self.use_checkpoint
+            and self.training
+            and (feat.requires_grad or base_target_norm.requires_grad)
+        ):
+            raw = checkpoint(self._forward_impl, feat, base_target_norm, use_reentrant=False)
         else:
-            raw = self.net(feat)
+            raw = self._forward_impl(feat, base_target_norm)
+
         residual = self.max_norm.to(device=raw.device, dtype=raw.dtype) * torch.tanh(raw)
         residual_high, leakage = self._project_highpass(residual)
         return residual_high, leakage
@@ -844,7 +1009,7 @@ class CanonicalFlowField(nn.Module):
         flow_top_norm = self.coarse_head(mot_ctx, h_ctx, a_map, edge_top)
         base_target_norm = resize_flow_norm(flow_top_norm, self.target_hw, mode="bicubic")
 
-        fine_res_norm, fine_leak = self.fine_head(fine_feat)
+        fine_res_norm, fine_leak = self.fine_head(fine_feat, base_target_norm)
         fine_res_target_norm = resize_flow_norm(fine_res_norm, self.target_hw, mode="bicubic")
         flow_target_norm = base_target_norm + fine_res_target_norm
         fine_null_loss = self._masked_mean(fine_leak.abs(), mask_t)

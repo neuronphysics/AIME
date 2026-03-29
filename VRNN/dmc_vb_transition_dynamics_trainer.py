@@ -2150,7 +2150,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 23,
+        'batch_size': 22,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 2,
