@@ -80,7 +80,6 @@ def get_width_settings(width, s):
 class SpatialSelfAttention(nn.Module):
     """
     Applied only in the encoder, and only at 64x64 by default.
-    No edge conditioning enters here.
     """
     def __init__(self, channels: int, res: int, H):
         super().__init__()
@@ -202,7 +201,7 @@ class Encoder(HModule):
 
 
 class DecBlock(nn.Module):
-    def __init__(self, H, res, mixin, n_blocks, is_top=False, edge_res=64):
+    def __init__(self, H, res, mixin, n_blocks, is_top=False):
         super().__init__()
         self.base = int(res)
         self.mixin = mixin
@@ -216,25 +215,20 @@ class DecBlock(nn.Module):
         self.zdim = H.zdim
         self.use_checkpoint = getattr(H, "use_checkpoint", False)
 
-        self.edge_channels = int(getattr(H, "edge_channels", 1))
-        self.use_edge_conditioning = (
-            self.base == int(getattr(H, "edge_conditioning_res", edge_res))
-        )
-
         self.top_h_dim = int(getattr(H, "top_h_context_dim", 0))
         self.use_top_h = self.is_top and (self.top_h_dim > 0)
 
         if self.use_top_h:
             # Raw-h concatenation only. No h projection.
             self.enc = Block(
-                width * 2 + self.top_h_dim,
+                width * 2 + self.top_h_dim+H.zdim,  # concat h and acts and top_h, plus skip connection from pre-z features
                 cond_width,
                 H.zdim * 2,
                 residual=False,
                 use_3x3=use_3x3,
             )
             self.prior = Block(
-                width + self.top_h_dim,
+                width + self.top_h_dim + H.zdim,
                 cond_width,
                 H.zdim * 2 + width,
                 residual=False,
@@ -242,9 +236,6 @@ class DecBlock(nn.Module):
                 zero_last=True,
             )
 
-            # Top decoder conditioning after z injection:
-            # concat raw h, then map back to width.
-            # This cannot be residual=True because input/output channels differ.
             self.resnet = Block(
                 width + self.top_h_dim,
                 cond_width,
@@ -282,36 +273,20 @@ class DecBlock(nn.Module):
         self.resnet.c4.weight.data *= np.sqrt(1 / n_blocks)
         self.z_fn = lambda z: self.z_proj(z)
 
-        self.edge_adapter = None
-        if self.use_edge_conditioning:
-            self.edge_adapter = Block(
-                width + self.edge_channels,
-                cond_width,
-                width,
-                residual=False,
-                use_3x3=use_3x3,
-                zero_last=True,
-            )
 
     def _maybe_ckpt(self, fn, *args):
         if self.training and self.use_checkpoint:
             return ckpt(fn, *args, use_reentrant=False)
         return fn(*args)
 
-    def _require_h(self, h_context_top):
-        if self.use_top_h and h_context_top is None:
-            raise ValueError(
-                "Top DecBlock requires h_context_top when H.top_h_context_dim > 0"
-            )
 
-    def sample(self, x, acts, h_context_top=None):
-        self._require_h(h_context_top)
+    def sample(self, x, acts, cond_top=None):
 
         if self.use_top_h:
-            enc_in = torch.cat([x, acts, h_context_top], dim=1)
+            enc_in = torch.cat([x, acts, cond_top], dim=1)
             qm, qv = self._maybe_ckpt(self.enc, enc_in).chunk(2, dim=1)
 
-            prior_in = torch.cat([x, h_context_top], dim=1)
+            prior_in = torch.cat([x, cond_top], dim=1)
             feats = self._maybe_ckpt(self.prior, prior_in)
         else:
             qm, qv = self._maybe_ckpt(
@@ -333,11 +308,11 @@ class DecBlock(nn.Module):
 
         return z, x, kl, qm, qv
 
-    def sample_uncond(self, x, t=None, lvs=None, h_context_top=None):
-        self._require_h(h_context_top)
+    def sample_uncond(self, x, cond_top =None, t=None, lvs=None):
+        
 
         if self.use_top_h:
-            prior_in = torch.cat([x, h_context_top], dim=1)
+            prior_in = torch.cat([x, cond_top], dim=1)
             feats = self._maybe_ckpt(self.prior, prior_in)
         else:
             feats = self._maybe_ckpt(self.prior, x)
@@ -372,18 +347,12 @@ class DecBlock(nn.Module):
             x = x.repeat(acts.shape[0], 1, 1, 1)
         return x, acts
 
-    def _apply_post_z(self, x, z, h_context_top=None, edge_guide=None):
+    def _apply_post_z(self, x, z, h_decoder_top=None):
         x_in = x                      # save pre-latent features
         x = x + self.z_fn(z)          # latent injection always uses x_in
 
-        if self.edge_adapter is not None and edge_guide is not None:
-            x = x + self._maybe_ckpt(
-                self.edge_adapter, torch.cat([x_in, edge_guide], dim=1)
-            )
-
         if self.use_top_h:
-            self._require_h(h_context_top)
-            x = self._maybe_ckpt(self.resnet, torch.cat([x, h_context_top], dim=1))
+            x = self._maybe_ckpt(self.resnet, torch.cat([x, h_decoder_top], dim=1))
         else:
             x = self._maybe_ckpt(self.resnet, x)
 
@@ -393,9 +362,9 @@ class DecBlock(nn.Module):
         self,
         xs,
         activations,
-        edge_guide: Optional[torch.Tensor] = None,
         get_latents=False,
-        h_context_top=None,
+        cond_top=None,
+        h_decoder_top=None,
     ):
         x, acts = self.get_inputs(xs, activations)
 
@@ -405,8 +374,8 @@ class DecBlock(nn.Module):
                 scale_factor=self.base // self.mixin,
             )
 
-        z, x, kl, qm, qv = self.sample(x, acts, h_context_top=h_context_top)
-        x = self._apply_post_z(x, z, h_context_top=h_context_top, edge_guide=edge_guide)
+        z, x, kl, qm, qv = self.sample(x, acts, cond_top=cond_top)
+        x = self._apply_post_z(x, z, h_decoder_top=h_decoder_top)
         xs[self.base] = x
 
         out = {
@@ -423,8 +392,8 @@ class DecBlock(nn.Module):
         xs,
         t=None,
         lvs=None,
-        edge_guide: Optional[torch.Tensor] = None,
-        h_context_top=None,
+        cond_top=None,
+        h_decoder_top=None,
     ):
         try:
             x = xs[self.base]
@@ -442,8 +411,8 @@ class DecBlock(nn.Module):
                 scale_factor=self.base // self.mixin,
             )
 
-        z, x = self.sample_uncond(x, t=t, lvs=lvs, h_context_top=h_context_top)
-        x = self._apply_post_z(x, z, h_context_top=h_context_top, edge_guide=edge_guide)
+        z, x = self.sample_uncond(x, t=t, lvs=lvs, cond_top=cond_top)
+        x = self._apply_post_z(x, z, h_decoder_top=h_decoder_top)
         xs[self.base] = x
         return xs
 
@@ -465,7 +434,6 @@ class Decoder(HModule):
                     mixin,
                     n_blocks=n_blocks,
                     is_top=(idx == 0),
-                    edge_res=int(getattr(H, "edge_conditioning_res", 64)),
                 )
             )
             resos.add(res)
@@ -489,21 +457,22 @@ class Decoder(HModule):
     def forward(
         self,
         activations,
-        edge_guide: Optional[torch.Tensor] = None,
         get_latents=False,
-        h_context_top=None,
+        cond_top=None,
+        h_decoder_top=None,
     ):
         stats = []
         xs = {a.shape[2]: a for a in self.bias_xs}
 
         for block in self.dec_blocks:
-            blk_h = h_context_top if block.is_top else None
+            blk_cond = cond_top if block.is_top else None
+            blk_h = h_decoder_top if block.is_top else None
             xs, block_stats = block(
                 xs,
                 activations,
-                edge_guide=edge_guide,
                 get_latents=get_latents,
-                h_context_top=blk_h,
+                cond_top=blk_cond,
+                h_decoder_top=blk_h,
             )
             stats.append(block_stats)
 
@@ -515,8 +484,8 @@ class Decoder(HModule):
         n,
         t=None,
         y=None,
-        edge_guide: Optional[torch.Tensor] = None,
-        h_context_top=None,
+        cond_top=None,
+        h_decoder_top=None,
     ):
         xs = {}
         for bias in self.bias_xs:
@@ -527,12 +496,14 @@ class Decoder(HModule):
                 temp = t[idx]
             except TypeError:
                 temp = t
-            blk_h = h_context_top if block.is_top else None
+            
+            blk_cond = cond_top if block.is_top else None
+            blk_h = h_decoder_top if block.is_top else None
             xs = block.forward_uncond(
                 xs,
                 temp,
-                edge_guide=edge_guide,
-                h_context_top=blk_h,
+                cond_top=blk_cond,
+                h_decoder_top=blk_h,
             )
 
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
@@ -543,21 +514,22 @@ class Decoder(HModule):
         n,
         latents,
         t=None,
-        edge_guide: Optional[torch.Tensor] = None,
-        h_context_top=None,
+        cond_top=None,
+        h_decoder_top=None,
     ):
         xs = {}
         for bias in self.bias_xs:
             xs[bias.shape[2]] = bias.repeat(n, 1, 1, 1)
 
         for block, lvs in itertools.zip_longest(self.dec_blocks, latents):
-            blk_h = h_context_top if block.is_top else None
+            blk_cond = cond_top if block.is_top else None
+            blk_h = h_decoder_top if block.is_top else None
             xs = block.forward_uncond(
                 xs,
                 t,
                 lvs=lvs,
-                edge_guide=edge_guide,
-                h_context_top=blk_h,
+                cond_top=blk_cond,
+                h_decoder_top=blk_h,
             )
 
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
@@ -567,8 +539,8 @@ class Decoder(HModule):
         self,
         z_top_map,
         t=None,
-        edge_guide: Optional[torch.Tensor] = None,
-        h_context_top=None,
+        cond_top=None,
+        h_decoder_top=None,
     ):
         n = z_top_map.shape[0]
         latents = [z_top_map] + [None] * (len(self.dec_blocks) - 1)
@@ -576,8 +548,8 @@ class Decoder(HModule):
             n,
             latents,
             t=t,
-            edge_guide=edge_guide,
-            h_context_top=h_context_top,
+            cond_top=cond_top,
+            h_decoder_top=h_decoder_top,
         )
 
 
@@ -598,79 +570,81 @@ class VDVAE(HModule):
         self.encoder = Encoder(self.H)
         self.decoder = Decoder(self.H)
 
+        # IMPORTANT: This is the channel count of h_t only, NOT concat(h_t, z_tilde_t)
         self.top_h_dim = int(getattr(self.H, "top_h_context_dim", 0))
 
         if self.prior is not None and self.top_h_dim > 0:
-            if int(self.prior.hidden_dim) != self.top_h_dim:
+            expected_prior_dim = self.top_h_dim + int(self.H.zdim)
+            if int(self.prior.hidden_dim) != expected_prior_dim:
                 raise ValueError(
-                    f"H.top_h_context_dim={self.top_h_dim} must equal "
-                    f"prior.hidden_dim={int(self.prior.hidden_dim)} "
-                    f"when using raw-h concatenation."
+                    f"prior.hidden_dim must be h_t_dim + zdim = "
+                    f"{self.top_h_dim} + {int(self.H.zdim)} = {expected_prior_dim}, "
+                    f"but got {int(self.prior.hidden_dim)}"
                 )
 
-    def _coerce_h_context_map(self, h_context: torch.Tensor, ht: int, wt: int):
+    def _check_top_inputs(self, cond_top, h_decoder_top):
         if self.top_h_dim <= 0:
-            raise ValueError("top_h_context_dim must be > 0 to use h_context")
+            return None, None
 
-        if h_context.dim() == 4:
-            h_map = h_context
-            if h_map.shape[1] != self.top_h_dim:
-                raise ValueError(
-                    f"h_context channels {h_map.shape[1]} != top_h_context_dim {self.top_h_dim}"
-                )
-        elif h_context.dim() == 2:
-            b, d = h_context.shape
-            if d == self.top_h_dim:
-                h_map = h_context[:, :, None, None].expand(b, d, ht, wt).contiguous()
-            elif d == self.top_h_dim * ht * wt:
-                h_map = h_context.view(b, self.top_h_dim, ht, wt).contiguous()
-            else:
-                raise ValueError(
-                    f"h_context dim {d} incompatible with "
-                    f"top_h_context_dim={self.top_h_dim} and top res {ht}x{wt}"
-                )
-        else:
+        if cond_top is None:
+            raise ValueError("cond_top must be provided for top prior/posterior")
+        if h_decoder_top is None:
+            raise ValueError("h_decoder_top must be provided for top decoder")
+
+        top_res = int(self.decoder.dec_blocks[0].base)
+        expected_cond_ch = self.top_h_dim + int(self.H.zdim)
+
+        if cond_top.dim() != 4:
+            raise ValueError(f"cond_top must be [B,C,H,W], got {tuple(cond_top.shape)}")
+        if h_decoder_top.dim() != 4:
             raise ValueError(
-                f"h_context must be [B,Hc,Ht,Wt], [B,Hc], or [B,Hc*Ht*Wt], "
-                f"got {tuple(h_context.shape)}"
+                f"h_decoder_top must be [B,C,H,W], got {tuple(h_decoder_top.shape)}"
             )
 
-        if h_map.shape[2:] != (ht, wt):
-            h_map = F.interpolate(
-                h_map,
-                size=(ht, wt),
-                mode="bilinear",
-                align_corners=False,
-            )
-        return h_map
-
-    def _prepare_top_h_map(self, h_context, ht: int, wt: int):
-        if self.top_h_dim <= 0:
-            return None
-        if h_context is None:
+        if cond_top.shape[1] != expected_cond_ch:
             raise ValueError(
-                "h_context must be provided when top_h_context_dim > 0"
+                f"cond_top channels must be top_h_dim + zdim = {expected_cond_ch}, "
+                f"got {cond_top.shape[1]}"
             )
-        return self._coerce_h_context_map(h_context, ht=ht, wt=wt)
+        if h_decoder_top.shape[1] != self.top_h_dim:
+            raise ValueError(
+                f"h_decoder_top channels must be top_h_dim = {self.top_h_dim}, "
+                f"got {h_decoder_top.shape[1]}"
+            )
 
-    def _compute_top_prior_terms(self, top_q_mean_map, top_q_logvar_map, h_top):
+        if cond_top.shape[2:] != (top_res, top_res):
+            raise ValueError(
+                f"cond_top spatial size must be {(top_res, top_res)}, "
+                f"got {tuple(cond_top.shape[2:])}"
+            )
+        if h_decoder_top.shape[2:] != (top_res, top_res):
+            raise ValueError(
+                f"h_decoder_top spatial size must be {(top_res, top_res)}, "
+                f"got {tuple(h_decoder_top.shape[2:])}"
+            )
+
+        if cond_top.shape[0] != h_decoder_top.shape[0]:
+            raise ValueError(
+                f"Batch mismatch: cond_top batch {cond_top.shape[0]} vs "
+                f"h_decoder_top batch {h_decoder_top.shape[0]}"
+            )
+
+        return cond_top.contiguous(), h_decoder_top.contiguous()
+
+    def _compute_top_prior_terms(self, top_q_mean_map, top_q_logvar_map, cond_top):
         if self.prior is None or top_q_mean_map is None or top_q_logvar_map is None:
             return None, None
-        if h_top is None:
-            raise ValueError(
-                "h_top must be provided when using the DPGMMPrior"
-            )
+        if cond_top is None:
+            raise ValueError("cond_top must be provided when using the DPGMMPrior")
 
         b, c, ht, wt = top_q_mean_map.shape
         top_q_mean_img = top_q_mean_map.contiguous().view(b, c * ht * wt)
 
-        # keep the same semantics as your current code:
-        # stored qv is treated downstream as log-sigma, so convert to log-variance
-        top_q_logvar_img = (
-            2 * top_q_logvar_map.contiguous().view(b, c * ht * wt)
-        )
+        # keep your current semantics:
+        # qv is treated downstream as log-sigma, so convert to log-variance
+        top_q_logvar_img = 2 * top_q_logvar_map.contiguous().view(b, c * ht * wt)
 
-        _, prior_params = self.prior(h_top)
+        _, prior_params = self.prior(cond_top)
         dp_kl_img = self.prior.compute_kl_divergence_mc(
             posterior_mean=top_q_mean_img,
             posterior_logvar=top_q_logvar_img,
@@ -684,21 +658,19 @@ class VDVAE(HModule):
         self,
         x,
         x_target,
-        h_context=None,
+        cond_top=None,
+        h_decoder_top=None,
         mask_t=None,
-        edge_guide: Optional[torch.Tensor] = None,
         get_latents=False,
     ):
         activations = self.encoder.forward(x)
-
-        top_res = int(self.decoder.dec_blocks[0].base)
-        h_top = self._prepare_top_h_map(h_context, ht=top_res, wt=top_res)
+        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
 
         px_z, stats = self.decoder.forward(
             activations,
-            edge_guide=edge_guide,
             get_latents=get_latents,
-            h_context_top=h_top,
+            cond_top=cond_top,
+            h_decoder_top=h_decoder_top,
         )
 
         distortion_per_pixel = self.decoder.out_net.nll(px_z, x_target)
@@ -725,7 +697,7 @@ class VDVAE(HModule):
             dp_kl_img, prior_params = self._compute_top_prior_terms(
                 top_q_mean_map=top_q_mean_map,
                 top_q_logvar_map=top_q_logvar_map,
-                h_top=h_top,
+                cond_top=cond_top,
             )
             if dp_kl_img is not None:
                 dp_rate = self.top_kl_weight * dp_kl_img / ndims
@@ -769,30 +741,39 @@ class VDVAE(HModule):
     def decode_from_top_latent(
         self,
         z_top_map,
-        h_context=None,
-        edge_guide: Optional[torch.Tensor] = None,
+        cond_top=None,
+        h_decoder_top=None,
         t=None,
     ):
-        top_res = int(self.decoder.dec_blocks[0].base)
-        h_top = self._prepare_top_h_map(h_context, ht=top_res, wt=top_res)
+        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
         return self.decoder.forward_from_top_latent(
             z_top_map,
             t=t,
-            edge_guide=edge_guide,
-            h_context_top=h_top,
+            cond_top=cond_top,
+            h_decoder_top=h_decoder_top,
         )
 
-    def sample(self, n_batch, h_context, edge_guide: Optional[torch.Tensor] = None):
+    def sample(
+        self,
+        n_batch,
+        cond_top,
+        h_decoder_top,
+    ):
         if self.prior is None:
             raise ValueError("VDVAE.sample requires a DPGMMPrior")
+
+        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
+
+        if cond_top.shape[0] != n_batch:
+            raise ValueError(
+                f"cond_top batch {cond_top.shape[0]} does not match n_batch={n_batch}"
+            )
 
         top_block = self.decoder.dec_blocks[0]
         c = top_block.zdim
         res = top_block.base
 
-        h_top = self._prepare_top_h_map(h_context, ht=res, wt=res)
-
-        prior_dist, _ = self.prior(h_top)
+        prior_dist, _ = self.prior(cond_top)
         z_img = prior_dist.sample()
 
         expected_dim = c * res * res
@@ -805,25 +786,24 @@ class VDVAE(HModule):
         z_top_map = z_img.view(n_batch, c, res, res).contiguous()
         px_z = self.decoder.forward_from_top_latent(
             z_top_map,
-            edge_guide=edge_guide,
-            h_context_top=h_top,
+            cond_top=cond_top,
+            h_decoder_top=h_decoder_top,
         )
         return self.decoder.out_net.sample(px_z)
 
     def forward_get_latents(
         self,
         x,
-        edge_guide: Optional[torch.Tensor] = None,
-        h_context=None,
+        cond_top=None,
+        h_decoder_top=None,
     ):
         activations = self.encoder.forward(x)
-        top_res = int(self.decoder.dec_blocks[0].base)
-        h_top = self._prepare_top_h_map(h_context, ht=top_res, wt=top_res)
+        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
         _, stats = self.decoder.forward(
             activations,
-            edge_guide=edge_guide,
             get_latents=True,
-            h_context_top=h_top,
+            cond_top=cond_top,
+            h_decoder_top=h_decoder_top,
         )
         return stats
 
@@ -831,16 +811,15 @@ class VDVAE(HModule):
         self,
         n_batch,
         t=None,
-        edge_guide: Optional[torch.Tensor] = None,
-        h_context=None,
+        cond_top=None,
+        h_decoder_top=None,
     ):
-        top_res = int(self.decoder.dec_blocks[0].base)
-        h_top = self._prepare_top_h_map(h_context, ht=top_res, wt=top_res)
+        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
         px_z = self.decoder.forward_uncond(
             n_batch,
             t=t,
-            edge_guide=edge_guide,
-            h_context_top=h_top,
+            cond_top=cond_top,
+            h_decoder_top=h_decoder_top,
         )
         return self.decoder.out_net.sample(px_z)
 
@@ -849,16 +828,15 @@ class VDVAE(HModule):
         n_batch,
         latents,
         t=None,
-        edge_guide: Optional[torch.Tensor] = None,
-        h_context=None,
+        cond_top=None,
+        h_decoder_top=None,
     ):
-        top_res = int(self.decoder.dec_blocks[0].base)
-        h_top = self._prepare_top_h_map(h_context, ht=top_res, wt=top_res)
+        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
         px_z = self.decoder.forward_manual_latents(
             n_batch,
             latents,
             t=t,
-            edge_guide=edge_guide,
-            h_context_top=h_top,
+            cond_top=cond_top,
+            h_decoder_top=h_decoder_top,
         )
         return self.decoder.out_net.sample(px_z)

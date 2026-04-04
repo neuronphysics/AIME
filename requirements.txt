@@ -48,6 +48,7 @@ gym
 gym-notices
 gymnasium
 h5py
+huggingface_hub
 hydra-core
 idna
 imageio

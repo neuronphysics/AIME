@@ -267,89 +267,6 @@ class ConvGNAct(nn.Module):
     def forward(self, x):
         return self.act(self.gn(self.conv(x)))
 
-
-class EdgeMapToTop(nn.Module):
-    """
-    Map an already-computed 1-channel edge map [B,1,H,W] to top grid
-    [B,out_ch,topH,topW] using:
-
-      1) average pooling to target grid
-      2) normalize
-      3) gamma boost
-      4) normalize again
-      5) trainable 1x1 projection
-    """
-    def __init__(
-        self,
-        out_ch: int = 16,
-        target_hw=(8, 8),
-        gamma: float = 0.8,
-        use_checkpoint: bool = False,
-        eps: float = 1e-8,
-    ):
-        super().__init__()
-        self.target_hw = (int(target_hw[0]), int(target_hw[1]))
-        self.gamma = float(gamma)
-        self.use_checkpoint = bool(use_checkpoint)
-        self.eps = float(eps)
-
-        groups = min(8, int(out_ch))
-        while groups > 1 and (int(out_ch) % groups != 0):
-            groups -= 1
-
-        self.proj = nn.Sequential(
-            nn.Conv2d(1, int(out_ch), kernel_size=1, bias=True),
-            nn.GroupNorm(groups, int(out_ch)),
-            nn.SiLU(inplace=False),
-        )
-
-    def _maybe_ckpt(self, fn, x: torch.Tensor) -> torch.Tensor:
-        if self.use_checkpoint and self.training and x.requires_grad:
-            return checkpoint(fn, x, use_reentrant=False)
-        return fn(x)
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return x / (x.amax(dim=(-2, -1), keepdim=True) + self.eps)
-
-    def _coerce_edge_shape(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 4:
-            raise ValueError(f"edge map must be 4D, got {tuple(x.shape)}")
-
-        # Accept [B,1,H,W] or [B,H,W,1]
-        if x.shape[1] == 1:
-            return x
-        if x.shape[-1] == 1:
-            return x.permute(0, 3, 1, 2).contiguous()
-
-        raise ValueError(f"Expected [B,1,H,W] or [B,H,W,1], got {tuple(x.shape)}")
-
-    def _pool_to_target(self, x: torch.Tensor) -> torch.Tensor:
-        th, tw = self.target_hw
-        h, w = x.shape[-2:]
-
-        if (h, w) == (th, tw):
-            return x
-
-        if (h % th == 0) and (w % tw == 0):
-            sy, sx = h // th, w // tw
-            return F.avg_pool2d(x, kernel_size=(sy, sx), stride=(sy, sx))
-
-        return F.adaptive_avg_pool2d(x, self.target_hw)
-
-    def forward(self, edge_map: torch.Tensor) -> torch.Tensor:
-        edge_map = self._coerce_edge_shape(edge_map)
-
-        # 1) map to top grid with avg pooling
-        e_top = self._pool_to_target(edge_map)
-
-        # 2) normalize -> gamma boost -> normalize again
-        e_top = self._normalize(e_top).clamp_min(self.eps).pow(self.gamma)
-        e_top = self._normalize(e_top)
-
-        # 3) always use trainable projection
-        return self._maybe_ckpt(self.proj, e_top)
-
-
 class PixelShuffleUpBlock(nn.Module):
     def __init__(self, channels: int, *, use_fir_blur: bool = True):
         super().__init__()
@@ -404,126 +321,24 @@ class PixelShuffleUpBlock(nn.Module):
         x = self.act(self.norm(x))
         return x
 
-class HFTopUpsampler(nn.Module):
-    """
-    Learned upsampler: [B,C,topH,topW] -> [B,C,target,target] using repeated 2x PixelShuffle blocks.
 
-    Works when:
-      - target % topH == 0 and target % topW == 0
-      - and scale factor is power-of-2 (e.g., 4->64, 8->64, 16->64, 32->64).
-
-    If top size varies (4 or 8 or 16...), create enough blocks for the smallest top you expect
-    and we will run only the required number at runtime.
-    """
-    def __init__(self, channels: int, target: int = 64, min_top: int = 4, use_checkpoint: bool = False):
-        super().__init__()
-        assert target % min_top == 0, "target must be divisible by min_top"
-        max_scale = target // min_top
-        assert max_scale > 0 and (max_scale & (max_scale - 1)) == 0, "target/min_top must be power of two for repeated x2 blocks"
-
-        self.channels = int(channels)
-        self.target = int(target)
-        self.use_checkpoint = bool(use_checkpoint)
-
-        self.max_steps = int(math.log2(max_scale))
-        self.blocks = nn.ModuleList([PixelShuffleUpBlock(self.channels) for _ in range(self.max_steps)])
-
-        g = min(32, self.channels)
-        while g > 1 and (self.channels % g != 0):
-            g -= 1
-        # optional final “polish” conv to reduce any remaining checkerboard / subpixel texture
-        self.final = nn.Sequential(
-            nn.Conv2d(self.channels, self.channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=g, num_channels=self.channels),
-            nn.SiLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        if H == self.target and W == self.target:
-            return x
-        if C != self.channels:
-            raise ValueError(f"Expected C={self.channels}, got C={C}")
-
-        if (self.target % H) != 0 or (self.target % W) != 0:
-            raise ValueError(f"target={self.target} must be divisible by input spatial {(H,W)}")
-
-        rH = self.target // H
-        rW = self.target // W
-        if rH != rW:
-            raise ValueError(f"Need equal scale for H and W; got rH={rH}, rW={rW}")
-        if not (rH > 0 and (rH & (rH - 1)) == 0):
-            raise ValueError(f"Scale factor must be power-of-two, got {rH}")
-
-        steps = int(math.log2(rH))
-        if steps > self.max_steps:
-            raise ValueError(
-                f"Need {steps} upsample steps but module was built for max_steps={self.max_steps}. "
-                f"Set min_top smaller (or increase target/min_top)."
-            )
-
-        for i in range(steps):
-            blk = self.blocks[i]
-            # checkpoint only makes sense during training and when grads are enabled
-            if self.use_checkpoint and self.training and torch.is_grad_enabled():
-                x = checkpoint(blk, x, use_reentrant=False)
-            else:
-                x = blk(x)
-
-        x = self.final(x)
-        return x
         
-
-class AntiAliasInterpolation2d(nn.Module):
+def make_coord(shape, ranges=None, flatten=True):
+    """ Make coordinates at grid centers.
     """
-    Band-limited downsampling, for better preservation of the input signal.
-    """
-
-    def __init__(self, channels, scale):
-        super(AntiAliasInterpolation2d, self).__init__()
-        sigma = (1 / scale - 1) / 2
-        kernel_size = 2 * round(sigma * 4) + 1
-        self.ka = kernel_size // 2
-        self.kb = self.ka - 1 if kernel_size % 2 == 0 else self.ka
-
-        kernel_size = [kernel_size, kernel_size]
-        sigma = [sigma, sigma]
-        # The gaussian kernel is the product of the
-        # gaussian function of each dimension.
-        kernel = 1
-        meshgrids = torch.meshgrid(
-            [
-                torch.arange(size, dtype=torch.float32)
-                for size in kernel_size
-            ]
-        )
-        for size, std, mgrid in zip(kernel_size, sigma, meshgrids):
-            mean = (size - 1) / 2
-            kernel *= torch.exp(-(mgrid - mean) ** 2 / (2 * std ** 2))
-
-        # Make sure sum of values in gaussian kernel equals 1.
-        kernel = kernel / torch.sum(kernel)
-        # Reshape to depthwise convolutional weight
-        kernel = kernel.view(1, 1, *kernel.size())
-        kernel = kernel.repeat(channels, *[1] * (kernel.dim() - 1))
-
-        self.register_buffer('weight', kernel)
-        self.groups = channels
-        self.scale = scale
-        inv_scale = 1 / scale
-        self.int_inv_scale = int(inv_scale)
-
-    def forward(self, input):
-        if self.scale == 1.0:
-            return input
-
-        out = F.pad(input, (self.ka, self.kb, self.ka, self.kb))
-        out = F.conv2d(out, weight=self.weight, groups=self.groups)
-        out = out[:, :, ::self.int_inv_scale, ::self.int_inv_scale]
-
-        return out
-
-
+    coord_seqs = []
+    for i, n in enumerate(shape):
+        if ranges is None:
+            v0, v1 = -1, 1
+        else:
+            v0, v1 = ranges[i]
+        r = (v1 - v0) / (2 * n)
+        seq = v0 + r + (2 * r) * torch.arange(n).float()
+        coord_seqs.append(seq)
+    ret = torch.stack(torch.meshgrid(*coord_seqs), dim=-1)
+    if flatten:
+        ret = ret.view(-1, ret.shape[-1])
+    return ret
 
 def sinusoidal_2d_pos_embed(H: int, W: int, D: int, device=None, dtype=None) -> torch.Tensor:
     """
@@ -568,143 +383,6 @@ class SEBlock2d(nn.Module):
     def forward(self, x):
         return x * self.fc(self.pool(x))
 
-
-class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim, heads=8, dim_head=64):
-        super().__init__()
-        inner_dim = heads * dim_head
-        self.heads = heads
-        self.dim_head = dim_head
-        self.scale = dim_head ** -0.5
-
-        self.to_q = nn.Conv2d(query_dim, inner_dim, 1, bias=False)
-        self.to_k = nn.Conv2d(context_dim, inner_dim, 1, bias=False)
-        self.to_v = nn.Conv2d(context_dim, inner_dim, 1, bias=False)
-        self.to_out = nn.Conv2d(inner_dim, query_dim, 1, bias=True)
-
-    def forward(self, x, context):
-        """
-        x:       [B, Cq, H, W]   query map
-        context: [B, Cc, H, W]   context map
-        returns: [B, Cq, H, W]
-        """
-        B, _, H, W = x.shape
-        h = self.heads
-        d = self.dim_head
-
-        q = self.to_q(x)        # [B, h*d, H, W]
-        k = self.to_k(context)  # [B, h*d, H, W]
-        v = self.to_v(context)  # [B, h*d, H, W]
-
-        # [B, h, HW, d]
-        q = q.view(B, h, d, H * W).permute(0, 1, 3, 2)
-        k = k.view(B, h, d, H * W).permute(0, 1, 3, 2)
-        v = v.view(B, h, d, H * W).permute(0, 1, 3, 2)
-
-        # attention scores: [B, h, HW, HW]
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        # [B, h, HW, d]
-        out = torch.matmul(attn, v)
-
-        # [B, h*d, H, W]
-        out = out.permute(0, 1, 3, 2).contiguous().view(B, h * d, H, W)
-
-        return self.to_out(out)
-
-
-class LatentFlowHead(nn.Module):
-    """Predict coarse canonical flow on the top grid in normalized coordinates."""
-
-    def __init__(
-        self,
-        mot_ch: int,
-        ctx_ch: int,
-        act_dim: int,
-        edge_ch: int,
-        top_hw: Tuple[int, int],
-        hidden: int = 128,
-        max_flow_top_px: float = 1.0,
-        use_checkpoint: bool = False,
-        attn_heads: int = 8,
-        attn_dim_head: int = 32,
-    ):
-        super().__init__()
-        self.use_checkpoint = bool(use_checkpoint)
-        topH, topW = int(top_hw[0]), int(top_hw[1])
-
-        max_dx_norm = 2.0 * float(max_flow_top_px) / max(topW - 1, 1)
-        max_dy_norm = 2.0 * float(max_flow_top_px) / max(topH - 1, 1)
-        self.register_buffer(
-            'max_flow_norm',
-            torch.tensor([max_dx_norm, max_dy_norm], dtype=torch.float32).view(1, 2, 1, 1),
-            persistent=False,
-        )
-
-        self.act_embed = nn.Sequential(
-            nn.Conv2d(act_dim, 32, 1, 1, 0),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(inplace=False),
-        )
-
-        self.motion_hctx_attn = CrossAttention(
-            query_dim=mot_ch,
-            context_dim=ctx_ch,
-            heads=attn_heads,
-            dim_head=attn_dim_head,
-        )
-
-        g_mot = min(8, mot_ch)
-        while mot_ch % g_mot != 0 and g_mot > 1:
-            g_mot -= 1
-        self.mot_fuse_norm = nn.GroupNorm(g_mot, mot_ch)
-
-        in_ch = mot_ch + 32 + edge_ch
-        self.net = nn.Sequential(
-            ConvGNAct(in_ch, hidden, 3, 1, inplace_act=False),
-            ConvGNAct(hidden, hidden, 3, 1, inplace_act=False),
-            ConvGNAct(hidden, hidden, 3, 1, inplace_act=False),
-            nn.Conv2d(hidden, 2, 3, 1, 1),
-        )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def _maybe_ckpt(self, fn, *args):
-        if self.use_checkpoint and self.training and any(torch.is_tensor(a) and a.requires_grad for a in args):
-            return checkpoint(fn, *args, use_reentrant=False)
-        return fn(*args)
-
-    def _cross_attend_motion(self, mot_ctx, h_context_map):
-        return self.motion_hctx_attn(mot_ctx, h_context_map)
-
-    def forward(self, mot_ctx, h_context_map, a_map, edge_top):
-        a_emb = self._maybe_ckpt(self.act_embed, a_map)
-        mot_ctx_attn = self._maybe_ckpt(self._cross_attend_motion, mot_ctx, h_context_map)
-        mot_ctx_fused = self.mot_fuse_norm(mot_ctx + mot_ctx_attn)
-        x = torch.cat([mot_ctx_fused, a_emb, edge_top], dim=1)
-        if self.use_checkpoint and self.training and x.requires_grad:
-            raw = checkpoint_sequential(self.net, segments=3, input=x, use_reentrant=False)
-        else:
-            raw = self.net(x)
-        return self.max_flow_norm.to(device=raw.device, dtype=raw.dtype) * torch.tanh(raw)
-
-def resize_flow_norm(
-    flow_norm: torch.Tensor,
-    dst_hw: Tuple[int, int],
-    mode: str = 'bicubic',
-) -> torch.Tensor:
-    """Resample a canonical flow field in normalized coordinates."""
-    assert flow_norm.ndim == 4 and flow_norm.size(1) == 2
-    Hd, Wd = int(dst_hw[0]), int(dst_hw[1])
-    if flow_norm.shape[-2:] == (Hd, Wd):
-        return flow_norm
-    if mode not in {'bilinear', 'bicubic'}:
-        raise ValueError(f'Unsupported mode={mode}')
-    return F.interpolate(flow_norm, size=(Hd, Wd), mode=mode, align_corners=True)
-
-
-
 class SineLayer(nn.Module):
     # See paper sec. 3.2, final paragraph, and supplement Sec. 1.5 for discussion of omega_0.
     
@@ -715,8 +393,8 @@ class SineLayer(nn.Module):
     # If is_first=False, then the weights will be divided by omega_0 so as to keep the magnitude of 
     # activations constant, but boost gradients to the weight matrix (see supplement Sec. 1.5)
     
-    def __init__(self, in_features, out_features, bias=True,
-                 is_first=False, omega_0=30):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 is_first: bool = False, omega_0: float = 30):
         super().__init__()
         self.omega_0 = omega_0
         self.is_first = is_first
@@ -741,8 +419,8 @@ class SineLayer(nn.Module):
     
     
 class Siren(nn.Module):
-    def __init__(self, in_features, hidden_features, hidden_layers, out_features, outermost_linear=False, 
-                 first_omega_0=30, hidden_omega_0=30.):
+    def __init__(self, in_features: int, hidden_features: list[int], hidden_layers: int, out_features: int, outermost_linear: bool = False, 
+                 first_omega_0: float = 30, hidden_omega_0: float = 30.):
         super().__init__()
         
         self.net = []
@@ -771,279 +449,477 @@ class Siren(nn.Module):
         # coords = coords.clone().detach().requires_grad_(True) # allows to take derivative w.r.t. input
         output = self.net(coords)
         return output     
+
+
+backwarp_tenGrid = {}
+
+def warpgrid(tenInput, tenFlow, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
+    k = (str(tenFlow.device), str(tenFlow.size()))
+    if k not in backwarp_tenGrid:
+        tenHorizontal = torch.linspace(-1.0, 1.0, tenFlow.shape[3], device=device).view(
+            1, 1, 1, tenFlow.shape[3]).expand(tenFlow.shape[0], -1, tenFlow.shape[2], -1)
+        tenVertical = torch.linspace(-1.0, 1.0, tenFlow.shape[2], device=device).view(
+            1, 1, tenFlow.shape[2], 1).expand(tenFlow.shape[0], -1, -1, tenFlow.shape[3])
+        backwarp_tenGrid[k] = torch.cat(
+            [tenHorizontal, tenVertical], 1).to(device)
+
+    tenFlow = torch.cat([tenFlow[:, 0:1, :, :] / ((tenFlow.shape[3] - 1.0) / 2.0),
+                         tenFlow[:, 1:2, :, :] / ((tenFlow.shape[2] - 1.0) / 2.0)], 1)
     
-    
-class FineResidualFlowHead(nn.Module):
+    g = (backwarp_tenGrid[k] + tenFlow).permute(0, 2, 3, 1)
+    return g, torch.nn.functional.grid_sample(input=tenInput, grid=g, mode='bilinear', padding_mode='border', align_corners=True)
+
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+def _batched_coord(
+    hw: Tuple[int, int],
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
     """
-    Predict a fine residual in canonical normalized coordinates using:
-      - local fine feature context
-      - bicubic coarse base flow at target resolution
-      - 2 sub-cell coordinate channels (relative position inside each coarse cell)
-
-    Then project the residual to the high-pass complement of the coarse bicubic
-    function class, preserving the original cross-scale design.
+    Returns [B, H*W, 2] coordinates in the make_coord convention.
     """
+    coord = make_coord(hw, flatten=True).to(device=device, dtype=dtype)
+    coord = coord.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+    return coord
 
-    def __init__(
-        self,
-        in_ch: int,
-        fine_hw: Tuple[int, int],
-        coarse_hw: Tuple[int, int],
-        hidden: int = 64,
-        max_fine_flow_norm: float = 0.05,
-        use_checkpoint: bool = False,
-        siren_omega_0: float = 30.0,
-    ):
-        super().__init__()
-        self.fine_H, self.fine_W = int(fine_hw[0]), int(fine_hw[1])
-        self.coarse_H, self.coarse_W = int(coarse_hw[0]), int(coarse_hw[1])
-        self.use_checkpoint = bool(use_checkpoint)
 
-        self.register_buffer(
-            "max_norm",
-            torch.tensor(float(max_fine_flow_norm), dtype=torch.float32),
-            persistent=False,
-        )
+def _coord_map(
+    hw: Tuple[int, int],
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Returns [B, 2, H, W] coordinate map in the make_coord convention.
+    """
+    coord = make_coord(hw, flatten=False).to(device=device, dtype=dtype)  # [H, W, 2]
+    coord = coord.permute(2, 0, 1).unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous()
+    return coord
 
-        def _groups(c: int) -> int:
-            g = min(8, c)
-            while c % g != 0 and g > 1:
-                g -= 1
-            return g
 
-        # Local spatial context extractor.
-        # It sees both the fine feature and the bicubic coarse base flow.
-        stem_in = in_ch + 2
-        g = _groups(hidden)
-        self.local_ctx = nn.Sequential(
-            nn.Conv2d(stem_in, hidden, 3, 1, 1, bias=True),
-            nn.GroupNorm(g, hidden),
-            nn.SiLU(inplace=False),
+def _sample_at_coord(
+    feat_map: torch.Tensor,
+    coord: torch.Tensor,
+    mode: str,
+) -> torch.Tensor:
+    """
+    feat_map: [B, C, H, W]
+    coord:    [B, Q, 2] in make_coord convention
+    returns:  [B, Q, C]
+    """
+    sampled = F.grid_sample(
+        feat_map,
+        coord.flip(-1).unsqueeze(1),  # grid_sample expects x,y order
+        mode=mode,
+        align_corners=False,
+    )  # [B, C, 1, Q]
+    return sampled[:, :, 0, :].permute(0, 2, 1).contiguous()
 
-            nn.Conv2d(hidden, hidden, 3, 1, 1, bias=True),
-            nn.GroupNorm(g, hidden),
-            nn.SiLU(inplace=False),
 
-            nn.Conv2d(hidden, hidden, 3, 1, 1, bias=True),
-            nn.GroupNorm(g, hidden),
-            nn.SiLU(inplace=False),
-        )
+def _expand_time(
+    dt,
+    batch_size: int,
+    num_queries: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Returns [B, Q, 1].
+    """
+    if not torch.is_tensor(dt):
+        dt = torch.tensor(dt, device=device, dtype=dtype)
 
-        # Per-pixel implicit decoder.
-        # Inputs = local context + 2 sub-cell coords + base flow (dx,dy).
-        siren_hidden = [hidden, hidden, hidden * 2]
-        self.imnet = Siren(
-            in_features=hidden + 2 + 2,
-            hidden_features=siren_hidden,
-            hidden_layers=len(siren_hidden) - 1,
-            out_features=2,
-            outermost_linear=True,
-            first_omega_0=siren_omega_0,
-            hidden_omega_0=siren_omega_0,
-        )
+    dt = dt.to(device=device, dtype=dtype)
 
-        # Make the new branch start near zero so it does not immediately fight
-        # the existing coarse path.
-        if hasattr(self.imnet, "net") and len(self.imnet.net) > 0 and isinstance(self.imnet.net[-1], nn.Linear):
-            nn.init.zeros_(self.imnet.net[-1].weight)
-            nn.init.zeros_(self.imnet.net[-1].bias)
-
-    def _project_highpass(self, residual: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        residual_low = resize_flow_norm(residual, (self.coarse_H, self.coarse_W), mode="bicubic")
-        residual_recon = resize_flow_norm(residual_low, (self.fine_H, self.fine_W), mode="bicubic")
-        residual_high = residual - residual_recon
-        leakage = resize_flow_norm(residual_high, (self.coarse_H, self.coarse_W), mode="bicubic")
-        return residual_high, leakage
-
-    def _subcell_coords(self, batch: int, device, dtype) -> torch.Tensor:
-        """
-        Returns [B,2,H,W] with coordinates in [-1,1] measuring each fine pixel's
-        relative position *inside its coarse top-grid cell*.
-
-        This is more appropriate than absolute x/y for coarse->fine lifting.
-        """
-        y = torch.arange(self.fine_H, device=device, dtype=dtype) + 0.5
-        x = torch.arange(self.fine_W, device=device, dtype=dtype) + 0.5
-
-        # Map fine-pixel centers into coarse-grid coordinates.
-        coarse_y = y * (float(self.coarse_H) / float(self.fine_H)) - 0.5
-        coarse_x = x * (float(self.coarse_W) / float(self.fine_W)) - 0.5
-
-        frac_y = coarse_y - torch.floor(coarse_y)
-        frac_x = coarse_x - torch.floor(coarse_x)
-
-        rel_y = 2.0 * frac_y - 1.0
-        rel_x = 2.0 * frac_x - 1.0
-
-        yy, xx = torch.meshgrid(rel_y, rel_x, indexing="ij")
-        coords = torch.stack([xx, yy], dim=0).unsqueeze(0)  # [1,2,H,W]
-        return coords.expand(batch, -1, -1, -1)
-
-    def _forward_impl(self, feat: torch.Tensor, base_target_norm: torch.Tensor) -> torch.Tensor:
-        B = feat.shape[0]
-
-        if feat.shape[-2:] != (self.fine_H, self.fine_W):
-            feat = F.interpolate(
-                feat, size=(self.fine_H, self.fine_W),
-                mode="bilinear", align_corners=True
-            )
-
-        if base_target_norm.shape[-2:] != (self.fine_H, self.fine_W):
-            base_target_norm = resize_flow_norm(
-                base_target_norm, (self.fine_H, self.fine_W), mode="bicubic"
-            )
-
-        # Local conv context over [fine feature, bicubic coarse base flow]
-        ctx = self.local_ctx(torch.cat([feat, base_target_norm], dim=1))  # [B,C,H,W]
-
-        # Relative coordinates inside coarse cell
-        subcell = self._subcell_coords(B, feat.device, feat.dtype)        # [B,2,H,W]
-
-        # Per-pixel implicit decoding
-        # Inputs: local ctx + subcell coords + base flow at that pixel
-        q = torch.cat([ctx, subcell, base_target_norm], dim=1)            # [B,C+4,H,W]
-        q = q.permute(0, 2, 3, 1).reshape(B * self.fine_H * self.fine_W, -1)
-
-        raw = self.imnet(q)                                               # [B*H*W,2]
-        raw = raw.view(B, self.fine_H, self.fine_W, 2).permute(0, 3, 1, 2).contiguous()
-        return raw
-
-    def forward(
-        self,
-        feat: torch.Tensor,
-        base_target_norm: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if (
-            self.use_checkpoint
-            and self.training
-            and (feat.requires_grad or base_target_norm.requires_grad)
-        ):
-            raw = checkpoint(self._forward_impl, feat, base_target_norm, use_reentrant=False)
+    if dt.dim() == 0:
+        dt = dt.view(1, 1, 1).expand(batch_size, num_queries, 1)
+    elif dt.dim() == 1:
+        if dt.numel() == batch_size:
+            dt = dt.view(batch_size, 1, 1).expand(batch_size, num_queries, 1)
+        elif dt.numel() == 1:
+            dt = dt.view(1, 1, 1).expand(batch_size, num_queries, 1)
         else:
-            raw = self._forward_impl(feat, base_target_norm)
+            raise ValueError(f"dt shape {tuple(dt.shape)} not supported")
+    elif dt.dim() == 2:
+        if dt.shape == (batch_size, 1):
+            dt = dt.unsqueeze(1).expand(batch_size, num_queries, 1)
+        elif dt.shape == (batch_size, num_queries):
+            dt = dt.unsqueeze(-1)
+        else:
+            raise ValueError(f"dt shape {tuple(dt.shape)} not supported")
+    elif dt.dim() == 3:
+        if dt.shape[-1] != 1:
+            raise ValueError(f"dt last dim must be 1, got {tuple(dt.shape)}")
+    else:
+        raise ValueError(f"dt shape {tuple(dt.shape)} not supported")
 
-        residual = self.max_norm.to(device=raw.device, dtype=raw.dtype) * torch.tanh(raw)
-        residual_high, leakage = self._project_highpass(residual)
-        return residual_high, leakage
-
-def flow_norm_to_px(flow_norm: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
-    """Convert normalized align_corners=True flow to pixel units."""
-    assert flow_norm.ndim == 4 and flow_norm.size(1) == 2
-    H, W = int(hw[0]), int(hw[1])
-
-    sx = max(W - 1, 1) / 2.0
-    sy = max(H - 1, 1) / 2.0
-
-    out = flow_norm.clone()
-    out[:, 0] = out[:, 0] * sx
-    out[:, 1] = out[:, 1] * sy
-    return out
+    return dt
 
 
-class CanonicalFlowField(nn.Module):
+def _expand_action(
+    action: Optional[torch.Tensor],
+    batch_size: int,
+    num_queries: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
     """
-    Canonical cross-scale flow module.
-    The top-grid flow is the only coarse motion predictor.
-    The target-resolution flow is deterministic bicubic lift plus an optional
-    strictly high-frequency residual.
+    Returns [B, Q, A] or None.
+    """
+    if action is None:
+        return None
+
+    action = action.to(device=device, dtype=dtype)
+
+    if action.dim() == 1:
+        action = action.view(1, -1).expand(batch_size, -1)
+    elif action.dim() != 2:
+        raise ValueError(f"action must be [B,A] or [A], got {tuple(action.shape)}")
+
+    if action.shape[0] != batch_size:
+        raise ValueError(
+            f"action batch {action.shape[0]} does not match batch_size={batch_size}"
+        )
+
+    return action.unsqueeze(1).expand(batch_size, num_queries, action.shape[-1]).contiguous()
+
+
+# ---------------------------------------------------------------------
+# continuous latent field
+# ---------------------------------------------------------------------
+
+class SpatialLatentINR(nn.Module):
+    """
+      Fs(xs) = fs(z*, xs - v*)
+
+    where z* is the nearest latent vector from the discrete top-latent map,
+    and v* is the coordinate of that nearest latent vector.
     """
 
     def __init__(
         self,
-        mot_ch: int,
-        ctx_ch: int,
-        act_dim: int,
-        edge_ch: int,
-        fine_feat_ch: int,
-        top_hw: Tuple[int, int],
-        target_hw: Tuple[int, int],
-        coarse_hidden: int = 128,
-        max_flow_top_px: float = 1.0,
-        use_checkpoint: bool = False,
-        fine_hw: Optional[Tuple[int, int]] = None,
-        fine_hidden: int = 64,
-        max_fine_flow_px: float = 0.5,
+        z_channels: int,
+        hidden_features: list[int] = [64, 64, 256],
+        hidden_layers: int = 2,
+        out_channels: Optional[int] = None,
     ):
         super().__init__()
-        self.top_hw = (int(top_hw[0]), int(top_hw[1]))
-        self.target_hw = (int(target_hw[0]), int(target_hw[1]))
+        self.z_channels = int(z_channels)
+        self.out_channels = int(out_channels) if out_channels is not None else int(z_channels)
 
-        self.coarse_head = LatentFlowHead(
-            mot_ch=mot_ch,
-            ctx_ch=ctx_ch,
-            act_dim=act_dim,
-            edge_ch=edge_ch,
-            top_hw=self.top_hw,
-            hidden=coarse_hidden,
-            max_flow_top_px=max_flow_top_px,
-            use_checkpoint=use_checkpoint,
+        self.feat_imnet = Siren(
+            in_features=self.z_channels + 2,      # nearest latent + relative coord
+            out_features=self.out_channels,
+            hidden_features=hidden_features,
+            hidden_layers=hidden_layers,
+            outermost_linear=True,
         )
 
-        fine_hw = self.target_hw if fine_hw is None else (int(fine_hw[0]), int(fine_hw[1]))
-        self.fine_head = FineResidualFlowHead(
-            in_ch=fine_feat_ch,
-            fine_hw=fine_hw,
-            coarse_hw=self.top_hw,
-            hidden=fine_hidden,
-            max_fine_flow_norm=max_fine_flow_px,
-            use_checkpoint=use_checkpoint,
-        )
+    def query(
+        self,
+        z_top_prev: torch.Tensor,
+        coord: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        z_top_prev: [B, Cz, Ht, Wt]
+        coord:      [B, Q, 2] in make_coord convention
+        returns:    [B, Q, Cz_out]
+        """
+        if z_top_prev.dim() != 4:
+            raise ValueError(f"z_top_prev must be [B,C,H,W], got {tuple(z_top_prev.shape)}")
+        if coord.dim() != 3 or coord.shape[-1] != 2:
+            raise ValueError(f"coord must be [B,Q,2], got {tuple(coord.shape)}")
 
-    @staticmethod
-    def _masked_mean(x: torch.Tensor, mask_t: Optional[torch.Tensor]) -> torch.Tensor:
-        if mask_t is None:
-            return x.mean()
-        vm = mask_t.view(mask_t.size(0), 1, 1, 1).to(device=x.device, dtype=x.dtype)
-        denom = (vm.sum() * x.shape[1] * x.shape[2] * x.shape[3]).clamp(min=1.0)
-        return (x * vm).sum() / denom
+        B, Cz, Ht, Wt = z_top_prev.shape
+        if Cz != self.z_channels:
+            raise ValueError(
+                f"z_top_prev channels {Cz} do not match z_channels={self.z_channels}"
+            )
+
+        q_feat = _sample_at_coord(z_top_prev, coord, mode="nearest")  # [B, Q, Cz]
+
+        feat_coord = _coord_map((Ht, Wt), B, z_top_prev.device, z_top_prev.dtype)
+        q_coord = _sample_at_coord(feat_coord, coord, mode="nearest")  # [B, Q, 2]
+
+        rel_coord = coord - q_coord
+        rel_coord[..., 0] *= Ht
+        rel_coord[..., 1] *= Wt
+
+        inp = torch.cat([q_feat, rel_coord], dim=-1)  # VideoINR-style concatenation
+        out = self.feat_imnet(inp.view(B * coord.shape[1], -1)).view(B, coord.shape[1], self.out_channels)
+        return out
+
+    def dense_field(
+        self,
+        z_top_prev: torch.Tensor,
+        out_hw: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build the dense continuous latent field once over the whole target grid.
+
+        returns:
+          field_map: [B, Cz_out, Hout, Wout]
+          coord:     [B, Hout*Wout, 2]
+        """
+        B, _, Ht, Wt = z_top_prev.shape
+        out_hw = (Ht, Wt) if out_hw is None else tuple(out_hw)
+
+        coord = _batched_coord(out_hw, B, z_top_prev.device, z_top_prev.dtype)
+        dense_feat = self.query(z_top_prev, coord)  # [B, Q, Cz_out]
+        field_map = dense_feat.permute(0, 2, 1).contiguous().view(B, self.out_channels, out_hw[0], out_hw[1])
+        return field_map, coord
+
+
+# ---------------------------------------------------------------------
+# continuous motion field
+# ---------------------------------------------------------------------
+
+class TemporalMotionINR(nn.Module):
+    """
+    Temporal implicit representation:
+      M(xs, xt) = ft(xt, Fs(xs), context)
+    """
+
+    def __init__(
+        self,
+        z_channels: int,
+        h_channels: int,
+        action_dim: int,
+        hidden_features: list[int] = [64, 64, 256],
+        hidden_layers: int = 2,
+        flow_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.z_channels = int(z_channels)
+        self.h_channels = int(h_channels)
+        self.action_dim = int(action_dim)
+        self.flow_scale = float(flow_scale)
+
+        # concatenation only:
+        # queried latent feature + queried recurrent context + query coord + dt + action
+        in_dim = self.z_channels + self.h_channels + 2 + 1 + self.action_dim
+
+        self.flow_imnet = Siren(
+            in_features=in_dim,
+            out_features=2,  # dx, dy in top-grid pixel units
+            hidden_features=hidden_features,
+            hidden_layers=hidden_layers,
+            outermost_linear=True,
+        )
 
     def forward(
         self,
-        mot_ctx: torch.Tensor,
-        h_ctx: torch.Tensor,
-        a_map: torch.Tensor,
-        edge_top: torch.Tensor,
-        fine_feat: torch.Tensor,
-        mask_t: Optional[torch.Tensor] = None,
+        spatial_field_map: torch.Tensor,
+        h_t: torch.Tensor,
+        action_prev: Optional[torch.Tensor],
+        dt,
+        coord: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        flow_top_norm = self.coarse_head(mot_ctx, h_ctx, a_map, edge_top)
-        base_target_norm = resize_flow_norm(flow_top_norm, self.target_hw, mode="bicubic")
+        """
+        spatial_field_map: [B, Cz, Ht, Wt]
+        h_t:               [B, Ch, Ht, Wt]  (same top-grid semantic context)
+        action_prev:       [B, A] or None
+        dt:                scalar, [B], [B,1], or [B,Q,1]
+        coord:             [B, Q, 2] or None
 
-        fine_res_norm, fine_leak = self.fine_head(fine_feat, base_target_norm)
-        fine_res_target_norm = resize_flow_norm(fine_res_norm, self.target_hw, mode="bicubic")
-        flow_target_norm = base_target_norm + fine_res_target_norm
-        fine_null_loss = self._masked_mean(fine_leak.abs(), mask_t)
+        returns:
+          {
+            "flow_top_px": [B, 2, Ht, Wt],
+            "coord":       [B, Q, 2],
+          }
+        """
+        if spatial_field_map.dim() != 4:
+            raise ValueError(
+                f"spatial_field_map must be [B,C,H,W], got {tuple(spatial_field_map.shape)}"
+            )
+        if h_t.dim() != 4:
+            raise ValueError(f"h_t must be [B,C,H,W], got {tuple(h_t.shape)}")
 
-        flow_back_to_top = resize_flow_norm(flow_target_norm, self.top_hw, mode="bicubic")
-        cross_scale_cycle_loss = self._masked_mean((flow_back_to_top - flow_top_norm).abs(), mask_t) + self._masked_mean((flow_target_norm - base_target_norm).abs(), mask_t)
+        B, Cz, Ht, Wt = spatial_field_map.shape
+        if Cz != self.z_channels:
+            raise ValueError(
+                f"spatial_field_map channels {Cz} do not match z_channels={self.z_channels}"
+            )
 
-        flow_top_px = flow_norm_to_px(flow_top_norm, self.top_hw)
-        flow_target_px = flow_norm_to_px(flow_target_norm, self.target_hw)
-        base_target_px = flow_norm_to_px(base_target_norm, self.target_hw)
+        if h_t.shape[-2:] != (Ht, Wt):
+            h_t = F.interpolate(
+                h_t,
+                size=(Ht, Wt),
+                mode="bilinear",
+                align_corners=False,
+            )
 
-        if mask_t is not None:
-            vm = mask_t.view(mask_t.size(0), 1, 1, 1).to(device=flow_top_px.device, dtype=flow_top_px.dtype)
-            flow_top_px = flow_top_px * vm
-            flow_target_px = flow_target_px * vm
-            base_target_px = base_target_px * vm
-            flow_top_norm = flow_top_norm * vm
-            flow_target_norm = flow_target_norm * vm
-            base_target_norm = base_target_norm * vm
-            fine_res_norm = fine_res_norm * vm
-            fine_res_target_norm = fine_res_target_norm * vm
+        if h_t.shape[1] != self.h_channels:
+            raise ValueError(
+                f"h_t channels {h_t.shape[1]} do not match h_channels={self.h_channels}"
+            )
+
+        if coord is None:
+            coord = _batched_coord((Ht, Wt), B, spatial_field_map.device, spatial_field_map.dtype)
+
+        Q = coord.shape[1]
+
+        q_spatial = _sample_at_coord(spatial_field_map, coord, mode="nearest")   # [B,Q,Cz]
+        q_h = _sample_at_coord(h_t, coord, mode="bilinear")                      # [B,Q,Ch]
+
+        dt_in = _expand_time(dt, B, Q, spatial_field_map.device, spatial_field_map.dtype)
+        a_in = _expand_action(action_prev, B, Q, spatial_field_map.device, spatial_field_map.dtype)
+
+        if a_in is None:
+            motion_inp = torch.cat([q_spatial, q_h, coord, dt_in], dim=-1)
+        else:
+            motion_inp = torch.cat([q_spatial, q_h, coord, dt_in, a_in], dim=-1)
+
+        flow = self.flow_imnet(motion_inp.view(B * Q, -1)).view(B, Q, 2)
+        flow = self.flow_scale * flow
+        flow_top_px = flow.permute(0, 2, 1).contiguous().view(B, 2, Ht, Wt)
 
         return {
-            "flow_top_norm": flow_top_norm,
             "flow_top_px": flow_top_px,
-            "flow_target_norm": flow_target_norm,
-            "flow_target_px": flow_target_px,
-            "base_target_norm": base_target_norm,
-            "base_target_px": base_target_px,
-            "fine_res_norm": fine_res_norm,
-            "fine_res_target_norm": fine_res_target_norm,
-            "fine_null_loss": fine_null_loss,
-            "cross_scale_cycle_loss": cross_scale_cycle_loss,
+            "coord": coord,
         }
+
+
+class LatentTransportINR(nn.Module):
+    """
+
+      z_prev_top --SpatialLatentINR--> dense continuous latent field
+      (field, h_t, a_prev, dt) --TemporalMotionINR--> flow_top_px
+      warp(field, flow_top_px) --> z_tilde
+      cond_top = concat(h_t, z_tilde)
+
+    """
+
+    def __init__(
+        self,
+        z_channels: int,
+        h_channels: int,
+        action_dim: int,
+        hidden_features: list[int] = [64, 64, 256],
+        hidden_layers: int = 2,
+        flow_scale: float = 1.0,
+        init_spatial_gate: float = 1e-3,
+        init_flow_gate: float = 1e-3,
+        init_transport_gate: float = 1e-3,
+    ):
+        super().__init__()
+        self.z_channels = int(z_channels)
+        self.h_channels = int(h_channels)
+        self.action_dim = int(action_dim)
+
+        self.spatial_inr = SpatialLatentINR(
+            z_channels=z_channels,
+            hidden_features=hidden_features,
+            hidden_layers=hidden_layers,
+            out_channels=z_channels,
+        )
+
+        self.temporal_inr = TemporalMotionINR(
+            z_channels=z_channels,
+            h_channels=h_channels,
+            action_dim=action_dim,
+            hidden_features=hidden_features,
+            hidden_layers=hidden_layers,
+            flow_scale=flow_scale,
+        )
+        self.spatial_gate_logit = nn.Parameter(self._inv_sigmoid(init_spatial_gate))
+        self.flow_gate_logit = nn.Parameter(self._inv_sigmoid(init_flow_gate))
+        self.transport_gate_logit = nn.Parameter(self._inv_sigmoid(init_transport_gate))
+
+
+    @staticmethod
+    def _inv_sigmoid(p: float, eps: float = torch.finfo(torch.float32).eps) -> torch.Tensor:
+        """
+        Convert a probability-like value in (0,1) into a logit parameter.
+        Using logits lets us keep gates in (0,1) with sigmoid while initializing
+        them to tiny but nonzero values.
+        """
+        
+        p = float(min(max(p, eps), 1.0 - eps))
+        return torch.tensor(math.log(p / (1.0 - p)), dtype=torch.float32)
+
+    def forward(
+        self,
+        z_top_prev: torch.Tensor,
+        h_t: torch.Tensor,
+        action_prev: Optional[torch.Tensor],
+        dt=1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        z_top_prev: [B, Cz, Ht, Wt]
+        h_t:        [B, Ch, Ht, Wt]
+        action_prev:[B, A] or None
+        dt:         scalar or batch tensor
+
+        returns:
+          {
+            "spatial_field": [B, Cz, Ht, Wt],
+            "flow_top_px":   [B, 2, Ht, Wt],
+            "z_tilde":       [B, Cz, Ht, Wt],
+            "cond_top":      [B, Ch + Cz, Ht, Wt],
+            "h_decoder_top": [B, Ch, Ht, Wt],
+          }
+        """
+        if z_top_prev.dim() != 4:
+            raise ValueError(f"z_top_prev must be [B,C,H,W], got {tuple(z_top_prev.shape)}")
+        if h_t.dim() != 4:
+            raise ValueError(f"h_t must be [B,C,H,W], got {tuple(h_t.shape)}")
+
+        B, Cz, Ht, Wt = z_top_prev.shape
+        if Cz != self.z_channels:
+            raise ValueError(
+                f"z_top_prev channels {Cz} do not match z_channels={self.z_channels}"
+            )
+
+        assert h_t.shape[-2:] == (Ht, Wt), f"h_t spatial dimensions {h_t.shape[-2:]} do not match expected {(Ht, Wt)}"
+
+        if h_t.shape[1] != self.h_channels:
+            raise ValueError(
+                f"h_t channels {h_t.shape[1]} do not match h_channels={self.h_channels}"
+            )
+
+        # 1) Build dense continuous latent field once, VideoINR-style
+        spatial_field, coord = self.spatial_inr.dense_field(z_top_prev, out_hw=(Ht, Wt))
+        alpha = torch.sigmoid(self.spatial_gate_logit)
+        spatial_field = alpha * spatial_field + z_top_prev  # gated residual to stabilize training at the start
+
+        # 2) Predict continuous motion field on the same grid
+        motion = self.temporal_inr(
+            spatial_field_map=spatial_field,
+            h_t=h_t,
+            action_prev=action_prev,
+            dt=dt,
+            coord=coord,
+        )
+        flow_top_px = motion["flow_top_px"]
+        beta = torch.sigmoid(self.flow_gate_logit)
+        flow_top_px = beta * flow_top_px  # gated scaling to stabilize training at the
+
+        # 3) Warp the dense continuous latent field to get transported latent z_tilde
+        _, z_tilde = warpgrid(
+            tenInput=spatial_field,
+            tenFlow=flow_top_px,
+            device=spatial_field.device,
+        )
+        gamma = torch.sigmoid(self.transport_gate_logit)
+        z_tilde = gamma * z_tilde + (1.0 - gamma) * spatial_field
+        # 4) Top conditioning s
+        cond_top = torch.cat([h_t, z_tilde], dim=1)
+        h_decoder_top = h_t
+
+        return {
+            "spatial_field": spatial_field,
+            "flow_top_px": flow_top_px,
+            "z_tilde": z_tilde,
+            "cond_top": cond_top,
+            "h_decoder_top": h_decoder_top,
+        }   
+
 
 class ConvPatchTokenizer(nn.Module):
     """

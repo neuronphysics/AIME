@@ -263,7 +263,7 @@ def sample_prior_image_latent(
     z_img = mu_img + torch.randn_like(mu_img) * std_img
     return z_img, idx, probs
 
-# Teacher-forced context (SpatioTemporalCore + VDVAE)
+# Teacher-forced context (SpatioTemporalCore + latent transport + VDVAE)
 @torch.no_grad()
 def _get_vdvae_out_at_t(
     model,
@@ -294,7 +294,40 @@ def _get_vdvae_out_at_t(
     B, T, C, H, W = obs.shape
     t_select = int(max(0, min(int(t_select), T - 1)))
 
-    edge_guide_t = None
+    def _zero_prev_action():
+        if getattr(model, "action_dim", 0) > 0:
+            return torch.zeros(B, model.action_dim, device=device, dtype=obs.dtype)
+        return None
+
+    def _pick_t(seq, t):
+        # supports either list[T] of [B,C,H,W] or stacked [B,T,C,H,W]
+        if torch.is_tensor(seq):
+            if seq.dim() == 5:
+                return seq[:, t]
+            if seq.dim() == 4:
+                return seq
+            raise ValueError(f"Unexpected tensor shape for time sequence: {tuple(seq.shape)}")
+        if isinstance(seq, (list, tuple)):
+            return seq[t]
+        raise TypeError(f"Unsupported sequence container: {type(seq)}")
+
+    def _top_h_dim():
+        if hasattr(model.vdvae, "top_h_dim"):
+            return int(model.vdvae.top_h_dim)
+        return int(getattr(model.vdvae.H, "top_h_context_dim"))
+
+    def _split_cond_top(cond_top_t: torch.Tensor):
+        top_h_dim = _top_h_dim()
+        expected = top_h_dim + int(model.zdim)
+        if cond_top_t.shape[1] != expected:
+            raise ValueError(
+                f"cond_top channels should be top_h_dim + zdim = {expected}, "
+                f"got {cond_top_t.shape[1]}"
+            )
+        h_decoder_top_t = cond_top_t[:, :top_h_dim].contiguous()
+        return cond_top_t.contiguous(), h_decoder_top_t
+
+    # Build the exact top conditioning used at timestep t_select
     if t_select > 0:
         prefix_out = model.forward_sequence(
             observations=obs[:, :t_select + 1],
@@ -302,20 +335,34 @@ def _get_vdvae_out_at_t(
             dones=dones[:, :t_select + 1] if dones is not None else None,
         )
 
-        h_context_maps_seq = prefix_out["h_context_maps_seq"]
-        if isinstance(h_context_maps_seq, torch.Tensor):
-            h_context_map_t = h_context_maps_seq[:, t_select].to(device=device, dtype=obs.dtype)
-        else:
-            h_context_map_t = h_context_maps_seq[t_select].to(device=device, dtype=obs.dtype)
+        if "cond_top_seq" not in prefix_out:
+            raise KeyError(
+                "forward_sequence must return cond_top_seq for visualization "
+                "after the latent-transport rewrite."
+            )
 
-        edge_guide_seq = prefix_out.get("edge_guide_seq", None)
-        if edge_guide_seq is not None and t_select < len(edge_guide_seq):
-            saved_edge = edge_guide_seq[t_select]
-            if saved_edge is not None:
-                edge_guide_t = saved_edge.to(device=device, dtype=obs.dtype)
+        cond_top_t = _pick_t(prefix_out["cond_top_seq"], t_select).to(
+            device=device, dtype=obs.dtype
+        )
+        cond_top_t, h_decoder_top_t = _split_cond_top(cond_top_t)
+
     else:
         core_state = model.rnn.init_state(B, device=device, dtype=obs.dtype)
-        h_context_map_t = model.rnn.out_norm(core_state[0])
+        h_t = model.rnn.out_norm(core_state[0])
+
+        z_prev_top = torch.zeros(
+            B, model.zdim, model.top_H, model.top_W,
+            device=device, dtype=obs.dtype
+        )
+
+        tr = model.latent_transport(
+            z_top_prev=z_prev_top,
+            h_t=h_t,
+            action_prev=_zero_prev_action(),
+            dt=1.0,
+        )
+        cond_top_t = tr["cond_top"].to(device=device, dtype=obs.dtype)
+        h_decoder_top_t = tr["h_decoder_top"].to(device=device, dtype=obs.dtype)
 
     x_t = obs[:, t_select]
     x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
@@ -328,13 +375,13 @@ def _get_vdvae_out_at_t(
     vdvae_out = model.vdvae.forward(
         x_t_nhwc,
         x_t_nhwc,
-        h_context=h_context_map_t,
+        cond_top=cond_top_t,
+        h_decoder_top=h_decoder_top_t,
         mask_t=mask_t,
-        edge_guide=edge_guide_t,
         get_latents=True,
     )
 
-    return vdvae_out, x_t, h_context_map_t
+    return vdvae_out, x_t, cond_top_t, h_decoder_top_t
 # Latent extraction (+ exemplars)
 # -----------------------------
 @torch.no_grad()
@@ -362,6 +409,7 @@ def extract_latents_and_assignments(
         prior_pi: [M, K] numpy array, sampling probabilities used for the prior samples
         labels: [M] numpy array or None
         h_contexts: [M, Hctx*Ht*Wt] numpy array (optional, only if store_h_context=True)
+        cond_top: [M, C_top*Ht*Wt] numpy array (optional, only if store_h_context=True)
         exemplar_images: [K, n, C, H, W] float32 (optional)
         exemplar_scores: [K, n] float32 (optional)
         exemplar_counts: [K] int64 (optional)
@@ -381,6 +429,7 @@ def extract_latents_and_assignments(
     prior_pi_all: List[torch.Tensor] = []
     labels_all: List[torch.Tensor] = []
     h_context_all: List[torch.Tensor] = []
+    cond_top_all: List[torch.Tensor] = []
 
     total_points = 0
     K_global: Optional[int] = None
@@ -418,11 +467,11 @@ def extract_latents_and_assignments(
 
         # Teacher-forced temporal forward to the selected timestep.
         if isinstance(batch, dict) and "observations" in batch:
-            vdvae_out, images_tf, hctx_map = _get_vdvae_out_at_t(
+            vdvae_out, images_tf, cond_top_t, h_decoder_top_t = _get_vdvae_out_at_t(
                 model, batch, device, t_select
             )
         else:
-            vdvae_out, images_tf, hctx_map = _get_vdvae_out_at_t(
+            vdvae_out, images_tf, cond_top_t, h_decoder_top_t = _get_vdvae_out_at_t(
                 model, {"observations": images}, device, 0
             )
 
@@ -495,6 +544,7 @@ def extract_latents_and_assignments(
         if store_h_context and hctx_map is not None:
             # Keep the full context map, not a spatial mean.
             h_context_all.append(hctx_map.reshape(B, -1).detach().cpu())
+            cond_top_all.append(cond_top_t.reshape(B, -1).detach().cpu())
 
         total_points += int(B)
 
@@ -544,6 +594,11 @@ def extract_latents_and_assignments(
         out["h_contexts"] = (
             torch.cat(h_context_all, dim=0).numpy()
             if len(h_context_all) > 0
+            else np.zeros((out["latents"].shape[0], 0), dtype=np.float32)
+        )
+        out["cond_top"] = (
+            torch.cat(cond_top_all, dim=0).numpy()
+            if len(cond_top_all) > 0
             else np.zeros((out["latents"].shape[0], 0), dtype=np.float32)
         )
 

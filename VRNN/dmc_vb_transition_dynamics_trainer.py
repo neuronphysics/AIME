@@ -38,7 +38,6 @@ import matplotlib
 from pathlib import Path
 from distutils.util import strtobool
 from VRNN.visualize_latent_clusters import visualize_dpgmm_clustering
-from VRNN.warp import image_warp
 def str2bool(v):
     return bool(strtobool(v))
     
@@ -52,37 +51,6 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 plt.ioff()
 
-def print_vdvae_edge_report(model):
-    H = model.vdvae.H
-    min_res = int(getattr(H, "edge_condition_min_res", 32))
-    print(f"\n[VDVAE edge report] use_edge_conditioning={getattr(H,'use_edge_conditioning',False)} "
-          f"edge_condition_min_res={min_res}\n")
-
-    for i, blk in enumerate(model.vdvae.decoder.dec_blocks):
-        res = int(getattr(blk, "base", -1))
-        is_top = bool(getattr(blk, "is_top", False))
-        edge_on = bool(getattr(blk, "use_edge_conditioning", False))
-        edge_ch = int(getattr(blk, "edge_channels", -1))
-
-        # width at this resolution (DecBlock stores widths dict)
-        width = blk.widths[res] if hasattr(blk, "widths") and res in blk.widths else None
-
-        enc_in  = blk.enc.c1.in_channels
-        prior_in = blk.prior.c1.in_channels
-
-
-        print(f"[{i:02d}] res={res:>3} is_top={is_top} edge={edge_on} edge_ch={edge_ch} enc_in={enc_in} prior_in={prior_in}")
-
-        # Strong sanity checks: NO edges when res < 32
-        if res < min_res:
-            if width is not None and enc_in != 2 * width:
-                print(f"   !!! ERROR: enc_in should be {2*width} (width*2) when edge is OFF")
-            # prior_in may include temporal width if one uses temporal priors at this res
-            # so only check the ">= width" and "not including edges" aspect:
-            if width is not None and prior_in < width:
-                print(f"   !!! ERROR: prior_in looks too small (expected at least width={width})")
-
-    print("")
 
 
 @contextmanager
@@ -1239,166 +1207,6 @@ class DMCVBTrainer:
         ramp = 0.5 * (1.0 - math.cos(math.pi * p))
         return beta_min + (beta_max - beta_min) * ramp
 
-    @torch.no_grad()
-    def tb_log_warp_panel(
-        self,
-        epoch: int,
-        b: int = 0,
-        t: int = 1,
-        tag: str = "warp/teacher_forced_panel",
-        max_flow_frac: float = 0.25,
-    ):
-        """
-        Logs:
-        Main 2x3:
-            [x_prev, x_tgt, x_warp_blend;
-            e_prev, e_tgt, e_warp_blend]
-
-        Extra diag panel (2x4):
-            [x_warp_top1, x_warp_blend, rgb_err, w_top1;
-            flow_mag, gate_entropy, top1_expert, edge_err]
-        """
-        if self.writer is None:
-            return
-
-        self.model.eval()
-
-        # stable batch across epochs
-        if not hasattr(self, "_tb_viz_batch") or self._tb_viz_batch is None:
-            self._tb_viz_batch = next(iter(self.eval_loader))
-
-        batch = self._tb_viz_batch
-        observations = batch["observations"].to(self.device)  # [B,T,C,H,W]
-        actions      = batch["actions"].to(self.device)       # [B,T,A]
-        dones        = batch.get("done", None)
-        if dones is not None:
-            dones = dones.to(self.device)
-
-        B, T, C, H, W = observations.shape
-        b = int(max(0, min(b, B - 1)))
-        t = int(max(1, min(t, T - 1)))   # need t>=1 for prev frame
-
-        # run only prefix up to t so temporal_state is correct AND it's cheaper than full sequence
-        obs_short  = observations[:, :t+1]
-        act_short  = actions[:, :t+1]
-        done_short = dones[:, :t+1] if dones is not None else None
-
-        # ask model to capture the *real* warp ctx_map used in training (from temporal_state["64"])
-        out = self.model.forward_sequence(
-            obs_short,
-            act_short,
-            done_short,
-            capture_flow_ctx=(b, t),
-        )
-
-        # frames
-        x_prev = observations[b, t-1:t]  # [1,C,H,W] in [-1,1]
-        x_tgt  = observations[b, t:t+1]  # [1,C,H,W] in [-1,1]
-
-        # to [0,1] + force float32 for logging robustness
-        x_prev01 = self.model.denormalize_generated_images(x_prev).clamp(0, 1).float()
-        x_tgt01  = self.model.denormalize_generated_images(x_tgt ).clamp(0, 1).float()
-
-        # edges in [0,1] (float32)
-        e_prev = self.model.canny(x_prev01).clamp(0, 1).float()  # [1,1,H,W]
-        e_tgt  = self.model.canny(x_tgt01 ).clamp(0, 1).float()  # [1,1,H,W]
-
-        # ---- flow conditioning: use captured ctx_map (NOT hidden_states) ----
-        ctx = out.get("captured_flow_ctx", None)  # expected [1, flow_ctx_dim, H, W] on CPU
-
-        if ctx is None:
-            # fallback: keep logging robust if capture didn't happen (e.g., warp disabled)
-            flow_ctx_dim = getattr(self.model, "flow_ctx_dim", self.model.flow_ctx_proj[0].out_channels)
-            ctx = torch.zeros((1, flow_ctx_dim, H, W), device=self.device, dtype=torch.float32)
-        else:
-            ctx = ctx.to(device=self.device, dtype=torch.float32)
-
-            # safety: if spatial size differs, resize to match current H,W
-            if (ctx.shape[-2], ctx.shape[-1]) != (H, W):
-                ctx = F.interpolate(ctx, size=(H, W), mode="bilinear", align_corners=False)
-
-        # ---------- GRU flow + warp.py ----------
-        max_flow_full = max(H, W) * float(max_flow_frac)
-
-        def to3(x1):
-            return x1 if x1.shape[1] == 3 else x1.repeat(1, 3, 1, 1)
-
-        # Prefer flows captured from forward_sequence (best: matches GRU state used in training)
-        flow_fw = out.get("captured_flow_fw", None)  # expected CPU [1,2,H,W]
-        flow_bw = out.get("captured_flow_bw", None)  # optional, for cycle diag
-
-        # Fallback if not captured: predict with zero GRU state (viz robustness only)
-        if flow_fw is None:
-            flow_state0 = torch.zeros((1, 128, H, W), device=self.device, dtype=torch.float32)
-            a_t = actions[b:b+1, t - 1]  # predicts between t-1 and t
-            # For forward flow, condition on prev frame
-            flow_fw, _ = self.model._predict_flow_one_step(
-                x01=x_prev01, e=e_prev, ctx=ctx, a_t=a_t,
-                state=flow_state0, first=(t == 1), direction="fw"
-            )
-        else:
-            flow_fw = flow_fw.to(device=self.device, dtype=torch.float32)
-
-        # --- MATCH TRAINING EDGE GUIDE PATH 1:1 ---
-        # forward splat prev -> current using flow_fw (prev->cur)
-        x_prev_to_cur_raw, denom = self.model.forward_splat_bilinear(x_prev01, flow_fw)
-        x_prev_to_cur_raw = x_prev_to_cur_raw.clamp(0, 1)
-
-        valid = (denom > 0.5).to(x_prev_to_cur_raw.dtype)
-        x_prev_to_cur = x_prev_to_cur_raw * valid + x_prev01 * (1.0 - valid)
-        # edges are computed FROM warped RGB 
-        e_prev_to_cur = self.model.canny(x_prev_to_cur.float()).clamp(0, 1).float()
-
-        rgb_err  = (x_prev_to_cur - x_tgt01).abs().mean(dim=1, keepdim=True).clamp(0, 1)
-        edge_err = (e_prev_to_cur - e_tgt).abs().clamp(0, 1)
-
-        flow_mag = torch.sqrt((flow_fw ** 2).sum(dim=1, keepdim=True) + 1e-8)
-        flow_mag = (flow_mag / (max_flow_full + 1e-6)).clamp(0, 1)
-
-        # Optional: cycle-consistency diagnostic if backward flow exists
-        cycle_mag = torch.zeros_like(flow_mag)
-        if flow_bw is not None:
-            flow_bw = flow_bw.to(device=self.device, dtype=torch.float32)
-            # cycle: f_fw + warp(f_bw, f_fw)
-            bw_warped = image_warp(flow_bw, flow_fw)
-            cyc = flow_fw + bw_warped
-            cycle_mag = torch.sqrt((cyc ** 2).sum(dim=1, keepdim=True) + 1e-8)
-            cycle_mag = (cycle_mag / (max_flow_full + 1e-6)).clamp(0, 1)
-
-        # --- flow HSV panel ---
-        flow_fw_rgb = flow_to_hsv_rgb(flow_fw).clamp(0, 1)  # [1,3,H,W]
-        flow_bw_rgb = torch.zeros_like(flow_fw_rgb)
-        if flow_bw is not None:
-            flow_bw_rgb = flow_to_hsv_rgb(flow_bw).clamp(0, 1)
-
-        flow_grid = torchvision.utils.make_grid(
-            torch.cat([flow_fw_rgb, flow_bw_rgb], dim=0),  # [2,3,H,W]
-            nrow=2,
-            padding=2
-        )
-        self.writer.add_image(tag + "_flow_hsv_fw_bw", flow_grid, epoch)
-
-        # --- main 2x3 panel ---
-        main_imgs = torch.cat([
-            x_prev01, x_tgt01, x_prev_to_cur,
-            to3(e_prev), to3(e_tgt), to3(e_prev_to_cur),
-        ], dim=0)
-        main_grid = torchvision.utils.make_grid(main_imgs, nrow=3, padding=2)
-        self.writer.add_image(tag, main_grid, epoch)
-
-        # --- diag 2x4 panel ---
-        diag_imgs = torch.cat([
-            x_prev_to_cur, x_tgt01, to3(rgb_err), to3(flow_mag),
-            to3(e_prev_to_cur), to3(e_tgt), to3(edge_err), to3(cycle_mag),
-        ], dim=0)
-        diag_grid = torchvision.utils.make_grid(diag_imgs, nrow=4, padding=2)
-        self.writer.add_image(tag + "_diag", diag_grid, epoch)
-
-        # Scalars (note: now aligned to forward-splat)
-        self.writer.add_images("warp/flow_hsv", flow_to_hsv_rgb(flow_fw.detach()), epoch)
-        self.writer.add_scalar(tag + "/rgb_l1", (x_prev_to_cur - x_tgt01).abs().mean().item(), epoch)
-        self.writer.add_scalar(tag + "/edge_l1", (e_prev_to_cur - e_tgt).abs().mean().item(), epoch)
-        self.writer.add_scalar(tag + "/cycle_mag_mean", cycle_mag.mean().item(), epoch)
 
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
@@ -1479,7 +1287,6 @@ class DMCVBTrainer:
         """Evaluate model performance"""
         self.model.eval()
         eval_metrics = defaultdict(list)
-        print(f"Examine code to see if I am getting consecutive frames within each sample.")
         
         
         with torch.no_grad():
@@ -1577,7 +1384,6 @@ class DMCVBTrainer:
             horizon=horizon,
             dones=dones[:, :T_ctx + horizon] if dones is not None else None,
             grad=False,
-            decode_mode="sample",
         )
 
         def denorm(x):
@@ -1694,9 +1500,8 @@ class DMCVBTrainer:
                         p.requires_grad_(False)
 
                     recon = outputs["reconstructions"]
-                    
-                    z_seq = torch.cat([outputs['latents'], outputs['hidden_states']], dim=-1)
-
+                     
+                    z_seq = outputs["z_seq_maps"]
                     fake = D(recon, z=z_seq, return_features=True)
                     adv_loss = -fake["final_score"].mean()
 
@@ -1808,7 +1613,6 @@ class DMCVBTrainer:
                 horizon=2,
                 dones=dones[:, :T_ctx + 2],
                 grad=False,
-                decode_mode="sample",
             )
 
             # PSNR per step (reuse compute_psnr which handles [-1,1])
@@ -2014,7 +1818,6 @@ class DMCVBTrainer:
             if epoch % self.config['visualize_every'] == 0:
                 self.visualize_results(epoch)
                 self.visualize_two_step_prediction(epoch, T_ctx=8)
-                self.tb_log_warp_panel(epoch=epoch, b=np.random.randint(0, self.config["batch_size"]), t=5, tag="warp/teacher_forced_panel")
                 
 
             
@@ -2153,7 +1956,7 @@ def main():
         'batch_size': 22,
         'sequence_length': 10,
         'disc_num_heads': 8,
-        'img_disc_layers': 2,
+        'img_disc_layers': 1,
         'frame_stack': 1,
         'img_height': 64,
         'img_width': 64,
@@ -2217,7 +2020,6 @@ def main():
 
     outputs = count_parameters(model, print_details=True)
     list_frozen_params(model)
-    print_vdvae_edge_report(model)
     # Initialize trainer
     trainer = DMCVBTrainer(
         model=model,
