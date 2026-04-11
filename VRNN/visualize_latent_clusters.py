@@ -291,97 +291,114 @@ def _get_vdvae_out_at_t(
         if dones.dim() == 1:
             dones = dones[:, None]
 
-    B, T, C, H, W = obs.shape
+    B, T, _, _, _ = obs.shape
     t_select = int(max(0, min(int(t_select), T - 1)))
+    dtype = obs.dtype
 
-    def _zero_prev_action():
-        if getattr(model, "action_dim", 0) > 0:
-            return torch.zeros(B, model.action_dim, device=device, dtype=obs.dtype)
+    action_dim = int(getattr(model, "action_dim", 0))
+
+    def _zero_action():
+        if action_dim > 0:
+            return torch.zeros(B, action_dim, device=device, dtype=dtype)
         return None
 
-    def _pick_t(seq, t):
-        # supports either list[T] of [B,C,H,W] or stacked [B,T,C,H,W]
-        if torch.is_tensor(seq):
-            if seq.dim() == 5:
-                return seq[:, t]
-            if seq.dim() == 4:
-                return seq
-            raise ValueError(f"Unexpected tensor shape for time sequence: {tuple(seq.shape)}")
-        if isinstance(seq, (list, tuple)):
-            return seq[t]
-        raise TypeError(f"Unsupported sequence container: {type(seq)}")
+    core_state = model.rnn.init_state(B, device=device, dtype=dtype)
+    z_prev_top = torch.zeros(
+        B, model.zdim, model.top_H, model.top_W,
+        device=device, dtype=dtype,
+    )
+    prev_latents = model._init_decoder_prev_latents(B, device, dtype)
 
-    def _top_h_dim():
-        if hasattr(model.vdvae, "top_h_dim"):
-            return int(model.vdvae.top_h_dim)
-        return int(getattr(model.vdvae.H, "top_h_context_dim"))
+    last_vdvae_out = None
+    last_x_t = None
+    last_cond_top_t = None
+    last_h_decoder_top_t = None
 
-    def _split_cond_top(cond_top_t: torch.Tensor):
-        top_h_dim = _top_h_dim()
-        expected = top_h_dim + int(model.zdim)
-        if cond_top_t.shape[1] != expected:
-            raise ValueError(
-                f"cond_top channels should be top_h_dim + zdim = {expected}, "
-                f"got {cond_top_t.shape[1]}"
-            )
-        h_decoder_top_t = cond_top_t[:, :top_h_dim].contiguous()
-        return cond_top_t.contiguous(), h_decoder_top_t
+    for t in range(t_select + 1):
+        x_t = obs[:, t]
 
-    # Build the exact top conditioning used at timestep t_select
-    if t_select > 0:
-        prefix_out = model.forward_sequence(
-            observations=obs[:, :t_select + 1],
-            actions=actions[:, :t_select + 1] if actions is not None else None,
-            dones=dones[:, :t_select + 1] if dones is not None else None,
+        if dones is None or t == 0:
+            mask_t = torch.ones(B, device=device, dtype=torch.float32)
+        else:
+            mask_t = 1.0 - dones[:, t - 1].float()
+
+        keep = mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype)
+
+        h, c, m = core_state
+        h0, c0, m0 = model.rnn.init_state(B, device=device, dtype=dtype)
+        core_state = (
+            h * keep + h0 * (1.0 - keep),
+            c * keep + c0 * (1.0 - keep),
+            m * keep + m0 * (1.0 - keep),
         )
 
-        if "cond_top_seq" not in prefix_out:
-            raise KeyError(
-                "forward_sequence must return cond_top_seq for visualization "
-                "after the latent-transport rewrite."
-            )
+        z_prev_top_masked = z_prev_top * keep
+        prev_latents = [pl * keep if pl is not None else None for pl in prev_latents]
 
-        cond_top_t = _pick_t(prefix_out["cond_top_seq"], t_select).to(
-            device=device, dtype=obs.dtype
-        )
-        cond_top_t, h_decoder_top_t = _split_cond_top(cond_top_t)
-
-    else:
-        core_state = model.rnn.init_state(B, device=device, dtype=obs.dtype)
         h_t = model.rnn.out_norm(core_state[0])
 
-        z_prev_top = torch.zeros(
-            B, model.zdim, model.top_H, model.top_W,
-            device=device, dtype=obs.dtype
-        )
+        if t == 0:
+            a_prev = _zero_action()
+        else:
+            if actions is None:
+                a_prev = _zero_action()
+            else:
+                a_prev = actions[:, t - 1]
+                if a_prev is not None:
+                    a_prev = a_prev.to(device=device, dtype=dtype)
+                    a_prev = a_prev * mask_t.view(B, 1).to(device=device, dtype=dtype)
 
         tr = model.latent_transport(
-            z_top_prev=z_prev_top,
+            z_top_prev=z_prev_top_masked,
             h_t=h_t,
-            action_prev=_zero_prev_action(),
+            action_prev=a_prev,
             dt=1.0,
         )
-        cond_top_t = tr["cond_top"].to(device=device, dtype=obs.dtype)
-        h_decoder_top_t = tr["h_decoder_top"].to(device=device, dtype=obs.dtype)
 
-    x_t = obs[:, t_select]
-    x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
+        cond_top_t = tr["cond_top"].to(device=device, dtype=dtype)
+        h_decoder_top_t = tr["h_decoder_top"].to(device=device, dtype=dtype)
 
-    if dones is None or t_select == 0:
-        mask_t = torch.ones(B, device=device, dtype=torch.float32)
-    else:
-        mask_t = 1.0 - dones[:, t_select - 1].float()
+        x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
+        vdvae_out = model.vdvae.forward(
+            x_t_nhwc,
+            x_t_nhwc,
+            cond_top=cond_top_t,
+            h_decoder_top=h_decoder_top_t,
+            mask_t=mask_t,
+            prev_latents=prev_latents,
+            get_latents=True,
+        )
 
-    vdvae_out = model.vdvae.forward(
-        x_t_nhwc,
-        x_t_nhwc,
-        cond_top=cond_top_t,
-        h_decoder_top=h_decoder_top_t,
-        mask_t=mask_t,
-        get_latents=True,
-    )
+        z_top_map = draw_gaussian_diag_samples(
+            vdvae_out["top_q_mean_map"],
+            vdvae_out["top_q_logvar_map"],
+        )
 
-    return vdvae_out, x_t, cond_top_t, h_decoder_top_t
+        if actions is None:
+            a_cur = _zero_action()
+        else:
+            a_cur = actions[:, t].to(device=device, dtype=dtype)
+
+        _, core_state = model.rnn(
+            z_top_map,
+            a_cur,
+            state=core_state,
+            mask_t=None,
+            extra_maps=None,
+        )
+
+        z_prev_top = z_top_map.detach()
+        prev_latents = [
+            None if idx == 0 else z.detach()
+            for idx, z in enumerate(vdvae_out["current_latents"])
+        ]
+
+        last_vdvae_out = vdvae_out
+        last_x_t = x_t
+        last_cond_top_t = cond_top_t
+        last_h_decoder_top_t = h_decoder_top_t
+
+    return last_vdvae_out, last_x_t, last_cond_top_t, last_h_decoder_top_t
 # Latent extraction (+ exemplars)
 # -----------------------------
 @torch.no_grad()
@@ -540,10 +557,8 @@ def extract_latents_and_assignments(
 
         if labels is not None and torch.is_tensor(labels):
             labels_all.append(labels)
-
-        if store_h_context and hctx_map is not None:
-            # Keep the full context map, not a spatial mean.
-            h_context_all.append(hctx_map.reshape(B, -1).detach().cpu())
+        if store_h_context:
+            h_context_all.append(h_decoder_top_t.reshape(B, -1).detach().cpu())
             cond_top_all.append(cond_top_t.reshape(B, -1).detach().cpu())
 
         total_points += int(B)

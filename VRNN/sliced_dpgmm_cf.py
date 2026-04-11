@@ -48,10 +48,8 @@ class SlicedDPGMMCFReg(nn.Module):
         self.gather_distributed = bool(gather_distributed)
         self.eps = float(eps)
 
-        t = torch.linspace(0.0, t_max, knots, dtype=torch.float32)
-        dt = t_max / (knots - 1)
-        trap = torch.full((knots,), dt, dtype=torch.float32)
-        trap[1:-1] = 2.0 * dt
+        # Match SIGReg style: explicit integration over a symmetric t-grid
+        t = torch.linspace(-t_max, t_max, knots, dtype=torch.float32)
 
         if use_frequency_window:
             window = torch.exp(-0.5 * t.square())
@@ -59,7 +57,7 @@ class SlicedDPGMMCFReg(nn.Module):
             window = torch.ones_like(t)
 
         self.register_buffer("t", t)
-        self.register_buffer("weights", trap * window)
+        self.register_buffer("window", window)
 
     @staticmethod
     def _normalize_pi(pi: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -135,7 +133,7 @@ class SlicedDPGMMCFReg(nn.Module):
 
         t = self.t.to(device=proj.device, dtype=proj.dtype)
         tt = t.view(1, 1, 1, -1)  # [1,1,1,T]
-        weights = self.weights.to(device=proj.device, dtype=proj.dtype).view(1, 1, -1)
+        window = self.window.to(device=proj.device, dtype=proj.dtype).view(1, 1, -1)  # [1,1,T]
 
         A = self._generate_unit_vectors(proj.device, proj.dtype, D)
 
@@ -143,24 +141,30 @@ class SlicedDPGMMCFReg(nn.Module):
         count = 0
 
         for A_chunk in A.split(self.vector_chunk_size, dim=1):
-            # chunk size m
-            x_proj = proj @ A_chunk                                # [B,N,m]
-            mu_proj = torch.einsum("bkd,dm->bkm", means, A_chunk)  # [B,K,m]
+            # x_proj:  [B,N,m]
+            # mu_proj: [B,K,m]
+            # var_proj:[B,K,m]
+            x_proj = proj @ A_chunk
+            mu_proj = torch.einsum("bkd,dm->bkm", means, A_chunk)
             var_proj = torch.einsum("bkd,dm->bkm", vars_, A_chunk.square()).clamp_min(self.eps)
 
-            x_t = x_proj.unsqueeze(-1) * tt                        # [B,N,m,T]
-            emp_real = x_t.cos().mean(dim=1)                       # [B,m,T]
-            emp_imag = x_t.sin().mean(dim=1)                       # [B,m,T]
+            # Empirical CF on projected samples
+            x_t = x_proj.unsqueeze(-1) * tt                  # [B,N,m,T]
+            emp_real = x_t.cos().mean(dim=1)                 # [B,m,T]
+            emp_imag = x_t.sin().mean(dim=1)                 # [B,m,T]
 
+            # Mixture Gaussian CF on projected target
             atten = torch.exp(-0.5 * tt.square() * var_proj.unsqueeze(-1))  # [B,K,m,T]
             phase = tt * mu_proj.unsqueeze(-1)                               # [B,K,m,T]
 
-            piw = pi.unsqueeze(-1).unsqueeze(-1)                  # [B,K,1,1]
-            target_real = (piw * atten * phase.cos()).sum(dim=1) # [B,m,T]
-            target_imag = (piw * atten * phase.sin()).sum(dim=1) # [B,m,T]
+            piw = pi.unsqueeze(-1).unsqueeze(-1)              # [B,K,1,1]
+            target_real = (piw * atten * phase.cos()).sum(dim=1)  # [B,m,T]
+            target_imag = (piw * atten * phase.sin()).sum(dim=1)  # [B,m,T]
 
-            err = (emp_real - target_real).square() + (emp_imag - target_imag).square()
-            statistic = (err * weights).sum(dim=-1) * float(N)   # [B,m]
+            err = (emp_real - target_real).square() + (emp_imag - target_imag).square()  # [B,m,T]
+
+            # SIGReg-style explicit integral
+            statistic = torch.trapz(err * window, t, dim=-1) * float(N)  # [B,m]
 
             total = total + statistic.sum()
             count += statistic.numel()

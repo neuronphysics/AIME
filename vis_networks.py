@@ -445,38 +445,71 @@ class Attention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
-
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        ) if project_out else nn.Identity()
+        self.to_out = (
+            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+            if project_out else nn.Identity()
+        )
 
     def forward(
         self,
         x: torch.Tensor,
         mask: torch.Tensor = None,
         return_attention: bool = False
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    ):
         qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+        q, k, v = map(
+            lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads),
+            qkv
+        )
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
+        q_valid = None
+
         if mask is not None:
-            expanded_mask: torch.Tensor = mask.unsqueeze(dim=1).repeat(1, dots.size(dim=1), 1, 1)
+            if mask.dim() == 2:
+                # mask: [B,S] valid-token mask
+                valid = mask.to(torch.bool)
+                pair_mask = valid[:, :, None] & valid[:, None, :]   # [B,S,S]
+                q_valid = valid
+            elif mask.dim() == 3:
+                # mask: [B,S,S] pairwise valid mask
+                pair_mask = mask.to(torch.bool)
+                q_valid = pair_mask.any(dim=-1)                     # [B,S]
+            else:
+                raise ValueError(f"mask must be [B,S] or [B,S,S], got {tuple(mask.shape)}")
+
+            # avoid all-masked rows causing softmax NaNs
+            row_has_any = pair_mask.any(dim=-1, keepdim=True)      # [B,S,1]
+            safe_pair_mask = torch.where(
+                row_has_any,
+                pair_mask,
+                torch.ones_like(pair_mask)
+            )
+
             max_neg_value = -torch.finfo(dots.dtype).max
-            dots.masked_fill_(~expanded_mask, max_neg_value)
+            dots = dots.masked_fill(~safe_pair_mask[:, None, :, :], max_neg_value)
 
         attn = self.attend(dots)
+
+        if q_valid is not None:
+            q_valid_f = q_valid[:, None, :, None].to(attn.dtype)   # [B,1,S,1]
+            attn = attn * q_valid_f
+            attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
 
-        if return_attention:
-            return self.to_out(out), attn
+        if q_valid is not None:
+            out = out * q_valid.unsqueeze(-1).to(out.dtype)
 
-        return self.to_out(out)
+        out = self.to_out(out)
+
+        if return_attention:
+            return out, attn
+        return out
 
 
 class Transformer(nn.Module):
@@ -1856,7 +1889,7 @@ class ImageDiscriminator(nn.Module):
         # Initial layer
         self.pre_layers.append(
             nn.Sequential(
-                nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw, bias=True),
+                nn.utils.spectral_norm(nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw, bias=True)),
                 nn.LeakyReLU(0.2, inplace=False),
             )
         )
@@ -1872,7 +1905,7 @@ class ImageDiscriminator(nn.Module):
             out_ch = ndf * nf_mult
 
             block = nn.Sequential(
-                nn.Conv2d(ndf * nf_mult_prev, out_ch, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
+                nn.utils.spectral_norm(nn.Conv2d(ndf * nf_mult_prev, out_ch, kernel_size=kw, stride=2, padding=padw, bias=use_bias)),
                 make_norm(out_ch),
                 nn.LeakyReLU(0.2, inplace=False),
             )
@@ -1888,7 +1921,7 @@ class ImageDiscriminator(nn.Module):
         nf_mult = min(2 ** n_layers, 8)
         self.post_layers.append(
             nn.Sequential(
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
+                nn.utils.spectral_norm(nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias)),
                 make_norm(ndf * nf_mult),
                 nn.LeakyReLU(0.2, inplace=False),
             )
@@ -1896,7 +1929,7 @@ class ImageDiscriminator(nn.Module):
 
         # Final patch logits
         self.post_layers.append(
-            nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw, bias=True)
+            nn.utils.spectral_norm(nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw, bias=True))
         )
 
         self.to(device)
@@ -2437,8 +2470,8 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
             for _ in range(st_depth)
         ])
 
-        self.frame_norm = nn.LayerNorm(self.token_dim)
-        self.seq_norm = nn.LayerNorm(self.token_dim)
+        self.frame_norm = nn.LayerNorm(self.token_dim, eps=1e-5)
+        self.seq_norm = nn.LayerNorm(self.token_dim, eps=5e-5)
 
         self.frame_head = spectral_norm(nn.Linear(self.token_dim, 1))
         self.seq_head = spectral_norm(nn.Linear(self.token_dim, 1))
@@ -2569,6 +2602,7 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         self,
         x: torch.Tensor,
         z: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
         return_features: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -2693,25 +2727,38 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         st_tokens = frame_tokens.view(Bf, Tdisc * Ntok, Ctok)
 
         cls = self.cls_token.to(device=st_tokens.device, dtype=st_tokens.dtype)
-        cls = cls.expand(Bf, -1, -1)  # [B,1,C]
+        cls = cls.expand(Bf, -1, -1)
 
-        seq = torch.cat([cls, st_tokens], dim=1)  # [B,1+T*N,C]
+        key_valid = None
+        tok_valid = None
+        if mask is not None:
+            t_valid = mask[:, :Tdisc].to(torch.bool)  # [B,T]
+            tok_valid = t_valid.unsqueeze(-1).expand(-1, -1, Ntok).reshape(Bf, Tdisc * Ntok)
+            key_valid = torch.cat(
+                [torch.ones(Bf, 1, device=st_tokens.device, dtype=torch.bool), tok_valid],
+                dim=1
+            )  # [B,1+T*N]
+
+
+        seq = torch.cat([cls, st_tokens], dim=1)
 
         for blk in self.st_blocks:
-            seq = blk(seq)
+            seq = blk(seq, mask=key_valid)
 
         seq = self.seq_norm(seq)
 
-        cls_out = seq[:, 0]  # [B,C]
-        tok_out = seq[:, 1:].view(Bf, Tdisc, Ntok, Ctok)  # [B,T,N,C]
 
-        # per-timestep score after temporal context
-        timestep_feat = tok_out.mean(dim=2)  # [B,T,C]
+        cls_out = seq[:, 0]
+        tok_out = seq[:, 1:].view(Bf, Tdisc, Ntok, Ctok)
+
+        timestep_feat = tok_out.mean(dim=2)
         timestep_feat = self.frame_norm(timestep_feat)
-        per_timestep = self.frame_head(timestep_feat)  # [B,T,1]
+        per_timestep = self.frame_head(timestep_feat)
+        if mask is not None:
+            t_valid_disc = mask[:, :per_timestep.size(1)].to(torch.bool)
+            per_timestep = per_timestep.masked_fill(~t_valid_disc.unsqueeze(-1), 0.0)
 
-        # single sequence score for joint spatial+temporal coherence
-        final_score = self.seq_head(cls_out).unsqueeze(1)  # [B,1,1]
+        final_score = self.seq_head(cls_out).unsqueeze(1)
 
         out = {
             "final_score": final_score,

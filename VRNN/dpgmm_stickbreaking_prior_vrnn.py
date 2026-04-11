@@ -149,33 +149,33 @@ class KumaraswamyNetwork(nn.Module):
     """
     Neural network to generate Kumaraswamy parameters
     """
-    def __init__(self, hidden_dim: int, num_components: int, device: torch.device):
+    def __init__(self, input_dim: int, hidden_dim: int, num_components: int, device: torch.device):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.K = num_components
         self.device = device
         self.eps = torch.tensor(torch.finfo(torch.float32).eps, device=self.device)
-        kumar_a_fc = nn.Linear(hidden_dim, hidden_dim)
+        kumar_a_fc = nn.Linear(input_dim, hidden_dim)
         nn.init.xavier_uniform_(kumar_a_fc.weight, gain=0.5)
         nn.init.constant_(kumar_a_fc.bias, 0.0)
 
         kumar_a_out = nn.Linear(hidden_dim, self.K - 1)
-        nn.init.normal_(kumar_a_out.weight, 0, 0.01)
+        nn.init.normal_(kumar_a_out.weight, mean=0, std=0.001)
         nn.init.constant_(kumar_a_out.bias, 0.0)
 
-        kumar_b_fc = nn.Linear(hidden_dim, hidden_dim)
+        kumar_b_fc = nn.Linear(input_dim, hidden_dim)
         nn.init.xavier_uniform_(kumar_b_fc.weight, gain=0.5)
         nn.init.constant_(kumar_b_fc.bias, 0.0)
 
         kumar_b_out = nn.Linear(hidden_dim, self.K - 1)
-        nn.init.normal_(kumar_b_out.weight, 0, 0.01)
+        nn.init.normal_(kumar_b_out.weight, mean=0, std=0.001)
         nn.init.constant_(kumar_b_out.bias, 0.0)
 
         # Then apply spectral norm and build sequential
         self.net_a = nn.Sequential(OrderedDict([
             ('kumar_a_fc', nn.utils.spectral_norm(kumar_a_fc)),
             ('kumar_a_ln', nn.LayerNorm(hidden_dim, eps=1e-6)),
-            ('kumar_a_relu', nn.GELU()),
+            ('kumar_a_relu', nn.SiLU()),
             ('kumar_a_out', nn.utils.spectral_norm(kumar_a_out)),
         ]))
 
@@ -183,7 +183,7 @@ class KumaraswamyNetwork(nn.Module):
         self.net_b = nn.Sequential(OrderedDict([
             ('kumar_b_fc', nn.utils.spectral_norm(kumar_b_fc)),
             ('kumar_b_ln', nn.LayerNorm(hidden_dim, eps=1e-6)),
-            ('kumar_b_relu', nn.GELU()),
+            ('kumar_b_relu', nn.SiLU()),
             ('kumar_b_out', nn.utils.spectral_norm(kumar_b_out)),
         ]))
         self.to(device)
@@ -234,7 +234,7 @@ class AdaptiveStickBreaking(nn.Module):
 
         # Neural network for generating stick-breaking proportions
         # Kumaraswamy parameter network
-        self.kumar_net = KumaraswamyNetwork(hidden_dim, max_components, device)
+        self.kumar_net = KumaraswamyNetwork(input_dim=hidden_dim, hidden_dim=hidden_dim, num_components=max_components, device=device)
         self.to(self.device)
 
     @property
@@ -401,7 +401,6 @@ class AdaptiveStickBreaking(nn.Module):
         prior_rate = self.gamma_b
         return self.alpha_posterior.kl_divergence(h, prior_concentration, prior_rate)
 
-
 class ComponentNN(nn.Module):
     def __init__(self, hidden_dim, latent_dim, max_components):
         super().__init__()
@@ -414,15 +413,17 @@ class ComponentNN(nn.Module):
         self.ln2 = nn.LayerNorm(hidden_dim)
 
         self.out = nn.Linear(hidden_dim, 2 * latent_dim * max_components)
+        nn.init.zeros_(self.out.bias)
+        nn.init.normal_(self.out.weight, std=1e-3)
 
     def forward(self, x):
         residual = x                          # [B, hidden_dim]
         h = self.fc1(x)
-        h = F.gelu(h)
         h = self.ln1(h)
+        h = F.silu(h)
         h = self.fc2(h)
-        h = F.gelu(h)
         h = self.ln2(h)
+        h = F.silu(h)
         h = h + residual                      # true residual
         return self.out(h)                    # [B, 2 * latent_dim * K]
 
@@ -796,6 +797,7 @@ class DPGMMPrior(nn.Module):
         logits = (torch.log(pi.clamp_min(eps)) + log_gauss) / max(float(temperature), eps)
         return torch.softmax(logits, dim=-1)
 
+
 @contextmanager
 def apply_emas(*emas):
     for e in emas: e.apply_shadow()
@@ -805,8 +807,7 @@ def apply_emas(*emas):
         for e in reversed(emas): e.restore()
 
 
-##############################
-### Main DPGMMVRNN Class #####
+################### Main DPGMMVRNN Class ###################
 
 class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     """
@@ -841,7 +842,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         rollout_horizon: int = 4,               # rollout length
         lambda_rollout_adv: float = 1.0,       # strength of rollout adversarial losses
         rollout_top_temperature: float = 0.2,   # sampling temperature for top prior
-        rollout_decoder_temperature: float = 0.4,
+        rollout_decoder_temperature: float = 0.2,
         patch_disc_layers: int = 4,
         patch_disc_ndf:int = 32,
         latent_transport_hidden_features: tuple[int, ...] = (128, 128, 256),
@@ -984,30 +985,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         return torch.sum(x * x, dim=1, keepdim=True)
 
 
-    def _masked_cosine_align(
-        self,
-        *,
-        pred_map: torch.Tensor,
-        target_map: torch.Tensor,
-        weight_map: torch.Tensor,
-        detach_target: bool = True,
-    ) -> torch.Tensor:
-        """
-        Masked cosine-alignment loss between a predicted top-latent map and a warped target map.
-        This aligns direction only and avoids the norm inflation problem of raw dot products.
-        """
-        tgt = target_map.detach() if detach_target else target_map
-
-        pred = F.normalize(pred_map, dim=1, eps=self.eps)
-        tgt = F.normalize(tgt, dim=1, eps=self.eps)
-
-        sim = (pred * tgt).sum(dim=1, keepdim=True)  # [B,1,H,W]
-        w = weight_map.detach().to(sim.dtype)
-
-        denom = w.sum().clamp_min(1.0)
-        return -(sim * w).sum() / denom
-
-
     def _maybe_ckpt(self, fn, *args):
         if (
             self.use_ctx_checkpoint
@@ -1099,6 +1076,34 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             flow_scale=float(self.latent_transport_flow_scale),
         ).to(self.device)
 
+    def _init_decoder_prev_latents(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        """
+        Per decoder block index.
+        Top block gets None because it does not use latent_prev.
+        Non-top blocks get zero tensors [B, zdim, res, res].
+        """
+        prev_latents = []
+        for idx, block in enumerate(self.vdvae.decoder.dec_blocks):
+            if idx == 0:
+                prev_latents.append(None)
+            else:
+                prev_latents.append(
+                    torch.zeros(
+                        batch_size,
+                        block.zdim,
+                        block.base,
+                        block.base,
+                        device=device,
+                        dtype=dtype,
+                    )
+                )
+        return prev_latents
+
 
     def _init_discriminators(self, img_disc_layers:int, patch_size: int, num_heads: int = 4):
         # Initialize discriminators
@@ -1118,7 +1123,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 n_layers=int(self.patch_disc_layers),
                 norm_type= "group",
                 gn_groups= 32,
-                use_checkpoint=self.use_ctx_checkpoint,
+                use_checkpoint=False,
                 checkpoint_use_reentrant=False,
                 device=self.device,
             )
@@ -1217,14 +1222,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         base_lr = float(learning_rate)
 
         lr_core  = base_lr * 1.0
-        lr_prior = base_lr * 1.2
-        lr_inr   = base_lr * 5.0
+        lr_prior = base_lr * 1.0
+        lr_inr   = base_lr * 2.0
         lr_gamma = base_lr * 5e-5   # small but not frozen
         lr_state = base_lr * 1.0
 
         wd_core  = float(weight_decay)
         wd_prior = float(weight_decay)
-        wd_inr   = float(weight_decay) * 0.5
+        wd_inr   = float(weight_decay) * 0.1
 
         # -------------------------
         # Special params first
@@ -1297,13 +1302,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if hasattr(self, "image_discriminator") and self.image_discriminator is not None:
             disc_param_groups.append({
                 "params": [p for p in self.image_discriminator.parameters() if p.requires_grad],
-                "lr": base_lr * 0.2,
+                "lr": base_lr * 0.5,
             })
 
         if hasattr(self, "patch_discriminator") and self.patch_discriminator is not None:
             disc_param_groups.append({
                 "params": [p for p in self.patch_discriminator.parameters() if p.requires_grad],
-                "lr": base_lr * 0.8,
+                "lr": base_lr * 0.07,
             })
 
         # flatten away any empty groups
@@ -1418,6 +1423,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         core_state = self.rnn.init_state(batch_size, device=device, dtype=dtype)
 
         z_prev_top = torch.zeros(B, self.zdim, self.top_H, self.top_W, device=device, dtype=dtype)
+        prev_latents = self._init_decoder_prev_latents(B, device, dtype)
 
         # Prepare output containers
         outputs = {
@@ -1477,6 +1483,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 m * keep + m0 * (1.0 - keep),
             )
             z_prev_top_masked = z_prev_top * keep
+            prev_latents = [pl * keep if pl is not None else None for pl in prev_latents]
             h_t = self.rnn.out_norm(core_state[0])  # [B, hidden_dim, topH, topW]
             tr = self.latent_transport(
                 z_top_prev=z_prev_top_masked,
@@ -1493,6 +1500,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 cond_top=tr["cond_top"],
                 h_decoder_top=tr["h_decoder_top"],  
                 mask_t=mask_t,
+                prev_latents=prev_latents,
                 get_latents=True,
             )
 
@@ -1545,14 +1553,15 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             )
 
             z_prev_top = z_top_map.detach()
+            prev_latents = [None if idx == 0 else pl.detach() for idx, pl in enumerate(vdvae_out["current_latents"])]
 
             # Store recurrent states and latent statistics for this timestep
             outputs["core_h_maps"].append(core_state[0].detach())
             outputs["core_c_maps"].append(core_state[1].detach())
             outputs["core_m_maps"].append(core_state[2].detach())
-            outputs["prior_pi"].append(pi_img)
-            outputs["top_q_mean_map"].append(vdvae_out["top_q_mean_map"])
-            outputs["top_q_logvar_map"].append(vdvae_out["top_q_logvar_map"])
+            outputs["prior_pi"].append(pi_img.detach())
+            outputs["top_q_mean_map"].append(vdvae_out["top_q_mean_map"].detach())
+            outputs["top_q_logvar_map"].append(vdvae_out["top_q_logvar_map"].detach())
             outputs["z_tilde_seq"].append(tr["z_tilde"].detach())
             outputs["flow_top_seq"].append(tr["flow_top_px"].detach())
             outputs["cond_top_seq"].append(tr["cond_top"].detach())
@@ -1811,7 +1820,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         hierarchical_kl = _mean_seq("kumaraswamy_kl_losses")
         component_margin = _mean_seq("component_margin")
 
-
         total_vae_loss = (
             lambda_recon * recon_loss
             + beta * (kl_z + hierarchical_kl)
@@ -1856,33 +1864,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         return vae_losses, outputs
 
-    def compute_gradient_penalty(self, discriminator, real_x, fake_x, z, device: torch.device, sequence_lengths: Optional[torch.Tensor] = None):
-        """
-        WGAN-GP with conditioning. Interpolates both x and z (optional).
-        Shapes:
-        real_x, fake_x: [B, T, C, H, W]
-        z: [B, T, Z] (or [B, Z], broadcast inside the disc)
-        """
-        B = real_x.size(0)
-        alpha = torch.rand(B, 1, 1, 1, 1, device=device)
-
-        x_hat = (alpha * real_x + (1 - alpha) * fake_x).requires_grad_(True)  # [B, T, C, H, W]
-        # Interpolate z as well (keeps conditioning aligned).
-        z_hat = None if z is None else z.detach()
-
-        d_hat = discriminator(x_hat, z=z_hat)["final_score"]  # [B, 1]
-
-        grads = torch.autograd.grad(
-            outputs=d_hat,
-            inputs=x_hat,
-            grad_outputs=torch.ones_like(d_hat, device=device),
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-        grads = grads.contiguous().view(B, -1)
-        gp = ((grads.norm(2, dim=1) - 1.0) ** 2).mean()
-        return gp
 
     def compute_gradient_penalty_patch(self, D2d, real_x, fake_x, device, mask_flat=None):
         N = real_x.size(0)
@@ -1922,7 +1903,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         fake_images: torch.Tensor, #[B, T, C, H, W]
         latents: torch.Tensor,  #[B, T, Cz, Ht, Wt] 
         sequence_lengths: Optional[torch.Tensor] = None,
-        WGAN_GP_Coeff: float = 10.0,
+        WGAN_GP_Coeff: float = 5.0,
         lambda_consistency: float = 0.4,
         lambda_temporal_lecam: float = 0.1,
         lambda_patch_lecam: float = 0.1,
@@ -1941,24 +1922,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         disc_losses: Dict[str, torch.Tensor] = {}
 
         # Temporal Image Discriminator
-        real_img_outputs = self.image_discriminator(real_images, z=latents.detach())
-        fake_img_outputs = self.image_discriminator(fake_images.detach(), z=latents.detach())
+        real_img_outputs = self.image_discriminator(real_images, z=latents.detach(), mask=temporal_mask)
+        fake_img_outputs = self.image_discriminator(fake_images.clamp(-1.0, 1.0).detach(), z=latents.detach(), mask=temporal_mask)
 
-        # Extract final scores
-        real_img_score = real_img_outputs['final_score']
-        fake_img_score = fake_img_outputs['final_score']
-        # WGAN: maximize real - fake => minimize fake - real
-        temporal_disc_loss = fake_img_score.mean() - real_img_score.mean()
-
-        # Gradient penalty requires computing second-order gradients
-        img_gp = self.compute_gradient_penalty(
-            self.image_discriminator,
-            real_images,
-            fake_images,
-            latents.detach(),
-            device=real_images.device,
-            sequence_lengths=sequence_lengths,
-        )
+        #Hinge Discriminator Loss
+        temporal_disc_loss = (F.relu(1.0 - real_img_outputs['final_score']) + F.relu(1.0 + fake_img_outputs['final_score'])).mean()
 
         # Temporal consistency losses
         img_consistency_loss = torch.zeros((), device=self.device)
@@ -1966,12 +1934,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if fake_per_t.size(1) > 1:
             pair_mask = None
             if temporal_mask is not None:
-                pair_mask = (temporal_mask[:, 1:] & temporal_mask[:, :-1]).float()
+                tmask = temporal_mask[:, :fake_per_t.size(1)]
+                pair_mask = (tmask[:, 1:] & tmask[:, :-1]).float()
             diffs = (fake_per_t[:, 1:] - fake_per_t[:, :-1]).abs()
             img_consistency_loss = self._masked_mean(diffs, pair_mask)
 
         real_frames = real_images.reshape(B * T, C, H, W).contiguous()
-        fake_frames = fake_images.reshape(B * T, C, H, W).contiguous()
+        fake_frames = fake_images.detach().reshape(B * T, C, H, W).contiguous()
 
         real_logits = self.patch_discriminator(real_frames)                 # [B*T,1,h,w]
         fake_logits = self.patch_discriminator(fake_frames)                 # [B*T,1,h,w]
@@ -1989,8 +1958,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
 
         # --- LeCam inputs ---
-        real_temporal_for_lc = real_img_score.reshape(-1)   # one score per sequence
-        fake_temporal_for_lc = fake_img_score.reshape(-1)
+        real_temporal_for_lc = real_img_outputs["final_score"].reshape(-1)   # one score per sequence
+        fake_temporal_for_lc = fake_img_outputs["final_score"].reshape(-1)
 
         if mask_flat is not None:
             valid = mask_flat > 0.5
@@ -2033,7 +2002,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             temporal_lecam_loss = real_temporal_for_lc.new_zeros(())
             patch_lecam_loss = real_frame_score.new_zeros(())
 
-        img_disc_loss = temporal_disc_loss + lambda_consistency * img_consistency_loss + WGAN_GP_Coeff *img_gp + patch_disc_loss + WGAN_GP_Coeff * patch_gp + lambda_temporal_lecam * temporal_lecam_loss + lambda_patch_lecam * patch_lecam_loss
+        img_disc_loss = temporal_disc_loss + lambda_consistency * img_consistency_loss + patch_disc_loss + WGAN_GP_Coeff * patch_gp + lambda_temporal_lecam * temporal_lecam_loss + lambda_patch_lecam * patch_lecam_loss
 
         if hasattr(self, 'img_disc_optimizer'):
             # Update image discriminator
@@ -2055,9 +2024,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             'img_disc_loss': img_disc_loss,
             # Temporal discriminator metrics
             'temporal_disc_loss': temporal_disc_loss.detach(),
-            'temporal_gp': img_gp.detach(),
-            'temporal_disc_real': real_img_score.mean().detach(),
-            'temporal_disc_fake': fake_img_score.mean().detach(),
+            'temporal_disc_real': real_img_outputs["final_score"].mean().detach(),
+            'temporal_disc_fake': fake_img_outputs["final_score"].mean().detach(),
             'temporal_consistency_loss': img_consistency_loss.detach(),  # Renamed
             # PatchGAN metrics
             'patch_disc_loss': patch_disc_loss.detach(),  # New key
@@ -2088,59 +2056,68 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
     def compute_adversarial_losses(
         self,
-        x: torch.Tensor, #[B, T, C, H, W  ]
-        reconstruction: torch.Tensor, #[B, T, C, H, W]
-        z_seq: torch.Tensor, #[B, T, Cz, Ht, Wt]
+        x: torch.Tensor,
+        reconstruction: torch.Tensor,
+        z_seq: torch.Tensor,
         sequence_lengths: Optional[torch.Tensor] = None,
+        lambda_final: float = 0.8,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Compute adversarial losses for both image and latent space
-        """
         D = self.image_discriminator
         Dpatch = self.patch_discriminator
         B, T, C, H, W = reconstruction.shape
 
         temporal_mask = self._make_temporal_mask(B, T, reconstruction.device, sequence_lengths)
         mask_flat = None
-        if sequence_lengths is not None:
-            mask_flat = temporal_mask.reshape(B * T).float()      # [B*T]
+        if temporal_mask is not None:
+            mask_flat = temporal_mask.reshape(B * T).float()
 
-        flags = [p.requires_grad for p in D.parameters()] #freeze Discriminator parameters
+        flags = [p.requires_grad for p in D.parameters()]
         for p in D.parameters():
             p.requires_grad_(False)
-        fake_img_outputs = D(reconstruction, z=z_seq,return_features=True)
 
-        real_img_outputs = D(x,             z=z_seq.detach(), return_features= True)
-
-        temporal_scores = fake_img_outputs["per_timestep_score"].squeeze(-1)
-        mask_tdisc = None if temporal_mask is None else temporal_mask[:, :temporal_scores.size(1)]
-        temporal_adv_loss = -self._masked_mean(temporal_scores, mask_tdisc)
-        # Feature Matching Loss:L1 loss between feature statistics
-        feature_match_loss = self.compute_feature_matching_loss(
-            real_features=real_img_outputs["frame_features"],  # [B,T,N,D]
-            fake_features=fake_img_outputs["frame_features"],  # [B,T,N,D]
-            temporal_mask=mask_tdisc if mask_tdisc is not None else None,  # [B,T]
+        fake_img_outputs = D(
+            reconstruction.clamp(-1.0, 1.0),
+            z=z_seq,
+            mask=temporal_mask,
+            return_features=True
         )
-        # Restore Discriminator parameter gradients
+        real_img_outputs = D(
+            x,
+            z=z_seq.detach(),
+            mask=temporal_mask,
+            return_features=True
+        )
+
+        final_scores = fake_img_outputs["final_score"].squeeze(-1).squeeze(-1)
+        final_adv_loss = -final_scores.mean()
+        temporal_adv_loss = lambda_final * final_adv_loss
+
+        mask_tdisc = None
+        if temporal_mask is not None:
+            mask_tdisc = temporal_mask[:, :fake_img_outputs["frame_features"].shape[1]]
+
+        feature_match_loss = self.compute_feature_matching_loss(
+            real_features=real_img_outputs["frame_features"],
+            fake_features=fake_img_outputs["frame_features"],
+            temporal_mask=mask_tdisc,
+        )
+
         for p, f in zip(D.parameters(), flags):
             p.requires_grad_(f)
-        # ---- PatchGAN discriminator (frames) ----
-        
+
         patch_flags = [p.requires_grad for p in Dpatch.parameters()]
         for p in Dpatch.parameters():
             p.requires_grad_(False)
 
         fake_frames = reconstruction.reshape(B * T, C, H, W).contiguous()
-        patch_logits = Dpatch(fake_frames)                 # [B*T,1,h,w]
-        patch_scores = patch_logits.mean(dim=(1,2,3))       # [B*T]
+        patch_logits = Dpatch(fake_frames)
+        patch_scores = patch_logits.mean(dim=(1, 2, 3))
         img_adv_loss = -self._masked_mean(patch_scores, mask_flat)
-
 
         for p, f in zip(Dpatch.parameters(), patch_flags):
             p.requires_grad_(f)
 
-        return img_adv_loss , temporal_adv_loss, feature_match_loss
-
+        return img_adv_loss, temporal_adv_loss, feature_match_loss
 
     def denormalize_generated_images(self, images):
         """
@@ -2340,11 +2317,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
                 "img_adv_loss": (warmup_factor * img_adv_loss).reshape([]),
                 "temporal_adv_loss": (warmup_factor * temporal_adv_loss).reshape([]),
-                "feat_match_loss": feat_match_loss.reshape([]),
+                "feat_match_loss": (warmup_factor * feat_match_loss).reshape([]),
 
-                "rollout_img_adv_loss": (self.lambda_rollout_adv * warmup_factor * rollout_img_adv_loss).reshape([]),
-                "rollout_temporal_adv_loss": (self.lambda_rollout_adv * warmup_factor * rollout_temporal_adv_loss).reshape([]),
-                "rollout_feat_match_loss": (self.lambda_rollout_adv * rollout_feat_match_loss).reshape([]),
+                "rollout_img_adv_loss": (warmup_factor * rollout_img_adv_loss).reshape([]),
+                "rollout_temporal_adv_loss": ( warmup_factor * rollout_temporal_adv_loss).reshape([]),
+                "rollout_feat_match_loss": ( warmup_factor * rollout_feat_match_loss).reshape([]),
+                
 
                 "overshoot_kl": vae_losses["overshoot_kl"].reshape([]),
             }
@@ -2439,11 +2417,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         if hasattr(self, "ema_vdvae"):
             self.ema_vdvae.apply_shadow()
+        prev_latents = self._init_decoder_prev_latents(num_samples, device, dtype)
 
-        x_np = self.vdvae.sample(
+        x_np, current_latents = self.vdvae.sample(
             num_samples,
             cond_top=tr["cond_top"],
             h_decoder_top=tr["h_decoder_top"],
+            prev_latents=prev_latents,
         )
 
         if hasattr(self, "ema_vdvae"):
@@ -2502,9 +2482,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             return (1.0 - dones[:, t_abs - 1].float()).to(torch.float32)
 
         core_state = self.rnn.init_state(B, device=device, dtype=dtype)
-        z_prev_top = torch.zeros(
-            B, self.zdim, self.top_H, self.top_W, device=device, dtype=dtype
-        )
+        z_prev_top = torch.zeros(B, self.zdim, self.top_H, self.top_W, device=device, dtype=dtype)
+        prev_latents = self._init_decoder_prev_latents(B, device, dtype)
 
         pred_imgs: List[torch.Tensor] = []
         z_seq: List[torch.Tensor] = []
@@ -2528,13 +2507,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 )
 
                 z_prev_top_masked = z_prev_top * keep
+                prev_latents = [pl * keep if pl is not None else None for pl in prev_latents]
                 h_t = self.rnn.out_norm(core_state[0])
 
                 tr = self.latent_transport(
                     z_top_prev=z_prev_top_masked,
                     h_t=h_t,
                     action_prev=(
-                        actions[:, t - 1]
+                        actions[:, t - 1] * mask_t.view(B, 1).to(device=device, dtype=dtype)
                         if t > 0
                         else torch.zeros(B, self.action_dim, device=device, dtype=dtype)
                     ),
@@ -2548,6 +2528,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     cond_top=tr["cond_top"],
                     h_decoder_top=tr["h_decoder_top"],
                     mask_t=mask_t,
+                    prev_latents=prev_latents,
                     get_latents=True,
                 )
 
@@ -2566,6 +2547,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 )
 
                 z_prev_top = z_top_map.detach()
+                prev_latents = [None if idx == 0 else pl.detach() for idx, pl in enumerate(vdvae_out["current_latents"])]
 
             # -------------------------
             # future rollout from prior
@@ -2584,10 +2566,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 )
 
                 z_prev_top_masked = z_prev_top * keep
+                prev_latents = [pl * keep if pl is not None else None for pl in prev_latents]
                 h_t = self.rnn.out_norm(core_state[0])
 
                 a_prev = (
-                    actions[:, t_abs - 1]
+                    actions[:, t_abs - 1] * mask_t.view(B, 1).to(device=device, dtype=dtype)
                     if t_abs > 0
                     else torch.zeros(B, self.action_dim, device=device, dtype=dtype)
                 )
@@ -2611,10 +2594,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
                 z_top_map = z_img.view(B, self.zdim, self.top_H, self.top_W).contiguous()
 
-                px_z = self.vdvae.decode_from_top_latent(
+                px_z, current_latents = self.vdvae.decode_from_top_latent(
                     z_top_map,
                     cond_top=tr["cond_top"],
                     h_decoder_top=tr["h_decoder_top"],
+                    prev_latents=prev_latents,
                 )
 
                 dmol_out = self.vdvae.decoder.out_net.forward(px_z)
@@ -2647,6 +2631,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 # preserve spatial structure for discriminator / analysis
                 z_seq.append(torch.cat([z_top_map, h_next], dim=1).detach())
                 z_prev_top = z_top_map.detach()
+                prev_latents = [None if idx == 0 else pl.detach() for idx, pl in enumerate(current_latents)]
 
         vae_future = (
             torch.stack(pred_imgs, dim=1)

@@ -199,6 +199,32 @@ class Encoder(HModule):
             activations[res] = x
         return activations
 
+class Upsample(nn.Module):
+    def __init__(self, zdim: int, src_res: int, dst_res: int):
+        super().__init__()
+        if src_res == dst_res:
+            self.net = nn.Identity()
+        else:
+            ratio = dst_res // src_res
+            layers = []
+            cur = src_res
+            while cur < dst_res:
+                step = min(2, dst_res // cur)
+                if step == 2:
+                    layers += [
+                        nn.Conv2d(zdim, 4 * zdim, kernel_size=1),
+                        nn.GELU(),
+                        nn.PixelShuffle(2),
+                        nn.Conv2d(zdim, zdim, kernel_size=3, padding=1),
+                        nn.GELU(),
+                    ]
+                    cur *= 2
+                else:
+                    raise ValueError(f"Unsupported ratio path {src_res}->{dst_res}")
+            self.net = nn.Sequential(*layers)
+
+    def forward(self, z):
+        return self.net(z)
 
 class DecBlock(nn.Module):
     def __init__(self, H, res, mixin, n_blocks, is_top=False):
@@ -251,14 +277,16 @@ class DecBlock(nn.Module):
                 residual=False,
                 use_3x3=use_3x3,
             )
+            #P(Z_t^{level} | Z_t^{level above}, Z_{t-1}^{same level}, x_t)
             self.prior = Block(
-                width,
+                width + 2 * H.zdim, #prior at each level coditioned on the previous latent at the same level and same time latent at one level above 
                 cond_width,
                 H.zdim * 2 + width,
                 residual=False,
                 use_3x3=use_3x3,
                 zero_last=True,
             )
+
             self.resnet = Block(
                 width,
                 cond_width,
@@ -280,7 +308,7 @@ class DecBlock(nn.Module):
         return fn(*args)
 
 
-    def sample(self, x, acts, cond_top=None):
+    def sample(self, x, acts, cond_top=None, latent_prev=None, up_latent_cur=None):
 
         if self.use_top_h:
             enc_in = torch.cat([x, acts, cond_top], dim=1)
@@ -292,7 +320,8 @@ class DecBlock(nn.Module):
             qm, qv = self._maybe_ckpt(
                 self.enc, torch.cat([x, acts], dim=1)
             ).chunk(2, dim=1)
-            feats = self._maybe_ckpt(self.prior, x)
+            prior_in = torch.cat([latent_prev, up_latent_cur, x], dim=1) 
+            feats = self._maybe_ckpt(self.prior, prior_in)
 
         pm = feats[:, :self.zdim, ...]
         pv = feats[:, self.zdim : 2 * self.zdim, ...]
@@ -308,14 +337,15 @@ class DecBlock(nn.Module):
 
         return z, x, kl, qm, qv
 
-    def sample_uncond(self, x, cond_top =None, t=None, lvs=None):
+    def sample_uncond(self, x, cond_top =None, latent_prev=None, up_latent_cur=None, t=None, lvs=None):
         
 
         if self.use_top_h:
             prior_in = torch.cat([x, cond_top], dim=1)
             feats = self._maybe_ckpt(self.prior, prior_in)
         else:
-            feats = self._maybe_ckpt(self.prior, x)
+            prior_in = torch.cat([latent_prev, up_latent_cur, x], dim=1) 
+            feats = self._maybe_ckpt(self.prior, prior_in)
 
         pm = feats[:, :self.zdim, ...]
         pv = feats[:, self.zdim : 2 * self.zdim, ...]
@@ -364,6 +394,8 @@ class DecBlock(nn.Module):
         activations,
         get_latents=False,
         cond_top=None,
+        latent_prev=None,
+        up_latent_cur=None,
         h_decoder_top=None,
     ):
         x, acts = self.get_inputs(xs, activations)
@@ -374,7 +406,7 @@ class DecBlock(nn.Module):
                 scale_factor=self.base // self.mixin,
             )
 
-        z, x, kl, qm, qv = self.sample(x, acts, cond_top=cond_top)
+        z, x, kl, qm, qv = self.sample(x, acts, cond_top=cond_top, latent_prev=latent_prev, up_latent_cur=up_latent_cur)
         x = self._apply_post_z(x, z, h_decoder_top=h_decoder_top)
         xs[self.base] = x
 
@@ -385,7 +417,7 @@ class DecBlock(nn.Module):
         }
         if get_latents:
             out["z"] = z.detach()
-        return xs, out
+        return xs, out, z
 
     def forward_uncond(
         self,
@@ -393,6 +425,8 @@ class DecBlock(nn.Module):
         t=None,
         lvs=None,
         cond_top=None,
+        latent_prev=None,
+        up_latent_cur=None,
         h_decoder_top=None,
     ):
         try:
@@ -411,10 +445,10 @@ class DecBlock(nn.Module):
                 scale_factor=self.base // self.mixin,
             )
 
-        z, x = self.sample_uncond(x, t=t, lvs=lvs, cond_top=cond_top)
+        z, x = self.sample_uncond(x, t=t, lvs=lvs, cond_top=cond_top,latent_prev=latent_prev, up_latent_cur=up_latent_cur)
         x = self._apply_post_z(x, z, h_decoder_top=h_decoder_top)
         xs[self.base] = x
-        return xs
+        return xs, z
 
 
 class Decoder(HModule):
@@ -426,6 +460,11 @@ class Decoder(HModule):
         blocks = parse_layer_string(H.dec_blocks)
         n_blocks = len(blocks)
 
+        # one-block-above latent routing
+        self.block_up_keys = []
+        self.upsamplers = nn.ModuleDict()
+
+        prev_res = None
         for idx, (res, mixin) in enumerate(blocks):
             dec_blocks.append(
                 DecBlock(
@@ -437,6 +476,17 @@ class Decoder(HModule):
                 )
             )
             resos.add(res)
+
+            if idx == 0:
+                self.block_up_keys.append(None)
+            else:
+                key = f"{prev_res}->{res}"
+                self.block_up_keys.append(key)
+
+                if key not in self.upsamplers:
+                    self.upsamplers[key] = Upsample(H.zdim, prev_res, res)
+
+            prev_res = res
 
         self.resolutions = sorted(resos)
         self.dec_blocks = nn.ModuleList(dec_blocks)
@@ -460,24 +510,38 @@ class Decoder(HModule):
         get_latents=False,
         cond_top=None,
         h_decoder_top=None,
+        prev_latents=None,
     ):
         stats = []
         xs = {a.shape[2]: a for a in self.bias_xs}
+        current_latents = []
 
-        for block in self.dec_blocks:
+        for idx, block in enumerate(self.dec_blocks):
             blk_cond = cond_top if block.is_top else None
             blk_h = h_decoder_top if block.is_top else None
-            xs, block_stats = block(
+
+            latent_prev = prev_latents[idx]
+            if idx ==0:
+                up_latent_cur = None
+            else:
+                z = current_latents[idx-1]
+                up_key = self.block_up_keys[idx]
+                up_latent_cur = self.upsamplers[up_key](z)
+
+            xs, block_stats, z_cur = block(
                 xs,
                 activations,
                 get_latents=get_latents,
                 cond_top=blk_cond,
+                latent_prev=latent_prev,
+                up_latent_cur=up_latent_cur,
                 h_decoder_top=blk_h,
             )
             stats.append(block_stats)
+            current_latents.append(z_cur)
 
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
-        return xs[self.H.image_size], stats
+        return xs[self.H.image_size], stats, current_latents
 
     def forward_uncond(
         self,
@@ -486,10 +550,13 @@ class Decoder(HModule):
         y=None,
         cond_top=None,
         h_decoder_top=None,
+        prev_latents=None,
     ):
         xs = {}
         for bias in self.bias_xs:
             xs[bias.shape[2]] = bias.repeat(n, 1, 1, 1)
+
+        current_latents = []
 
         for idx, block in enumerate(self.dec_blocks):
             try:
@@ -499,15 +566,26 @@ class Decoder(HModule):
             
             blk_cond = cond_top if block.is_top else None
             blk_h = h_decoder_top if block.is_top else None
-            xs = block.forward_uncond(
+            latent_prev = prev_latents[idx] 
+
+            if idx == 0:
+                up_latent_cur = None
+            else:
+                z = current_latents[idx-1]
+                up_key = self.block_up_keys[idx]
+                up_latent_cur = self.upsamplers[up_key](z)
+            xs, z_cur = block.forward_uncond(
                 xs,
-                temp,
+                t=temp,
                 cond_top=blk_cond,
+                latent_prev=latent_prev,
+                up_latent_cur=up_latent_cur,
                 h_decoder_top=blk_h,
             )
+            current_latents.append(z_cur)
 
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
-        return xs[self.H.image_size]
+        return xs[self.H.image_size], current_latents
 
     def forward_manual_latents(
         self,
@@ -516,31 +594,45 @@ class Decoder(HModule):
         t=None,
         cond_top=None,
         h_decoder_top=None,
+        prev_latents=None,
     ):
         xs = {}
         for bias in self.bias_xs:
             xs[bias.shape[2]] = bias.repeat(n, 1, 1, 1)
 
-        for block, lvs in itertools.zip_longest(self.dec_blocks, latents):
+        current_latents = []
+        for idx, (block, lvs) in enumerate(itertools.zip_longest(self.dec_blocks, latents)):
             blk_cond = cond_top if block.is_top else None
             blk_h = h_decoder_top if block.is_top else None
-            xs = block.forward_uncond(
+            latent_prev = prev_latents[idx] 
+
+            if idx == 0:
+                up_latent_cur = None
+            else:
+                z = current_latents[idx-1]
+                up_key = self.block_up_keys[idx]
+                up_latent_cur = self.upsamplers[up_key](z)
+            xs, z_cur = block.forward_uncond(
                 xs,
                 t,
                 lvs=lvs,
                 cond_top=blk_cond,
                 h_decoder_top=blk_h,
+                latent_prev=latent_prev,
+                up_latent_cur=up_latent_cur,
             )
+            current_latents.append(z_cur)
 
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
-        return xs[self.H.image_size]
-
+        return xs[self.H.image_size], current_latents
+    
     def forward_from_top_latent(
         self,
         z_top_map,
         t=None,
         cond_top=None,
         h_decoder_top=None,
+        prev_latents=None,
     ):
         n = z_top_map.shape[0]
         latents = [z_top_map] + [None] * (len(self.dec_blocks) - 1)
@@ -550,6 +642,7 @@ class Decoder(HModule):
             t=t,
             cond_top=cond_top,
             h_decoder_top=h_decoder_top,
+            prev_latents=prev_latents,
         )
 
 
@@ -661,16 +754,18 @@ class VDVAE(HModule):
         cond_top=None,
         h_decoder_top=None,
         mask_t=None,
+        prev_latents=None,
         get_latents=False,
     ):
         activations = self.encoder.forward(x)
         cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
 
-        px_z, stats = self.decoder.forward(
+        px_z, stats, current_latents = self.decoder.forward(
             activations,
             get_latents=get_latents,
             cond_top=cond_top,
             h_decoder_top=h_decoder_top,
+            prev_latents=prev_latents,
         )
 
         distortion_per_pixel = self.decoder.out_net.nll(px_z, x_target)
@@ -731,6 +826,7 @@ class VDVAE(HModule):
             "top_q_logvar_map": top_q_logvar_map,
             "prior_params": prior_params,
             "valid_count": valid_count,
+            "current_latents": current_latents,
         }
         if dp_kl_img is not None:
             out["dp_kl"] = reduce(dp_kl_img)
@@ -744,13 +840,18 @@ class VDVAE(HModule):
         cond_top=None,
         h_decoder_top=None,
         t=None,
-    ):
+        prev_latents=None,
+    ):  
+        """
+        return pz and current latents
+        """
         cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
         return self.decoder.forward_from_top_latent(
             z_top_map,
             t=t,
             cond_top=cond_top,
             h_decoder_top=h_decoder_top,
+            prev_latents=prev_latents,
         )
 
     def sample(
@@ -758,6 +859,7 @@ class VDVAE(HModule):
         n_batch,
         cond_top,
         h_decoder_top,
+        prev_latents=None,
     ):
         if self.prior is None:
             raise ValueError("VDVAE.sample requires a DPGMMPrior")
@@ -784,28 +886,31 @@ class VDVAE(HModule):
             )
 
         z_top_map = z_img.view(n_batch, c, res, res).contiguous()
-        px_z = self.decoder.forward_from_top_latent(
+        px_z, current_latents = self.decoder.forward_from_top_latent(
             z_top_map,
             cond_top=cond_top,
             h_decoder_top=h_decoder_top,
+            prev_latents=prev_latents,
         )
-        return self.decoder.out_net.sample(px_z)
+        return self.decoder.out_net.sample(px_z), current_latents
 
     def forward_get_latents(
         self,
         x,
         cond_top=None,
         h_decoder_top=None,
+        prev_latents=None,
     ):
         activations = self.encoder.forward(x)
         cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
-        _, stats = self.decoder.forward(
+        _, stats, current_latents = self.decoder.forward(
             activations,
             get_latents=True,
             cond_top=cond_top,
             h_decoder_top=h_decoder_top,
+            prev_latents=prev_latents,
         )
-        return stats
+        return stats, current_latents
 
     def forward_uncond_samples(
         self,
@@ -813,15 +918,17 @@ class VDVAE(HModule):
         t=None,
         cond_top=None,
         h_decoder_top=None,
+        prev_latents=None,
     ):
         cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
-        px_z = self.decoder.forward_uncond(
+        px_z, current_latents = self.decoder.forward_uncond(
             n_batch,
             t=t,
             cond_top=cond_top,
             h_decoder_top=h_decoder_top,
+            prev_latents=prev_latents,
         )
-        return self.decoder.out_net.sample(px_z)
+        return self.decoder.out_net.sample(px_z), current_latents
 
     def forward_samples_set_latents(
         self,
@@ -830,13 +937,15 @@ class VDVAE(HModule):
         t=None,
         cond_top=None,
         h_decoder_top=None,
+        prev_latents=None,
     ):
         cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
-        px_z = self.decoder.forward_manual_latents(
+        px_z, current_latents = self.decoder.forward_manual_latents(
             n_batch,
             latents,
             t=t,
             cond_top=cond_top,
             h_decoder_top=h_decoder_top,
+            prev_latents=prev_latents,
         )
-        return self.decoder.out_net.sample(px_z)
+        return self.decoder.out_net.sample(px_z), current_latents

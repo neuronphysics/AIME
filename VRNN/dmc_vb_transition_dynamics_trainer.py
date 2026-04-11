@@ -1317,17 +1317,20 @@ class DMCVBTrainer:
                 psnr = self.compute_psnr(observations, recon, dones)
                 eval_metrics['psnr'].append(psnr.item())       
                 
-        if epoch % 10 == 0:
+        if epoch % 30 == 0:
             with torch.no_grad():
-                 num_samples = 16
-                 samples =self.model.sample(num_samples)
-                 if self.use_wandb:
-                     wandb.log({
-                         'eval/samples': wandb.Image(
-                        torchvision.utils.make_grid(self.denormalize_image(samples), nrow=4
-                        )
+                num_samples = 16
+                samples =self.model.sample(num_samples)
+
+                if self.use_wandb:
+                    sample_grid = torchvision.utils.make_grid(
+                        self.denormalize_for_grid(samples).cpu(),
+                        nrow=4,
                     )
-                     })
+                    wandb.log({
+                        'eval/samples': wandb.Image(sample_grid),
+                        'epoch': epoch,
+                    }, step=epoch)
             save_path = str(self.ckpt_dir / f"dpgmm_prior_tsne_epoch_{epoch:04d}.png")
             
             try:
@@ -1335,7 +1338,7 @@ class DMCVBTrainer:
                     model=self.model,
                     dataloader=self.viz_loader,
                     device=self.device,
-                    max_batches=15,       # keep it cheap
+                    max_batches=10,       # keep it cheap
                     max_samples=5000,
                     perplexity=30.0,
                     tsne_dims=3,
@@ -1383,6 +1386,8 @@ class DMCVBTrainer:
             actions=actions[:,:T_ctx + horizon],
             horizon=horizon,
             dones=dones[:, :T_ctx + horizon] if dones is not None else None,
+            top_temperature=0.2,
+            decoder_temperature=0.2,
             grad=False,
         )
 
@@ -1953,7 +1958,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 22,
+        'batch_size': 23,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 1,
