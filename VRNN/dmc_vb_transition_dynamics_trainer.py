@@ -13,7 +13,7 @@ import time, contextlib
 import tensorflow as tf
 import argparse
 import wandb
-
+from torchvision import transforms
 try:
     # completely disable TF GPUs (safest, simplest)
     tf.config.set_visible_devices([], 'GPU')
@@ -52,6 +52,235 @@ import matplotlib.pyplot as plt
 plt.ioff()
 
 
+class FIDScore:
+    def __init__(self, device):
+        self.device = device
+        # Initialize Inception network properly with modern practices
+        self.inception = torchvision.models.inception_v3(
+            weights=torchvision.models.Inception_V3_Weights.IMAGENET1K_V1,
+            transform_input=True
+        ).to(device)
+        # Remove final classification layer and set to features only
+        self.inception.aux_logits = False
+        self.inception.fc = nn.Identity()
+        self.inception.eval()
+
+    def preprocess_images(self, images):
+        """
+        Preprocess images to match Inception-v3 expectations.
+        Args:
+            images: torch.Tensor of shape (N, 3, H, W) with values in [-1, 1]
+        Returns:
+            preprocessed images: torch.Tensor of shape (N, 3, 299, 299)
+        """
+        # Convert from [-1, 1] to [0, 255]
+        images = (images + 1) /2.0  # Scale from [-1, 1] to [0, 1]
+        
+        # Resize to Inception input size
+        images = F.interpolate(images.float(), size=(299, 299))
+        # Apply ImageNet normalization
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        images = normalize(images)
+        
+        return images
+
+    def get_features(self, images):
+        """
+        Extract features using Inception-v3 network.
+        Args:
+            images: torch.Tensor of shape (N, 3, H, W) in range [-1, 1]
+        Returns:
+            features: torch.Tensor of shape (N, 2048)
+        """
+        if not isinstance(images, torch.Tensor):
+            raise ValueError("Input must be a torch tensor")
+            
+        if len(images.shape) != 4:
+            raise ValueError(f"Input must be a 4D tensor (B,C,H,W), got shape {images.shape}")
+
+        with torch.no_grad():
+            # Preprocess images
+            preprocessed_images = self.preprocess_images(images)
+            # Extract features
+            features = self.inception(preprocessed_images.to(self.device))
+            
+        return features
+
+    def calculate_statistics(self, features):
+        """
+        Calculate mean and covariance statistics of features.
+        Args:
+            features: torch.Tensor of shape (N, 2048)
+        Returns:
+            mu: mean features
+            sigma: covariance matrix
+        """
+        features = features.cpu().numpy()
+        mu = np.mean(features, axis=0)
+        
+        # Compute covariance
+        sigma = np.cov(features, rowvar=False)
+        return mu, sigma
+
+    def calculate_frechet_distance(self, mu1, sigma1, mu2, sigma2):
+    
+        """
+        Calculate Frechet distance between two sets of statistics.
+        Args:
+            mu1, mu2: mean features for each distribution
+            sigma1, sigma2: covariance matrices for each distribution
+        Returns:
+            fid: Frechet distance score
+        """
+        # Ensure covariance matrices are positive semi-definite
+        eps = np.finfo(np.float32).eps
+        sigma1 += np.eye(sigma1.shape[0]) * eps
+        sigma2 += np.eye(sigma2.shape[0]) * eps
+
+        # Compute mean difference
+        diff = mu1 - mu2
+        mean_diff_sq = np.sum(diff**2)
+
+        # Compute sqrtm(sigma1 @ sigma2) with improved numerical stability
+        try:
+            covmean, _ = scipy.linalg.sqrtm(sigma1 @ sigma2, disp=False)
+            if np.iscomplexobj(covmean):
+                covmean = covmean.real  # Take only real part if imaginary component is negligible
+        except ValueError:
+            # SVD-based fallback for sqrtm computation
+            U, S, Vt = np.linalg.svd(sigma1 @ sigma2)
+            covmean = U @ np.diag(np.sqrt(S)) @ Vt
+
+        # Compute final FID score
+        trace_covmean = np.trace(covmean)
+        fid_score = mean_diff_sq + np.trace(sigma1) + np.trace(sigma2) - 2 * trace_covmean
+
+        return float(fid_score)
+
+    def calculate_fid(self, real_images, fake_images):
+        """
+        Calculate FID score between real and fake images.
+        Args:
+            real_images: torch.Tensor of shape (N, 3, H, W) in range [-1, 1]
+            fake_images: torch.Tensor of shape (N, 3, H, W) in range [-1, 1]
+        Returns:
+            fid_score: float, the FID score between the two sets of images
+        """
+        try:
+            # Move images to correct device
+            real_images = real_images.to(self.device)
+            fake_images = fake_images.to(self.device)
+            
+            # Extract features
+            real_features = self.get_features(real_images)
+            fake_features = self.get_features(fake_images)
+            
+            # Calculate statistics
+            mu1, sigma1 = self.calculate_statistics(real_features)
+            mu2, sigma2 = self.calculate_statistics(fake_features)
+            
+            # Calculate FID score
+            fid_score = self.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+            
+            return fid_score
+            
+        except Exception as e:
+            print(f"Error calculating FID: {str(e)}")
+            return float('inf')
+        
+def compute_metrics(model, test_loader, device, writer, global_step, max_samples=100):
+    """Compute clustering metrics and image quality metrics."""
+    model.eval()
+
+    # Metric accumulators
+    acc_meter = AverageMeter()
+    fid = FIDScore(device=device)
+    total_loss = 0
+    all_predictions, all_labels = [], []
+    all_real_images, all_fake_images = [], []
+
+    with torch.no_grad():
+        for batch_idx, (data, masks, labels) in enumerate(test_loader):
+            if len(all_real_images) >= max_samples:
+                break  # Limit samples for efficiency
+
+            data = data.to(device)
+            data = (data - 0.5) * 2.0  # Normalize input data
+
+            # Forward pass
+            reconstruction, params = model(data)
+            cluster_probs = params['prior_dist'].mixture_distribution.probs
+
+            # Store predictions & labels
+            all_predictions.append(cluster_probs)
+            all_labels.append(labels.to(device))
+            all_real_images.append(data)
+            all_fake_images.append(reconstruction)
+
+            # Compute loss
+            losses = model.compute_loss(data, reconstruction, params)
+            total_loss += losses['loss'].item()
+
+            # Compute accuracy
+            cluster_assignments = cluster_probs.argmax(1)
+            acc = (cluster_assignments == labels.to(device)).float().mean()
+            acc_meter.update(acc.item(), data.size(0))
+
+    # Convert collected data
+    all_predictions = torch.cat(all_predictions, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+
+    # Compute clustering metrics
+    metrics = {}
+    # Add learning rates
+    metrics['gen_lr'] = model.gen_scheduler.get_last_lr()[0]
+    metrics['img_disc_lr'] = model.img_disc_scheduler.get_last_lr()[0]
+    metrics['latent_disc_lr'] = model.latent_disc_scheduler.get_last_lr()[0]
+
+    cluster_assignments = all_predictions.argmax(1).cpu().numpy()
+    true_labels = all_labels.cpu().numpy()
+    #Normalized Mutual Information
+    metrics['nmi'] = normalized_mutual_info_score(true_labels,
+                                                  cluster_assignments,
+                                                  average_method='arithmetic'  # Can also be 'geometric' or 'min'
+                                                  )
+    #Measures similarity between two clusterings and it is adjusted for chance (can be negative if worse than random)
+    metrics['ari'] = adjusted_rand_score(true_labels, cluster_assignments)
+
+    # Compute cluster purity
+    def compute_purity(predictions, labels):
+        #Simpler metric that measures percentage of samples correctly clustered
+        contingency = contingency_matrix(labels, predictions)
+
+        # For each cluster, find the most common true label
+        # Sum these and divide by total samples
+        return np.sum(np.amax(contingency, axis=0)) / np.sum(contingency)
+
+    metrics['purity'] = compute_purity(cluster_assignments, true_labels)
+
+    # Compute effective number of clusters
+    metrics['effective_clusters'] = model.prior.get_effective_components(all_predictions.mean(0)).item()
+
+    # Compute entropy of cluster assignments
+    cluster_entropy = -(all_predictions * torch.log(all_predictions + 1e-10)).sum(1).mean()
+    metrics['cluster_entropy'] = cluster_entropy.item()
+
+    # Compute FID Score
+    try:
+        real_images = torch.cat(all_real_images, dim=0)[:max_samples]
+        fake_images = torch.cat(all_fake_images, dim=0)[:max_samples]
+        metrics['fid_score'] = fid.calculate_fid(real_images, fake_images)
+    except Exception as e:
+        print(f"Error in FID calculation: {str(e)}")
+        metrics['fid_score'] = float('inf')
+
+    # Log metrics
+    writer.add_scalar('test/accuracy', acc_meter.avg, global_step)
+    for name, value in metrics.items():
+        writer.add_scalar(f'test/{name}', value, global_step)
+    writer.add_scalar('test/loss', total_loss / len(test_loader), global_step)
+
+    return metrics, acc_meter.avg, total_loss / len(test_loader)
 
 @contextmanager
 def disable_all_checkpoint_modules(model: torch.nn.Module):
@@ -1166,6 +1395,8 @@ class DMCVBTrainer:
         # Initialize metrics tracking
         self.metrics_history = defaultdict(list)
         self.best_eval_loss = float('inf')
+        self.best_rollout_score = -float('inf')    # primary metric
+        self.best_epoch = -1
         self.episode_length = self.train_dataset.min_episode_length
         # Setup wandb if configured
         
@@ -1208,7 +1439,6 @@ class DMCVBTrainer:
         return beta_min + (beta_max - beta_min) * ramp
 
 
-
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
         self.model.train()
@@ -1227,16 +1457,27 @@ class DMCVBTrainer:
             observations = batch['observations'].to(self.device)
             actions = batch['actions'].to(self.device)
             dones = batch['done'].to(self.device)
+            episode_idx = batch["episode_idx"].to(device=self.device, dtype=torch.long)
+            start_idx   = batch["start_idx"].to(device=self.device, dtype=torch.long)
+
+            # action-aligned absolute timestep of model step t=0
+            abs_t0 = start_idx + (self.frame_stack - 1)
+
+            # unique per-(episode, absolute time) base id
+            seq_ids = (episode_idx.to(torch.int64) << 32) + abs_t0.to(torch.int64)
+
             # Training step
             losses = self.model.training_step_sequence(
                 observations=observations,
                 actions=actions,
-                dones= dones,
+                dones=dones,
                 beta=beta_t,
                 n_critic=self.config['n_critic'],
                 lambda_img=self.config['lambda_img'],
                 lambda_recon=self.config['lambda_recon'],
                 batch_idx=batch_idx,
+                collect_top_buffer=True,   
+                seq_ids=seq_ids,
             )
             component_grads = self.grad_monitor.compute_component_gradients()
             for component, grad_norm in component_grads.items():
@@ -1280,6 +1521,7 @@ class DMCVBTrainer:
         # Log gradient norms to tensorboard
         for component, grad_norm in avg_component_grads.items():
             self.writer.add_scalar(f'gradients/components/{component}', grad_norm, epoch)
+        avg_metrics['train/top_buffer_size'] = len(self.model.top_replay_buffer)
 
         return avg_metrics
     
@@ -1304,6 +1546,7 @@ class DMCVBTrainer:
                     dones=dones,
                     beta=self.config.get('beta_eval', self.config.get('beta_max', 1.0)),
                     lambda_recon =self.config['lambda_recon'],
+                    collect_top_buffer=False
                 )
                 
                 # Track metrics
@@ -1317,7 +1560,7 @@ class DMCVBTrainer:
                 psnr = self.compute_psnr(observations, recon, dones)
                 eval_metrics['psnr'].append(psnr.item())       
                 
-        if epoch % 30 == 0:
+        if epoch % 20 == 0:
             with torch.no_grad():
                 num_samples = 16
                 samples =self.model.sample(num_samples)
@@ -1343,7 +1586,7 @@ class DMCVBTrainer:
                     perplexity=30.0,
                     tsne_dims=3,
                     save_path=save_path,
-                    t_select=5,            # choose which frame from the sequence
+                    t_select=8,            # choose which frame from the sequence
                 )
                 plt.close(fig)
             except Exception as e:
@@ -1351,17 +1594,36 @@ class DMCVBTrainer:
                 print(f"[eval] Warning: visualize_dpgmm_clustering failed at epoch {epoch}: {type(e).__name__}: {e}")
         # Compute averages
         avg_metrics = {f'eval/{k}': np.mean(v) for k, v in eval_metrics.items()}
-        pred_metrics = self.evaluate_two_step_prediction(epoch, num_batches=5, T_ctx=8) 
+        pred_metrics = self.evaluate_two_step_prediction(epoch, num_batches=5, T_ctx=8)
+
         if self.config.get("use_wandb", False):
             wandb.log({f"{k}": v for k, v in pred_metrics.items()}, step=epoch)
 
-        avg_metrics.update(pred_metrics)     
-        # Save best model
-        eval_loss = avg_metrics.get('eval/total_vae_loss', float('inf'))
-        if eval_loss < self.best_eval_loss:
-            self.best_eval_loss = eval_loss
-            self.save_checkpoint(epoch, is_best=True)
-        
+        avg_metrics.update(pred_metrics)
+
+        # Best-checkpoint selection
+        eval_loss = float(avg_metrics.get('eval/total_vae_loss', float('inf')))
+        psnr_t1 = float(avg_metrics.get("eval/pred_psnr_t+1", 0.0))
+        psnr_t2 = float(avg_metrics.get("eval/pred_psnr_t+2", 0.0))
+
+        w_t1 = float(self.config.get("best_ckpt_w_t1", 0.4))
+        w_t2 = float(self.config.get("best_ckpt_w_t2", 0.6))
+        delta = float(self.config.get("best_ckpt_min_delta", 1e-4))
+
+        rollout_score = w_t1 * psnr_t1 + w_t2 * psnr_t2
+        avg_metrics["eval/rollout_selection_score"] = rollout_score
+
+        if np.isfinite(rollout_score):
+            better_rollout = rollout_score > (self.best_rollout_score + delta)
+            same_rollout = abs(rollout_score - self.best_rollout_score) <= delta
+            better_tiebreak = eval_loss < self.best_eval_loss
+
+            if better_rollout or (same_rollout and better_tiebreak):
+                self.best_rollout_score = rollout_score
+                self.best_eval_loss = eval_loss
+                self.best_epoch = epoch
+                self.save_checkpoint(epoch, is_best=True)
+
         return avg_metrics
 
     @torch.no_grad()
@@ -1488,11 +1750,8 @@ class DMCVBTrainer:
                 )
 
                 # Same ELBO combination 
-                elbo_loss = (
-                    self.config["lambda_recon"] * vae_losses["recon_loss"]
-                    + self.config["beta"] * vae_losses["kl_z"]
-                    + self.config["beta"] * vae_losses["hierarchical_kl"]
-                )
+                elbo_loss = self.config["lambda_recon"] * vae_losses["recon_loss"] + self.config["beta"] * vae_losses["kl_z"]
+                    
 
 
                 # Optional adversarial term – we DO NOT want grads into D's params
@@ -1684,6 +1943,7 @@ class DMCVBTrainer:
                     actions=actions,
                     dones=dones,
                     store_reconstruction_samples=True,
+                    collect_top_buffer=False
                 )
 
                 for i in range(batch_size):
@@ -1793,12 +2053,17 @@ class DMCVBTrainer:
             
             # Train
             train_metrics = self.train_epoch(epoch)
-            
+            prior_metrics = {}
+            if len(self.model.top_replay_buffer) > 0:
+                self.model.refresh_top_prior_from_buffer(batch_size=self.config.get('dpgmm_outer_batch_size', 256), n_laps=self.config.get('dpgmm_outer_n_laps', 4))
+                
+
+            prior_metrics = {"train/top_prior_K": float(self.model.top_prior_model.K)}
             # Evaluate
             eval_metrics = self.evaluate(epoch)
             self.run_grad_diag(max_B=1, max_T=visualize_steps, use_amp=False)            
             # Combine metrics
-            all_metrics = {**train_metrics, **eval_metrics}
+            all_metrics = {**train_metrics, **prior_metrics, **eval_metrics}
             
             # Log metrics
             if self.use_wandb:
@@ -1824,7 +2089,6 @@ class DMCVBTrainer:
                 self.visualize_results(epoch)
                 self.visualize_two_step_prediction(epoch, T_ctx=8)
                 
-
             
             # Save checkpoint
             if epoch % self.config['checkpoint_every'] == 0:

@@ -7,38 +7,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as ckpt
-from vdvae.vae_helpers import HModule,DmolNet, draw_gaussian_diag_samples,gaussian_analytical_kl,get_1x1,get_3x3
+from vdvae.vae_helpers import HModule,DmolNet, draw_gaussian_diag_samples, gaussian_analytical_kl, get_1x1, get_3x3, Block
 from VRNN.perceiver.modules import SelfAttentionBlock
 from VRNN.perceiver.position import FourierPositionEncoding
+from vdvae.top_dpgmm_prior import compute_top_kl_conditional_frozen, sample_top_conditional_frozen, ConditionalTopDPGMM
 
-class Block(nn.Module):
-    def __init__(
-        self,
-        in_width,
-        middle_width,
-        out_width,
-        down_rate=None,
-        residual=False,
-        use_3x3=True,
-        zero_last=False,
-    ):
-        super().__init__()
-        self.down_rate = down_rate
-        self.residual = residual
-        self.c1 = get_1x1(in_width, middle_width)
-        self.c2 = get_3x3(middle_width, middle_width) if use_3x3 else get_1x1(middle_width, middle_width)
-        self.c3 = get_3x3(middle_width, middle_width) if use_3x3 else get_1x1(middle_width, middle_width)
-        self.c4 = get_1x1(middle_width, out_width, zero_weights=zero_last)
 
-    def forward(self, x):
-        xhat = self.c1(F.gelu(x))
-        xhat = self.c2(F.gelu(xhat))
-        xhat = self.c3(F.gelu(xhat))
-        xhat = self.c4(F.gelu(xhat))
-        out = x + xhat if self.residual else xhat
-        if self.down_rate is not None:
-            out = F.avg_pool2d(out, kernel_size=self.down_rate, stride=self.down_rate)
-        return out
 
 
 def parse_layer_string(s):
@@ -247,19 +221,11 @@ class DecBlock(nn.Module):
         if self.use_top_h:
             # Raw-h concatenation only. No h projection.
             self.enc = Block(
-                width * 2 + self.top_h_dim+H.zdim,  # concat h and acts and top_h, plus skip connection from pre-z features
+                width * 2 + self.top_h_dim + H.zdim,  
                 cond_width,
                 H.zdim * 2,
                 residual=False,
                 use_3x3=use_3x3,
-            )
-            self.prior = Block(
-                width + self.top_h_dim + H.zdim,
-                cond_width,
-                H.zdim * 2 + width,
-                residual=False,
-                use_3x3=use_3x3,
-                zero_last=True,
             )
 
             self.resnet = Block(
@@ -314,8 +280,6 @@ class DecBlock(nn.Module):
             enc_in = torch.cat([x, acts, cond_top], dim=1)
             qm, qv = self._maybe_ckpt(self.enc, enc_in).chunk(2, dim=1)
 
-            prior_in = torch.cat([x, cond_top], dim=1)
-            feats = self._maybe_ckpt(self.prior, prior_in)
         else:
             qm, qv = self._maybe_ckpt(
                 self.enc, torch.cat([x, acts], dim=1)
@@ -323,10 +287,10 @@ class DecBlock(nn.Module):
             prior_in = torch.cat([latent_prev, up_latent_cur, x], dim=1) 
             feats = self._maybe_ckpt(self.prior, prior_in)
 
-        pm = feats[:, :self.zdim, ...]
-        pv = feats[:, self.zdim : 2 * self.zdim, ...]
-        xpp = feats[:, 2 * self.zdim :, ...]
-        x = x + xpp
+            pm = feats[:, :self.zdim, ...]
+            pv = feats[:, self.zdim : 2 * self.zdim, ...]
+            xpp = feats[:, 2 * self.zdim :, ...]
+            x = x + xpp
 
         z = draw_gaussian_diag_samples(qm, qv)
 
@@ -337,20 +301,17 @@ class DecBlock(nn.Module):
 
         return z, x, kl, qm, qv
 
-    def sample_uncond(self, x, cond_top =None, latent_prev=None, up_latent_cur=None, t=None, lvs=None):
+    def sample_uncond(self, x, latent_prev=None, up_latent_cur=None, t=None, lvs=None):
         
 
-        if self.use_top_h:
-            prior_in = torch.cat([x, cond_top], dim=1)
-            feats = self._maybe_ckpt(self.prior, prior_in)
-        else:
+        if not self.use_top_h:
             prior_in = torch.cat([latent_prev, up_latent_cur, x], dim=1) 
             feats = self._maybe_ckpt(self.prior, prior_in)
 
-        pm = feats[:, :self.zdim, ...]
-        pv = feats[:, self.zdim : 2 * self.zdim, ...]
-        xpp = feats[:, 2 * self.zdim :, ...]
-        x = x + xpp
+            pm = feats[:, :self.zdim, ...]
+            pv = feats[:, self.zdim : 2 * self.zdim, ...]
+            xpp = feats[:, 2 * self.zdim :, ...]
+            x = x + xpp
 
         if lvs is not None:
             z = lvs
@@ -388,23 +349,11 @@ class DecBlock(nn.Module):
 
         return x
         
-    def forward(
-        self,
-        xs,
-        activations,
-        get_latents=False,
-        cond_top=None,
-        latent_prev=None,
-        up_latent_cur=None,
-        h_decoder_top=None,
-    ):
+    def forward(self, xs, activations, get_latents=False, cond_top=None, latent_prev=None, up_latent_cur=None, h_decoder_top=None):
         x, acts = self.get_inputs(xs, activations)
 
         if self.mixin is not None:
-            x = x + F.interpolate(
-                xs[self.mixin][:, : x.shape[1], ...],
-                scale_factor=self.base // self.mixin,
-            )
+            x = x + F.interpolate(xs[self.mixin][:, : x.shape[1], ...], scale_factor=self.base // self.mixin)
 
         z, x, kl, qm, qv = self.sample(x, acts, cond_top=cond_top, latent_prev=latent_prev, up_latent_cur=up_latent_cur)
         x = self._apply_post_z(x, z, h_decoder_top=h_decoder_top)
@@ -419,33 +368,17 @@ class DecBlock(nn.Module):
             out["z"] = z.detach()
         return xs, out, z
 
-    def forward_uncond(
-        self,
-        xs,
-        t=None,
-        lvs=None,
-        cond_top=None,
-        latent_prev=None,
-        up_latent_cur=None,
-        h_decoder_top=None,
-    ):
+    def forward_uncond(self, xs, t=None, lvs=None, latent_prev=None, up_latent_cur=None, h_decoder_top=None):
         try:
             x = xs[self.base]
         except KeyError:
             ref = xs[list(xs.keys())[0]]
-            x = torch.zeros(
-                dtype=ref.dtype,
-                size=(ref.shape[0], self.widths[self.base], self.base, self.base),
-                device=ref.device,
-            )
+            x = torch.zeros(dtype=ref.dtype, size=(ref.shape[0], self.widths[self.base], self.base, self.base),device=ref.device)
 
         if self.mixin is not None:
-            x = x + F.interpolate(
-                xs[self.mixin][:, : x.shape[1], ...],
-                scale_factor=self.base // self.mixin,
-            )
+            x = x + F.interpolate(xs[self.mixin][:, : x.shape[1], ...], scale_factor=self.base // self.mixin)
 
-        z, x = self.sample_uncond(x, t=t, lvs=lvs, cond_top=cond_top,latent_prev=latent_prev, up_latent_cur=up_latent_cur)
+        z, x = self.sample_uncond(x, t=t, lvs=lvs, latent_prev=latent_prev, up_latent_cur=up_latent_cur)
         x = self._apply_post_z(x, z, h_decoder_top=h_decoder_top)
         xs[self.base] = x
         return xs, z
@@ -547,10 +480,9 @@ class Decoder(HModule):
         self,
         n,
         t=None,
-        y=None,
-        cond_top=None,
         h_decoder_top=None,
         prev_latents=None,
+        z_top=None,
     ):
         xs = {}
         for bias in self.bias_xs:
@@ -564,20 +496,21 @@ class Decoder(HModule):
             except TypeError:
                 temp = t
             
-            blk_cond = cond_top if block.is_top else None
             blk_h = h_decoder_top if block.is_top else None
             latent_prev = prev_latents[idx] 
 
             if idx == 0:
                 up_latent_cur = None
+                lvs = z_top
             else:
                 z = current_latents[idx-1]
                 up_key = self.block_up_keys[idx]
                 up_latent_cur = self.upsamplers[up_key](z)
+                lvs = None
             xs, z_cur = block.forward_uncond(
                 xs,
                 t=temp,
-                cond_top=blk_cond,
+                lvs=lvs,
                 latent_prev=latent_prev,
                 up_latent_cur=up_latent_cur,
                 h_decoder_top=blk_h,
@@ -592,7 +525,6 @@ class Decoder(HModule):
         n,
         latents,
         t=None,
-        cond_top=None,
         h_decoder_top=None,
         prev_latents=None,
     ):
@@ -600,9 +532,12 @@ class Decoder(HModule):
         for bias in self.bias_xs:
             xs[bias.shape[2]] = bias.repeat(n, 1, 1, 1)
 
+        if len(latents) != len(self.dec_blocks):
+            raise ValueError(
+                f"Expected {len(self.dec_blocks)} latents, got {len(latents)}"
+            )
         current_latents = []
         for idx, (block, lvs) in enumerate(itertools.zip_longest(self.dec_blocks, latents)):
-            blk_cond = cond_top if block.is_top else None
             blk_h = h_decoder_top if block.is_top else None
             latent_prev = prev_latents[idx] 
 
@@ -616,7 +551,6 @@ class Decoder(HModule):
                 xs,
                 t,
                 lvs=lvs,
-                cond_top=blk_cond,
                 h_decoder_top=blk_h,
                 latent_prev=latent_prev,
                 up_latent_cur=up_latent_cur,
@@ -630,7 +564,6 @@ class Decoder(HModule):
         self,
         z_top_map,
         t=None,
-        cond_top=None,
         h_decoder_top=None,
         prev_latents=None,
     ):
@@ -640,7 +573,6 @@ class Decoder(HModule):
             n,
             latents,
             t=t,
-            cond_top=cond_top,
             h_decoder_top=h_decoder_top,
             prev_latents=prev_latents,
         )
@@ -654,7 +586,9 @@ class VDVAE(HModule):
         top_kl_weight: float = 1.0,
         prior_kl_mc_samples: int = 10,
     ):
-        self.prior = prior
+        self.top_prior = prior
+        self.top_prior_snapshot = None
+        self.top_prior_gate = None
         self.top_kl_weight = float(top_kl_weight)
         self.prior_kl_mc_samples = int(prior_kl_mc_samples)
         super().__init__(H)
@@ -664,101 +598,21 @@ class VDVAE(HModule):
         self.decoder = Decoder(self.H)
 
         # IMPORTANT: This is the channel count of h_t only, NOT concat(h_t, z_tilde_t)
-        self.top_h_dim = int(getattr(self.H, "top_h_context_dim", 0))
+        self.top_h_dim = int(getattr(self.H, "top_h_context_dim", 0)) #h_t 
 
-        if self.prior is not None and self.top_h_dim > 0:
-            expected_prior_dim = self.top_h_dim + int(self.H.zdim)
-            if int(self.prior.hidden_dim) != expected_prior_dim:
-                raise ValueError(
-                    f"prior.hidden_dim must be h_t_dim + zdim = "
-                    f"{self.top_h_dim} + {int(self.H.zdim)} = {expected_prior_dim}, "
-                    f"but got {int(self.prior.hidden_dim)}"
-                )
-
-    def _check_top_inputs(self, cond_top, h_decoder_top):
-        if self.top_h_dim <= 0:
-            return None, None
-
-        if cond_top is None:
-            raise ValueError("cond_top must be provided for top prior/posterior")
-        if h_decoder_top is None:
-            raise ValueError("h_decoder_top must be provided for top decoder")
-
-        top_res = int(self.decoder.dec_blocks[0].base)
-        expected_cond_ch = self.top_h_dim + int(self.H.zdim)
-
-        if cond_top.dim() != 4:
-            raise ValueError(f"cond_top must be [B,C,H,W], got {tuple(cond_top.shape)}")
-        if h_decoder_top.dim() != 4:
-            raise ValueError(
-                f"h_decoder_top must be [B,C,H,W], got {tuple(h_decoder_top.shape)}"
-            )
-
-        if cond_top.shape[1] != expected_cond_ch:
-            raise ValueError(
-                f"cond_top channels must be top_h_dim + zdim = {expected_cond_ch}, "
-                f"got {cond_top.shape[1]}"
-            )
-        if h_decoder_top.shape[1] != self.top_h_dim:
-            raise ValueError(
-                f"h_decoder_top channels must be top_h_dim = {self.top_h_dim}, "
-                f"got {h_decoder_top.shape[1]}"
-            )
-
-        if cond_top.shape[2:] != (top_res, top_res):
-            raise ValueError(
-                f"cond_top spatial size must be {(top_res, top_res)}, "
-                f"got {tuple(cond_top.shape[2:])}"
-            )
-        if h_decoder_top.shape[2:] != (top_res, top_res):
-            raise ValueError(
-                f"h_decoder_top spatial size must be {(top_res, top_res)}, "
-                f"got {tuple(h_decoder_top.shape[2:])}"
-            )
-
-        if cond_top.shape[0] != h_decoder_top.shape[0]:
-            raise ValueError(
-                f"Batch mismatch: cond_top batch {cond_top.shape[0]} vs "
-                f"h_decoder_top batch {h_decoder_top.shape[0]}"
-            )
-
-        return cond_top.contiguous(), h_decoder_top.contiguous()
-
-    def _compute_top_prior_terms(self, top_q_mean_map, top_q_logvar_map, cond_top):
-        if self.prior is None or top_q_mean_map is None or top_q_logvar_map is None:
-            return None, None
-        if cond_top is None:
-            raise ValueError("cond_top must be provided when using the DPGMMPrior")
-
-        b, c, ht, wt = top_q_mean_map.shape
-        top_q_mean_img = top_q_mean_map.contiguous().view(b, c * ht * wt)
-
-        # keep your current semantics:
-        # qv is treated downstream as log-sigma, so convert to log-variance
-        top_q_logvar_img = 2 * top_q_logvar_map.contiguous().view(b, c * ht * wt)
-
-        _, prior_params = self.prior(cond_top)
-        dp_kl_img = self.prior.compute_kl_divergence_mc(
-            posterior_mean=top_q_mean_img,
-            posterior_logvar=top_q_logvar_img,
-            prior_params=prior_params,
-            n_samples=self.prior_kl_mc_samples,
-            reduction="image",
-        )
-        return dp_kl_img, prior_params
 
     def forward(
         self,
         x,
         x_target,
         cond_top=None,
+        h_prior_top=None,
         h_decoder_top=None,
         mask_t=None,
         prev_latents=None,
         get_latents=False,
     ):
         activations = self.encoder.forward(x)
-        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
 
         px_z, stats, current_latents = self.decoder.forward(
             activations,
@@ -786,13 +640,16 @@ class VDVAE(HModule):
         rate_gauss = rate_gauss / ndims
         dp_rate = torch.zeros_like(distortion_per_pixel)
         dp_kl_img = None
-        prior_params = None
 
-        if self.prior is not None:
-            dp_kl_img, prior_params = self._compute_top_prior_terms(
+        if self.top_prior is not None:
+
+            dp_kl_img = compute_top_kl_conditional_frozen(
+                snapshot=self.top_prior_snapshot,
+                frozen_gate=self.top_prior_gate,
+                h_t=h_prior_top,
                 top_q_mean_map=top_q_mean_map,
-                top_q_logvar_map=top_q_logvar_map,
-                cond_top=cond_top,
+                top_q_logvar_map=2 * top_q_logvar_map,
+                n_samples=self.prior_kl_mc_samples,
             )
             if dp_kl_img is not None:
                 dp_rate = self.top_kl_weight * dp_kl_img / ndims
@@ -824,7 +681,6 @@ class VDVAE(HModule):
             "px_z": px_z,
             "top_q_mean_map": top_q_mean_map,
             "top_q_logvar_map": top_q_logvar_map,
-            "prior_params": prior_params,
             "valid_count": valid_count,
             "current_latents": current_latents,
         }
@@ -837,7 +693,6 @@ class VDVAE(HModule):
     def decode_from_top_latent(
         self,
         z_top_map,
-        cond_top=None,
         h_decoder_top=None,
         t=None,
         prev_latents=None,
@@ -845,50 +700,31 @@ class VDVAE(HModule):
         """
         return pz and current latents
         """
-        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
         return self.decoder.forward_from_top_latent(
             z_top_map,
             t=t,
-            cond_top=cond_top,
             h_decoder_top=h_decoder_top,
             prev_latents=prev_latents,
         )
 
+
     def sample(
         self,
         n_batch,
-        cond_top,
+        h_prior_top,
         h_decoder_top,
+        t=None,
         prev_latents=None,
     ):
-        if self.prior is None:
-            raise ValueError("VDVAE.sample requires a DPGMMPrior")
 
-        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
-
-        if cond_top.shape[0] != n_batch:
-            raise ValueError(
-                f"cond_top batch {cond_top.shape[0]} does not match n_batch={n_batch}"
-            )
-
-        top_block = self.decoder.dec_blocks[0]
-        c = top_block.zdim
-        res = top_block.base
-
-        prior_dist, _ = self.prior(cond_top)
-        z_img = prior_dist.sample()
-
-        expected_dim = c * res * res
-        if z_img.shape != (n_batch, expected_dim):
-            raise ValueError(
-                f"Sampled top latent has shape {tuple(z_img.shape)}, "
-                f"expected {(n_batch, expected_dim)}"
-            )
-
-        z_top_map = z_img.view(n_batch, c, res, res).contiguous()
+        z_top_map = sample_top_conditional_frozen(
+            snapshot=self.top_prior_snapshot,
+            frozen_gate=self.top_prior_gate,
+            h_t=h_prior_top
+        )
         px_z, current_latents = self.decoder.forward_from_top_latent(
             z_top_map,
-            cond_top=cond_top,
+            t=t,
             h_decoder_top=h_decoder_top,
             prev_latents=prev_latents,
         )
@@ -902,7 +738,6 @@ class VDVAE(HModule):
         prev_latents=None,
     ):
         activations = self.encoder.forward(x)
-        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
         _, stats, current_latents = self.decoder.forward(
             activations,
             get_latents=True,
@@ -916,18 +751,20 @@ class VDVAE(HModule):
         self,
         n_batch,
         t=None,
-        cond_top=None,
         h_decoder_top=None,
         prev_latents=None,
+        z_top=None,
     ):
-        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
+        if z_top is None:
+            raise ValueError("z_top must be provided for unconditional sampling with forward_uncond_samples")
         px_z, current_latents = self.decoder.forward_uncond(
             n_batch,
             t=t,
-            cond_top=cond_top,
             h_decoder_top=h_decoder_top,
             prev_latents=prev_latents,
+            z_top=z_top,
         )
+
         return self.decoder.out_net.sample(px_z), current_latents
 
     def forward_samples_set_latents(
@@ -935,16 +772,13 @@ class VDVAE(HModule):
         n_batch,
         latents,
         t=None,
-        cond_top=None,
         h_decoder_top=None,
         prev_latents=None,
     ):
-        cond_top, h_decoder_top = self._check_top_inputs(cond_top, h_decoder_top)
         px_z, current_latents = self.decoder.forward_manual_latents(
             n_batch,
             latents,
             t=t,
-            cond_top=cond_top,
             h_decoder_top=h_decoder_top,
             prev_latents=prev_latents,
         )

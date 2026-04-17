@@ -209,3 +209,32 @@ class DmolNet(nn.Module):
         xhat = xhat.detach().cpu().numpy()
         xhat = np.minimum(np.maximum(0.0, xhat), 255.0).astype(np.uint8)
         return xhat
+
+class Block(nn.Module):
+    def __init__(
+        self,
+        in_width,
+        middle_width,
+        out_width,
+        down_rate=None,
+        residual=False,
+        use_3x3=True,
+        zero_last=False,
+    ):
+        super().__init__()
+        self.down_rate = down_rate
+        self.residual = residual
+        self.c1 = get_1x1(in_width, middle_width)
+        self.c2 = get_3x3(middle_width, middle_width) if use_3x3 else get_1x1(middle_width, middle_width)
+        self.c3 = get_3x3(middle_width, middle_width) if use_3x3 else get_1x1(middle_width, middle_width)
+        self.c4 = get_1x1(middle_width, out_width, zero_weights=zero_last)
+
+    def forward(self, x):
+        xhat = self.c1(F.gelu(x))
+        xhat = self.c2(F.gelu(xhat))
+        xhat = self.c3(F.gelu(xhat))
+        xhat = self.c4(F.gelu(xhat))
+        out = x + xhat if self.residual else xhat
+        if self.down_rate is not None:
+            out = F.avg_pool2d(out, kernel_size=self.down_rate, stride=self.down_rate)
+        return out
