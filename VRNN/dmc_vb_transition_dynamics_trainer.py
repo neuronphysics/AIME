@@ -1328,6 +1328,10 @@ class DMCVBTrainer:
         self.model = model.to(device)
         self.device = device
         self.config = config
+        self.frame_stack = config['frame_stack']
+        self.sequence_length = config['sequence_length']
+        self.img_height = config['img_height']
+        self.img_width = config['img_width']
         self.data_dir = data_dir
         default_ckpt_dir = PARENT_DIR / "results" / "dpgmm_vrnn_dmc_vb" / "checkpoints"
         self.ckpt_dir = Path(config.get("ckpt_dir", default_ckpt_dir))
