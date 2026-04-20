@@ -32,13 +32,7 @@ from vdvae.vae import VDVAE
 from vdvae.hps import Hyperparams
 from vdvae.vae_helpers import mean_from_discretized_mix_logistic, sample_from_discretized_mix_logistic, draw_gaussian_diag_samples
 from vdvae.top_dpgmm_prior import ConditionalTopDPGMM, ReplayBufferConditional, compute_top_kl_conditional_frozen, sample_top_conditional_frozen, TensorDiagComponentPosterior
-from VRNN.warp import (
-    TVLoss, SSIM, create_outgoing_mask,
-    charbonnier_loss, CensusLoss, multi_scale_warp_solver
-)
 from VRNN.flow_predict import LatentTransportINR
-
-
 
 
 @contextmanager
@@ -343,8 +337,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.top_prior_model._update_global_sticks_from_counts(
             torch.zeros(1, device=self.top_prior_model.device_, dtype=self.top_prior_model.dtype)
         )
-
+        self.top_prior_model._reset_global_summaries()   
         self.vdvae.top_prior_snapshot = self.top_prior_model.frozen_snapshot()
+
         self.vdvae.top_prior_gate =  ConditionalTopDPGMM.load_gate_from_snapshot(
             snapshot=self.vdvae.top_prior_snapshot,
             h_shape=(self.hidden_dim, self.top_H, self.top_W),
