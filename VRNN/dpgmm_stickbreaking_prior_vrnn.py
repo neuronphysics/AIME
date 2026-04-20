@@ -307,40 +307,46 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             hidden_layers=int(self.latent_transport_hidden_layers),
             flow_scale=float(self.latent_transport_flow_scale),
         ).to(self.device)
-
+        
     @torch.no_grad()
     def _bootstrap_top_prior_state(self):
-        # Match DIVA / Hughes style: start with K=1, then allow birth moves later
-        self.top_prior_model.K = 1
-        self.top_prior_model.gate.set_active_K(1)
+        # Start with K=4 active components; birth/merge/delete can adapt later
+        self.top_prior_model.K = 4
+        self.top_prior_model.gate.set_active_K(self.top_prior_model.K)
 
-        # Build one simple global component at the prior mean / variance
-        m0 = self.top_prior_model._prior_m0()          # [C,H,W]
-        beta0 = self.top_prior_model._prior_beta0()    # [C,H,W]
+        m0 = self.top_prior_model._prior_m0()
+        beta0 = self.top_prior_model._prior_beta0()
+
+        base_component = TensorDiagComponentPosterior(
+            mean=m0.clone(),
+            kappa=torch.tensor(
+                self.top_prior_model.prior_kappa0 + 1.0,
+                device=self.top_prior_model.device_,
+                dtype=self.top_prior_model.dtype,
+            ),
+            alpha=torch.tensor(
+                self.top_prior_model.prior_alpha0 + 0.5,
+                device=self.top_prior_model.device_,
+                dtype=self.top_prior_model.dtype,
+            ),
+            beta=beta0.clone(),
+        )
 
         self.top_prior_model.comp = [
-            TensorDiagComponentPosterior(
-                mean=m0.clone(),
-                kappa=torch.tensor(
-                    self.top_prior_model.prior_kappa0 + 1.0,
-                    device=self.top_prior_model.device_,
-                    dtype=self.top_prior_model.dtype,
-                ),
-                alpha=torch.tensor(
-                    self.top_prior_model.prior_alpha0 + 0.5,
-                    device=self.top_prior_model.device_,
-                    dtype=self.top_prior_model.dtype,
-                ),
-                beta=beta0.clone(),
-            )
+            copy.deepcopy(base_component) for _ in range(self.top_prior_model.K)
         ]
-        self.top_prior_model._update_global_sticks_from_counts(
-            torch.zeros(1, device=self.top_prior_model.device_, dtype=self.top_prior_model.dtype)
-        )
-        self.top_prior_model._reset_global_summaries()   
-        self.vdvae.top_prior_snapshot = self.top_prior_model.frozen_snapshot()
 
-        self.vdvae.top_prior_gate =  ConditionalTopDPGMM.load_gate_from_snapshot(
+        self.top_prior_model._update_global_sticks_from_counts(
+            torch.zeros(
+                self.top_prior_model.K,
+                device=self.top_prior_model.device_,
+                dtype=self.top_prior_model.dtype,
+            )
+        )
+        self.top_prior_model._reset_global_summaries()
+
+        self.vdvae.top_prior_snapshot = self.top_prior_model.frozen_snapshot()
+        self.vdvae.top_prior_gate = ConditionalTopDPGMM.load_gate_from_snapshot(
             snapshot=self.vdvae.top_prior_snapshot,
             h_shape=(self.hidden_dim, self.top_H, self.top_W),
             hidden_dim=self.top_prior_model.gate.hidden_dim,
