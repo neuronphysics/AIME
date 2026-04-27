@@ -509,8 +509,21 @@ class ConditionalTopDPGMM(nn.Module):
         self.entropy = None
         self.to(device=self.device_, dtype=self.dtype)
 
-    # ----------------------- basic helpers -----------------------
+    #  basic helpers 
 
+    @torch.no_grad()
+    def clear_fit_cache(self):
+        """
+        Release epoch-end memoized VI state after frozen_snapshot() has been produced.
+        Keeps learned comp/qv/gate parameters for warm-starting the next epoch.
+        """
+        self.batches = []
+        self.cache = {}
+        self.Nk = None
+        self.S1 = None
+        self.S2 = None
+        self.entropy = None
+        
     def _prior_m0(self) -> torch.Tensor:
         return torch.full(self.z_shape, self.prior_m0_scalar, device=self.device_, dtype=self.dtype)
 
@@ -536,12 +549,17 @@ class ConditionalTopDPGMM(nn.Module):
         self.qv_a1 = (1.0 + Nk[:-1]).detach()
         self.qv_a0 = (self.dp_alpha + tail).detach()
 
+
     def _cache_from_resp(self, z: torch.Tensor, resp: torch.Tensor) -> MemoizedBatchCache:
-        Nk = resp.sum(dim=0)
-        S1 = torch.einsum('nk,nchw->kchw', resp, z)
-        S2 = torch.einsum('nk,nchw->kchw', resp, z * z)
-        H = -(resp.clamp_min(EPS) * resp.clamp_min(EPS).log()).sum()
-        return MemoizedBatchCache(resp=resp, Nk=Nk, S1=S1, S2=S2, entropy=H)
+        resp = resp.detach()
+        z = z.detach()
+
+        Nk = resp.sum(dim=0).detach()
+        S1 = torch.einsum('nk,nchw->kchw', resp, z).detach()
+        S2 = torch.einsum('nk,nchw->kchw', resp, z * z).detach()
+        H = (-(resp.clamp_min(EPS) * resp.clamp_min(EPS).log()).sum()).detach()
+
+        return MemoizedBatchCache(resp=resp,Nk=Nk,S1=S1,S2=S2,entropy=H)
 
     def _add_cache(self, c: MemoizedBatchCache):
         self.Nk = self.Nk + c.Nk
@@ -555,18 +573,37 @@ class ConditionalTopDPGMM(nn.Module):
         self.S2 = self.S2 - c.S2
         self.entropy = self.entropy - c.entropy
 
+    def _detach_comp(self, c: TensorDiagComponentPosterior) -> TensorDiagComponentPosterior:
+        return TensorDiagComponentPosterior(
+            mean=c.mean.detach().clone(),
+            kappa=c.kappa.detach().clone() if torch.is_tensor(c.kappa) else torch.as_tensor(
+                c.kappa, device=self.device_, dtype=self.dtype
+            ),
+            alpha=c.alpha.detach().clone() if torch.is_tensor(c.alpha) else torch.as_tensor(
+                c.alpha, device=self.device_, dtype=self.dtype
+            ),
+            beta=c.beta.detach().clone(),
+        )
+
+    @torch.no_grad()
     def save_checkpoint(self) -> StructuralCheckpoint:
         return StructuralCheckpoint(
             K=self.K,
-            comp=[copy.deepcopy(c) for c in self.comp],
-            qv_a1=self.qv_a1.clone(),
-            qv_a0=self.qv_a0.clone(),
-            Nk=self.Nk.clone(),
-            S1=self.S1.clone(),
-            S2=self.S2.clone(),
-            entropy=self.entropy.clone(),
-            cache_resp={bid: self.cache[bid].resp.clone() for bid in self.cache},
-            gate_state={k: v.clone() for k, v in self.gate.state_dict().items()},
+            comp=[self._detach_comp(c) for c in self.comp],
+            qv_a1=self.qv_a1.detach().clone(),
+            qv_a0=self.qv_a0.detach().clone(),
+            Nk=self.Nk.detach().clone(),
+            S1=self.S1.detach().clone(),
+            S2=self.S2.detach().clone(),
+            entropy=self.entropy.detach().clone(),
+            cache_resp={
+                bid: self.cache[bid].resp.detach().clone()
+                for bid in self.cache
+            },
+            gate_state={
+                k: v.detach().clone()
+                for k, v in self.gate.state_dict().items()
+            },
         )
 
     @torch.no_grad()
@@ -675,6 +712,7 @@ class ConditionalTopDPGMM(nn.Module):
 
         self._initialize_caches()
 
+    @torch.no_grad()
     def _initialize_caches(self):
         self._reset_global_summaries()
         for b_cpu in self.batches:
@@ -715,12 +753,12 @@ class ConditionalTopDPGMM(nn.Module):
             out[:, k] = term.view(N, -1).sum(dim=1)
         return out
 
+    @torch.no_grad()
     def local_step(self, h: torch.Tensor, z: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
         logits = (self.conditional_expected_log_pi(h) + self.component_expected_log_likelihood(z)) / max(float(temperature), 1e-6)
         return torch.softmax(logits, dim=1)
 
-    # ----------------------- updates -----------------------
-
+    # updates 
     def _update_components_from_summaries(self):
         self._update_global_sticks_from_counts(self.Nk)
         m0 = self._prior_m0()
@@ -777,6 +815,7 @@ class ConditionalTopDPGMM(nn.Module):
                 self.gate_optimizer.step()
         self.gate.eval()
 
+    @torch.no_grad()
     def update_one_batch(self, batch: EpochBatch):
         old = self.cache[batch.batch_id]
         if old.resp is not None:
@@ -1011,7 +1050,7 @@ class ConditionalTopDPGMM(nn.Module):
         return comps
 
     # ----------------------- structural edits -----------------------
-
+    @torch.no_grad()
     def _rebuild_all_caches_from_current_model(self):
         self._reset_global_summaries()
         for b_cpu in self.batches:
@@ -1035,6 +1074,7 @@ class ConditionalTopDPGMM(nn.Module):
             )
         self.gate.set_active_K(self.K)
 
+    @torch.no_grad()
     def _merge_structure(self, kA: int, kB: int):
         if kB < kA:
             kA, kB = kB, kA
@@ -1054,7 +1094,8 @@ class ConditionalTopDPGMM(nn.Module):
             self.cache[bid] = c
             self._add_cache(c)
         self._update_components_from_summaries()
-
+    
+    @torch.no_grad()
     def _delete_structure(self, kdel: int):
         for bid, _ in enumerate(self.batches):
             resp = self.cache[bid].resp
@@ -1288,22 +1329,74 @@ class ConditionalTopDPGMM(nn.Module):
                 elog_global[k] = prefix
         return elog_global.view(1, snapshot.K) + frozen_gate.expected_log_pi(h_t)
 
+
     @staticmethod
-    def kl_mc_to_frozen_prior(snapshot: FrozenConditionalTopPrior, frozen_gate: ConditionalKumaraswamyGate, h_t: torch.Tensor, posterior_mean: torch.Tensor, posterior_logvar: torch.Tensor, n_samples: int = 8) -> torch.Tensor:
+    def kl_mc_to_frozen_prior(
+        snapshot: FrozenConditionalTopPrior,
+        frozen_gate: ConditionalKumaraswamyGate,
+        h_t: torch.Tensor,
+        posterior_mean: torch.Tensor,
+        posterior_logvar: torch.Tensor,
+        n_samples: int = 8,
+    ) -> torch.Tensor:
+        """
+        Differentiable MC estimate of KL[q(z_top|x,h) || p_frozen(z_top|h)].
+
+        Gradients should flow to posterior_mean, posterior_logvar, and h_t.
+        Gradients should not update frozen prior parameters, because frozen_gate has
+        requires_grad=False and snapshot tensors are detached clones.
+        """
+        S = int(max(1, n_samples))
         B = posterior_mean.shape[0]
-        means = snapshot.comp_mean.to(device=posterior_mean.device, dtype=posterior_mean.dtype)
-        vars_ = snapshot.comp_var.to(device=posterior_mean.device, dtype=posterior_mean.dtype).clamp_min(1e-6)
-        elogpi = ConditionalTopDPGMM.conditional_expected_log_pi_frozen(snapshot, frozen_gate, h_t)
-        out = torch.zeros(B, device=posterior_mean.device, dtype=posterior_mean.dtype)
-        std = torch.exp(0.5 * posterior_logvar)
-        for _ in range(int(n_samples)):
-            z = posterior_mean + std * torch.randn_like(std)
-            log_q = (-0.5 * (posterior_logvar + LOG2PI + ((z - posterior_mean) ** 2) / torch.exp(posterior_logvar).clamp_min(1e-6))).flatten(1).sum(dim=1)
-            z_exp = z.unsqueeze(1)
-            comp_log = (-0.5 * (torch.log(vars_.unsqueeze(0)) + LOG2PI + (z_exp - means.unsqueeze(0)).pow(2) / vars_.unsqueeze(0))).flatten(2).sum(dim=2)
-            log_p = stable_logsumexp(comp_log + elogpi, dim=1)
-            out = out + (log_q - log_p)
-        return out / float(n_samples)
+        device = posterior_mean.device
+        dtype = posterior_mean.dtype
+
+        means = snapshot.comp_mean.to(device=device, dtype=dtype)                  # [K,C,H,W]
+        vars_ = snapshot.comp_var.to(device=device, dtype=dtype).clamp_min(1e-6)   # [K,C,H,W]
+
+        # This is differentiable w.r.t. h_t, but not w.r.t. frozen_gate parameters.
+        elogpi = ConditionalTopDPGMM.conditional_expected_log_pi_frozen(
+            snapshot, frozen_gate, h_t
+        )  # [B,K]
+
+        q_logvar = posterior_logvar.clamp(min=-20.0, max=10.0)
+        q_var = torch.exp(q_logvar).clamp_min(1e-6)
+        q_std = torch.sqrt(q_var)
+
+        eps = torch.randn(
+            S,
+            *posterior_mean.shape,
+            device=device,
+            dtype=dtype,
+        )
+
+        z = posterior_mean.unsqueeze(0) + q_std.unsqueeze(0) * eps  # [S,B,C,H,W]
+
+        log_q = (
+            -0.5
+            * (
+                q_logvar.unsqueeze(0)
+                + LOG2PI
+                + (z - posterior_mean.unsqueeze(0)).pow(2) / q_var.unsqueeze(0)
+            )
+        ).flatten(2).sum(dim=2)  # [S,B]
+
+        z_exp = z.unsqueeze(2)                         # [S,B,1,C,H,W]
+        means_exp = means.view(1, 1, *means.shape)     # [1,1,K,C,H,W]
+        vars_exp = vars_.view(1, 1, *vars_.shape)      # [1,1,K,C,H,W]
+
+        comp_log = (
+            -0.5
+            * (
+                torch.log(vars_exp)
+                + LOG2PI
+                + (z_exp - means_exp).pow(2) / vars_exp
+            )
+        ).flatten(3).sum(dim=3)  # [S,B,K]
+
+        log_p = stable_logsumexp(comp_log + elogpi.unsqueeze(0), dim=2)  # [S,B]
+
+        return (log_q - log_p).mean(dim=0)  # [B]
 
     @staticmethod
     @torch.no_grad()

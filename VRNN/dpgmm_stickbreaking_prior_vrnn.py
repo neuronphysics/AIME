@@ -33,7 +33,7 @@ from vdvae.hps import Hyperparams
 from vdvae.vae_helpers import mean_from_discretized_mix_logistic, sample_from_discretized_mix_logistic, draw_gaussian_diag_samples
 from vdvae.top_dpgmm_prior import ConditionalTopDPGMM, ReplayBufferConditional, compute_top_kl_conditional_frozen, sample_top_conditional_frozen, TensorDiagComponentPosterior
 from VRNN.flow_predict import LatentTransportINR
-
+import copy
 
 @contextmanager
 def apply_emas(*emas):
@@ -101,7 +101,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.latent_transport_hidden_features = latent_transport_hidden_features
         self.latent_transport_hidden_layers = latent_transport_hidden_layers
         self.latent_transport_flow_scale = latent_transport_flow_scale
-        
+        self.prior_alpha = float(prior_alpha)
+        self.prior_beta = float(prior_beta)
+        self.init_components = min(5, int(max_components))
         # Hyperparameters
         self._lr = learning_rate
         self._grad_clip = grad_clip
@@ -243,13 +245,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.image_channels = self.input_channels   # usually 3
         H.zdim = self.latent_dim                 # or set explicitly (e.g., 16)
         H.bottleneck_multiple = 0.25
-        H.width = 96
+        H.width = 80
         H.image_size = self.image_size          # e.g. 64
         H.dataset = 'imagenet64'
         H.num_mixtures = 10
         H.skip_threshold = 100.0
-        H.enc_blocks = "64x2,64d2,32x3,32d2,16x3,16d2,8x3"   # +2 blocks at 8
-        H.dec_blocks = "8x3,16m8,16x3,32m16,32x3,64m32,64x2"
+        H.enc_blocks = "64x2,64d2,32x2,32d2,16x3,16d2,8x3"   # +2 blocks at 8
+        H.dec_blocks = "8x3,16m8,16x3,32m16,32x2,64m32,64x2"
         H.attn_resolutions = [32,16]
         H.use_spatial_attn = True
         H.attn_where = "last"
@@ -287,6 +289,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             z_shape=(self.zdim, self.top_H, self.top_W),
             h_shape=(self.hidden_dim, self.top_H, self.top_W),
             max_components=max_components,
+            init_components = self.init_components,
+            dp_alpha = self.prior_alpha,
+            prior_beta0 = self.prior_beta,
+            birth_kfresh = 4,
+            birth_resp_threshold = 0.03,
             device=self.device,
             dtype=torch.float32,
         )
@@ -311,7 +318,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
     @torch.no_grad()
     def _bootstrap_top_prior_state(self):
         # Start with K=4 active components; birth/merge/delete can adapt later
-        self.top_prior_model.K = 4
+        self.top_prior_model.K = self.init_components
         self.top_prior_model.gate.set_active_K(self.top_prior_model.K)
 
         m0 = self.top_prior_model._prior_m0()
@@ -399,8 +406,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 input_nc=self.input_channels,
                 ndf=int(self.patch_disc_ndf),
                 n_layers=int(self.patch_disc_layers),
-                norm_type= "group",
-                gn_groups= 32,
+                norm_type= "frn",
+                gn_groups= 8,
                 use_checkpoint=False,
                 checkpoint_use_reentrant=False,
                 device=self.device,
@@ -632,7 +639,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 min_lr=1e-7,
             )
 
-    def refresh_top_prior_from_buffer(self, batch_size=256, n_laps=4):
+    def refresh_top_prior_from_buffer(self, batch_size=128, n_laps=4):
         if self.top_replay_buffer.is_empty():
             return
         self.vdvae.top_prior_snapshot = self.top_prior_model.fit_epoch(
@@ -1363,8 +1370,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         for p in Dpatch.parameters():
             p.requires_grad_(False)
 
-        fake_frames = reconstruction.reshape(B * T, C, H, W).contiguous()
-        patch_logits = Dpatch(fake_frames)
+        fake_frames = reconstruction.clamp(-1.0, 1.0).reshape(B * T, C, H, W).contiguous()
+        with torch.autocast(device_type="cuda", enabled=False):
+            patch_logits = Dpatch(fake_frames.float())
         patch_scores = patch_logits.mean(dim=(1, 2, 3))
         img_adv_loss = -self._masked_mean(patch_scores, mask_flat)
 

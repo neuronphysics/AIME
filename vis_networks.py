@@ -1754,6 +1754,29 @@ class attentionBlock(nn.Module):
         x = x.transpose(1, 2).reshape(B, C, H, W).contiguous()
         return x + residual
 
+class FilterResponseNorm2d(nn.Module):
+    """
+    FRN + TLU activation.
+    Use this instead of Norm + LeakyReLU.
+    """
+    def __init__(self, ch: int, eps: float = 1e-6):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(1, ch, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, ch, 1, 1))
+        self.tau = nn.Parameter(torch.zeros(1, ch, 1, 1))
+        self.eps = float(eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x_float = x.float()
+
+        nu2 = x_float.pow(2).mean(dim=(2, 3), keepdim=True)
+        x_norm = x_float * torch.rsqrt(nu2 + self.eps)
+
+        y = self.gamma.float() * x_norm + self.beta.float()
+        y = torch.maximum(y, self.tau.float())
+
+        return y.to(orig_dtype)
 
 class ActNorm(nn.Module):
     def __init__(self, num_features, logdet=False, affine=True,
@@ -1849,7 +1872,7 @@ class ImageDiscriminator(nn.Module):
         input_nc=3,
         ndf=16,
         n_layers=5,
-        norm_type="group",
+        norm_type="frn",
         gn_groups=32,
         use_checkpoint=False,
         checkpoint_use_reentrant=False,  # keep False (as you prefer)
@@ -1874,7 +1897,9 @@ class ImageDiscriminator(nn.Module):
                 g = max(1, min(g, ch))
                 while ch % g != 0 and g > 1:
                     g -= 1
-                return nn.GroupNorm(g, ch)
+                return nn.GroupNorm(g, ch, eps=1e-4)
+            elif norm_type == "frn":
+                return FilterResponseNorm2d(ch, eps=1e-6)
             elif norm_type == "actnorm":
                 return ActNorm(ch)
             else:
@@ -1907,7 +1932,7 @@ class ImageDiscriminator(nn.Module):
             block = nn.Sequential(
                 nn.utils.spectral_norm(nn.Conv2d(ndf * nf_mult_prev, out_ch, kernel_size=kw, stride=2, padding=padw, bias=use_bias)),
                 make_norm(out_ch),
-                nn.LeakyReLU(0.2, inplace=False),
+                nn.Identity() if norm_type == "frn" else nn.LeakyReLU(0.2, inplace=False),
             )
             self.pre_layers.append(block)
 
@@ -1923,13 +1948,13 @@ class ImageDiscriminator(nn.Module):
             nn.Sequential(
                 nn.utils.spectral_norm(nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias)),
                 make_norm(ndf * nf_mult),
-                nn.LeakyReLU(0.2, inplace=False),
+                nn.Identity() if norm_type == "frn" else nn.LeakyReLU(0.2, inplace=False),
             )
         )
 
         # Final patch logits
         self.post_layers.append(
-            nn.utils.spectral_norm(nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw, bias=True))
+            nn.utils.spectral_norm(nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw, bias=True)),
         )
 
         self.to(device)
