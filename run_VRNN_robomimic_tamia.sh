@@ -88,15 +88,16 @@ cd /home/memole/links/projects/def-irina/memole/AIME
 
 echo "pretrain VQVAE ....."
 #CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.pretrain_vqvae
-echo "finished pretraining and start training world model dpgmm vrnn model... " 
+echo "finished pretraining and start training world model dpgmm vrnn model on robomimic dataset... " 
 python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_physical_devices('GPU'))"
 ##Dowload dataset
 #action space: can (118, 7), lift (48, 7), square (127, 7)
-#export DATA_ROOT=/home/m/memole/links/scratch/transition_data/robomimic/datasets
+export DATA_ROOT=/home/m/memole/links/scratch/transition_data/robomimic/datasets
 #python download_datasets.py --tasks can --dataset_types mh --hdf5_types raw --download_dir "$DATA_ROOT"
 #python /home/m/memole/links/scratch/AIME/VRNN/dataset_states_to_obs.py --dataset "$DATA_ROOT/can/mh/demo_v15.hdf5" --output_name image64_can_mh.hdf5 --done_mode 2 --camera_names agentview robot0_eye_in_hand --camera_height 64 --camera_width 64 --compress --exclude-next-obs
 #python /home/m/memole/links/scratch/AIME/VRNN/dataset_states_to_obs.py --dataset "$DATA_ROOT/lift/mh/demo_v15.hdf5" --output_name image64_lift_mh.hdf5 --done_mode 2 --camera_names agentview robot0_eye_in_hand --camera_height 64 --camera_width 64 --compress --exclude-next-obs
 #python /home/m/memole/links/scratch/AIME/VRNN/dataset_states_to_obs.py --dataset "$DATA_ROOT/square/mh/demo_v15.hdf5" --output_name image64_square_mh.hdf5 --done_mode 2 --camera_names agentview robot0_eye_in_hand --camera_height 64 --camera_width 64 --compress --exclude-next-obs
 #python -c 'import os, h5py; p=os.path.expandvars("$DATA_ROOT/square/mh/demo_v15.hdf5"); f=h5py.File(p,"r"); d=next(iter(f["data"])); print(f["data"][d]["actions"].shape)'
 #python -c 'import os,h5py,numpy as np; p=os.path.expandvars("$DATA_ROOT/square/mh/demo_v15.hdf5"); f=h5py.File(p,"r"); L=[f["data"][d]["actions"].shape[0] for d in f["data"]]; print(len(L), "demos, T min/mean/max:", min(L), np.mean(L), max(L))'
-CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.robomimic_transition_dynamics_trainer --hdf5 /home/memole/links/scratch/transition_data/robomimic_v1.5/v1.5/can/mg/image64_v15.hdf5 --obs_keys agentview_image --run_name robomimic_can_agentview --logger tensorboard --sequence_length 12
+HDF5S="$DATA_ROOT/lift/mh/image64_lift_mh.hdf5,$DATA_ROOT/can/mh/image64_can_mh.hdf5,$DATA_ROOT/square/mh/image64_square_mh.hdf5"
+CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.robomimic_transition_dynamics_trainer --hdf5 "$HDF5S" --obs_keys agentview_image --frame_stack 1 --img_size 64 --batch_size 30 --num_workers 4 --n_epochs 200 --run_name robomimic_lift_can_square_agentview --logger tensorboard --sequence_length 20
