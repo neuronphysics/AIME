@@ -19,6 +19,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from huggingface_hub import PyTorchModelHubMixin
 from torch.nn.modules.pixelshuffle import PixelUnshuffle 
 from torch.nn.utils.parametrizations import spectral_norm 
+from torch.nn import init
 class AddEpsilon(nn.Module):
     def __init__(self, eps):
         super().__init__()
@@ -2420,6 +2421,49 @@ class ResBlock3DSpatial(nn.Module):
 
         return x_skip + h
 
+def init_conv(conv, glu=True):
+    init.xavier_uniform_(conv.weight)
+    if conv.bias is not None:
+        conv.bias.data.zero_()
+        
+class SelfAttention(nn.Module):
+    """ Self attention Layer"""
+    def __init__(self,in_dim,activation=F.relu):
+        super(SelfAttention,self).__init__()
+        self.chanel_in = in_dim
+        self.activation = activation
+        
+        self.query_conv = nn.Conv2d(in_channels = in_dim , out_channels = in_dim//8 , kernel_size= 1)
+        self.key_conv = nn.Conv2d(in_channels = in_dim , out_channels = in_dim//8 , kernel_size= 1)
+        self.value_conv = nn.Conv2d(in_channels = in_dim , out_channels = in_dim , kernel_size= 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+        self.softmax  = nn.Softmax(dim=-1) #
+
+        init_conv(self.query_conv)
+        init_conv(self.key_conv)
+        init_conv(self.value_conv)
+        
+    def forward(self,x):
+        """
+            inputs :
+                x : input feature maps( B X C X W X H)
+            returns :
+                out : self attention value + input feature 
+                attention: B X N X N (N is Width*Height)
+        """
+        m_batchsize, C,width ,height = x.size()
+        proj_query  = self.query_conv(x).view(m_batchsize,-1,width*height).permute(0,2,1) # B X CX(N)
+        proj_key =  self.key_conv(x).view(m_batchsize,-1,width*height) # B X C x (*W*H)
+        energy =  torch.bmm(proj_query,proj_key) # transpose check
+        attention = self.softmax(energy) # BX (N) X (N) 
+        proj_value = self.value_conv(x).view(m_batchsize,-1,width*height) # B X C X N
+
+        out = torch.bmm(proj_value,attention.permute(0,2,1) )
+        out = out.view(m_batchsize,C,width,height)
+        
+        out = self.gamma*out + x
+        return out
 
 class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
     """
@@ -2468,9 +2512,7 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         self.ckpt_use_reentrant = bool(ckpt_use_reentrant)
         self.ckpt_preserve_rng = True
 
-        # ------------------------------------------------------------
         # x path: preserve time, reduce space
-        # ------------------------------------------------------------
         self.downsample = nn.AvgPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
         self.space2depth = PixelUnshuffle(downscale_factor=2)
 
@@ -2488,10 +2530,8 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         )
 
         self.pre_attn_channels = 2 * internal_chn
-
-        # ------------------------------------------------------------
+        self.frame_self_attn = SelfAttention(internal_chn)
         # z path + framewise cross-attention
-        # ------------------------------------------------------------
         self.x_to_attn = spectral_norm(
             nn.Conv3d(self.pre_attn_channels, self.attn_dim, kernel_size=1, bias=False)
         )
@@ -2540,9 +2580,10 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         # Cache RoPE modules by spatial size for x/z cross-attention features.
         self._rope_cache = nn.ModuleDict()
 
-        # ------------------------------------------------------------
+        # 
         # per-frame 2D conv tower after temporal conditioning
-        # ------------------------------------------------------------
+        # 
+        
         self.intermediate_dblocks = nn.ModuleList()
         tmp_internal = internal_chn
         for _ in range(self.num_layers):
@@ -2561,13 +2602,11 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
             keep_same_output=True,
             conv_type=self.conv_type,
         )
-
+        
         self.token_dim = 2 * tmp_internal
 
-        # ------------------------------------------------------------
+        # 
         # spatiotemporal transformer head
-        # ------------------------------------------------------------
-        st_depth = max(1, self.num_layers)
         dim_head = max(32, self.token_dim // max(1, self.num_heads))
 
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.token_dim) * 0.02)
@@ -2580,7 +2619,7 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
                 mlp_dim=4 * self.token_dim,
                 dropout=0.0,
             )
-            for _ in range(st_depth)
+            for _ in range(self.num_layers)
         ])
 
         self.frame_norm = nn.LayerNorm(self.token_dim, eps=1e-5)
@@ -2708,9 +2747,7 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         x_out = x_tok.view(B, T, H, W, Dx).permute(0, 4, 1, 2, 3).contiguous()
         return x_out
 
-    # ------------------------------------------------------------------
-    # forward
-    # ------------------------------------------------------------------
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2760,6 +2797,14 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         x0 = x0.view(B, T0, 4 * C0, H0 // 2, W0 // 2).permute(0, 2, 1, 3, 4).contiguous()
 
         x1 = self._maybe_ckpt(self.d1, x0)  # [B,C,T,H',W']
+        x1_bt = x1.permute(0, 2, 1, 3, 4).contiguous()  # [B,T,C,H1,W1]
+        B1, T1, C1, H1, W1 = x1_bt.shape
+        x1_bt = x1_bt.view(B1 * T1, C1, H1, W1)
+
+        x1_bt = self._maybe_ckpt(self.frame_self_attn, x1_bt)
+
+        x1 = x1_bt.view(B1, T1, C1, H1, W1).permute(0, 2, 1, 3, 4).contiguous()
+
         x2 = self._maybe_ckpt(self.d2, x1)  # [B,C2,T,H'',W'']
 
         # ------------------------------------------------------------
@@ -2799,7 +2844,7 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
 
         for t in range(x3.size(1)):
             rep = x3[:, t]  # [B,C,H,W]
-
+           
             for block in self.intermediate_dblocks:
                 rep = self._maybe_ckpt(block, rep)
 
