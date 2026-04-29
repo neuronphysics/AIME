@@ -1754,29 +1754,7 @@ class attentionBlock(nn.Module):
         x = x.transpose(1, 2).reshape(B, C, H, W).contiguous()
         return x + residual
 
-class FilterResponseNorm2d(nn.Module):
-    """
-    FRN + TLU activation.
-    Use this instead of Norm + LeakyReLU.
-    """
-    def __init__(self, ch: int, eps: float = 1e-6):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.ones(1, ch, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, ch, 1, 1))
-        self.tau = nn.Parameter(torch.zeros(1, ch, 1, 1))
-        self.eps = float(eps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x_float = x.float()
-
-        nu2 = x_float.pow(2).mean(dim=(2, 3), keepdim=True)
-        x_norm = x_float * torch.rsqrt(nu2 + self.eps)
-
-        y = self.gamma.float() * x_norm + self.beta.float()
-        y = torch.maximum(y, self.tau.float())
-
-        return y.to(orig_dtype)
 
 class ActNorm(nn.Module):
     def __init__(self, num_features, logdet=False, affine=True,
@@ -1863,6 +1841,116 @@ class ActNorm(nn.Module):
         return h
 
 
+class FilterResponseNorm2d(nn.Module):
+    r"""Feature Response Normalization layer from 'Filter Response Normalization Layer: Eliminating Batch Dependence
+    in the Training of Deep Neural Networks', see :cite:`FRN2019` for more details.
+
+    .. math::
+        y =  \gamma \times \frac{x}{\sqrt{\mathrm{E}[x^2]} + |\epsilon|} + \beta
+
+
+    Args:
+        num_features: number of channels
+        eps: normalization constant
+        is_bias: use bias
+        is_scale: use scale
+        drop_rate: dropout rate,
+        is_eps_leanable: if eps is learnable
+
+    Returns:
+        torch.Tensor: Normalized features
+
+    Shape:
+        - Input: :math:`(B, \text{num_features}, H, W)`
+        - Output: :math:`(B, \text{num_features}, H, W)`
+
+    """  # noqa: D205
+
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-6,
+        is_bias: bool = True,
+        is_scale: bool = True,
+        is_eps_leanable: bool = False,
+    ) -> None:
+        super().__init__()
+
+        self.num_features = num_features
+        self.init_eps = eps
+        self.is_eps_leanable = is_eps_leanable
+        self.is_bias = is_bias
+        self.is_scale = is_scale
+
+        self.weight = nn.Parameter(torch.ones(1, num_features, 1, 1), requires_grad=True)
+        self.bias = nn.Parameter(torch.zeros(1, num_features, 1, 1), requires_grad=True)
+        if is_eps_leanable:
+            self.eps = nn.Parameter(torch.tensor(1), requires_grad=True)
+        else:
+            self.register_buffer("eps", torch.tensor([eps]))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.ones_(self.weight)
+        nn.init.zeros_(self.bias)
+        if self.is_eps_leanable:
+            nn.init.constant_(self.eps, self.init_eps)
+
+    def extra_repr(self) -> str:
+        return "num_features={num_features}, eps={init_eps}".format(**self.__dict__)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Compute the mean norm of activations per channel.
+        nu2 = x.pow(2).mean(dim=[2, 3], keepdim=True)
+
+        # Perform FRN.
+        x = x * torch.rsqrt(nu2 + self.eps.abs())
+
+        # Scale and Bias
+        if self.is_scale:
+            x = self.weight * x
+        if self.is_bias:
+            x = x + self.bias
+        return x
+
+
+class TLU(nn.Module):
+    r"""TLU layer from 'Filter Response Normalization Layer: Eliminating Batch Dependence in the Training of Deep
+    Neural Networks, see :cite:`FRN2019` for more details. :math:`{\tau}` is learnable per channel.
+
+    .. math::
+        y = \max(x, {\tau})
+
+    Args:
+        num_features: number of channels
+
+    Returns:
+        torch.Tensor
+
+    Shape:
+        - Input: :math:`(B, \text{num_features}, H, W)`
+        - Output: :math:`(B, \text{num_features}, H, W)`
+
+    """  # noqa:D205
+
+    def __init__(self, num_features: int) -> None:
+        """max(y, tau) = max(y - tau, 0) + tau = ReLU(y - tau) + tau."""
+        super().__init__()
+        self.num_features = num_features
+        self.tau = nn.Parameter(-torch.ones(1, num_features, 1, 1), requires_grad=True)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        # nn.init.zeros_(self.tau)
+        nn.init.constant_(self.tau, -1)
+
+    def extra_repr(self) -> str:
+        return "num_features={num_features}".format(**self.__dict__)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.max(x, self.tau)
+
+
 class ImageDiscriminator(nn.Module):
     """
     https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/models/networks.py
@@ -1899,7 +1987,7 @@ class ImageDiscriminator(nn.Module):
                     g -= 1
                 return nn.GroupNorm(g, ch, eps=1e-4)
             elif norm_type == "frn":
-                return FilterResponseNorm2d(ch, eps=1e-6)
+                return FilterResponseNorm2d(num_features=ch, eps=1e-6)
             elif norm_type == "actnorm":
                 return ActNorm(ch)
             else:
@@ -1932,7 +2020,7 @@ class ImageDiscriminator(nn.Module):
             block = nn.Sequential(
                 nn.utils.spectral_norm(nn.Conv2d(ndf * nf_mult_prev, out_ch, kernel_size=kw, stride=2, padding=padw, bias=use_bias)),
                 make_norm(out_ch),
-                nn.Identity() if norm_type == "frn" else nn.LeakyReLU(0.2, inplace=False),
+                TLU(out_ch) if norm_type == "frn" else nn.LeakyReLU(0.2, inplace=False),
             )
             self.pre_layers.append(block)
 
@@ -1948,7 +2036,7 @@ class ImageDiscriminator(nn.Module):
             nn.Sequential(
                 nn.utils.spectral_norm(nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias)),
                 make_norm(ndf * nf_mult),
-                nn.Identity() if norm_type == "frn" else nn.LeakyReLU(0.2, inplace=False),
+                TLU(ndf * nf_mult) if norm_type == "frn" else nn.LeakyReLU(0.2, inplace=False),
             )
         )
 

@@ -441,11 +441,7 @@ if __name__ == "__main__":
     )
 
     # flag to exclude next obs in dataset
-    parser.add_argument(
-        "--exclude-next-obs", 
-        action='store_true',
-        help="(optional) exclude next obs in dataset",
-    )
+    parser.add_argument( "--exclude-next-obs",  action='store_true', help="(optional) exclude next obs in dataset")
 
     # flag to compress observations with gzip option in hdf5
     parser.add_argument(

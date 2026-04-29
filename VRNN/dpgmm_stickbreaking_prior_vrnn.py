@@ -1128,7 +1128,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
     def compute_gradient_penalty_patch(self, D2d, real_x, fake_x, device, mask_flat=None):
         N = real_x.size(0)
-        alpha = torch.rand(N, 1, 1, 1, device=device)
+        alpha = torch.FloatTensor(np.random.random((N, 1, 1, 1))).to(device)
         x_hat = (alpha * real_x + (1 - alpha) * fake_x).requires_grad_(True)
         d_hat = D2d(x_hat).mean(dim=(1, 2, 3))
         grads = torch.autograd.grad(
@@ -1164,10 +1164,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         fake_images: torch.Tensor, #[B, T, C, H, W]
         latents: torch.Tensor,  #[B, T, Cz, Ht, Wt] 
         sequence_lengths: Optional[torch.Tensor] = None,
-        WGAN_GP_Coeff: float = 5.0,
+        WGAN_GP_Coeff: float = 10.0,
         lambda_consistency: float = 0.4,
-        lambda_temporal_lecam: float = 0.1,
-        lambda_patch_lecam: float = 0.1,
+        lambda_temporal_lecam: float = 0.2,
+        lambda_patch_lecam: float = 0.2,
     ) -> Dict[str, torch.Tensor]:
         """
         Training step for both discriminators

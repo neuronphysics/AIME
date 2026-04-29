@@ -1,4 +1,4 @@
-from __future__ import annotations
+ffrom __future__ import annotations
 import os
 import math
 import json
@@ -377,15 +377,24 @@ def to_float_image_tchw(x: np.ndarray) -> torch.Tensor:
     if x.ndim == 3:
         x = x[None, ...]
     assert x.ndim == 4
-    if x.shape[-1] == 3:
-        x = np.transpose(x, (0,3,1,2))  # T,C,H,W
-    elif x.shape[1] == 3:
+    # RoboMimic image observations are usually channel-last uint8: [T,H,W,3].
+    # This also supports multiple concatenated RGB cameras: [T,H,W,3*num_cams].
+    if x.shape[-1] >= 1 and (x.shape[-1] == 1 or x.shape[-1] % 3 == 0):
+        x = np.transpose(x, (0, 3, 1, 2))  # T,C,H,W
+    elif x.shape[1] >= 1 and (x.shape[1] == 1 or x.shape[1] % 3 == 0):
         # already T,C,H,W
         pass
     else:
-        raise ValueError(f"Unexpected image shape {x.shape}; expected (...,3) channel last or channel-first.")
-    x = x.astype(np.float32) / 255.0
-    x = x * 2.0 - 1.0
+        raise ValueError(
+            f"Unexpected image shape {x.shape}; expected channel-last or channel-first RGB-like images."
+        )
+
+    x = x.astype(np.float32)
+    # uint8 / [0,255] -> [0,1]. If already [0,1] or [-1,1], preserve the scale.
+    if x.max() > 1.5:
+        x = x / 255.0
+    if x.min() >= 0.0:
+        x = x * 2.0 - 1.0
     return torch.from_numpy(x)
 
 def resize_tchw(x: torch.Tensor, size: int) -> torch.Tensor:
@@ -475,6 +484,7 @@ class RoboMimicSequenceDataset(Dataset):
         obs_group_name: str = "obs",
         max_sequences_per_demo: Optional[int] = None,
         seed: int = 0,
+        file_id: int = 0,
         augmenter: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ):
         super().__init__()
@@ -487,6 +497,8 @@ class RoboMimicSequenceDataset(Dataset):
         self.img_size = int(img_size)
         self.max_sequences_per_demo = max_sequences_per_demo
         self.seed = int(seed)
+        self.file_id = int(file_id)
+        self.demo_to_idx = {d: i for i, d in enumerate(self.demo_keys)}
         self.augmenter = augmenter
 
         self._h5: Optional[h5py.File] = None  # opened lazily per worker
@@ -594,11 +606,17 @@ class RoboMimicSequenceDataset(Dataset):
         else:
             done = torch.from_numpy(dones_arr[action_start:action_start + self.sequence_length])
 
+        local_demo_idx = int(self.demo_to_idx.get(demo, 0))
+        # Unique numeric id for the demo across files, used by the DPGMM top-prior replay buffer.
+        episode_idx = self.file_id * 1_000_000 + local_demo_idx
+
         return {
             "observations": obs,
             "actions": actions,
             "done": done,
-            "meta": {"demo": demo, "start": int(start)},
+            "episode_idx": torch.tensor(episode_idx, dtype=torch.long),
+            "start_idx": torch.tensor(int(start), dtype=torch.long),
+            "meta": {"demo": demo, "start": int(start), "file_id": int(self.file_id)},
         }
 
 
@@ -793,6 +811,21 @@ class TrainConfig:
     max_sequences_per_demo: Optional[int] = None
     seed: int = 0
 
+    # data augmentation
+    use_zoom_aug: bool = False
+    zoom_prob: float = 0.6
+    zoom_area_min: float = 0.6
+    zoom_area_max: float = 0.85
+
+    # DPGMM top prior refresh
+    dpgmm_outer_batch_size: int = 256
+    dpgmm_outer_n_laps: int = 4
+    refresh_top_prior_every: int = 1
+
+    # model update helpers
+    use_ema: bool = True
+    use_schedulers: bool = True
+
     # train
     batch_size: int = 30
     num_workers: int = 4
@@ -945,7 +978,9 @@ class RoboMimicTrainer:
                 img_size=cfg.img_size,
                 max_sequences_per_demo=cfg.max_sequences_per_demo,
                 seed=cfg.seed + fi,
+                file_id=fi,
                 obs_group_name=obs_group_name,
+                augmenter=train_augmenter,
             )
             eval_ds_i = RoboMimicSequenceDataset(
                 path, eval_demos, obs_keys,
@@ -954,7 +989,9 @@ class RoboMimicTrainer:
                 img_size=cfg.img_size,
                 max_sequences_per_demo=min(cfg.max_sequences_per_demo or 10**9, 2000) if cfg.max_sequences_per_demo else 2000,
                 seed=cfg.seed + 1000 + fi,
+                file_id=fi,
                 obs_group_name=obs_group_name,
+                augmenter=None,
             )
 
             if getattr(train_ds_i, "action_dim", None) is not None:
@@ -1351,7 +1388,18 @@ class RoboMimicTrainer:
                 if done is not None:
                     done = done.to(self.device, non_blocking=True)
 
-                # Training step happens inside the model (optimizers inside model)
+                # Stable sequence IDs let the DPGMM top-prior replay buffer recognize
+                # posterior samples from the same RoboMimic demo / start time.
+                seq_ids = None
+                if "episode_idx" in batch and "start_idx" in batch:
+                    episode_idx = batch["episode_idx"].to(self.device, dtype=torch.long, non_blocking=True)
+                    start_idx = batch["start_idx"].to(self.device, dtype=torch.long, non_blocking=True)
+                    abs_t0 = start_idx + int(self.cfg.frame_stack) - 1
+                    seq_ids = torch.bitwise_left_shift(episode_idx.to(torch.int64), 32) + abs_t0.to(torch.int64)
+
+                # Training step happens inside the model (optimizers inside model).
+                # collect_top_buffer=True is important: otherwise the ConditionalTopDPGMM
+                # never receives posterior top-latent samples for epoch-end VI updates.
                 losses = self.model.training_step_sequence(
                     observations=obs,
                     actions=act,
@@ -1361,6 +1409,8 @@ class RoboMimicTrainer:
                     lambda_img=self.cfg.lambda_img,
                     lambda_recon=self.cfg.lambda_recon,
                     batch_idx=self.global_step,
+                    collect_top_buffer=True,
+                    seq_ids=seq_ids,
                 )
 
                 # tqdm postfix (cheap live feedback)
@@ -1462,6 +1512,28 @@ class RoboMimicTrainer:
                         print(f"[warn] image logging failed: {e}")
 
                 self.global_step += 1
+
+            # Epoch-end DPGMM update. This mirrors the DMC-VB trainer:
+            # first collect posterior top latents during teacher-forced training,
+            # then fit/refresh the frozen conditional top prior before eval/rollout.
+            try:
+                if hasattr(self.model, "top_replay_buffer") and hasattr(self.model, "refresh_top_prior_from_buffer"):
+                    top_buffer_size = len(self.model.top_replay_buffer)
+                    epoch_metrics.setdefault("top_buffer_size", []).append(float(top_buffer_size))
+                    do_refresh = (
+                        top_buffer_size > 0
+                        and int(getattr(self.cfg, "refresh_top_prior_every", 1)) > 0
+                        and (epoch % int(getattr(self.cfg, "refresh_top_prior_every", 1)) == 0)
+                    )
+                    if do_refresh:
+                        self.model.refresh_top_prior_from_buffer(
+                            batch_size=int(getattr(self.cfg, "dpgmm_outer_batch_size", 256)),
+                            n_laps=int(getattr(self.cfg, "dpgmm_outer_n_laps", 4)),
+                        )
+                    if hasattr(self.model, "top_prior_model"):
+                        epoch_metrics.setdefault("top_prior_K", []).append(float(self.model.top_prior_model.K))
+            except Exception as e:
+                print(f"[warn] top-prior refresh failed: {e}")
 
             # epoch average logs
             avg = {k: float(np.mean(v)) for k, v in epoch_metrics.items() if len(v) > 0}
@@ -1638,6 +1710,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rollout_context_frames", type=int, default=4)
     p.add_argument("--rollout_horizon", type=int, default=8)
 
+    # DPGMM top-prior refresh. Keep these small for a smoke test.
+    p.add_argument("--dpgmm_outer_batch_size", type=int, default=256)
+    p.add_argument("--dpgmm_outer_n_laps", type=int, default=4)
+    p.add_argument("--refresh_top_prior_every", type=int, default=1)
+
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--seed", type=int, default=0)
 
@@ -1679,6 +1756,16 @@ def main():
         train_fraction=args.train_fraction,
         max_sequences_per_demo=(None if args.max_sequences_per_demo == 0 else int(args.max_sequences_per_demo)),
         seed=args.seed,
+
+        use_zoom_aug=bool(args.use_zoom_aug),
+        zoom_prob=float(args.zoom_prob),
+        zoom_area_min=float(args.zoom_area_min),
+        zoom_area_max=float(args.zoom_area_max),
+        dpgmm_outer_batch_size=int(args.dpgmm_outer_batch_size),
+        dpgmm_outer_n_laps=int(args.dpgmm_outer_n_laps),
+        refresh_top_prior_every=int(args.refresh_top_prior_every),
+        use_ema=(not bool(args.no_ema)),
+        use_schedulers=(not bool(args.no_schedulers)),
 
         batch_size=args.batch_size,
         num_workers=args.num_workers,
