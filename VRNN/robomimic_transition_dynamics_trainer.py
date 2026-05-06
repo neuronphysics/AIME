@@ -21,7 +21,6 @@ import h5py
 from torch.utils.data import ConcatDataset
 import wandb  
 from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoencoder
-from VRNN.warp import image_warp
 from VRNN.grad_diagnostics import GradDiagnosticsAggregator
 from VRNN.visualize_latent_clusters import visualize_dpgmm_clustering
 from torchvision.utils import make_grid
@@ -1243,78 +1242,6 @@ class RoboMimicTrainer:
         grid = make_grid(torch.cat([ctxp, gtp, prp], dim=0), nrow=nrow, padding=2)
         self.writer.add_image(tag, grid, global_step=epoch)
 
-    @torch.no_grad()
-    def tb_log_warp_panel(self, epoch: int, b: int = 0, t: int = 1, tag: str = "viz/warp_panel", max_flow_frac: float = 0.25):
-        """
-        Ported from dmc_vb trainer. Uses model.forward_sequence capture_flow_ctx + image_warp for robust flow visualization.
-        """
-        if self.writer is None:
-            return
-        self.model.eval()
-
-        if self._tb_viz_batch is None:
-            self._tb_viz_batch = next(iter(self.eval_loader))
-
-        batch = self._tb_viz_batch
-        observations = batch["observations"].to(self.device)
-        actions = batch["actions"].to(self.device)
-        dones = batch.get("done", None)
-        if dones is not None:
-            dones = dones.to(self.device)
-
-        B, T, C, H, W = observations.shape
-        b = int(max(0, min(b, B - 1)))
-        t = int(max(1, min(t, T - 1)))
-
-        obs_short  = observations[:, :t+1]
-        act_short  = actions[:, :t+1]
-        done_short = dones[:, :t+1] if dones is not None else None
-
-        out = self.model.forward_sequence(obs_short, act_short, done_short, capture_flow_ctx=(b, t))
-
-        x_prev = observations[b, t-1:t]
-        x_tgt  = observations[b, t:t+1]
-        x_prev01 = self._to01(x_prev[:, -3:]).float()
-        x_tgt01  = self._to01(x_tgt[:, -3:]).float()
-
-        e_prev = self.model.canny(x_prev01).clamp(0,1).float() if hasattr(self.model, "canny") else torch.zeros((1,1,H,W), device=self.device)
-        e_tgt  = self.model.canny(x_tgt01 ).clamp(0,1).float() if hasattr(self.model, "canny") else torch.zeros((1,1,H,W), device=self.device)
-
-        ctx = out.get("captured_flow_ctx", None)
-        if ctx is None:
-            flow_ctx_dim = getattr(self.model, "flow_ctx_dim", 64)
-            ctx = torch.zeros((1, flow_ctx_dim, H, W), device=self.device, dtype=torch.float32)
-        else:
-            ctx = ctx.to(device=self.device, dtype=torch.float32)
-            if (ctx.shape[-2], ctx.shape[-1]) != (H, W):
-                ctx = F.interpolate(ctx, size=(H, W), mode="bilinear", align_corners=False)
-
-        max_flow_full = max(H, W) * float(max_flow_frac)
-
-        flow_bw = out.get("captured_flow_bw", None)
-        if flow_bw is None:
-            # fallback
-            flow_state0 = torch.zeros((1, 128, H, W), device=self.device, dtype=torch.float32)
-            a_t = actions[b:b+1, t - 1]
-            if hasattr(self.model, "_predict_flow_one_step"):
-                flow_bw, _ = self.model._predict_flow_one_step(
-                    x01=x_tgt01, e=e_tgt, ctx=ctx, a_t=a_t,
-                    state=flow_state0, first=(t == 1), direction="bw"
-                )
-            else:
-                flow_bw = torch.zeros((1,2,H,W), device=self.device, dtype=torch.float32)
-        else:
-            flow_bw = flow_bw.to(device=self.device, dtype=torch.float32)
-
-        # warp prev -> current
-        x_prev_to_cur = image_warp(x_prev01, flow_bw).clamp(0,1)
-        rgb_err = (x_prev_to_cur - x_tgt01).abs().mean(dim=1, keepdim=True).repeat(1,3,1,1)
-
-        flow_rgb = flow_to_hsv_rgb(flow_bw, max_flow=max_flow_full)
-        # panel: prev | tgt | warped | flow | err
-        panel = torch.cat([x_prev01, x_tgt01, x_prev_to_cur, flow_rgb, rgb_err], dim=0)
-        grid = make_grid(panel, nrow=5, padding=2)
-        self.writer.add_image(tag, grid, global_step=epoch)
 
     @torch.no_grad()
     def tb_log_latent_tsne(self, epoch: int, tag: str = "viz/latent_tsne"):
@@ -1507,7 +1434,7 @@ class RoboMimicTrainer:
                     try:
                         self.tb_log_reconstruction(epoch, tag="viz/reconstruction_step", max_frames=min(8, self.cfg.sequence_length))
                         self.tb_log_future_prediction(epoch, tag="viz/future_step")
-                        self.tb_log_warp_panel(epoch, tag="viz/warp_step", t=min(2, self.cfg.sequence_length-1))
+                        
                     except Exception as e:
                         print(f"[warn] image logging failed: {e}")
 
@@ -1562,7 +1489,6 @@ class RoboMimicTrainer:
                 try:
                     self.tb_log_reconstruction(epoch)
                     self.tb_log_future_prediction(epoch)
-                    self.tb_log_warp_panel(epoch, tag="viz/warp_panel", t=min(3, self.cfg.sequence_length-1))
                     self.tb_log_latent_tsne(epoch)
                 except Exception as e:
                     print(f"[warn] epoch viz failed: {e}")

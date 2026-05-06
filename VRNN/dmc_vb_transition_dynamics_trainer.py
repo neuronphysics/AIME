@@ -32,7 +32,7 @@ from torch.utils.tensorboard import SummaryWriter
 from VRNN.dpgmm_stickbreaking_prior_vrnn import DPGMMVariationalRecurrentAutoencoder
 """Download data :gsutil -m cp -r gs://dmc_vision_benchmark/dmc_vision_benchmark/locomotion/humanoid_walk/medium ./transition_data/dmc_vb/humanoid_walk/"""
 from torch.utils.data._utils.collate import default_collate
-from VRNN.grad_diagnostics import GradDiagnosticsAggregator  
+from VRNN.grad_diagnostics import GradDiagnosticsAggregator
 from contextlib import contextmanager
 import matplotlib
 from pathlib import Path
@@ -40,8 +40,8 @@ from distutils.util import strtobool
 from VRNN.visualize_latent_clusters import visualize_dpgmm_clustering
 def str2bool(v):
     return bool(strtobool(v))
-    
-os.environ["MPLBACKEND"] = "Agg" 
+
+os.environ["MPLBACKEND"] = "Agg"
 SCRIPT_DIR = Path(__file__).resolve().parent
 PARENT_DIR = SCRIPT_DIR.parent
 
@@ -75,13 +75,13 @@ class FIDScore:
         """
         # Convert from [-1, 1] to [0, 255]
         images = (images + 1) /2.0  # Scale from [-1, 1] to [0, 1]
-        
+
         # Resize to Inception input size
         images = F.interpolate(images.float(), size=(299, 299))
         # Apply ImageNet normalization
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         images = normalize(images)
-        
+
         return images
 
     def get_features(self, images):
@@ -94,7 +94,7 @@ class FIDScore:
         """
         if not isinstance(images, torch.Tensor):
             raise ValueError("Input must be a torch tensor")
-            
+
         if len(images.shape) != 4:
             raise ValueError(f"Input must be a 4D tensor (B,C,H,W), got shape {images.shape}")
 
@@ -103,7 +103,7 @@ class FIDScore:
             preprocessed_images = self.preprocess_images(images)
             # Extract features
             features = self.inception(preprocessed_images.to(self.device))
-            
+
         return features
 
     def calculate_statistics(self, features):
@@ -117,13 +117,13 @@ class FIDScore:
         """
         features = features.cpu().numpy()
         mu = np.mean(features, axis=0)
-        
+
         # Compute covariance
         sigma = np.cov(features, rowvar=False)
         return mu, sigma
 
     def calculate_frechet_distance(self, mu1, sigma1, mu2, sigma2):
-    
+
         """
         Calculate Frechet distance between two sets of statistics.
         Args:
@@ -170,24 +170,24 @@ class FIDScore:
             # Move images to correct device
             real_images = real_images.to(self.device)
             fake_images = fake_images.to(self.device)
-            
+
             # Extract features
             real_features = self.get_features(real_images)
             fake_features = self.get_features(fake_images)
-            
+
             # Calculate statistics
             mu1, sigma1 = self.calculate_statistics(real_features)
             mu2, sigma2 = self.calculate_statistics(fake_features)
-            
+
             # Calculate FID score
             fid_score = self.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
-            
+
             return fid_score
-            
+
         except Exception as e:
             print(f"Error calculating FID: {str(e)}")
             return float('inf')
-        
+
 def compute_metrics(model, test_loader, device, writer, global_step, max_samples=100):
     """Compute clustering metrics and image quality metrics."""
     model.eval()
@@ -501,7 +501,7 @@ class HumanoidAwareZoomTransform:
 
 class DMCVBInfo:
     """PyTorch version of DMC Vision Benchmark info"""
-    
+
     DMC_INFO = {
         'humanoid': {
             'task_name': 'walk',
@@ -511,15 +511,15 @@ class DMCVBInfo:
             'cameras': ('pixels',),
         }
     }
-    
+
     @staticmethod
     def get_action_dim(domain_name: str) -> int:
         return DMCVBInfo.DMC_INFO[domain_name]['action_dim']
-    
+
     @staticmethod
     def get_state_dim(domain_name: str) -> int:
         return DMCVBInfo.DMC_INFO[domain_name]['state_dim']
-    
+
     @staticmethod
     def get_camera_fields(domain_name: str, target_hidden: bool = False) -> tuple:
         return DMCVBInfo.DMC_INFO[domain_name]['cameras']
@@ -529,50 +529,50 @@ class TFRecordConverter:
     @staticmethod
     def decode_zlib_observation(obs_bytes: bytes, target_shape=(64, 64, 3)) -> Optional[np.ndarray]:
         """
-        
+
         This implementation embodies principles of information recovery through
         reversible compression transforms, revealing the underlying visual manifold.
         """
-        
+
         try:
             # Phase 1: Decompress using zlib
             decompressed = zlib.decompress(obs_bytes)
-            
+
             # Phase 2: Convert to numpy array
             obs_array = np.frombuffer(decompressed, dtype=np.uint8)
-            
+
             # Phase 3: Reshape to canonical dimensions
             height, width, channels = target_shape
-    
-            return obs_array.reshape(height, width, channels)        
-                
+
+            return obs_array.reshape(height, width, channels)
+
         except zlib.error as e:
             print(f"Zlib decompression failed: {e}")
-            return None       
-         
+            return None
+
     @staticmethod
     def parse_tfrecord_episode(tfrecord_path: Path, action_dim:int) -> Dict[str, np.ndarray]:
         """
         Robust TFRecord parser acknowledging compressed observation encoding
         """
-        
+
         dataset = tf.data.TFRecordDataset(str(tfrecord_path))
-        
+
         # Accumulate all timesteps for complete episode reconstruction
         timesteps = []
-        
+
         for idx, raw_record in enumerate(dataset):
             example = tf.train.Example()
             example.ParseFromString(raw_record.numpy())
-            
+
             features = example.features.feature
-            
+
             # Check if this is an episode boundary marker
             if 'episode_id' in features or 'episode_length' in features:
                 continue  # Skip metadata records
-            
+
             timestep_data = {}
-            
+
             # Robust observation decoding with compression awareness
             if 'steps/observation/pixels' in features:
                 obs_bytes = features['steps/observation/pixels'].bytes_list.value[0]
@@ -589,14 +589,14 @@ class TFRecordConverter:
                         # This leverages internal heuristics for JPEG/PNG/BMP/GIF detection
                         obs_tensor = tf.io.decode_image(obs_bytes, channels=3)
                         obs = obs_tensor.numpy()
-                    
+
                         timestep_data['observation'] = obs
-                    
+
                     except Exception as e:
                         print(f"Observation decoding failed for timestep: {e}")
                         # Critical: Continue to next timestep rather than attempting fallback
                         continue
-            
+
             # Parse actions with robustness
             if 'steps/action' in features:
                 action_bytes= features['steps/action'].bytes_list.value[0]
@@ -609,20 +609,20 @@ class TFRecordConverter:
                         continue
                 else:
                     action_values = np.frombuffer(action_bytes, dtype=np.float64)
-                
+
                 # Validate action dimension
                 if len(action_values) == action_dim:
                     timestep_data['action'] = action_values
                 else:
                     print(f"Unexpected action dimension: {len(action_values)}")
                     continue
-            
+
             # Parse rewards
             if 'steps/reward' in features:
                 reward_values = features['steps/reward'].float_list.value
                 if reward_values:
                     timestep_data['reward'] = float(reward_values[0])
-            
+
             # Parse termination flags
             for flag_name in ['is_first', 'is_last', 'is_terminal']:
                 feature_key = f'steps/{flag_name}'
@@ -630,43 +630,43 @@ class TFRecordConverter:
                     flag_values = features[feature_key].int64_list.value
                     if flag_values:
                         timestep_data[flag_name] = int(flag_values[0])
-            
+
             # Only add complete timesteps
             if 'observation' in timestep_data and 'action' in timestep_data:
                 timesteps.append(timestep_data)
-        
+
         # Reconstruct episode from timesteps
         episode_data = {}
-        
+
         if timesteps:
             # Stack observations
             episode_data['observation_pixels'] = np.stack([t['observation'] for t in timesteps])
-            
+
             # Stack actions
             episode_data['action'] = np.stack([t['action'] for t in timesteps])
-            
+
             # Stack rewards
             episode_data['reward'] = np.array([t.get('reward', 0.0) for t in timesteps], dtype=np.float32)
-            
+
             # Construct done flags from termination indicators
             done_flags = []
             for i, t in enumerate(timesteps):
                 is_done = t.get('is_last', 0) or t.get('is_terminal', 0)
                 done_flags.append(float(is_done))
-            
+
             episode_data['done'] = np.array(done_flags, dtype=np.float32)
-            
+
             # Ensure at least one done flag
             if not np.any(episode_data['done']):
                 episode_data['done'][-1] = 1.0
-            
+
             episode_data['episode_length'] = len(timesteps)
-            
+
             print(f"Parsed episode: {episode_data['episode_length']} timesteps, "
                 f"observations shape: {episode_data['observation_pixels'].shape}")
-        
+
         return episode_data
-    
+
 
 class DMCVBDataset(Dataset):
     """PyTorch Dataset for DMC Vision Benchmark data"""
@@ -1005,17 +1005,17 @@ def list_frozen_params(model):
 def count_parameters(model, print_details=True):
     """
     Count the number of parameters in a model
-    
+
     """
     # Count total parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     non_trainable_params = total_params - trainable_params
-    
+
     # Count by module
     module_params = defaultdict(int)
     module_trainable = defaultdict(int)
-    
+
     for name, module in model.named_modules():
         if len(list(module.children())) == 0:  # Leaf modules only
             module_params[module.__class__.__name__] += sum(
@@ -1024,7 +1024,7 @@ def count_parameters(model, print_details=True):
             module_trainable[module.__class__.__name__] += sum(
                 p.numel() for p in module.parameters() if p.requires_grad
             )
-    
+
     component_params = {}
     component_map = {
         'encoder': 'vdvae.encoder',
@@ -1033,32 +1033,32 @@ def count_parameters(model, print_details=True):
         'rnn': '_rnn',
         'discriminators': 'image_discriminator'
     }
-    
+
     for comp_name, attr_names in component_map.items():
         if isinstance(attr_names, str):
             attr_names = [attr_names]
-        
+
         comp_total = 0
         for attr_name in attr_names:
             if hasattr(model, attr_name):
                 component = getattr(model, attr_name)
                 comp_total += sum(p.numel() for p in component.parameters())
-        
+
         if comp_total > 0:
             component_params[comp_name] = comp_total
-    
+
     if print_details:
         print("=" * 60)
         print(f"{'MODEL PARAMETER COUNT':^60}")
         print("=" * 60)
-        
+
         # Total summary
         print(f"\nTOTAL PARAMETERS OF MODEL")
         print(f"  Total:         {total_params:,}")
         print(f"  Trainable:     {trainable_params:,}")
         print(f"  Non-trainable: {non_trainable_params:,}")
         print(f"  Memory (MB):   {(total_params * 4) / (1024**2):.2f} (assuming float32)")
-        
+
         # Component breakdown
         if component_params:
             print(f"\nCOMPONENT BREAKDOWN")
@@ -1066,7 +1066,7 @@ def count_parameters(model, print_details=True):
             for name, count in sorted_components:
                 percentage = (count / total_params) * 100
                 print(f"  {name:15s}: {count:12,} ({percentage:5.1f}%)")
-        
+
         # Module type breakdown
         print(f"\nMODULE TYPE BREAKDOWN")
         sorted_modules = sorted(module_params.items(), key=lambda x: x[1], reverse=True)[:10]
@@ -1074,9 +1074,9 @@ def count_parameters(model, print_details=True):
             percentage = (count / total_params) * 100
             trainable = module_trainable[module_type]
             print(f"  {module_type:20s}: {count:12,} ({percentage:5.1f}%) [{trainable:,} trainable]")
-        
+
         print("=" * 60)
-    
+
     return {
         'total': total_params,
         'trainable': trainable_params,
@@ -1087,7 +1087,7 @@ def count_parameters(model, print_details=True):
 
 class GradientMonitor:
     """Comprehensive gradient flow diagnostic system for hierarchical architectures"""
-    
+
     def __init__(self, model, writer):
         self.model = model
         self.writer = writer
@@ -1095,7 +1095,7 @@ class GradientMonitor:
         self.gradient_cache = {}
         self.step_counter = 0
         self.global_step = 0
-        
+
     def _define_component_hierarchy(self):
         """Establish semantic groupings for architectural components"""
         return {
@@ -1105,7 +1105,7 @@ class GradientMonitor:
             'vrnn_core': ['_rnn', 'rnn_layer_norm'],
             'discriminators': ['image_discriminator']
         }
-    
+
     def compute_component_gradients(
         self,
         update_global_step: bool = True,
@@ -1165,11 +1165,11 @@ class GradientMonitor:
         """Generate comprehensive gradient flow visualization"""
         # Create stacked bar chart for component contributions
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-        
+
         components = list(component_grads.keys())
         values = list(component_grads.values())
         colors = plt.cm.viridis(np.linspace(0, 1, len(components)))
-        
+
         # Gradient magnitude distribution
         ax1.bar(components, values, color=colors)
         ax1.set_ylabel('Gradient Norm (L2)')
@@ -1181,7 +1181,7 @@ class GradientMonitor:
         percentages = [v/total_grad * 100 for v in values]
         ax2.pie(percentages, labels=components, autopct='%1.1f%%', colors=colors)
         ax2.set_title('Relative Gradient Contribution', y=-0.2)
-        
+
         self.writer.add_figure('gradient_analysis/component_distribution', fig, epoch)
         plt.close()
 
@@ -1317,7 +1317,7 @@ def flow_to_hsv_rgb(flow_bchw: torch.Tensor, mag_percentile: float = 99.0, eps: 
 
 class DMCVBTrainer:
     """Trainer for DPGMM-VRNN on DMC Vision Benchmark"""
-    
+
     def __init__(
         self,
         model: nn.Module,
@@ -1357,7 +1357,7 @@ class DMCVBTrainer:
             add_state= False,
             transform = common_transform
         )
-        
+
         self.eval_dataset = DMCVBDataset(
             data_dir=data_dir,
             domain_name=config['domain_name'],
@@ -1369,7 +1369,7 @@ class DMCVBTrainer:
             add_state= False,
             transform = common_transform
         )
-        
+
         # Setup dataloaders
         self.train_loader = DataLoader(
             self.train_dataset,
@@ -1379,7 +1379,7 @@ class DMCVBTrainer:
             collate_fn=safe_collate,
             pin_memory=True
         )
-        
+
         self.eval_loader = DataLoader(
             self.eval_dataset,
             batch_size=config['batch_size'],
@@ -1403,7 +1403,7 @@ class DMCVBTrainer:
         self.best_epoch = -1
         self.episode_length = self.train_dataset.min_episode_length
         # Setup wandb if configured
-        
+
         self.use_wandb = config.get('use_wandb', False) and self._try_init_wandb(config)
         if not self.use_wandb:
             log_dir = PARENT_DIR / "results" / "dpgmm_vrnn_dmc_vb" / "runs" / f"{config.get('experiment_name', 'dpgmm_vrnn')}_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -1412,8 +1412,8 @@ class DMCVBTrainer:
         else:
             self.writer = None
         self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
-        task_names = ["ELBO", "adversarial"]  
-        self._agg = GradDiagnosticsAggregator(task_names, 
+        task_names = ["ELBO", "adversarial"]
+        self._agg = GradDiagnosticsAggregator(task_names,
                                               component_groups=self.grad_monitor.component_groups,
                                               average_component_norms=True)
 
@@ -1447,16 +1447,16 @@ class DMCVBTrainer:
         """Train for one epoch"""
         self.model.train()
         # Calculate alpha for gradient normalization this epoch
-        
+
         epoch_metrics = defaultdict(list)
         self.epoch_disc_losses = {'image': []}
         total_loss =[]
         epoch_component_grads = defaultdict(list)
-        
+
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch} [Train]')
         beta_t = self.anneal_beta(epoch)
         for batch_idx, batch in enumerate(pbar):
-            
+
             # Move batch to device
             observations = batch['observations'].to(self.device)
             actions = batch['actions'].to(self.device)
@@ -1480,7 +1480,7 @@ class DMCVBTrainer:
                 lambda_img=self.config['lambda_img'],
                 lambda_recon=self.config['lambda_recon'],
                 batch_idx=batch_idx,
-                collect_top_buffer=True,   
+                collect_top_buffer=True,
                 seq_ids=seq_ids,
             )
             component_grads = self.grad_monitor.compute_component_gradients()
@@ -1488,10 +1488,10 @@ class DMCVBTrainer:
                 epoch_component_grads[component].append(grad_norm)
             if 'img_disc_loss' in losses:
                 self.epoch_disc_losses['image'].append(
-                losses['img_disc_loss'].item() if torch.is_tensor(losses['img_disc_loss']) 
+                losses['img_disc_loss'].item() if torch.is_tensor(losses['img_disc_loss'])
                 else losses['img_disc_loss']
                 )
-            
+
             # Track metrics
             for key, value in losses.items():
                 if isinstance(value, torch.Tensor):
@@ -1505,10 +1505,10 @@ class DMCVBTrainer:
                 'kl_z': losses['kl_z'].item() if torch.is_tensor(losses['kl_z']) else losses['kl_z'],
                 'beta': f'{beta_t:.3f}',
             })
-        
+
         # Compute epoch averages
         avg_metrics = {f'train/{k}': np.mean(v) for k, v in epoch_metrics.items()}
-        avg_img_disc_loss = np.mean(self.epoch_disc_losses['image']) 
+        avg_img_disc_loss = np.mean(self.epoch_disc_losses['image'])
         self.model.img_disc_scheduler.step(avg_img_disc_loss)
         avg_metrics['train/img_disc_lr'] = self.model.img_disc_optimizer.param_groups[0]['lr']
 
@@ -1517,7 +1517,7 @@ class DMCVBTrainer:
         avg_metrics['train/gen_lr'] = self.model.gen_optimizer.param_groups[0]['lr']
 
         avg_component_grads = {
-                 component: np.mean(grads) 
+                 component: np.mean(grads)
                  for component, grads in epoch_component_grads.items()
        }
         self.grad_monitor.visualize_gradient_flow(avg_component_grads, epoch)
@@ -1528,21 +1528,21 @@ class DMCVBTrainer:
         avg_metrics['train/top_buffer_size'] = len(self.model.top_replay_buffer)
 
         return avg_metrics
-    
+
     def evaluate(self, epoch: int) -> Dict[str, float]:
         """Evaluate model performance"""
         self.model.eval()
         eval_metrics = defaultdict(list)
-        
-        
+
+
         with torch.no_grad():
             pbar = tqdm(self.eval_loader, desc=f'Epoch {epoch} [Eval]')
-            
+
             for batch in pbar:
                 observations = batch['observations'].to(self.device)
                 actions = batch['actions'].to(self.device)
                 dones = batch['done'].to(self.device)
-                
+
                 # Forward pass and compute losses
                 vae_losses, outputs = self.model.compute_total_loss(
                     observations=observations,
@@ -1552,19 +1552,20 @@ class DMCVBTrainer:
                     lambda_recon =self.config['lambda_recon'],
                     collect_top_buffer=False
                 )
-                
+
                 # Track metrics
                 for key, value in vae_losses.items():
                     if isinstance(value, torch.Tensor):
                         value = value.item()
                     eval_metrics[key].append(value)
-                
+
                 # 1. Reconstruction quality (PSNR)
                 recon = outputs['reconstructions']
                 psnr = self.compute_psnr(observations, recon, dones)
-                eval_metrics['psnr'].append(psnr.item())       
-                
-        if epoch % 20 == 0:
+                eval_metrics['psnr'].append(psnr.item())
+
+        visualize_every = int(self.config.get('visualize_every', 4))
+        if visualize_every > 0 and epoch % (2 * visualize_every) == 0:
             with torch.no_grad():
                 num_samples = 16
                 samples =self.model.sample(num_samples)
@@ -1579,7 +1580,7 @@ class DMCVBTrainer:
                         'epoch': epoch,
                     }, step=epoch)
             save_path = str(self.ckpt_dir / f"dpgmm_prior_tsne_epoch_{epoch:04d}.png")
-            
+
             try:
                 fig = visualize_dpgmm_clustering(
                     model=self.model,
@@ -1593,6 +1594,12 @@ class DMCVBTrainer:
                     t_select=8,            # choose which frame from the sequence
                 )
                 plt.close(fig)
+                if self.use_wandb:
+                    wandb.log({
+                        'eval/slot_prior_diagnostics': wandb.Image(save_path),
+                        'epoch': epoch,
+                    }, step=epoch)
+
             except Exception as e:
                 # Never crash training because a diagnostic plot failed.
                 print(f"[eval] Warning: visualize_dpgmm_clustering failed at epoch {epoch}: {type(e).__name__}: {e}")
@@ -1680,7 +1687,7 @@ class DMCVBTrainer:
 
             vae_t1   = denorm(futures["vae_future"][i, 0, -3:])
             vae_t2   = denorm(futures["vae_future"][i, 1, -3:])
-            
+
             def show(ax, img, title):
                 ax.imshow(img.permute(1, 2, 0).detach().cpu().numpy())
                 ax.set_title(title)
@@ -1753,9 +1760,9 @@ class DMCVBTrainer:
                     lambda_recon=self.config["lambda_recon"],
                 )
 
-                # Same ELBO combination 
+                # Same ELBO combination
                 elbo_loss = self.config["lambda_recon"] * vae_losses["recon_loss"] + self.config["beta"] * vae_losses["kl_z"]
-                    
+
 
 
                 # Optional adversarial term – we DO NOT want grads into D's params
@@ -1768,7 +1775,7 @@ class DMCVBTrainer:
                         p.requires_grad_(False)
 
                     recon = outputs["reconstructions"]
-                     
+
                     z_seq = outputs["z_seq_maps"]
                     fake = D(recon, z=z_seq, return_features=True)
                     adv_loss = -fake["final_score"].mean()
@@ -1782,8 +1789,8 @@ class DMCVBTrainer:
                 lambda_img_eff = (
                     self.config["lambda_img"] * warmup_factor
                     if warmup_factor > 0.0 else 0.0
-                )                
-                
+                )
+
                 task_losses = [elbo_loss, lambda_img_eff * adv_loss]
 
                 # Let GradDiagnosticsAggregator handle backward() etc.
@@ -1805,7 +1812,7 @@ class DMCVBTrainer:
                 )
 
         finally:
-            # detach outputs 
+            # detach outputs
             for k, v in list(outputs.items()):
                 if isinstance(v, torch.Tensor):
                     outputs[k] = v.detach().cpu()
@@ -1909,7 +1916,7 @@ class DMCVBTrainer:
 
     def visualize_results(self, epoch: int):
         """
-        
+
         Cols = [Original, Recon]
         """
         self.model.eval()
@@ -1923,7 +1930,7 @@ class DMCVBTrainer:
         # random eval minibatch
         batch_idx = random.randint(0, len(self.eval_loader) - 1)
         for i, eval_batch in enumerate(self.eval_loader):
-            if i == batch_idx: 
+            if i == batch_idx:
                 break
         eval_obs     = eval_batch['observations'].to(self.device)
         eval_actions = eval_batch['actions'].to(self.device)
@@ -1976,7 +1983,7 @@ class DMCVBTrainer:
 
         plt.tight_layout()
         if self.use_wandb:
-            
+
             # Convert figure to image for wandb
             wandb.log({
                 f'visualizations/train_eval_epoch_{epoch}': wandb.Image(fig),
@@ -1988,7 +1995,7 @@ class DMCVBTrainer:
         else:
             if not os.path.exists('visualizations'):
                 os.makedirs('visualizations')
-            plt.savefig(f'visualizations/train_eval_epoch_{epoch}.png', dpi=150, bbox_inches='tight')    
+            plt.savefig(f'visualizations/train_eval_epoch_{epoch}.png', dpi=150, bbox_inches='tight')
 
         plt.close(fig)
 
@@ -1998,7 +2005,7 @@ class DMCVBTrainer:
         Args:
         image: Tensor of shape [C, H, W] or [B, C, H, W]
         to_uint8: If True, convert to uint8 (0-255), else keep as float (0-1)
-    
+
         Returns:
         numpy array of shape [H, W, C] or [B, H, W, C]
 
@@ -2009,7 +2016,7 @@ class DMCVBTrainer:
         else:
             squeeze_batch = False
 
-        
+
         img = (img + 1) / 2
         img = torch.clamp(img, 0, 1)
         img = img.cpu().permute(0,2,3,1).numpy()
@@ -2017,7 +2024,7 @@ class DMCVBTrainer:
         if squeeze_batch:
             img = img[0]
         return img
-    
+
     def denormalize_for_grid(self, img):
         """For torchvision.make_grid: [-1,1] → [0,1] float"""
         img = (img + 1) / 2
@@ -2033,7 +2040,7 @@ class DMCVBTrainer:
             'metrics_history': dict(self.metrics_history),
             'best_eval_loss': self.best_eval_loss
         }
-        
+
         # Save regular checkpoint
         if epoch % 10 == 0:
            checkpoint_path = self.ckpt_dir / f"checkpoint_epoch_{epoch:04d}.pt"
@@ -2042,7 +2049,7 @@ class DMCVBTrainer:
         if is_best:
             best_path = self.ckpt_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
-    
+
     def train(self, n_epochs: int, visualize_steps: int = 8):
         """Main training loop"""
         print(f"Starting training for {n_epochs} epochs...")
@@ -2052,34 +2059,34 @@ class DMCVBTrainer:
         self.model.ema_vdvae.register()
 
         for epoch in range(n_epochs):
-            
+
             self.model.current_epoch = epoch
-            
+
             # Train
             train_metrics = self.train_epoch(epoch)
             prior_metrics = {}
             if len(self.model.top_replay_buffer) > 0:
                 self.model.refresh_top_prior_from_buffer(batch_size=self.config.get('dpgmm_outer_batch_size', 256), n_laps=self.config.get('dpgmm_outer_n_laps', 4))
-                
+
 
             prior_metrics = {"train/top_prior_K": float(self.model.top_prior_model.K)}
             # Evaluate
             eval_metrics = self.evaluate(epoch)
-            self.run_grad_diag(max_B=1, max_T=visualize_steps, use_amp=False)            
+            self.run_grad_diag(max_B=1, max_T=visualize_steps, use_amp=False)
             # Combine metrics
             all_metrics = {**train_metrics, **prior_metrics, **eval_metrics}
-            
+
             # Log metrics
             if self.use_wandb:
                 wandb.log(all_metrics, step=epoch)
             elif self.writer:
                 for key, value in all_metrics.items():
                     self.writer.add_scalar(key, value, epoch)
-            
+
             # Store metrics
             for key, value in all_metrics.items():
                 self.metrics_history[key].append(value)
-            
+
             # Print summary
             print(f"\nEpoch {epoch} Summary:")
             print(f"  Train Loss: {train_metrics.get('train/total_gen_loss', 0):.4f}")
@@ -2092,21 +2099,21 @@ class DMCVBTrainer:
             if epoch % self.config['visualize_every'] == 0:
                 self.visualize_results(epoch)
                 self.visualize_two_step_prediction(epoch, T_ctx=8)
-                
-            
+
+
             # Save checkpoint
             if epoch % self.config['checkpoint_every'] == 0:
                 self.save_checkpoint(epoch)
 
             del train_metrics, eval_metrics, all_metrics
-            
+
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             gc.collect()
         # Cleanup
         if self.writer:
             self.writer.close()
-        
+
         print("Training completed!")
 
 def parse_args():
@@ -2170,11 +2177,11 @@ def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
         # data / task
         "data_dir", "domain_name", "task_name", "policy_level",
         # model
-        "max_components", "latent_dim", "hidden_dim", 
+        "max_components", "latent_dim", "hidden_dim",
         # training
         "batch_size", "sequence_length", "learning_rate", "n_epochs",
         "num_workers", "beta_min", "beta_max", "beta_warmup_epochs",
-        "beta_eval", "lambda_img", "lambda_recon", 
+        "beta_eval", "lambda_img", "lambda_recon",
         "grad_clip", "n_critic",
         # logging
         "experiment_name",
@@ -2201,11 +2208,11 @@ def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
 def main():
     """Main training script"""
     torch.autograd.set_detect_anomaly(True) #check issues with gradients
-    
+
     args = parse_args()
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')  # Enable TensorFloat32 cores
-    torch.cuda.empty_cache()  
+    torch.cuda.empty_cache()
     # Additional foundational configurations
 
     # Configuration
@@ -2215,7 +2222,7 @@ def main():
         'domain_name': 'humanoid',
         'task_name': 'walk',
         'policy_level': 'all',
-        
+
         # Model settings
         'max_components': 15,
         'latent_dim': 56,
@@ -2226,7 +2233,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 23,
+        'batch_size': 22,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 1,
@@ -2240,14 +2247,14 @@ def main():
         'beta_min': 0.5,
         'beta_max': 1.0,
         'beta_warmup_epochs': 20,  # 20–50 is common
-        'beta_eval': 1.0,          # force eval to use full KL 
-        
+        'beta_eval': 1.0,          # force eval to use full KL
+
         # Loss weights
         'beta': 1.0,
         'lambda_img': 1.0,
         'lambda_recon': 1.0,
         'grad_clip': 1.0,
-        'n_critic': 1,       
+        'n_critic': 1,
         "use_dynamic_weight_average": False,
         # Logging
         'use_wandb': False,
@@ -2262,14 +2269,14 @@ def main():
     print("=== Final config ===")
     for k, v in config.items():
         print(f"{k}: {v}")
-    print("====================")    
+    print("====================")
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
+
     # Get action dimension from dataset
     action_dim = DMCVBInfo.get_action_dim(config['domain_name'])
-    
+
     # Initialize model
     model = DPGMMVariationalRecurrentAutoencoder(
         max_components=config['max_components'],
@@ -2300,7 +2307,7 @@ def main():
         config=config,
         device=device
     )
-    
+
     # Train
     trainer.train(n_epochs=config['n_epochs'])
 
