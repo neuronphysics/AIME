@@ -278,11 +278,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.top_slot_iters = self.top_slot_iters
         H.slot_diversity_weight = self.slot_diversity_weight
         H.top_slot_decoder_hidden = 4 * H.width
-        # ---- 2) Instantiate VDVAE (no prior yet) ----
+        # ---- 2) Instantiate VDVAE ----
         self.vdvae = VDVAE(
             H,
             prior=None,              # we'll set self.prior separately
-            top_kl_weight=2.0,
+            top_kl_weight=1.0,
             prior_kl_mc_samples=prior_mc_samples,
         ).to(self.device)
         # ---- 3) Extract top block latent dim & resolution ----
@@ -292,7 +292,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.zdim = C                           # spatial resolution (e.g. 8)
         self.top_zdim = C * res * res
 
-        self.top_H = res #TODO:Is this correct?
+        self.top_H = res 
         self.top_W = res
         self.top_num_slots = int(H.top_num_slots)
         self.top_slot_dim = int(H.top_slot_dim)
@@ -303,6 +303,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             init_components = self.init_components,
             dp_alpha = self.prior_alpha,
             prior_beta0 = self.prior_beta,
+            gate_lr = self._lr * 0.2,
             birth_kfresh = 4,
             birth_resp_threshold = 0.03,
             device=self.device,
@@ -640,7 +641,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 min_lr=1e-7,
             )
 
-    def refresh_top_prior_from_buffer(self, batch_size: int =128, n_laps: int =4):
+    def refresh_top_prior_from_buffer(self, batch_size: int =256, n_laps: int =4):
         if self.top_replay_buffer.is_empty():
             return
         structural_allowed = self.current_epoch >= self.unfreeze_structural_warmup_epochs

@@ -14,11 +14,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-
 from vdvae.top_dpgmm_prior import ConditionalTopDPGMM, compute_slot_kl_conditional_frozen, sample_slots_conditional_frozen
 from umap import UMAP  # type: ignore
-
-
 
 def _to_minus1_1(x: torch.Tensor) -> torch.Tensor:
     """Convert uint8 [0,255] or float [0,1]/[-1,1] into float [-1,1]."""

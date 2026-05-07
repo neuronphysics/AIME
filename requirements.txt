@@ -14,7 +14,6 @@ colorama
 contextlib2
 contourpy
 crafter
-cupy
 cycler
 Cython==0.29.37
 decorator
@@ -96,7 +95,6 @@ PyOpenGL
 pyparsing
 python-dateutil
 pytorch-ranger
-pytorch3d
 pytz
 PyWavelets
 PyYAML

@@ -639,6 +639,7 @@ class VDVAE(HModule):
         mask_t=None,
         prev_latents=None,
         get_latents=False,
+        slot_repulsion_tau =1.0,
     ):
         activations = self.encoder.forward(x)
 
@@ -683,6 +684,29 @@ class VDVAE(HModule):
 
         rate_gauss = rate_gauss / ndims
         dp_rate = torch.zeros_like(distortion_per_pixel)
+        slot_div_loss = torch.zeros_like(distortion_per_pixel)
+
+        slot_div_w = float(getattr(self.H, "slot_diversity_weight", 0.0))
+
+        if slot_div_w > 0.0:
+            d2 = torch.cdist(top_slot_mu, top_slot_mu, p=2) ** 2
+            slots = F.normalize(top_slot_mu, dim=-1, eps=torch.finfo(top_slot_mu.dtype).eps)
+            sim = torch.einsum("bsd,btd->bst", slots, slots)
+
+            S = top_slot_mu.shape[1]
+            eye = torch.eye(
+                S,
+                device=top_slot_mu.device,
+                dtype=top_slot_mu.dtype,
+            )[None]  # [1, S, S]
+
+            off = 1.0 - eye  # remove diagonal/self-comparisons
+
+            denom = S * (S - 1) + torch.finfo(top_slot_mu.dtype).eps
+
+            slot_div_img = ((sim * off) ** 2).sum(dim=(1, 2)) / denom
+
+            slot_div_loss = slot_div_w *( slot_div_img + (torch.exp(-d2/slot_repulsion_tau) * off).sum(dim(1,2)) / denom
         dp_kl_img = None
 
         if self.top_prior is not None and bool(getattr(self, "top_prior_ready", False)) and self.top_prior_snapshot is not None and self.top_prior_gate is not None and h_prior_top is not None and top_slot_mu is not None and top_slot_logsigma is not None:
@@ -694,37 +718,16 @@ class VDVAE(HModule):
                 slot_mu=top_slot_mu,
                 slot_logsigma=top_slot_logsigma,
             )
-            slot_div_loss = torch.zeros_like(distortion_per_pixel)
 
-            slot_div_w = float(getattr(self.H, "slot_diversity_weight", 0.0))
-
-            if slot_div_w > 0.0:
-                slots = F.normalize(top_slot_mu, dim=-1, eps=torch.finfo(top_slot_mu.dtype).eps)
-                sim = torch.einsum("bsd,btd->bst", slots, slots)
-
-                S = top_slot_mu.shape[1]
-                eye = torch.eye(S, device=top_slot_mu.device, dtype=top_slot_mu.dtype)[None]
-
-                off_diag = sim * (1.0 - eye)
-
-                slot_div_img = (off_diag ** 2).sum(dim=(1, 2)) / (S * (S - 1) + 1e-8)
-
-                slot_div_loss = slot_div_w * slot_div_img 
-            dp_rate = self.top_kl_weight * dp_kl_img  / ndims + slot_div_loss
-        total_rate = rate_gauss + dp_rate + top_slot_feature_loss + slot_entropy
+            dp_rate = self.top_kl_weight * dp_kl_img  / ndims 
+        total_rate = rate_gauss + dp_rate + top_slot_feature_loss + slot_entropy + slot_div_loss
         elbo_per_sample = distortion_per_pixel + total_rate
 
         if mask_t is None:
             reduce = torch.mean
-            valid_count = torch.tensor(
-                float(elbo_per_sample.shape[0]),
-                device=elbo_per_sample.device,
-            )
+            valid_count = torch.tensor(float(elbo_per_sample.shape[0]), device=elbo_per_sample.device)
         else:
-            vm = mask_t.float().view(-1).to(
-                device=elbo_per_sample.device,
-                dtype=elbo_per_sample.dtype,
-            )
+            vm = mask_t.float().view(-1).to(device=elbo_per_sample.device, dtype=elbo_per_sample.dtype)
             den = vm.sum().clamp(min=1.0)
             reduce = lambda z: (z * vm).sum() / den
             valid_count = den

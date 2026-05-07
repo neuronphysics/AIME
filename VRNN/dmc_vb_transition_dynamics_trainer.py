@@ -732,8 +732,8 @@ class DMCVBDataset(Dataset):
         else:
             policy_levels = ['expert', 'medium', 'mixed']
 
-        #subfolders = ['none', 'dynamic_medium', 'static_medium']
-        subfolders = ['none', 'static_medium']
+        subfolders = ['none', 'dynamic_medium', 'static_medium']
+        #subfolders = ['none', 'static_medium']
         base_dir = self.data_dir / "dmc_vb" / f"{self.domain_name}_{self.task_name}"
 
         for policy_level in policy_levels:
@@ -2207,8 +2207,6 @@ def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
 
 def main():
     """Main training script"""
-    torch.autograd.set_detect_anomaly(True) #check issues with gradients
-
     args = parse_args()
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')  # Enable TensorFloat32 cores
@@ -2234,6 +2232,7 @@ def main():
 
         # Training settings
         'batch_size': 22,
+        'dpgmm_outer_batch_size': 512,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 1,

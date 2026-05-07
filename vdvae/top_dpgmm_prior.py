@@ -1,33 +1,24 @@
 from __future__ import annotations
 """
-1) The gate is PREALLOCATED at max_components and never reconstructs nn.Linear
-   during birth/delete/merge. Active components are controlled by active_K.
-   This preserves optimizer state and avoids parameter-registration bugs.
 
-2) We only save/restore the mutable structural state needed for speculative moves.
-
-3) Speculative birth/merge/delete proposals keep the gate FROZEN.
-   The gate is refined only AFTER a proposal is accepted.
-
-4) Merge candidates are ranked with an analytic surrogate score computed from
+1) Merge candidates are ranked with an analytic surrogate score computed from
    sufficient statistics, then only the top few are evaluated exactly.
 
-5) Birth initialization uses divisive splitting along the dominant residual
+2) Birth initialization uses divisive splitting along the dominant residual
    variance direction instead of random seeding.
 
-6) The design remains close to Hughes & Sudderth 2013 memoized VI:
+3) The design remains close to Hughes & Sudderth 2013 memoized VI:
    - memoized batches
    - cached sufficient statistics
    - nonlocal birth/merge/delete on a global component bank and accept or reject number of clusters
 
-7) The prior remains conditional:
+4) The prior remains conditional:
        p(z_t^top | h_t) = sum_k pi_k(h_t) N(z_t^top ; mu_k, Sigma_k)
 
    with global component bank {mu_k, Sigma_k} and a context-conditioned
    Kumaraswamy gate over weights pi_k(h_t).
 
 Notes:
-- z_t^top stays tensor-shaped [C,H,W].
 - Replay buffer stores (h_t, z_t^top, posterior_mean, posterior_logvar, seq_id, t, mask).
 - During the online epoch, use a frozen snapshot of this prior for KL.
 - At epoch end, fit/update this model on replay-buffer posterior samples first, then freeze it for the next epoch.
@@ -68,6 +59,7 @@ def kumar2beta_kl(
     n_approx: int = 10,
     eps: float = 100 * torch.finfo(torch.float32).eps,
 ) -> torch.Tensor:
+    #equation (12): https://arxiv.org/pdf/1605.06197
     a = torch.clamp(a, min=eps, max=20)
     b = torch.clamp(b, min=eps, max=20)
     alpha = torch.clamp(alpha, min=eps)
@@ -243,6 +235,7 @@ class ReplayBufferConditional:
         batch_size: int,
         shuffle: bool = True,
     ) -> List[EpochBatch]:
+        
         if len(self._z) == 0:
             raise RuntimeError("Replay buffer is empty.")
         h = torch.cat(self._h, dim=0).contiguous()
@@ -439,7 +432,7 @@ class ConditionalTopDPGMM(nn.Module):
         prior_alpha0: float = 2.0,
         prior_beta0: float = 1.0,
         gate_hidden_dim: int = 256,
-        gate_lr: float = 1e-3,
+        gate_lr: float = 1e-4,
         gate_kl_weight: float = 1.0,
         birth_kfresh: int = 4,
         birth_resp_threshold: float = 0.10,
@@ -855,7 +848,8 @@ class ConditionalTopDPGMM(nn.Module):
         e_tau = alpha / beta.clamp_min(torch.finfo(beta.dtype).eps)
         residual_quad = (S2 - 2.0 * mean * S1 + Nk * mean.pow(2)).clamp_min(0.0)
         return 0.5 * (Nk * (e_log_tau - LOG2PI - (1.0 / kappa.clamp_min(torch.finfo(kappa.dtype).eps))) - e_tau * residual_quad).sum()
-
+    
+    @torch.no_grad()
     def global_objective(self) -> torch.Tensor:
         data_term = torch.tensor(0.0, device=self.device_, dtype=self.dtype)
         kl_gate = torch.tensor(0.0, device=self.device_, dtype=self.dtype)
