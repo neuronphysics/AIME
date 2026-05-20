@@ -3,8 +3,8 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=12
-#SBATCH --mem=100G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=160G
 #SBATCH --time=23:59:59
 #SBATCH --account=aip-irina
 #SBATCH --output=/home/m/memole/links/scratch/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.out
@@ -46,7 +46,7 @@ pip install setuptools
 python -m pip install "timm<1.0.0" --no-deps
 python -m pip install torchjd[full]
 python -m pip install huggingface-hub
-
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
 #python -m pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 
 

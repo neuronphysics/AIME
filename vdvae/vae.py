@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as ckpt
-from vdvae.vae_helpers import HModule,DmolNet, draw_gaussian_diag_samples, gaussian_analytical_kl, get_1x1, get_3x3, Block, SlotBottleneck
+from vdvae.vae_helpers import HModule,DmolNet, draw_gaussian_diag_samples, gaussian_analytical_kl, get_1x1, get_3x3, Block, TopSlotPosterior
 from VRNN.perceiver.modules import SelfAttentionBlock
 from VRNN.perceiver.position import FourierPositionEncoding
 from vdvae.top_dpgmm_prior import compute_top_kl_conditional_frozen, sample_top_conditional_frozen, ConditionalTopDPGMM, compute_slot_kl_conditional_frozen, sample_slots_conditional_frozen
@@ -219,13 +219,19 @@ class DecBlock(nn.Module):
         self.use_top_h = self.is_top and (self.top_h_dim > 0)
 
         if self.use_top_h:
-            # Raw-h concatenation only. No h projection.
-            self.enc = Block(
-                width * 2 + H.zdim + self.top_h_dim,
-                cond_width,
-                H.zdim * 2,
-                residual=False,
-                use_3x3=use_3x3,
+
+            self.top_cond_channels = self.top_h_dim + H.zdim
+
+            self.top_slot_posterior = TopSlotPosterior(
+                in_channels=width,          # encoder activation channels at top resolution
+                z_channels=H.zdim,
+                top_h=self.base,
+                top_w=self.base,
+                cond_channels=self.top_cond_channels,
+                cond_width=cond_width,
+                num_slots=int(getattr(H, "top_num_slots", 6)),
+                slot_dim=int(getattr(H, "top_slot_dim", H.zdim * 4)),
+                n_iters=int(getattr(H, "top_slot_iters", 3)),
             )
 
             self.resnet = Block(
@@ -260,16 +266,7 @@ class DecBlock(nn.Module):
                 residual=True,
                 use_3x3=use_3x3,
             )
-        if self.is_top:
-            self.slot_bottleneck = SlotBottleneck(
-                z_channels=H.zdim,
-                top_h=self.base,
-                top_w=self.base,
-                hidden_dim=int(getattr(H, "top_slot_decoder_hidden", H.zdim * 8)),
-                num_slots=int(getattr(H, "top_num_slots", 6)),
-                slot_dim=int(getattr(H, "top_slot_dim", H.zdim * 4)),
-                n_iters=int(getattr(H, "top_slot_iters", 3)),
-            )
+            
         self.z_proj = get_1x1(H.zdim, width)
         self.z_proj.weight.data *= np.sqrt(1 / n_blocks)
 
@@ -287,26 +284,21 @@ class DecBlock(nn.Module):
         extra = {}
 
         if self.is_top:
-            enc_in = torch.cat([x, acts, cond_top], dim=1)
-            qm, qv = self._maybe_ckpt(self.enc, enc_in).chunk(2, dim=1)
-            slot_out = self.slot_bottleneck(
-                top_q_mean_map=qm,
-            )
+            
+            slot_out = self._maybe_ckpt(self.top_slot_posterior, acts, cond_top)
 
+
+            qm = slot_out["top_q_mean_map"]
+            qv = slot_out["top_q_logsigma_map"]   # logsigma, not logvar
             z = slot_out["z_top_map"]
-
-            feat_loss = F.smooth_l1_loss(F.normalize(z, dim=1, eps=1e-6),F.normalize(qm.detach(), dim=1, eps=1e-6),reduction="none").mean(dim=(1, 2, 3))  # [B]
 
             extra = {
                 "slot_mu": slot_out["slot_mu"],
                 "slot_logsigma": slot_out["slot_logsigma"],
-                "slot_z": slot_out["slot_z"],
                 "slot_attn": slot_out["slot_attn"],
                 "slot_masks": slot_out["slot_masks"],
                 "slot_comp_maps": slot_out["slot_comp_maps"],
                 "z_top_map": z,
-                "slot_feat_loss": feat_loss,
-                "entropy": slot_out["entropy_reg"],
             }
             kl = torch.zeros_like(qm)
 
@@ -659,13 +651,11 @@ class VDVAE(HModule):
         top_q_logvar_map = None
         top_slot_mu = None
         top_slot_logsigma = None
-        top_slot_z = None
         top_slot_resp = None
         top_slot_attn = None
         top_slot_masks = None
         top_slot_comp_maps = None
-        top_slot_feature_loss = torch.zeros_like(distortion_per_pixel)
-        slot_entropy = torch.zeros_like(distortion_per_pixel)
+        
         for block, st in zip(self.decoder.dec_blocks, stats):
             kl_block = st["kl"].sum(dim=(1, 2, 3))
             if block.is_top:
@@ -673,12 +663,9 @@ class VDVAE(HModule):
                 top_q_logvar_map = st.get("posterior_logvar", None)
                 top_slot_mu = st.get("slot_mu", None)
                 top_slot_logsigma = st.get("slot_logsigma", None)
-                top_slot_z = st.get("slot_z", None)
                 top_slot_attn = st.get("slot_attn", None)
                 top_slot_masks = st.get("slot_masks", None)
                 top_slot_comp_maps = st.get("slot_comp_maps", None)
-                top_slot_feature_loss = st["slot_feat_loss"]
-                slot_entropy = st["entropy"]
             else:
                 rate_gauss = rate_gauss + kl_block
 
@@ -704,9 +691,9 @@ class VDVAE(HModule):
 
             denom = S * (S - 1) + torch.finfo(top_slot_mu.dtype).eps
 
-            slot_div_img = ((sim * off) ** 2).sum(dim=(1, 2)) / denom
+            slot_div_img = ((sim * off) ** 2).sum(dim=(1, 2)) 
 
-            slot_div_loss = slot_div_w *( slot_div_img + (torch.exp(-d2/slot_repulsion_tau) * off).sum(dim(1,2)) / denom
+            slot_div_loss = slot_div_w *( slot_div_img + (torch.exp(-d2/slot_repulsion_tau) * off).sum(dim=(1,2))) / denom
         dp_kl_img = None
 
         if self.top_prior is not None and bool(getattr(self, "top_prior_ready", False)) and self.top_prior_snapshot is not None and self.top_prior_gate is not None and h_prior_top is not None and top_slot_mu is not None and top_slot_logsigma is not None:
@@ -720,7 +707,7 @@ class VDVAE(HModule):
             )
 
             dp_rate = self.top_kl_weight * dp_kl_img  / ndims 
-        total_rate = rate_gauss + dp_rate + top_slot_feature_loss + slot_entropy + slot_div_loss
+        total_rate = rate_gauss + dp_rate + slot_div_loss
         elbo_per_sample = distortion_per_pixel + total_rate
 
         if mask_t is None:
@@ -745,13 +732,10 @@ class VDVAE(HModule):
             # Actual top slot posterior.
             "top_slot_mu": top_slot_mu,
             "top_slot_logsigma": top_slot_logsigma,
-            "top_slot_z": top_slot_z,
             "top_slot_resp": top_slot_resp,
             "top_slot_attn": top_slot_attn,
             "top_slot_masks": top_slot_masks,
             "top_slot_comp_maps": top_slot_comp_maps,
-            "top_slot_feature_loss": top_slot_feature_loss,
-            "slot_entropy_reg": slot_entropy,
             "current_latents": current_latents,
         }
         if dp_kl_img is not None:
@@ -782,12 +766,15 @@ class VDVAE(HModule):
         n_batch,
         h_prior_top,
         h_decoder_top,
+        cond_top, #added to fix issue with the inputs
         t=None,
         prev_latents=None,
         temperature: float =1.0,
     ):
-        slots_top = sample_slots_conditional_frozen(snapshot=self.top_prior_snapshot, frozen_gate=self.top_prior_gate, h_t=h_prior_top, num_slots = self.decoder.dec_blocks[0].slot_bottleneck.num_slots,temperature=temperature)
-        z_top_map, _, _ = self.decoder.dec_blocks[0].slot_bottleneck.slot_to_map(slots_top)
+        slots_mu, slots_var = sample_slots_conditional_frozen(snapshot=self.top_prior_snapshot, frozen_gate=self.top_prior_gate, h_t=h_prior_top, num_slots = self.decoder.dec_blocks[0].top_slot_posterior.num_slots,temperature=temperature)
+        slots_mu = slots_mu.contiguous()
+        slots_logsigma = 0.5 * torch.log(slots_var.clamp_min(torch.finfo(slots_var.dtype).eps)).contiguous()
+        _, _, z_top_map, _, _, _ = self.decoder.dec_blocks[0].top_slot_posterior.slot_to_top(slots_mu, slots_logsigma, cond_top )
         px_z, current_latents = self.decoder.forward_from_top_latent(
             z_top_map,
             t=t,

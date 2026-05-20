@@ -1362,12 +1362,13 @@ class DMCVBTrainer:
             data_dir=data_dir,
             domain_name=config['domain_name'],
             split='eval',
+            policy_level=config['policy_level'],   # ADD THIS
             sequence_length=config['sequence_length'],
             frame_stack=config['frame_stack'],
             img_height=config['img_height'],
             img_width=config['img_width'],
-            add_state= False,
-            transform = common_transform
+            add_state=False,
+            transform=common_transform
         )
 
         # Setup dataloaders
@@ -1581,28 +1582,53 @@ class DMCVBTrainer:
                     }, step=epoch)
             save_path = str(self.ckpt_dir / f"dpgmm_prior_tsne_epoch_{epoch:04d}.png")
 
+            fig = None
             try:
-                fig = visualize_dpgmm_clustering(
-                    model=self.model,
-                    dataloader=self.viz_loader,
-                    device=self.device,
-                    max_batches=10,       # keep it cheap
-                    max_samples=5000,
-                    perplexity=30.0,
-                    tsne_dims=3,
-                    save_path=save_path,
-                    t_select=8,            # choose which frame from the sequence
-                )
-                plt.close(fig)
+                self.model.eval()
+
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                with torch.inference_mode():
+                    fig = visualize_dpgmm_clustering(
+                        model=self.model,
+                        dataloader=self.viz_loader,
+                        device=self.device,
+                        max_batches=5,        # safer than 10
+                        max_samples=1000,     # safer than 5000
+                        perplexity=30.0,
+                        tsne_dims=3,          # safer than 3
+                        save_path=save_path,
+                        t_select=8,
+                    )
+
                 if self.use_wandb:
                     wandb.log({
-                        'eval/slot_prior_diagnostics': wandb.Image(save_path),
-                        'epoch': epoch,
+                        "eval/slot_prior_diagnostics": wandb.Image(save_path),
+                        "epoch": epoch,
                     }, step=epoch)
 
             except Exception as e:
                 # Never crash training because a diagnostic plot failed.
-                print(f"[eval] Warning: visualize_dpgmm_clustering failed at epoch {epoch}: {type(e).__name__}: {e}")
+                print(
+                    f"[eval] Warning: visualize_dpgmm_clustering failed at epoch {epoch}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+            finally:
+                if fig is not None:
+                    plt.close(fig)
+
+                plt.close("all")  # extra safe for matplotlib
+                del fig
+
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                if torch.cuda.is_available():
+                    torch.cuda.ipc_collect()
+
+                self.model.train()
         # Compute averages
         avg_metrics = {f'eval/{k}': np.mean(v) for k, v in eval_metrics.items()}
         pred_metrics = self.evaluate_two_step_prediction(epoch, num_batches=5, T_ctx=8)
@@ -2055,67 +2081,94 @@ class DMCVBTrainer:
         print(f"Starting training for {n_epochs} epochs...")
         print(f"Train dataset size: {len(self.train_dataset)}")
         print(f"Eval dataset size: {len(self.eval_dataset)}")
-        # Register EMA model
         self.model.ema_vdvae.register()
 
-        for epoch in range(n_epochs):
+        grad_diag_every    = int(self.config.get("grad_diag_every", 2))
+        grad_diag_start    = int(self.config.get("grad_diag_start_epoch", 1))
 
+        for epoch in range(n_epochs):
             self.model.current_epoch = epoch
 
-            # Train
+            # -------- Train --------
             train_metrics = self.train_epoch(epoch)
-            prior_metrics = {}
             if len(self.model.top_replay_buffer) > 0:
-                self.model.refresh_top_prior_from_buffer(batch_size=self.config.get('dpgmm_outer_batch_size', 256), n_laps=self.config.get('dpgmm_outer_n_laps', 4))
-
-
+                self.model.refresh_top_prior_from_buffer(
+                    batch_size=self.config.get('dpgmm_outer_batch_size', 128),
+                    n_laps=self.config.get('dpgmm_outer_n_laps', 4),
+                )
             prior_metrics = {"train/top_prior_K": float(self.model.top_prior_model.K)}
-            # Evaluate
+
+            # Release the train-side high-water mark before eval
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # -------- Evaluate --------
             eval_metrics = self.evaluate(epoch)
-            self.run_grad_diag(max_B=1, max_T=visualize_steps, use_amp=False)
-            # Combine metrics
+
+            # -------- Log / print / visualize / checkpoint --------
             all_metrics = {**train_metrics, **prior_metrics, **eval_metrics}
 
-            # Log metrics
             if self.use_wandb:
                 wandb.log(all_metrics, step=epoch)
             elif self.writer:
                 for key, value in all_metrics.items():
                     self.writer.add_scalar(key, value, epoch)
 
-            # Store metrics
             for key, value in all_metrics.items():
                 self.metrics_history[key].append(value)
 
-            # Print summary
             print(f"\nEpoch {epoch} Summary:")
             print(f"  Train Loss: {train_metrics.get('train/total_gen_loss', 0):.4f}")
-            print(f"  Eval Loss: {eval_metrics.get('eval/total_vae_loss', 0):.4f}")
-            print(f"  PSNR: {eval_metrics.get('eval/psnr', 0):.2f}")
+            print(f"  Eval Loss:  {eval_metrics.get('eval/total_vae_loss', 0):.4f}")
+            print(f"  PSNR:       {eval_metrics.get('eval/psnr', 0):.2f}")
             print(f"  Active Components: {train_metrics.get('train/effective_components', 0):.2f}")
-            print(f"  Top 6 components: {train_metrics.get('train/Top 6 coverage', 0):.3f}")
+            print(f"  Top 6 components:  {train_metrics.get('train/Top 6 coverage', 0):.3f}")
 
-            # Visualize periodically
             if epoch % self.config['visualize_every'] == 0:
                 self.visualize_results(epoch)
                 self.visualize_two_step_prediction(epoch, T_ctx=8)
 
-
-            # Save checkpoint
             if epoch % self.config['checkpoint_every'] == 0:
                 self.save_checkpoint(epoch)
 
-            del train_metrics, eval_metrics, all_metrics
-
+            # -------- End-of-epoch cleanup --------
+            del train_metrics, eval_metrics, all_metrics, prior_metrics
+            gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
-            gc.collect()
-        # Cleanup
+
+            # -------- Gradient diagnostics on the cleanest possible state --------
+            run_diag = (
+                grad_diag_every > 0
+                and epoch >= grad_diag_start
+                and (epoch - grad_diag_start) % grad_diag_every == 0
+            )
+            if run_diag:
+                try:
+                    self.run_grad_diag(
+                        max_B=1,
+                        max_T=visualize_steps,
+                        use_amp=False,
+                    )
+                except torch.cuda.OutOfMemoryError as e:
+                    print(
+                        f"[grad_diag] OOM at epoch {epoch}; skipping this "
+                        f"epoch's gradient diagnostics. {e}"
+                    )
+                    # Drop any half-built state
+                    
+                finally:
+                    self.model.zero_grad(set_to_none=True)
+                    self.model.train()  # ensure we're back in train mode
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                    
+
         if self.writer:
             self.writer.close()
-
         print("Training completed!")
-
+        
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train DPGMM-VRNN transition dynamics on DMC VB data"
@@ -2226,13 +2279,14 @@ def main():
         'latent_dim': 56,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
-        'prior_alpha': 20.0,  # Hyperparameters for prior
-        'prior_beta': 2.0,
+        'dp_alpha':1.0,
+        'prior_alpha': 4.0,  # Hyperparameters for prior
+        'prior_beta': 1.0,
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 22,
-        'dpgmm_outer_batch_size': 512,
+        'batch_size': 21,
+        'dpgmm_outer_batch_size': 256,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 1,
@@ -2243,7 +2297,7 @@ def main():
         'n_epochs': 200,
         'num_workers': 4,
 
-        'beta_min': 0.5,
+        'beta_min': 0.25,
         'beta_max': 1.0,
         'beta_warmup_epochs': 20,  # 20–50 is common
         'beta_eval': 1.0,          # force eval to use full KL
@@ -2261,7 +2315,8 @@ def main():
         'wandb_entity': 'zahrasheikh',
         'experiment_name': 'humanoid_walk_expert',
         'visualize_every': 4,
-        'checkpoint_every': 10
+        'checkpoint_every': 10,
+        'top_slot_dim': 64,
     }
     config = override_config_from_args(config, args)
 
@@ -2290,10 +2345,12 @@ def main():
         input_channels=config['input_channels'],
         learning_rate=config['learning_rate'],
         grad_clip= config['grad_clip'],
+        dp_alpha = config['dp_alpha'],
         prior_alpha =config['prior_alpha'],
         prior_beta = config['prior_beta'],
         dropout=config['dropout'],
         use_dwa = config["use_dynamic_weight_average"],
+        top_slot_dim = config["top_slot_dim"],
     )
 
 
