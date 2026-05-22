@@ -7,7 +7,7 @@ from torch import Tensor
 from einops import reduce
 import functools, math
 import pathlib
-
+from torch.utils.checkpoint import checkpoint as ckpt
 def assert_shape(actual: Union[torch.Size, Tuple[int, ...]], expected: Tuple[int, ...], message: str = ""):
     assert actual == expected, f"Expected shape: {expected} but passed shape: {actual}. {message}"
 
@@ -810,7 +810,7 @@ class SlotToTopPosterior(nn.Module):
     def forward(self, slot_mu, slot_logsigma, cond_top):
         B, S, D = slot_mu.shape
         assert D == self.slot_dim, (D, self.slot_dim)
-
+        slot_logsigma = slot_logsigma.clamp(-7.0, 3.0)
         slot_params = torch.cat([slot_mu, slot_logsigma], dim=-1)
 
         slot_grid = slot_params[:, :, :, None, None].expand(
@@ -822,12 +822,7 @@ class SlotToTopPosterior(nn.Module):
         cond = cond_top[:, None].expand(B, S, self.cond_channels, self.top_h, self.top_w)
 
         inp = torch.cat([slot_grid, pos, cond], dim=2)
-        inp = inp.reshape(
-            B * S,
-            2 * D + 4 + self.cond_channels,
-            self.top_h,
-            self.top_w,
-        )
+        inp = inp.reshape(B * S, 2 * D + 4 + self.cond_channels, self.top_h, self.top_w)
 
         out = self.net(inp)
         out = out.view(B, S, 2 * self.z_channels + 1, self.top_h, self.top_w)
@@ -850,6 +845,42 @@ class SlotToTopPosterior(nn.Module):
 
         return qm, qv, z_top_map, comp_mu, comp_logsigma, masks
 
+def slot_mask_regularization_from_masks(slot_masks: torch.Tensor, eps: float = 1e-8):
+    """
+    slot_masks: [B, S, 1, H, W] or [B, S, H, W]
+
+    Returns:
+        mask_entropy_per_img: [B]
+        mask_balance_per_img: [B]
+    """
+    if slot_masks.dim() == 5:
+        # [B, S, 1, H, W] -> [B, S, H, W]
+        if slot_masks.shape[2] != 1:
+            raise ValueError(f"Expected singleton channel dim, got {tuple(slot_masks.shape)}")
+        masks = slot_masks.squeeze(2)
+    elif slot_masks.dim() == 4:
+        masks = slot_masks
+    else:
+        raise ValueError(f"Expected [B,S,1,H,W] or [B,S,H,W], got {tuple(slot_masks.shape)}")
+
+    # Make sure masks sum to 1 over slots at each spatial location.
+    p = masks.clamp_min(eps)
+    p = p / p.sum(dim=1, keepdim=True).clamp_min(eps)
+
+    # Entropy over slots per spatial location, then average over spatial dims.
+    # Shape: [B]
+    mask_entropy_per_img = -(p * p.log()).sum(dim=1).mean(dim=(-1, -2))
+
+    # Average mass per slot. Shape: [B, S]
+    slot_usage = p.mean(dim=(-1, -2))
+
+    expected = torch.full_like(slot_usage, 1.0 / float(slot_usage.shape[1]))
+
+    # Shape: [B]
+    mask_balance_per_img = ((slot_usage - expected) ** 2).mean(dim=1)
+
+    return mask_entropy_per_img, mask_balance_per_img
+
 class TopSlotPosterior(nn.Module):
     def __init__(
         self,
@@ -863,6 +894,7 @@ class TopSlotPosterior(nn.Module):
         slot_dim,
         n_iters=3,
         logsigma_clamp=(-5.0, 3.0),
+        use_checkpoint=True,
     ):
         super().__init__()
         self.top_h = int(top_h)
@@ -871,7 +903,7 @@ class TopSlotPosterior(nn.Module):
         self.slot_dim = int(slot_dim)
         self.in_channels = int(in_channels)
         self.logsigma_clamp = logsigma_clamp
-
+        self.use_checkpoint = bool(use_checkpoint)
         # Position embedding must now match encoder feature channels.
         self.pre_pos = SoftPositionEmbed(
             hidden_size=in_channels,
@@ -897,7 +929,7 @@ class TopSlotPosterior(nn.Module):
             slot_size=slot_dim,
             qkv_size=slot_dim,
             num_iterations=n_iters,
-            mlp_size=4 * slot_dim,
+            mlp_size=2 * slot_dim,
             num_heads=1,
             weight_init=slot_weight_init,
         )
@@ -915,6 +947,15 @@ class TopSlotPosterior(nn.Module):
             use_3x3=True,
         )
 
+    def _maybe_ckpt(self, fn, *args):
+        if (
+            self.training
+            and self.use_checkpoint
+            and any(torch.is_tensor(a) and a.requires_grad for a in args)
+        ):
+            return ckpt(fn, *args, use_reentrant=False)
+        return fn(*args)
+
     def forward(self, acts_top, cond_top):
         B, C, H, W = acts_top.shape
         assert H == self.top_h and W == self.top_w, (H, W, self.top_h, self.top_w)
@@ -930,19 +971,27 @@ class TopSlotPosterior(nn.Module):
         init_logsigma = self.slots_init_logsigma(torch.arange(self.num_slots, device=acts_top.device)).unsqueeze(0).expand(B, -1, -1).to(dtype=tokens.dtype).clamp(*self.logsigma_clamp)
         init_slots = init_mu + torch.exp(init_logsigma) * torch.randn_like(init_mu)
 
-        attn_out = self.slot_attention(init_slots, tokens)
-        slots = attn_out["slots"]
-        slot_attn = attn_out["masks"]
+        def _slot_attention_fn(init_slots_, tokens_):
+            out = self.slot_attention(init_slots_, tokens_)
+            return out["slots"], out["masks"]
 
+        slots, slot_attn = self._maybe_ckpt(
+            _slot_attention_fn,
+            init_slots,
+            tokens,
+        )
         slot_mu = self.to_mu(slots)
         slot_logsigma = self.to_logsigma(slots).clamp(*self.logsigma_clamp)
 
-        qm, qv, z_top_map, comp_mu, comp_logsigma, comp_masks = self.slot_to_top(
+        def _slot_to_top_fn(slot_mu_, slot_logsigma_, cond_top_):
+            return self.slot_to_top(slot_mu_, slot_logsigma_, cond_top_)
+
+        qm, qv, z_top_map, comp_mu, comp_logsigma, comp_masks = self._maybe_ckpt(
+            _slot_to_top_fn,
             slot_mu,
             slot_logsigma,
             cond_top,
         )
-
         return {
             "slot_mu": slot_mu,
             "slot_logsigma": slot_logsigma,
@@ -960,12 +1009,15 @@ class TopSlotPosterior(nn.Module):
 
 @torch.jit.script
 def gaussian_analytical_kl(mu1, mu2, logsigma1, logsigma2):
+    logsigma1 = logsigma1.clamp(-7.0, 3.0)
+    logsigma2 = logsigma2.clamp(-7.0, 3.0)
     return -0.5 + logsigma2 - logsigma1 + 0.5 * (logsigma1.exp() ** 2 + (mu1 - mu2) ** 2) / (logsigma2.exp() ** 2)
 
 
 @torch.jit.script
 def draw_gaussian_diag_samples(mu, logsigma):
     eps = torch.empty_like(mu).normal_(0., 1.)
+    logsigma = logsigma.clamp(-7.0, 3.0)
     return torch.exp(logsigma) * eps + mu
 
 

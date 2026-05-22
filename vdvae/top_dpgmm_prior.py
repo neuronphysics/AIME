@@ -36,14 +36,13 @@ from vdvae.vae_helpers import Block
 LOG2PI = math.log(2.0 * math.pi)
 EULER_GAMMA = 0.5772156649
 
-
 def stable_logsumexp(x: torch.Tensor, dim: int) -> torch.Tensor:
     m = x.max(dim=dim, keepdim=True).values
     return m.squeeze(dim) + torch.log(torch.exp(x - m).sum(dim=dim).clamp_min(torch.finfo(x.dtype).eps))
 
 
 def sample_diag_gaussian(mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    return mean + torch.exp(0.5 * logvar) * torch.randn_like(mean)
+    return mean + torch.exp(0.5 * logvar.clamp(min=-7.0, max=4.0)) * torch.randn_like(mean)
 
 
 # Kumaraswamy / Beta helpers
@@ -684,7 +683,7 @@ class ConditionalTopDPGMM(nn.Module):
 
         if posterior_logvar is not None:
             # Use E_q[s^2] = mu^2 + var, not only mu^2.
-            var_q = torch.exp(posterior_logvar.detach()).clamp_min(1e-8)
+            var_q = torch.exp(posterior_logvar.clamp(min=-7.0, max=4.0).detach()).clamp_min(1e-8)
             second_moment = z * z + var_q
         else:
             second_moment = z * z
@@ -978,7 +977,7 @@ class ConditionalTopDPGMM(nn.Module):
 
         return fit + self.gate_kl_weight * kl
 
-    def gate_refine(self, n_steps: int = 5):
+    def gate_refine(self, n_steps: int = 5, l2_weight: float = 1e-4):
         if n_steps <= 0 or self.K <= 1:
             return
         self.gate.train()
@@ -989,10 +988,18 @@ class ConditionalTopDPGMM(nn.Module):
                 b = self.batches[bid]
                 self.gate_optimizer.zero_grad(set_to_none=True)
                 loss = self.gate_loss_on_batch(b, self.cache[bid].resp)
+                # L2 penalty on gate weights
+                if l2_weight > 0:
+                    l2 = torch.zeros((), device=loss.device, dtype=loss.dtype)
+                    for name, p in self.gate.named_parameters():
+                        if p.requires_grad and p.ndim > 1:   # avoid biases/norm scalars
+                            l2 = l2 + p.pow(2).sum()
+                    loss = loss + l2_weight * l2
+
                 if not loss.requires_grad:
                     continue
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.gate.parameters(), 5.0)
+                nn.utils.clip_grad_norm_(self.gate.parameters(), max_norm=0.5, norm_type=2.0)
                 self.gate_optimizer.step()
         self.gate.eval()
 
@@ -1181,56 +1188,64 @@ class ConditionalTopDPGMM(nn.Module):
         ent_delta = self._merge_entropy_delta(kA, kB)
         return float((ell_m - ell_sep - kl_m + kl_sep + ent_delta).item())
 
-    #  birth init
+    # birth init
     def _collect_birth_subset(self, target_k: int):
-        hs, zs, lvs = [], [], []
+        zs, lvs = [], []
         have_all_logvars = True
+        remaining = int(self.birth_subset_max)
 
-        for bid, b_cpu in enumerate(self.batches):
+        order = list(range(len(self.batches)))
+        random.shuffle(order)
+
+        for bid in order:
+            if remaining <= 0:
+                break
+
+            # responsibilities already depend on h_t through local_step/cache
             rk = self.cache[bid].resp[:, target_k]
-            keep = rk > self.birth_resp_threshold
+            keep_idx = torch.nonzero(
+                rk > self.birth_resp_threshold,
+                as_tuple=False,
+            ).flatten()
 
-            if keep.any():
-                b = self._move_batch(b_cpu)
-                z_fit = b.posterior_mean if b.posterior_mean is not None else b.z
+            if keep_idx.numel() == 0:
+                continue
 
-                hs.append(b.h[keep])
-                zs.append(z_fit[keep])
+            # IMPORTANT: subsample BEFORE moving/collecting tensors
+            if keep_idx.numel() > remaining:
+                perm = torch.randperm(
+                    keep_idx.numel(),
+                    device=keep_idx.device,
+                )[:remaining]
+                keep_idx = keep_idx.index_select(0, perm)
 
-                if b.posterior_logvar is not None:
-                    lvs.append(b.posterior_logvar[keep])
-                else:
-                    have_all_logvars = False
+            b = self._move_batch(self.batches[bid])
+            z_fit = b.posterior_mean if b.posterior_mean is not None else b.z
+
+            zs.append(z_fit.index_select(0, keep_idx).detach().cpu())
+
+            if b.posterior_logvar is not None:
+                lvs.append(b.posterior_logvar.index_select(0, keep_idx).detach().cpu())
+            else:
+                have_all_logvars = False
+
+            remaining -= int(keep_idx.numel())
+
+            del b, z_fit
 
         if len(zs) == 0:
-            h_empty = torch.empty(
-                (0,) + self.h_shape,
-                device=self.device_,
-                dtype=self.dtype,
-            )
             z_empty = torch.empty(
                 (0, self.C, self.H, self.W),
-                device=self.device_,
                 dtype=self.dtype,
             )
-            return h_empty, z_empty, None
+            return z_empty, None
 
-        h_sub = torch.cat(hs, dim=0)
-        z_sub = torch.cat(zs, dim=0)
+        z_sub = torch.cat(zs, dim=0).contiguous()
 
         lv_sub = None
         if have_all_logvars and len(lvs) == len(zs):
-            lv_sub = torch.cat(lvs, dim=0)
-
-        if z_sub.shape[0] > self.birth_subset_max:
-            perm = torch.randperm(z_sub.shape[0], device=z_sub.device)[: self.birth_subset_max]
-            h_sub = h_sub.index_select(0, perm)
-            z_sub = z_sub.index_select(0, perm)
-            if lv_sub is not None:
-                lv_sub = lv_sub.index_select(0, perm)
-
-        return h_sub, z_sub, lv_sub
-
+            lv_sub = torch.cat(lvs, dim=0).contiguous()
+        return z_sub, lv_sub
 
     #  structural edits
     @torch.no_grad()
@@ -1498,7 +1513,7 @@ class ConditionalTopDPGMM(nn.Module):
         old_obj = float(self.global_objective().item())
 
         target_k = self.choose_birth_target()
-        _, z_sub, lv_sub = self._collect_birth_subset(target_k)
+        z_sub, lv_sub = self._collect_birth_subset(target_k)
 
         Kfresh = int(Kfresh or self.birth_kfresh)
         Kfresh = min(Kfresh, self.max_components - self.K)
@@ -1788,11 +1803,7 @@ class ConditionalTopDPGMM(nn.Module):
 
             kappa = c.kappa
             if not torch.is_tensor(kappa):
-                kappa = torch.as_tensor(
-                    kappa,
-                    device=self.device_,
-                    dtype=self.dtype,
-                )
+                kappa = torch.as_tensor(kappa, device=self.device_, dtype=self.dtype)
             kappa = kappa.to(device=self.device_, dtype=self.dtype).clamp_min(eps)
 
             var_k = c.beta / (alpha - 1.0)
@@ -1803,12 +1814,12 @@ class ConditionalTopDPGMM(nn.Module):
         var = torch.stack(vars_pred, dim=0)
 
         return FrozenConditionalTopPrior(
-            comp_mean=mean.detach().clone(),
-            comp_var=var.detach().clone(),
-            gate_state={k: v.detach().clone() for k, v in self.gate.state_dict().items()},
+            comp_mean=mean.detach().clone().cpu().contiguous(),
+            comp_var=var.detach().clone().cpu().contiguous(),
+            gate_state={k: v.detach().clone().cpu() for k, v in self.gate.state_dict().items()},
             K=self.K,
             max_K=self.max_components,
-            objective=float(self.global_objective().item()),
+            objective=float(self.global_objective().detach().cpu().item()),
         )
 
     @staticmethod
@@ -1856,7 +1867,7 @@ class ConditionalTopDPGMM(nn.Module):
             frozen_gate, h_t
         )  # [B,K]
 
-        q_logvar = posterior_logvar.clamp(min=-20.0, max=10.0)
+        q_logvar = posterior_logvar.clamp(min=-7.0, max=5.0)
         q_var = torch.exp(q_logvar).clamp_min(1e-6)
         q_std = torch.sqrt(q_var)
 
@@ -1950,7 +1961,7 @@ def gaussian_kl_diag_to_components(
     returns:
         KL[q(s_k) || component_j] with shape [B, S, M]
     """
-    q_logvar = 2.0 * q_logsigma
+    q_logvar = 2.0 * q_logsigma.clamp(min=-7.0, max=4.0)
     q_var = torch.exp(q_logvar).clamp_min(eps)
 
     comp_var = comp_var.clamp_min(eps)

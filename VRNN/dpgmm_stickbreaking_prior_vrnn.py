@@ -81,12 +81,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         rollout_decoder_temperature: float = 1.0,
         patch_disc_layers: int = 4,
         patch_disc_ndf:int = 32,
-        latent_transport_hidden_features: tuple[int, ...] = (128, 128, 256),
+        latent_transport_hidden_features: tuple[int, ...] = (128, 128, 128),
         latent_transport_hidden_layers: int = 2,
         latent_transport_flow_scale: float = 1.0,
         lecam_ema_decay: float = 0.99,    # EMA decay for LeCam regularization anchors
         top_slot_iters: int = 3,
         slot_diversity_weight: float = 0.5,
+        mask_regularizer_weight: float = 0.2,
         top_slot_dim: Optional[int] = None,
         num_top_slots: Optional[int] = None,
         unfreeze_structural_warmup_epochs: int = 9,
@@ -111,7 +112,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.prior_alpha = float(prior_alpha)
         self.prior_beta = float(prior_beta)
         self.dp_alpha = float(dp_alpha)
-        self.init_components = min(6, int(max_components))
+        self.init_components = min(5, int(max_components))
         # Hyperparameters
         self._lr = learning_rate
         self._grad_clip = grad_clip
@@ -138,6 +139,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.lecam_ema_decay = float(lecam_ema_decay)
         self.num_top_slots = int(num_top_slots) if num_top_slots is not None else self.init_components
         self.slot_diversity_weight = float(slot_diversity_weight)
+        self.mask_regularizer_weight = float(mask_regularizer_weight)
         self.top_slot_dim = int(top_slot_dim) if top_slot_dim is not None else int(latent_dim * 2)
         self.top_slot_iters = int(top_slot_iters)
         self.unfreeze_structural_warmup_epochs = unfreeze_structural_warmup_epochs
@@ -264,7 +266,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.image_channels = self.input_channels   # usually 3
         H.zdim = self.latent_dim                 # or set explicitly (e.g., 16)
         H.bottleneck_multiple = 0.25
-        H.width = 72
+        H.width = 64
         H.image_size = self.image_size          # e.g. 64
         H.dataset = 'imagenet64'
         H.num_mixtures = 10
@@ -291,6 +293,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.top_slot_dim = self.top_slot_dim
         H.top_slot_iters = self.top_slot_iters
         H.slot_diversity_weight = self.slot_diversity_weight
+        H.mask_regularizer_weight = self.mask_regularizer_weight
         H.top_slot_decoder_hidden =  H.width
         
         # ---- 2) Instantiate VDVAE ----
@@ -319,10 +322,11 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             dp_alpha = self.dp_alpha,
             prior_alpha0 = self.prior_alpha,
             prior_beta0 = self.prior_beta,
-            gate_lr = self._lr * 0.2,
+            gate_hidden_dim = self.hidden_dim,
+            gate_lr = self._lr * 0.1,
             birth_kfresh = 10,
             birth_resp_threshold = 0.1,
-            birth_subset_max=8192,
+            birth_subset_max= 8192,
             device=self.device,
             dtype=torch.float32,
         )
@@ -382,10 +386,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         anchors = anchors - anchors.mean(dim=0, keepdim=True)
         anchors = F.normalize(anchors, dim=-1)
 
-        comp_std = torch.sqrt(
-            (beta0 / (alpha - 1.0).clamp_min(1e-3)).clamp_min(1e-6)
-        )
-
+        comp_std = torch.sqrt((beta0 / (alpha - 1.0).clamp_min(1e-3)).clamp_min(1e-6))
         radius = math.sqrt(2.0 * 1.5)
 
         prior.comp = []
@@ -550,7 +551,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         base_lr = float(learning_rate)
 
         lr_core  = base_lr * 1.0
-        lr_inr   = base_lr * 2.0
+        lr_inr   = base_lr * 0.5
         lr_state = base_lr * 1.0
 
         wd_core  = float(weight_decay)
@@ -949,10 +950,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             outputs["hidden_states"].append( h_context_next.permute(0, 2, 3, 1).contiguous().view(batch_size, Ht * Wt * self.hidden_dim).detach())
             outputs["z_seq_maps"].append(torch.cat([z_top_map.detach(), h_context_next.detach()], dim=1))
             outputs["reconstruction_losses"].append(vdvae_out["distortion"])
-            outputs["gauss_rate"].append(vdvae_out["gauss_rate"])
-            outputs["dp_rate"].append(vdvae_out["dp_rate"])
+            outputs["gauss_rate"].append(vdvae_out["gauss_rate"].detach())
+            outputs["dp_rate"].append(vdvae_out["dp_rate"].detach())
             outputs["kl_latents"].append(vdvae_out["rate"])
-            outputs["elbo"].append(vdvae_out["elbo"])
+            outputs["elbo"].append(vdvae_out["elbo"].detach())
 
         # Stack time-major tensors where downstream code expects [B, T, ...]
         for k in [

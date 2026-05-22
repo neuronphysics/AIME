@@ -806,12 +806,13 @@ class LatentTransportINR(nn.Module):
         init_spatial_gate: float = 1e-3,
         init_flow_gate: float = 1e-3,
         init_transport_gate: float = 1e-3,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.z_channels = int(z_channels)
         self.h_channels = int(h_channels)
         self.action_dim = int(action_dim)
-
+        self.use_checkpoint = bool(use_checkpoint)
         self.spatial_inr = SpatialLatentINR(
             z_channels=z_channels,
             hidden_features=hidden_features,
@@ -831,7 +832,14 @@ class LatentTransportINR(nn.Module):
         self.flow_gate_logit = nn.Parameter(self._inv_sigmoid(init_flow_gate))
         self.transport_gate_logit = nn.Parameter(self._inv_sigmoid(init_transport_gate))
 
-
+    def _maybe_ckpt(self, fn, *args):
+        if (
+            self.use_checkpoint
+            and self.training
+            and any(torch.is_tensor(a) and a.requires_grad for a in args)
+        ):
+            return checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
     @staticmethod
     def _inv_sigmoid(p: float, eps: float = torch.finfo(torch.float32).eps) -> torch.Tensor:
         """
@@ -882,35 +890,59 @@ class LatentTransportINR(nn.Module):
             raise ValueError(
                 f"h_t channels {h_t.shape[1]} do not match h_channels={self.h_channels}"
             )
+        if not torch.is_tensor(dt):
+            dt = torch.tensor(dt, device=z_top_prev.device, dtype=z_top_prev.dtype)
+        else:
+            dt = dt.to(device=z_top_prev.device, dtype=z_top_prev.dtype)
 
-        # 1) Build dense continuous latent field once, VideoINR-style
-        spatial_field, coord = self.spatial_inr.dense_field(z_top_prev, out_hw=(Ht, Wt))
-        alpha = torch.sigmoid(self.spatial_gate_logit)
-        spatial_field = alpha * spatial_field + z_top_prev  # gated residual to stabilize training at the start
+        def _transport_impl(z_prev_, h_, action_, dt_):
+            # 1) Build dense continuous latent field once, VideoINR-style
+            spatial_field, coord = self.spatial_inr.dense_field(
+                z_prev_,
+                out_hw=(Ht, Wt),
+            )
 
-        # 2) Predict continuous motion field on the same grid
-        motion = self.temporal_inr(
-            spatial_field_map=spatial_field,
-            h_t=h_t,
-            action_prev=action_prev,
-            dt=dt,
-            coord=coord,
+            alpha = torch.sigmoid(self.spatial_gate_logit)
+            spatial_field = alpha * spatial_field + z_prev_
+
+            # 2) Predict continuous motion field
+            motion = self.temporal_inr(
+                spatial_field_map=spatial_field,
+                h_t=h_,
+                action_prev=action_,
+                dt=dt_,
+                coord=coord,
+            )
+
+            flow_top_px = motion["flow_top_px"]
+
+            beta = torch.sigmoid(self.flow_gate_logit)
+            flow_top_px = beta * flow_top_px
+
+            # 3) Warp latent field
+            _, z_tilde = warpgrid(
+                tenInput=spatial_field,
+                tenFlow=flow_top_px,
+                device=spatial_field.device,
+            )
+
+            gamma = torch.sigmoid(self.transport_gate_logit)
+            z_tilde = gamma * z_tilde + (1.0 - gamma) * spatial_field
+
+            # 4) Top conditioning
+            cond_top = torch.cat([h_, z_tilde], dim=1)
+            h_decoder_top = h_
+
+            # Return tuple, not dict, because checkpoint is happier with tensor tuples.
+            return spatial_field, flow_top_px, z_tilde, cond_top, h_decoder_top
+
+        spatial_field, flow_top_px, z_tilde, cond_top, h_decoder_top = self._maybe_ckpt(
+            _transport_impl,
+            z_top_prev,
+            h_t,
+            action_prev,
+            dt,
         )
-        flow_top_px = motion["flow_top_px"]
-        beta = torch.sigmoid(self.flow_gate_logit)
-        flow_top_px = beta * flow_top_px  # gated scaling to stabilize training at the
-
-        # 3) Warp the dense continuous latent field to get transported latent z_tilde
-        _, z_tilde = warpgrid(
-            tenInput=spatial_field,
-            tenFlow=flow_top_px,
-            device=spatial_field.device,
-        )
-        gamma = torch.sigmoid(self.transport_gate_logit)
-        z_tilde = gamma * z_tilde + (1.0 - gamma) * spatial_field
-        # 4) Top conditioning s
-        cond_top = torch.cat([h_t, z_tilde], dim=1)
-        h_decoder_top = h_t
 
         return {
             "spatial_field": spatial_field,

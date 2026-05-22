@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as ckpt
-from vdvae.vae_helpers import HModule,DmolNet, draw_gaussian_diag_samples, gaussian_analytical_kl, get_1x1, get_3x3, Block, TopSlotPosterior
+from vdvae.vae_helpers import HModule,DmolNet, draw_gaussian_diag_samples, gaussian_analytical_kl, get_1x1, get_3x3, Block, TopSlotPosterior, slot_mask_regularization_from_masks
 from VRNN.perceiver.modules import SelfAttentionBlock
 from VRNN.perceiver.position import FourierPositionEncoding
 from vdvae.top_dpgmm_prior import compute_top_kl_conditional_frozen, sample_top_conditional_frozen, ConditionalTopDPGMM, compute_slot_kl_conditional_frozen, sample_slots_conditional_frozen
@@ -672,8 +672,9 @@ class VDVAE(HModule):
         rate_gauss = rate_gauss / ndims
         dp_rate = torch.zeros_like(distortion_per_pixel)
         slot_div_loss = torch.zeros_like(distortion_per_pixel)
-
+        mask_entropy_img, mask_balance_img = slot_mask_regularization_from_masks(top_slot_masks)
         slot_div_w = float(getattr(self.H, "slot_diversity_weight", 0.0))
+        mask_reg_w = float(getattr(self.H, "mask_regularizer_weight", 0.0))
 
         if slot_div_w > 0.0:
             d2 = torch.cdist(top_slot_mu, top_slot_mu, p=2) ** 2
@@ -707,7 +708,7 @@ class VDVAE(HModule):
             )
 
             dp_rate = self.top_kl_weight * dp_kl_img  / ndims 
-        total_rate = rate_gauss + dp_rate + slot_div_loss
+        total_rate = rate_gauss + dp_rate + slot_div_loss + mask_reg_w * (mask_entropy_img + 0.05 * mask_balance_img)
         elbo_per_sample = distortion_per_pixel + total_rate
 
         if mask_t is None:
@@ -773,7 +774,7 @@ class VDVAE(HModule):
     ):
         slots_mu, slots_var = sample_slots_conditional_frozen(snapshot=self.top_prior_snapshot, frozen_gate=self.top_prior_gate, h_t=h_prior_top, num_slots = self.decoder.dec_blocks[0].top_slot_posterior.num_slots,temperature=temperature)
         slots_mu = slots_mu.contiguous()
-        slots_logsigma = 0.5 * torch.log(slots_var.clamp_min(torch.finfo(slots_var.dtype).eps)).contiguous()
+        slots_logsigma = 0.5 * torch.log(slots_var.clamp_min(torch.finfo(slots_var.dtype).eps)).clamp(-7.0, 3.0).contiguous()
         _, _, z_top_map, _, _, _ = self.decoder.dec_blocks[0].top_slot_posterior.slot_to_top(slots_mu, slots_logsigma, cond_top )
         px_z, current_latents = self.decoder.forward_from_top_latent(
             z_top_map,

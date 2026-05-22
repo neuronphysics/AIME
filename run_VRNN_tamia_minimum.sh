@@ -46,7 +46,8 @@ pip install setuptools
 python -m pip install "timm<1.0.0" --no-deps
 python -m pip install torchjd[full]
 python -m pip install huggingface-hub
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+unset PYTORCH_CUDA_ALLOC_CONF
+export PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
 #python -m pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 
 

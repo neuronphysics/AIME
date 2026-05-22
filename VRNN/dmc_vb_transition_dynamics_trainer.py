@@ -2286,7 +2286,7 @@ def main():
 
         # Training settings
         'batch_size': 21,
-        'dpgmm_outer_batch_size': 256,
+        'dpgmm_outer_batch_size': 384,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 1,
@@ -2316,7 +2316,7 @@ def main():
         'experiment_name': 'humanoid_walk_expert',
         'visualize_every': 4,
         'checkpoint_every': 10,
-        'top_slot_dim': 64,
+        'top_slot_dim': 48,
     }
     config = override_config_from_args(config, args)
 
