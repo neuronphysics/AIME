@@ -31,7 +31,6 @@ from vdvae.vae import VDVAE
 from vdvae.hps import Hyperparams
 from vdvae.vae_helpers import mean_from_discretized_mix_logistic, sample_from_discretized_mix_logistic, draw_gaussian_diag_samples, Slot_Slot_Contrastive_Loss
 from vdvae.top_dpgmm_prior import ConditionalTopDPGMM, ReplayBufferConditional, TensorDiagComponentPosterior, sample_slots_conditional_frozen, compute_slot_kl_conditional_frozen
-from VRNN.flow_predict import LatentTransportINR
 
 @contextmanager
 def apply_emas(*emas):
@@ -80,10 +79,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         rollout_top_temperature: float = 1.0,   # sampling temperature for top prior
         rollout_decoder_temperature: float = 1.0,
         patch_disc_layers: int = 2,
-        patch_disc_ndf:int = 32,
-        latent_transport_hidden_features: tuple[int, ...] = (64, 64, 64),
-        latent_transport_hidden_layers: int = 2,
-        latent_transport_flow_scale: float = 1.0,
+        patch_disc_ndf:int = 36,
         lecam_ema_decay: float = 0.99,    # EMA decay for LeCam regularization anchors
         top_slot_iters: int = 3,
         slot_diversity_weight: float = 0.5,
@@ -105,9 +101,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.sequence_length = sequence_length
         self.device = device
         self.dropout = dropout
-        self.latent_transport_hidden_features = latent_transport_hidden_features
-        self.latent_transport_hidden_layers = latent_transport_hidden_layers
-        self.latent_transport_flow_scale = latent_transport_flow_scale
         self.prior_alpha = float(prior_alpha)
         self.prior_beta = float(prior_beta)
         self.dp_alpha = float(dp_alpha)
@@ -269,8 +262,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.dataset = 'imagenet64'
         H.num_mixtures = 10
         H.skip_threshold = 100.0
-        H.enc_blocks = "64x2,64d2,32x3"
-        H.dec_blocks = "32x3,64m32,64x2"
+        H.enc_blocks = "64x3,64d2,32x3"
+        H.dec_blocks = "32x3,64m32,64x3"
         H.attn_resolutions = []
         H.use_spatial_attn = False
         H.attn_where = "last"
@@ -292,7 +285,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.top_slot_iters = self.top_slot_iters
         H.slot_diversity_weight = self.slot_diversity_weight
         H.top_slot_decoder_hidden =  H.width
-        
+
         # ---- 2) Instantiate VDVAE ----
         self.vdvae = VDVAE(
             H,
@@ -307,7 +300,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.zdim = C                           # spatial resolution (e.g. 8)
         self.top_zdim = C * res * res
 
-        self.top_H = res 
+        self.top_H = res
         self.top_W = res
         self.top_num_slots = int(H.top_num_slots)
         self.top_slot_dim = int(H.top_slot_dim)
@@ -338,15 +331,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self._bootstrap_top_prior_state()
         self.top_prior_initialized_from_data = False
         self.overshoot_K = int(getattr(H, "overshoot_K", 8))
-        self.latent_transport = LatentTransportINR(
-            z_channels=self.zdim,
-            h_channels=int(self.vdvae.H.top_h_context_dim),
-            action_dim=self.action_dim,
-            hidden_features=list(self.latent_transport_hidden_features),
-            hidden_layers=int(self.latent_transport_hidden_layers),
-            flow_scale=float(self.latent_transport_flow_scale),
-            use_checkpoint=self.use_ctx_checkpoint,
-        ).to(self.device)
+
 
     @torch.no_grad()
     def _bootstrap_top_prior_state(self):
@@ -549,11 +534,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         base_lr = float(learning_rate)
 
         lr_core  = base_lr * 1.0
-        lr_inr   = base_lr * 0.5
         lr_state = base_lr * 1.0
 
         wd_core  = float(weight_decay)
-        wd_inr   = float(weight_decay) * 0.1
 
         # Special params first
         scalar_state_params = [
@@ -572,14 +555,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             exclude_params=special_exclude,
         )
 
-        inr_params = collect_unique_params(
-            getattr(self, "latent_transport", None),
-            exclude_params=special_exclude,
-        )
+
 
         gen_param_groups = []
         add_groups(gen_param_groups, core_params,  lr_core,  wd_core)
-        add_groups(gen_param_groups, inr_params,   lr_inr,   wd_inr)
 
 
         if scalar_state_params:
@@ -786,9 +765,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "elbo": [],
             "top_q_mean_map": [],
             "top_q_logvar_map": [],
-            "z_tilde_seq": [],
-            "flow_top_seq": [],
-            "cond_top_seq": [],
             "z_seq_maps": [],
             "top_slot_mu": [],
             "top_slot_logsigma": [],
@@ -832,21 +808,14 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             assert all(pl is None or pl.shape[0] == B or pl.shape[0] % B == 0 for pl in prev_latents)
             prev_latents = [None if pl is None else pl * (keep if pl.shape[0] == B else keep.repeat_interleave(pl.shape[0] // B, dim=0)) for pl in prev_latents]
             h_t = self.rnn.out_norm(core_state[0])  # [B, hidden_dim, topH, topW]
-            tr = self.latent_transport(
-                z_top_prev=z_prev_top_masked,
-                h_t=h_t,
-                action_prev=a_t,
-                dt=1.0,
-            )
+
 
             # Encode the current frame with VDVAE conditioned on current context
             x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
             vdvae_out = self.vdvae.forward(
                 x_t_nhwc,
                 x_t_nhwc,
-                cond_top=tr["cond_top"],
                 h_prior_top=h_t,
-                h_decoder_top=tr["h_decoder_top"],
                 mask_t=mask_t,
                 prev_latents=prev_latents,
                 get_latents=False,
@@ -897,9 +866,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             outputs["prior_pi"].append(pi_t)
             outputs["top_q_mean_map"].append(vdvae_out["top_q_mean_map"].detach())
             outputs["top_q_logvar_map"].append(vdvae_out["top_q_logvar_map"].detach())
-            outputs["z_tilde_seq"].append(tr["z_tilde"].detach())
-            outputs["flow_top_seq"].append(tr["flow_top_px"].detach())
-            outputs["cond_top_seq"].append(tr["cond_top"].detach())
             outputs["overshoot_z_prev_top"].append(z_prev_top)
             ##slot component outputs (for analysis / visualization)
             top_slot_mu = vdvae_out.get("top_slot_mu", None)
@@ -925,7 +891,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             if top_slot_attn is not None:
                 outputs["top_slot_attn"].append(top_slot_attn.detach())
 
-            
+
 
             # Decode reconstruction mean and log scalar VAE losses
             px_z = vdvae_out["px_z"]                         # [B*S,width+1,H,W]
@@ -958,8 +924,16 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     sample = self.vdvae.decoder.out_net.sample(vdvae_out["px_z"])
                     sample = torch.from_numpy(sample).to(device=device, dtype=torch.float32)
                     sample = sample.permute(0, 3, 1, 2).contiguous()/ 127.5 - 1.0 #TODO:is this correct
-                    
-                outputs["reconstruction_samples"].append(sample)
+                    N_sample, C_sample, H_sample, W_sample = sample.shape
+                    S_sample = N_sample // B
+
+                    # [B*S, 3, H, W] -> [B, S, 3, H, W]
+                    sample_slots = sample.view(B, S_sample, C_sample, H_img, W_img)
+
+                    # decoder_masks already has shape [B,S,1,H,W]
+                    sample_img = torch.sum(decoder_masks.detach() * sample_slots, dim=1)
+                    sample_img = sample_img.clamp(-1.0, 1.0)
+                outputs["reconstruction_samples"].append(sample_img)
             outputs["reconstructions"].append(recon_mean)
             outputs["latents"].append(z_top_state.detach())
             outputs["hidden_states"].append( h_context_next.permute(0, 2, 3, 1).contiguous().view(batch_size, Ht * Wt * self.hidden_dim).detach())
@@ -975,9 +949,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "core_h_maps",
             "core_c_maps",
             "core_m_maps",
-            "z_tilde_seq",
-            "flow_top_seq",
-            "cond_top_seq",
             "overshoot_z_prev_top",
             "z_seq_maps",
             "top_slot_mu",
@@ -1039,7 +1010,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             or self.vdvae.top_prior_gate is None
         ):
             return torch.zeros((), device=device, dtype=dtype)
-            
+
         if T < 2 or K <= 0:
             return torch.zeros((), device=device, dtype=dtype)
 
@@ -1117,12 +1088,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
             # 4) imagined top sample
             slot_block = self.vdvae.decoder.dec_blocks[0].top_slot_posterior
-            tr_roll = self.latent_transport(
-                z_top_prev=z_prev_top,
-                h_t=h_t,
-                action_prev=a_prev,
-                dt=1.0,
-            )
+
 
             slots_mu, slots_var = sample_slots_conditional_frozen(
                 snapshot=self.vdvae.top_prior_snapshot,
@@ -1134,7 +1100,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             slots_mu = slots_mu.contiguous()
             slots_logsigma = 0.5 * torch.log(slots_var.clamp_min(torch.finfo(slots_var.dtype).eps)).contiguous()
 
-            _, _, z_top_state, _, _, _ = slot_block.slot_to_top(slots_mu, slots_logsigma, tr_roll["cond_top"])
+            _, _, z_top_state, _, _, _ = slot_block.slot_to_top(slots_mu, slots_logsigma, h_t)
             # 5) latent 64 update, no decoder
             if actions is None:
                 a_cur = torch.zeros(BA, self.action_dim, device=device, dtype=dtype)
@@ -1561,8 +1527,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                             seq_ids: Optional[torch.Tensor] = None,
                             ) -> Dict[str, torch.Tensor]:
         """
-        Dynamic Weight Averaging (DWA) or fix loss coefficients 
-            
+        Dynamic Weight Averaging (DWA) or fix loss coefficients
+
         """
         self.train()
         if getattr(self, "image_discriminator", None) is not None:
@@ -1826,12 +1792,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         h_t = self.rnn.out_norm(core_state[0])
         z_prev_top = torch.zeros(num_samples, self.zdim, self.top_H, self.top_W, device=device, dtype=dtype)
 
-        tr = self.latent_transport(
-            z_top_prev=z_prev_top,
-            h_t=h_t,
-            action_prev=torch.zeros(num_samples, self.action_dim, device=device, dtype=dtype),
-            dt=1.0,
-        )
+
 
         if hasattr(self, "ema_vdvae"):
             self.ema_vdvae.apply_shadow()
@@ -1840,8 +1801,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         x_np, current_latents = self.vdvae.sample(
             num_samples,
             h_prior_top=h_t,
-            h_decoder_top=tr["h_decoder_top"],
-            cond_top=tr["cond_top"],
             prev_latents=prev_latents,
         )
 
@@ -1931,24 +1890,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
                 h_t = self.rnn.out_norm(core_state[0])
 
-                tr = self.latent_transport(
-                    z_top_prev=z_prev_top_masked,
-                    h_t=h_t,
-                    action_prev=(
-                        actions[:, t - 1] * mask_t.view(B, 1).to(device=device, dtype=dtype)
-                        if t > 0
-                        else torch.zeros(B, self.action_dim, device=device, dtype=dtype)
-                    ),
-                    dt=1.0,
-                )
 
                 x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
                 vdvae_out = self.vdvae.forward(
                     x_t_nhwc,
                     x_t_nhwc,
-                    cond_top=tr["cond_top"],
                     h_prior_top=h_t,
-                    h_decoder_top=tr["h_decoder_top"],
                     mask_t=mask_t,
                     prev_latents=prev_latents,
                     get_latents=True,
@@ -1995,13 +1942,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     if t_abs > 0
                     else torch.zeros(B, self.action_dim, device=device, dtype=dtype)
                 )
-                #TODO: Do we use this anywhere????
-                tr = self.latent_transport(
-                    z_top_prev=z_prev_top_masked,
-                    h_t=h_t,
-                    action_prev=a_prev,
-                    dt=1.0,
-                )
+
 
                 # frozen conditional mixture weights p(z_t^top | h_t)
                 slot_block = self.vdvae.decoder.dec_blocks[0].top_slot_posterior
@@ -2016,7 +1957,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 slots_mu = slots_mu.contiguous()
                 slots_logsigma = 0.5 * torch.log(slots_var.clamp_min(torch.finfo(slots_var.dtype).eps)).contiguous()
 
-                _, _, z_top_state, _, _, z_slot_maps = slot_block.slot_to_top(slots_mu, slots_logsigma, tr["cond_top"])
+                _, _, z_top_state, _, _, z_slot_maps = slot_block.slot_to_top(slots_mu, slots_logsigma, h_t)
                 elogpi_t = ConditionalTopDPGMM.conditional_expected_log_pi_frozen(
                                 self.vdvae.top_prior_gate,
                                 h_t,
@@ -2024,10 +1965,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 pi_seq.append(torch.softmax(elogpi_t / top_temperature, dim=1).detach())
                 px_z, current_latents = self.vdvae.decode_from_top_latent(
                     z_slot_maps,
-                    h_decoder_top=tr["h_decoder_top"],
+                    h_decoder_top=h_t,
                     prev_latents=prev_latents,
                 )
-                
+
                 if grad:
                     dmol_out = self.vdvae.decoder.out_net.forward(px_z)
                     rgb_slots = mean_from_discretized_mix_logistic(
@@ -2053,7 +1994,19 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 else:
                     x_np = self.vdvae.decoder.out_net.sample(px_z)
                     x_hat = torch.from_numpy(x_np).to(device=device, dtype=torch.float32)
-                    x_hat = x_hat.permute(0, 3, 1, 2).contiguous() / 127.5 - 1.0                
+                    x_hat = x_hat.permute(0, 3, 1, 2).contiguous() / 127.5 - 1.0
+
+                    N_sample, C_sample, H_sample, W_sample = x_hat.shape
+                    if N_sample % B != 0:
+                        raise ValueError(f"Expected rollout sample batch B*S, got N={N_sample}, B={B}")
+                    S_sample = N_sample // B
+                    x_hat = x_hat.view(B, S_sample, C_sample, H_sample, W_sample)
+                    mask_logits = px_z[:, self.vdvae.H.width:self.vdvae.H.width + 1] #TODO: What is the size of this tensor???
+                    mask_logits = mask_logits.view(B, S_sample, 1, H_sample, W_sample)
+                    decoder_masks = F.softmax(mask_logits, dim=1)
+
+                    x_hat = torch.sum(decoder_masks * x_hat, dim=1)
+                    x_hat = x_hat.clamp(-1.0, 1.0)
                 pred_imgs.append(x_hat)
 
                 a_cur = (

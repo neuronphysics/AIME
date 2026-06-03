@@ -772,7 +772,6 @@ class SlotToTopPosterior(nn.Module):
     Inputs:
         slot_mu:       [B, S, D]
         slot_logsigma: [B, S, D]
-        cond_top:      [B, Ccond, H, W] = concat(h_t, z_tilde_t)
     Outputs:
         qm:            [B, C, H, W]
         qv:            [B, C, H, W]  # IMPORTANT: logsigma, not logvar

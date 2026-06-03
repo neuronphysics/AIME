@@ -222,7 +222,7 @@ class DecBlock(nn.Module):
 
         if self.use_top_h:
 
-            self.top_cond_channels = self.top_h_dim + H.zdim
+            self.top_cond_channels = self.top_h_dim
 
             self.top_slot_posterior = TopSlotPosterior(
                 in_channels=width,          # encoder activation channels at top resolution
@@ -268,7 +268,7 @@ class DecBlock(nn.Module):
                 residual=(out_width == width),
                 use_3x3=use_3x3,
             )
-            
+
         self.z_proj = get_1x1(H.zdim, width)
         self.z_proj.weight.data *= np.sqrt(1 / n_blocks)
 
@@ -282,12 +282,12 @@ class DecBlock(nn.Module):
         return fn(*args)
 
 
-    def sample(self, x, acts, cond_top=None, latent_prev=None, up_latent_cur=None):
+    def sample(self, x, acts, h_top=None, latent_prev=None, up_latent_cur=None):
         extra = {}
 
         if self.is_top:
-            
-            slot_out = self._maybe_ckpt(self.top_slot_posterior, acts, cond_top)
+
+            slot_out = self._maybe_ckpt(self.top_slot_posterior, acts, h_top)
 
 
             qm = slot_out["top_q_mean_map"]
@@ -409,7 +409,7 @@ class DecBlock(nn.Module):
 
         return x
 
-    def forward(self, xs, activations, get_latents=False, cond_top=None, latent_prev=None, up_latent_cur=None, h_decoder_top=None):
+    def forward(self, xs, activations, get_latents=False, latent_prev=None, up_latent_cur=None, h_decoder_top=None):
         x, acts = self.get_inputs(xs, activations)
 
         if self.mixin is not None:
@@ -438,7 +438,7 @@ class DecBlock(nn.Module):
         z, x, kl, qm, qv, extra = self.sample(
             x,
             acts,
-            cond_top=cond_top,
+            h_top=h_decoder_top,
             latent_prev=latent_prev,
             up_latent_cur=up_latent_cur,
         )
@@ -588,7 +588,7 @@ class DecBlock(nn.Module):
         x = self._apply_post_z(x, z, h_decoder_top=h_decoder_top)
         xs[self.base] = x
         return xs, z
-    
+
 
 
 class Decoder(HModule):
@@ -645,17 +645,16 @@ class Decoder(HModule):
         self.bias = nn.Parameter(torch.zeros(1, out_width, 1, 1))
         self.final_fn = lambda x: x * self.gain + self.bias
 
-    def forward( self, activations, get_latents=False, cond_top=None, h_decoder_top=None, prev_latents=None):
+    def forward( self, activations, get_latents=False, h_decoder_top=None, prev_latents=None):
         stats = []
         xs = {a.shape[2]: a for a in self.bias_xs}
-        current_latents = [] #BxS which is slot-wise 
+        current_latents = [] #BxS which is slot-wise
         decode_latents = [] #B which is used for RNN as image-level states
 
         if prev_latents is None:
             prev_latents = [None] * len(self.dec_blocks)
 
         for idx, block in enumerate(self.dec_blocks):
-            blk_cond = cond_top if block.is_top else None
             blk_h = h_decoder_top if block.is_top else None
 
             latent_prev = prev_latents[idx]
@@ -691,7 +690,6 @@ class Decoder(HModule):
                 xs,
                 activations,
                 get_latents=get_latents,
-                cond_top=blk_cond,
                 latent_prev=latent_prev,
                 up_latent_cur=up_latent_cur,
                 h_decoder_top=blk_h,
@@ -704,10 +702,10 @@ class Decoder(HModule):
                     raise KeyError("Top block did not return z_top_state.")
                 decode_latents.append(block_stats["z_top_state"])
             else:
-                decode_latents.append(z_cur)                
+                decode_latents.append(z_cur)
 
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
-        return xs[self.H.image_size], stats, decode_latents        
+        return xs[self.H.image_size], stats, decode_latents
 
     def forward_uncond(
         self,
@@ -839,20 +837,17 @@ class VDVAE(HModule):
         self,
         x,
         x_target,
-        cond_top=None,
         h_prior_top=None,
-        h_decoder_top=None,
         mask_t=None,
         prev_latents=None,
         get_latents=False,
         slot_repulsion_tau =1.0,
     ):
-        activations = self.encoder.forward(x)        
+        activations = self.encoder.forward(x)
         px_z, stats, current_latents = self.decoder.forward(
             activations,
             get_latents=get_latents,
-            cond_top=cond_top,
-            h_decoder_top=h_decoder_top,
+            h_decoder_top=h_prior_top,
             prev_latents=prev_latents,
         )
         B = x_target.shape[0]
@@ -862,7 +857,7 @@ class VDVAE(HModule):
                 f"Decoder output batch {BS} is not divisible by image batch {B}. "
                 "This means slot flattening B*S was not propagated consistently."
             )
-        
+
         distortion_per_pixel = self.decoder.out_net.nll(px_z, x_target)
         ndims = float(np.prod(x_target.shape[1:]))
 
@@ -918,7 +913,7 @@ class VDVAE(HModule):
 
             denom = S * (S - 1) + torch.finfo(top_slot_mu.dtype).eps
 
-            slot_div_img = ((sim * off) ** 2).sum(dim=(1, 2)) 
+            slot_div_img = ((sim * off) ** 2).sum(dim=(1, 2))
 
             slot_div_loss = slot_div_w *( slot_div_img + (torch.exp(-d2/slot_repulsion_tau) * off).sum(dim=(1,2))) / denom
         dp_kl_img = None
@@ -933,8 +928,8 @@ class VDVAE(HModule):
                 slot_logsigma=top_slot_logsigma,
             )
 
-            dp_rate = self.top_kl_weight * dp_kl_img  / ndims 
-        total_rate = rate_gauss + dp_rate + slot_div_loss 
+            dp_rate = self.top_kl_weight * dp_kl_img  / ndims
+        total_rate = rate_gauss + dp_rate + slot_div_loss
         elbo_per_sample = distortion_per_pixel + total_rate
 
         if mask_t is None:
@@ -992,8 +987,6 @@ class VDVAE(HModule):
         self,
         n_batch,
         h_prior_top,
-        h_decoder_top,
-        cond_top, #added to fix issue with the inputs
         t=None,
         prev_latents=None,
         temperature: float =1.0,
@@ -1001,11 +994,11 @@ class VDVAE(HModule):
         slots_mu, slots_var = sample_slots_conditional_frozen(snapshot=self.top_prior_snapshot, frozen_gate=self.top_prior_gate, h_t=h_prior_top, num_slots = self.decoder.dec_blocks[0].top_slot_posterior.num_slots,temperature=temperature)
         slots_mu = slots_mu.contiguous()
         slots_logsigma = 0.5 * torch.log(slots_var.clamp_min(torch.finfo(slots_var.dtype).eps)).clamp(-7.0, 3.0).contiguous()
-        _, _, _, _, _, z_slot_maps = self.decoder.dec_blocks[0].top_slot_posterior.slot_to_top(slots_mu, slots_logsigma, cond_top )
+        _, _, _, _, _, z_slot_maps = self.decoder.dec_blocks[0].top_slot_posterior.slot_to_top(slots_mu, slots_logsigma, h_prior_top )
         px_z, current_latents = self.decoder.forward_from_top_latent(
             z_slot_maps,
             t=t,
-            h_decoder_top=h_decoder_top,
+            h_decoder_top=h_prior_top,
             prev_latents=prev_latents,
         )
         return self.decoder.out_net.sample(px_z), current_latents
@@ -1013,7 +1006,6 @@ class VDVAE(HModule):
     def forward_get_latents(
         self,
         x,
-        cond_top=None,
         h_decoder_top=None,
         prev_latents=None,
     ):
@@ -1021,7 +1013,6 @@ class VDVAE(HModule):
         _, stats, current_latents = self.decoder.forward(
             activations,
             get_latents=True,
-            cond_top=cond_top,
             h_decoder_top=h_decoder_top,
             prev_latents=prev_latents,
         )
