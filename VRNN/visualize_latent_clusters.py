@@ -247,7 +247,7 @@ def _get_vdvae_out_at_t(model, batch: Dict, device: torch.device, t_select: int 
         h, c, m = core_state
         h0, c0, m0 = model.rnn.init_state(B, device=device, dtype=dtype)
         core_state = (h * keep + h0 * (1.0 - keep), c * keep + c0 * (1.0 - keep), m * keep + m0 * (1.0 - keep))
-        prev_latents = [pl * keep if pl is not None else None for pl in prev_latents]
+        prev_latents = [None if pl is None else pl * (keep if pl.shape[0] == B else keep.repeat_interleave(pl.shape[0] // B, dim=0)) for pl in prev_latents]
 
         h_t = model.rnn.out_norm(core_state[0])
         a_prev = zero_action() if t == 0 or actions is None else actions[:, t - 1].to(device=device, dtype=dtype) * mask_t.view(B, 1).to(dtype)
@@ -268,10 +268,10 @@ def _get_vdvae_out_at_t(model, batch: Dict, device: torch.device, t_select: int 
             get_latents=True,
         )
 
-        z_top_map = vdvae_out["current_latents"][0]
+        z_top_state = vdvae_out.get("z_top_state", vdvae_out["current_latents"][0])
         a_cur = zero_action() if actions is None else actions[:, t].to(device=device, dtype=dtype)
-        _, core_state = model.rnn(z_top_map, a_cur, state=core_state, mask_t=None, extra_maps=None)
-        z_prev_top = z_top_map.detach()
+        _, core_state = model.rnn(z_top_state, a_cur, state=core_state, mask_t=None, extra_maps=None)
+        z_prev_top = z_top_state.detach()
         prev_latents = [None if idx == 0 else z.detach() for idx, z in enumerate(vdvae_out["current_latents"])]
         last = (vdvae_out, x_t, h_t, h_decoder_top, prev_latents_in, tr["cond_top"].detach().clone())
 
@@ -316,10 +316,22 @@ def extract_slot_latents_and_assignments(
         vdvae_out, x_t, h_t, h_decoder_top, prev_latents_in, cond_top = _get_vdvae_out_at_t(model, batch, device, t_select=t_select)
         slot_mu = vdvae_out.get("top_slot_mu", None)
         slot_logsigma = vdvae_out.get("top_slot_logsigma", None)
-        slot_masks = vdvae_out.get("top_slot_masks", None)
-        slot_attn = vdvae_out.get("top_slot_attn", None)
         slot_comp_maps = vdvae_out.get("top_slot_comp_maps", None)
-        if slot_mu is None or slot_logsigma is None or slot_masks is None or slot_comp_maps is None:
+        B, S, D = slot_mu.shape
+
+        px_z = vdvae_out["px_z"]  # [B*S,width+1,H,W]
+        N, _, H_img, W_img = px_z.shape
+
+        if N % B != 0:
+            raise ValueError(f"Expected px_z batch B*S, got N={N}, B={B}")
+
+
+        slot_masks = px_z[:, model.vdvae.H.width:model.vdvae.H.width + 1]
+        slot_masks = slot_masks.view(B, S, 1, H_img, W_img)
+        slot_masks = F.softmax(slot_masks, dim=1)        
+        slot_attn = vdvae_out.get("top_slot_attn", None)
+        
+        if slot_mu is None or slot_logsigma is None or slot_comp_maps is None:
             continue
 
         B, S, D = slot_mu.shape
@@ -415,7 +427,7 @@ def extract_slot_latents_and_assignments(
             for s in range(S):
                 kk = int(k_slot[b, s].item())
                 conf = float(resp[b, s, kk].item())
-                z_top_slot = (slot_comp_maps[b:b+1, s] * slot_masks[b:b+1, s]).detach().cpu()
+                z_top_slot = slot_comp_maps[b:b+1, s:s+1].detach().cpu()
                 mask_mass = float(comp_mask_up[b, s].mean().item())
                 item = {
                     "slot_id": int(s),
@@ -582,7 +594,7 @@ def _decode_component_mean_rgb(
     slot_logsigma = torch.as_tensor(comp_logsigma_k, device=device, dtype=torch.float32).view(1, 1, slot_dim)
     cond_top = cond_top.to(device=device, dtype=torch.float32)
 
-    qm, qv, z_top, _, _, _ = slot_to_map(slot_mu, slot_logsigma, cond_top)
+    _, _, _, _, _, z_slot_maps = slot_to_map(slot_mu, slot_logsigma, cond_top)
 
     vdvae_h = getattr(getattr(model, "vdvae", None), "H", None)
     zdim = int(getattr(model, "zdim", getattr(vdvae_h, "zdim", comp_mean_k.shape[0])))
@@ -592,7 +604,7 @@ def _decode_component_mean_rgb(
 
     h_dec = None if h_decoder_top is None else h_decoder_top.to(device=device, dtype=torch.float32)
     prev = [None if z is None else z.to(device=device, dtype=torch.float32) for z in prev_latents]
-    px_z, _ = model.vdvae.decode_from_top_latent(z_top, h_decoder_top=h_dec, prev_latents=prev)
+    px_z, _ = model.vdvae.decode_from_top_latent(z_slot_maps, h_decoder_top=h_dec, prev_latents=prev)
     rgb = model.vdvae.decoder.out_net.sample(px_z)[0]
     return rgb.astype(np.float32) / 255.0
 

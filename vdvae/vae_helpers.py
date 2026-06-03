@@ -794,7 +794,7 @@ class SlotToTopPosterior(nn.Module):
         self.net = Block(
                 2 * slot_dim + 4 + cond_channels,
                 cond_width,
-                2 * self.z_channels + 1,
+                2 * self.z_channels,
                 residual=False,
                 use_3x3=use_3x3,
             )
@@ -825,61 +825,29 @@ class SlotToTopPosterior(nn.Module):
         inp = inp.reshape(B * S, 2 * D + 4 + self.cond_channels, self.top_h, self.top_w)
 
         out = self.net(inp)
-        out = out.view(B, S, 2 * self.z_channels + 1, self.top_h, self.top_w)
+        out = out.view(B, S, 2 * self.z_channels, self.top_h, self.top_w)
 
         comp_mu = out[:, :, :self.z_channels]
         comp_logsigma = out[:, :, self.z_channels:2 * self.z_channels]
-        mask_logits = out[:, :, 2 * self.z_channels:2 * self.z_channels + 1]
 
         comp_logsigma = comp_logsigma.clamp(-7.0, 3.0)
-        masks = torch.softmax(mask_logits, dim=1)
 
-        qm = torch.sum(masks * comp_mu, dim=1)
+        # Per-slot latent maps. These are what should go into the decoder.
+        z_slot_maps = comp_mu + torch.exp(comp_logsigma) * torch.randn_like(comp_mu)
+
+        # Aggregate only for top-level KL / temporal state, not for image decoding.
+        qm = comp_mu.mean(dim=1)
 
         comp_var = torch.exp(2.0 * comp_logsigma)
-        second_moment = torch.sum(masks * (comp_var + comp_mu.pow(2)), dim=1)
+        second_moment = (comp_var + comp_mu.pow(2)).mean(dim=1)
         q_var = (second_moment - qm.pow(2)).clamp_min(1e-8)
         qv = 0.5 * torch.log(q_var)
 
+        # This mixed z is only for temporal/RNN bookkeeping if you still need it.
         z_top_map = qm + torch.exp(qv) * torch.randn_like(qm)
 
-        return qm, qv, z_top_map, comp_mu, comp_logsigma, masks
+        return qm, qv, z_top_map, comp_mu, comp_logsigma, z_slot_maps
 
-def slot_mask_regularization_from_masks(slot_masks: torch.Tensor, eps: float = 1e-8):
-    """
-    slot_masks: [B, S, 1, H, W] or [B, S, H, W]
-
-    Returns:
-        mask_entropy_per_img: [B]
-        mask_balance_per_img: [B]
-    """
-    if slot_masks.dim() == 5:
-        # [B, S, 1, H, W] -> [B, S, H, W]
-        if slot_masks.shape[2] != 1:
-            raise ValueError(f"Expected singleton channel dim, got {tuple(slot_masks.shape)}")
-        masks = slot_masks.squeeze(2)
-    elif slot_masks.dim() == 4:
-        masks = slot_masks
-    else:
-        raise ValueError(f"Expected [B,S,1,H,W] or [B,S,H,W], got {tuple(slot_masks.shape)}")
-
-    # Make sure masks sum to 1 over slots at each spatial location.
-    p = masks.clamp_min(eps)
-    p = p / p.sum(dim=1, keepdim=True).clamp_min(eps)
-
-    # Entropy over slots per spatial location, then average over spatial dims.
-    # Shape: [B]
-    mask_entropy_per_img = -(p * p.log()).sum(dim=1).mean(dim=(-1, -2))
-
-    # Average mass per slot. Shape: [B, S]
-    slot_usage = p.mean(dim=(-1, -2))
-
-    expected = torch.full_like(slot_usage, 1.0 / float(slot_usage.shape[1]))
-
-    # Shape: [B]
-    mask_balance_per_img = ((slot_usage - expected) ** 2).mean(dim=1)
-
-    return mask_entropy_per_img, mask_balance_per_img
 
 class TopSlotPosterior(nn.Module):
     def __init__(
@@ -929,7 +897,7 @@ class TopSlotPosterior(nn.Module):
             slot_size=slot_dim,
             qkv_size=slot_dim,
             num_iterations=n_iters,
-            mlp_size=2 * slot_dim,
+            mlp_size=slot_dim,
             num_heads=1,
             weight_init=slot_weight_init,
         )
@@ -986,7 +954,7 @@ class TopSlotPosterior(nn.Module):
         def _slot_to_top_fn(slot_mu_, slot_logsigma_, cond_top_):
             return self.slot_to_top(slot_mu_, slot_logsigma_, cond_top_)
 
-        qm, qv, z_top_map, comp_mu, comp_logsigma, comp_masks = self._maybe_ckpt(
+        qm, qv, z_top_map, comp_mu, comp_logsigma, z_slot_maps = self._maybe_ckpt(
             _slot_to_top_fn,
             slot_mu,
             slot_logsigma,
@@ -1003,7 +971,7 @@ class TopSlotPosterior(nn.Module):
             "slot_attn": slot_attn,
             "slot_comp_maps": comp_mu,
             "slot_comp_logsigma": comp_logsigma,
-            "slot_masks": comp_masks,
+            "z_slot_maps": z_slot_maps,
         }
 
 
@@ -1011,8 +979,8 @@ class TopSlotPosterior(nn.Module):
 def gaussian_analytical_kl(mu1, mu2, logsigma1, logsigma2):
     logsigma1 = logsigma1.clamp(-7.0, 3.0)
     logsigma2 = logsigma2.clamp(-7.0, 3.0)
-    return -0.5 + logsigma2 - logsigma1 + 0.5 * (logsigma1.exp() ** 2 + (mu1 - mu2) ** 2) / (logsigma2.exp() ** 2)
-
+    kl = -0.5 + logsigma2 - logsigma1 + 0.5 * (logsigma1.exp() ** 2 + (mu1 - mu2) ** 2) / (logsigma2.exp() ** 2)
+    return kl.sum(dim=(1, 2, 3))
 
 @torch.jit.script
 def draw_gaussian_diag_samples(mu, logsigma):
@@ -1055,21 +1023,27 @@ def const_min(t, constant):
     return torch.min(t, other)
 
 
-def discretized_mix_logistic_loss(x, l, low_bit=False):
+def discretized_mix_logistic_loss(x, l, mask_logits, low_bit=False):
     """ log-likelihood for mixture of discretized logistics, assumes the data has been rescaled to [-1,1] interval """
     # Adapted from https://github.com/openai/pixel-cnn/blob/master/pixel_cnn_pp/nn.py
     xs = [s for s in x.shape]  # true image (i.e. labels) to regress to, e.g. (B,32,32,3)
     ls = [s for s in l.shape]  # predicted distribution, e.g. (B,32,32,100)
+    B = xs[0]
+    N = ls[0]
+    S = N // B
+    H, W = xs[1], xs[2]
     nr_mix = int(ls[-1] / 10)  # here and below: unpacking the params of the mixture of logistics
+    # [B,H,W,3] -> [B,S,H,W,3] -> [B*S,H,W,3]
+    x = x[:, None].expand(B, S, H, W, 3).reshape(N, H, W, 3)
     logit_probs = l[:, :, :, :nr_mix]
-    l = torch.reshape(l[:, :, :, nr_mix:], xs + [nr_mix * 3])
+    l = torch.reshape(l[:, :, :, nr_mix:], [N, H, W, 3] + [nr_mix * 3])
     means = l[:, :, :, :, :nr_mix]
     log_scales = const_max(l[:, :, :, :, nr_mix:2 * nr_mix], -7.)
     coeffs = torch.tanh(l[:, :, :, :, 2 * nr_mix:3 * nr_mix])
-    x = torch.reshape(x, xs + [1]) + torch.zeros(xs + [nr_mix]).to(x.device)  # here and below: getting the means and adjusting them based on preceding sub-pixels
-    m2 = torch.reshape(means[:, :, :, 1, :] + coeffs[:, :, :, 0, :] * x[:, :, :, 0, :], [xs[0], xs[1], xs[2], 1, nr_mix])
-    m3 = torch.reshape(means[:, :, :, 2, :] + coeffs[:, :, :, 1, :] * x[:, :, :, 0, :] + coeffs[:, :, :, 2, :] * x[:, :, :, 1, :], [xs[0], xs[1], xs[2], 1, nr_mix])
-    means = torch.cat([torch.reshape(means[:, :, :, 0, :], [xs[0], xs[1], xs[2], 1, nr_mix]), m2, m3], dim=3)
+    x = torch.reshape(x, [N, H, W, 3] + [1]) + torch.zeros([N, H, W, 3] + [nr_mix]).to(device=x.device, dtype=x.dtype)  # here and below: getting the means and adjusting them based on preceding sub-pixels
+    m2 = torch.reshape(means[:, :, :, 1, :] + coeffs[:, :, :, 0, :] * x[:, :, :, 0, :], [N, H, W, 1, nr_mix])
+    m3 = torch.reshape(means[:, :, :, 2, :] + coeffs[:, :, :, 1, :] * x[:, :, :, 0, :] + coeffs[:, :, :, 2, :] * x[:, :, :, 1, :], [N, H, W, 1, nr_mix])
+    means = torch.cat([torch.reshape(means[:, :, :, 0, :], [N, H, W, 1, nr_mix]), m2, m3], dim=3)
     centered_x = x - means
     inv_stdv = torch.exp(-log_scales)
     if low_bit:
@@ -1113,8 +1087,16 @@ def discretized_mix_logistic_loss(x, l, low_bit=False):
                                                         torch.log(const_max(cdf_delta, 1e-12)),
                                                         log_pdf_mid - np.log(127.5))))
     log_probs = log_probs.sum(dim=3) + log_prob_from_logits(logit_probs)
-    mixture_probs = torch.logsumexp(log_probs, -1)
-    return -1. * mixture_probs.sum(dim=[1, 2]) / np.prod(xs[1:])
+    mixture_probs = torch.logsumexp(log_probs, dim=-1)
+    denom = float(H * W * 3)
+    logp_slots = mixture_probs.view(B, S, H, W)
+    mask_logits = mask_logits.reshape(B, S, H, W)
+    log_masks = F.log_softmax(mask_logits, dim=1)  # [B,S,H,W]
+
+    # log p(x_hw) = logsumexp_s(log m_s_hw + log p_s(x_hw))
+    logp_pixel = torch.logsumexp(log_masks + logp_slots, dim=1)  # [B,H,W]
+
+    return -1. * logp_pixel.sum(dim=[1, 2]) / denom
 
 
 def sample_from_discretized_mix_logistic(l, nr_mix):
@@ -1194,7 +1176,7 @@ class HModule(nn.Module):
         self.H = H
         self.build()
 
-
+"""
 class DmolNet(nn.Module):
     def __init__(self, H):
         super().__init__()
@@ -1215,6 +1197,40 @@ class DmolNet(nn.Module):
         xhat = xhat.detach().cpu().numpy()
         xhat = np.minimum(np.maximum(0.0, xhat), 255.0).astype(np.uint8)
         return xhat
+"""
+class DmolNet(nn.Module):
+    def __init__(self, H):
+        super().__init__()
+        self.H = H
+        self.width = H.width
+        self.out_conv = get_conv(H.width, H.num_mixtures * 10, kernel_size=1, stride=1, padding=0)
+
+    def nll(self, px_z, x):
+        
+        mask_logits = px_z[:, self.width:self.width + 1]
+
+        return discretized_mix_logistic_loss(x=x, l=self.forward(px_z), mask_logits=mask_logits, low_bit=self.H.dataset in ['ffhq_256'])
+
+    def forward(self, px_z):
+        xhat = self.out_conv(px_z[:, :self.width])
+        return xhat.permute(0, 2, 3, 1)
+
+    def sample(self, px_z):
+        im = sample_from_discretized_mix_logistic(self.forward(px_z), self.H.num_mixtures)
+        N, H, W, _ = im.shape
+        S = self.H.top_num_slots
+        B = N // S
+        mask_logits = px_z[:, self.width:self.width + 1]  # [B*S,1,H,W]
+        mask_logits = mask_logits.view(B, S, 1, H, W)
+        masks = F.softmax(mask_logits, dim=1)             # [B,S,1,H,W]
+
+        im = im.view(B, S, H, W, 3)
+        im = torch.sum(im * masks.permute(0, 1, 3, 4, 2), dim=1)
+        xhat = (im + 1.0) * 127.5
+        xhat = xhat.detach().cpu().numpy()
+        xhat = np.minimum(np.maximum(0.0, xhat), 255.0).astype(np.uint8)
+        return xhat
+
 
 class Block(nn.Module):
     def __init__(
@@ -1230,7 +1246,7 @@ class Block(nn.Module):
         super().__init__()
         self.down_rate = down_rate
         self.residual = residual
-        self.c1 = get_1x1(in_width, middle_width)
+        self.c1 = get_1x1(in_width, middle_width)        
         self.c2 = get_3x3(middle_width, middle_width) if use_3x3 else get_1x1(middle_width, middle_width)
         self.c3 = get_3x3(middle_width, middle_width) if use_3x3 else get_1x1(middle_width, middle_width)
         self.c4 = get_1x1(middle_width, out_width, zero_weights=zero_last)

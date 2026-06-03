@@ -37,7 +37,8 @@ from contextlib import contextmanager
 import matplotlib
 from pathlib import Path
 from distutils.util import strtobool
-from VRNN.visualize_latent_clusters import visualize_dpgmm_clustering
+from sklearn.metrics import adjusted_rand_score
+from VRNN.visualize_latent_clusters import visualize_dpgmm_clustering, extract_slot_latents_and_assignments
 def str2bool(v):
     return bool(strtobool(v))
 
@@ -1443,6 +1444,44 @@ class DMCVBTrainer:
         ramp = 0.5 * (1.0 - math.cos(math.pi * p))
         return beta_min + (beta_max - beta_min) * ramp
 
+    @torch.no_grad()
+    def log_dpgmm_ari_diagnostics(self, epoch, max_batches=10, t_select=8):
+
+        self.model.eval()
+
+        data = extract_slot_latents_and_assignments(
+            model=self.model,
+            dataloader=self.eval_loader,
+            device=self.device,
+            max_batches=max_batches,
+            t_select=t_select,
+            max_points=4000,
+        )
+
+        post_assign = np.asarray(data["posterior_assignments"]).reshape(-1)
+        post_slot_ids = np.asarray(data["posterior_slot_ids"]).reshape(-1)
+
+        prior_assign = np.asarray(data["prior_assignments"]).reshape(-1)
+        prior_slot_ids = np.asarray(data["prior_slot_ids"]).reshape(-1)
+
+        post_valid = np.isfinite(post_assign) & np.isfinite(post_slot_ids)
+        prior_valid = np.isfinite(prior_assign) & np.isfinite(prior_slot_ids)
+
+        if post_valid.sum() > 1:
+            ari_post = adjusted_rand_score(
+                post_slot_ids[post_valid],
+                post_assign[post_valid],
+            )
+            self.writer.add_scalar("eval/ari_slot_component_posterior", ari_post, epoch)
+
+        if prior_valid.sum() > 1:
+            ari_prior = adjusted_rand_score(
+                prior_slot_ids[prior_valid],
+                prior_assign[prior_valid],
+            )
+            self.writer.add_scalar("eval/ari_slot_component_prior", ari_prior, epoch)
+
+        self.model.train()
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
@@ -1993,9 +2032,9 @@ class DMCVBTrainer:
                     axes[row, 0].axis('off')
 
                     recon_img = outputs['reconstruction_samples'][i, t, :3]
-                    axes[row, 1].imshow(
-                        recon_img.detach().clamp(0, 255).to(torch.uint8).cpu().permute(1, 2, 0).numpy()
-                    )
+                    #axes[row, 1].imshow(recon_img.detach().clamp(0, 255).to(torch.uint8).cpu().permute(1, 2, 0).numpy())
+                    axes[row, 1].imshow(self.denormalize_image(recon_img))
+
                     axes[row, 1].set_title('VAE Recon samples')
                     axes[row, 1].axis('off')
 
@@ -2127,6 +2166,7 @@ class DMCVBTrainer:
             if epoch % self.config['visualize_every'] == 0:
                 self.visualize_results(epoch)
                 self.visualize_two_step_prediction(epoch, T_ctx=8)
+                self.log_dpgmm_ari_diagnostics(epoch, max_batches=10, t_select=8)
 
             if epoch % self.config['checkpoint_every'] == 0:
                 self.save_checkpoint(epoch)
@@ -2145,11 +2185,7 @@ class DMCVBTrainer:
             )
             if run_diag:
                 try:
-                    self.run_grad_diag(
-                        max_B=1,
-                        max_T=visualize_steps,
-                        use_amp=False,
-                    )
+                    self.run_grad_diag( max_B=1, max_T=visualize_steps, use_amp=False)
                 except torch.cuda.OutOfMemoryError as e:
                     print(
                         f"[grad_diag] OOM at epoch {epoch}; skipping this "
@@ -2275,8 +2311,8 @@ def main():
         'policy_level': 'all',
 
         # Model settings
-        'max_components': 15,
-        'latent_dim': 56,
+        'max_components': 12,
+        'latent_dim': 48,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
         'dp_alpha':1.0,
@@ -2286,7 +2322,7 @@ def main():
 
         # Training settings
         'batch_size': 21,
-        'dpgmm_outer_batch_size': 384,
+        'dpgmm_outer_batch_size': 512,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 1,
@@ -2316,7 +2352,7 @@ def main():
         'experiment_name': 'humanoid_walk_expert',
         'visualize_every': 4,
         'checkpoint_every': 10,
-        'top_slot_dim': 48,
+        'top_slot_dim': 36,
     }
     config = override_config_from_args(config, args)
 

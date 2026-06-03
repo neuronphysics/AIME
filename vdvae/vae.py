@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as ckpt
-from vdvae.vae_helpers import HModule,DmolNet, draw_gaussian_diag_samples, gaussian_analytical_kl, get_1x1, get_3x3, Block, TopSlotPosterior, slot_mask_regularization_from_masks
+from vdvae.vae_helpers import HModule, DmolNet, draw_gaussian_diag_samples, gaussian_analytical_kl, get_1x1, get_3x3, Block, TopSlotPosterior, mean_from_discretized_mix_logistic
 from VRNN.perceiver.modules import SelfAttentionBlock
 from VRNN.perceiver.position import FourierPositionEncoding
 from vdvae.top_dpgmm_prior import compute_top_kl_conditional_frozen, sample_top_conditional_frozen, ConditionalTopDPGMM, compute_slot_kl_conditional_frozen, sample_slots_conditional_frozen
@@ -201,15 +201,17 @@ class Upsample(nn.Module):
         return self.net(z)
 
 class DecBlock(nn.Module):
-    def __init__(self, H, res, mixin, n_blocks, is_top=False):
+    def __init__(self, H, res, mixin, n_blocks, is_top=False, is_last =False):
         super().__init__()
         self.base = int(res)
         self.mixin = mixin
         self.H = H
         self.is_top = bool(is_top)
+        self.is_last = bool(is_last)
 
         self.widths = get_width_settings(H.width, H.custom_width_str)
         width = self.widths[self.base]
+        out_width = width + 1 if (self.is_last and self.base == int(H.image_size)) else width
         use_3x3 = self.base > 2
         cond_width = int(width * H.bottleneck_multiple)
         self.zdim = H.zdim
@@ -237,7 +239,7 @@ class DecBlock(nn.Module):
             self.resnet = Block(
                 width + self.top_h_dim,
                 cond_width,
-                width,
+                out_width,
                 residual=False,
                 use_3x3=use_3x3,
             )
@@ -262,8 +264,8 @@ class DecBlock(nn.Module):
             self.resnet = Block(
                 width,
                 cond_width,
-                width,
-                residual=True,
+                out_width,
+                residual=(out_width == width),
                 use_3x3=use_3x3,
             )
             
@@ -291,14 +293,17 @@ class DecBlock(nn.Module):
             qm = slot_out["top_q_mean_map"]
             qv = slot_out["top_q_logsigma_map"]   # logsigma, not logvar
             z = slot_out["z_top_map"]
-
+            z_slot_maps = slot_out["z_slot_maps"]
             extra = {
-                "slot_mu": slot_out["slot_mu"],
-                "slot_logsigma": slot_out["slot_logsigma"],
-                "slot_attn": slot_out["slot_attn"],
-                "slot_masks": slot_out["slot_masks"],
-                "slot_comp_maps": slot_out["slot_comp_maps"],
-                "z_top_map": z,
+                    "slot_mu": slot_out["slot_mu"],
+                    "slot_logsigma": slot_out["slot_logsigma"],
+                    "slot_attn": slot_out["slot_attn"],
+                    "slot_comp_maps": slot_out["slot_comp_maps"],
+                    "slot_comp_logsigma": slot_out["slot_comp_logsigma"],
+
+                    # Keep both names clear:
+                    "z_top_map": z,       # [B, C, H, W], aggregate
+                    "z_slot_maps": z_slot_maps,   # [B, S, C, H, W], decoder input
             }
             kl = torch.zeros_like(qm)
 
@@ -348,12 +353,49 @@ class DecBlock(nn.Module):
 
     def get_inputs(self, xs, activations):
         acts = activations[self.base]
-        try:
+
+        if self.base in xs:
             x = xs[self.base]
-        except KeyError:
-            x = torch.zeros_like(acts)
-        if acts.shape[0] != x.shape[0]:
-            x = x.repeat(acts.shape[0], 1, 1, 1)
+        else:
+            # Use batch 1 here, then expand below to the correct target batch.
+            x = torch.zeros(1, self.widths[self.base], self.base, self.base, device=acts.device, dtype=acts.dtype)
+
+        # Determine the effective decoder batch.
+        # Top block: target_b = B.
+        # Lower slot-wise blocks: target_b = B*S, usually inherited from xs[self.mixin].
+        target_b = max(x.shape[0], acts.shape[0])
+
+        if self.mixin is not None and self.mixin in xs:
+            target_b = max(target_b, xs[self.mixin].shape[0])
+
+        if x.shape[0] != target_b:
+            if x.shape[0] == 1:
+                x = x.expand(target_b, *x.shape[1:]).contiguous()
+            elif target_b % x.shape[0] == 0:
+                rep = target_b // x.shape[0]
+                x = x[:, None].expand(
+                    x.shape[0], rep, *x.shape[1:]
+                ).reshape(target_b, *x.shape[1:]).contiguous()
+            else:
+                raise ValueError(
+                    f"Cannot expand decoder x batch {x.shape[0]} to target batch {target_b} "
+                    f"at resolution {self.base}."
+                )
+
+        if acts.shape[0] != target_b:
+            if acts.shape[0] == 1:
+                acts = acts.expand(target_b, *acts.shape[1:]).contiguous()
+            elif target_b % acts.shape[0] == 0:
+                rep = target_b // acts.shape[0]
+                acts = acts[:, None].expand(
+                    acts.shape[0], rep, *acts.shape[1:]
+                ).reshape(target_b, *acts.shape[1:]).contiguous()
+            else:
+                raise ValueError(
+                    f"Cannot expand encoder acts batch {acts.shape[0]} to target batch {target_b} "
+                    f"at resolution {self.base}."
+                )
+
         return x, acts
 
     def _apply_post_z(self, x, z, h_decoder_top=None):
@@ -371,11 +413,66 @@ class DecBlock(nn.Module):
         x, acts = self.get_inputs(xs, activations)
 
         if self.mixin is not None:
-            x = x + F.interpolate(xs[self.mixin][:, : x.shape[1], ...], scale_factor=self.base // self.mixin)
+            mix = F.interpolate(
+                xs[self.mixin][:, : x.shape[1], ...],
+                scale_factor=self.base // self.mixin,
+            )
 
-        z, x, kl, qm, qv, extra = self.sample(x, acts, cond_top=cond_top, latent_prev=latent_prev, up_latent_cur=up_latent_cur)
-        x = self._apply_post_z(x, z, h_decoder_top=h_decoder_top)
-        xs[self.base] = x
+            if mix.shape[0] != x.shape[0]:
+                target_b = x.shape[0]
+                if mix.shape[0] == 1:
+                    mix = mix.expand(target_b, *mix.shape[1:]).contiguous()
+                elif target_b % mix.shape[0] == 0:
+                    rep = target_b // mix.shape[0]
+                    mix = mix[:, None].expand(
+                        mix.shape[0], rep, *mix.shape[1:]
+                    ).reshape(target_b, *mix.shape[1:]).contiguous()
+                else:
+                    raise ValueError(
+                        f"Cannot expand mixin batch {mix.shape[0]} to x batch {target_b} "
+                        f"at resolution {self.base}."
+                    )
+
+            x = x + mix
+
+        z, x, kl, qm, qv, extra = self.sample(
+            x,
+            acts,
+            cond_top=cond_top,
+            latent_prev=latent_prev,
+            up_latent_cur=up_latent_cur,
+        )
+
+        if self.is_top and "z_slot_maps" in extra:
+            # z_state is the aggregate top latent for RNN/state.
+            z_state = extra["z_top_map"]          # [B, C, H, W]
+
+            # z_slot_maps are the actual per-slot decoder inputs.
+            z_slot_maps = extra["z_slot_maps"]    # [B, S, C, H, W]
+            B, S, C, Ht, Wt = z_slot_maps.shape
+
+            z_for_decoder = z_slot_maps.reshape(B * S, C, Ht, Wt)
+
+            x = x[:, None].expand(
+                B, S, *x.shape[1:]
+            ).reshape(B * S, *x.shape[1:]).contiguous()
+
+            if h_decoder_top is not None:
+                h_decoder_top = h_decoder_top[:, None].expand(
+                    B, S, *h_decoder_top.shape[1:]
+                ).reshape(B * S, *h_decoder_top.shape[1:]).contiguous()
+
+            x = self._apply_post_z(x, z_for_decoder, h_decoder_top=h_decoder_top)
+            xs[self.base] = x
+
+            # Lower decoder blocks need B*S latent.
+            z_cur = z_for_decoder
+
+        else:
+            z_state = z
+            x = self._apply_post_z(x, z, h_decoder_top=h_decoder_top)
+            xs[self.base] = x
+            z_cur = z
 
         out = {
             "kl": kl,
@@ -383,24 +480,115 @@ class DecBlock(nn.Module):
             "posterior_logvar": qv,
             **extra,
         }
+
+        # Do not expose decoder z as the state latent.
         if get_latents:
-            out["z"] = z.detach()
-        return xs, out, z
+            out["z_decoder"] = z_cur.detach()
+
+        if self.is_top:
+            out["z_top_state"] = z_state
+
+        return xs, out, z_cur
 
     def forward_uncond(self, xs, t=None, lvs=None, latent_prev=None, up_latent_cur=None, h_decoder_top=None):
-        try:
+        # The live decoder batch is set by what this block consumes.
+        if self.mixin is not None and self.mixin in xs:
+            b = xs[self.mixin].shape[0]
+        elif up_latent_cur is not None:
+            b = up_latent_cur.shape[0]
+        elif lvs is not None:
+            b = lvs.shape[0]  # top block: image batch B, even if lvs is [B,S,C,H,W]
+        else:
+            b = next(iter(xs.values())).shape[0]
+
+        # Get x or create it directly at the live batch.
+        if self.base in xs:
             x = xs[self.base]
-        except KeyError:
-            ref = xs[list(xs.keys())[0]]
-            x = torch.zeros(dtype=ref.dtype, size=(ref.shape[0], self.widths[self.base], self.base, self.base),device=ref.device)
+
+            if x.shape[0] != b:
+                if b % x.shape[0] != 0:
+                    raise ValueError(
+                        f"res {self.base}: cannot promote x batch {x.shape[0]} to {b}."
+                    )
+                x = x.repeat_interleave(b // x.shape[0], dim=0)
+
+        else:
+            if self.mixin is not None and self.mixin in xs:
+                ref = xs[self.mixin]
+            elif up_latent_cur is not None:
+                ref = up_latent_cur
+            elif lvs is not None:
+                ref = lvs
+            else:
+                ref = next(iter(xs.values()))
+
+            x = torch.zeros(b, self.widths[self.base], self.base, self.base, dtype=ref.dtype, device=ref.device)
 
         if self.mixin is not None:
-            x = x + F.interpolate(xs[self.mixin][:, : x.shape[1], ...], scale_factor=self.base // self.mixin)
+            mix = F.interpolate(xs[self.mixin][:, :x.shape[1], ...], scale_factor=self.base // self.mixin)
 
-        z, x = self.sample_uncond(x, t=t, lvs=lvs, latent_prev=latent_prev, up_latent_cur=up_latent_cur)
+            if mix.shape[0] != b:
+                raise ValueError(
+                    f"res {self.base}: mixin batch {mix.shape[0]} != expected batch {b}."
+                )
+
+            x = x + mix
+
+        if not self.is_top:
+            if up_latent_cur is None or latent_prev is None:
+                raise ValueError(
+                    f"res {self.base}: up_latent_cur/latent_prev required at non-top block."
+                )
+
+            if up_latent_cur.shape[0] != b:
+                raise ValueError(
+                    f"res {self.base}: up_latent_cur batch {up_latent_cur.shape[0]} != expected {b}."
+                )
+
+            if latent_prev.shape[0] != b:
+                if b % latent_prev.shape[0] != 0:
+                    raise ValueError(
+                        f"res {self.base}: cannot promote latent_prev batch "
+                        f"{latent_prev.shape[0]} to {b}."
+                    )
+                latent_prev = latent_prev.repeat_interleave(b // latent_prev.shape[0], dim=0)
+
+            if x.shape[0] != b:
+                raise ValueError(
+                    f"res {self.base}: x batch {x.shape[0]} != expected {b}."
+                )
+
+        z, x = self.sample_uncond( x, t=t, lvs=lvs, latent_prev=latent_prev, up_latent_cur=up_latent_cur)
+
+        if self.is_top and lvs is not None and lvs.dim() == 5:
+            B, S, C, Ht, Wt = lvs.shape
+
+            if x.shape[0] != B:
+                raise ValueError(
+                    f"top block must start at image batch B={B}, got {x.shape[0]}."
+                )
+
+            z = lvs.reshape(B * S, C, Ht, Wt)
+
+            x = (
+                x[:, None]
+                .expand(B, S, *x.shape[1:])
+                .reshape(B * S, *x.shape[1:])
+                .contiguous()
+            )
+
+            if h_decoder_top is not None:
+                h_decoder_top = (
+                    h_decoder_top[:, None]
+                    .expand(B, S, *h_decoder_top.shape[1:])
+                    .reshape(B * S, *h_decoder_top.shape[1:])
+                    .contiguous()
+                )
+
         x = self._apply_post_z(x, z, h_decoder_top=h_decoder_top)
         xs[self.base] = x
         return xs, z
+    
 
 
 class Decoder(HModule):
@@ -425,6 +613,7 @@ class Decoder(HModule):
                     mixin,
                     n_blocks=n_blocks,
                     is_top=(idx == 0),
+                    is_last=(idx == len(blocks) - 1),
                 )
             )
             resos.add(res)
@@ -451,34 +640,52 @@ class Decoder(HModule):
         )
         self.out_net = DmolNet(H)
 
-        out_width = self.widths[int(H.image_size)]
+        out_width = self.widths[int(H.image_size)] + 1
         self.gain = nn.Parameter(torch.ones(1, out_width, 1, 1))
         self.bias = nn.Parameter(torch.zeros(1, out_width, 1, 1))
         self.final_fn = lambda x: x * self.gain + self.bias
 
-    def forward(
-        self,
-        activations,
-        get_latents=False,
-        cond_top=None,
-        h_decoder_top=None,
-        prev_latents=None,
-    ):
+    def forward( self, activations, get_latents=False, cond_top=None, h_decoder_top=None, prev_latents=None):
         stats = []
         xs = {a.shape[2]: a for a in self.bias_xs}
-        current_latents = []
+        current_latents = [] #BxS which is slot-wise 
+        decode_latents = [] #B which is used for RNN as image-level states
+
+        if prev_latents is None:
+            prev_latents = [None] * len(self.dec_blocks)
 
         for idx, block in enumerate(self.dec_blocks):
             blk_cond = cond_top if block.is_top else None
             blk_h = h_decoder_top if block.is_top else None
 
             latent_prev = prev_latents[idx]
-            if idx ==0:
+
+            if idx == 0:
                 up_latent_cur = None
             else:
-                z = current_latents[idx-1]
+                z = current_latents[idx - 1]
                 up_key = self.block_up_keys[idx]
                 up_latent_cur = self.upsamplers[up_key](z)
+
+                if latent_prev is not None and latent_prev.shape[0] != up_latent_cur.shape[0]:
+                    target_b = up_latent_cur.shape[0]
+
+                    if latent_prev.shape[0] == 1:
+                        latent_prev = latent_prev.expand(
+                            target_b, *latent_prev.shape[1:]
+                        ).contiguous()
+
+                    elif target_b % latent_prev.shape[0] == 0:
+                        rep = target_b // latent_prev.shape[0]
+                        latent_prev = latent_prev[:, None].expand(
+                            latent_prev.shape[0], rep, *latent_prev.shape[1:]
+                        ).reshape(target_b, *latent_prev.shape[1:]).contiguous()
+
+                    else:
+                        raise ValueError(
+                            f"Cannot expand latent_prev batch {latent_prev.shape[0]} "
+                            f"to decoder batch {target_b} at block {idx}."
+                        )
 
             xs, block_stats, z_cur = block(
                 xs,
@@ -489,11 +696,18 @@ class Decoder(HModule):
                 up_latent_cur=up_latent_cur,
                 h_decoder_top=blk_h,
             )
+
             stats.append(block_stats)
             current_latents.append(z_cur)
+            if block.is_top:
+                if "z_top_state" not in block_stats:
+                    raise KeyError("Top block did not return z_top_state.")
+                decode_latents.append(block_stats["z_top_state"])
+            else:
+                decode_latents.append(z_cur)                
 
         xs[self.H.image_size] = self.final_fn(xs[self.H.image_size])
-        return xs[self.H.image_size], stats, current_latents
+        return xs[self.H.image_size], stats, decode_latents        
 
     def forward_uncond(
         self,
@@ -633,8 +847,7 @@ class VDVAE(HModule):
         get_latents=False,
         slot_repulsion_tau =1.0,
     ):
-        activations = self.encoder.forward(x)
-
+        activations = self.encoder.forward(x)        
         px_z, stats, current_latents = self.decoder.forward(
             activations,
             get_latents=get_latents,
@@ -642,7 +855,14 @@ class VDVAE(HModule):
             h_decoder_top=h_decoder_top,
             prev_latents=prev_latents,
         )
-
+        B = x_target.shape[0]
+        BS = px_z.shape[0]
+        if BS % B != 0:
+            raise ValueError(
+                f"Decoder output batch {BS} is not divisible by image batch {B}. "
+                "This means slot flattening B*S was not propagated consistently."
+            )
+        
         distortion_per_pixel = self.decoder.out_net.nll(px_z, x_target)
         ndims = float(np.prod(x_target.shape[1:]))
 
@@ -653,28 +873,34 @@ class VDVAE(HModule):
         top_slot_logsigma = None
         top_slot_resp = None
         top_slot_attn = None
-        top_slot_masks = None
         top_slot_comp_maps = None
-        
+        z_top_state = None
         for block, st in zip(self.decoder.dec_blocks, stats):
-            kl_block = st["kl"].sum(dim=(1, 2, 3))
+            kl_block = st["kl"]
             if block.is_top:
                 top_q_mean_map = st.get("posterior_mean", None)
                 top_q_logvar_map = st.get("posterior_logvar", None)
                 top_slot_mu = st.get("slot_mu", None)
                 top_slot_logsigma = st.get("slot_logsigma", None)
                 top_slot_attn = st.get("slot_attn", None)
-                top_slot_masks = st.get("slot_masks", None)
                 top_slot_comp_maps = st.get("slot_comp_maps", None)
+                z_top_state = st.get("z_top_state", None)
             else:
-                rate_gauss = rate_gauss + kl_block
+                if kl_block.shape[0] == B:
+                    kl_img = kl_block
+                elif kl_block.shape[0] % B == 0:
+                    S_kl = kl_block.shape[0] // B
+                    kl_img = kl_block.view(B, S_kl).sum(dim=1)
+                else:
+                    raise ValueError(
+                        f"KL batch {kl_block.shape[0]} is not compatible with image batch {B}."
+                    )
+                rate_gauss = rate_gauss + kl_img
 
         rate_gauss = rate_gauss / ndims
         dp_rate = torch.zeros_like(distortion_per_pixel)
         slot_div_loss = torch.zeros_like(distortion_per_pixel)
-        mask_entropy_img, mask_balance_img = slot_mask_regularization_from_masks(top_slot_masks)
         slot_div_w = float(getattr(self.H, "slot_diversity_weight", 0.0))
-        mask_reg_w = float(getattr(self.H, "mask_regularizer_weight", 0.0))
 
         if slot_div_w > 0.0:
             d2 = torch.cdist(top_slot_mu, top_slot_mu, p=2) ** 2
@@ -708,7 +934,7 @@ class VDVAE(HModule):
             )
 
             dp_rate = self.top_kl_weight * dp_kl_img  / ndims 
-        total_rate = rate_gauss + dp_rate + slot_div_loss + mask_reg_w * (mask_entropy_img + 0.05 * mask_balance_img)
+        total_rate = rate_gauss + dp_rate + slot_div_loss 
         elbo_per_sample = distortion_per_pixel + total_rate
 
         if mask_t is None:
@@ -735,9 +961,9 @@ class VDVAE(HModule):
             "top_slot_logsigma": top_slot_logsigma,
             "top_slot_resp": top_slot_resp,
             "top_slot_attn": top_slot_attn,
-            "top_slot_masks": top_slot_masks,
             "top_slot_comp_maps": top_slot_comp_maps,
             "current_latents": current_latents,
+            "z_top_state": z_top_state,
         }
         if dp_kl_img is not None:
             out["dp_kl"] = reduce(dp_kl_img)
@@ -775,9 +1001,9 @@ class VDVAE(HModule):
         slots_mu, slots_var = sample_slots_conditional_frozen(snapshot=self.top_prior_snapshot, frozen_gate=self.top_prior_gate, h_t=h_prior_top, num_slots = self.decoder.dec_blocks[0].top_slot_posterior.num_slots,temperature=temperature)
         slots_mu = slots_mu.contiguous()
         slots_logsigma = 0.5 * torch.log(slots_var.clamp_min(torch.finfo(slots_var.dtype).eps)).clamp(-7.0, 3.0).contiguous()
-        _, _, z_top_map, _, _, _ = self.decoder.dec_blocks[0].top_slot_posterior.slot_to_top(slots_mu, slots_logsigma, cond_top )
+        _, _, _, _, _, z_slot_maps = self.decoder.dec_blocks[0].top_slot_posterior.slot_to_top(slots_mu, slots_logsigma, cond_top )
         px_z, current_latents = self.decoder.forward_from_top_latent(
-            z_top_map,
+            z_slot_maps,
             t=t,
             h_decoder_top=h_decoder_top,
             prev_latents=prev_latents,

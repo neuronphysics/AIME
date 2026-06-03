@@ -2027,7 +2027,7 @@ def compute_slot_kl_conditional_frozen(
         eps=eps
     )  # [B, S, M]
 
-    log_r = log_pi[:, None, :] - kl_q_to_comp
+    log_r = log_pi[:, None, :] - torch.clamp(kl_q_to_comp, max=1e5)
     resp = torch.softmax(log_r, dim=-1)
 
     slot_kl = resp * (
@@ -2064,10 +2064,7 @@ def sample_slots_conditional_frozen(
     pi = frozen_gate.mean_pi(h_t).clamp_min(torch.finfo(h_t.dtype).eps)
 
     temp = max(float(temperature), 1e-4)
-    if temp != 1.0:
-        pi = torch.softmax(torch.log(pi) / temp, dim=-1)
-    else:
-        pi = pi / pi.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(pi.dtype).eps)
+    pi = torch.softmax(torch.log(pi) / temp, dim=-1)
 
     pi_rep = pi[:, None, :].expand(B, num_slots, M).reshape(B * num_slots, M)
     idx = torch.multinomial(pi_rep, 1).squeeze(-1)
