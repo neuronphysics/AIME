@@ -63,6 +63,7 @@ labmaze
 libclang
 lpips
 lxml
+mamba-ssm
 Markdown
 MarkupSafe
 matplotlib

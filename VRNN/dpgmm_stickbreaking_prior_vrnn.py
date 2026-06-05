@@ -25,7 +25,7 @@ from torch.utils.checkpoint import checkpoint as ckpt
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from vis_networks import EMA, TemporalDiscriminator, AddEpsilon, check_tensor, ImageDiscriminator
 from VRNN.RGB import DynamicWeightAverage
-from VRNN.lstm import LSTMLayer, SpatioTemporalCore
+from VRNN.VMRNN_D import VMRNNCore
 from VRNN.perceiver.position import RoPE
 from vdvae.vae import VDVAE
 from vdvae.hps import Hyperparams
@@ -80,6 +80,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         rollout_decoder_temperature: float = 1.0,
         patch_disc_layers: int = 2,
         patch_disc_ndf:int = 36,
+        mamba_d_state:int =32,
         lecam_ema_decay: float = 0.99,    # EMA decay for LeCam regularization anchors
         top_slot_iters: int = 3,
         slot_diversity_weight: float = 0.5,
@@ -120,7 +121,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.lambda_overshoot = 0.5
         # rollout GAN attributes
         self.register_buffer("global_step", torch.zeros((), dtype=torch.long), persistent=True)
-
+        self.mamba_d_state = int(mamba_d_state)
         self.rollout_adv_every = int(rollout_adv_every)
         self.rollout_context_frames = int(rollout_context_frames)
         self.rollout_horizon = int(rollout_horizon)
@@ -262,12 +263,12 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         H.dataset = 'imagenet64'
         H.num_mixtures = 10
         H.skip_threshold = 100.0
-        H.enc_blocks = "64x3,64d2,32x3"
-        H.dec_blocks = "32x3,64m32,64x3"
+        H.enc_blocks = "64x2,64d2,32x2"
+        H.dec_blocks = "32x2,64m32,64x2"
         H.attn_resolutions = []
         H.use_spatial_attn = False
         H.attn_where = "last"
-        H.top_h_context_dim = self.hidden_dim
+        H.top_h_context_dim = H.zdim + self.action_dim
 
         H.no_bias_above = 64
         H.custom_width_str = ""
@@ -306,7 +307,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.top_slot_dim = int(H.top_slot_dim)
         self.top_prior_model = ConditionalTopDPGMM(
             z_shape=(self.top_slot_dim, 1, 1),
-            h_shape=(self.hidden_dim, self.top_H, self.top_W),
+            h_shape=(self.latent_dim + self.action_dim, self.top_H, self.top_W),
             max_components=max_components,
             init_components = self.init_components,
             dp_alpha = self.dp_alpha,
@@ -391,7 +392,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         self.vdvae.top_prior_snapshot = prior.frozen_snapshot()
         self.vdvae.top_prior_gate = ConditionalTopDPGMM.load_gate_from_snapshot(
             snapshot=self.vdvae.top_prior_snapshot,
-            h_shape=(self.hidden_dim, self.top_H, self.top_W),
+            h_shape=(self.latent_dim + self.action_dim, self.top_H, self.top_W),
             hidden_dim=prior.gate.hidden_dim,
             device=self.device,
             dtype=torch.float32,
@@ -430,7 +431,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         # Initialize discriminators
         self.image_discriminator = TemporalDiscriminator(
             input_channels=self.input_channels,
-            cond_channels=self.zdim+self.hidden_dim,
+            cond_channels=self.zdim+self.latent_dim + self.action_dim,
             num_layers=int(img_disc_layers),
             conv_type="standard",
             attn_dim=self.hidden_dim,
@@ -454,15 +455,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         """Initialize VRNN components with context conditioning"""
         # Feature extractors
         # VRNN recurrence: h_t = f(h_{t-1}, z_t, a_t)
-        self._rnn = SpatioTemporalCore(
-            zdim=self.zdim,                # C, not C*H*W
+        self._rnn = VMRNNCore(
+            zdim=self.zdim,
             action_dim=self.action_dim,
-            hidden_dim=self.hidden_dim,    # correct keyword
             height=self.top_H,
             width=self.top_W,
-            kernel=5,
-            use_checkpoint=self.use_ctx_checkpoint,
-            extra_channels=extra_channels
+            depth=3,
+            d_state=self.mamba_d_state,
         )
 
 
@@ -542,7 +541,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         scalar_state_params = [
             getattr(self.rnn, "h0", None),
             getattr(self.rnn, "c0", None),
-            getattr(self.rnn, "m0", None),
         ]
         scalar_state_params = [p for p in scalar_state_params if isinstance(p, nn.Parameter) and p.requires_grad]
 
@@ -676,7 +674,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         with torch.no_grad():
             self.vdvae.top_prior_gate = ConditionalTopDPGMM.load_gate_from_snapshot(
                 self.vdvae.top_prior_snapshot,
-                h_shape=(self.hidden_dim, self.top_H, self.top_W),
+                h_shape=(self.latent_dim + self.action_dim, self.top_H, self.top_W),
                 hidden_dim=self.top_prior_model.gate.hidden_dim,
                 device=self.device,
                 dtype=torch.float32,
@@ -756,7 +754,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             "hidden_states": [],              # post-RNN-update normalized hidden maps, flattened
             "core_h_maps": [],
             "core_c_maps": [],
-            "core_m_maps": [],
             "prior_pi": [],
             "reconstruction_losses": [],
             "gauss_rate": [],
@@ -795,19 +792,20 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             else:
                 mask_t = (1.0 - dones[:, t - 1].float()).to(torch.float32)
 
-            h, c, m = core_state
-            keep = mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype)
+            h, c = core_state
+            keep = mask_t.view(B, 1, 1).to(device=device, dtype=dtype)
 
-            h0, c0, m0 = self.rnn.init_state(B, device=device, dtype=dtype)
+            h0, c0= self.rnn.init_state(B, device=device, dtype=dtype)
             core_state = (
                 h * keep + h0 * (1.0 - keep),
                 c * keep + c0 * (1.0 - keep),
-                m * keep + m0 * (1.0 - keep),
             )
-            z_prev_top_masked = z_prev_top * keep
+            z_prev_top_masked = z_prev_top * mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype)
             assert all(pl is None or pl.shape[0] == B or pl.shape[0] % B == 0 for pl in prev_latents)
-            prev_latents = [None if pl is None else pl * (keep if pl.shape[0] == B else keep.repeat_interleave(pl.shape[0] // B, dim=0)) for pl in prev_latents]
-            h_t = self.rnn.out_norm(core_state[0])  # [B, hidden_dim, topH, topW]
+            prev_latents = [None if pl is None else pl * (mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype) if pl.shape[0] == B else mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype).repeat_interleave(pl.shape[0] // B, dim=0)) for pl in prev_latents]
+            h_tok = self.rnn.out_norm(core_state[0])
+            B_, _, D_ = h_tok.shape
+            h_t= h_tok.transpose(1, 2).reshape(B_, D_, self.top_H, self.top_W ).contiguous()
 
 
             # Encode the current frame with VDVAE conditioned on current context
@@ -862,7 +860,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             # Store recurrent states and latent statistics for this timestep
             outputs["core_h_maps"].append(core_state[0])
             outputs["core_c_maps"].append(core_state[1])
-            outputs["core_m_maps"].append(core_state[2])
             outputs["prior_pi"].append(pi_t)
             outputs["top_q_mean_map"].append(vdvae_out["top_q_mean_map"].detach())
             outputs["top_q_logvar_map"].append(vdvae_out["top_q_logvar_map"].detach())
@@ -924,19 +921,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     sample = self.vdvae.decoder.out_net.sample(vdvae_out["px_z"])
                     sample = torch.from_numpy(sample).to(device=device, dtype=torch.float32)
                     sample = sample.permute(0, 3, 1, 2).contiguous()/ 127.5 - 1.0 #TODO:is this correct
-                    N_sample, C_sample, H_sample, W_sample = sample.shape
-                    S_sample = N_sample // B
 
-                    # [B*S, 3, H, W] -> [B, S, 3, H, W]
-                    sample_slots = sample.view(B, S_sample, C_sample, H_img, W_img)
-
-                    # decoder_masks already has shape [B,S,1,H,W]
-                    sample_img = torch.sum(decoder_masks.detach() * sample_slots, dim=1)
-                    sample_img = sample_img.clamp(-1.0, 1.0)
+                    sample_img = sample.clamp(-1.0, 1.0)
                 outputs["reconstruction_samples"].append(sample_img)
             outputs["reconstructions"].append(recon_mean)
             outputs["latents"].append(z_top_state.detach())
-            outputs["hidden_states"].append( h_context_next.permute(0, 2, 3, 1).contiguous().view(batch_size, Ht * Wt * self.hidden_dim).detach())
+            ctx_dim = h_context_next.shape[1]
+            outputs["hidden_states"].append( h_context_next.permute(0, 2, 3, 1).contiguous().view(batch_size, Ht * Wt * ctx_dim).detach())
             outputs["z_seq_maps"].append(torch.cat([z_top_state.detach(), h_context_next.detach()], dim=1))
             outputs["reconstruction_losses"].append(vdvae_out["distortion"])
             outputs["gauss_rate"].append(vdvae_out["gauss_rate"].detach())
@@ -948,7 +939,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         for k in [
             "core_h_maps",
             "core_c_maps",
-            "core_m_maps",
             "overshoot_z_prev_top",
             "z_seq_maps",
             "top_slot_mu",
@@ -1022,7 +1012,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         if core_state_maps is None or overshoot_anchor_state is None:
             raise ValueError("Pass core_state_maps and overshoot_anchor_state.")
 
-        core_h_seq, core_c_seq, core_m_seq = core_state_maps
+        core_h_seq, core_c_seq= core_state_maps
         z_prev_seq = overshoot_anchor_state["z_prev_top"]
 
         A = T - 1
@@ -1033,7 +1023,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         h = core_h_seq[:, anchors].reshape(BA, *core_h_seq.shape[2:]).contiguous().detach()
         c = core_c_seq[:, anchors].reshape(BA, *core_c_seq.shape[2:]).contiguous().detach()
-        m = core_m_seq[:, anchors].reshape(BA, *core_m_seq.shape[2:]).contiguous().detach()
         z_prev_top = z_prev_seq[:, anchors].reshape(BA, *z_prev_seq.shape[2:]).contiguous().detach()
 
 
@@ -1059,18 +1048,19 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
             mask_roll = valid_ba.to(dtype)
 
-            keep = mask_roll.view(BA, 1, 1, 1).to(device=device, dtype=dtype)
-            h0, c0, m0 = self.rnn.init_state(BA, device=device, dtype=dtype)
+            keep = mask_roll.view(BA, 1, 1).to(device=device, dtype=dtype)
+            h0, c0= self.rnn.init_state(BA, device=device, dtype=dtype)
             h = h * keep + h0 * (1.0 - keep)
             c = c * keep + c0 * (1.0 - keep)
-            m = m * keep + m0 * (1.0 - keep)
-            z_prev_top = z_prev_top * keep
+            z_prev_top = z_prev_top * mask_roll.view(BA, 1, 1, 1).to(device=device, dtype=dtype)
             if actions is None:
                 a_prev = torch.zeros(BA, self.action_dim, device=device, dtype=dtype)
             else:
                 a_prev = actions[:, t_idx_safe - 1].reshape(BA, -1).contiguous()
                 a_prev = a_prev * mask_roll.unsqueeze(-1)
-            h_t = self.rnn.out_norm(h)  # [BA, hidden_dim, topH, topW]
+            h_tok = self.rnn.out_norm(h)
+            B_, _, D_ = h_tok.shape
+            h_t = h_tok.transpose(1, 2).reshape(B_, D_, self.top_H, self.top_W ).contiguous()
 
 
             kl_ba, _ = compute_slot_kl_conditional_frozen(
@@ -1114,10 +1104,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 )
                 a_cur = a_cur * (mask_roll * can_step_fwd).unsqueeze(-1) #TODO: ???Is this correct?
 
-            _, (h, c, m) = self.rnn(
+            _, (h, c) = self.rnn(
                 z_top_state,
                 a_cur,
-                state=(h, c, m),
+                state=(h, c),
                 mask_t=None,
                 extra_maps=None,
             )
@@ -1233,7 +1223,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     core_state_maps=(
                         outputs["core_h_maps"],
                         outputs["core_c_maps"],
-                        outputs["core_m_maps"],
                     ),
                     overshoot_anchor_state={
                         "z_prev_top": outputs["overshoot_z_prev_top"],
@@ -1535,7 +1524,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             self.image_discriminator.train()
         # 1) Prepare data and compute VAE loss
         warmup_factor = self.get_warmup_factor()
-
         vae_losses, outputs = self.compute_total_loss(
             observations,
             actions,
@@ -1603,6 +1591,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     seq_len_future = future_len[keep]
 
                     # Rollout once WITHOUT grad for discriminator updates
+                    
                     dbgD = self.generate_future_sequence(
                         initial_obs=observations[keep, :T_ctx],
                         actions=(actions_slice[keep] if actions_slice is not None else None),
@@ -1620,18 +1609,18 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         for _ in range(n_critic):
             # teacher-forced recon fakes
             disc_loss = self.discriminator_step(
-                real_images=observations,
-                fake_images=outputs["reconstructions"].detach(),
-                latents=z_seq_tf,
+                real_images=observations.float(),
+                fake_images=outputs["reconstructions"].detach().float(),
+                latents=z_seq_tf.detach().float(),
                 sequence_lengths=lengths_full,
             )
 
             # rollout fakes (optional)
             if do_rollout and (fake_future_D is not None) and (z_seq_roll_D is not None):
                 disc_loss_roll = self.discriminator_step(
-                    real_images=real_future,
-                    fake_images=fake_future_D,
-                    latents=z_seq_roll_D,
+                    real_images=real_future.float(),
+                    fake_images=fake_future_D.detach().float(),
+                    latents=z_seq_roll_D.detach().float(),
                     sequence_lengths=seq_len_future,
                 )
                 for k, v in disc_loss_roll.items():
@@ -1674,6 +1663,13 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             )
             fake_future_G = dbgG["vae_future"]      # [B_keep, H, C, H, W] (requires grad)
             z_seq_roll_G = dbgG["z_seq"].detach()   # keep conditioning stable + save memory
+
+            rollout_img_adv_loss, rollout_temporal_adv_loss, rollout_feat_match_loss = self.compute_adversarial_losses(
+                x=real_future,
+                reconstruction=fake_future_G,
+                z_seq=z_seq_roll_G,
+                sequence_lengths=seq_len_future,
+            )
             # Flatten time for LPIPS
             fake_bt = rearrange(fake_future_G, "b t c h w -> (b t) c h w")
             real_bt = rearrange(real_future,   "b t c h w -> (b t) c h w")
@@ -1686,14 +1682,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             Bf, Tf, C, H, W = fake01.shape
             fake_flat = fake01.reshape(Bf * Tf, C, H, W)
             real_flat = real01.reshape(Bf * Tf, C, H, W)
-
-
-            rollout_img_adv_loss, rollout_temporal_adv_loss, rollout_feat_match_loss = self.compute_adversarial_losses(
-                x=real_future,
-                reconstruction=fake_future_G,
-                z_seq=z_seq_roll_G,
-                sequence_lengths=seq_len_future,
-            )
 
         # 6) Combine losses with DWA or fixed weights
         if self.use_dwa:
@@ -1789,7 +1777,9 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         dtype = next(self.parameters()).dtype
 
         core_state = self.rnn.init_state(num_samples, device=device, dtype=dtype)
-        h_t = self.rnn.out_norm(core_state[0])
+        h_tok = self.rnn.out_norm(core_state[0])
+        B_, _, D_ = h_tok.shape
+        h_t = h_tok.transpose(1, 2).reshape(B_, D_, self.top_H, self.top_W ).contiguous()
         z_prev_top = torch.zeros(num_samples, self.zdim, self.top_H, self.top_W, device=device, dtype=dtype)
 
 
@@ -1826,7 +1816,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
 
         Returns:
             vae_future: [B, H_roll, C, H, W]
-            z_seq:      [B, H_roll, zdim + hidden_dim, top_H, top_W]
+            z_seq:      [B, H_roll, zdim + self.latent_dim + self.action_dim, top_H, top_W]
             pi_seq:     [B, H_roll, K]
         """
         B, T_ctx, C, H, W = initial_obs.shape
@@ -1875,20 +1865,21 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 x_t = initial_obs[:, t]
                 mask_t = mask_at(t)
 
-                keep = mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype)
-                h, c, m_ = core_state
-                h0, c0, m0 = self.rnn.init_state(B, device=device, dtype=dtype)
+                keep = mask_t.view(B, 1, 1).to(device=device, dtype=dtype)
+                h, c = core_state
+                h0, c0= self.rnn.init_state(B, device=device, dtype=dtype)
                 core_state = (
                     h * keep + h0 * (1.0 - keep),
                     c * keep + c0 * (1.0 - keep),
-                    m_ * keep + m0 * (1.0 - keep),
                 )
 
-                z_prev_top_masked = z_prev_top * keep
+                z_prev_top_masked = z_prev_top * mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype)
                 assert all(pl is None or pl.shape[0] == B or pl.shape[0] % B == 0 for pl in prev_latents)
-                prev_latents = [None if pl is None else pl * (keep if pl.shape[0] == B else keep.repeat_interleave(pl.shape[0] // B, dim=0)) for pl in prev_latents]
+                prev_latents = [None if pl is None else pl * (mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype) if pl.shape[0] == B else mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype).repeat_interleave(pl.shape[0] // B, dim=0)) for pl in prev_latents]
 
-                h_t = self.rnn.out_norm(core_state[0])
+                h_tok = self.rnn.out_norm(core_state[0])
+                B_, _, D_ = h_tok.shape
+                h_t = h_tok.transpose(1, 2).reshape(B_, D_, self.top_H, self.top_W ).contiguous()
 
 
                 x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
@@ -1900,10 +1891,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     prev_latents=prev_latents,
                     get_latents=True,
                 )
-
-
                 z_top_state = vdvae_out.get("z_top_state", vdvae_out["current_latents"][0])
-
 
                 a_cur = actions[:, t]
                 _, core_state = self.rnn(
@@ -1922,20 +1910,21 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                 t_abs = T_ctx + k
                 mask_t = mask_at(t_abs)
 
-                keep = mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype)
-                h, c, m_ = core_state
-                h0, c0, m0 = self.rnn.init_state(B, device=device, dtype=dtype)
+                keep = mask_t.view(B, 1, 1).to(device=device, dtype=dtype)
+                h, c= core_state
+                h0, c0 = self.rnn.init_state(B, device=device, dtype=dtype)
                 core_state = (
                     h * keep + h0 * (1.0 - keep),
                     c * keep + c0 * (1.0 - keep),
-                    m_ * keep + m0 * (1.0 - keep),
                 )
 
-                z_prev_top_masked = z_prev_top * keep
+                z_prev_top_masked = z_prev_top * mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype)
                 assert all(pl is None or pl.shape[0] == B or pl.shape[0] % B == 0 for pl in prev_latents)
-                prev_latents = [None if pl is None else pl * (keep if pl.shape[0] == B else keep.repeat_interleave(pl.shape[0] // B, dim=0)) for pl in prev_latents]
+                prev_latents = [None if pl is None else pl * (mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype) if pl.shape[0] == B else mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype).repeat_interleave(pl.shape[0] // B, dim=0)) for pl in prev_latents]
 
-                h_t = self.rnn.out_norm(core_state[0])
+                h_tok = self.rnn.out_norm(core_state[0])
+                B_, _, D_ = h_tok.shape
+                h_t = h_tok.transpose(1, 2).reshape(B_, D_, self.top_H, self.top_W ).contiguous()
 
                 a_prev = (
                     actions[:, t_abs - 1] * mask_t.view(B, 1).to(device=device, dtype=dtype)
@@ -1996,16 +1985,6 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
                     x_hat = torch.from_numpy(x_np).to(device=device, dtype=torch.float32)
                     x_hat = x_hat.permute(0, 3, 1, 2).contiguous() / 127.5 - 1.0
 
-                    N_sample, C_sample, H_sample, W_sample = x_hat.shape
-                    if N_sample % B != 0:
-                        raise ValueError(f"Expected rollout sample batch B*S, got N={N_sample}, B={B}")
-                    S_sample = N_sample // B
-                    x_hat = x_hat.view(B, S_sample, C_sample, H_sample, W_sample)
-                    mask_logits = px_z[:, self.vdvae.H.width:self.vdvae.H.width + 1] #TODO: What is the size of this tensor???
-                    mask_logits = mask_logits.view(B, S_sample, 1, H_sample, W_sample)
-                    decoder_masks = F.softmax(mask_logits, dim=1)
-
-                    x_hat = torch.sum(decoder_masks * x_hat, dim=1)
                     x_hat = x_hat.clamp(-1.0, 1.0)
                 pred_imgs.append(x_hat)
 
@@ -2038,7 +2017,7 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             torch.stack(z_seq, dim=1)
             if z_seq
             else initial_obs.new_zeros(
-                (B, 0, self.zdim + self.hidden_dim, self.top_H, self.top_W)
+                (B, 0, self.zdim + self.latent_dim + self.action_dim, self.top_H, self.top_W)
             )
         )
 

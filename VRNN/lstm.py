@@ -383,6 +383,17 @@ class ConvLSTM(nn.Module):
             return h_list[-1], (h_list, c_list)
 
 
+def make_group_norm(
+    channels: int,
+    max_groups: int = 8,
+    eps: float = 1e-5,
+) -> nn.GroupNorm:
+    return nn.GroupNorm(
+        num_groups=_largest_divisor_leq(channels, max_groups),
+        num_channels=channels,
+        eps=eps,
+        affine=True,
+    )
 class SpatioTemporalLSTMCell(nn.Module):
     def __init__(self, in_channel, num_hidden, height, width, filter_size, stride):
         super(SpatioTemporalLSTMCell, self).__init__()
@@ -392,19 +403,23 @@ class SpatioTemporalLSTMCell(nn.Module):
         self._forget_bias = 1.0
         self.conv_x = nn.Sequential(
             nn.Conv2d(in_channel, num_hidden * 7, kernel_size=filter_size, stride=stride, padding=self.padding, bias=False),
-            nn.LayerNorm([num_hidden * 7, height, width])
+            #nn.LayerNorm([num_hidden * 7, height, width])
+            make_group_norm(num_hidden * 7, max_groups=8)
         )
         self.conv_h = nn.Sequential(
             nn.Conv2d(num_hidden, num_hidden * 4, kernel_size=filter_size, stride=stride, padding=self.padding, bias=False),
-            nn.LayerNorm([num_hidden * 4, height, width])
+            #nn.LayerNorm([num_hidden * 4, height, width])
+            make_group_norm(num_hidden * 4, max_groups=8)
         )
         self.conv_m = nn.Sequential(
             nn.Conv2d(num_hidden, num_hidden * 3, kernel_size=filter_size, stride=stride, padding=self.padding, bias=False),
-            nn.LayerNorm([num_hidden * 3, height, width])
+            #nn.LayerNorm([num_hidden * 3, height, width])
+            make_group_norm(num_hidden * 3, max_groups=8)
         )
         self.conv_o = nn.Sequential(
             nn.Conv2d(num_hidden * 2, num_hidden, kernel_size=filter_size, stride=stride, padding=self.padding, bias=False),
-            nn.LayerNorm([num_hidden, height, width])
+            #nn.LayerNorm([num_hidden, height, width])
+            make_group_norm(num_hidden, max_groups=8)
         )
         self.conv_last = nn.Conv2d(num_hidden * 2, num_hidden, kernel_size=1, stride=1, padding=0)
 
@@ -437,12 +452,6 @@ class SpatioTemporalLSTMCell(nn.Module):
 
 
 
-def safe_groups(C, max_groups=8):
-    for g in range(min(max_groups, C), 0, -1):
-        if C % g == 0:
-            return g
-    return 1
-
 class SpatioTemporalCore(nn.Module):
     def __init__(self, zdim, action_dim, hidden_dim, *, height=4, width=4,
                  kernel=5, init_std=0.0, use_checkpoint=False,
@@ -467,8 +476,7 @@ class SpatioTemporalCore(nn.Module):
             stride=1,
         )
 
-        self.out_norm = nn.GroupNorm(num_groups=safe_groups(self.hidden_dim, 8),
-                                     num_channels=self.hidden_dim)
+        self.out_norm = make_group_norm(self.hidden_dim, max_groups=8)
 
         self.h0 = nn.Parameter(torch.zeros(1, self.hidden_dim, self.height, self.width))
         self.c0 = nn.Parameter(torch.zeros(1, self.hidden_dim, self.height, self.width))

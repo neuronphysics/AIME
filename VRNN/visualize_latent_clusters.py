@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -11,184 +12,269 @@ from tqdm import tqdm
 import matplotlib
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
+from matplotlib.gridspec import GridSpec
+from matplotlib.colors import BoundaryNorm
+
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from vdvae.top_dpgmm_prior import ConditionalTopDPGMM, compute_slot_kl_conditional_frozen, sample_slots_conditional_frozen
-from umap import UMAP  # type: ignore
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
+from umap import UMAP 
+
+from vdvae.top_dpgmm_prior import compute_slot_kl_conditional_frozen,  sample_slots_conditional_frozen
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+@dataclass
+class VizConfig:
+    t_select: int = 8
+    max_batches: int = 5
+    max_points: int = 3000          # total slot tokens extracted from loader
+    max_embed_points: int = 2000    # total posterior+prior points embedded; comp means always kept
+    n_example_frames: int = 3
+    embed_method: str = "umap"      # "umap" | "tsne" | "pca"
+    perplexity: float = 30.0
+    random_state: int = 42
+    point_size: float = 10.0
+    dpi: int = 150
+    eps: float = 1e-6
+    active_component_threshold: float = 0.01
+    show_kumaraswamy: bool = True
+
+
+_PALETTE = plt.cm.tab10.colors
+
+
+def _discrete_cmap(n: int):
+    n = max(1, int(n))
+    cols = [_PALETTE[i % len(_PALETTE)] for i in range(n)]
+    return matplotlib.colors.ListedColormap(cols), BoundaryNorm(
+        np.arange(-0.5, n + 0.5, 1.0), n
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Style helpers
+# --------------------------------------------------------------------------- #
+def _style_axis(ax, *, title: str = "", xlabel: str = "", ylabel: str = "", grid: bool = False) -> None:
+    if title:
+        ax.set_title(title, fontsize=10, pad=6)
+    if xlabel:
+        ax.set_xlabel(xlabel, fontsize=8.5)
+    if ylabel:
+        ax.set_ylabel(ylabel, fontsize=8.5)
+    ax.tick_params(labelsize=7.5, length=2.5, width=0.6)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_linewidth(0.7)
+    if grid:
+        ax.grid(True, linewidth=0.4, alpha=0.35)
+        ax.set_axisbelow(True)
+
+
+def _blank(ax, msg: str = "") -> None:
+    ax.axis("off")
+    if msg:
+        ax.text(0.5, 0.5, msg, ha="center", va="center", fontsize=8, color="0.35", transform=ax.transAxes)
+
+
+# --------------------------------------------------------------------------- #
+# Tensor/image helpers
+# --------------------------------------------------------------------------- #
 def _to_minus1_1(x: torch.Tensor) -> torch.Tensor:
-    """Convert uint8 [0,255] or float [0,1]/[-1,1] into float [-1,1]."""
+    """Convert uint8 [0,255], float [0,1], or already [-1,1] to float [-1,1]."""
     if x.dtype == torch.uint8:
         return x.float() / 127.5 - 1.0
     x = x.float()
     if x.numel() > 0:
-        mx = float(x.max().item())
-        mn = float(x.min().item())
+        mx = float(x.max().detach().cpu().item())
+        mn = float(x.min().detach().cpu().item())
         if mx <= 1.0 + 1e-6 and mn >= 0.0 - 1e-6:
             x = x * 2.0 - 1.0
     return x
 
 
 def _chw_to_01(x: torch.Tensor) -> np.ndarray:
-    """Tensor [C,H,W] or [H,W,C] in [-1,1] or [0,1] -> numpy [H,W,3]."""
+    """CHW tensor in [-1,1] or [0,1] -> HWC float array in [0,1]."""
     x = x.detach().float().cpu()
-    if x.dim() == 3 and x.shape[0] in (1, 3):
-        x = x.permute(1, 2, 0)
-    if x.numel() == 0:
-        arr = np.zeros((1, 1, 3), dtype=np.float32)
-    else:
-        mn, mx = float(x.min().item()), float(x.max().item())
-        y = x if (mn >= -1e-6 and mx <= 1.0 + 1e-6) else (x + 1.0) * 0.5
-        y = y.clamp(0.0, 1.0)
-        arr = y.numpy()
-    if arr.ndim == 2:
-        arr = np.repeat(arr[..., None], 3, axis=-1)
+    if x.dim() == 2:
+        x = x.unsqueeze(0)
+    if x.dim() == 3 and x.shape[0] not in (1, 3) and x.shape[-1] in (1, 3):
+        # already HWC
+        arr = x.clamp(0, 1).numpy()
+        if arr.shape[-1] == 1:
+            arr = np.repeat(arr, 3, axis=-1)
+        return arr
+    if x.numel() and float(x.min()) < -0.01:
+        x = (x + 1.0) * 0.5
+    x = x.clamp(0.0, 1.0)
+    arr = x.permute(1, 2, 0).numpy()
     if arr.shape[-1] == 1:
         arr = np.repeat(arr, 3, axis=-1)
     return arr.astype(np.float32, copy=False)
 
 
-def _mask_to_rgb(mask: torch.Tensor) -> np.ndarray:
-    """Mask tensor [1,H,W] or [H,W] -> RGB numpy [H,W,3]."""
+def _mask_to_01(mask: torch.Tensor) -> np.ndarray:
     m = mask.detach().float().cpu()
+    if m.dim() == 4:
+        m = m[0]
     if m.dim() == 3:
         m = m.squeeze(0)
-    if m.numel() == 0:
-        return np.zeros((1, 1, 3), dtype=np.float32)
-    arr = m.clamp(0.0, 1.0).numpy().astype(np.float32, copy=False)
-    return np.repeat(arr[..., None], 3, axis=-1)
+    return m.clamp(0.0, 1.0).numpy().astype(np.float32, copy=False)
 
 
-def _slot_content(x_chw: torch.Tensor, mask_1hw: torch.Tensor) -> np.ndarray:
-    """Original frame multiplied by a slot mask, shown as the slot content proxy."""
-    x01 = torch.from_numpy(_chw_to_01(x_chw)).permute(2, 0, 1)
-    m = mask_1hw.detach().float().cpu()
-    if m.dim() == 2:
-        m = m[None]
-    m = m.clamp(0.0, 1.0)
-    return (x01 * m + 0.15 * (1.0 - m)).permute(1, 2, 0).numpy().astype(np.float32, copy=False)
+def _overlay(frame_chw: torch.Tensor, mask_1hw: torch.Tensor, alpha: float = 0.62) -> np.ndarray:
+    """Show slot responsibility by dimming the image outside the mask."""
+    img = _chw_to_01(frame_chw)
+    m = _mask_to_01(mask_1hw)
+    if m.shape != img.shape[:2]:
+        mt = torch.from_numpy(m)[None, None].float()
+        m = F.interpolate(mt, size=img.shape[:2], mode="bilinear", align_corners=False)[0, 0].numpy()
+    m = np.clip(m, 0.0, 1.0)[..., None]
+    dimmed = img * (1.0 - alpha)
+    highlighted = img * (0.25 + 0.75 * m)
+    return np.clip(dimmed + alpha * highlighted, 0.0, 1.0)
+
+
+def _apply_batch_mask(x: Optional[torch.Tensor], mask: torch.Tensor, B: int) -> Optional[torch.Tensor]:
+    """Apply an image-level mask to tensors whose batch is B or B*S."""
+    if x is None:
+        return None
+    if x.shape[0] == B:
+        view = (B,) + (1,) * (x.dim() - 1)
+        return x * mask.view(view).to(device=x.device, dtype=x.dtype)
+    if x.shape[0] % B == 0:
+        rep = x.shape[0] // B
+        expanded = mask.repeat_interleave(rep, dim=0)
+        view = (x.shape[0],) + (1,) * (x.dim() - 1)
+        return x * expanded.view(view).to(device=x.device, dtype=x.dtype)
+    raise ValueError(f"Cannot apply [B] mask with B={B} to tensor batch {x.shape[0]}")
+
+
+# --------------------------------------------------------------------------- #
+# Embedding / metrics
+# --------------------------------------------------------------------------- #
+def _standardize_pca(X: np.ndarray, dims: int = 50) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float64)
+    finite = np.isfinite(X).all(axis=1)
+    if not finite.all():
+        X = X[finite]
+    if X.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    mu = X.mean(0, keepdims=True)
+    sd = X.std(0, keepdims=True)
+    sd = np.where(sd < 1e-8, 1.0, sd)
+    Xs = (X - mu) / sd
+    d = min(int(dims), Xs.shape[1], max(2, Xs.shape[0] - 1))
+    if Xs.shape[1] > d and Xs.shape[0] > 3:
+        Xs = PCA(n_components=d, random_state=0).fit_transform(Xs)
+    return Xs.astype(np.float32, copy=False)
+
+
+def _embed_preselected(X: np.ndarray, cfg: VizConfig) -> Tuple[np.ndarray, str]:
+    Xs = _standardize_pca(X)
+    if Xs.shape[0] < 3:
+        emb = np.zeros((Xs.shape[0], 2), dtype=np.float32)
+        if Xs.shape[0] and Xs.shape[1] >= 1:
+            emb[:, : min(2, Xs.shape[1])] = Xs[:, : min(2, Xs.shape[1])]
+        return emb, "PCA"
+
+    method = cfg.embed_method.lower()
+    if method == "umap" and UMAP is not None and Xs.shape[0] >= 5:
+        emb = UMAP(
+            n_components=2,
+            n_neighbors=max(2, min(15, Xs.shape[0] - 1)),
+            min_dist=0.1,
+            random_state=cfg.random_state,
+        ).fit_transform(Xs)
+        return emb.astype(np.float32), "UMAP"
+
+    if method in ("umap", "tsne") and Xs.shape[0] >= 5:
+        perp = min(float(cfg.perplexity), float(Xs.shape[0] - 1) - 1e-3, max(2.0, (Xs.shape[0] - 1) / 3.0))
+        perp = max(2.0, perp)
+        kwargs = dict(n_components=2, perplexity=perp, random_state=cfg.random_state, init="pca")
+        try:
+            tsne = TSNE(**kwargs, learning_rate="auto", max_iter=1000)
+        except TypeError:
+            tsne = TSNE(**kwargs, n_iter=1000)
+        return tsne.fit_transform(Xs).astype(np.float32), "t-SNE"
+
+    n_comp = min(2, Xs.shape[1], Xs.shape[0] - 1)
+    emb = PCA(n_components=n_comp, random_state=0).fit_transform(Xs)
+    if emb.shape[1] < 2:
+        emb = np.pad(emb, ((0, 0), (0, 2 - emb.shape[1])))
+    return emb.astype(np.float32), "PCA"
+
+
+def joint_embed_with_component_means(
+    post_latents: np.ndarray,
+    prior_latents: np.ndarray,
+    comp_mean: np.ndarray,
+    cfg: VizConfig,
+) -> Dict[str, Any]:
+    """One coordinate system for posterior, prior, and component means."""
+    rng = np.random.default_rng(cfg.random_state)
+    n_post = post_latents.shape[0]
+    n_prior = prior_latents.shape[0]
+    n_mean = comp_mean.shape[0]
+
+    budget = max(10, int(cfg.max_embed_points))
+    # Split budget roughly between posterior and prior, always keep component means.
+    post_budget = min(n_post, max(1, budget // 2))
+    prior_budget = min(n_prior, max(1, budget - post_budget))
+    post_idx = rng.choice(n_post, post_budget, replace=False) if n_post > post_budget else np.arange(n_post)
+    prior_idx = rng.choice(n_prior, prior_budget, replace=False) if n_prior > prior_budget else np.arange(n_prior)
+
+    X = np.concatenate([post_latents[post_idx], prior_latents[prior_idx], comp_mean], axis=0).astype(np.float32)
+    src = np.concatenate([
+        np.zeros(len(post_idx), dtype=np.int64),
+        np.ones(len(prior_idx), dtype=np.int64),
+        np.full(n_mean, 2, dtype=np.int64),
+    ])
+    emb, method = _embed_preselected(X, cfg)
+    return {"emb": emb, "src": src, "post_idx": post_idx, "prior_idx": prior_idx, "method": method}
+
+
+def slot_component_contingency(slot_ids: np.ndarray, comp_ids: np.ndarray, n_slots: int, n_comp: int) -> np.ndarray:
+    M = np.zeros((int(n_slots), int(n_comp)), dtype=np.float64)
+    for s, k in zip(slot_ids.reshape(-1), comp_ids.reshape(-1)):
+        if 0 <= s < n_slots and 0 <= k < n_comp:
+            M[int(s), int(k)] += 1.0
+    row = M.sum(1, keepdims=True)
+    return np.divide(M, row, out=np.zeros_like(M), where=row > 0)
+
+
+def mapping_scores(slot_ids: np.ndarray, comp_ids: np.ndarray) -> Dict[str, float]:
+    if slot_ids.size < 2 or np.unique(comp_ids).size < 2 or np.unique(slot_ids).size < 2:
+        return {"ari": float("nan"), "nmi": float("nan")}
+    return {
+        "ari": float(adjusted_rand_score(slot_ids, comp_ids)),
+        "nmi": float(normalized_mutual_info_score(slot_ids, comp_ids)),
+    }
+
+
+def _slot_centroid_cosine(latents: np.ndarray, slot_ids: np.ndarray, n_slots: int) -> np.ndarray:
+    cent = np.zeros((int(n_slots), latents.shape[1]), dtype=np.float64)
+    for s in range(int(n_slots)):
+        m = slot_ids == s
+        if np.any(m):
+            cent[s] = latents[m].mean(0)
+    norm = np.linalg.norm(cent, axis=1, keepdims=True)
+    norm = np.maximum(norm, 1e-12)
+    return (cent / norm) @ (cent / norm).T
 
 
 def _entropy(p: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     p = np.clip(p, eps, 1.0)
+    p = p / np.maximum(p.sum(axis=-1, keepdims=True), eps)
     return -(p * np.log(p)).sum(axis=-1)
 
 
-def _effective_k(p: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    return np.exp(_entropy(p, eps=eps))
-
-
-def _standardize_and_pca(X: np.ndarray, pca_dims: int = 50) -> np.ndarray:
-    X = np.asarray(X, dtype=np.float64)
-    finite = np.isfinite(X).all(axis=1)
-    X = X[finite]
-    if X.shape[0] == 0:
-        return X.astype(np.float32)
-    mu = X.mean(axis=0, keepdims=True)
-    sd = X.std(axis=0, keepdims=True)
-    sd = np.where(sd < 1e-12, 1.0, sd)
-    X = (X - mu) / sd
-    if pca_dims and X.shape[1] > pca_dims and X.shape[0] > 3:
-        n_comp = min(int(pca_dims), X.shape[1], X.shape[0] - 1)
-        X = PCA(n_components=n_comp, random_state=42).fit_transform(X)
-    return X.astype(np.float32, copy=False)
-
-
-def compute_tsne_embedding(
-    latents: np.ndarray,
-    max_samples: int = 10000,
-    perplexity: float = 30.0,
-    pca_dims: int = 50,
-    random_state: int = 42,
-    n_components: int = 2,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Safe t-SNE with downsampling, PCA pre-reduction, and sklearn-version fallback."""
-    rng = np.random.default_rng(int(random_state))
-    n_total = int(latents.shape[0])
-    if n_total == 0:
-        return np.zeros((0, int(n_components)), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-
-    idx = np.arange(n_total, dtype=np.int64)
-    if n_total > int(max_samples):
-        idx = rng.choice(idx, size=int(max_samples), replace=False).astype(np.int64, copy=False)
-
-    X0 = np.asarray(latents[idx], dtype=np.float64)
-    finite = np.isfinite(X0).all(axis=1)
-    idx = idx[finite]
-    X = _standardize_and_pca(X0[finite], pca_dims=pca_dims)
-
-    if X.shape[0] < 5:
-        # Not enough points for useful t-SNE. Return 2-D PCA/padded zeros.
-        if X.shape[0] == 0:
-            return np.zeros((0, int(n_components)), dtype=np.float32), idx
-        n_comp = min(int(n_components), X.shape[1], max(1, X.shape[0] - 1))
-        emb = PCA(n_components=n_comp, random_state=int(random_state)).fit_transform(X) if X.shape[0] > 1 else np.zeros((1, n_comp))
-        if emb.shape[1] < int(n_components):
-            emb = np.pad(emb, ((0, 0), (0, int(n_components) - emb.shape[1])))
-        return emb.astype(np.float32, copy=False), idx
-
-    # tiny jitter for duplicated rows, because duplicate slots can break neighbor graph assumptions
-    if np.unique(np.round(X, 6), axis=0).shape[0] < X.shape[0]:
-        X = X + (1e-6 * rng.standard_normal(X.shape)).astype(X.dtype)
-
-    n_pts = int(X.shape[0])
-    perp = min(float(perplexity), float(n_pts - 1) - 1e-3, max(2.0, (n_pts - 1) / 3.0))
-    perp = max(2.0, perp)
-
-    kwargs = dict(
-        n_components=int(n_components),
-        perplexity=perp,
-        init="pca" if X.shape[0] > 10 else "random",
-        learning_rate="auto",
-        random_state=int(random_state),
-        method="barnes_hut",
-    )
-    try:
-        tsne = TSNE(**kwargs, max_iter=1000)
-    except TypeError:  # older sklearn
-        tsne = TSNE(**kwargs, n_iter=1000)
-
-    try:
-        emb = tsne.fit_transform(X)
-    except ValueError:
-        kwargs["method"] = "exact"
-        kwargs["init"] = "random"
-        kwargs["perplexity"] = max(2.0, min(perp, 20.0, float(n_pts - 1) - 1e-3))
-        try:
-            tsne = TSNE(**kwargs, max_iter=1000)
-        except TypeError:
-            tsne = TSNE(**kwargs, n_iter=1000)
-        emb = tsne.fit_transform(X)
-
-    return emb.astype(np.float32, copy=False), idx
-
-
-def compute_umap_or_pca(
-    latents: np.ndarray,
-    max_samples: int = 10000,
-    random_state: int = 42,
-) -> Tuple[np.ndarray, np.ndarray, str]:
-    rng = np.random.default_rng(int(random_state))
-    n = int(latents.shape[0])
-    idx = np.arange(n, dtype=np.int64)
-    if n > int(max_samples):
-        idx = rng.choice(idx, size=int(max_samples), replace=False).astype(np.int64, copy=False)
-    X0 = np.asarray(latents[idx], dtype=np.float64)
-    finite = np.isfinite(X0).all(axis=1)
-    idx = idx[finite]
-    X = _standardize_and_pca(X0[finite], pca_dims=50)
-    if X.shape[0] < 3:
-        return np.zeros((X.shape[0], 2), dtype=np.float32), idx, "PCA"
-    if UMAP is not None:
-        n_neighbors = max(2, min(15, X.shape[0] - 1))
-        emb = UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.1, random_state=int(random_state)).fit_transform(X)
-        return emb.astype(np.float32, copy=False), idx, "UMAP"
-    n_comp = min(2, X.shape[1], X.shape[0] - 1)
-    emb = PCA(n_components=n_comp, random_state=int(random_state)).fit_transform(X)
-    if emb.shape[1] < 2:
-        emb = np.pad(emb, ((0, 0), (0, 2 - emb.shape[1])))
-    return emb.astype(np.float32, copy=False), idx, "PCA fallback (install umap-learn for UMAP)"
+def _effective_k(pi: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    return np.exp(_entropy(pi, eps=eps))
 
 
 def compute_responsibilities(
@@ -198,6 +284,7 @@ def compute_responsibilities(
     log_vars: torch.Tensor,
     eps: float = 1e-8,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Responsibilities under pi_k(h) N(z | mu_k, diag_var_k)."""
     var = torch.exp(log_vars).clamp_min(eps)
     diff2 = (z_tokens[:, None, :] - means) ** 2
     log_gauss = -0.5 * (math.log(2.0 * math.pi) + torch.log(var) + diff2 / var).sum(dim=-1)
@@ -206,9 +293,43 @@ def compute_responsibilities(
     return resp, resp.argmax(dim=-1)
 
 
-@torch.no_grad()
-def _get_vdvae_out_at_t(model, batch: Dict, device: torch.device, t_select: int = 0):
+# --------------------------------------------------------------------------- #
+# Extraction
+# --------------------------------------------------------------------------- #
+@dataclass
+class SlotDiagnostics:
+    post_latents: np.ndarray
+    post_comp: np.ndarray
+    post_pi: np.ndarray
+    post_slot_id: np.ndarray
+    prior_latents: np.ndarray
+    prior_comp: np.ndarray
+    prior_pi: np.ndarray
+    prior_slot_id: np.ndarray
+    comp_mean: np.ndarray
+    comp_var: np.ndarray
+    comp_usage_post: np.ndarray
+    comp_usage_prior: np.ndarray
+    n_slots: int
+    n_comp: int
+    pi_per_image: np.ndarray
+    kumar_a: np.ndarray
+    kumar_b: np.ndarray
+    slot_mask_mass: np.ndarray
+    slot_mask_entropy: np.ndarray
+    examples: List[Dict[str, Any]]
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+def _get_vdvae_out_at_t(model, batch: Dict[str, Any], device: torch.device, t_select: int):
+    """Follow the real recurrent path up to t_select.
+
+    This is the important part: h_t is produced from VMRNNCore state and passed
+    as h_prior_top into VDVAE.forward. Do not replace this with h_t=None.
+    """
     obs = batch["observations"].to(device)
+    if obs.dim() == 6:  # [B,T,V,C,H,W] -> use first view
+        obs = obs[:, :, 0]
     obs = _to_minus1_1(obs)
     if obs.dim() == 4:
         obs = obs[:, None]
@@ -229,31 +350,41 @@ def _get_vdvae_out_at_t(model, batch: Dict, device: torch.device, t_select: int 
 
     B, T, _, _, _ = obs.shape
     t_select = int(max(0, min(int(t_select), T - 1)))
-    dtype = obs.dtype
+    param_dtype = next(model.parameters()).dtype
+    if param_dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        param_dtype = torch.float32
 
-    def zero_action():
-        return torch.zeros(B, model.action_dim, device=device, dtype=dtype)
+    def zero_action() -> torch.Tensor:
+        return torch.zeros(B, int(model.action_dim), device=device, dtype=param_dtype)
 
-    core_state = model.rnn.init_state(B, device=device, dtype=dtype)
-    z_prev_top = torch.zeros(B, model.zdim, model.top_H, model.top_W, device=device, dtype=dtype)
-    prev_latents = model._init_decoder_prev_latents(B, device, dtype)
-
+    core_state = model.rnn.init_state(B, device=device, dtype=param_dtype)
+    prev_latents = model._init_decoder_prev_latents(B, device, param_dtype)
     last = None
+
     for t in range(t_select + 1):
-        x_t = obs[:, t]
-        mask_t = torch.ones(B, device=device, dtype=torch.float32) if dones is None or t == 0 else (1.0 - dones[:, t - 1].float())
-        keep = mask_t.view(B, 1, 1, 1).to(device=device, dtype=dtype)
+        x_t = obs[:, t].to(dtype=param_dtype)
 
-        h, c, m = core_state
-        h0, c0, m0 = model.rnn.init_state(B, device=device, dtype=dtype)
-        core_state = (h * keep + h0 * (1.0 - keep), c * keep + c0 * (1.0 - keep), m * keep + m0 * (1.0 - keep))
-        prev_latents = [None if pl is None else pl * (keep if pl.shape[0] == B else keep.repeat_interleave(pl.shape[0] // B, dim=0)) for pl in prev_latents]
+        if dones is None or t == 0:
+            mask_t = torch.ones(B, device=device, dtype=torch.float32)
+        else:
+            mask_t = (1.0 - dones[:, t - 1].float()).to(device=device, dtype=torch.float32)
 
-        h_t = model.rnn.out_norm(core_state[0])
-        a_prev = zero_action() if t == 0 or actions is None else actions[:, t - 1].to(device=device, dtype=dtype) * mask_t.view(B, 1).to(dtype)
+        keep_tok = mask_t.view(B, 1, 1).to(device=device, dtype=param_dtype)
+        h, c = core_state
+        h0, c0 = model.rnn.init_state(B, device=device, dtype=param_dtype)
+        core_state = (h * keep_tok + h0 * (1.0 - keep_tok), c * keep_tok + c0 * (1.0 - keep_tok))
+        prev_latents = [_apply_batch_mask(pl, mask_t, B) for pl in prev_latents]
+
+        h_tok = model.rnn.out_norm(core_state[0])
+        B_, L_, D_ = h_tok.shape
+        expected_L = int(model.top_H) * int(model.top_W)
+        if L_ != expected_L:
+            raise ValueError(f"VMRNN token state length {L_} != top_H*top_W={expected_L}")
+        h_t = h_tok.transpose(1, 2).reshape(B_, D_, int(model.top_H), int(model.top_W)).contiguous()
+
         prev_latents_in = [None if pl is None else pl.detach().clone() for pl in prev_latents]
-
         x_t_nhwc = x_t.permute(0, 2, 3, 1).contiguous()
+
         vdvae_out = model.vdvae.forward(
             x_t_nhwc,
             x_t_nhwc,
@@ -264,15 +395,209 @@ def _get_vdvae_out_at_t(model, batch: Dict, device: torch.device, t_select: int 
         )
 
         z_top_state = vdvae_out.get("z_top_state", vdvae_out["current_latents"][0])
-        a_cur = zero_action() if actions is None else actions[:, t].to(device=device, dtype=dtype)
+        a_cur = zero_action() if actions is None else actions[:, t].to(device=device, dtype=param_dtype)
         _, core_state = model.rnn(z_top_state, a_cur, state=core_state, mask_t=None, extra_maps=None)
-        z_prev_top = z_top_state.detach()
+
         prev_latents = [None if idx == 0 else z.detach() for idx, z in enumerate(vdvae_out["current_latents"])]
-        last = (vdvae_out, x_t, h_t, prev_latents_in)
+        last = (vdvae_out, x_t.detach(), h_t.detach(), prev_latents_in)
 
     if last is None:
         raise RuntimeError("Could not extract a VDVAE output from the batch.")
     return last
+
+
+@torch.no_grad()
+def extract_slot_diagnostics(model, dataloader, device: torch.device, cfg: VizConfig) -> SlotDiagnostics:
+    model.eval()
+    snap = model.vdvae.top_prior_snapshot
+    gate = model.vdvae.top_prior_gate
+    if snap is None or gate is None:
+        raise ValueError("Frozen top prior is not set. Run refresh_top_prior_from_buffer() or bootstrap it before visualizing.")
+
+    K = int(snap.K)
+    post_z, post_pi, post_k, post_sid = [], [], [], []
+    prior_z, prior_pi, prior_k, prior_sid = [], [], [], []
+    pi_img_all, kumar_a_all, kumar_b_all = [], [], []
+    mask_mass_all, mask_entropy_all = [], []
+    examples: List[Dict[str, Any]] = []
+    n_slots: Optional[int] = None
+    total = 0
+
+    for bi, batch in enumerate(tqdm(dataloader, desc="slot/DPGMM diagnostics", leave=False)):
+        if bi >= int(cfg.max_batches) or total >= int(cfg.max_points):
+            break
+        if not isinstance(batch, dict) or "observations" not in batch:
+            continue
+
+        out, x_t, h_t, _prev = _get_vdvae_out_at_t(model, batch, device, cfg.t_select)
+        slot_mu = out.get("top_slot_mu", None)
+        slot_ls = out.get("top_slot_logsigma", None)
+        if slot_mu is None or slot_ls is None:
+            continue
+
+        B, S, D = slot_mu.shape
+        if n_slots is None:
+            n_slots = int(S)
+        elif int(S) != int(n_slots):
+            raise ValueError(f"Number of slots changed across batches: first {n_slots}, now {S}")
+
+        px_z = out["px_z"]
+        N, Cpx, Hc, Wc = px_z.shape
+        if N % B != 0:
+            raise ValueError(f"Expected px_z batch B*S, got N={N}, B={B}")
+        S_from_px = N // B
+        if S_from_px != S:
+            raise ValueError(f"top_slot_mu has S={S}, but px_z implies S={S_from_px}")
+
+        width = int(model.vdvae.H.width)
+        mask_logits = px_z[:, width:width + 1]
+        masks = F.softmax(mask_logits.view(B, S, 1, Hc, Wc), dim=1)
+
+        # posterior responsibilities under the frozen conditional DPGMM
+        _, resp = compute_slot_kl_conditional_frozen(
+            snapshot=snap,
+            frozen_gate=gate,
+            h_t=h_t,
+            slot_mu=slot_mu,
+            slot_logsigma=slot_ls,
+        )
+        k_post = resp.argmax(-1)
+        sid = torch.arange(S, device=device, dtype=torch.long).view(1, S).expand(B, S).reshape(B * S)
+
+        post_z.append(slot_mu.reshape(B * S, D).detach().cpu())
+        post_pi.append(resp.reshape(B * S, K).detach().cpu())
+        post_k.append(k_post.reshape(B * S).detach().cpu())
+        post_sid.append(sid.detach().cpu())
+
+        # conditional prior samples + full responsibility assignment
+        pri_mu, pri_var = sample_slots_conditional_frozen(snap, gate, h_t, num_slots=S, temperature=1.0)
+        pri = pri_mu + torch.randn_like(pri_mu) * torch.sqrt(pri_var.clamp_min(cfg.eps))
+        pri_flat = pri.reshape(B * S, D)
+
+        pi_img = gate.mean_pi(h_t)
+        pi_img_all.append(pi_img.detach().cpu())
+        pi_slot = pi_img[:, None, :].expand(B, S, K).reshape(B * S, K)
+
+        means = snap.comp_mean.to(device=device, dtype=pri_flat.dtype).view(K, -1)
+        log_vars = torch.log(snap.comp_var.to(device=device, dtype=pri_flat.dtype).view(K, -1).clamp_min(1e-6))
+        means_b = means[None].expand(B * S, K, D)
+        log_vars_b = log_vars[None].expand(B * S, K, D)
+        pri_resp, k_prior = compute_responsibilities(pri_flat, pi_slot, means_b, log_vars_b, eps=cfg.eps)
+
+        prior_z.append(pri_flat.detach().cpu())
+        prior_pi.append(pri_resp.detach().cpu())
+        prior_k.append(k_prior.detach().cpu())
+        prior_sid.append(sid.detach().cpu())
+
+        # Gate params for optional diagnostic.
+        try:
+            gate_out = gate(h_t)
+            kumar_a_all.append(gate_out.get("a", torch.empty(B, 0, device=device)).detach().cpu())
+            kumar_b_all.append(gate_out.get("b", torch.empty(B, 0, device=device)).detach().cpu())
+        except Exception:
+            pass
+
+        # mask statistics at image resolution
+        masks_up = F.interpolate(
+            masks.reshape(B * S, 1, Hc, Wc),
+            size=x_t.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).reshape(B, S, 1, *x_t.shape[-2:]).clamp(0.0, 1.0)
+
+        mass = masks_up.mean(dim=(2, 3, 4))
+        # per-pixel entropy over slots, averaged per image; duplicated as [B,S] summary via slot mass entropy proxy
+        slot_p = masks_up.flatten(3).clamp_min(cfg.eps)  # [B,S,1,HW]
+        slot_entropy = -(slot_p * slot_p.log()).mean(dim=(2, 3))
+        mask_mass_all.append(mass.detach().cpu())
+        mask_entropy_all.append(slot_entropy.detach().cpu())
+
+        if len(examples) < int(cfg.n_example_frames):
+            take = min(B, int(cfg.n_example_frames) - len(examples))
+            conf = resp.gather(-1, k_post[..., None]).squeeze(-1)
+            for b in range(take):
+                examples.append({
+                    "frame": x_t[b].detach().cpu(),
+                    "masks": masks_up[b].detach().cpu(),
+                    "comp": k_post[b].detach().cpu(),
+                    "conf": conf[b].detach().cpu(),
+                    "mass": mass[b].detach().cpu(),
+                    "mask_entropy": slot_entropy[b].detach().cpu(),
+                })
+
+        total += B * S
+
+    if n_slots is None or not post_z or not prior_z:
+        raise ValueError("No usable slot latents were extracted from the dataloader.")
+
+    def cat(xs: List[torch.Tensor]) -> np.ndarray:
+        return torch.cat(xs, dim=0).numpy() if xs else np.zeros((0,), dtype=np.float32)
+
+    post_latents = cat(post_z).astype(np.float32)
+    post_comp = cat(post_k).astype(np.int64)
+    post_pi_arr = cat(post_pi).astype(np.float32)
+    post_slot = cat(post_sid).astype(np.int64)
+    prior_latents = cat(prior_z).astype(np.float32)
+    prior_comp = cat(prior_k).astype(np.int64)
+    prior_pi_arr = cat(prior_pi).astype(np.float32)
+    prior_slot = cat(prior_sid).astype(np.int64)
+
+    usage_post = np.bincount(post_comp.reshape(-1), minlength=K).astype(np.float64)
+    usage_prior = np.bincount(prior_comp.reshape(-1), minlength=K).astype(np.float64)
+    usage_post = usage_post / max(1.0, usage_post.sum())
+    usage_prior = usage_prior / max(1.0, usage_prior.sum())
+
+    pi_per_image = cat(pi_img_all).astype(np.float32) if pi_img_all else np.zeros((0, K), dtype=np.float32)
+    kumar_a = cat(kumar_a_all).astype(np.float32) if kumar_a_all else np.zeros((0, max(0, K - 1)), dtype=np.float32)
+    kumar_b = cat(kumar_b_all).astype(np.float32) if kumar_b_all else np.zeros((0, max(0, K - 1)), dtype=np.float32)
+    mask_mass = cat(mask_mass_all).astype(np.float32) if mask_mass_all else np.zeros((0, int(n_slots)), dtype=np.float32)
+    mask_entropy = cat(mask_entropy_all).astype(np.float32) if mask_entropy_all else np.zeros((0, int(n_slots)), dtype=np.float32)
+
+    return SlotDiagnostics(
+        post_latents=post_latents,
+        post_comp=post_comp,
+        post_pi=post_pi_arr,
+        post_slot_id=post_slot,
+        prior_latents=prior_latents,
+        prior_comp=prior_comp,
+        prior_pi=prior_pi_arr,
+        prior_slot_id=prior_slot,
+        comp_mean=snap.comp_mean.detach().cpu().numpy().reshape(K, -1).astype(np.float32),
+        comp_var=snap.comp_var.detach().cpu().numpy().reshape(K, -1).astype(np.float32),
+        comp_usage_post=usage_post,
+        comp_usage_prior=usage_prior,
+        n_slots=int(n_slots),
+        n_comp=K,
+        pi_per_image=pi_per_image,
+        kumar_a=kumar_a,
+        kumar_b=kumar_b,
+        slot_mask_mass=mask_mass,
+        slot_mask_entropy=mask_entropy,
+        examples=examples,
+        meta={"t_select": cfg.t_select, "points": int(post_latents.shape[0])},
+    )
+
+
+def _diag_to_legacy_dict(diag: SlotDiagnostics) -> Dict[str, Any]:
+    return {
+        "posterior_latents": diag.post_latents,
+        "posterior_pi": diag.post_pi,
+        "posterior_assignments": diag.post_comp,
+        "posterior_slot_ids": diag.post_slot_id,
+        "prior_latents": diag.prior_latents,
+        "prior_pi": diag.prior_pi,
+        "prior_assignments": diag.prior_comp,
+        "prior_slot_ids": diag.prior_slot_id,
+        "slot_mask_mass": diag.slot_mask_mass,
+        "slot_mask_entropy": diag.slot_mask_entropy,
+        "pi_per_image": diag.pi_per_image,
+        "kumar_a": diag.kumar_a,
+        "kumar_b": diag.kumar_b,
+        "comp_mean": diag.comp_mean,
+        "comp_var": diag.comp_var,
+        "num_slots": diag.n_slots,
+        "same_frame_examples": diag.examples,
+    }
 
 
 @torch.no_grad()
@@ -283,939 +608,312 @@ def extract_slot_latents_and_assignments(
     max_batches: int = 10,
     t_select: int = 8,
     max_points: int = 8000,
-    n_exemplars_per_component: int = 4,
 ) -> Dict[str, Any]:
-    model.eval()
-    snapshot = model.vdvae.top_prior_snapshot
-    frozen_gate = model.vdvae.top_prior_gate
-    if snapshot is None or frozen_gate is None:
-        raise ValueError("Frozen top prior is not set. Run refresh_top_prior_from_buffer once or use the bootstrapped prior.")
-
-    K = int(snapshot.K)
-    post_z_all, post_pi_all, post_k_all, post_sid_all = [], [], [], []
-    prior_z_all, prior_pi_all, prior_k_all, prior_sid_all = [], [], [], []
-    slot_mask_mass_all, slot_attn_mass_all = [], []
-    pi_per_image_all, kumar_a_all, kumar_b_all = [], [], []
-    same_frame_examples: List[Dict[str, Any]] = []
-    exemplars: List[List[Dict[str, Any]]] = [[] for _ in range(K)]
-    slot_exemplars_by_index: Optional[List[List[Dict[str, Any]]]] = None
-    num_slots_seen: Optional[int] = None
-    total = 0
-
-    for bi, batch in enumerate(tqdm(dataloader, desc="Extracting slot diagnostics", leave=False)):
-        if bi >= max_batches or total >= max_points:
-            break
-        if not isinstance(batch, dict) or "observations" not in batch:
-            continue
-
-        vdvae_out, x_t, h_t, prev_latents_in = _get_vdvae_out_at_t(model, batch, device, t_select=t_select)
-        slot_mu = vdvae_out.get("top_slot_mu", None)
-        slot_logsigma = vdvae_out.get("top_slot_logsigma", None)
-        slot_comp_maps = vdvae_out.get("top_slot_comp_maps", None)
-        B, S, D = slot_mu.shape
-
-        px_z = vdvae_out["px_z"]  # [B*S,width+1,H,W]
-        N, _, H_img, W_img = px_z.shape
-
-        if N % B != 0:
-            raise ValueError(f"Expected px_z batch B*S, got N={N}, B={B}")
+    cfg = VizConfig(t_select=t_select, max_batches=max_batches, max_points=max_points, max_embed_points=min(max_points, 4000))
+    return _diag_to_legacy_dict(extract_slot_diagnostics(model, dataloader, device, cfg))
 
 
-        slot_masks = px_z[:, model.vdvae.H.width:model.vdvae.H.width + 1]
-        slot_masks = slot_masks.view(B, S, 1, H_img, W_img)
-        slot_masks = F.softmax(slot_masks, dim=1)
-        slot_attn = vdvae_out.get("top_slot_attn", None)
-
-        if slot_mu is None or slot_logsigma is None or slot_comp_maps is None:
-            continue
-
-        B, S, D = slot_mu.shape
-        if slot_exemplars_by_index is None:
-            slot_exemplars_by_index = [[] for _ in range(S)]
-            num_slots_seen = S
-        elif S != num_slots_seen:
-            raise ValueError(f"Number of slots changed across batches: first S={num_slots_seen}, now S={S}")
-        _, resp = compute_slot_kl_conditional_frozen(
-            snapshot=snapshot,
-            frozen_gate=frozen_gate,
-            h_t=h_t,
-            slot_mu=slot_mu,
-            slot_logsigma=slot_logsigma,
-        )
-        k_slot = resp.argmax(dim=-1)
-
-        slot_ids = torch.arange(S, device=device, dtype=torch.long).view(1, S).expand(B, S).reshape(B * S)
-        post_z_all.append(slot_mu.reshape(B * S, D).detach().cpu())
-        post_pi_all.append(resp.reshape(B * S, K).detach().cpu())
-        post_k_all.append(k_slot.reshape(B * S).detach().cpu())
-        post_sid_all.append(slot_ids.detach().cpu())
-
-        prior_slots_mu, prior_slots_var = sample_slots_conditional_frozen(snapshot, frozen_gate, h_t, num_slots=S, temperature=1.0)
-        #elogpi = ConditionalTopDPGMM.conditional_expected_log_pi_frozen( frozen_gate, h_t)
-        #pi_img = torch.softmax(elogpi, dim=-1)
-        pi_img = frozen_gate.mean_pi(h_t)
-        gate_out = frozen_gate(h_t)
-        kumar_a = gate_out.get("a", torch.empty(B, 0, device=device, dtype=slot_mu.dtype))
-        kumar_b = gate_out.get("b", torch.empty(B, 0, device=device, dtype=slot_mu.dtype))
-        pi_per_image_all.append(pi_img.detach().cpu())
-        kumar_a_all.append(kumar_a.detach().cpu())
-        kumar_b_all.append(kumar_b.detach().cpu())
-        pi_slot = pi_img[:, None, :].expand(B, S, K).reshape(B * S, K)
-        means = snapshot.comp_mean.to(device=device, dtype=prior_slots_mu.dtype).view(K, -1)
-        log_vars = torch.log(snapshot.comp_var.to(device=device, dtype=prior_slots_mu.dtype).view(K, -1).clamp_min(1e-6))
-        means_b = means[None].expand(B * S, K, D)
-        log_vars_b = log_vars[None].expand(B * S, K, D)
-        #here
-        prior_slots = prior_slots_mu + torch.sqrt(prior_slots_var.clamp_min(torch.finfo(prior_slots_var.dtype).eps)) * torch.randn_like(prior_slots_mu)
-        prior_resp, prior_k = compute_responsibilities(prior_slots.reshape(B * S, D), pi_slot, means_b, log_vars_b)
-
-        prior_z_all.append(prior_slots.reshape(B * S, D).detach().cpu())
-        prior_pi_all.append(prior_resp.detach().cpu())
-        prior_k_all.append(prior_k.detach().cpu())
-        prior_sid_all.append(slot_ids.detach().cpu())
-
-        H_img, W_img = x_t.shape[-2], x_t.shape[-1]
-        comp_mask_up = F.interpolate(
-            slot_masks.reshape(B * S, 1, slot_masks.shape[-2], slot_masks.shape[-1]),
-            size=(H_img, W_img),
-            mode="bilinear",
-            align_corners=False,
-        ).reshape(B, S, 1, H_img, W_img).clamp(0.0, 1.0)
-
-        attn_up = None
-        if slot_attn is not None:
-            Ftok = int(slot_attn.shape[-1])
-            side = int(round(Ftok ** 0.5))
-
-            if side * side == Ftok:
-                attn_map = slot_attn.reshape(B * S, 1, side, side)
-                attn_up = F.interpolate(
-                    attn_map,
-                    size=(H_img, W_img),
-                    mode="bilinear",
-                    align_corners=False,
-                ).reshape(B, S, 1, H_img, W_img).clamp(0.0, 1.0)
-
-        if len(same_frame_examples) < 3:
-            n_take = min(B, 3 - len(same_frame_examples))
-            for b in range(n_take):
-                same_frame_examples.append({
-                    "frame": x_t[b].detach().cpu(),
-                    "routing_attn": None if attn_up is None else attn_up[b].detach().cpu(),        # diagnostic only
-                    "decoder_masks": comp_mask_up[b].detach().cpu(),  # real object masks
-                    "coverage": comp_mask_up[b].sum(dim=0).detach().cpu(),
-                    "resp": resp[b].detach().cpu(),
-                    "pi": pi_img[b].detach().cpu(),
-                    "h_decoder_top": None if h_t is None else h_t[b:b+1].detach().cpu(),
-                    "prev_latents": [None if z is None else z[b:b+1].detach().cpu() for z in prev_latents_in],
-                })
-
-        slot_mask_mass_all.append(comp_mask_up.mean(dim=(2, 3, 4)).detach().cpu())
-        if attn_up is not None:
-            slot_attn_mass_all.append(attn_up.mean(dim=(2, 3, 4)).detach().cpu())
+# --------------------------------------------------------------------------- #
+# Plotting
+# --------------------------------------------------------------------------- #
+def _scatter_discrete(ax, emb: np.ndarray, labels: np.ndarray, n_classes: int, title: str, legend_title: str, point_size: float) -> None:
+    cmap, norm = _discrete_cmap(n_classes)
+    ax.scatter(emb[:, 0], emb[:, 1], c=labels, cmap=cmap, norm=norm, s=point_size, linewidths=0, alpha=0.78)
+    _style_axis(ax, title=title, xlabel="latent dim 1", ylabel="latent dim 2")
+    if n_classes <= 12:
+        handles = [plt.Line2D([], [], marker="o", linestyle="", markersize=4.5, color=cmap(i), label=str(i)) for i in range(n_classes)]
+        ax.legend(handles=handles, title=legend_title, fontsize=6.3, title_fontsize=7, loc="best", framealpha=0.82, borderpad=0.3, handletextpad=0.2, labelspacing=0.18)
 
 
-        for b in range(B):
-            prev_latents_b = [None if z is None else z[b:b+1].detach().cpu() for z in prev_latents_in]
-            for s in range(S):
-                kk = int(k_slot[b, s].item())
-                conf = float(resp[b, s, kk].item())
-                z_top_slot = slot_comp_maps[b:b+1, s:s+1].detach().cpu()
-                mask_mass = float(comp_mask_up[b, s].mean().item())
-                item = {
-                    "slot_id": int(s),
-                    "component_id": kk,
-                    "conf": conf,
-                    "frame": x_t[b].detach().cpu(),
-                    "routing_attn":  None if attn_up is None else attn_up[b, s].detach().cpu(),
-                    "decoder_mask": comp_mask_up[b, s].detach().cpu(),
-                    "z_top_slot": z_top_slot,
-                    "h_decoder_top": None if h_t is None else h_t[b:b+1].detach().cpu(),
-                    "prev_latents": prev_latents_b,
-                    "mask_mass": mask_mass,
-                }
-                bucket = exemplars[kk]
-                if len(bucket) < n_exemplars_per_component:
-                    bucket.append(item)
-                elif conf > bucket[-1]["conf"]:
-                    bucket[-1] = item
-                bucket.sort(key=lambda z: z["conf"], reverse=True)
-                slot_bucket = slot_exemplars_by_index[s]
-                if len(slot_bucket) < n_exemplars_per_component:
-                    slot_bucket.append(item)
-                elif mask_mass > slot_bucket[-1]["mask_mass"]:
-                    slot_bucket[-1] = item
-                slot_bucket.sort(key=lambda z: z["mask_mass"], reverse=True)
-
-        total += B * S
-
-    if not post_z_all or not prior_z_all:
-        raise ValueError("No slot latents were extracted. Check that the dataloader returns dict batches with 'observations'.")
-
-    return {
-        "posterior_latents": torch.cat(post_z_all, dim=0).numpy(),
-        "posterior_pi": torch.cat(post_pi_all, dim=0).numpy(),
-        "posterior_assignments": torch.cat(post_k_all, dim=0).numpy(),
-        "posterior_slot_ids": torch.cat(post_sid_all, dim=0).numpy(),
-        "prior_latents": torch.cat(prior_z_all, dim=0).numpy(),
-        "prior_pi": torch.cat(prior_pi_all, dim=0).numpy(),
-        "prior_assignments": torch.cat(prior_k_all, dim=0).numpy(),
-        "prior_slot_ids": torch.cat(prior_sid_all, dim=0).numpy(),
-        "slot_mask_mass": torch.cat(slot_mask_mass_all, dim=0).numpy() if slot_mask_mass_all else np.zeros((0, int(num_slots_seen or 0)), dtype=np.float32),
-        "slot_attn_mass": torch.cat(slot_attn_mass_all, dim=0).numpy() if slot_attn_mass_all else np.zeros((0, int(num_slots_seen or 0)), dtype=np.float32),
-        "pi_per_image": torch.cat(pi_per_image_all, dim=0).numpy() if pi_per_image_all else np.zeros((0, K), dtype=np.float32),
-        "kumar_a": torch.cat(kumar_a_all, dim=0).numpy() if kumar_a_all else np.zeros((0, max(0, K - 1)), dtype=np.float32),
-        "kumar_b": torch.cat(kumar_b_all, dim=0).numpy() if kumar_b_all else np.zeros((0, max(0, K - 1)), dtype=np.float32),
-        "comp_mean": snapshot.comp_mean.detach().cpu().numpy(),
-        "comp_var": snapshot.comp_var.detach().cpu().numpy(),
-        "same_frame_examples": same_frame_examples,
-        "exemplars_with_masks": exemplars,
-        "slot_exemplars_by_index": slot_exemplars_by_index if slot_exemplars_by_index is not None else [],
-        "num_slots": int(num_slots_seen or 0),
-    }
+def _plot_joint_prior_posterior(ax, emb: np.ndarray, src: np.ndarray, comp_for_means: np.ndarray, title: str, point_size: float) -> None:
+    m_post = src == 0
+    m_prior = src == 1
+    m_mean = src == 2
+    ax.scatter(emb[m_post, 0], emb[m_post, 1], s=point_size, alpha=0.42, linewidths=0, label="posterior slots")
+    ax.scatter(emb[m_prior, 0], emb[m_prior, 1], s=point_size, alpha=0.42, linewidths=0, label="prior samples")
+    if m_mean.any():
+        # comp means are last K rows among src==2, label each with k
+        ax.scatter(emb[m_mean, 0], emb[m_mean, 1], marker="X", s=95, edgecolor="black", linewidths=0.8, label="component means")
+        coords = emb[m_mean]
+        for k, (x, y) in zip(comp_for_means, coords):
+            ax.text(x, y, str(int(k)), fontsize=7, ha="center", va="center", color="white")
+    _style_axis(ax, title=title, xlabel="latent dim 1", ylabel="latent dim 2")
+    ax.legend(fontsize=7, framealpha=0.86, loc="best")
 
 
-def _sanitize(latents: np.ndarray, assignments: np.ndarray, pi: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    if latents.ndim != 2:
-        raise ValueError(f"Expected latents [N,D], got {latents.shape}")
-    if pi.ndim != 2:
-        raise ValueError(f"Expected responsibilities [N,K], got {pi.shape}")
-    assignments = assignments.reshape(-1)
-    if latents.shape[0] != pi.shape[0] or latents.shape[0] != assignments.shape[0]:
-        raise ValueError(f"Shape mismatch: latents={latents.shape}, assignments={assignments.shape}, pi={pi.shape}")
-    K = pi.shape[1]
-    mask = np.isfinite(latents).all(axis=1) & np.isfinite(pi).all(axis=1) & (assignments >= 0) & (assignments < K)
-    return latents[mask].astype(np.float32, copy=False), assignments[mask].astype(np.int64, copy=False), pi[mask].astype(np.float32, copy=False), int((~mask).sum())
+def _plot_contingency(ax, M: np.ndarray, scores: Dict[str, float]) -> None:
+    im = ax.imshow(M, cmap="magma", vmin=0, vmax=1, aspect="auto")
+    _style_axis(ax, title="P(component | slot)\n(slot/component agreement)", xlabel="DPGMM component", ylabel="slot index")
+    ax.set_xticks(range(M.shape[1]))
+    ax.set_yticks(range(M.shape[0]))
+    for s in range(M.shape[0]):
+        for k in range(M.shape[1]):
+            v = float(M[s, k])
+            if v >= 0.04:
+                ax.text(k, s, f"{v:.2f}", ha="center", va="center", fontsize=6.2, color="white" if v < 0.58 else "black")
+    cb = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.ax.tick_params(labelsize=6.5)
+    ari, nmi = scores["ari"], scores["nmi"]
+    ax.text(0.0, 1.14, f"ARI={ari:.2f}   NMI={nmi:.2f}", transform=ax.transAxes, fontsize=8, color="0.2")
 
 
-
-def _sanitize_with_slot_ids(
-    latents: np.ndarray,
-    assignments: np.ndarray,
-    pi: np.ndarray,
-    slot_ids: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
-    if latents.ndim != 2:
-        raise ValueError(f"Expected latents [N,D], got {latents.shape}")
-    if pi.ndim != 2:
-        raise ValueError(f"Expected responsibilities [N,K], got {pi.shape}")
-    assignments = assignments.reshape(-1)
-    slot_ids = slot_ids.reshape(-1)
-    if latents.shape[0] != pi.shape[0] or latents.shape[0] != assignments.shape[0] or latents.shape[0] != slot_ids.shape[0]:
-        raise ValueError(
-            f"Shape mismatch: latents={latents.shape}, assignments={assignments.shape}, "
-            f"pi={pi.shape}, slot_ids={slot_ids.shape}"
-        )
-    K = pi.shape[1]
-    mask = (
-        np.isfinite(latents).all(axis=1)
-        & np.isfinite(pi).all(axis=1)
-        & np.isfinite(slot_ids)
-        & (assignments >= 0)
-        & (assignments < K)
-        & (slot_ids >= 0)
-    )
-    return (
-        latents[mask].astype(np.float32, copy=False),
-        assignments[mask].astype(np.int64, copy=False),
-        pi[mask].astype(np.float32, copy=False),
-        slot_ids[mask].astype(np.int64, copy=False),
-        int((~mask).sum()),
-    )
+def _plot_slot_cosine(ax, C: np.ndarray) -> None:
+    im = ax.imshow(C, cmap="coolwarm", vmin=-1, vmax=1, aspect="auto")
+    _style_axis(ax, title="slot-centroid cosine\nhigh off-diagonal = slot collapse", xlabel="slot", ylabel="slot")
+    ax.set_xticks(range(C.shape[0]))
+    ax.set_yticks(range(C.shape[0]))
+    cb = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.ax.tick_params(labelsize=6.5)
 
 
-def _slot_component_table(slot_ids: np.ndarray, assignments: np.ndarray, num_slots: int, num_components: int) -> np.ndarray:
-    table = np.zeros((int(num_slots), int(num_components)), dtype=np.float64)
-    if slot_ids.size == 0 or assignments.size == 0 or num_slots <= 0 or num_components <= 0:
-        return table
-    valid = (slot_ids >= 0) & (slot_ids < num_slots) & (assignments >= 0) & (assignments < num_components)
-    np.add.at(table, (slot_ids[valid], assignments[valid]), 1.0)
-    row_sum = table.sum(axis=1, keepdims=True)
-    return table / np.maximum(row_sum, 1.0)
+def _plot_component_usage(ax, usage_post: np.ndarray, usage_prior: np.ndarray, threshold: float) -> None:
+    k = np.arange(len(usage_post))
+    w = 0.4
+    ax.bar(k - w / 2, usage_post, width=w, label="posterior")
+    ax.bar(k + w / 2, usage_prior, width=w, label="prior")
+    ax.axhline(threshold, linestyle="--", linewidth=0.8, alpha=0.55)
+    _style_axis(ax, title="component usage", xlabel="component", ylabel="fraction of slot tokens", grid=True)
+    ax.set_xticks(k)
+    ax.legend(fontsize=7, framealpha=0.85)
 
 
-
-def _pairwise_cosine(X: np.ndarray) -> np.ndarray:
-    X = np.asarray(X, dtype=np.float64)
-    if X.ndim != 2 or X.shape[0] == 0:
-        return np.zeros((0, 0), dtype=np.float64)
-    norm = np.linalg.norm(X, axis=1, keepdims=True)
-    Xn = X / np.maximum(norm, 1e-12)
-    return Xn @ Xn.T
-
-
-def _pairwise_l2(X: np.ndarray) -> np.ndarray:
-    X = np.asarray(X, dtype=np.float64)
-    if X.ndim != 2 or X.shape[0] == 0:
-        return np.zeros((0, 0), dtype=np.float64)
-    sq = np.sum(X * X, axis=1)
-    return np.sqrt(np.maximum(sq[:, None] + sq[None, :] - 2.0 * (X @ X.T), 0.0))
+def _plot_entropy_hist(ax, diag: SlotDiagnostics) -> None:
+    post_H = _entropy(diag.post_pi)
+    prior_H = _entropy(diag.prior_pi)
+    ax.hist(post_H, bins=30, alpha=0.6, label="posterior resp")
+    ax.hist(prior_H, bins=30, alpha=0.45, label="prior resp")
+    _style_axis(ax, title="responsibility entropy\nhigh = uncertain component", xlabel="entropy", ylabel="count", grid=True)
+    ax.legend(fontsize=7, framealpha=0.85)
 
 
-def _slot_means_by_index(latents: np.ndarray, slot_ids: np.ndarray, num_slots: int) -> np.ndarray:
-    latents = np.asarray(latents, dtype=np.float64)
-    slot_ids = np.asarray(slot_ids, dtype=np.int64).reshape(-1)
-    if latents.ndim != 2 or latents.shape[0] == 0 or num_slots <= 0:
-        return np.zeros((max(1, int(num_slots)), 1), dtype=np.float64)
-    out = np.zeros((int(num_slots), latents.shape[1]), dtype=np.float64)
-    for s in range(int(num_slots)):
-        mask = slot_ids == s
-        if np.any(mask):
-            out[s] = latents[mask].mean(axis=0)
-    return out
-
-
-@torch.inference_mode()
-def _decode_component_mean_rgb(
-    model,
-    comp_mean_k: torch.Tensor,
-    comp_logsigma_k: torch.Tensor,
-    h_decoder_top: Optional[torch.Tensor],
-    prev_latents: List[Optional[torch.Tensor]],
-    device: torch.device,
-) -> np.ndarray:
-    """Decode one DPGMM component mean through the correct top-latent interface."""
-    comp_mean_k = comp_mean_k.to(device=device, dtype=torch.float32)
-
-    slot_bottleneck = model.vdvae.decoder.dec_blocks[0].top_slot_posterior
-    slot_to_map = slot_bottleneck.slot_to_top
-
-
-    slot_dim = int( getattr(slot_bottleneck, "slot_dim"))
-    slot_mu = comp_mean_k.to(device=device, dtype=torch.float32).view(1, 1, slot_dim)
-    slot_logsigma = torch.as_tensor(comp_logsigma_k, device=device, dtype=torch.float32).view(1, 1, slot_dim)
-
-    _, _, _, _, _, z_slot_maps = slot_to_map(slot_mu, slot_logsigma, h_decoder_top)
-
-    vdvae_h = getattr(getattr(model, "vdvae", None), "H", None)
-    zdim = int(getattr(model, "zdim", getattr(vdvae_h, "zdim", comp_mean_k.shape[0])))
-    top_h = int(getattr(model, "top_H", comp_mean_k.shape[-2]))
-    top_w = int(getattr(model, "top_W", comp_mean_k.shape[-1]))
-
-
-    h_dec = None if h_decoder_top is None else h_decoder_top.to(device=device, dtype=torch.float32)
-    prev = [None if z is None else z.to(device=device, dtype=torch.float32) for z in prev_latents]
-    px_z, _ = model.vdvae.decode_from_top_latent(z_slot_maps, h_decoder_top=h_dec, prev_latents=prev)
-    rgb = model.vdvae.decoder.out_net.sample(px_z)[0]
-    return rgb.astype(np.float32) / 255.0
-
-def _imshow_mask(ax, arr: np.ndarray, title: str = "", cmap: str = "magma") -> None:
-    arr = np.asarray(arr, dtype=np.float32)
-    if arr.ndim == 3 and arr.shape[0] == 1:
-        arr = arr[0]
-    if arr.ndim == 3 and arr.shape[-1] == 1:
-        arr = arr[..., 0]
-    if arr.size:
-        arr = arr / max(float(np.nanmax(arr)), 1e-8)
-    ax.imshow(arr, cmap=cmap, interpolation="nearest")
-    ax.set_xticks([])
-    ax.set_yticks([])
-    if title:
-        ax.set_title(title, fontsize=8)
-
-
-def _plot_same_frame_examples(
-    fig: plt.Figure,
-    gs,
-    examples: List[Dict[str, Any]],
-    num_slots: int,
-) -> None:
-    n = min(len(examples), 3)
-    S = int(max(1, num_slots))
-
-    if n == 0:
-        ax = fig.add_subplot(gs)
-        ax.axis("off")
-        ax.text(
-            0.5,
-            0.5,
-            "No same-frame examples collected",
-            ha="center",
-            va="center",
-        )
+def _plot_gate_effective_k(ax, diag: SlotDiagnostics) -> None:
+    if diag.pi_per_image.size == 0:
+        _blank(ax, "no gate probabilities")
         return
+    eff = _effective_k(diag.pi_per_image)
+    ax.hist(eff, bins=20, alpha=0.75)
+    _style_axis(ax, title="conditional gate effective K\nper image", xlabel="K_eff = exp(H(pi(h)))", ylabel="count", grid=True)
+    ax.axvline(float(np.mean(eff)), linestyle="--", linewidth=1.0, alpha=0.8)
 
-    # columns: frame | slot 0 content | ... | slot S-1 content | mask coverage
-    sub = gs.subgridspec(n, S + 2, wspace=0.04, hspace=0.14)
 
-    for i in range(n):
-        ex = examples[i]
+def _plot_mask_stats(ax, diag: SlotDiagnostics) -> None:
+    if diag.slot_mask_mass.size == 0:
+        _blank(ax, "no mask statistics")
+        return
+    s = np.arange(diag.n_slots)
+    mass_mean = diag.slot_mask_mass.mean(axis=0)
+    mass_std = diag.slot_mask_mass.std(axis=0)
+    ax.bar(s, mass_mean, yerr=mass_std, capsize=2, alpha=0.8)
+    _style_axis(ax, title="decoder mask mass by slot\nempty/identical slots show up here", xlabel="slot", ylabel="mean mask mass", grid=True)
+    ax.set_xticks(s)
 
-        # Original frame
-        ax = fig.add_subplot(sub[i, 0])
+
+def _plot_kumaraswamy(ax, diag: SlotDiagnostics) -> None:
+    if diag.kumar_a.size == 0 or diag.kumar_b.size == 0 or diag.kumar_a.shape[1] == 0:
+        _blank(ax, "no Kumaraswamy gate params")
+        return
+    m = min(8, diag.kumar_a.shape[1])
+    vals = [diag.kumar_a[:, i] for i in range(m)] + [diag.kumar_b[:, i] for i in range(m)]
+    labels = [f"a{i}" for i in range(m)] + [f"b{i}" for i in range(m)]
+    ax.boxplot(vals, labels=labels, showfliers=False)
+    ax.set_yscale("log")
+    ax.tick_params(axis="x", labelrotation=90, labelsize=6.5)
+    _style_axis(ax, title="Kumaraswamy gate params", ylabel="value")
+
+
+def _plot_content_grid(fig: plt.Figure, gs_cell, examples: List[Dict[str, Any]], n_slots: int) -> None:
+    n_rows = len(examples)
+    if n_rows == 0:
+        _blank(fig.add_subplot(gs_cell), "no example frames")
+        return
+    cols = 1 + 2 * int(n_slots)
+    sub = gs_cell.subgridspec(n_rows, cols, wspace=0.055, hspace=0.22)
+    for r, ex in enumerate(examples):
+        ax = fig.add_subplot(sub[r, 0])
         ax.imshow(_chw_to_01(ex["frame"]))
-        ax.set_xticks([])
-        ax.set_yticks([])
-        if i == 0:
-            ax.set_title("frame", fontsize=8)
-        ax.set_ylabel(f"example {i}", fontsize=8)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_ylabel(f"ex {r}", fontsize=8)
+        if r == 0:
+            ax.set_title("input", fontsize=8.5)
+        for s in range(int(n_slots)):
+            c0 = 1 + 2 * s
+            ax_overlay = fig.add_subplot(sub[r, c0])
+            ax_overlay.imshow(_overlay(ex["frame"], ex["masks"][s]))
+            ax_overlay.set_xticks([]); ax_overlay.set_yticks([])
+            if r == 0:
+                ax_overlay.set_title(f"slot {s}\noverlay", fontsize=7.5)
+            comp = int(ex["comp"][s])
+            conf = float(ex["conf"][s])
+            mass = float(ex["mass"][s])
+            ax_overlay.set_xlabel(f"k={comp} c={conf:.2f}\nmass={mass:.3f}", fontsize=6.1)
 
-        # Use decoder masks, not slot-attention routing weights
-        masks = ex.get("decoder_masks", ex.get("slot_masks", None))
-
-        for s in range(S):
-            ax = fig.add_subplot(sub[i, s + 1])
-
-            if masks is not None and s < masks.shape[0]:
-                # masks[s] has shape [1, H, W]
-                mask_t = masks[s]
-            else:
-                H_img, W_img = ex["frame"].shape[-2], ex["frame"].shape[-1]
-                mask_t = torch.zeros(1, H_img, W_img)
-
-            content = _slot_content(ex["frame"], mask_t)
-            ax.imshow(content)
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-            if i == 0:
-                ax.set_title(f"slot {s}\ncontent", fontsize=8)
-
-        # Coverage of decoder masks
-        ax = fig.add_subplot(sub[i, S + 1])
-        if "coverage" in ex:
-            _imshow_mask(
-                ax,
-                ex["coverage"].numpy(),
-                title="decoder-mask\ncoverage" if i == 0 else "",
-                cmap="viridis",
-            )
-        elif masks is not None:
-            coverage = masks.sum(dim=0)
-            _imshow_mask(
-                ax,
-                coverage.numpy(),
-                title="decoder-mask\ncoverage" if i == 0 else "",
-                cmap="viridis",
-            )
-        else:
-            ax.axis("off")
-
-def _plot_component_decodes(
-    fig: plt.Figure,
-    gs,
-    model,
-    device: torch.device,
-    comp_mean: np.ndarray,
-    comp_logsigma: np.ndarray,
-    pi_mean: np.ndarray,
-    examples: List[Dict[str, Any]],
-) -> None:
-    K = int(comp_mean.shape[0]) if comp_mean.ndim >= 2 else 0
-    if K <= 0:
-        ax = fig.add_subplot(gs)
-        ax.axis("off")
-        ax.text(0.5, 0.5, "No component means available", ha="center", va="center")
-        return
-    sub = gs.subgridspec(1, K, wspace=0.05)
-    comp_t = torch.from_numpy(np.asarray(comp_mean, dtype=np.float32))
-
-    # Use one shared decoder context for all components. This makes differences
-    # in the decoded row attributable to the component means rather than context.
-    base_ex = examples[0] if examples else {}
-    h_dec = base_ex.get("h_decoder_top", None)
-    prev = base_ex.get("prev_latents", [])
+            ax_mask = fig.add_subplot(sub[r, c0 + 1])
+            ax_mask.imshow(_mask_to_01(ex["masks"][s]), cmap="magma", vmin=0, vmax=1)
+            ax_mask.set_xticks([]); ax_mask.set_yticks([])
+            if r == 0:
+                ax_mask.set_title("mask", fontsize=7.5)
 
 
-    for k in range(K):
-        ax = fig.add_subplot(sub[0, k])
-        try:
-            rgb = _decode_component_mean_rgb(model, comp_t[k], comp_logsigma[k], h_dec, prev, device=device)
-            ax.imshow(np.clip(rgb, 0.0, 1.0))
-            title = f"comp {k} | same ctx\nmean pi={pi_mean[k]:.2f}" if k < len(pi_mean) else f"comp {k} | same ctx"
-            ax.set_title(title, fontsize=8)
-        except Exception as exc:
-            ax.text(0.5, 0.5, f"decode error\n{type(exc).__name__}", ha="center", va="center", fontsize=7)
-        ax.set_xticks([])
-        ax.set_yticks([])
+def _verdict_text(scores: Dict[str, float], C: np.ndarray, diag: SlotDiagnostics, cfg: VizConfig) -> str:
+    off = C[~np.eye(diag.n_slots, dtype=bool)] if diag.n_slots > 1 else np.array([])
+    max_off = float(np.nanmax(off)) if off.size else float("nan")
+    active_post = int((diag.comp_usage_post > cfg.active_component_threshold).sum())
+    active_prior = int((diag.comp_usage_prior > cfg.active_component_threshold).sum())
+    k_eff = float(np.mean(_effective_k(diag.pi_per_image))) if diag.pi_per_image.size else float("nan")
+    resp_H = float(np.mean(_entropy(diag.post_pi))) if diag.post_pi.size else float("nan")
+    ari = scores["ari"]
 
+    if np.isnan(ari):
+        mapping = "slot-component mapping undefined (too few components/slots active)"
+    elif ari > 0.50:
+        mapping = f"strong slot-component mapping (ARI={ari:.2f})"
+    elif ari > 0.15:
+        mapping = f"weak/moderate slot-component mapping (ARI={ari:.2f})"
+    else:
+        mapping = f"little slot-component mapping (ARI={ari:.2f})"
 
-def _select_components_by_coverage(frac: np.ndarray, coverage: float = 0.99) -> np.ndarray:
-    frac = np.asarray(frac, dtype=np.float64)
-    if frac.size == 0:
-        return np.zeros((0,), dtype=np.int64)
-    total = frac.sum()
-    if not np.isfinite(total) or total <= 0.0:
-        return np.arange(frac.shape[0], dtype=np.int64)
-    frac = frac / total
-    order = np.argsort(frac)[::-1]
-    cum = np.cumsum(frac[order])
-    n_keep = int(np.searchsorted(cum, float(coverage), side="left") + 1)
-    n_keep = max(1, min(n_keep, order.shape[0]))
-    return order[:n_keep].astype(np.int64, copy=False)
-
-@torch.inference_mode()
-def _decode_approx_slot_rgb(model, exemplar: Dict[str, Any], device: torch.device) -> np.ndarray:
-    z_top_slot = exemplar["z_top_slot"].to(device)
-    h_decoder_top = None if exemplar.get("h_decoder_top", None) is None else exemplar["h_decoder_top"].to(device)
-    prev_latents = [None if z is None else z.to(device) for z in exemplar.get("prev_latents", [])]
-    px_z, _ = model.vdvae.decode_from_top_latent(
-        z_top_slot,
-        h_decoder_top=h_decoder_top,
-        prev_latents=prev_latents,
+    collapse = "possible slot collapse" if np.isfinite(max_off) and max_off > 0.90 else "no obvious centroid collapse"
+    return (
+        f"diagnosis: {mapping}; {collapse}; active posterior components "
+        f"{active_post}/{diag.n_comp}, active prior components {active_prior}/{diag.n_comp}; "
+        f"mean gate K_eff={k_eff:.2f}; mean posterior responsibility entropy={resp_H:.2f}; "
+        f"slot tokens={diag.post_latents.shape[0]} at t={cfg.t_select}."
     )
-    rgb = model.vdvae.decoder.out_net.sample(px_z)[0]
-    return rgb.astype(np.float32) / 255.0
 
-def _plot_slot_index_exemplars(
-    fig: plt.Figure,
-    gs,
-    slot_exemplars_by_index,
-    num_slots: int,
-    model,
-    device: torch.device,
-) -> None:
-    """
-    Plot one row per actual slot index.
-    """
-    S = int(num_slots)
-    if S <= 0 or not slot_exemplars_by_index:
-        ax = fig.add_subplot(gs)
-        ax.axis("off")
-        ax.text(0.5, 0.5, "No slot-index exemplars collected", ha="center", va="center")
-        return
 
-    sub = gs.subgridspec(S, 5, wspace=0.02, hspace=0.12)
-    headers = ["frame", "routing attn", "slot content", "decoder mask", "approx RGB"]
-
-    for s in range(S):
-        if s >= len(slot_exemplars_by_index) or len(slot_exemplars_by_index[s]) == 0:
-            for c in range(5):
-                ax = fig.add_subplot(sub[s, c])
-                ax.axis("off")
-                if c == 0:
-                    ax.text(0.5, 0.5, f"slot {s}\nno exemplar", ha="center", va="center")
-            continue
-
-        # Already sorted by mask_mass in extract_slot_latents_and_assignments
-        ex = slot_exemplars_by_index[s][0]
-
-        try:
-            approx_rgb = _decode_approx_slot_rgb(model, ex, device=device)
-        except Exception:
-            approx_rgb = np.zeros_like(_chw_to_01(ex["frame"]))
-
-        images = [
-            _chw_to_01(ex["frame"]),
-            _mask_to_rgb(ex["routing_attn"]),
-            _slot_content(ex["frame"], ex["decoder_mask"]),
-            _mask_to_rgb(ex["decoder_mask"]),
-            approx_rgb,
-        ]
-
-        for c, img in enumerate(images):
-            ax = fig.add_subplot(sub[s, c])
-            ax.imshow(img)
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-            if s == 0:
-                ax.set_title(headers[c], fontsize=9)
-
-            if c == 0:
-                comp_id = ex.get("component_id", -1)
-                conf = ex.get("conf", 0.0)
-                mass = ex.get("mask_mass", 0.0)
-                ax.set_ylabel(
-                    f"slot={s}\nDPGMM k={comp_id}\nconf={conf:.2f}\nmass={mass:.3f}",
-                    fontsize=8,
-                )
-
+# --------------------------------------------------------------------------- #
+# Top-level public API
+# --------------------------------------------------------------------------- #
 def visualize_dpgmm_clustering(
     model,
     dataloader,
     device: torch.device,
-    max_batches: int = 50,
-    max_samples: int = 10000,
-    perplexity: float = 30.0,
-    t_select: int = 0,
+    cfg: Optional[VizConfig] = None,
     save_path: Optional[str] = None,
-    figsize: Tuple[int, int] = (20, 16),
-    tsne_dims: int = 2,
-    coverage_threshold: float = 0.99,
+    # backwards-compatible trainer args:
+    max_batches: Optional[int] = None,
+    max_samples: Optional[int] = None,
+    perplexity: Optional[float] = None,
+    t_select: Optional[int] = None,
+    figsize: Optional[Tuple[int, int]] = None,
 ) -> plt.Figure:
-    """
-    Slot-focused diagnostic dashboard.
+    cfg = cfg or VizConfig()
+    if max_batches is not None:
+        cfg.max_batches = int(max_batches)
+    if max_samples is not None:
+        cfg.max_points = int(max_samples) * 3
+        cfg.max_embed_points = int(max_samples)
+    if perplexity is not None:
+        cfg.perplexity = float(perplexity)
+    if t_select is not None:
+        cfg.t_select = int(t_select)
 
-    """
-    model.eval()
-    data = extract_slot_latents_and_assignments(
-        model=model,
-        dataloader=dataloader,
-        device=device,
-        max_batches=max_batches,
-        t_select=t_select,
-        max_points=max_samples * 3,
-        n_exemplars_per_component=4,
+    diag = extract_slot_diagnostics(model, dataloader, device, cfg)
+    return render_figure(diag, cfg, save_path=save_path, figsize=figsize)
+
+
+def render_figure(
+    diag: SlotDiagnostics,
+    cfg: VizConfig,
+    save_path: Optional[str] = None,
+    figsize: Optional[Tuple[int, int]] = None,
+) -> plt.Figure:
+    joint = joint_embed_with_component_means(diag.post_latents, diag.prior_latents, diag.comp_mean, cfg)
+    emb = joint["emb"]
+    src = joint["src"]
+    post_idx = joint["post_idx"]
+    prior_idx = joint["prior_idx"]
+    method = joint["method"]
+
+    m_post = src == 0
+    m_prior = src == 1
+    m_mean = src == 2
+    emb_post = emb[m_post]
+    emb_prior = emb[m_prior]
+    comp_post = diag.post_comp[post_idx]
+    slot_post = diag.post_slot_id[post_idx]
+    comp_prior = diag.prior_comp[prior_idx]
+
+    M = slot_component_contingency(diag.post_slot_id, diag.post_comp, diag.n_slots, diag.n_comp)
+    M_sampled = slot_component_contingency(slot_post, comp_post, diag.n_slots, diag.n_comp)
+    scores = mapping_scores(diag.post_slot_id, diag.post_comp)
+    C = _slot_centroid_cosine(diag.post_latents, diag.post_slot_id, diag.n_slots)
+
+    fig = plt.figure(figsize=figsize or (18, 15), dpi=cfg.dpi)
+    fig.suptitle(
+        f"Slot / DPGMM posterior-prior diagnostics  (t={cfg.t_select}, embedding={method})",
+        fontsize=14,
+        y=0.996,
     )
-
-    post_latents, post_assign, post_pi, post_slot_ids, dropped_post = _sanitize_with_slot_ids(
-        np.asarray(data["posterior_latents"], dtype=np.float32),
-        np.asarray(data["posterior_assignments"], dtype=np.int64),
-        np.asarray(data["posterior_pi"], dtype=np.float32),
-        np.asarray(data.get("posterior_slot_ids", np.zeros((len(data["posterior_latents"]),), dtype=np.int64)), dtype=np.int64),
-    )
-    prior_latents, prior_assign, prior_pi, prior_slot_ids, dropped_prior = _sanitize_with_slot_ids(
-        np.asarray(data["prior_latents"], dtype=np.float32),
-        np.asarray(data["prior_assignments"], dtype=np.int64),
-        np.asarray(data["prior_pi"], dtype=np.float32),
-        np.asarray(data.get("prior_slot_ids", np.zeros((len(data["prior_latents"]),), dtype=np.int64)), dtype=np.int64),
-    )
-    if dropped_post:
-        print(f"[slot-viz] Dropped {dropped_post} invalid posterior points.")
-    if dropped_prior:
-        print(f"[slot-viz] Dropped {dropped_prior} invalid prior points.")
-    if post_latents.shape[0] < 5 or prior_latents.shape[0] < 5:
-        raise ValueError("Not enough valid posterior/prior slot points for visualization; need at least 5 each.")
-
-    num_slots = int(data.get("num_slots", 0))
-    num_slots = max(1, num_slots)
-    tsne_dims = 3 if int(tsne_dims) == 3 else 2
-    emb_post, idx_post = compute_tsne_embedding(
-        post_latents,
-        max_samples=max_samples,
-        perplexity=perplexity,
-        random_state=42,
-        n_components=tsne_dims,
-    )
-    emb_prior, idx_prior = compute_tsne_embedding(
-        prior_latents,
-        max_samples=max_samples,
-        perplexity=perplexity,
-        random_state=43,
-        n_components=tsne_dims,
-    )
-
-    n_joint = min(int(max_samples), post_latents.shape[0], prior_latents.shape[0])
-    joint = np.concatenate([post_latents[:n_joint], prior_latents[:n_joint]], axis=0)
-    joint_src = np.concatenate([np.zeros(n_joint, dtype=np.int64), np.ones(n_joint, dtype=np.int64)])
-    joint_emb, _, joint_method = compute_umap_or_pca(joint, max_samples=2 * n_joint, random_state=44)
-
-    K_seen = max(post_pi.shape[1], prior_pi.shape[1])
-    if K_seen <= 20:
-        colors = plt.cm.tab20(np.linspace(0, 1, min(20, max(1, K_seen))))
-    else:
-        colors = plt.cm.turbo(np.linspace(0, 1, K_seen))
-    cmap = ListedColormap(colors)
-
-    post_counts = np.bincount(post_assign, minlength=K_seen).astype(np.float64)
-    prior_counts = np.bincount(prior_assign, minlength=K_seen).astype(np.float64)
-    post_frac = post_counts / max(1.0, post_counts.sum())
-    prior_frac = prior_counts / max(1.0, prior_counts.sum())
-    combined_frac = post_frac + prior_frac
-    combined_frac = combined_frac / max(1e-12, combined_frac.sum())
-    order = np.argsort(combined_frac)[::-1]
-    selected_components = _select_components_by_coverage(combined_frac, coverage=coverage_threshold)
-    displayed_coverage = float(combined_frac[selected_components].sum()) if selected_components.size else 0.0
-
-    slot_counts = np.bincount(post_slot_ids, minlength=num_slots).astype(np.float64)
-    slot_frac = slot_counts / max(1.0, slot_counts.sum())
-    slot_mask_mass = np.asarray(data.get("slot_mask_mass", np.zeros((0, num_slots))), dtype=np.float64)
-    slot_attn_mass = np.asarray(data.get("slot_attn_mass", np.zeros((0, num_slots))), dtype=np.float64)
-    mean_mask_mass = slot_mask_mass.mean(axis=0) if slot_mask_mass.ndim == 2 and slot_mask_mass.shape[0] else np.zeros((num_slots,), dtype=np.float64)
-    mean_attn_mass = slot_attn_mass.mean(axis=0) if slot_attn_mass.ndim == 2 and slot_attn_mass.shape[0] else np.zeros((num_slots,), dtype=np.float64)
-    slot_component = _slot_component_table(post_slot_ids, post_assign, num_slots, K_seen)
-
-    comp_mean = np.asarray(data.get("comp_mean", np.zeros((K_seen, 1, 1, 1))), dtype=np.float32)
-    comp_var = np.asarray(data.get("comp_var", np.ones_like(comp_mean)), dtype=np.float32)
-    comp_mean_flat = comp_mean.reshape(comp_mean.shape[0], -1) if comp_mean.ndim >= 2 else np.zeros((K_seen, 1), dtype=np.float32)
-    comp_var_flat = comp_var.reshape(comp_var.shape[0], -1) if comp_var.ndim >= 2 else np.ones((K_seen, 1), dtype=np.float32)
-    comp_dist = _pairwise_l2(comp_mean_flat)
-    comp_norm = np.linalg.norm(comp_mean_flat, axis=1)
-    comp_var_mean = np.maximum(comp_var_flat.mean(axis=1), 1e-12)
-
-    pi_per_image = np.asarray(data.get("pi_per_image", np.zeros((0, K_seen))), dtype=np.float64)
-    if pi_per_image.ndim != 2 or pi_per_image.shape[0] == 0:
-        pi_per_image = post_pi.reshape(-1, K_seen)
-    pi_mean = pi_per_image.mean(axis=0)
-    pi_eff = _effective_k(pi_per_image)
-    kumar_a = np.asarray(data.get("kumar_a", np.zeros((0, max(0, K_seen - 1)))), dtype=np.float64)
-    kumar_b = np.asarray(data.get("kumar_b", np.zeros((0, max(0, K_seen - 1)))), dtype=np.float64)
-
-    slot_mean_by_idx = _slot_means_by_index(post_latents, post_slot_ids, num_slots)
-    slot_cos = _pairwise_cosine(slot_mean_by_idx)
-
-    n_same = min(3, len(data.get("same_frame_examples", [])))
-    fig_h = max(float(figsize[1]), 13.5 + 1.15 * num_slots + 1.5 * max(1, n_same))
-    fig = plt.figure(figsize=(max(float(figsize[0]), 26.0), fig_h), constrained_layout=True)
-    outer = fig.add_gridspec(
-        6,
+    outer = GridSpec(
+        4,
         1,
-        height_ratios=[max(1.4, 0.78 * max(1, n_same)), 1.10, 0.92, 1.00, 0.82, max(1.6, 0.62 * num_slots)],
+        figure=fig,
+        height_ratios=[1.03, 0.92, 0.82, 1.28],
+        hspace=0.36,
+        left=0.045,
+        right=0.985,
+        top=0.955,
+        bottom=0.055,
     )
 
-    _plot_same_frame_examples(fig, outer[0], data.get("same_frame_examples", []), num_slots=num_slots)
+    # Row 1: core latent-space question.
+    row1 = outer[0].subgridspec(1, 4, wspace=0.30)
+    _scatter_discrete(fig.add_subplot(row1[0]), emb_post, comp_post, diag.n_comp,
+                      "posterior slot latents\ncolored by DPGMM component", "comp", cfg.point_size)
+    _scatter_discrete(fig.add_subplot(row1[1]), emb_post, slot_post, diag.n_slots,
+                      "same posterior latents\ncolored by slot index", "slot", cfg.point_size)
+    _plot_joint_prior_posterior(fig.add_subplot(row1[2]), emb, src, np.arange(diag.n_comp),
+                                "posterior vs conditional prior\n(shared embedding + comp means)", cfg.point_size)
+    _plot_contingency(fig.add_subplot(row1[3]), M, scores)
 
-    row2 = outer[1].subgridspec(1, 5, wspace=0.25)
-    if tsne_dims == 3:
-        ax = fig.add_subplot(row2[0, 0], projection="3d")
-        ax.scatter(emb_post[:, 0], emb_post[:, 1], emb_post[:, 2], c=post_assign[idx_post], cmap=cmap, s=8, alpha=0.75)
-        ax.set_zlabel("t-SNE 3")
+    # Row 2: usage/collapse/calibration.
+    row2 = outer[1].subgridspec(1, 4, wspace=0.32)
+    _scatter_discrete(fig.add_subplot(row2[0]), emb_prior, comp_prior, diag.n_comp,
+                      "conditional prior samples\ncolored by component", "comp", cfg.point_size * 0.85)
+    _plot_slot_cosine(fig.add_subplot(row2[1]), C)
+    _plot_component_usage(fig.add_subplot(row2[2]), diag.comp_usage_post, diag.comp_usage_prior, cfg.active_component_threshold)
+    _plot_entropy_hist(fig.add_subplot(row2[3]), diag)
+
+    # Row 3: masks and gate.
+    row3 = outer[2].subgridspec(1, 4, wspace=0.32)
+    _plot_gate_effective_k(fig.add_subplot(row3[0]), diag)
+    _plot_mask_stats(fig.add_subplot(row3[1]), diag)
+    if cfg.show_kumaraswamy:
+        _plot_kumaraswamy(fig.add_subplot(row3[2]), diag)
     else:
-        ax = fig.add_subplot(row2[0, 0])
-        sc = ax.scatter(emb_post[:, 0], emb_post[:, 1], c=post_assign[idx_post], cmap=cmap, s=9, alpha=0.75)
-        fig.colorbar(sc, ax=ax, label="DPGMM component")
-    ax.set_title("Posterior slots by component")
-    ax.set_xlabel("dim 1")
-    ax.set_ylabel("dim 2")
-
-    if tsne_dims == 3:
-        ax = fig.add_subplot(row2[0, 1], projection="3d")
-        ax.scatter(emb_post[:, 0], emb_post[:, 1], emb_post[:, 2], c=post_slot_ids[idx_post], cmap=plt.cm.tab20, s=8, alpha=0.75)
-        ax.set_zlabel("t-SNE 3")
-    else:
-        ax = fig.add_subplot(row2[0, 1])
-        sc = ax.scatter(emb_post[:, 0], emb_post[:, 1], c=post_slot_ids[idx_post], cmap=plt.cm.tab20, s=9, alpha=0.75)
-        fig.colorbar(sc, ax=ax, label="slot index")
-    ax.set_title("Posterior slots by slot index")
-    ax.set_xlabel("dim 1")
-    ax.set_ylabel("dim 2")
-
-    if tsne_dims == 3:
-        ax = fig.add_subplot(row2[0, 2], projection="3d")
-        ax.scatter(emb_prior[:, 0], emb_prior[:, 1], emb_prior[:, 2], c=prior_assign[idx_prior], cmap=cmap, s=8, alpha=0.75)
-        ax.set_zlabel("t-SNE 3")
-    else:
-        ax = fig.add_subplot(row2[0, 2])
-        sc = ax.scatter(emb_prior[:, 0], emb_prior[:, 1], c=prior_assign[idx_prior], cmap=cmap, s=9, alpha=0.75)
-        fig.colorbar(sc, ax=ax, label="DPGMM component")
-    ax.set_title("Prior samples by component")
-    ax.set_xlabel("dim 1")
-    ax.set_ylabel("dim 2")
-
-    if tsne_dims == 3:
-        ax = fig.add_subplot(row2[0, 3], projection="3d")
-        ax.scatter(emb_prior[:, 0], emb_prior[:, 1], emb_prior[:, 2], c=prior_slot_ids[idx_prior], cmap=plt.cm.tab20, s=8, alpha=0.75)
-        ax.set_zlabel("t-SNE 3")
-    else:
-        ax = fig.add_subplot(row2[0, 3])
-        sc = ax.scatter(emb_prior[:, 0], emb_prior[:, 1], c=prior_slot_ids[idx_prior], cmap=plt.cm.tab20, s=9, alpha=0.75)
-        fig.colorbar(sc, ax=ax, label="slot index")
-    ax.set_title("Prior samples by slot index")
-    ax.set_xlabel("dim 1")
-    ax.set_ylabel("dim 2")
-
-    ax = fig.add_subplot(row2[0, 4])
-    ax.scatter(joint_emb[joint_src == 0, 0], joint_emb[joint_src == 0, 1], s=10, alpha=0.6, label="posterior")
-    ax.scatter(joint_emb[joint_src == 1, 0], joint_emb[joint_src == 1, 1], s=10, alpha=0.6, label="prior")
-    ax.set_title(f"{joint_method}: posterior vs prior")
-    ax.set_xlabel("dim 1")
-    ax.set_ylabel("dim 2")
-    ax.legend(fontsize=8)
-
-    row3 = outer[2].subgridspec(1, 4, wspace=0.25)
-    ax = fig.add_subplot(row3[0, 0])
-    comp_x = np.arange(len(order))
-    width = 0.42
-    ax.bar(comp_x - width / 2, post_frac[order], width=width, label="posterior")
-    ax.bar(comp_x + width / 2, prior_frac[order], width=width, label="prior")
-    ax.set_title("DPGMM component usage")
-    ax.set_xlabel("component id, sorted")
-    ax.set_ylabel("fraction of slot tokens")
-    ax.set_xticks(comp_x)
-    ax.set_xticklabels([str(int(k)) for k in order], rotation=0)
-    ax.legend(fontsize=8)
-
-    ax = fig.add_subplot(row3[0, 1])
-    slot_x = np.arange(num_slots)
-    width2 = 0.30
-    ax.bar(slot_x - width2, slot_frac[:num_slots], width=width2, label="slot-token fraction")
-    ax.bar(slot_x, mean_mask_mass[:num_slots], width=width2, label="decoder object-mask mass")
-    ax.bar(slot_x + width2, mean_attn_mass[:num_slots], width=width2, label="routing-attn mass")
-    ax.set_title("Slot index usage")
-    ax.set_xlabel("slot index")
-    ax.set_ylabel("mean / fraction")
-    ax.set_xticks(slot_x)
-    ax.legend(fontsize=7)
-
-    ax = fig.add_subplot(row3[0, 2])
-    im = ax.imshow(slot_component, aspect="auto", vmin=0.0, vmax=1.0)
-    ax.set_title("Posterior component assignment by slot")
-    ax.set_xlabel("DPGMM component")
-    ax.set_ylabel("slot index")
-    ax.set_xticks(np.arange(K_seen))
-    ax.set_yticks(np.arange(num_slots))
-    fig.colorbar(im, ax=ax, label="fraction")
-
-    ax = fig.add_subplot(row3[0, 3])
-    im = ax.imshow(slot_cos, vmin=-1.0, vmax=1.0, cmap="RdBu_r")
-    ax.set_title("Slot-index mean cosine")
-    ax.set_xlabel("slot")
-    ax.set_ylabel("slot")
-    ax.set_xticks(np.arange(num_slots))
-    ax.set_yticks(np.arange(num_slots))
-    fig.colorbar(im, ax=ax, label="cosine")
-
-    row4 = outer[3].subgridspec(1, 5, wspace=0.25)
-    ax = fig.add_subplot(row4[0, 0])
-    im = ax.imshow(comp_dist, cmap="viridis")
-    ax.set_title("Component mean pairwise L2")
-    ax.set_xlabel("component")
-    ax.set_ylabel("component")
-    ax.set_xticks(np.arange(comp_mean.shape[0]))
-    ax.set_yticks(np.arange(comp_mean.shape[0]))
-    fig.colorbar(im, ax=ax, label="L2")
-
-    ax = fig.add_subplot(row4[0, 1])
-    ax.bar(np.arange(comp_mean.shape[0]), comp_norm, label="||mean||")
-    ax2 = ax.twinx()
-    ax2.plot(np.arange(comp_var_mean.shape[0]), comp_var_mean, marker="o", linewidth=1.0, label="mean var")
-    ax2.set_yscale("log")
-    ax.set_title("Component norm and variance")
-    ax.set_xlabel("component")
-    ax.set_ylabel("||component mean||")
-    ax2.set_ylabel("mean variance")
-
-    ax = fig.add_subplot(row4[0, 2])
-    ax.bar(np.arange(K_seen), pi_mean[:K_seen])
-    ax.set_title("Mean conditional gate pi(h)")
-    ax.set_xlabel("component")
-    ax.set_ylabel("mean probability")
-    ax.set_xticks(np.arange(K_seen))
-    ax.set_ylim(0.0, 1.05)
-
-    ax = fig.add_subplot(row4[0, 3])
-    if pi_eff.size:
-        ax.hist(pi_eff, bins=min(20, max(4, int(np.sqrt(pi_eff.size)))), edgecolor="black")
-        ax.axvline(1.0, linestyle="--", linewidth=1.0, label="K_eff=1")
-        ax.axvline(float(K_seen), linestyle="--", linewidth=1.0, label=f"K_eff={K_seen}")
-        ax.legend(fontsize=7)
-    ax.set_title("Per-image effective K")
-    ax.set_xlabel("exp(H[pi])")
-    ax.set_ylabel("count")
-
-    ax = fig.add_subplot(row4[0, 4])
-    if kumar_a.size and kumar_b.size and kumar_a.shape[1] > 0:
-        max_sticks_to_show = min(kumar_a.shape[1], 10)
-        vals = [kumar_a[:, k] for k in range(max_sticks_to_show)] + [kumar_b[:, k] for k in range(max_sticks_to_show)]
-        labels = [f"a{k}" for k in range(max_sticks_to_show)] + [f"b{k}" for k in range(max_sticks_to_show)]
-        ax.boxplot(vals, labels=labels, showfliers=False)
-        ax.set_yscale("log")
-        ax.tick_params(axis="x", labelrotation=90, labelsize=7)
-        if kumar_a.shape[1] > max_sticks_to_show:
-            ax.text(0.5, 0.95, f"showing first {max_sticks_to_show} sticks", transform=ax.transAxes, ha="center", va="top", fontsize=7)
-    else:
-        ax.axis("off")
-        ax.text(0.5, 0.5, "No Kumaraswamy sticks", ha="center", va="center", fontsize=8)
-    ax.set_title("Kumaraswamy gate parameters")
-    ax.set_ylabel("value")
-
-    row5 = outer[4].subgridspec(1, 2, width_ratios=[1.8, 1.0], wspace=0.20)
-    slot_dim = int(model.vdvae.decoder.dec_blocks[0].top_slot_posterior.slot_dim)
-
-    comp_logsigma = 0.5 * np.log(
-        np.maximum(comp_var.reshape(comp_var.shape[0], slot_dim), 1e-6)
+        _blank(fig.add_subplot(row3[2]), "Kumaraswamy hidden")
+    ax_sum = fig.add_subplot(row3[3])
+    ax_sum.axis("off")
+    summary = _verdict_text(scores, C, diag, cfg)
+    ax_sum.text(0.0, 1.0, "Reading guide", fontsize=10, fontweight="bold", va="top")
+    guide = (
+        "Good signs:\n"
+        "  • posterior and prior overlap in the joint plot\n"
+        "  • more than one component is active\n"
+        "  • slot masks cover different image regions\n"
+        "  • off-diagonal slot cosine is not near 1\n\n"
+        "Warnings:\n"
+        "  • one active component = DPGMM collapse\n"
+        "  • identical masks/content = slot collapse\n"
+        "  • high resp entropy = uncertain component assignment\n\n"
+        + summary
     )
-    _plot_component_decodes(
-        fig,
-        row5[0, 0],
-        model=model,
-        device=device,
-        comp_mean=comp_mean,
-        comp_logsigma=comp_logsigma,  # treat variance as log-sigma for visualization purposes
-        pi_mean=pi_mean,
-        examples=data.get("same_frame_examples", []),
-    )
-    ax = fig.add_subplot(row5[0, 1])
-    ax.axis("off")
-    slot_cos_off = np.nan
-    if num_slots >= 2 and slot_cos.size:
-        c = slot_cos.copy()
-        c[np.eye(num_slots, dtype=bool)] = np.nan
-        slot_cos_off = float(np.nanmax(c))
-    comp_min_off = np.nan
-    if comp_dist.shape[0] >= 2:
-        d = comp_dist.copy()
-        d[np.eye(d.shape[0], dtype=bool)] = np.nan
-        comp_min_off = float(np.nanmin(d))
-    summary = [
-        f"fixed slots per input:              {num_slots}",
-        f"posterior slot tokens:             {post_latents.shape[0]}",
-        f"prior slot tokens:                 {prior_latents.shape[0]}",
-        f"DPGMM components in frozen prior:  {K_seen}",
-        f"active posterior components >1%:   {int((post_frac > 0.01).sum())}",
-        f"active prior components >1%:       {int((prior_frac > 0.01).sum())}",
-        f"mean gate K_eff:                   {float(np.mean(pi_eff)) if pi_eff.size else 0.0:.2f}",
-        f"max off-diagonal slot cosine:      {slot_cos_off:.3f}",
-        f"min off-diagonal comp L2:          {comp_min_off:.3g}",
-        f"coverage components at {coverage_threshold:.0%}:        {selected_components.tolist() if selected_components.size else []}",
-        f"coverage of selected components:   {displayed_coverage:.1%}",
-        #"",
-        #"Reading guide:",
-        #"same-frame slots should differ across a row;",
-        #"one component color confirms DPGMM usage collapse;",
-        #"high off-diagonal slot cosine indicates similar slot means;",
-        #"low component L2 indicates duplicate component means;",
-        #"decoded component means should differ if the bank is useful.",
-    ]
-    ax.text(0.01, 0.98, "Slot-DPGMM diagnostics", ha="left", va="top", fontsize=12, fontweight="bold")
-    ax.text(0.01, 0.86, "\n".join(summary), ha="left", va="top", fontsize=9, family="monospace")
+    ax_sum.text(0.0, 0.88, guide, fontsize=8.2, family="monospace", va="top", wrap=True)
 
-    _plot_slot_index_exemplars(
-        fig,
-        outer[5],
-        data["slot_exemplars_by_index"],
-        num_slots=num_slots,
-        model=model,
-        device=device,
-    )
+    # Row 4: direct slot visual evidence.
+    _plot_content_grid(fig, outer[3], diag.examples, diag.n_slots)
 
-    fig.suptitle(f"Slot posterior/prior diagnostics at t={t_select}", fontsize=14)
-    if save_path is not None:
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    if save_path:
+        fig.savefig(save_path, dpi=cfg.dpi, bbox_inches="tight")
     return fig
 
 
-def visualize_component_evolution(
-    model,
-    dataloader,
-    device: torch.device,
-    n_timesteps: int = 10,
-    max_batches: int = 20,
-    save_path: Optional[str] = None,
-) -> plt.Figure:
-    """Plot posterior/prior component usage over time using slot assignments."""
-    model.eval()
-    post_list, prior_list, keff_post, keff_prior = [], [], [], []
-    Kmax = 0
-    for t in range(n_timesteps):
-        data = extract_slot_latents_and_assignments(model, dataloader, device, max_batches=max_batches, t_select=t, max_points=20000, n_exemplars_per_component=1)
-        post_pi = np.asarray(data["posterior_pi"], dtype=np.float64)
-        prior_pi = np.asarray(data["prior_pi"], dtype=np.float64)
-        post_mean = post_pi.mean(axis=0) if post_pi.ndim == 2 and post_pi.shape[0] else np.zeros((1,), dtype=np.float64)
-        prior_mean = prior_pi.mean(axis=0) if prior_pi.ndim == 2 and prior_pi.shape[0] else np.zeros((1,), dtype=np.float64)
-        Kmax = max(Kmax, post_mean.shape[0], prior_mean.shape[0])
-        post_list.append(post_mean)
-        prior_list.append(prior_mean)
-        keff_post.append(float(_effective_k(post_pi).mean()) if post_pi.ndim == 2 and post_pi.shape[0] else 0.0)
-        keff_prior.append(float(_effective_k(prior_pi).mean()) if prior_pi.ndim == 2 and prior_pi.shape[0] else 0.0)
-
-    post_mat = np.zeros((n_timesteps, Kmax), dtype=np.float64)
-    prior_mat = np.zeros((n_timesteps, Kmax), dtype=np.float64)
-    for t in range(n_timesteps):
-        post_mat[t, :post_list[t].shape[0]] = post_list[t]
-        prior_mat[t, :prior_list[t].shape[0]] = prior_list[t]
-
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), constrained_layout=True)
-    im0 = axes[0].imshow(post_mat, aspect="auto")
-    axes[0].set_title("Mean posterior slot responsibility over time")
-    axes[0].set_xlabel("component")
-    axes[0].set_ylabel("timestep")
-    fig.colorbar(im0, ax=axes[0], label="mean responsibility")
-
-    im1 = axes[1].imshow(prior_mat, aspect="auto")
-    axes[1].set_title("Mean prior slot responsibility over time")
-    axes[1].set_xlabel("component")
-    axes[1].set_ylabel("timestep")
-    fig.colorbar(im1, ax=axes[1], label="mean responsibility")
-
-    axes[2].plot(np.arange(n_timesteps), keff_post, label="posterior K_eff")
-    axes[2].plot(np.arange(n_timesteps), keff_prior, label="prior K_eff")
-    axes[2].set_title("Effective active components over time")
-    axes[2].set_xlabel("timestep")
-    axes[2].set_ylabel("exp(H)")
-    axes[2].legend()
-
-    if save_path is not None:
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
-    return fig
+__all__ = [
+    "VizConfig",
+    "SlotDiagnostics",
+    "extract_slot_diagnostics",
+    "extract_slot_latents_and_assignments",
+    "visualize_dpgmm_clustering",
+    "render_figure",
+]

@@ -189,99 +189,7 @@ class FIDScore:
             print(f"Error calculating FID: {str(e)}")
             return float('inf')
 
-def compute_metrics(model, test_loader, device, writer, global_step, max_samples=100):
-    """Compute clustering metrics and image quality metrics."""
-    model.eval()
 
-    # Metric accumulators
-    acc_meter = AverageMeter()
-    fid = FIDScore(device=device)
-    total_loss = 0
-    all_predictions, all_labels = [], []
-    all_real_images, all_fake_images = [], []
-
-    with torch.no_grad():
-        for batch_idx, (data, masks, labels) in enumerate(test_loader):
-            if len(all_real_images) >= max_samples:
-                break  # Limit samples for efficiency
-
-            data = data.to(device)
-            data = (data - 0.5) * 2.0  # Normalize input data
-
-            # Forward pass
-            reconstruction, params = model(data)
-            cluster_probs = params['prior_dist'].mixture_distribution.probs
-
-            # Store predictions & labels
-            all_predictions.append(cluster_probs)
-            all_labels.append(labels.to(device))
-            all_real_images.append(data)
-            all_fake_images.append(reconstruction)
-
-            # Compute loss
-            losses = model.compute_loss(data, reconstruction, params)
-            total_loss += losses['loss'].item()
-
-            # Compute accuracy
-            cluster_assignments = cluster_probs.argmax(1)
-            acc = (cluster_assignments == labels.to(device)).float().mean()
-            acc_meter.update(acc.item(), data.size(0))
-
-    # Convert collected data
-    all_predictions = torch.cat(all_predictions, dim=0)
-    all_labels = torch.cat(all_labels, dim=0)
-
-    # Compute clustering metrics
-    metrics = {}
-    # Add learning rates
-    metrics['gen_lr'] = model.gen_scheduler.get_last_lr()[0]
-    metrics['img_disc_lr'] = model.img_disc_scheduler.get_last_lr()[0]
-    metrics['latent_disc_lr'] = model.latent_disc_scheduler.get_last_lr()[0]
-
-    cluster_assignments = all_predictions.argmax(1).cpu().numpy()
-    true_labels = all_labels.cpu().numpy()
-    #Normalized Mutual Information
-    metrics['nmi'] = normalized_mutual_info_score(true_labels,
-                                                  cluster_assignments,
-                                                  average_method='arithmetic'  # Can also be 'geometric' or 'min'
-                                                  )
-    #Measures similarity between two clusterings and it is adjusted for chance (can be negative if worse than random)
-    metrics['ari'] = adjusted_rand_score(true_labels, cluster_assignments)
-
-    # Compute cluster purity
-    def compute_purity(predictions, labels):
-        #Simpler metric that measures percentage of samples correctly clustered
-        contingency = contingency_matrix(labels, predictions)
-
-        # For each cluster, find the most common true label
-        # Sum these and divide by total samples
-        return np.sum(np.amax(contingency, axis=0)) / np.sum(contingency)
-
-    metrics['purity'] = compute_purity(cluster_assignments, true_labels)
-
-    # Compute effective number of clusters
-    metrics['effective_clusters'] = model.prior.get_effective_components(all_predictions.mean(0)).item()
-
-    # Compute entropy of cluster assignments
-    cluster_entropy = -(all_predictions * torch.log(all_predictions + 1e-10)).sum(1).mean()
-    metrics['cluster_entropy'] = cluster_entropy.item()
-
-    # Compute FID Score
-    try:
-        real_images = torch.cat(all_real_images, dim=0)[:max_samples]
-        fake_images = torch.cat(all_fake_images, dim=0)[:max_samples]
-        metrics['fid_score'] = fid.calculate_fid(real_images, fake_images)
-    except Exception as e:
-        print(f"Error in FID calculation: {str(e)}")
-        metrics['fid_score'] = float('inf')
-
-    # Log metrics
-    writer.add_scalar('test/accuracy', acc_meter.avg, global_step)
-    for name, value in metrics.items():
-        writer.add_scalar(f'test/{name}', value, global_step)
-    writer.add_scalar('test/loss', total_loss / len(test_loader), global_step)
-
-    return metrics, acc_meter.avg, total_loss / len(test_loader)
 
 @contextmanager
 def disable_all_checkpoint_modules(model: torch.nn.Module):
@@ -1636,7 +1544,6 @@ class DMCVBTrainer:
                         max_batches=5,        # safer than 10
                         max_samples=1000,     # safer than 5000
                         perplexity=30.0,
-                        tsne_dims=3,          # safer than 3
                         save_path=save_path,
                         t_select=8,
                     )
@@ -2321,7 +2228,7 @@ def main():
         'dropout': 0.1,
 
         # Training settings
-        'batch_size': 21,
+        'batch_size': 20,
         'dpgmm_outer_batch_size': 512,
         'sequence_length': 10,
         'disc_num_heads': 8,
