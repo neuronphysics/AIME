@@ -240,6 +240,7 @@ class SS2D(nn.Module):
         bias=False,
         device=None,
         dtype=None,
+        use_checkpoint=False,
         **kwargs,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -251,7 +252,8 @@ class SS2D(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-
+        self.use_checkpoint = bool(use_checkpoint)
+        self.ckpt_use_reentrant = False
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
         self.conv2d = nn.Conv2d(
             in_channels=self.d_inner,
@@ -293,6 +295,19 @@ class SS2D(nn.Module):
         self.out_norm = nn.LayerNorm(self.d_inner)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
+
+    def _maybe_ckpt(self, fn, *args):
+        if (
+            self.use_checkpoint
+            and self.training
+            and any(torch.is_tensor(arg) and arg.requires_grad for arg in args)
+        ):
+            return checkpoint.checkpoint(
+                fn,
+                *args,
+                use_reentrant=self.ckpt_use_reentrant,
+            )
+        return fn(*args)
 
     @staticmethod
     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4, **factory_kwargs):
@@ -470,7 +485,7 @@ class SS2D(nn.Module):
             delta_bias=dt_projs_bias,
             delta_softplus=True,
         ).view(B, K, -1, L)
-        assert out_y.dtype == torch.float16
+        #assert out_y.dtype == torch.float16
 
         inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
         wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
@@ -481,6 +496,10 @@ class SS2D(nn.Module):
 
         return y
 
+    def _core(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.conv2d(x))# (b, d, h, w)
+        return self.forward_core(x)
+
     def forward(self, x: torch.Tensor, **kwargs):
         B, H, W, C = x.shape
 
@@ -488,8 +507,8 @@ class SS2D(nn.Module):
         x, z = xz.chunk(2, dim=-1) # (b, h, w, d)
 
         x = x.permute(0, 3, 1, 2).contiguous()
-        x = self.act(self.conv2d(x)) # (b, d, h, w)
-        y = self.forward_core(x)
+        y = self._maybe_ckpt(self._core, x)
+        
         y = y * F.silu(z)
         out = self.out_proj(y)
         if self.dropout is not None:
@@ -505,11 +524,12 @@ class VSSBlock(nn.Module):
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         attn_drop_rate: float = 0,
         d_state: int = 16,
+        use_checkpoint: bool = False,
         **kwargs,
     ):
         super().__init__()
         self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = SS2D(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, **kwargs)
+        self.self_attention = SS2D(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, use_checkpoint=use_checkpoint, **kwargs)
         self.drop_path = DropPath(drop_path)
 
     def forward(self, input: torch.Tensor):
@@ -553,6 +573,8 @@ class VSSLayer(nn.Module):
                 norm_layer=norm_layer,
                 attn_drop_rate=attn_drop,
                 d_state=d_state,
+                use_checkpoint=use_checkpoint,
+                **kwargs,
             )
             for i in range(depth)])
         
@@ -676,6 +698,7 @@ class VSB(VSSBlock):
         norm_layer: Callable[..., nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         attn_drop_rate: float = 0,
         d_state: int = 16,
+        use_checkpoint: bool = False,
         **kwargs
     ):
         super().__init__(
@@ -685,6 +708,7 @@ class VSB(VSSBlock):
             norm_layer=norm_layer,
             attn_drop_rate=attn_drop_rate,
             d_state=d_state,
+            use_checkpoint=use_checkpoint,
             **kwargs
         )
         self.linear = nn.Linear(hidden_dim * 2, hidden_dim)
@@ -783,7 +807,7 @@ class PatchInflated(nn.Module):
 
 class VMRNNCell(nn.Module):
     def __init__(self, hidden_dim, input_resolution,depth,
-                 drop=0., attn_drop=0., drop_path=0., norm_layer=nn.LayerNorm, d_state=16, **kwargs):
+                 drop=0., attn_drop=0., drop_path=0., norm_layer=nn.LayerNorm, d_state:int =16, use_checkpoint: bool = False, **kwargs):
         """
         Args:
         hidden_dim: Dimension of the hidden layer.
@@ -794,11 +818,11 @@ class VMRNNCell(nn.Module):
         d_state: State dimension for SS2D in VSB.
         """
         super(VMRNNCell, self).__init__()
-
+        self.use_checkpoint = bool(use_checkpoint)
         self.VSBs = nn.ModuleList(
             VSB(hidden_dim=hidden_dim, input_resolution=input_resolution,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, norm_layer=norm_layer, attn_drop_rate=attn_drop,
-                d_state=d_state, **kwargs)
+                d_state=d_state, use_checkpoint=self.use_checkpoint, **kwargs)
             for i in range(depth))
 
     def forward(self, xt, hidden_states):
@@ -839,6 +863,7 @@ class VMRNNCore(nn.Module):
         width: int = 32,
         depth: int = 4,
         d_state: int = 16,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
 
@@ -859,6 +884,7 @@ class VMRNNCore(nn.Module):
             depth=depth,
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
             d_state=d_state,
+            use_checkpoint=use_checkpoint,
         )
 
         # Apply this on token tensor [B, L, hidden_dim], not on [B, C, H, W].

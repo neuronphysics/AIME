@@ -30,9 +30,10 @@ export TF_CPP_MIN_LOG_LEVEL=2
 source /home/memole/links/D2E/bin/activate
 ### FORCE SINGLE-THREAD BLAS / OMP / TORCH
 # ---- VRAM allocator / fragmentation fixes ----
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512,garbage_collection_threshold:0.8
 export CUDA_MODULE_LOADING=LAZY
-
+#pip install --no-index --no-cache-dir --no-deps "mamba-ssm==2.2.4+computecanada"
+#pip install --no-index --no-cache-dir --no-deps "torch==2.5.1+computecanada" "sympy==1.13.1+computecanada" "torchvision==0.20.1+computecanada" "torchaudio==2.5.1+computecanada"
 # If TensorFlow is imported anywhere in the SAME training process:
 export TF_FORCE_GPU_ALLOW_GROWTH=true
 export OMP_NUM_THREADS=1
@@ -92,3 +93,4 @@ python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_
 #python -m pip install -U "huggingface_hub[cli]"
 #hf download ml-jku/meta-world --local-dir /home/memole/links/scratch/transition_data/LiRE/meta-world --repo-type dataset
 CUDA_VISIBLE_DEVICES=0 python3 -m VRNN.dmc_vb_transition_dynamics_trainer --data_dir /home/memole/links/scratch/transition_data/
+

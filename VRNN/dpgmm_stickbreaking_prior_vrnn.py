@@ -460,10 +460,10 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
             action_dim=self.action_dim,
             height=self.top_H,
             width=self.top_W,
-            depth=3,
+            depth=2,
             d_state=self.mamba_d_state,
+            use_checkpoint=self.use_ctx_checkpoint,
         )
-
 
     @property
     def rnn(self):

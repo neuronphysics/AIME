@@ -2173,7 +2173,7 @@ def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
         # data / task
         "data_dir", "domain_name", "task_name", "policy_level",
         # model
-        "max_components", "latent_dim", "hidden_dim",
+        "max_components", "latent_dim", "hidden_dim", "mamba_d_state", "dpgmm_outer_batch_size",
         # training
         "batch_size", "sequence_length", "learning_rate", "n_epochs",
         "num_workers", "beta_min", "beta_max", "beta_warmup_epochs",
@@ -2219,6 +2219,7 @@ def main():
 
         # Model settings
         'max_components': 12,
+        'mamba_d_state': 16,
         'latent_dim': 48,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
@@ -2294,6 +2295,7 @@ def main():
         dropout=config['dropout'],
         use_dwa = config["use_dynamic_weight_average"],
         top_slot_dim = config["top_slot_dim"],
+        mamba_d_state = config["mamba_d_state"],
     )
 
 
