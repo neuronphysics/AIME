@@ -18,10 +18,8 @@ from matplotlib.colors import BoundaryNorm
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-
 from umap import UMAP 
-
-from vdvae.top_dpgmm_prior import compute_slot_kl_conditional_frozen,  sample_slots_conditional_frozen
+from vdvae.top_dpgmm_prior import compute_slot_kl_conditional_frozen,  sample_slots_conditional_frozen, sample_slot_vectors_conditional_frozen
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +150,69 @@ def _apply_batch_mask(x: Optional[torch.Tensor], mask: torch.Tensor, B: int) -> 
         view = (x.shape[0],) + (1,) * (x.dim() - 1)
         return x * expanded.view(view).to(device=x.device, dtype=x.dtype)
     raise ValueError(f"Cannot apply [B] mask with B={B} to tensor batch {x.shape[0]}")
+
+
+# --------------------------------------------------------------------------- #
+# Mask helpers (attention vs decoder alpha)
+# --------------------------------------------------------------------------- #
+def _attn_to_grid(top_slot_attn: torch.Tensor, top_hw: Tuple[int, int]) -> Optional[torch.Tensor]:
+    """[B,S,L] slot-attention -> [B,S,h,w] using the TRUE top grid (top_H, top_W).
+
+    Returns None if L != h*w so the caller can fall back gracefully instead of
+    guessing a square grid.
+    """
+    B, S, L = top_slot_attn.shape
+    h, w = int(top_hw[0]), int(top_hw[1])
+    if h * w != L:
+        return None
+    return top_slot_attn.reshape(B, S, h, w).float()
+
+
+def _peak_entropy_native(masks_bshw: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-image sharpness of a per-pixel distribution over the slot axis.
+
+    masks_bshw: [B,S,H,W], summing to ~1 over dim=1.
+    Returns (peak, ent), each [B]:
+        peak = mean over pixels of max_slot p(slot|pixel)   (1/S collapsed -> 1 sharp)
+        ent  = mean over pixels of -sum_slot p log p        (log S collapsed -> 0 sharp)
+
+    IMPORTANT: pass NATIVE-resolution masks. Bilinear upsampling smooths the
+    distribution and biases peak down / entropy up, and it penalizes the coarser
+    attention grid more than the decoder grid, which corrupts the comparison.
+    """
+    p = masks_bshw.float()
+    p = p / p.sum(dim=1, keepdim=True).clamp_min(eps)
+    peak = p.max(dim=1).values.mean(dim=(-1, -2))                                  # [B]
+    ent = -(p.clamp_min(eps) * p.clamp_min(eps).log()).sum(dim=1).mean(dim=(-1, -2))  # [B]
+    return peak, ent
+
+
+def _upsample_masks(masks_bshw: torch.Tensor, size: Tuple[int, int], renorm: bool = True, eps: float = 1e-8) -> torch.Tensor:
+    """[B,S,h,w] -> [B,S,1,H,W] bilinear, renormalized over slots for display only."""
+    B, S, h, w = masks_bshw.shape
+    up = F.interpolate(masks_bshw.reshape(B * S, 1, h, w), size=size, mode="bilinear", align_corners=False)
+    up = up.reshape(B, S, 1, *size).clamp_min(0.0)
+    if renorm:
+        up = up / up.sum(dim=1, keepdim=True).clamp_min(eps)
+    return up
+
+
+def _argmax_overlay(frame_chw: torch.Tensor, masks_native_shw: torch.Tensor, alpha: float = 0.45) -> np.ndarray:
+    """Hard slot segmentation overlay.
+
+    frame_chw:        [C,H,W]
+    masks_native_shw: [S,h,w] at the NATIVE grid. We argmax at native resolution
+    and upsample the integer label map with nearest, so segment boundaries reflect
+    the real assignment rather than interpolation artifacts.
+    """
+    img = _chw_to_01(frame_chw)
+    H, W = img.shape[:2]
+    seg_native = masks_native_shw.argmax(dim=0)[None, None].float()  # [1,1,h,w]
+    seg = F.interpolate(seg_native, size=(H, W), mode="nearest")[0, 0].long().cpu().numpy()
+    S = int(masks_native_shw.shape[0])
+    colors = np.asarray([_PALETTE[i % len(_PALETTE)] for i in range(S)], dtype=np.float32)
+    seg_rgb = colors[seg]
+    return np.clip((1.0 - alpha) * img + alpha * seg_rgb, 0.0, 1.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -317,6 +378,10 @@ class SlotDiagnostics:
     kumar_b: np.ndarray
     slot_mask_mass: np.ndarray
     slot_mask_entropy: np.ndarray
+    attn_peak: np.ndarray
+    attn_entropy: np.ndarray
+    dec_peak: np.ndarray
+    dec_entropy: np.ndarray
     examples: List[Dict[str, Any]]
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -419,6 +484,7 @@ def extract_slot_diagnostics(model, dataloader, device: torch.device, cfg: VizCo
     prior_z, prior_pi, prior_k, prior_sid = [], [], [], []
     pi_img_all, kumar_a_all, kumar_b_all = [], [], []
     mask_mass_all, mask_entropy_all = [], []
+    attn_peak_all, attn_ent_all, dec_peak_all, dec_ent_all = [], [], [], []
     examples: List[Dict[str, Any]] = []
     n_slots: Optional[int] = None
     total = 0
@@ -470,13 +536,12 @@ def extract_slot_diagnostics(model, dataloader, device: torch.device, cfg: VizCo
         post_sid.append(sid.detach().cpu())
 
         # conditional prior samples + full responsibility assignment
-        pri_mu, pri_var = sample_slots_conditional_frozen(snap, gate, h_t, num_slots=S, temperature=1.0)
-        pri = pri_mu + torch.randn_like(pri_mu) * torch.sqrt(pri_var.clamp_min(cfg.eps))
+        pri,  prior_idx, log_pi_slot = sample_slot_vectors_conditional_frozen(snap, gate, h_t, num_slots=S, assignment_temperature=1.0, slot_temperature=1.0)
         pri_flat = pri.reshape(B * S, D)
 
         pi_img = gate.mean_pi(h_t)
-        pi_img_all.append(pi_img.detach().cpu())
-        pi_slot = pi_img[:, None, :].expand(B, S, K).reshape(B * S, K)
+        pi_img_all.append(log_pi_slot.exp().mean(dim=1).detach().cpu())
+        pi_slot = log_pi_slot.exp().reshape(B * S, K)  # [B,S,K] -> [B,S,K] average over slot dim to get image-level pi TODO:check this??
 
         means = snap.comp_mean.to(device=device, dtype=pri_flat.dtype).view(K, -1)
         log_vars = torch.log(snap.comp_var.to(device=device, dtype=pri_flat.dtype).view(K, -1).clamp_min(1e-6))
@@ -486,7 +551,7 @@ def extract_slot_diagnostics(model, dataloader, device: torch.device, cfg: VizCo
 
         prior_z.append(pri_flat.detach().cpu())
         prior_pi.append(pri_resp.detach().cpu())
-        prior_k.append(k_prior.detach().cpu())
+        prior_k.append(prior_idx.reshape(B * S).detach().cpu())
         prior_sid.append(sid.detach().cpu())
 
         # Gate params for optional diagnostic.
@@ -497,33 +562,49 @@ def extract_slot_diagnostics(model, dataloader, device: torch.device, cfg: VizCo
         except Exception:
             pass
 
-        # mask statistics at image resolution
-        masks_up = F.interpolate(
-            masks.reshape(B * S, 1, Hc, Wc),
-            size=x_t.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        ).reshape(B, S, 1, *x_t.shape[-2:]).clamp(0.0, 1.0)
+        # --- mask sharpness on NATIVE resolution (no upsampling bias) ---
+        # decoder alpha masks: [B,S,1,Hc,Wc] -> [B,S,Hc,Wc]
+        dec_native = masks.squeeze(2)
+        dec_peak_b, dec_ent_b = _peak_entropy_native(dec_native, eps=cfg.eps)
 
-        mass = masks_up.mean(dim=(2, 3, 4))
-        # per-pixel entropy over slots, averaged per image; duplicated as [B,S] summary via slot mass entropy proxy
-        slot_p = masks_up.flatten(3).clamp_min(cfg.eps)  # [B,S,1,HW]
-        slot_entropy = -(slot_p * slot_p.log()).mean(dim=(2, 3))
+        # slot-attention masks: [B,S,L] -> [B,S,top_H,top_W] using the TRUE grid
+        top_attn = out.get("top_slot_attn", None)
+        attn_native = _attn_to_grid(top_attn, (int(model.top_H), int(model.top_W))) if top_attn is not None else None
+        if attn_native is not None:
+            attn_peak_b, attn_ent_b = _peak_entropy_native(attn_native, eps=cfg.eps)
+        else:
+            attn_peak_b = torch.full((B,), float("nan"))
+            attn_ent_b = torch.full((B,), float("nan"))
+
+        attn_peak_all.append(attn_peak_b.detach().cpu())
+        attn_ent_all.append(attn_ent_b.detach().cpu())
+        dec_peak_all.append(dec_peak_b.detach().cpu())
+        dec_ent_all.append(dec_ent_b.detach().cpu())
+
+        # legacy fields kept for the external dict contract (not plotted)
+        mass = dec_native.mean(dim=(2, 3))                       # [B,S]
         mask_mass_all.append(mass.detach().cpu())
-        mask_entropy_all.append(slot_entropy.detach().cpu())
+        mask_entropy_all.append(dec_ent_b[:, None].expand(B, S).detach().cpu())
 
         if len(examples) < int(cfg.n_example_frames):
             take = min(B, int(cfg.n_example_frames) - len(examples))
             conf = resp.gather(-1, k_post[..., None]).squeeze(-1)
             for b in range(take):
-                examples.append({
+                ex = {
                     "frame": x_t[b].detach().cpu(),
-                    "masks": masks_up[b].detach().cpu(),
+                    "decoder_masks_native": dec_native[b].detach().cpu(),   # [S,Hc,Wc]
+                    "attn_masks_native": (attn_native[b].detach().cpu() if attn_native is not None else None),
                     "comp": k_post[b].detach().cpu(),
                     "conf": conf[b].detach().cpu(),
+                    "decoder_peak": float(dec_peak_b[b]),
+                    "decoder_entropy": float(dec_ent_b[b]),
+                    "attn_peak": float(attn_peak_b[b]),
+                    "attn_entropy": float(attn_ent_b[b]),
+                    # legacy compat for any external reader of same_frame_examples:
+                    "masks": _upsample_masks(dec_native[b:b + 1], x_t.shape[-2:])[0].detach().cpu(),
                     "mass": mass[b].detach().cpu(),
-                    "mask_entropy": slot_entropy[b].detach().cpu(),
-                })
+                }
+                examples.append(ex)
 
         total += B * S
 
@@ -552,6 +633,10 @@ def extract_slot_diagnostics(model, dataloader, device: torch.device, cfg: VizCo
     kumar_b = cat(kumar_b_all).astype(np.float32) if kumar_b_all else np.zeros((0, max(0, K - 1)), dtype=np.float32)
     mask_mass = cat(mask_mass_all).astype(np.float32) if mask_mass_all else np.zeros((0, int(n_slots)), dtype=np.float32)
     mask_entropy = cat(mask_entropy_all).astype(np.float32) if mask_entropy_all else np.zeros((0, int(n_slots)), dtype=np.float32)
+    attn_peak = cat(attn_peak_all).astype(np.float32) if attn_peak_all else np.zeros((0,), dtype=np.float32)
+    attn_entropy = cat(attn_ent_all).astype(np.float32) if attn_ent_all else np.zeros((0,), dtype=np.float32)
+    dec_peak = cat(dec_peak_all).astype(np.float32) if dec_peak_all else np.zeros((0,), dtype=np.float32)
+    dec_entropy = cat(dec_ent_all).astype(np.float32) if dec_ent_all else np.zeros((0,), dtype=np.float32)
 
     return SlotDiagnostics(
         post_latents=post_latents,
@@ -573,6 +658,10 @@ def extract_slot_diagnostics(model, dataloader, device: torch.device, cfg: VizCo
         kumar_b=kumar_b,
         slot_mask_mass=mask_mass,
         slot_mask_entropy=mask_entropy,
+        attn_peak=attn_peak,
+        attn_entropy=attn_entropy,
+        dec_peak=dec_peak,
+        dec_entropy=dec_entropy,
         examples=examples,
         meta={"t_select": cfg.t_select, "points": int(post_latents.shape[0])},
     )
@@ -590,6 +679,10 @@ def _diag_to_legacy_dict(diag: SlotDiagnostics) -> Dict[str, Any]:
         "prior_slot_ids": diag.prior_slot_id,
         "slot_mask_mass": diag.slot_mask_mass,
         "slot_mask_entropy": diag.slot_mask_entropy,
+        "attn_peak": diag.attn_peak,
+        "attn_entropy": diag.attn_entropy,
+        "decoder_peak": diag.dec_peak,
+        "decoder_entropy": diag.dec_entropy,
         "pi_per_image": diag.pi_per_image,
         "kumar_a": diag.kumar_a,
         "kumar_b": diag.kumar_b,
@@ -696,16 +789,67 @@ def _plot_gate_effective_k(ax, diag: SlotDiagnostics) -> None:
     ax.axvline(float(np.mean(eff)), linestyle="--", linewidth=1.0, alpha=0.8)
 
 
-def _plot_mask_stats(ax, diag: SlotDiagnostics) -> None:
-    if diag.slot_mask_mass.size == 0:
+def _mask_means(diag: "SlotDiagnostics") -> Dict[str, float]:
+    def _m(a):
+        a = np.asarray(a, np.float32)
+        a = a[np.isfinite(a)]
+        return float(a.mean()) if a.size else float("nan")
+    return {
+        "attn_peak": _m(diag.attn_peak), "attn_ent": _m(diag.attn_entropy),
+        "dec_peak": _m(diag.dec_peak), "dec_ent": _m(diag.dec_entropy),
+    }
+
+
+def _mask_verdict(diag: "SlotDiagnostics") -> str:
+    S = max(1, diag.n_slots)
+    base = 1.0 / S
+    thr = base + 0.5 * (1.0 - base)   # midpoint between uniform (1/S) and perfect (1)
+    m = _mask_means(diag)
+    ap, dp = m["attn_peak"], m["dec_peak"]
+    if not np.isfinite(ap) and not np.isfinite(dp):
+        return "masks: no mask signal available"
+    if not np.isfinite(ap):
+        return f"masks: attention unavailable; decoder peak={dp:.2f} (1/S={base:.2f})"
+    attn_ok = ap > thr
+    dec_ok = np.isfinite(dp) and dp > thr
+    if attn_ok and dec_ok:
+        return f"masks: decomposition works (attn peak={ap:.2f}, decoder peak={dp:.2f})"
+    if attn_ok and not dec_ok:
+        return (f"masks: attention segments (peak={ap:.2f}) but decoder alpha is ~uniform "
+                f"(peak={dp:.2f} vs 1/S={base:.2f}) -> decoder ignores slot masks")
+    if not attn_ok and not dec_ok:
+        return (f"masks: both ~uniform (attn peak={ap:.2f}, decoder peak={dp:.2f} vs 1/S={base:.2f}) "
+                f"-> slot attention itself collapsed")
+    return f"masks: decoder peak={dp:.2f} above attention peak={ap:.2f} (unexpected)"
+
+
+def _plot_mask_quality(ax, diag: "SlotDiagnostics") -> None:
+    S = max(1, diag.n_slots)
+    base_peak = 1.0 / S
+    base_ent = math.log(S)
+    m = _mask_means(diag)
+    if not np.isfinite(m["attn_peak"]) and not np.isfinite(m["dec_peak"]):
         _blank(ax, "no mask statistics")
         return
-    s = np.arange(diag.n_slots)
-    mass_mean = diag.slot_mask_mass.mean(axis=0)
-    mass_std = diag.slot_mask_mass.std(axis=0)
-    ax.bar(s, mass_mean, yerr=mass_std, capsize=2, alpha=0.8)
-    _style_axis(ax, title="decoder mask mass by slot\nempty/identical slots show up here", xlabel="slot", ylabel="mean mask mass", grid=True)
-    ax.set_xticks(s)
+
+    # both metrics on [0,1]: peak in [1/S,1]; entropy divided by log S in [0,1].
+    def _en(x):
+        return (x / base_ent) if (base_ent > 0 and np.isfinite(x)) else np.nan
+    groups = ["peak\n(higher=sharper)", "entropy/logS\n(lower=sharper)"]
+    attn_vals = [m["attn_peak"], _en(m["attn_ent"])]
+    dec_vals = [m["dec_peak"], _en(m["dec_ent"])]
+    base_vals = [base_peak, 1.0]
+
+    x = np.arange(len(groups))
+    w = 0.26
+    ax.bar(x - w, attn_vals, width=w, label="slot attention")
+    ax.bar(x, dec_vals, width=w, label="decoder alpha")
+    ax.bar(x + w, base_vals, width=w, color="0.72", label="collapsed baseline")
+    ax.set_ylim(0.0, 1.05)
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups, fontsize=7)
+    _style_axis(ax, title="mask sharpness\nattention vs decoder vs collapse", ylabel="value", grid=True)
+    ax.legend(fontsize=6.3, framealpha=0.85, loc="upper center", ncol=1)
 
 
 def _plot_kumaraswamy(ax, diag: SlotDiagnostics) -> None:
@@ -721,37 +865,71 @@ def _plot_kumaraswamy(ax, diag: SlotDiagnostics) -> None:
     _style_axis(ax, title="Kumaraswamy gate params", ylabel="value")
 
 
-def _plot_content_grid(fig: plt.Figure, gs_cell, examples: List[Dict[str, Any]], n_slots: int) -> None:
+def _plot_mask_comparison_grid(fig: plt.Figure, gs_cell, examples: List[Dict[str, Any]], n_slots: int) -> None:
+    """One row per example:
+    input | attn argmax | decoder argmax | per-slot attention | per-slot decoder alpha.
+    """
     n_rows = len(examples)
     if n_rows == 0:
         _blank(fig.add_subplot(gs_cell), "no example frames")
         return
-    cols = 1 + 2 * int(n_slots)
-    sub = gs_cell.subgridspec(n_rows, cols, wspace=0.055, hspace=0.22)
+    S = int(n_slots)
+    cols = 3 + 2 * S
+    sub = gs_cell.subgridspec(n_rows, cols, wspace=0.05, hspace=0.30)
+
     for r, ex in enumerate(examples):
+        frame = ex["frame"]
+        H, W = frame.shape[-2:]
+        attn_n = ex.get("attn_masks_native", None)
+        dec_n = ex.get("decoder_masks_native", None)
+        attn_ok = attn_n is not None and torch.isfinite(attn_n).all()
+
         ax = fig.add_subplot(sub[r, 0])
-        ax.imshow(_chw_to_01(ex["frame"]))
+        ax.imshow(_chw_to_01(frame))
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_ylabel(f"ex {r}", fontsize=8)
         if r == 0:
             ax.set_title("input", fontsize=8.5)
-        for s in range(int(n_slots)):
-            c0 = 1 + 2 * s
-            ax_overlay = fig.add_subplot(sub[r, c0])
-            ax_overlay.imshow(_overlay(ex["frame"], ex["masks"][s]))
-            ax_overlay.set_xticks([]); ax_overlay.set_yticks([])
-            if r == 0:
-                ax_overlay.set_title(f"slot {s}\noverlay", fontsize=7.5)
-            comp = int(ex["comp"][s])
-            conf = float(ex["conf"][s])
-            mass = float(ex["mass"][s])
-            ax_overlay.set_xlabel(f"k={comp} c={conf:.2f}\nmass={mass:.3f}", fontsize=6.1)
 
-            ax_mask = fig.add_subplot(sub[r, c0 + 1])
-            ax_mask.imshow(_mask_to_01(ex["masks"][s]), cmap="magma", vmin=0, vmax=1)
-            ax_mask.set_xticks([]); ax_mask.set_yticks([])
+        ax = fig.add_subplot(sub[r, 1])
+        ax.set_xticks([]); ax.set_yticks([])
+        if attn_ok:
+            ax.imshow(_argmax_overlay(frame, attn_n))
+            ax.set_xlabel(f"peak={ex['attn_peak']:.2f} H={ex['attn_entropy']:.2f}", fontsize=5.5)
+        else:
+            _blank(ax, "no attn")
+        if r == 0:
+            ax.set_title("attn argmax", fontsize=8.5)
+
+        ax = fig.add_subplot(sub[r, 2])
+        ax.set_xticks([]); ax.set_yticks([])
+        if dec_n is not None:
+            ax.imshow(_argmax_overlay(frame, dec_n))
+            ax.set_xlabel(f"peak={ex['decoder_peak']:.2f} H={ex['decoder_entropy']:.2f}", fontsize=5.5)
+        else:
+            _blank(ax, "no decoder")
+        if r == 0:
+            ax.set_title("decoder argmax", fontsize=8.5)
+
+        attn_up = _upsample_masks(attn_n[None], (H, W))[0] if attn_ok else None
+        for s in range(S):
+            ax = fig.add_subplot(sub[r, 3 + s])
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.imshow(_chw_to_01(frame))
+            if attn_up is not None:
+                ax.imshow(attn_up[s, 0].numpy(), cmap="magma", alpha=0.6, vmin=0, vmax=1)
             if r == 0:
-                ax_mask.set_title("mask", fontsize=7.5)
+                ax.set_title(f"attn s{s}", fontsize=6.5)
+
+        dec_up = _upsample_masks(dec_n[None], (H, W))[0] if dec_n is not None else None
+        for s in range(S):
+            ax = fig.add_subplot(sub[r, 3 + S + s])
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.imshow(_chw_to_01(frame))
+            if dec_up is not None:
+                ax.imshow(dec_up[s, 0].numpy(), cmap="magma", alpha=0.6, vmin=0, vmax=1)
+            if r == 0:
+                ax.set_title(f"dec s{s}", fontsize=6.5)
 
 
 def _verdict_text(scores: Dict[str, float], C: np.ndarray, diag: SlotDiagnostics, cfg: VizConfig) -> str:
@@ -774,10 +952,11 @@ def _verdict_text(scores: Dict[str, float], C: np.ndarray, diag: SlotDiagnostics
 
     collapse = "possible slot collapse" if np.isfinite(max_off) and max_off > 0.90 else "no obvious centroid collapse"
     return (
-        f"diagnosis: {mapping}; {collapse}; active posterior components "
-        f"{active_post}/{diag.n_comp}, active prior components {active_prior}/{diag.n_comp}; "
-        f"mean gate K_eff={k_eff:.2f}; mean posterior responsibility entropy={resp_H:.2f}; "
-        f"slot tokens={diag.post_latents.shape[0]} at t={cfg.t_select}."
+        f"diagnosis: {mapping}; {collapse}; active posterior components \n"
+        f"{active_post}/{diag.n_comp}, active prior components {active_prior}/{diag.n_comp};\n"
+        f"mean gate K_eff={k_eff:.2f}; mean posterior responsibility entropy={resp_H:.2f};\n"
+        f"slot tokens={diag.post_latents.shape[0]} at t={cfg.t_select}.\n"
+        f"{_mask_verdict(diag)}"
     )
 
 
@@ -849,12 +1028,12 @@ def render_figure(
         4,
         1,
         figure=fig,
-        height_ratios=[1.03, 0.92, 0.82, 1.28],
-        hspace=0.36,
+        height_ratios=[1.0, 0.9, 1.0, 1.18],
+        hspace=0.6,
         left=0.045,
         right=0.985,
-        top=0.955,
-        bottom=0.055,
+        top=0.95,
+        bottom=0.05,
     )
 
     # Row 1: core latent-space question.
@@ -878,7 +1057,7 @@ def render_figure(
     # Row 3: masks and gate.
     row3 = outer[2].subgridspec(1, 4, wspace=0.32)
     _plot_gate_effective_k(fig.add_subplot(row3[0]), diag)
-    _plot_mask_stats(fig.add_subplot(row3[1]), diag)
+    _plot_mask_quality(fig.add_subplot(row3[1]), diag)
     if cfg.show_kumaraswamy:
         _plot_kumaraswamy(fig.add_subplot(row3[2]), diag)
     else:
@@ -886,23 +1065,23 @@ def render_figure(
     ax_sum = fig.add_subplot(row3[3])
     ax_sum.axis("off")
     summary = _verdict_text(scores, C, diag, cfg)
-    ax_sum.text(0.0, 1.0, "Reading guide", fontsize=10, fontweight="bold", va="top")
     guide = (
         "Good signs:\n"
         "  • posterior and prior overlap in the joint plot\n"
         "  • more than one component is active\n"
-        "  • slot masks cover different image regions\n"
+        "  • attention masks are peaked (peak >> 1/S, entropy << log S)\n"
         "  • off-diagonal slot cosine is not near 1\n\n"
         "Warnings:\n"
         "  • one active component = DPGMM collapse\n"
-        "  • identical masks/content = slot collapse\n"
+        "  • attention peak ~ 1/S = slot attention collapsed\n"
+        "  • attention sharp but decoder alpha ~ 1/S = decoder ignores masks\n"
         "  • high resp entropy = uncertain component assignment\n\n"
         + summary
     )
-    ax_sum.text(0.0, 0.88, guide, fontsize=8.2, family="monospace", va="top", wrap=True)
+    ax_sum.text(0.0, 1.0, guide, fontsize=7.0, family="monospace", va="top", ha="left", linespacing=1.02, transform=ax_sum.transAxes)
 
-    # Row 4: direct slot visual evidence.
-    _plot_content_grid(fig, outer[3], diag.examples, diag.n_slots)
+    # Row 4: direct slot visual evidence (attention vs decoder alpha).
+    _plot_mask_comparison_grid(fig, outer[3], diag.examples, diag.n_slots)
 
     if save_path:
         fig.savefig(save_path, dpi=cfg.dpi, bbox_inches="tight")

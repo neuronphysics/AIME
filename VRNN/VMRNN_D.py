@@ -16,7 +16,6 @@ DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 
 
-
 def flops_selective_scan_ref(B=1, L=256, D=768, N=16, with_D=True, with_Z=False, with_Group=True, with_complex=False):
     """
     u: r(B D L)
@@ -877,6 +876,9 @@ class VMRNNCore(nn.Module):
         self.action_norm = nn.LayerNorm(self.action_dim)
 
         self.input_norm = nn.LayerNorm(self.hidden_dim, eps=1e-5)
+        self.num_tokens = self.height * self.width
+        self.pos_emb = nn.Parameter(torch.zeros(1, self.num_tokens, self.zdim))
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
 
         self.cell = VMRNNCell(
             hidden_dim=self.hidden_dim,
@@ -891,9 +893,9 @@ class VMRNNCore(nn.Module):
         self.out_norm = nn.LayerNorm(self.hidden_dim, eps=1e-5)
 
     def init_state(self, B, device, dtype):
-        L = self.height * self.width
-        h = torch.zeros(B, L, self.hidden_dim, device=device, dtype=dtype)
-        c = torch.zeros(B, L, self.hidden_dim, device=device, dtype=dtype)
+
+        h = torch.zeros(B, self.num_tokens, self.hidden_dim, device=device, dtype=dtype)
+        c = torch.zeros(B, self.num_tokens, self.hidden_dim, device=device, dtype=dtype)
         return h, c
 
     def forward(self, z_map, a_t, state=None, mask_t=None, extra_maps=None):
@@ -917,10 +919,23 @@ class VMRNNCore(nn.Module):
         # [B, zdim, H, W] -> [B, H*W, zdim]
         z_tok = z_map.flatten(2).transpose(1, 2).contiguous()
 
+        # ------------------------------------------------------------
+        # 2. Add simple positional embedding to latent channels only
+        # ------------------------------------------------------------
+        # pos_emb: [1, H*W, zdim]
+        # z_tok:  [B, H*W, zdim]
+        #
+        # This is not RoPE. This is plain additive absolute position.
+        # It works for VMRNN/SS2D because the scan block receives
+        # position-aware tokens directly.
+        z_tok = z_tok + self.pos_emb.to(
+            device=z_tok.device,
+            dtype=z_tok.dtype,
+        )
         # [B, action_dim] -> [B, H*W, action_dim]
         a_t = a_t.to(device=z_map.device, dtype=z_map.dtype)
         a_t = self.action_norm(a_t)
-        a_tok = a_t[:, None, :].expand(B, H * W, self.action_dim)
+        a_tok = a_t[:, None, :].expand(B, self.num_tokens, self.action_dim)
 
         # [B, H*W, zdim + action_dim]
         x_tok = torch.cat([z_tok, a_tok], dim=-1)
@@ -936,8 +951,6 @@ class VMRNNCore(nn.Module):
         h_map = h_out.transpose(1, 2).reshape(B, self.hidden_dim, self.height, self.width).contiguous()
 
         return h_map, (h_new, c_new)
-
-
 
 
 class DownSample(nn.Module):

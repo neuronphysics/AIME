@@ -11,6 +11,7 @@ from tqdm import tqdm
 from collections import defaultdict
 import time, contextlib
 import tensorflow as tf
+import scipy.linalg
 import argparse
 import wandb
 from torchvision import transforms
@@ -371,18 +372,7 @@ class HumanoidAwareZoomTransform:
         x1, y1 = x0 + crop_w, y0 + crop_h
         return x0, y0, x1, y1
 
-    def _crop_and_resize_sequence(
-        self,
-        imgs: torch.Tensor,  # [T, C, H, W]
-        T: int,
-        C: int,
-        H: int,
-        W: int,
-        x0: int,
-        y0: int,
-        x1: int,
-        y1: int,
-    ) -> np.ndarray:
+    def _crop_and_resize_sequence(self, imgs: torch.Tensor, T: int, C: int, H: int, W: int, x0: int, y0: int, x1: int, y1: int) -> np.ndarray:
         """
         Crop same box for all frames and resize back to (W, H). Uses cv2 on CPU.
         """
@@ -1163,6 +1153,16 @@ def _to_01(x: torch.Tensor, name: str, tol: float = 1e-3, verbose: bool = False)
 
     return x01
 
+def _to_float(x):
+    if torch.is_tensor(x):
+        x = x.detach()
+        if x.numel() == 1:
+            return float(x.cpu())
+        return float(x.float().mean().cpu())
+    try:
+        return float(x)
+    except Exception:
+        return x
 
 def flow_to_hsv_rgb(flow_bchw: torch.Tensor, mag_percentile: float = 99.0, eps: float = 1e-6):
     """
@@ -1223,6 +1223,214 @@ def flow_to_hsv_rgb(flow_bchw: torch.Tensor, mag_percentile: float = 99.0, eps: 
 
     rgb = torch.stack([r, g, b], dim=1)  # [B,3,H,W]
     return rgb
+
+OKABE_ITO = ["#0072B2", "#D55E00", "#009E73", "#CC79A7",
+             "#E69F00", "#56B4E9", "#F0E442", "#000000"]
+
+# (panel title, [(loss-dict key, short label)], yscale)
+PANELS = [
+    ("reconstruction & rate", [("recon_loss", "distortion"), ("kl_z", "rate (all KLs)"),
+                               ("dp_kl", "slot KL"), ("top_bridge_kl", "bridge KL")], "linear"),
+    ("imagination",           [("overshoot_kl", "overshoot KL")], "linear"),
+    ("slot regularizers",     [("slot_orth_loss", "orthogonality"),
+                               ("slot_contrast_loss", "contrast")], "linear"),
+    ("mask terms (log)",      [("mask_entropy", "entropy"), ("mask_balance", "balance")], "log"),
+    ("adversarial (gen)",     [("img_adv_loss", "image"), ("temporal_adv_loss", "temporal"),
+                               ("rollout_img_adv_loss", "rollout img"),
+                               ("rollout_temporal_adv_loss", "rollout temp")], "linear"),
+    ("feature matching",      [("feat_match_loss", "recon"),
+                               ("rollout_feat_match_loss", "rollout")], "linear"),
+    ("total objective",       [("total_gen_loss", "total"), ("total_vae_loss", "VAE part")], "linear"),
+    ("gradient norm",         [("grad_norm", "after clip")], "linear"),
+]
+TRACK_KEYS = sorted({k for _, ks, _ in PANELS for k, _ in ks})
+
+
+def _ema(y, span):
+    """Exponential moving average that leaves a gap (NaN) wherever y is non-finite."""
+    y = np.asarray(y, float)
+    out = np.full_like(y, np.nan)
+    a = 2.0 / (span + 1.0)
+    m, started = 0.0, False
+    for i, v in enumerate(y):
+        if np.isfinite(v):
+            m = v if not started else (1 - a) * m + a * v
+            started = True
+            out[i] = m
+    return out
+
+
+def _first_nan(x, ys):
+    bad = np.zeros(len(x), bool)
+    for y in ys:
+        started = np.isfinite(y).cumsum() > 0
+        bad |= (~np.isfinite(y)) & started
+    if bad.any():
+        i = int(np.argmax(bad))
+        if bad[i]:
+            return x[i]
+    return None
+
+
+class LiveLossPlotter:
+    def __init__(self, png_path, every: int = 4, dpi: int = 300,
+                 max_points: int = 4000, also_pdf: bool = False):
+        self.path = Path(png_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.every = max(1, int(every))
+        self.dpi = int(dpi)
+        self.max_points = int(max_points)
+        self.also_pdf = bool(also_pdf)
+        self.series = defaultdict(list)     # key -> per-step values (NaN-filled)
+        self.epoch_of = []                  # epoch index per step
+        self._n = 0
+
+    # ---------------------------------------------------------------- data in
+    @staticmethod
+    def _coerce(v):
+        try:
+            import torch
+            if torch.is_tensor(v):
+                return float(v.detach().float().mean().item())
+        except Exception:
+            pass
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    def update_step(self, epoch, step, losses: dict):
+        """Call once per training step with the dict returned by training_step_sequence."""
+        for k in TRACK_KEYS:
+            self.series[k].append(self._coerce(losses.get(k, float("nan"))))
+        self.epoch_of.append(int(epoch))
+        self._n += 1
+
+    # ---------------------------------------------------------------- render
+    def maybe_plot(self, epoch, epoch_history=None, force=False):
+        if self._n == 0:
+            return
+        if not force and (int(epoch) % self.every != 0):
+            return
+        try:
+            self._render(int(epoch), epoch_history)
+        except Exception as e:                       # never kill a training run
+            print(f"[LiveLossPlotter] render failed: {type(e).__name__}: {e}")
+
+    def _render(self, epoch, epoch_history):
+        n = self._n
+        x_full = np.arange(n, dtype=float)
+        stride = max(1, n // self.max_points)
+        span = max(15, n // 200)
+
+        plt.rcParams.update({
+            "savefig.dpi": self.dpi, "font.size": 9.5, "axes.titlesize": 10.5,
+            "legend.fontsize": 7.6, "xtick.labelsize": 8.3, "ytick.labelsize": 8.3,
+            "axes.spines.top": False, "axes.spines.right": False,
+            "axes.grid": True, "grid.alpha": 0.25, "grid.linewidth": 0.6,
+            "lines.linewidth": 1.4, "axes.prop_cycle": plt.cycler(color=OKABE_ITO),
+            "figure.constrained_layout.use": True,
+        })
+
+        panels = []
+        for title, ks, sc in PANELS:
+            live = [(k, lab) for k, lab in ks
+                    if k in self.series and np.isfinite(np.asarray(self.series[k])).any()]
+            if live:
+                panels.append((title, live, sc))
+        has_eval_quality = bool(epoch_history) and any(
+            k in epoch_history and len(epoch_history[k]) for k in
+            ("eval/pred_psnr_t+1", "eval/pred_psnr_t+2", "eval/psnr", "eval/fid"))
+        n_pan = len(panels) + (1 if has_eval_quality else 0)
+        nc = 3
+        nr = max(1, int(np.ceil(n_pan / nc)))
+        fig, axes = plt.subplots(nr, nc, figsize=(3.65 * nc, 2.55 * nr))
+        axes = np.atleast_1d(axes).ravel()
+        for ax in axes[n_pan:]:
+            ax.set_visible(False)
+
+        for ax, (title, ks, sc) in zip(axes, panels):
+            ax.set_yscale(sc)
+            ys_s = []
+            for k, lab in ks:
+                y = np.asarray(self.series[k], float)
+                c = ax._get_lines.get_next_color()
+                if k == "grad_norm":
+                    yz = np.where(y == 0, np.nan, y)   # gn==0 means NaN grads in this trainer
+                    ax.plot(x_full[::stride], yz[::stride], alpha=0.16, lw=0.9, color=c)
+                    s = _ema(yz, span); ys_s.append(s)
+                    ax.plot(x_full[::stride], s[::stride], color=c, label=lab)
+                    z = np.isfinite(y) & (y == 0)
+                    if z.any():
+                        ax.scatter(x_full[z][::stride], np.full(int(np.ceil(z.sum() / stride)), 0.035)[:len(x_full[z][::stride])],
+                                   s=5, color="#D00000", zorder=5, clip_on=False,
+                                   transform=ax.get_xaxis_transform(), label="g = NaN (logged 0)")
+                    continue
+                yp = np.clip(y, 1e-12, None) if sc == "log" else y
+                ax.plot(x_full[::stride], yp[::stride], alpha=0.16, lw=0.9, color=c)
+                s = _ema(yp, span); ys_s.append(s)
+                last = s[np.isfinite(s)][-1] if np.isfinite(s).any() else float("nan")
+                ax.plot(x_full[::stride], s[::stride], color=c, label=f"{lab} ({last:.3g})")
+            nan_x = _first_nan(x_full, [np.asarray(self.series[k], float) for k, _ in ks])
+            if nan_x is not None:
+                ax.axvline(nan_x, color="#D00000", ls="--", lw=1.1)
+                right = nan_x > 0.5 * n
+                ax.text(nan_x, 0.03, "first NaN " if right else " first NaN",
+                        color="#D00000", fontsize=7.5, ha="right" if right else "left",
+                        va="bottom", transform=ax.get_xaxis_transform())
+            ax.set_title(title)
+            ax.legend(frameon=False, ncol=2 if len(ks) > 3 else 1)
+            allv = np.concatenate([s[np.isfinite(s)] for s in ys_s if np.isfinite(s).any()]
+                                  or [np.array([0.0])])
+            if ax.get_yscale() == "linear" and allv.size > 4:
+                lo, hi = np.percentile(allv, [0.5, 99.5])
+                pad = 0.08 * (hi - lo + 1e-12)
+                ax.set_ylim(lo - pad, hi + pad)
+            ax.set_xlabel("training step")
+
+        if has_eval_quality:
+            ax = axes[len(panels)]
+            for k, lab in (("eval/pred_psnr_t+1", "PSNR t+1"),
+                           ("eval/pred_psnr_t+2", "PSNR t+2"),
+                           ("eval/psnr", "recon PSNR")):
+                if epoch_history and k in epoch_history and len(epoch_history[k]):
+                    v = np.asarray(epoch_history[k], float)
+                    ax.plot(np.arange(len(v)), v, marker="o", ms=2.8, label=lab)
+
+            if epoch_history and "eval/fid" in epoch_history and len(epoch_history["eval/fid"]):
+                ax2 = ax.twinx()
+                v = np.asarray(epoch_history["eval/fid"], float)
+                ax2.plot(np.arange(len(v)), v, marker="s", ms=2.8, linestyle="--", label="FID")
+                ax2.set_ylabel("FID lower is better")
+
+                lines1, labels1 = ax.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax.legend(lines1 + lines2, labels1 + labels2, frameon=False, loc="best")
+            else:
+                ax.legend(frameon=False)
+
+            ax.set_title("eval quality per epoch")
+            ax.set_xlabel("epoch")
+            ax.set_ylabel("PSNR higher is better")
+
+        # epoch boundaries on step-axis panels, only while still legible
+        ep = np.asarray(self.epoch_of)
+        bnd = np.flatnonzero(np.diff(ep)) + 1
+        if 0 < len(bnd) <= 30:
+            for ax, _p in zip(axes, panels):
+                for b in bnd:
+                    ax.axvline(b, color="0.78", lw=0.5, zorder=0)
+
+        fig.suptitle(f"loss convergence   epoch {epoch}   {n} steps   "
+                     f"updated {time.strftime('%H:%M:%S')}", fontsize=12)
+        tmp = self.path.with_name(self.path.stem + ".tmp.png")
+        fig.savefig(tmp)
+        os.replace(tmp, self.path)          # atomic: the PNG is never half-written
+        if self.also_pdf:
+            fig.savefig(self.path.with_suffix(".pdf"))
+        plt.close(fig)
+        print(f"[LiveLossPlotter] wrote {self.path} (epoch {epoch}, {n} steps)")
+
 
 class DMCVBTrainer:
     """Trainer for DPGMM-VRNN on DMC Vision Benchmark"""
@@ -1308,6 +1516,15 @@ class DMCVBTrainer:
         )
         # Initialize metrics tracking
         self.metrics_history = defaultdict(list)
+        # Live convergence plot settings
+        self.curve_plot_every = int(config.get("curve_plot_every", 4))
+
+        default_curve_dir = PARENT_DIR / "results" / "dpgmm_vrnn_dmc_vb" / "curves"
+        self.curve_plot_dir = Path(config.get("curve_plot_dir", default_curve_dir))
+        self.curve_plot_dir.mkdir(parents=True, exist_ok=True)
+
+        # This single file is overwritten every curve_plot_every epochs.
+        self.curve_plot_path = self.curve_plot_dir / f"{config.get('experiment_name', 'dpgmm_vrnn')}_training_curves_live.png"
         self.best_eval_loss = float('inf')
         self.best_rollout_score = -float('inf')    # primary metric
         self.best_epoch = -1
@@ -1321,6 +1538,22 @@ class DMCVBTrainer:
             print(f"TensorBoard logging to: {log_dir}")
         else:
             self.writer = None
+
+        # Per-step live convergence plotter. It writes one PNG in place every curve_plot_every epochs.
+        self.loss_plotter = LiveLossPlotter(
+            png_path=self.curve_plot_path,
+            every=self.curve_plot_every,
+            dpi=int(config.get("curve_plot_dpi", 400)),
+            max_points=int(config.get("curve_plot_max_points", 4000)),
+            also_pdf=bool(config.get("curve_plot_pdf", False)),
+        )
+        self.compute_fid = bool(config.get("compute_fid", True))
+        self.fid_every = int(config.get("fid_every", config.get("curve_plot_every", 4)))
+        self.fid_max_batches = int(config.get("fid_max_batches", config.get("fid_num_batches", 5)))
+        self.fid_max_images = int(config.get("fid_max_images", 512))
+
+        self.fid_metric = FIDScore(self.device) if self.compute_fid else None
+        
         self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
         task_names = ["ELBO", "adversarial"]
         self._agg = GradDiagnosticsAggregator(task_names,
@@ -1403,6 +1636,28 @@ class DMCVBTrainer:
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch} [Train]')
         beta_t = self.anneal_beta(epoch)
+        watch_keys = {
+            "tot": "total_gen_loss",
+            "vae": "total_vae_loss",
+            "rec": "recon_loss",
+            "kl": "kl_z",
+            "ovr": "overshoot_kl",
+
+            "scon": "slot_contrast_loss",
+            "sort": "slot_orth_loss",
+            "ment": "mask_entropy",
+            "mbal": "mask_balance",
+
+            "iadv": "img_adv_loss",
+            "tadv": "temporal_adv_loss",
+            "feat": "feat_match_loss",
+
+            "riadv": "rollout_img_adv_loss",
+            "rtadv": "rollout_temporal_adv_loss",
+            "rfeat": "rollout_feat_match_loss",
+
+            "gn": "grad_norm",
+        }
         for batch_idx, batch in enumerate(pbar):
 
             # Move batch to device
@@ -1431,28 +1686,33 @@ class DMCVBTrainer:
                 collect_top_buffer=True,
                 seq_ids=seq_ids,
             )
+            for key, value in losses.items():
+                if torch.is_tensor(value) or isinstance(value, (int, float, np.number)):
+                    epoch_metrics[key].append(_to_float(value))
+
+            self.loss_plotter.update_step(epoch, batch_idx, losses)
+
+            if "total_gen_loss" in losses:
+                total_loss.append(_to_float(losses["total_gen_loss"]))
+
+            if "img_disc_loss" in losses:
+                self.epoch_disc_losses["image"].append(_to_float(losses["img_disc_loss"]))
+
             component_grads = self.grad_monitor.compute_component_gradients()
             for component, grad_norm in component_grads.items():
                 epoch_component_grads[component].append(grad_norm)
-            if 'img_disc_loss' in losses:
-                self.epoch_disc_losses['image'].append(
-                losses['img_disc_loss'].item() if torch.is_tensor(losses['img_disc_loss'])
-                else losses['img_disc_loss']
-                )
+            postfix = {}
+            for short_name, key in watch_keys.items():
+                if key not in losses:
+                    continue
 
-            # Track metrics
-            for key, value in losses.items():
-                if isinstance(value, torch.Tensor):
-                    value = value.item()
-                epoch_metrics[key].append(value)
-            total_loss.append(losses['total_gen_loss'].item() if torch.is_tensor(losses['total_gen_loss']) else float(losses['total_gen_loss']))
-            # Update progress bar
-            pbar.set_postfix({
-                'total_loss': losses['total_gen_loss'],
-                'recon_loss': losses['recon_loss'].item() if torch.is_tensor(losses['recon_loss']) else losses['recon_loss'],
-                'kl_z': losses['kl_z'].item() if torch.is_tensor(losses['kl_z']) else losses['kl_z'],
-                'beta': f'{beta_t:.3f}',
-            })
+                value = _to_float(losses[key])
+                if isinstance(value, float):
+                    postfix[short_name] = f"{value:.3g}"
+                else:
+                    postfix[short_name] = value
+
+            pbar.set_postfix(postfix)
 
         # Compute epoch averages
         avg_metrics = {f'train/{k}': np.mean(v) for k, v in epoch_metrics.items()}
@@ -1482,7 +1742,8 @@ class DMCVBTrainer:
         self.model.eval()
         eval_metrics = defaultdict(list)
 
-
+        fid_real_batches = []
+        fid_fake_batches = []
         with torch.no_grad():
             pbar = tqdm(self.eval_loader, desc=f'Epoch {epoch} [Eval]')
 
@@ -1511,7 +1772,21 @@ class DMCVBTrainer:
                 recon = outputs['reconstructions']
                 psnr = self.compute_psnr(observations, recon, dones)
                 eval_metrics['psnr'].append(psnr.item())
+                if (
+                    self.compute_fid
+                    and self.fid_metric is not None
+                    and epoch % self.fid_every == 0
+                    and len(fid_real_batches) < self.fid_max_batches
+                ):
+                    real_fid, fake_fid = self._select_alive_rgb_frames_for_fid(
+                        observations=observations,
+                        recon=recon,
+                        dones=dones,
+                    )
 
+                    if real_fid.numel() > 0 and fake_fid.numel() > 0:
+                        fid_real_batches.append(real_fid.detach().cpu())
+                        fid_fake_batches.append(fake_fid.detach().cpu())
         visualize_every = int(self.config.get('visualize_every', 4))
         if visualize_every > 0 and epoch % (2 * visualize_every) == 0:
             with torch.no_grad():
@@ -1575,6 +1850,23 @@ class DMCVBTrainer:
                     torch.cuda.ipc_collect()
 
                 self.model.train()
+        if (
+            self.compute_fid
+            and self.fid_metric is not None
+            and epoch % self.fid_every == 0
+            and len(fid_real_batches) > 0
+        ):
+            real_fid = torch.cat(fid_real_batches, dim=0).to(self.device)
+            fake_fid = torch.cat(fid_fake_batches, dim=0).to(self.device)
+
+            # Optional cap so Inception does not become too expensive.
+            fid_max_images = int(self.config.get("fid_max_images", 512))
+            if real_fid.shape[0] > fid_max_images:
+                real_fid = real_fid[:fid_max_images]
+                fake_fid = fake_fid[:fid_max_images]
+
+            fid_score = self.fid_metric.calculate_fid(real_fid, fake_fid)
+            eval_metrics["fid"].append(float(fid_score))
         # Compute averages
         avg_metrics = {f'eval/{k}': np.mean(v) for k, v in eval_metrics.items()}
         pred_metrics = self.evaluate_two_step_prediction(epoch, num_batches=5, T_ctx=8)
@@ -1631,8 +1923,7 @@ class DMCVBTrainer:
             actions=actions[:,:T_ctx + horizon],
             horizon=horizon,
             dones=dones[:, :T_ctx + horizon] if dones is not None else None,
-            top_temperature=0.2,
-            decoder_temperature=0.2,
+            top_temperature=0.7,
             grad=False,
         )
 
@@ -1826,6 +2117,358 @@ class DMCVBTrainer:
 
         return 10.0 * torch.log10(1.0 / mse.clamp_min(eps))
 
+    def _select_alive_rgb_frames_for_fid(self, observations, recon, dones=None):
+        """
+        Convert sequence tensors to [N, 3, H, W] for FID.
+
+        observations: [B,T,C,H,W], usually C = 3 * frame_stack
+        recon:        [B,T,C,H,W]
+        dones:        [B,T] or None
+
+        Uses only first 3 channels, because FID/Inception expects RGB.
+        """
+        real = observations[:, :, :3].detach().clamp(-1.0, 1.0)
+        fake = recon[:, :, :3].detach().clamp(-1.0, 1.0)
+
+        B, T, C, H, W = real.shape
+
+        real = real.reshape(B * T, C, H, W)
+        fake = fake.reshape(B * T, C, H, W)
+
+        if dones is not None:
+            # Keep frames before/at valid rollout region; exclude padded frames after done.
+            dones_bt = dones
+            if dones_bt.dim() == 1:
+                dones_bt = dones_bt[:, None].expand(B, T)
+            else:
+                dones_bt = dones_bt[:, :T]
+
+            alive = torch.ones_like(dones_bt, dtype=torch.bool)
+            done_cum = dones_bt.to(torch.bool).cumsum(dim=1)
+
+            # This keeps frames until first done inclusive.
+            alive = done_cum <= 1
+            alive = alive.reshape(B * T)
+
+            real = real[alive]
+            fake = fake[alive]
+
+        return real, fake
+
+    def _safe_metric_float(self, value):
+        """
+        Convert scalar tensors / numbers to Python float.
+        Keep NaN/Inf as float values so the plot can reveal instability.
+        """
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                return None
+            value = value.detach().float().cpu().item()
+
+        if isinstance(value, (int, float, np.number)):
+            return float(value)
+
+        return None
+
+
+    def _record_epoch_metrics(self, epoch: int, all_metrics: Dict[str, float]) -> None:
+        """
+        Append one row of epoch-level metrics into self.metrics_history.
+        Keeps all metric lists aligned with self.metrics_history["epoch"].
+        Missing metrics are recorded as NaN.
+        """
+        hist = self.metrics_history
+        n_prev = len(hist["epoch"])
+
+        hist["epoch"].append(int(epoch))
+
+        # Backfill newly appearing metrics with NaN for previous epochs.
+        for key in all_metrics.keys():
+            if key not in hist:
+                hist[key] = [float("nan")] * n_prev
+
+        # Append one value for every existing metric key.
+        for key in list(hist.keys()):
+            if key == "epoch":
+                continue
+
+            value = all_metrics.get(key, float("nan"))
+            value = self._safe_metric_float(value)
+
+            if value is None:
+                value = float("nan")
+
+            hist[key].append(float(value))
+
+
+    def _ema_np(self, y, span: int = 5):
+        """
+        NaN-aware exponential moving average for prettier plots.
+        """
+        y = np.asarray(y, dtype=float)
+        out = np.full_like(y, np.nan, dtype=float)
+
+        alpha = 2.0 / (span + 1.0)
+        m = 0.0
+        initialized = False
+
+        for i, v in enumerate(y):
+            if np.isfinite(v):
+                m = v if not initialized else (1.0 - alpha) * m + alpha * v
+                initialized = True
+                out[i] = m
+
+        return out
+
+
+    def _plot_live_training_curves(self, epoch: int, smooth_span: int = 5) -> None:
+        """
+        Save one high-quality PNG that is overwritten every few epochs.
+        Uses epoch-level self.metrics_history.
+        """
+        if len(self.metrics_history.get("epoch", [])) < 2:
+            return
+
+        hist = self.metrics_history
+        x = np.asarray(hist["epoch"], dtype=float)
+
+        # Panels: (title, [(metric_key, label)], yscale)
+        panels = [
+            (
+                "Objective",
+                [
+                    ("train/total_gen_loss", "total gen"),
+                    ("train/total_vae_loss", "VAE"),
+                    ("eval/total_vae_loss", "eval VAE"),
+                ],
+                "linear",
+            ),
+            (
+                "Reconstruction and KL",
+                [
+                    ("train/recon_loss", "train recon"),
+                    ("train/kl_z", "train KL"),
+                    ("eval/recon_loss", "eval recon"),
+                    ("eval/kl_z", "eval KL"),
+                ],
+                "linear",
+            ),
+            (
+                "Overshooting",
+                [
+                    ("train/overshoot_kl", "overshoot KL"),
+                ],
+                "linear",
+            ),
+            (
+                "Slot losses",
+                [
+                    ("train/slot_contrast_loss", "slot contrast"),
+                    ("train/slot_orth_loss", "slot orthogonality"),
+                ],
+                "linear",
+            ),
+            (
+                "Mask diagnostics",
+                [
+                    ("train/mask_entropy", "mask entropy"),
+                    ("train/mask_balance", "mask balance"),
+                ],
+                "log",
+            ),
+            (
+                "Generator adversarial",
+                [
+                    ("train/img_adv_loss", "image adv"),
+                    ("train/temporal_adv_loss", "temporal adv"),
+                    ("train/rollout_img_adv_loss", "rollout image adv"),
+                    ("train/rollout_temporal_adv_loss", "rollout temporal adv"),
+                ],
+                "linear",
+            ),
+            (
+                "Feature matching",
+                [
+                    ("train/feat_match_loss", "feature match"),
+                    ("train/rollout_feat_match_loss", "rollout feature match"),
+                ],
+                "linear",
+            ),
+            (
+                "Discriminator / stability",
+                [
+                    ("train/img_disc_loss", "image D loss"),
+                    ("train/patch_disc_loss", "patch D loss"),
+                    ("train/patch_gp", "patch GP"),
+                    ("train/grad_norm", "grad norm"),
+                ],
+                "linear",
+            ),
+            (
+                "Prediction quality",
+                [
+                    ("eval/psnr", "eval PSNR"),
+                    ("eval/pred_psnr_t+1", "PSNR t+1"),
+                    ("eval/pred_psnr_t+2", "PSNR t+2"),
+                ],
+                "linear",
+            ),
+            (
+                "Learning rates / structure",
+                [
+                    ("train/gen_lr", "gen LR"),
+                    ("train/img_disc_lr", "disc LR"),
+                    ("train/top_prior_K", "top prior K"),
+                    ("train/top_buffer_size", "top buffer size"),
+                ],
+                "log",
+            ),
+        ]
+
+        # Keep only panels with at least one available metric.
+        active_panels = []
+        for title, keys, yscale in panels:
+            usable = [(k, label) for k, label in keys if k in hist and len(hist[k]) > 0]
+            if usable:
+                active_panels.append((title, usable, yscale))
+
+        if not active_panels:
+            return
+
+        # Style: high-quality but not huge.
+        plt.rcParams.update({
+            "figure.dpi": 120,
+            "savefig.dpi": 300,
+            "font.size": 9.5,
+            "axes.titlesize": 10.5,
+            "axes.labelsize": 9.5,
+            "legend.fontsize": 7.8,
+            "xtick.labelsize": 8.5,
+            "ytick.labelsize": 8.5,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.grid": True,
+            "grid.alpha": 0.25,
+            "grid.linewidth": 0.6,
+            "lines.linewidth": 1.55,
+            "figure.constrained_layout.use": True,
+        })
+
+        n = len(active_panels)
+        ncols = 3
+        nrows = int(math.ceil(n / ncols))
+
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(4.2 * ncols, 3.0 * nrows),
+            sharex=False,
+        )
+        axes = np.atleast_1d(axes).ravel()
+
+        for ax in axes[n:]:
+            ax.set_visible(False)
+
+        for ax, (title, keys, yscale) in zip(axes, active_panels):
+            ax.set_title(title)
+            ax.set_yscale(yscale)
+
+            all_y_for_limits = []
+
+            for key, label in keys:
+                y_raw = np.asarray(hist[key], dtype=float)
+
+                # Align length if some metric starts later.
+                m = min(len(x), len(y_raw))
+                if m == 0:
+                    continue
+
+                xx = x[:m]
+                yy = y_raw[:m]
+
+                # For log plots, avoid <=0 breaking the axis.
+                yy_plot = np.clip(yy, 1e-12, None) if yscale == "log" else yy
+
+                # Raw faint curve + smoothed strong curve.
+                ax.plot(xx, yy_plot, alpha=0.18, linewidth=0.9)
+                yy_smooth = self._ema_np(yy_plot, span=smooth_span)
+                ax.plot(xx, yy_smooth, label=label)
+
+                all_y_for_limits.append(yy_smooth)
+
+                # Mark first non-finite point for that metric.
+                finite_seen = np.isfinite(yy).cumsum() > 0
+                bad = (~np.isfinite(yy)) & finite_seen
+                if bad.any():
+                    bad_epoch = xx[int(np.argmax(bad))]
+                    ax.axvline(bad_epoch, linestyle="--", linewidth=1.0)
+                    ax.text(
+                        bad_epoch,
+                        0.03,
+                        "NaN/Inf",
+                        transform=ax.get_xaxis_transform(),
+                        fontsize=7.0,
+                        rotation=90,
+                        va="bottom",
+                        ha="right",
+                    )
+
+            # Robust y-limits for linear plots.
+            if yscale == "linear" and all_y_for_limits:
+                vals = np.concatenate([
+                    yy[np.isfinite(yy)] for yy in all_y_for_limits
+                    if np.isfinite(yy).any()
+                ]) if any(np.isfinite(yy).any() for yy in all_y_for_limits) else np.array([])
+
+                if vals.size >= 4:
+                    lo, hi = np.percentile(vals, [1.0, 99.0])
+                    pad = 0.08 * (hi - lo + 1e-12)
+                    ax.set_ylim(lo - pad, hi + pad)
+
+            ax.set_xlabel("epoch")
+            ax.legend(frameon=False, loc="best")
+
+        fig.suptitle(
+            f"Training convergence diagnostics — updated at epoch {epoch}",
+            fontsize=13,
+        )
+
+        # Atomic-ish overwrite: write temp then replace final file.
+        tmp_path = self.curve_plot_path.with_suffix(".tmp.png")
+        fig.savefig(tmp_path, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+
+        Path(tmp_path).replace(self.curve_plot_path)
+
+        # Optional: also send latest figure to TensorBoard / W&B.
+        if self.writer is not None:
+            # TensorBoard image logging from file avoids keeping the figure open.
+            try:
+                import matplotlib.image as mpimg
+                img = mpimg.imread(self.curve_plot_path)
+                # HWC -> CHW
+                if img.ndim == 3:
+                    self.writer.add_image(
+                        "diagnostics/live_training_curves",
+                        np.transpose(img, (2, 0, 1)),
+                        epoch,
+                    )
+            except Exception as e:
+                print(f"[plot] TensorBoard image logging failed: {e}")
+
+        if self.use_wandb:
+            try:
+                wandb.log(
+                    {
+                        "diagnostics/live_training_curves": wandb.Image(str(self.curve_plot_path)),
+                        "epoch": epoch,
+                    },
+                    step=epoch,
+                )
+            except Exception as e:
+                print(f"[plot] W&B image logging failed: {e}")
+
+        print(f"[plot] updated live training curves: {self.curve_plot_path}")
 
     @torch.no_grad()
     def evaluate_two_step_prediction(
@@ -2060,8 +2703,14 @@ class DMCVBTrainer:
                 for key, value in all_metrics.items():
                     self.writer.add_scalar(key, value, epoch)
 
-            for key, value in all_metrics.items():
-                self.metrics_history[key].append(value)
+            # Store epoch-level metrics once for live plotting and checkpoints.
+            self._record_epoch_metrics(epoch, all_metrics)
+
+            # Update one single PNG every N completed epochs using per-step losses.
+            self.loss_plotter.maybe_plot(
+                epoch + 1,
+                epoch_history=self.metrics_history,
+            )
 
             print(f"\nEpoch {epoch} Summary:")
             print(f"  Train Loss: {train_metrics.get('train/total_gen_loss', 0):.4f}")
@@ -2150,6 +2799,8 @@ def parse_args():
     parser.add_argument("--lambda_recon", type=float, default=None)
     parser.add_argument("--grad_clip", type=float, default=None)
     parser.add_argument("--n_critic", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--deterministic", type=str2bool, default=True)
 
     # --- logging / wandb ---
     parser.add_argument("--experiment_name", type=str, default=None)
@@ -2173,7 +2824,7 @@ def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
         # data / task
         "data_dir", "domain_name", "task_name", "policy_level",
         # model
-        "max_components", "latent_dim", "hidden_dim", "mamba_d_state", "dpgmm_outer_batch_size",
+        "max_components", "latent_dim", "hidden_dim", "mamba_d_state", "dpgmm_outer_batch_size", "dpgmm_outer_n_laps",
         # training
         "batch_size", "sequence_length", "learning_rate", "n_epochs",
         "num_workers", "beta_min", "beta_max", "beta_warmup_epochs",
@@ -2204,8 +2855,33 @@ def override_config_from_args(config: dict, args: argparse.Namespace) -> dict:
 def main():
     """Main training script"""
     args = parse_args()
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision('high')  # Enable TensorFloat32 cores
+    os.environ["PYTHONHASHSEED"] = str(args.seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    tf.random.set_seed(args.seed)
+
+    if args.deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+        # More reproducible than "high"
+        torch.set_float32_matmul_precision("highest")
+    else:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+
     torch.cuda.empty_cache()
     # Additional foundational configurations
 
@@ -2220,7 +2896,7 @@ def main():
         # Model settings
         'max_components': 12,
         'mamba_d_state': 16,
-        'latent_dim': 48,
+        'latent_dim': 36,
         'hidden_dim': 48, #must be divisible by 8
         'input_channels': 3*1,  # 3 stacked frames
         'dp_alpha':1.0,
@@ -2230,7 +2906,8 @@ def main():
 
         # Training settings
         'batch_size': 20,
-        'dpgmm_outer_batch_size': 512,
+        'dpgmm_outer_batch_size': 1024,
+        'dpgmm_outer_n_laps': 1,
         'sequence_length': 10,
         'disc_num_heads': 8,
         'img_disc_layers': 1,
@@ -2241,7 +2918,7 @@ def main():
         'n_epochs': 200,
         'num_workers': 4,
 
-        'beta_min': 0.25,
+        'beta_min': 0.8,
         'beta_max': 1.0,
         'beta_warmup_epochs': 20,  # 20–50 is common
         'beta_eval': 1.0,          # force eval to use full KL
@@ -2311,7 +2988,6 @@ def main():
 
     # Train
     trainer.train(n_epochs=config['n_epochs'])
-
 
 if __name__ == '__main__':
     main()

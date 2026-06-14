@@ -2524,12 +2524,12 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         )
         self.d2 = ResBlock3DSpatial(
             input_channels=internal_chn,
-            output_channels=2 * internal_chn,
+            output_channels= internal_chn,
             first_relu=True,
             keep_same_output=False,
         )
 
-        self.pre_attn_channels = 2 * internal_chn
+        self.pre_attn_channels = internal_chn
         self.frame_self_attn = SelfAttention(internal_chn)
         # z path + framewise cross-attention
         self.x_to_attn = spectral_norm(
@@ -2585,25 +2585,27 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         # 
         
         self.intermediate_dblocks = nn.ModuleList()
-        tmp_internal = internal_chn
+        current_channel = int(internal_chn)
+
         for _ in range(self.num_layers):
-            tmp_internal *= 2
+            out_channel = 2 * current_channel
             self.intermediate_dblocks.append(
                 DBlock(
-                    input_channels=tmp_internal,
-                    output_channels=2 * tmp_internal,
+                    input_channels=current_channel,
+                    output_channels=out_channel,
                     conv_type=self.conv_type,
                 )
             )
+            current_channel = out_channel
 
         self.d_last = DBlock(
-            input_channels=2 * tmp_internal,
-            output_channels=2 * tmp_internal,
+            input_channels=current_channel,
+            output_channels=current_channel,
             keep_same_output=True,
             conv_type=self.conv_type,
         )
         
-        self.token_dim = 2 * tmp_internal
+        self.token_dim =  current_channel
 
         # 
         # spatiotemporal transformer head
@@ -2740,8 +2742,10 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
 
         x_tok = x_feat.permute(0, 2, 3, 4, 1).contiguous().view(B * T, H * W, Dx)
         zh_tok = zh_feat.permute(0, 2, 3, 4, 1).contiguous().view(B * T, H * W, Dz)
+        def _cross(q, k, v):
+            return self.cross_attn(q=q, k=k, v=v)
+        attn_out = self._maybe_ckpt(_cross, x_tok, zh_tok, zh_tok)
 
-        attn_out = self.cross_attn(q=x_tok, k=zh_tok, v=zh_tok)
         x_tok = self.cross_out_norm(x_tok + attn_out)
 
         x_out = x_tok.view(B, T, H, W, Dx).permute(0, 4, 1, 2, 3).contiguous()
@@ -2796,7 +2800,7 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         x0 = self.space2depth(x0)  # [B*T,4C,H/2,W/2]
         x0 = x0.view(B, T0, 4 * C0, H0 // 2, W0 // 2).permute(0, 2, 1, 3, 4).contiguous()
 
-        x1 = self._maybe_ckpt(self.d1, x0)  # [B,C,T,H',W']
+        x1 = self.d1(x0)  # [B,C,T,H',W']
         x1_bt = x1.permute(0, 2, 1, 3, 4).contiguous()  # [B,T,C,H1,W1]
         B1, T1, C1, H1, W1 = x1_bt.shape
         x1_bt = x1_bt.view(B1 * T1, C1, H1, W1)
@@ -2805,14 +2809,14 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
 
         x1 = x1_bt.view(B1, T1, C1, H1, W1).permute(0, 2, 1, 3, 4).contiguous()
 
-        x2 = self._maybe_ckpt(self.d2, x1)  # [B,C2,T,H'',W'']
+        x2 = self.d2(x1)  # [B,C2,T,H'',W'']
 
         # ------------------------------------------------------------
         # z path + cross-attention conditioning
         # ------------------------------------------------------------
         z_3d = z.permute(0, 2, 1, 3, 4).contiguous()        # [B,Cz,T,Hz,Wz]
-        z_feat = self._maybe_ckpt(self.zh_stem, z_3d)       # [B,D,T,h,w]
-        x_feat = self._maybe_ckpt(self.x_to_attn, x2)       # [B,D,T,hx,wx]
+        z_feat = self.zh_stem(z_3d)                         # [B,D,T,h,w]
+        x_feat = self.x_to_attn(x2)                         # [B,D,T,hx,wx]
 
         # align spatial sizes if needed; keep time unchanged
         if z_feat.shape[-3] != x_feat.shape[-3]:
@@ -2832,7 +2836,7 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
         z_feat = self._apply_2d_rope_per_timestep(z_feat)
 
         x_ctx = self._cross_attend_framewise(x_feat, z_feat)
-        x2 = x2 + self._maybe_ckpt(self.x_from_attn, x_ctx)
+        x2 = x2 + self.x_from_attn(x_ctx)
 
         # ------------------------------------------------------------
         # per-frame 2D tower -> spatial tokens
@@ -2846,9 +2850,9 @@ class TemporalDiscriminator(torch.nn.Module, PyTorchModelHubMixin):
             rep = x3[:, t]  # [B,C,H,W]
            
             for block in self.intermediate_dblocks:
-                rep = self._maybe_ckpt(block, rep)
+                rep = block(rep)
 
-            rep = self._maybe_ckpt(self.d_last, rep)  # [B,Cf,Hf,Wf]
+            rep = self.d_last(rep)  # [B,Cf,Hf,Wf]
 
             if return_features:
                 frame_features.append(rep)

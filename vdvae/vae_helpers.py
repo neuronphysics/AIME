@@ -19,16 +19,72 @@ def build_grid(resolution):
     grid = grid.unsqueeze(0)
     return torch.cat([grid, 1.0 - grid], dim=-1)
 
-class SoftPositionEmbed(nn.Module):
-    def __init__(self, hidden_size: int, resolution: Tuple[int, int]):
-        super().__init__()
-        self.dense = nn.Linear(in_features=4, out_features=hidden_size)
-        self.register_buffer("grid", build_grid(resolution))
 
-    def forward(self, inputs: Tensor):
-        emb_proj = self.dense(self.grid).permute(0, 3, 1, 2)
-        assert_shape(inputs.shape[1:], emb_proj.shape[1:])
-        return inputs + emb_proj
+class PositionalEncoding2D(nn.Module):
+    def __init__(self, channels, dtype_override=None):
+        """
+        :param channels: The last dimension of the tensor you want to apply pos emb to.
+        :param dtype_override: If set, overrides the dtype of the output embedding.
+        """
+        super(PositionalEncoding2D, self).__init__()
+        self.org_channels = channels
+        channels = int(np.ceil(channels / 4) * 2)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, channels, 2).float() / channels))
+        self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("cached_penc", None, persistent=False)
+        self.dtype_override = dtype_override
+        self.channels = channels
+
+    def forward(self, tensor):
+        """
+        :param tensor: A 4d tensor of size (batch_size, x, y, ch)
+        :return: Positional Encoding Matrix of size (batch_size, x, y, ch)
+        """
+        if len(tensor.shape) != 4:
+            raise RuntimeError("The input tensor has to be 4d!")
+
+        if self.cached_penc is not None and self.cached_penc.shape == tensor.shape:
+            return self.cached_penc
+
+        self.cached_penc = None
+        batch_size, x, y, orig_ch = tensor.shape
+        pos_x = torch.arange(x, device=tensor.device, dtype=self.inv_freq.dtype)
+        pos_y = torch.arange(y, device=tensor.device, dtype=self.inv_freq.dtype)
+        sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq)
+        sin_inp_y = torch.einsum("i,j->ij", pos_y, self.inv_freq)
+        emb_x = get_emb(sin_inp_x).unsqueeze(1)
+        emb_y = get_emb(sin_inp_y)
+        emb = torch.zeros(
+            (x, y, self.channels * 2),
+            device=tensor.device,
+            dtype=(
+                self.dtype_override if self.dtype_override is not None else tensor.dtype
+            ),
+        )
+        emb[:, :, : self.channels] = emb_x
+        emb[:, :, self.channels : 2 * self.channels] = emb_y
+
+        self.cached_penc = emb[None, :, :, :orig_ch].repeat(tensor.shape[0], 1, 1, 1)
+        return self.cached_penc
+
+
+class PositionalEncodingPermute2D(nn.Module):
+    def __init__(self, channels, dtype_override=None):
+        """
+        Accepts (batchsize, ch, x, y) instead of (batchsize, x, y, ch)
+        """
+        super(PositionalEncodingPermute2D, self).__init__()
+        self.penc = PositionalEncoding2D(channels, dtype_override)
+
+    def forward(self, tensor):
+        tensor = tensor.permute(0, 2, 3, 1)
+        enc = self.penc(tensor)
+        return enc.permute(0, 3, 1, 2)
+
+    @property
+    def org_channels(self):
+        return self.penc.org_channels
+
 
 DEFAULT_WEIGHT_INIT = "default"
 def init_parameters(layers: Union[nn.Module, Iterable[nn.Module]], weight_init: str = "default"):
@@ -847,6 +903,122 @@ class SlotToTopPosterior(nn.Module):
 
         return qm, qv, z_top_map, comp_mu, comp_logsigma, z_slot_maps
 
+class SlotToTopPrior(nn.Module):
+    """
+    Generative bridge:
+        p(z_top_slot | slot_mu, h_t, slot_index)
+
+    This is used ONLY for rollout/generation.
+    It does NOT consume posterior slot_logsigma.
+    """
+    def __init__(
+        self,
+        slot_dim: int,
+        z_channels: int,
+        top_h: int,
+        top_w: int,
+        cond_channels: int,
+        cond_width: int,
+        num_slots: int,
+        use_3x3: bool = True,
+        use_checkpoint=False,
+    ):
+        super().__init__()
+        self.slot_dim = int(slot_dim)
+        self.z_channels = int(z_channels)
+        self.top_h = int(top_h)
+        self.top_w = int(top_w)
+        self.cond_channels = int(cond_channels)
+        self.num_slots = int(num_slots)
+        self.use_checkpoint = bool(use_checkpoint)
+        # Slot index is part of the generative condition, not a hard component assignment.
+        self.slot_embed = nn.Embedding(self.num_slots, self.slot_dim)
+        nn.init.normal_(self.slot_embed.weight, mean=0.0, std=0.02)
+
+        self.net = Block(
+            2 * self.slot_dim + 4 + self.cond_channels,
+            cond_width,
+            2 * self.z_channels,
+            residual=False,
+            use_3x3=use_3x3,
+        )
+
+    def _coord_grid(self, B, S, device, dtype):
+        y = torch.linspace(-1.0, 1.0, self.top_h, device=device, dtype=dtype)
+        x = torch.linspace(-1.0, 1.0, self.top_w, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        grid = torch.stack([xx, yy, 1.0 - xx, 1.0 - yy], dim=0)
+        return grid[None, None].expand(B, S, 4, self.top_h, self.top_w)
+
+    def _sample_diag(self, mu, logsigma, temperature: float):
+        logsigma = logsigma.clamp(-7.0, 3.0)
+        if temperature is None:
+            temperature = 1.0
+        t = float(temperature)
+        
+        return mu + t * torch.exp(logsigma) * torch.randn_like(mu)
+
+    def forward(self, slot_mu: torch.Tensor, cond_top: torch.Tensor, temperature: float = 1.0):
+        """
+        slot_mu:  [B,S,D]
+        cond_top: [B,C_h,H_top,W_top]
+
+        Returns:
+            qm:            [B,C,H,W]
+            qv:            [B,C,H,W] logsigma
+            z_top_state:   [B,C,H,W] aggregate state for RNN
+            comp_mu:       [B,S,C,H,W]
+            comp_logsigma: [B,S,C,H,W]
+            z_slot_maps:   [B,S,C,H,W] decoder input
+        """
+        B, S, D = slot_mu.shape
+        assert D == self.slot_dim, (D, self.slot_dim)
+        assert S <= self.num_slots, (S, self.num_slots)
+
+        slot_grid = slot_mu[:, :, :, None, None].expand(
+            B, S, D, self.top_h, self.top_w
+        )
+
+        slot_ids = torch.arange(S, device=slot_mu.device)
+        slot_emb = self.slot_embed(slot_ids)[None].expand(B, S, D)
+        slot_emb_grid = slot_emb[:, :, :, None, None].expand(
+            B, S, D, self.top_h, self.top_w
+        )
+
+        pos = self._coord_grid(B, S, slot_mu.device, slot_mu.dtype)
+
+        cond = cond_top[:, None].expand(B, S, self.cond_channels, self.top_h, self.top_w)
+
+        inp = torch.cat([slot_grid, slot_emb_grid, pos, cond], dim=2)
+        inp = inp.reshape(
+            B * S,
+            2 * D + 4 + self.cond_channels,
+            self.top_h,
+            self.top_w,
+        )
+        if self.training and self.use_checkpoint and torch.is_grad_enabled():
+            out = ckpt(self.net, inp, use_reentrant=False, preserve_rng_state=False)
+        else:
+            out = self.net(inp)
+        out = out.view(B, S, 2 * self.z_channels, self.top_h, self.top_w)
+
+        comp_mu = out[:, :, :self.z_channels]
+        comp_logsigma = out[:, :, self.z_channels:]
+        comp_logsigma = comp_logsigma.clamp(-7.0, 3.0)
+
+        # Per-slot decoder maps.
+        z_slot_maps = self._sample_diag(comp_mu, comp_logsigma, temperature)
+
+        # Aggregate only for RNN state.
+        qm = comp_mu.mean(dim=1)
+        comp_var = torch.exp(2.0 * comp_logsigma)
+        second_moment = (comp_var + comp_mu.pow(2)).mean(dim=1)
+        q_var = (second_moment - qm.pow(2)).clamp_min(1e-8)
+        qv = 0.5 * torch.log(q_var)
+
+        z_top_state = self._sample_diag(qm, qv, temperature)
+
+        return qm, qv, z_top_state, comp_mu, comp_logsigma, z_slot_maps
 
 class TopSlotPosterior(nn.Module):
     def __init__(
@@ -862,6 +1034,8 @@ class TopSlotPosterior(nn.Module):
         n_iters=3,
         logsigma_clamp=(-5.0, 3.0),
         use_checkpoint=True,
+        mean_init: Callable[[torch.Tensor], None] = torch.nn.init.xavier_uniform_,
+        logsigma_init: Callable[[torch.Tensor], None] = nn.init.xavier_uniform_,
     ):
         super().__init__()
         self.top_h = int(top_h)
@@ -872,17 +1046,17 @@ class TopSlotPosterior(nn.Module):
         self.logsigma_clamp = logsigma_clamp
         self.use_checkpoint = bool(use_checkpoint)
         # Position embedding must now match encoder feature channels.
-        self.pre_pos = SoftPositionEmbed(
-            hidden_size=in_channels,
-            resolution=(top_h, top_w),
-        )
+        self.pre_pos = PositionalEncodingPermute2D(in_channels)
         self.pre_norm = nn.LayerNorm(in_channels)
 
-        self.slots_init_mu = nn.Embedding(num_slots, slot_dim)
-        nn.init.orthogonal_(self.slots_init_mu.weight)
+        self.register_buffer("slots_init_mu", torch.zeros(num_slots, slot_dim))
 
-        self.slots_init_logsigma = nn.Embedding(num_slots, slot_dim)
-        nn.init.xavier_uniform_(self.slots_init_logsigma.weight)
+
+        self.register_buffer("slots_init_logsigma", torch.zeros(num_slots, slot_dim))
+        
+        with torch.no_grad():
+            mean_init(self.slots_init_mu)
+            logsigma_init(self.slots_init_logsigma)
 
         # Slot Attention receives encoder feature dim,
         # but slots themselves still live in slot_dim.
@@ -913,6 +1087,17 @@ class TopSlotPosterior(nn.Module):
             cond_width=cond_width,
             use_3x3=True,
         )
+        self.slot_to_top_prior = SlotToTopPrior(
+            slot_dim=slot_dim,
+            z_channels=z_channels,
+            top_h=top_h,
+            top_w=top_w,
+            cond_channels=cond_channels,
+            cond_width=cond_width,
+            num_slots=num_slots,
+            use_3x3=True,
+            use_checkpoint=use_checkpoint,
+        )
 
     def _maybe_ckpt(self, fn, *args):
         if (
@@ -929,14 +1114,17 @@ class TopSlotPosterior(nn.Module):
         assert C == self.in_channels, (C, self.in_channels)
 
         # Directly use encoder features.
-        feat = self.pre_pos(acts_top)
+        pos = self.pre_pos(acts_top)
+        feat = acts_top + pos
 
         tokens = feat.flatten(2).transpose(1, 2).contiguous()
         tokens = self.pre_norm(tokens)
-        
-        init_mu = self.slots_init_mu(torch.arange(self.num_slots, device=acts_top.device)).unsqueeze(0).expand(B, -1, -1).to(dtype=tokens.dtype)
-        init_logsigma = self.slots_init_logsigma(torch.arange(self.num_slots, device=acts_top.device)).unsqueeze(0).expand(B, -1, -1).to(dtype=tokens.dtype).clamp(*self.logsigma_clamp)
+        init_mu = self.slots_init_mu[None].expand(B, -1, -1).to(device=acts_top.device,dtype=tokens.dtype)
+
+        init_logsigma = self.slots_init_logsigma[None].expand(B, -1, -1).to(device=acts_top.device,dtype=tokens.dtype,).clamp(*self.logsigma_clamp)
+
         init_slots = init_mu + torch.exp(init_logsigma) * torch.randn_like(init_mu)
+        
 
         def _slot_attention_fn(init_slots_, tokens_):
             out = self.slot_attention(init_slots_, tokens_)
@@ -1202,7 +1390,17 @@ class DmolNet(nn.Module):
         super().__init__()
         self.H = H
         self.width = H.width
+        self.use_checkpoint = H.use_checkpoint
         self.out_conv = get_conv(H.width, H.num_mixtures * 10, kernel_size=1, stride=1, padding=0)
+        
+    def _maybe_ckpt(self, fn, *args):
+        if (
+            self.training
+            and self.use_checkpoint
+            and any(torch.is_tensor(a) and a.requires_grad for a in args)
+        ):
+            return ckpt(fn, *args, use_reentrant=False)
+        return fn(*args)
 
     def nll(self, px_z, x):
         
@@ -1211,8 +1409,8 @@ class DmolNet(nn.Module):
         return discretized_mix_logistic_loss(x=x, l=self.forward(px_z), mask_logits=mask_logits, low_bit=self.H.dataset in ['ffhq_256'])
 
     def forward(self, px_z):
-        xhat = self.out_conv(px_z[:, :self.width])
-        return xhat.permute(0, 2, 3, 1)
+        xhat = self._maybe_ckpt(self.out_conv, px_z[:, :self.width])
+        return xhat.permute(0, 2, 3, 1).contiguous()
 
     def sample(self, px_z):
         im = sample_from_discretized_mix_logistic(self.forward(px_z), self.H.num_mixtures)

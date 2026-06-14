@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vdvae.vae_helpers import Block
-
+from torch.utils.checkpoint import checkpoint as ckpt
 LOG2PI = math.log(2.0 * math.pi)
 EULER_GAMMA = 0.5772156649
 
@@ -59,8 +59,8 @@ def kumar2beta_kl(
     eps: float = 100 * torch.finfo(torch.float32).eps,
 ) -> torch.Tensor:
     #equation (12): https://arxiv.org/pdf/1605.06197
-    a = torch.clamp(a, min=eps, max=20)
-    b = torch.clamp(b, min=eps, max=20)
+    a = torch.clamp(a, min=eps, max=50)
+    b = torch.clamp(b, min=eps, max=50)
     alpha = torch.clamp(alpha, min=eps)
     beta = torch.clamp(beta, min=eps)
     ab = a * b
@@ -81,10 +81,10 @@ def kumar2beta_kl(
 def kumar_expected_log_v(
     a: torch.Tensor,
     b: torch.Tensor,
-    eps: float = 100 * torch.finfo(torch.float32).eps,
+    eps: float = 10 * torch.finfo(torch.float32).eps,
 ) -> torch.Tensor:
-    a = torch.clamp(a, min=eps, max=20)
-    b = torch.clamp(b, min=eps, max=20)
+    a = torch.clamp(a, min=eps, max=50)
+    b = torch.clamp(b, min=eps, max=50)
     a_inv = torch.reciprocal(a + eps)
     b_inv = torch.reciprocal(b + eps)
     return a_inv * (-EULER_GAMMA - torch.digamma(b + eps) - b_inv)
@@ -94,10 +94,10 @@ def kumar_expected_log_1mv(
     a: torch.Tensor,
     b: torch.Tensor,
     n_approx: int = 10,
-    eps: float = 100 * torch.finfo(torch.float32).eps,
+    eps: float = 10 * torch.finfo(torch.float32).eps,
 ) -> torch.Tensor:
-    a = torch.clamp(a, min=eps, max=20)
-    b = torch.clamp(b, min=eps, max=20)
+    a = torch.clamp(a, min=eps, max=50)
+    b = torch.clamp(b, min=eps, max=50)
     ab = a * b
     a_inv = torch.reciprocal(a + eps)
     terms = []
@@ -112,10 +112,10 @@ def kumar_expected_log_1mv(
 def kumar_mean(
     a: torch.Tensor,
     b: torch.Tensor,
-    eps: float = 100 * torch.finfo(torch.float32).eps,
+    eps: float = 10 * torch.finfo(torch.float32).eps,
 ) -> torch.Tensor:
-    a = torch.clamp(a, min=eps, max=20)
-    b = torch.clamp(b, min=eps, max=20)
+    a = torch.clamp(a, min=eps, max=50)
+    b = torch.clamp(b, min=eps, max=50)
     one_plus_a_inv = 1.0 + torch.reciprocal(a + eps)
     log_mean = torch.log(b + eps) + beta_fn(one_plus_a_inv, b)
     return torch.exp(log_mean)
@@ -170,7 +170,7 @@ class EpochBatch:
     valid_mask: Optional[torch.Tensor]
     seq_id: Optional[torch.Tensor]
     t_index: Optional[torch.Tensor]
-
+    slot_index: Optional[torch.Tensor] = None
 
 class ReplayBufferConditional:
     """
@@ -418,6 +418,7 @@ class ReplayBufferConditional:
                     valid_mask=mask_b,
                     seq_id=seq_b,
                     t_index=t_b,
+                    slot_index=slot_idx.contiguous(),
                 )
             )
 
@@ -433,12 +434,13 @@ class ConditionalKumaraswamyGate(nn.Module):
 
     This preserves optimizer state across birth/delete/merge.
     """
-    def __init__(self, h_shape: Tuple[int, ...], max_K: int, hidden_dim: int = 256, use_3x3: bool = True, zero_last: bool = False):
+    def __init__(self, h_shape: Tuple[int, ...], max_K: int, hidden_dim: int = 256, use_3x3: bool = True, zero_last: bool = False, use_checkpoint: bool = False):
         super().__init__()
         self.h_shape = h_shape
         self.max_K = int(max_K)
         self.hidden_dim = int(hidden_dim)
         self.active_K = int(max_K)
+        self.use_checkpoint = bool(use_checkpoint)
 
         h_channels, h_height, h_width = h_shape
         self.h_encoder = Block(
@@ -449,6 +451,12 @@ class ConditionalKumaraswamyGate(nn.Module):
             residual=False,          # h_channels != hidden_dim in general
             use_3x3=use_3x3,
             zero_last=zero_last,
+        )
+        self.h_norm = nn.GroupNorm(
+            num_groups=1,
+            num_channels=h_channels,
+            eps=1e-5,
+            affine=True,
         )
         self.out_a = nn.Conv2d(hidden_dim, max(1, max_K - 1), kernel_size=(h_height, h_width), stride=1, padding=0, bias=True)
         self.out_b = nn.Conv2d(hidden_dim, max(1, max_K - 1), kernel_size=(h_height, h_width), stride=1, padding=0, bias=True)
@@ -465,8 +473,17 @@ class ConditionalKumaraswamyGate(nn.Module):
             self.out_a.weight.mul_(0.01)
             self.out_b.weight.mul_(0.01)
 
+    def _embed_core(self, h: torch.Tensor) -> torch.Tensor:
+        h = self.h_norm(h)
+        return self.h_encoder(h)
+
     def _embed(self, h: torch.Tensor) -> torch.Tensor:
-        return self.h_encoder(h) #[B, C, H, W] -> [B, hidden_dim, H, W]
+        if not torch.isfinite(h).all():
+            raise ValueError("Input hidden contains non-finite values")
+        if self.training and self.use_checkpoint and h.requires_grad:
+            return ckpt(self._embed_core, h, use_reentrant=False, preserve_rng_state=False)
+        else:
+            return self._embed_core(h) #[B, C, H, W] -> [B, hidden_dim, H, W]
 
 
     def set_active_K(self, K: int):
@@ -503,6 +520,9 @@ class ConditionalKumaraswamyGate(nn.Module):
         n = self.active_K - 1
         a_full = F.softplus(self.out_a(feat)) + 1e-4
         b_full = F.softplus(self.out_b(feat)) + 1e-4
+        a_full = a_full.clamp(min=1e-4, max=50.0)
+        b_full = b_full.clamp(min=1e-4, max=50.0)
+
         return {'a': a_full[:, :n, 0, 0], 'b': b_full[:, :n, 0, 0]}
 
     def expected_log_pi(self, h: torch.Tensor) -> torch.Tensor:
@@ -528,7 +548,7 @@ class ConditionalKumaraswamyGate(nn.Module):
             return torch.ones(h.shape[0], 1, device=h.device, dtype=h.dtype)
         out = self.forward(h)
         a, b = out['a'], out['b']
-        ev = kumar_mean(a, b).clamp_min(torch.finfo(a.dtype).eps)
+        ev = kumar_mean(a, b).clamp(min=torch.finfo(a.dtype).eps, max=1.0 - torch.finfo(a.dtype).eps)
         e1 = (1.0 - ev).clamp_min(torch.finfo(ev.dtype).eps)
         B = h.shape[0]
         pi = torch.empty(B, self.active_K, device=h.device, dtype=h.dtype)
@@ -539,6 +559,7 @@ class ConditionalKumaraswamyGate(nn.Module):
                 prefix = prefix * e1[:, k]
             else:
                 pi[:, k] = prefix
+        
         return pi / pi.sum(dim=1, keepdim=True).clamp_min(torch.finfo(pi.dtype).eps)
 
 
@@ -560,6 +581,7 @@ class MemoizedBatchCache:
     entropy: Optional[torch.Tensor] = None    # scalar
 
 
+
 @dataclass
 class FrozenConditionalTopPrior:
     comp_mean: torch.Tensor
@@ -568,7 +590,7 @@ class FrozenConditionalTopPrior:
     K: int
     max_K: int
     objective: float
-
+    slot_component_logits: Optional[torch.Tensor] = None
 
 @dataclass
 class StructuralCheckpoint:
@@ -581,6 +603,7 @@ class StructuralCheckpoint:
     cache_resp: Dict[int, torch.Tensor]
     gate_state: Dict[str, torch.Tensor]
     gate_optim_state: Dict[str, Any]
+    slot_component_logits: Optional[torch.Tensor] = None
 
 
 # Main conditional DPGMM
@@ -591,6 +614,7 @@ class ConditionalTopDPGMM(nn.Module):
         h_shape: Tuple[int, ...],
         max_components: int = 32,
         init_components: int = 4,
+        num_slots: Optional[int] = None,
         dp_alpha: float = 1.0,
         prior_m0: float = 0.0,
         prior_kappa0: float = 0.5,
@@ -608,6 +632,7 @@ class ConditionalTopDPGMM(nn.Module):
         delete_min_seqs: int = 2,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.C, self.H, self.W = z_shape
@@ -632,9 +657,19 @@ class ConditionalTopDPGMM(nn.Module):
         self.device_ = device if device is not None else torch.device('cpu')
         self.dtype = dtype
 
-        self.gate = ConditionalKumaraswamyGate(h_shape=h_shape, max_K=self.max_components, hidden_dim=gate_hidden_dim).to(self.device_, self.dtype)
+        self.gate = ConditionalKumaraswamyGate(h_shape=h_shape, max_K=self.max_components, hidden_dim=gate_hidden_dim, use_checkpoint=use_checkpoint).to(self.device_, self.dtype)
+        self.num_slots = None if num_slots is None else int(num_slots)
+        if self.num_slots is not None:
+            self.slot_component_logits = nn.Parameter(
+                torch.zeros(self.num_slots, self.max_components, device=self.device_, dtype=self.dtype)
+            )
+        else:
+            self.slot_component_logits = None
         self.gate.set_active_K(self.K)
-        self.gate_optimizer = torch.optim.Adam(self.gate.parameters(), lr=gate_lr)
+        gate_params = list(self.gate.parameters())
+        if self.slot_component_logits is not None:
+            gate_params.append(self.slot_component_logits)
+        self.gate_optimizer = torch.optim.Adam(gate_params, lr=gate_lr)
 
         self.comp: List[TensorDiagComponentPosterior] = []
         self.batches: List[EpochBatch] = []
@@ -740,6 +775,7 @@ class ConditionalTopDPGMM(nn.Module):
                 for k, v in self.gate.state_dict().items()
             },
             gate_optim_state=copy.deepcopy(self.gate_optimizer.state_dict()),
+            slot_component_logits=(None if self.slot_component_logits is None else self.slot_component_logits.detach().clone()),
         )
 
     @torch.no_grad()
@@ -747,6 +783,11 @@ class ConditionalTopDPGMM(nn.Module):
         self.K = ckpt.K
         self.comp = [copy.deepcopy(c) for c in ckpt.comp]
         self.gate.load_state_dict(ckpt.gate_state, strict=True)
+        if self.slot_component_logits is not None and ckpt.slot_component_logits is not None:
+            self.slot_component_logits.data.copy_(ckpt.slot_component_logits.to(
+                device=self.device_,
+                dtype=self.dtype,
+            ))
         self.gate.set_active_K(self.K)
 
         self._reset_gate_optimizer()
@@ -858,7 +899,7 @@ class ConditionalTopDPGMM(nn.Module):
 
             z_fit = b.posterior_mean if b.posterior_mean is not None else b.z
 
-            resp = self.local_step(b.h, z_fit, b.posterior_logvar)
+            resp = self.local_step(b.h, z_fit, b.posterior_logvar, slot_index=b.slot_index)
             c = self._cache_from_resp(z_fit, resp, posterior_logvar=b.posterior_logvar)
 
             self.cache[b.batch_id] = c
@@ -870,6 +911,32 @@ class ConditionalTopDPGMM(nn.Module):
     def conditional_expected_log_pi(self, h: torch.Tensor) -> torch.Tensor:
         #q(v_k | h_t) = Kumaraswamy(a_k(h_t), b_k(h_t))
         return self.gate.expected_log_pi(h)
+
+    def conditional_slot_log_pi(
+        self,
+        h: torch.Tensor,
+        slot_index: Optional[torch.Tensor] = None,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """
+        Returns slot-conditioned component log-probabilities.
+
+        h:          [N,C,H,W]
+        slot_index: [N] or None
+
+        Output:
+            [N,K]
+        """
+        base = self.conditional_expected_log_pi(h)[:, :self.K]
+
+        if self.slot_component_logits is not None and slot_index is not None:
+            slot_index = slot_index.to(device=h.device, dtype=torch.long)
+            bias = self.slot_component_logits[slot_index, :self.K].to(device=h.device, dtype=h.dtype)
+            base = base + bias
+
+        if normalize:
+            return torch.log_softmax(base, dim=-1)
+        return base
 
     def component_expected_log_likelihood(
         self,
@@ -915,12 +982,18 @@ class ConditionalTopDPGMM(nn.Module):
         z_mean: torch.Tensor,
         posterior_logvar: Optional[torch.Tensor] = None,
         temperature: float = 1.0,
+        slot_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        logits = (
-            self.conditional_expected_log_pi(h)
-            + self.component_expected_log_likelihood(z_mean, posterior_logvar)
+        prior_logits = self.conditional_slot_log_pi(
+            h,
+            slot_index=slot_index,
+            normalize=False,
         )
 
+        logits = prior_logits + self.component_expected_log_likelihood(
+            z_mean,
+            posterior_logvar,
+        )
         logits = logits / max(float(temperature), torch.finfo(h.dtype).eps)
         return torch.softmax(logits, dim=1)
 
@@ -953,7 +1026,7 @@ class ConditionalTopDPGMM(nn.Module):
         b = self._move_batch(batch)
         resp = resp.to(device=b.h.device, dtype=b.h.dtype)
 
-        elogpi = self.conditional_expected_log_pi(b.h)
+        elogpi = self.conditional_slot_log_pi(b.h, slot_index=b.slot_index, normalize=True)
 
         # Negative ELBO stick-assignment term.
         fit = -(resp.detach() * elogpi).sum(dim=1).mean()
@@ -999,7 +1072,7 @@ class ConditionalTopDPGMM(nn.Module):
                 if not loss.requires_grad:
                     continue
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.gate.parameters(), max_norm=0.5, norm_type=2.0)
+                nn.utils.clip_grad_norm_(self.gate.parameters(), max_norm=0.5, norm_type=2.0, error_if_nonfinite=True)
                 self.gate_optimizer.step()
         self.gate.eval()
 
@@ -1010,7 +1083,7 @@ class ConditionalTopDPGMM(nn.Module):
             self._sub_cache(old)
         b = self._move_batch(batch)
         z_fit = b.posterior_mean if b.posterior_mean is not None else b.z
-        new_resp = self.local_step(b.h, z_fit, b.posterior_logvar)
+        new_resp = self.local_step(b.h, z_fit, b.posterior_logvar, slot_index=b.slot_index)
         new_cache = self._cache_from_resp(z_fit, new_resp, posterior_logvar=b.posterior_logvar)
         self.cache[batch.batch_id] = new_cache
         self._add_cache(new_cache)
@@ -1076,7 +1149,7 @@ class ConditionalTopDPGMM(nn.Module):
 
             z_fit = b.posterior_mean if b.posterior_mean is not None else b.z
 
-            elogpi = self.conditional_expected_log_pi(b.h)
+            elogpi = self.conditional_slot_log_pi(b.h, slot_index=b.slot_index, normalize=True)
             eloglik = self.component_expected_log_likelihood(
                 z_fit,
                 posterior_logvar=b.posterior_logvar,
@@ -1254,7 +1327,7 @@ class ConditionalTopDPGMM(nn.Module):
         for b_cpu in self.batches:
             b = self._move_batch(b_cpu)
             z_fit = b.posterior_mean if b.posterior_mean is not None else b.z
-            c = self._cache_from_resp(z_fit, self.local_step(b.h, z_fit, b.posterior_logvar), posterior_logvar=b.posterior_logvar)
+            c = self._cache_from_resp(z_fit, self.local_step(b.h, z_fit, b.posterior_logvar, slot_index=b.slot_index), posterior_logvar=b.posterior_logvar)
             self.cache[b.batch_id] = c
             self._add_cache(c)
         self._update_components_from_summaries()
@@ -1820,6 +1893,7 @@ class ConditionalTopDPGMM(nn.Module):
             K=self.K,
             max_K=self.max_components,
             objective=float(self.global_objective().detach().cpu().item()),
+            slot_component_logits=(None if self.slot_component_logits is None else self.slot_component_logits[:, :self.K].detach().clone().cpu().contiguous()),
         )
 
     @staticmethod
@@ -1908,11 +1982,14 @@ class ConditionalTopDPGMM(nn.Module):
         # Use the SAME conditional mixture weights as the KL path
         elogpi = ConditionalTopDPGMM.conditional_expected_log_pi_frozen(
             frozen_gate=frozen_gate,
-            h_t=h_t,
+            h_t=h_t.float(),
         )  # [B, K]
 
-        pi = torch.softmax(elogpi/ max(float(temperature), 1e-4), dim=1)  # [B, K]
-        idx = torch.multinomial(pi, 1).squeeze(1)  # [B]
+        #pi = torch.softmax(elogpi/ max(float(temperature), 1e-4), dim=1)  # [B, K]
+        logits = elogpi / max(float(temperature), 1e-4)
+        logits = logits - logits.max(dim=-1, keepdim=True).values
+        idx = torch.distributions.Categorical(logits=logits).sample()   # [ B]
+        #idx = torch.multinomial(pi, 1).squeeze(1)  # [B]
 
         means = snapshot.comp_mean.to(device=h_t.device, dtype=h_t.dtype).index_select(0, idx)
         vars_ = snapshot.comp_var.to(device=h_t.device, dtype=h_t.dtype).index_select(0, idx).clamp_min(1e-6)
@@ -1936,8 +2013,8 @@ class ConditionalTopDPGMM(nn.Module):
             valid_mask=self._to_device(b.valid_mask),
             seq_id=self._to_device(b.seq_id),
             t_index=self._to_device(b.t_index),
-        )
-
+            slot_index=self._to_device(getattr(b, "slot_index", None)),
+    )
 def compute_top_kl_conditional_frozen(snapshot, frozen_gate, h_t, top_q_mean_map, top_q_logvar_map, n_samples: int = 8):
     return ConditionalTopDPGMM.kl_mc_to_frozen_prior(snapshot, frozen_gate, h_t, top_q_mean_map, top_q_logvar_map, n_samples=n_samples)
 
@@ -2016,8 +2093,18 @@ def compute_slot_kl_conditional_frozen(
     #     h_t=h_t,
     # )  # [B, M]
     # log_pi = torch.log_softmax(elogpi, dim=-1)
-    pi = frozen_gate.mean_pi(h_t).clamp_min(eps)
-    log_pi = torch.log(pi)
+
+    pi = frozen_gate.mean_pi(h_t).clamp_min(eps)[:, :M]
+    base_log_pi = torch.log(pi)
+
+    logits = base_log_pi[:, None, :].expand(B, S, M).contiguous()
+
+    if getattr(snapshot, "slot_component_logits", None) is not None:
+        bias = snapshot.slot_component_logits.to(device=slot_mu.device, dtype=slot_mu.dtype)
+        bias = bias[:S, :M]
+        logits = logits + bias[None, :, :]
+
+    log_pi = torch.log_softmax(logits, dim=-1)
 
     kl_q_to_comp = gaussian_kl_diag_to_components(
         q_mu=slot_mu,
@@ -2027,13 +2114,13 @@ def compute_slot_kl_conditional_frozen(
         eps=eps
     )  # [B, S, M]
 
-    log_r = log_pi[:, None, :] - torch.clamp(kl_q_to_comp, max=1e5)
+    log_r = log_pi - kl_q_to_comp.clamp(min=0, max=1e5)
     resp = torch.softmax(log_r, dim=-1)
 
     slot_kl = resp * (
         torch.log(resp.clamp_min(eps))
-        - log_pi[:, None, :]
-        + kl_q_to_comp
+        - log_pi
+        + kl_q_to_comp.clamp(min=0, max=1e5)
     )
 
     return slot_kl.sum(dim=(1, 2)), resp
@@ -2054,18 +2141,15 @@ def sample_slots_conditional_frozen(
     B = h_t.shape[0]
     M = snapshot.K
 
-    # elogpi = ConditionalTopDPGMM.conditional_expected_log_pi_frozen(
-    #     frozen_gate=frozen_gate,
-    #     h_t=h_t,
-    # )
+    elogpi = ConditionalTopDPGMM.conditional_expected_log_pi_frozen(
+         frozen_gate=frozen_gate,
+         h_t=h_t,
+    )[:, :M]
 
-    # temp = max(float(temperature), 1e-4)
-    # pi = torch.softmax(elogpi / temp, dim=-1)
-    pi = frozen_gate.mean_pi(h_t).clamp_min(torch.finfo(h_t.dtype).eps)
-
-    temp = max(float(temperature), 1e-4)
-    pi = torch.softmax(torch.log(pi) / temp, dim=-1)
-
+    logits = elogpi / max(float(temperature), 1e-4)
+    logits = logits - logits.max(dim=-1, keepdim=True).values
+    pi = torch.softmax(logits, dim=-1)
+  
     pi_rep = pi[:, None, :].expand(B, num_slots, M).reshape(B * num_slots, M)
     idx = torch.multinomial(pi_rep, 1).squeeze(-1)
 
@@ -2077,3 +2161,49 @@ def sample_slots_conditional_frozen(
 
     return mu.view(B, num_slots, -1).contiguous(), var.view(B, num_slots, -1).contiguous()
 
+@torch.no_grad()
+def sample_slot_vectors_conditional_frozen(
+    snapshot,
+    frozen_gate,
+    h_t: torch.Tensor,
+    num_slots: int,
+    assignment_temperature: float = 1.0,
+    slot_temperature: float = 1.0,
+):
+    """
+    Samples actual slot vectors from the frozen conditional DPGMM.
+
+    Returns:
+        slots: [B,S,D]
+        idx:   [B,S]
+        log_pi_slot: [B,S,K]
+    """
+    B = h_t.shape[0]
+    K = int(snapshot.K)
+    eps = torch.finfo(h_t.dtype).eps
+
+    pi = frozen_gate.mean_pi(h_t).to(device=h_t.device, dtype=h_t.dtype)[:, :K]
+    base_log_pi = torch.log(pi.clamp_min(eps))  # [B,K]
+
+    logits = base_log_pi[:, None, :].expand(B, num_slots, K).contiguous()
+
+    if getattr(snapshot, "slot_component_logits", None) is not None:
+        bias = snapshot.slot_component_logits.to(device=h_t.device, dtype=h_t.dtype)
+        bias = bias[:num_slots, :K]
+        logits = logits + bias[None, :, :]
+
+    logits = logits / max(float(assignment_temperature), 1e-4)
+    log_pi_slot = torch.log_softmax(logits, dim=-1)
+
+    idx = torch.distributions.Categorical(logits=log_pi_slot).sample()  # [B,S]
+
+    comp_mean = snapshot.comp_mean.to(device=h_t.device, dtype=h_t.dtype).view(K, -1)
+    comp_var = snapshot.comp_var.to(device=h_t.device, dtype=h_t.dtype).view(K, -1).clamp_min(1e-6)
+
+    mean = comp_mean[idx]
+    var = comp_var[idx]
+
+    t = float(slot_temperature)
+    slots = mean + t * torch.sqrt(var) * torch.randn_like(mean)
+
+    return slots.contiguous(), idx.contiguous(), log_pi_slot.contiguous()

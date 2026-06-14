@@ -10,7 +10,7 @@ from torch.utils.checkpoint import checkpoint as ckpt
 from vdvae.vae_helpers import HModule, DmolNet, draw_gaussian_diag_samples, gaussian_analytical_kl, get_1x1, get_3x3, Block, TopSlotPosterior, mean_from_discretized_mix_logistic
 from VRNN.perceiver.modules import SelfAttentionBlock
 from VRNN.perceiver.position import FourierPositionEncoding
-from vdvae.top_dpgmm_prior import compute_top_kl_conditional_frozen, sample_top_conditional_frozen, ConditionalTopDPGMM, compute_slot_kl_conditional_frozen, sample_slots_conditional_frozen
+from vdvae.top_dpgmm_prior import compute_top_kl_conditional_frozen, sample_top_conditional_frozen, ConditionalTopDPGMM, compute_slot_kl_conditional_frozen, sample_slots_conditional_frozen, sample_slot_vectors_conditional_frozen
 
 
 
@@ -174,8 +174,9 @@ class Encoder(HModule):
         return activations
 
 class Upsample(nn.Module):
-    def __init__(self, zdim: int, src_res: int, dst_res: int):
+    def __init__(self, zdim: int, src_res: int, dst_res: int, use_checkpoint=False):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         if src_res == dst_res:
             self.net = nn.Identity()
         else:
@@ -198,6 +199,8 @@ class Upsample(nn.Module):
             self.net = nn.Sequential(*layers)
 
     def forward(self, z):
+        if self.training and self.use_checkpoint and z.requires_grad:
+            return ckpt(self.net, z, use_reentrant=False)
         return self.net(z)
 
 class DecBlock(nn.Module):
@@ -625,7 +628,7 @@ class Decoder(HModule):
                 self.block_up_keys.append(key)
 
                 if key not in self.upsamplers:
-                    self.upsamplers[key] = Upsample(H.zdim, prev_res, res)
+                    self.upsamplers[key] = Upsample(H.zdim, prev_res, res, use_checkpoint=H.use_checkpoint)
 
             prev_res = res
 
@@ -869,6 +872,7 @@ class VDVAE(HModule):
         top_slot_resp = None
         top_slot_attn = None
         top_slot_comp_maps = None
+        top_slot_comp_logsigma = None
         z_top_state = None
         for block, st in zip(self.decoder.dec_blocks, stats):
             kl_block = st["kl"]
@@ -879,6 +883,7 @@ class VDVAE(HModule):
                 top_slot_logsigma = st.get("slot_logsigma", None)
                 top_slot_attn = st.get("slot_attn", None)
                 top_slot_comp_maps = st.get("slot_comp_maps", None)
+                top_slot_comp_logsigma = st.get("slot_comp_logsigma", None)
                 z_top_state = st.get("z_top_state", None)
             else:
                 if kl_block.shape[0] == B:
@@ -895,6 +900,8 @@ class VDVAE(HModule):
         rate_gauss = rate_gauss / ndims
         dp_rate = torch.zeros_like(distortion_per_pixel)
         slot_div_loss = torch.zeros_like(distortion_per_pixel)
+        top_bridge_rate = torch.zeros_like(distortion_per_pixel)
+
         slot_div_w = float(getattr(self.H, "slot_diversity_weight", 0.0))
 
         if slot_div_w > 0.0:
@@ -929,7 +936,24 @@ class VDVAE(HModule):
             )
 
             dp_rate = self.top_kl_weight * dp_kl_img  / ndims
-        total_rate = rate_gauss + dp_rate + slot_div_loss
+        if (h_prior_top is not None and top_slot_mu is not None and top_slot_comp_maps is not None and top_slot_comp_logsigma is not None):
+            _, _, _, prior_comp_mu, prior_comp_logsigma, _ = self.decoder.dec_blocks[0].top_slot_posterior.slot_to_top_prior(
+                top_slot_mu.detach(),
+                h_prior_top,
+                temperature=0.0,
+            )
+
+            B0, S0, C0, H0, W0 = top_slot_comp_maps.shape
+
+            kl_flat = gaussian_analytical_kl(
+                top_slot_comp_maps.detach().reshape(B0 * S0, C0, H0, W0),
+                prior_comp_mu.reshape(B0 * S0, C0, H0, W0),
+                top_slot_comp_logsigma.detach().reshape(B0 * S0, C0, H0, W0),
+                prior_comp_logsigma.reshape(B0 * S0, C0, H0, W0),
+            )
+
+            top_bridge_rate = kl_flat.view(B0, S0).sum(dim=1) / ndims
+        total_rate = rate_gauss + dp_rate + slot_div_loss + top_bridge_rate
         elbo_per_sample = distortion_per_pixel + total_rate
 
         if mask_t is None:
@@ -947,6 +971,7 @@ class VDVAE(HModule):
             "gauss_rate": reduce(rate_gauss),
             "rate": reduce(total_rate),
             "dp_rate": reduce(dp_rate),
+            "top_bridge_rate": reduce(top_bridge_rate),
             "px_z": px_z,
             "top_q_mean_map": top_q_mean_map,
             "top_q_logvar_map": top_q_logvar_map,
@@ -957,6 +982,7 @@ class VDVAE(HModule):
             "top_slot_resp": top_slot_resp,
             "top_slot_attn": top_slot_attn,
             "top_slot_comp_maps": top_slot_comp_maps,
+            "top_slot_comp_logsigma": top_slot_comp_logsigma,
             "current_latents": current_latents,
             "z_top_state": z_top_state,
         }
@@ -991,10 +1017,9 @@ class VDVAE(HModule):
         prev_latents=None,
         temperature: float =1.0,
     ):
-        slots_mu, slots_var = sample_slots_conditional_frozen(snapshot=self.top_prior_snapshot, frozen_gate=self.top_prior_gate, h_t=h_prior_top, num_slots = self.decoder.dec_blocks[0].top_slot_posterior.num_slots,temperature=temperature)
-        slots_mu = slots_mu.contiguous()
-        slots_logsigma = 0.5 * torch.log(slots_var.clamp_min(torch.finfo(slots_var.dtype).eps)).clamp(-7.0, 3.0).contiguous()
-        _, _, _, _, _, z_slot_maps = self.decoder.dec_blocks[0].top_slot_posterior.slot_to_top(slots_mu, slots_logsigma, h_prior_top )
+        slots, _, _ = sample_slot_vectors_conditional_frozen(snapshot=self.top_prior_snapshot, frozen_gate=self.top_prior_gate, h_t=h_prior_top, num_slots = self.decoder.dec_blocks[0].top_slot_posterior.num_slots, assignment_temperature=temperature, slot_temperature=temperature)
+        
+        _, _, _, _, _, z_slot_maps = self.decoder.dec_blocks[0].top_slot_posterior.slot_to_top_prior(slots.contiguous(), h_prior_top, temperature=temperature)
         px_z, current_latents = self.decoder.forward_from_top_latent(
             z_slot_maps,
             t=t,
