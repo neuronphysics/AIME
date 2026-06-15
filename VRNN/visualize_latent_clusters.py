@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-
 import matplotlib
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
@@ -19,7 +18,7 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from umap import UMAP 
-from vdvae.top_dpgmm_prior import compute_slot_kl_conditional_frozen,  sample_slots_conditional_frozen, sample_slot_vectors_conditional_frozen
+from vdvae.top_dpgmm_prior import compute_slot_kl_conditional_frozen, sample_slots_conditional_frozen, sample_slot_vectors_conditional_frozen
 
 
 # --------------------------------------------------------------------------- #

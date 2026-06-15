@@ -74,6 +74,7 @@ mpmath
 mujoco
 mujoco-py
 networkx
+numba
 numpy
 oauthlib
 omegaconf
@@ -131,6 +132,7 @@ torchgan
 torchrec
 torchvision
 tqdm
+transformers
 triton
 typing_extensions
 tzdata

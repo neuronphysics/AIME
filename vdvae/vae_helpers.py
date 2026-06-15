@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Tuple, Union, Iterable, Any, Dict, Mapping
+from typing import List, Optional, Tuple, Union, Iterable, Any, Dict, Mapping, Callable, Sequence
 from torch import Tensor
 from einops import reduce
 import functools, math
@@ -67,6 +67,12 @@ class PositionalEncoding2D(nn.Module):
         self.cached_penc = emb[None, :, :, :orig_ch].repeat(tensor.shape[0], 1, 1, 1)
         return self.cached_penc
 
+def get_emb(sin_inp):
+    """
+    Gets a base embedding for one dimension with sin and cos intertwined
+    """
+    emb = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)
+    return torch.flatten(emb, -2, -1)
 
 class PositionalEncodingPermute2D(nn.Module):
     def __init__(self, channels, dtype_override=None):
@@ -132,7 +138,7 @@ class MLP(nn.Module):
 				 layernorm: Optional[str] = None,
 				 activate_output: bool = False,
 				 residual: bool = False,
-				 weight_init = None
+				 weight_init = "xavier_uniform"
 				):
 		super().__init__()
 
@@ -144,7 +150,7 @@ class MLP(nn.Module):
 		self.layernorm = layernorm
 		self.activate_output = activate_output
 		self.residual = residual
-		self.weight_init = weight_init
+		self.weight_init = normalize_weight_init(weight_init)
 
 		# submodules
 		## layernorm
@@ -165,8 +171,8 @@ class MLP(nn.Module):
 		for name, module in self.model.named_children():
 			if 'act' not in name:
 				# nn.init.xavier_uniform_(module.weight)
-				init_fn[weight_init['linear_w']](module.weight)
-				init_fn[weight_init['linear_b']](module.bias)
+				init_fn[self.weight_init['linear_w']](module.weight)
+				init_fn[self.weight_init['linear_b']](module.bias)
 
 	def forward(self, inputs: Array) -> Array:
 
@@ -204,7 +210,7 @@ class myGRUCell(nn.Module):
 				 hidden_size: int,
 				 gate_fn = torch.sigmoid,
 				 activation_fn = torch.tanh,
-				 weight_init = None
+				 weight_init = "xavier_uniform"
 				):
 		super().__init__()
 
@@ -212,7 +218,7 @@ class myGRUCell(nn.Module):
 		self.hidden_size = hidden_size
 		self.gate_fn = gate_fn
 		self.activation_fn = activation_fn
-		self.weight_init = weight_init
+		self.weight_init = normalize_weight_init(weight_init)
 
 		# submodules
 		self.dense_ir = nn.Linear(input_size, hidden_size)
@@ -307,7 +313,30 @@ def init_param(name, gain=1.):
     # return init_fn[name](tensor, gain)
     return functools.partial(init_fn[name], gain=gain)
 
+DEFAULT_WEIGHT_INIT_DICT = {
+    "linear_w": "xavier_uniform",
+    "linear_b": "zeros",
+}
 
+
+def normalize_weight_init(weight_init):
+    if weight_init is None:
+        return DEFAULT_WEIGHT_INIT_DICT.copy()
+
+    if isinstance(weight_init, str):
+        if weight_init not in init_fn:
+            raise ValueError(f"Unknown weight_init: {weight_init}")
+        return {
+            "linear_w": weight_init,
+            "linear_b": "zeros",
+        }
+
+    if isinstance(weight_init, dict):
+        out = DEFAULT_WEIGHT_INIT_DICT.copy()
+        out.update(weight_init)
+        return out
+
+    raise TypeError(f"weight_init must be str, dict, or None, got {type(weight_init)}")
 
 
 class SlotAttention(nn.Module):
@@ -323,7 +352,7 @@ class SlotAttention(nn.Module):
                  mlp_size: Optional[int] = None,
                  epsilon: float = 1e-8,
                  num_heads: int = 1,
-                 weight_init: str = 'xavier_uniform'
+                 weight_init: Union[str, Dict[str, str]] = 'xavier_uniform'
                 ):
         super().__init__()
 
@@ -334,13 +363,13 @@ class SlotAttention(nn.Module):
         self.mlp_size = mlp_size
         self.epsilon = epsilon
         self.num_heads = num_heads
-        self.weight_init = weight_init
+        self.weight_init = normalize_weight_init(weight_init)
         # other definitions
         self.head_dim = self.qkv_size // self.num_heads
 
         # shared modules
         ## gru
-        self.gru = myGRUCell(slot_size, slot_size, weight_init=weight_init)
+        self.gru = myGRUCell(slot_size, slot_size, weight_init=self.weight_init)
 
         ## weights
         self.dense_q = nn.Linear(slot_size, self.qkv_size, bias=False)

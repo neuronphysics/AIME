@@ -365,8 +365,8 @@ class DPGMMVariationalRecurrentAutoencoder(nn.Module):
         )
 
         slot_block = self.vdvae.decoder.dec_blocks[0].top_slot_posterior
+        anchors = slot_block.slots_init_mu.detach().to(device=device, dtype=dtype)
 
-        anchors = slot_block.slots_init_mu.weight.detach().to(device=device, dtype=dtype)
         anchors = anchors[:K]  # [K, slot_dim]
 
         # map through to_mu, because DPGMM is over slot_mu, not raw init slots.
