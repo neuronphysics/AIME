@@ -4,8 +4,8 @@
 #SBATCH --gpus=h100:1 
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=15
-#SBATCH --mem=100G
-#SBATCH --time=01-02:59:59
+#SBATCH --mem=180G
+#SBATCH --time=01-03:59:59
 #SBATCH --account=def-irina
 #SBATCH --output=/home/memole/links/projects/def-irina/memole/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.out
 #SBATCH --error=/home/memole/links/projects/def-irina/memole/AIME/logs/dpgmm-transit-run-seed-1_%N-%j.err
@@ -36,12 +36,12 @@ export CUDA_MODULE_LOADING=LAZY
 #pip install --no-index --no-cache-dir --no-deps "torch==2.5.1+computecanada" "sympy==1.13.1+computecanada" "torchvision==0.20.1+computecanada" "torchaudio==2.5.1+computecanada"
 # If TensorFlow is imported anywhere in the SAME training process:
 export TF_FORCE_GPU_ALLOW_GROWTH=true
-export OMP_NUM_THREADS=1
+export OMP_NUM_THREADS=4
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export BLIS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
-export PYTORCH_NUM_THREADS=1
+export PYTORCH_NUM_THREADS=4
 
 # keep Python from seeing ~/.local
 export PYTHONNOUSERSITE=1

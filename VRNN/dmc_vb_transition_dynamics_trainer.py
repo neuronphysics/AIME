@@ -1,3 +1,11 @@
+import os
+from pathlib import Path
+_SCRIPT_DIR_PREIMPORT = Path(__file__).resolve().parent
+_PROJECT_ROOT_PREIMPORT = _SCRIPT_DIR_PREIMPORT.parent
+_TORCH_HOME_PREIMPORT = _PROJECT_ROOT_PREIMPORT / "results" / "pretrained_weights"
+os.environ.setdefault("TORCH_HOME", str(_TORCH_HOME_PREIMPORT))
+_TORCH_HOME_PREIMPORT.mkdir(parents=True, exist_ok=True)
+
 import torch, torchvision
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,10 +19,11 @@ from tqdm import tqdm
 from collections import defaultdict
 import time, contextlib
 import tensorflow as tf
-import scipy.linalg
 import argparse
 import wandb
 from torchvision import transforms
+import scipy.linalg
+from urllib.parse import urlparse
 try:
     # completely disable TF GPUs (safest, simplest)
     tf.config.set_visible_devices([], 'GPU')
@@ -55,18 +64,66 @@ plt.ioff()
 
 
 class FIDScore:
-    def __init__(self, device):
-        self.device = device
-        # Initialize Inception network properly with modern practices
+    """
+    Frechet Inception Distance with torchvision Inception-v3 features.
+
+    This is meant as an internal run-to-run trend metric. TorchVision Inception
+    weights are not exactly the same as the TensorFlow pool3 network used in the
+    original FID paper, and small N is noisy.
+    """
+
+    def __init__(
+        self,
+        device,
+        feature_batch: int = 64,
+        keep_on_device: bool = False,
+        weights: str = "imagenet",
+    ):
+        self.device = torch.device(device)
+        self.feature_batch = max(1, int(feature_batch))
+        self.keep_on_device = bool(keep_on_device)
+
+        weights_name = str(weights).lower() if weights is not None else "none"
+        if weights_name in ("imagenet", "default", "true", "1"):
+            inception_weights = torchvision.models.Inception_V3_Weights.IMAGENET1K_V1
+            init_kwargs = {}
+            try:
+                
+                filename = os.path.basename(urlparse(inception_weights.url).path)
+                cached_path = Path(torch.hub.get_dir()) / "checkpoints" / filename
+                if cached_path.exists():
+                    print(f"[FID] Reusing cached Inception-v3 weights: {cached_path}")
+                else:
+                    print(f"[FID] Inception-v3 weights not found in cache; TorchVision may download them to: {cached_path}")
+            except Exception:
+                pass
+        elif weights_name in ("none", "random", "false", "0"):
+            inception_weights = None
+            init_kwargs = {"init_weights": True}
+            print("[FID] Using randomly initialized Inception-v3 weights; FID values are not meaningful.")
+        else:
+            raise ValueError(
+                "FIDScore weights must be one of: 'imagenet', 'default', 'none', or 'random'. "
+                f"Got {weights!r}."
+            )
+
         self.inception = torchvision.models.inception_v3(
-            weights=torchvision.models.Inception_V3_Weights.IMAGENET1K_V1,
-            transform_input=True
-        ).to(device)
-        # Remove final classification layer and set to features only
+            weights=inception_weights,
+            transform_input=False,
+            **init_kwargs,
+        )
         self.inception.aux_logits = False
         self.inception.fc = nn.Identity()
         self.inception.eval()
+        for p in self.inception.parameters():
+            p.requires_grad_(False)
 
+        # Keep the large Inception model off the training GPU except during FID.
+        self._home_device = self.device if self.keep_on_device else torch.device("cpu")
+        self.inception.to(self._home_device)
+
+
+ 
     def preprocess_images(self, images):
         """
         Preprocess images to match Inception-v3 expectations.
@@ -77,119 +134,110 @@ class FIDScore:
         """
         # Convert from [-1, 1] to [0, 255]
         images = (images + 1) /2.0  # Scale from [-1, 1] to [0, 1]
-
+ 
         # Resize to Inception input size
         images = F.interpolate(images.float(), size=(299, 299))
         # Apply ImageNet normalization
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         images = normalize(images)
-
+ 
         return images
 
     def get_features(self, images):
         """
-        Extract features using Inception-v3 network.
-        Args:
-            images: torch.Tensor of shape (N, 3, H, W) in range [-1, 1]
-        Returns:
-            features: torch.Tensor of shape (N, 2048)
+        Extract Inception-v3 features in small chunks and return CPU features.
         """
         if not isinstance(images, torch.Tensor):
             raise ValueError("Input must be a torch tensor")
 
-        if len(images.shape) != 4:
-            raise ValueError(f"Input must be a 4D tensor (B,C,H,W), got shape {images.shape}")
+        if images.dim() != 4:
+            raise ValueError(f"Input must be a 4D tensor (B,C,H,W), got shape {tuple(images.shape)}")
 
-        with torch.no_grad():
-            # Preprocess images
-            preprocessed_images = self.preprocess_images(images)
-            # Extract features
-            features = self.inception(preprocessed_images.to(self.device))
+        features = []
+        run_device = next(self.inception.parameters()).device
 
-        return features
+        with torch.inference_mode():
+            for i in range(0, images.shape[0], self.feature_batch):
+                chunk = images[i:i + self.feature_batch].to(run_device, non_blocking=True)
+                chunk = self.preprocess_images(chunk)
+                features.append(self.inception(chunk).float().cpu())
+                del chunk
 
-    def calculate_statistics(self, features):
+        if not features:
+            return torch.empty(0, 2048)
+
+        return torch.cat(features, dim=0)
+
+    @staticmethod
+    def calculate_statistics(features):
         """
-        Calculate mean and covariance statistics of features.
-        Args:
-            features: torch.Tensor of shape (N, 2048)
-        Returns:
-            mu: mean features
-            sigma: covariance matrix
+        Calculate mean and covariance statistics in float64 for stability.
         """
-        features = features.cpu().numpy()
+        features = features.cpu().numpy().astype(np.float64, copy=False)
         mu = np.mean(features, axis=0)
-
-        # Compute covariance
         sigma = np.cov(features, rowvar=False)
         return mu, sigma
 
-    def calculate_frechet_distance(self, mu1, sigma1, mu2, sigma2):
-
+    @staticmethod
+    def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps: float = 1e-6):
         """
-        Calculate Frechet distance between two sets of statistics.
-        Args:
-            mu1, mu2: mean features for each distribution
-            sigma1, sigma2: covariance matrices for each distribution
-        Returns:
-            fid: Frechet distance score
+        Calculate Frechet distance. Uses scipy.sqrtm when available and an SVD
+        fallback otherwise. Returns NaN instead of Inf on numerical failure.
         """
-        # Ensure covariance matrices are positive semi-definite
-        eps = np.finfo(np.float32).eps
-        sigma1 += np.eye(sigma1.shape[0]) * eps
-        sigma2 += np.eye(sigma2.shape[0]) * eps
+        mu1 = np.asarray(mu1, dtype=np.float64)
+        mu2 = np.asarray(mu2, dtype=np.float64)
+        sigma1 = np.asarray(sigma1, dtype=np.float64)
+        sigma2 = np.asarray(sigma2, dtype=np.float64)
 
-        # Compute mean difference
+        sigma1 = sigma1 + np.eye(sigma1.shape[0], dtype=np.float64) * eps
+        sigma2 = sigma2 + np.eye(sigma2.shape[0], dtype=np.float64) * eps
+
         diff = mu1 - mu2
-        mean_diff_sq = np.sum(diff**2)
-
-        # Compute sqrtm(sigma1 @ sigma2) with improved numerical stability
+        prod = sigma1 @ sigma2
         try:
-            covmean, _ = scipy.linalg.sqrtm(sigma1 @ sigma2, disp=False)
-            if np.iscomplexobj(covmean):
-                covmean = covmean.real  # Take only real part if imaginary component is negligible
+           covmean, _ = scipy.linalg.sqrtm(prod, disp=False)
+
+           if np.iscomplexobj(covmean):
+              covmean = covmean.real
         except ValueError:
             # SVD-based fallback for sqrtm computation
-            U, S, Vt = np.linalg.svd(sigma1 @ sigma2)
+            U, S, Vt = np.linalg.svd(prod)
             covmean = U @ np.diag(np.sqrt(S)) @ Vt
-
-        # Compute final FID score
-        trace_covmean = np.trace(covmean)
-        fid_score = mean_diff_sq + np.trace(sigma1) + np.trace(sigma2) - 2 * trace_covmean
-
-        return float(fid_score)
+            
+        fid_score = float(diff @ diff + np.trace(sigma1) + np.trace(sigma2) - 2.0 * np.trace(covmean))
+        return fid_score if np.isfinite(fid_score) else float("nan")
 
     def calculate_fid(self, real_images, fake_images):
         """
-        Calculate FID score between real and fake images.
-        Args:
-            real_images: torch.Tensor of shape (N, 3, H, W) in range [-1, 1]
-            fake_images: torch.Tensor of shape (N, 3, H, W) in range [-1, 1]
-        Returns:
-            fid_score: float, the FID score between the two sets of images
+        Calculate FID score between real and fake image tensors.
+        Returns NaN on failure so diagnostics do not kill or distort training.
         """
         try:
-            # Move images to correct device
-            real_images = real_images.to(self.device)
-            fake_images = fake_images.to(self.device)
+            if real_images.shape[0] < 2 or fake_images.shape[0] < 2:
+                print("[FID] Need at least two real and two fake images; skipping FID for this epoch.")
+                return float("nan")
 
-            # Extract features
-            real_features = self.get_features(real_images)
-            fake_features = self.get_features(fake_images)
+            moved_to_gpu = False
+            if not self.keep_on_device and self.device.type != "cpu":
+                self.inception.to(self.device)
+                moved_to_gpu = True
 
-            # Calculate statistics
+            try:
+                real_features = self.get_features(real_images)
+                fake_features = self.get_features(fake_images)
+            finally:
+                if moved_to_gpu:
+                    self.inception.to(self._home_device)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
             mu1, sigma1 = self.calculate_statistics(real_features)
             mu2, sigma2 = self.calculate_statistics(fake_features)
-
-            # Calculate FID score
-            fid_score = self.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
-
-            return fid_score
+            return self.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
 
         except Exception as e:
-            print(f"Error calculating FID: {str(e)}")
-            return float('inf')
-
+            print(f"[FID] Error calculating FID: {type(e).__name__}: {e}")
+            return float("nan")
 
 
 @contextmanager
@@ -1245,6 +1293,24 @@ PANELS = [
 ]
 TRACK_KEYS = sorted({k for _, ks, _ in PANELS for k, _ in ks})
 
+RC_PARAM = {
+            "savefig.dpi": 400,
+            "font.size": 9.5,
+            "axes.titlesize": 10.5,
+            "legend.fontsize": 7.6,
+            "xtick.labelsize": 8.3,
+            "ytick.labelsize": 8.3,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.grid": True,
+            "grid.alpha": 0.25,
+            "grid.linewidth": 0.6,
+            "lines.linewidth": 1.4,
+            "axes.prop_cycle": plt.cycler(color=OKABE_ITO),
+            "figure.constrained_layout.use": True,
+}
+
+
 
 def _ema(y, span):
     """Exponential moving average that leaves a gap (NaN) wherever y is non-finite."""
@@ -1289,7 +1355,6 @@ class LiveLossPlotter:
     @staticmethod
     def _coerce(v):
         try:
-            import torch
             if torch.is_tensor(v):
                 return float(v.detach().float().mean().item())
         except Exception:
@@ -1313,8 +1378,9 @@ class LiveLossPlotter:
         if not force and (int(epoch) % self.every != 0):
             return
         try:
-            self._render(int(epoch), epoch_history)
-        except Exception as e:                       # never kill a training run
+            with plt.rc_context(RC_PARAM):        
+                self._render(int(epoch), epoch_history)
+        except Exception as e:               # never kill a training run
             print(f"[LiveLossPlotter] render failed: {type(e).__name__}: {e}")
 
     def _render(self, epoch, epoch_history):
@@ -1323,24 +1389,18 @@ class LiveLossPlotter:
         stride = max(1, n // self.max_points)
         span = max(15, n // 200)
 
-        plt.rcParams.update({
-            "savefig.dpi": self.dpi, "font.size": 9.5, "axes.titlesize": 10.5,
-            "legend.fontsize": 7.6, "xtick.labelsize": 8.3, "ytick.labelsize": 8.3,
-            "axes.spines.top": False, "axes.spines.right": False,
-            "axes.grid": True, "grid.alpha": 0.25, "grid.linewidth": 0.6,
-            "lines.linewidth": 1.4, "axes.prop_cycle": plt.cycler(color=OKABE_ITO),
-            "figure.constrained_layout.use": True,
-        })
-
         panels = []
         for title, ks, sc in PANELS:
             live = [(k, lab) for k, lab in ks
-                    if k in self.series and np.isfinite(np.asarray(self.series[k])).any()]
+                    if k in self.series and np.isfinite(np.asarray(self.series[k], dtype=float)).any()]
             if live:
                 panels.append((title, live, sc))
+
+        eval_keys = ("eval/pred_psnr_t+1", "eval/pred_psnr_t+2", "eval/psnr", "eval/fid")
         has_eval_quality = bool(epoch_history) and any(
-            k in epoch_history and len(epoch_history[k]) for k in
-            ("eval/pred_psnr_t+1", "eval/pred_psnr_t+2", "eval/psnr", "eval/fid"))
+            k in epoch_history and len(epoch_history[k]) for k in eval_keys
+        )
+
         n_pan = len(panels) + (1 if has_eval_quality else 0)
         nc = 3
         nr = max(1, int(np.ceil(n_pan / nc)))
@@ -1353,35 +1413,58 @@ class LiveLossPlotter:
             ax.set_yscale(sc)
             ys_s = []
             for k, lab in ks:
-                y = np.asarray(self.series[k], float)
+                y = np.asarray(self.series[k], dtype=float)
                 c = ax._get_lines.get_next_color()
+
                 if k == "grad_norm":
-                    yz = np.where(y == 0, np.nan, y)   # gn==0 means NaN grads in this trainer
+                    yz = np.where(y == 0, np.nan, y)   # grad_norm==0 means NaN grads in this trainer
                     ax.plot(x_full[::stride], yz[::stride], alpha=0.16, lw=0.9, color=c)
-                    s = _ema(yz, span); ys_s.append(s)
+                    s = _ema(yz, span)
+                    ys_s.append(s)
                     ax.plot(x_full[::stride], s[::stride], color=c, label=lab)
                     z = np.isfinite(y) & (y == 0)
                     if z.any():
-                        ax.scatter(x_full[z][::stride], np.full(int(np.ceil(z.sum() / stride)), 0.035)[:len(x_full[z][::stride])],
-                                   s=5, color="#D00000", zorder=5, clip_on=False,
-                                   transform=ax.get_xaxis_transform(), label="g = NaN (logged 0)")
+                        xz = x_full[z][::stride]
+                        ax.scatter(
+                            xz,
+                            np.full(len(xz), 0.035),
+                            s=5,
+                            color="#D00000",
+                            zorder=5,
+                            clip_on=False,
+                            transform=ax.get_xaxis_transform(),
+                            label="g = NaN (logged 0)",
+                        )
                     continue
+
                 yp = np.clip(y, 1e-12, None) if sc == "log" else y
                 ax.plot(x_full[::stride], yp[::stride], alpha=0.16, lw=0.9, color=c)
-                s = _ema(yp, span); ys_s.append(s)
+                s = _ema(yp, span)
+                ys_s.append(s)
                 last = s[np.isfinite(s)][-1] if np.isfinite(s).any() else float("nan")
                 ax.plot(x_full[::stride], s[::stride], color=c, label=f"{lab} ({last:.3g})")
-            nan_x = _first_nan(x_full, [np.asarray(self.series[k], float) for k, _ in ks])
+
+            nan_x = _first_nan(x_full, [np.asarray(self.series[k], dtype=float) for k, _ in ks])
             if nan_x is not None:
                 ax.axvline(nan_x, color="#D00000", ls="--", lw=1.1)
                 right = nan_x > 0.5 * n
-                ax.text(nan_x, 0.03, "first NaN " if right else " first NaN",
-                        color="#D00000", fontsize=7.5, ha="right" if right else "left",
-                        va="bottom", transform=ax.get_xaxis_transform())
+                ax.text(
+                    nan_x,
+                    0.03,
+                    "first NaN " if right else " first NaN",
+                    color="#D00000",
+                    fontsize=7.5,
+                    ha="right" if right else "left",
+                    va="bottom",
+                    transform=ax.get_xaxis_transform(),
+                )
+
             ax.set_title(title)
             ax.legend(frameon=False, ncol=2 if len(ks) > 3 else 1)
-            allv = np.concatenate([s[np.isfinite(s)] for s in ys_s if np.isfinite(s).any()]
-                                  or [np.array([0.0])])
+            allv = np.concatenate(
+                [s[np.isfinite(s)] for s in ys_s if np.isfinite(s).any()]
+                or [np.array([0.0])]
+            )
             if ax.get_yscale() == "linear" and allv.size > 4:
                 lo, hi = np.percentile(allv, [0.5, 99.5])
                 pad = 0.08 * (hi - lo + 1e-12)
@@ -1390,30 +1473,48 @@ class LiveLossPlotter:
 
         if has_eval_quality:
             ax = axes[len(panels)]
-            for k, lab in (("eval/pred_psnr_t+1", "PSNR t+1"),
-                           ("eval/pred_psnr_t+2", "PSNR t+2"),
-                           ("eval/psnr", "recon PSNR")):
+
+            ep_x = None
+            if epoch_history and "epoch" in epoch_history and len(epoch_history["epoch"]):
+                ep_x = np.asarray(epoch_history["epoch"], dtype=float)
+
+            def finite_epoch_series(key):
+                v = np.asarray(epoch_history[key], dtype=float)
+                x = ep_x if (ep_x is not None and len(ep_x) == len(v)) else np.arange(len(v), dtype=float)
+                m = np.isfinite(v)
+                return x[m], v[m]
+
+            for k, lab in (
+                ("eval/pred_psnr_t+1", "PSNR t+1"),
+                ("eval/pred_psnr_t+2", "PSNR t+2"),
+                ("eval/psnr", "recon PSNR"),
+            ):
                 if epoch_history and k in epoch_history and len(epoch_history[k]):
-                    v = np.asarray(epoch_history[k], float)
-                    ax.plot(np.arange(len(v)), v, marker="o", ms=2.8, label=lab)
+                    xs, vs = finite_epoch_series(k)
+                    if len(xs):
+                        ax.plot(xs, vs, marker="o", ms=2.8, label=lab)
 
             if epoch_history and "eval/fid" in epoch_history and len(epoch_history["eval/fid"]):
-                ax2 = ax.twinx()
-                v = np.asarray(epoch_history["eval/fid"], float)
-                ax2.plot(np.arange(len(v)), v, marker="s", ms=2.8, linestyle="--", label="FID")
-                ax2.set_ylabel("FID lower is better")
+                xs, vs = finite_epoch_series("eval/fid")
+                if len(xs):
+                    ax2 = ax.twinx()
+                    ax2.plot(xs, vs, marker="s", ms=2.8, ls="--", color="#000000", label="FID")
+                    ax2.set_ylabel("FID (lower is better)")
+                    ax2.spines.right.set_visible(True)
 
-                lines1, labels1 = ax.get_legend_handles_labels()
-                lines2, labels2 = ax2.get_legend_handles_labels()
-                ax.legend(lines1 + lines2, labels1 + labels2, frameon=False, loc="best")
+                    lines1, labels1 = ax.get_legend_handles_labels()
+                    lines2, labels2 = ax2.get_legend_handles_labels()
+                    ax.legend(lines1 + lines2, labels1 + labels2, frameon=False, loc="best")
+                else:
+                    ax.legend(frameon=False)
             else:
                 ax.legend(frameon=False)
 
             ax.set_title("eval quality per epoch")
             ax.set_xlabel("epoch")
-            ax.set_ylabel("PSNR higher is better")
+            ax.set_ylabel("PSNR (higher is better)")
 
-        # epoch boundaries on step-axis panels, only while still legible
+        # Epoch boundaries on step-axis panels, only while still legible.
         ep = np.asarray(self.epoch_of)
         bnd = np.flatnonzero(np.diff(ep)) + 1
         if 0 < len(bnd) <= 30:
@@ -1421,10 +1522,12 @@ class LiveLossPlotter:
                 for b in bnd:
                     ax.axvline(b, color="0.78", lw=0.5, zorder=0)
 
-        fig.suptitle(f"loss convergence   epoch {epoch}   {n} steps   "
-                     f"updated {time.strftime('%H:%M:%S')}", fontsize=12)
+        fig.suptitle(
+            f"loss convergence   epoch {epoch}   {n} steps   updated {time.strftime('%H:%M:%S')}",
+            fontsize=12,
+        )
         tmp = self.path.with_name(self.path.stem + ".tmp.png")
-        fig.savefig(tmp)
+        fig.savefig(tmp, dpi=self.dpi)
         os.replace(tmp, self.path)          # atomic: the PNG is never half-written
         if self.also_pdf:
             fig.savefig(self.path.with_suffix(".pdf"))
@@ -1552,8 +1655,16 @@ class DMCVBTrainer:
         self.fid_max_batches = int(config.get("fid_max_batches", config.get("fid_num_batches", 5)))
         self.fid_max_images = int(config.get("fid_max_images", 512))
 
-        self.fid_metric = FIDScore(self.device) if self.compute_fid else None
-        
+        self.fid_metric = (
+            FIDScore(
+                self.device,
+                feature_batch=int(config.get("fid_feature_batch", 256)),
+                keep_on_device=bool(config.get("fid_keep_on_device", False)),
+                weights=config.get("fid_weights", "imagenet"),
+            )
+            if self.compute_fid else None
+        )
+
         self.grad_monitor = GradientMonitor(model, self.writer)  # Initialize without writer first
         task_names = ["ELBO", "adversarial"]
         self._agg = GradDiagnosticsAggregator(task_names,
@@ -1856,8 +1967,10 @@ class DMCVBTrainer:
             and epoch % self.fid_every == 0
             and len(fid_real_batches) > 0
         ):
-            real_fid = torch.cat(fid_real_batches, dim=0).to(self.device)
-            fake_fid = torch.cat(fid_fake_batches, dim=0).to(self.device)
+            # Keep the collected frames on CPU here. FIDScore moves only small chunks
+            # to the target device, which avoids a large one-shot GPU allocation.
+            real_fid = torch.cat(fid_real_batches, dim=0)
+            fake_fid = torch.cat(fid_fake_batches, dim=0)
 
             # Optional cap so Inception does not become too expensive.
             fid_max_images = int(self.config.get("fid_max_images", 512))
@@ -1867,6 +1980,11 @@ class DMCVBTrainer:
 
             fid_score = self.fid_metric.calculate_fid(real_fid, fake_fid)
             eval_metrics["fid"].append(float(fid_score))
+
+            del real_fid, fake_fid
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         # Compute averages
         avg_metrics = {f'eval/{k}': np.mean(v) for k, v in eval_metrics.items()}
         pred_metrics = self.evaluate_two_step_prediction(epoch, num_batches=5, T_ctx=8)
@@ -2748,19 +2866,19 @@ class DMCVBTrainer:
                         f"epoch's gradient diagnostics. {e}"
                     )
                     # Drop any half-built state
-                    
+
                 finally:
                     self.model.zero_grad(set_to_none=True)
                     self.model.train()  # ensure we're back in train mode
                     gc.collect()
                     torch.cuda.empty_cache()
                     torch.cuda.ipc_collect()
-                    
+
 
         if self.writer:
             self.writer.close()
         print("Training completed!")
-        
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train DPGMM-VRNN transition dynamics on DMC VB data"
