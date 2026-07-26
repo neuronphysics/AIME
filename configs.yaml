@@ -69,7 +69,7 @@ defaults:
   shs_imag_mode: actor_moment     # blocker 7: actor_moment (differentiable, actor training) | eval_sample (categorical) | reinforce_sample
   shs_global_source: replay_ema   # replay_ema | completed_episode_stream | offline_memoized (blocker 1: separates replay-EMA from absorb-once episode ingestion)
   shs_repr_epoch_steps: 0     # review P0 #4: refresh the frozen SHS target every N steps (0=hold one epoch for the whole run)
-  shs_stream_episodes: False  # round-15: absorb each completed episode ONCE into persistent SHS stats (needs a streaming shs_online_mode)
+  shs_stream_episodes: False  # absorb each completed episode ONCE into persistent SHS stats (needs a streaming shs_online_mode)
   shs_consolidate_every_episodes: 0   # 0=off; else run frozen-rep consolidation every N completed episodes
   shs_consolidate_warmup: 100000      # env steps before the first consolidation
   shs_consolidate_batches: 8          # replay batches forming the frozen corpus
@@ -89,7 +89,7 @@ defaults:
   shs_hdp_every: 1            # item 18: run HDP root-stick optimisation every Nth global step
   shs_pg_every: 1             # item 18: refresh recurrent PG block every Nth global step
   shs_strict_stream: False    # streaming only: reject non-integer/gap ids (no id-set fallback)
-  shs_action_dim: 0           # >0: per-regime action term B_k a_{t-1} in the conjugate regressor (round-12)
+  shs_action_dim: 0           # >0: per-regime action term B_k a_{t-1} in the conjugate regressor 
   shs_merge_topm: null        # recurrent/low-rank merge: exact-refit only the top-M ranked pairs
   shs_online_mode: ema        # ema (Dreamer replay default) | full_batch | streaming | memoized. memoized REQUIRES
                               # stable batch ids (SHSRSSM.set_batch_id / consolidation / offline fitting) and now
@@ -170,7 +170,7 @@ shs_strict:
   # (SHSRSSM.set_batch_id per corpus chunk); live replay without stable partitions is
   # rejected for streaming/full_batch and fails loudly for memoized without ids.
   # A complete profile on its own: enables the SHS head and continuous latents
-  # (round-4 review, issue 6) -- no additional SHS environment preset required.
+  # no additional SHS environment preset required.
   use_shs: True
   dyn_discrete: 0
   shs_strict_elbo: True

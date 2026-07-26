@@ -99,8 +99,8 @@ class MoveBuffer:
     def purge_stale(self, current_version) -> int:
         """Drop every buffered batch whose repr_version differs from the current
         one. A live ring can never legitimately hold pre-bump latents (the raw
-        observations are gone), so staleness is PURGED, never silently mixed
-        (round-4 review, issue 1). Returns the number of entries dropped."""
+        observations are gone), so staleness is PURGED, never silently mixed. 
+        Returns the number of entries dropped."""
         before = len(self.batches)
         self.batches = [b for b in self.batches
                         if b.repr_version is None
@@ -114,7 +114,7 @@ class MoveBuffer:
         if any(i is None for i in ids) or len(set(ids)) != len(ids):
             return False                       # anonymous or duplicated partitions
         if self.expected_ids is not None:
-            return set(ids) == self.expected_ids     # EXACT set (round-5 review): no foreign/missing ids
+            return set(ids) == self.expected_ids     # EXACT set: no foreign/missing ids
         if self.expected_batches is None:
             return False                       # no certificate declared -> never complete
         return len(set(ids)) == self.expected_batches
@@ -175,8 +175,7 @@ def _validate_buffer(head, buf):
         # The single-version requirement applies ONLY to a COMPLETE (whole-corpus)
         # buffer, whose "gain on the whole corpus" reading needs one encoder version.
         # A live (non-complete) ring is a recent-data proposal buffer scored by exact
-        # acceptance; mixing recent versions in it is sound and must NOT raise
-        # (round-5 review, issue 1 -- avoiding both the round-4 crash and its purge).
+        # acceptance; mixing recent versions in it is sound and must NOT raise.
         cur = int(head.repr_version)
         stale = [b.batch_id for b in buf.batches
                  if b.repr_version is not None and b.repr_version != cur]
@@ -326,7 +325,7 @@ def _current_stats(regimes: DiagARRegimes):
     if getattr(regimes, "q_rank", 0) > 0 and hasattr(regimes, "Szf"):
         # Bayes-U factor statistics ride the candidate stats, so merge/delete
         # candidates refit q(U) from REAL evidence via _update_qU instead of
-        # collapsing every regime to the zero-loading saddle (round-4 review, 3)
+        # collapsing every regime to the zero-loading saddle 
         for nm in ("Szf", "Sfr", "Sfh", "Sff"):
             s[nm] = getattr(regimes, nm).clone()
     return s
@@ -337,8 +336,8 @@ def _merge_stats(stats, i, j):
     s = {k: v.clone() for k, v in stats.items()}
     # The factor statistics Szf/Sfr/Sfh/Sff live in each regime's ARBITRARY factor
     # basis (the low-rank model is invariant under U_k -> U_k R, f_tk -> R^T f_tk for
-    # orthogonal R), so summing them across two regimes is basis-inconsistent
-    # (round-5 review, issue 3). Correctness is already guaranteed downstream --
+    # orthogonal R), so summing them across two regimes is basis-inconsistent. 
+    #Correctness is already guaranteed downstream --
     # _refine recomputes q(f) and every factor moment from the buffer under the merged
     # U, so the SCORED bound does not depend on the seed basis -- but we also make the
     # SEED basis-consistent: the merged row inherits the dominant parent's factor
@@ -514,14 +513,14 @@ def _apply(head, regimes, hdp, C, start, rstick=None, row_map=None):
     K_old = int(head.K)
     head.regimes = regimes
     if hasattr(regimes, "_freeze_C"):
-        # ROUND-12 review item 10: scoring clones freeze the tied carry C; the
+        # Scoring clones freeze the tied carry C; the
         # ACCEPTED model must resume learning C or every later episode trains
         # against a frozen drift.
         regimes._freeze_C = False
     head.hdp = hdp
     head.K = regimes.K
     if hasattr(head, "bump_struct_gen"):
-        head.bump_struct_gen()   # round-9: re-identify states for async deltas
+        head.bump_struct_gen()   # re-identify states for async deltas
     if getattr(head, "rstick", None) is not None:
         if rstick is not None:
             # install the candidate's buffer-refit, row-mapped stickiness posterior
@@ -690,8 +689,8 @@ def merge_move(head, stoch=None, deter=None, is_first=None, *, buffer=None,
         # diagonal stationary model. For the recurrent model it omits the PG/JJ expected
         # transition-likelihood term, and for q_rank>0 the factor evidence is a diagonal
         # surrogate -- either can reject a pair that improves the full bound. So for those
-        # models we evaluate EVERY pair with the exact aggregated bound (round-5 review,
-        # issue 2): correct, at O(K^2) exact confirmations.
+        # models we evaluate EVERY pair with the exact aggregated bound: 
+        # correct, at O(K^2) exact confirmations.
         _exact_all = bool(head.recurrent) or int(getattr(head.regimes, "q_rank", 0)) > 0
         pairs = None
         if merge_select == "hughes" and not _exact_all:
@@ -702,7 +701,7 @@ def merge_move(head, stoch=None, deter=None, is_first=None, *, buffer=None,
                      for i in range(K) for j in range(i + 1, K)]
             pairs.sort(key=lambda t: -t[2])
             if _exact_all and merge_topm is not None:
-                # ROUND-11 cost fix: Hughes-style top-M SCREENING for the recurrent /
+                # Hughes top-M SCREENING for the recurrent /
                 # low-rank models. The residual ranking is a PROPOSAL heuristic only --
                 # acceptance below is still the exact refit + whole-buffer bound, so a
                 # harmful merge can never be accepted; a beneficial one can be missed.
@@ -1057,7 +1056,7 @@ def sweep_moves(head, stoch=None, deter=None, is_first=None, *, buffer=None,
     increases L -- now including the recurrent-stickiness factors when recurrence is active,
     since base and candidates are scored under the same PG/JJ-bounded recurrent ELBO.
     """
-    # ROUND-16 review blocker 4 (honest labeling): birth/split redistribute the data
+    # (honest labeling): birth/split redistribute the data
     # currently in the move BUFFER exactly, but when the persistent globals are a
     # constant-memory STREAMING aggregate, historical mass OUTSIDE the buffer cannot
     # be re-split -- so on a streaming store birth/split are APPROXIMATE model
@@ -1070,7 +1069,7 @@ def sweep_moves(head, stoch=None, deter=None, is_first=None, *, buffer=None,
         import warnings
         warnings.warn("birth/split on a streaming aggregate are APPROXIMATE (historical "
                       "mass outside the move buffer is not re-split); use offline_memoized "
-                      "consolidation for exact model selection (round-16 blocker 4).")
+                      "consolidation for exact model selection.")
         head._warned_stream_birth = True
     buf = _as_buffer(buffer, stoch, deter, is_first, head=head, action=action)
     s = create_bonus if size_log_prior_odds is None else size_log_prior_odds
@@ -1101,8 +1100,8 @@ def sweep_moves(head, stoch=None, deter=None, is_first=None, *, buffer=None,
         # Hughes post-move consistency: rebuild the memoized ledger under the INSTALLED
         # candidate over the certified complete buffer, so subsequent global updates
         # start from the accepted model's own whole-corpus statistics instead of the
-        # row-remapped pre-move summaries (external review, round 2). The row remap in
+        # row-remapped pre-move summaries. The row remap in
         # _apply remains the mid-sweep safety net between multiple accepts. The rebuild
-        # finishes with one global step from the COMPLETE totals (round 3).
+        # finishes with one global step from the COMPLETE totals.
         head.resync_store_from_buffer(buf)
     return log

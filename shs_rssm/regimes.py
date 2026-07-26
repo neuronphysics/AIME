@@ -133,7 +133,7 @@ class DiagARRegimes(nn.Module):
             raise ValueError(
                 "q_rank>0 on the non-shared path (DiagARRegimes) evaluated an inflated "
                 "PREDICTIVE density instead of the ELBO likelihood and carried a "
-                "point-estimated U with no posterior or KL (external review, round 3). "
+                "point-estimated U with no posterior or KL. "
                 "Use shared_carry=True: SharedCarryRegimes implements the fully "
                 "variational factor-augmented low-rank noise (local f_t ~ N(0,I), "
                 "Gaussian q(U) with prior and KL, exact conditional q(f)). "
@@ -315,7 +315,7 @@ class DiagARRegimes(nn.Module):
         from predictive_cov, and the regressor-UNCERTAINTY term adds only:
           - the diagonal inflation extra_gVg * D of the diagonal noise;
           - the cross-output columns M diag(sqrt(g_var)) (= M diag(g_var) M^T).
-        It does NOT scale the factor U_fac U_fac^T (round-12 review item 11: f indep. tau).
+        It does NOT scale the factor U_fac U_fac^T (f is independent of tau).
         The Dreamer low-rank sampler reads the factor width dynamically, so the wider U is
         drawn correctly. For q_rank==0 the covariance is genuinely diagonal and the
         off-diagonal cannot be represented in a zero-column factor, so that path keeps the
@@ -327,7 +327,7 @@ class DiagARRegimes(nn.Module):
         Vdiag = torch.diagonal(self.V, dim1=-2, dim2=-1)
         extra_gVg = torch.einsum("kg,...g->...k", Vdiag, g_var)
         if self.q_rank > 0:
-            # ROUND-12 review, item 11: regressor UNCERTAINTY (g_var) inflates the diagonal
+            # regressor UNCERTAINTY (g_var) inflates the diagonal
             # noise (extra_gVg * q_Ddiag) and adds the mean-map cross-output covariance
             # M diag(g_var) M^T (U_extra), but does NOT re-scale the factor covariance
             # U0 U0^T -- the factor f is independent of the noise precision tau. The old
@@ -364,7 +364,7 @@ class DiagARRegimes(nn.Module):
             U = d.new_zeros(d.shape + (0,))                       # (...,K,L,0)
         return mean, d, U
 
-    # ------------------------------------------------------ sufficient stats
+    # sufficient statistics for one batch
     def stats_from_batch(self, resp: torch.Tensor, z: torch.Tensor, g: torch.Tensor,
                          z_var: torch.Tensor = None, g_z_var: torch.Tensor = None):
         """Responsibility-weighted sufficient statistics for one batch.
@@ -440,7 +440,7 @@ class DiagARRegimes(nn.Module):
         for name, S in pairs:
             S.mul_(1.0 - tau).add_(tau * stats[name])
 
-    # --------------------------------------------------------- closed-form M-step
+    # closed-form M-step
     @torch.no_grad()
     def m_step(self):
         """Closed-form MNIW (diagonal) update of the posterior from current stats."""
@@ -644,7 +644,7 @@ class DiagARRegimes(nn.Module):
             new.m_step()
         return new
 
-    # ------------------------------------------------------------------ convenience
+    # convenience function for a full-batch fit (stats from a batch, then M-step)
     @torch.no_grad()
     def fit_full_batch(self, resp, z, g, n_iter: int = 1):
         """Convenience: set stats from a batch and run the closed-form M-step.

@@ -70,7 +70,7 @@ class SharedCarryRegimes(nn.Module):
         identity_init: bool = True,
         jitter: float = 1e-6,
         q_rank: int = 0,              # only diagonal supported on the shared-carry path
-        action_dim: int = 0,          # round-12 item 13: action joins the regime regressor r
+        action_dim: int = 0,          # action joins the regime regressor r
         infl_max: float = 10.0,
         n_block_iters: int = 3,       # block-coordinate (regime <-> C) sweeps per m_step
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
@@ -143,7 +143,7 @@ class SharedCarryRegimes(nn.Module):
             # uncertainty tr Cov(U) SEPARATE, so only the noise is inflated by (1+rVr).
             self.register_buffer("_q_taudiag", torch.full((K, L), float(b0), dtype=dtype, device=device))
             self.register_buffer("_q_Udiag", torch.zeros((K, L), dtype=dtype, device=device))
-            # fully variational factor augmentation (review round 3): z = A r + C h~ + U f + eps,
+            # fully variational factor augmentation : z = A r + C h~ + U f + eps,
             # f_t ~ N(0, I_F) local latents, rows u_{k,i} ~ N(0, u_prior_scale I) with Gaussian
             # posterior q(u_{k,i}) = N(Umean[k,i], Ucov[k,i]). (Ufac, q_Ddiag) above become
             # DERIVED moment-matched predictive caches; the fitting path never reads them.
@@ -258,7 +258,7 @@ class SharedCarryRegimes(nn.Module):
             - 0.5 * carry_fluc
         )
         if self.q_rank > 0:
-            # Fully variational low-rank noise by FACTOR AUGMENTATION (review round 3):
+            # Fully variational low-rank noise by FACTOR AUGMENTATION:
             # z = A r + C h~ + U f + eps with f_t ~ N(0, I_F) local and Gaussian q(U).
             # The per-(t,k) evidence is the f-PROFILED bound
             #   ell = E_{q(f*)}[E_q log N(z; Ar+Ch+Uf, diag(1/tau))] - KL(q(f*)||N(0,I))
@@ -283,7 +283,7 @@ class SharedCarryRegimes(nn.Module):
             out = out + 0.5 * (quadf - logdetP)
         return out
 
-    # ----------------------------------------------- predictive (mixture prior)
+    # predictive (mixture prior)
     def predictive(self, g: torch.Tensor):
         """Posterior-predictive mean and DIAGONAL covariance per regime (Eq 33/34).
 
@@ -298,7 +298,7 @@ class SharedCarryRegimes(nn.Module):
         infl = (1.0 + rVr).clamp(max=self.infl_max).unsqueeze(-1)  # (...,K,1)
         carry_var = self._hVCh(htil).unsqueeze(-2)               # (...,1,L) shared across regimes
         if self.q_rank > 0:
-            # round-16 review blocker 6: q(U) is INDEPENDENT of (A,tau), so the factor
+            # q(U) is INDEPENDENT of (A,tau), so the factor
             # variance sum(Ufac^2) = E[U]E[U]^T diagonal is NOT inflated by the
             # coefficient-uncertainty (1+rVr); only the tau-scaled diagonal noise is.
             # This makes predictive() consistent with the (already-fixed) predictive_cov.
@@ -341,7 +341,7 @@ class SharedCarryRegimes(nn.Module):
         E_r[Q(r)] + M diag(r_var) M^T.  The regressor-uncertainty term inflates the
         DIAGONAL noise (extra_rVr * q_Ddiag) and adds the cross-output columns
         M diag(r_var) M^T (kept in full as extra U columns); it does NOT scale the factor
-        covariance U0 U0^T (round-12 review item 11: f is independent of tau).
+        covariance U0 U0^T (f is independent of tau).
         """
         mean, d, U = self.predictive_cov(g)
         if g_var is None:
@@ -351,7 +351,7 @@ class SharedCarryRegimes(nn.Module):
         Vdiag = torch.diagonal(self.V, dim1=-2, dim2=-1)
         extra_rVr = torch.einsum("kr,...r->...k", Vdiag, r_var)
         if self.q_rank > 0:
-            # ROUND-12 review, item 11: regressor UNCERTAINTY (r_var) propagates through the
+            # regressor UNCERTAINTY (r_var) propagates through the
             # mean map -- giving the cross-output term M diag(r_var) M^T (U_extra) and the
             # diagonal inflation extra_rVr * q_Ddiag -- but it must NOT re-scale the
             # independent factor covariance U0 U0^T (the factor f is independent of the
@@ -385,7 +385,7 @@ class SharedCarryRegimes(nn.Module):
         if self.q_rank > 0:
             # review Important #1: inflate tau-noise only; add tr Cov(U) un-inflated.
             d = infl.unsqueeze(-1) * self._q_taudiag + self._q_Udiag + carry_var    # (...,K,L)
-            # round-14 review: q(U) is INDEPENDENT of the (A,tau) Normal-Gamma block, so the
+            # q(U) is INDEPENDENT of the (A,tau) Normal-Gamma block, so the
             # factor loading U0 U0^T is NOT scaled by the coefficient-uncertainty inflation
             # (1+rVr) -- only the tau-scaled diagonal noise is inflated (f is indep. of tau).
             U = torch.ones_like(infl).unsqueeze(-1).unsqueeze(-1) * self.Ufac  # (...,K,L,r) UNSCALED
@@ -395,7 +395,7 @@ class SharedCarryRegimes(nn.Module):
             U = d.new_zeros(d.shape + (0,))
         return mean, d.clamp_min(1e-8), U
 
-    # ------------------------------------------------------ sufficient stats
+    # sufficient statistics for one batch
     def stats_from_batch(self, resp: torch.Tensor, z: torch.Tensor, g: torch.Tensor,
                          z_var: torch.Tensor = None, g_z_var: torch.Tensor = None):
         """Responsibility-weighted RAW sufficient statistics for one batch.
@@ -486,7 +486,7 @@ class SharedCarryRegimes(nn.Module):
                 # the factor statistics are RAW (C-free) accumulations in BOTH
                 # conventions -- _update_qU forms the residual combination itself
                 # (Syf = Szf - C Sfh) -- so a candidate clone installs them as-is.
-                # Dropping them here was the round-4 issue-3 collapse: the clone
+                # Dropping them here was the collapse: the clone
                 # refit q(U) from zero factor evidence and every surviving regime
                 # lost its learned loadings on installation.
                 for _nm in ("Szf", "Sfr", "Sfh", "Sff"):
@@ -576,7 +576,7 @@ class SharedCarryRegimes(nn.Module):
         # Rows with NO factor evidence (all-zero Sff: freshly born states, or a
         # clone handed statistics from before a state existed) KEEP their current
         # q(U): overwriting them with the exact zero of empty stats would pin them
-        # to the loading saddle forever (round-4 review, issue 3). Constructor
+        # to the loading saddle forever. Constructor
         # initialisation is saddle-broken, so kept rows acquire evidence at their
         # next E-step.
         evid = (self.Sff.abs().sum(dim=(-2, -1)) > 0)                  # (K,)
@@ -690,7 +690,7 @@ class SharedCarryRegimes(nn.Module):
 
     @torch.no_grad()
     def reset_slot(self, k):
-        """ROUND-24 review P1 #9: reset regime slot k to its PRIOR (a fresh regime) and clear
+        """reset regime slot k to its PRIOR (a fresh regime) and clear
         its sufficient statistics -- the parameter side of a fixed-Kmax birth (activate a
         spare + reset it) or delete (deactivate + clear), so structural moves never resize."""
         k = int(k)
@@ -834,7 +834,7 @@ class SharedCarryRegimes(nn.Module):
             K=new_K, L=self.L, G=self.G, a0=float(self.a0), b0=float(self.b0),
             v0_scale=1.0, vC0_scale=float(self.vC0), ard=False, identity_init=False,
             jitter=self.jitter, q_rank=self.q_rank, action_dim=self.action_dim,
-            device=self.M.device, dtype=self.M.dtype,   # round-13 review item 3/7: keep action_dim
+            device=self.M.device, dtype=self.M.dtype,   # keep action_dim
         )
         new.lam0_diag.copy_(self.lam0_diag)
         new.M0.copy_(self.M0)

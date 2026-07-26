@@ -1,13 +1,5 @@
 """Exactly-once completed-episode ingestion for persistent streaming SHS-VB.
 
-Round-16 review blocker 2. `simulate()` pushes each ACTUALLY completed episode into the
-queue as ``(monotonic_id, data)``; the consumer drains it in id order EXACTLY ONCE and
-routes each episode through ``stream_episode`` (absorb-once). Episodes are never recovered
-by random replay sampling, so there is no double-count, no omission, and no ingestion of an
-active/incomplete episode. The next id, the consumed watermark and the pending id list are
-checkpointed; on resume the pending episodes are re-fetched from replay by id (their tensor
-payloads are not serialised here -- they live in the replay store).
-
 This is the queue DATA STRUCTURE and its contract, fully unit-tested. Wiring `simulate()`
 to call `push` on real episode-completion events is Dreamer-loop integration; the trigger
 is provided (see dreamer.py) but not executed in the test environment.

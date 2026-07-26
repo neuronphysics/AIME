@@ -204,7 +204,7 @@ def simulate(
             # logging for done episode
             for i in indices:
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
-                # ROUND-26 review P0 #3: fire an exactly-once completion hook with the
+                # fire an exactly-once completion hook with the
                 # DURABLE replay key (the saved filename stem) and the EXACT episode
                 # payload -- no random sampling. Guarded so a callback error never breaks
                 # the rollout loop.
@@ -333,7 +333,7 @@ def from_generator(generator, batch_size):
 
 
 def episode_to_batch(ep, max_len=500):
-    """ROUND-26 review P0 #3: convert ONE loaded episode dict into a single (1,T,...) batch
+    """Convert ONE loaded episode dict into a single (1,T,...) batch
     in the training dataset format (same transform sample_whole_episodes applies per episode),
     so the exactly-once fetched episode feeds WorldModel.preprocess/encoder unchanged."""
     if ep is None:
@@ -418,7 +418,7 @@ def sample_episodes(episodes, length, seed=0):
 
 
 def load_episode_by_key(directory, key):
-    """ROUND-26 review P0 #3: load the EXACT completed episode by its durable replay key
+    """Load the EXACT completed episode by its durable replay key
     (the filename stem written by save_episodes, e.g. "<env_id>-<length>"), so the
     completed-episode queue ingests precisely the episode that finished -- never a random
     replay sample. Returns the episode dict, or None if the file is absent."""

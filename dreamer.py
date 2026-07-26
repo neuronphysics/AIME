@@ -73,7 +73,7 @@ class Dreamer(nn.Module):
         )[config.expl_behavior]().to(self._config.device)
 
     def _shs_stream_enqueue(self, env_id, key, payload):
-        """ROUND-26 review P0 #3: exactly-once enqueue at the REAL episode-completion event
+        """Exactly-once enqueue at the REAL episode-completion event
         (called from tools.simulate). Pushes the DURABLE replay key AND the exact payload so
         the transactional drain ingests precisely the finished episode. Active only when SHS
         completed-episode streaming is configured."""
@@ -148,18 +148,18 @@ class Dreamer(nn.Module):
                     for _k, _v in cons.items():
                         self._logger.scalar(_k, _v)
 
-            # ROUND-15 review issues 1/2: absorb-ONCE persistent streaming of completed
+            # absorb-ONCE persistent streaming of completed
             # episodes into the SHS sufficient-statistic archive (separate from replay
             # training and from consolidation moves). Off unless `shs_stream_episodes` and a
             # streaming online_mode.
             #
-            # ROUND-19 blocker 2/3 (push side + long-horizon epoch): each COMPLETED episode
+            # (push side + long-horizon epoch): each COMPLETED episode
             # (reset>0) is PUSHED to the exactly-once queue; a long-horizon representation
             # epoch is opened around the drain so all episodes ingested in one burst share a
             # FROZEN target encoder; the queue drains exactly once (monotonic ids, watermark
             # checkpointed) and routes to stream_completed_episodes.
             #
-            # ROUND-26 review P0 #3: episodes are ENQUEUED at the real completion event in
+            # episodes are ENQUEUED at the real completion event in
             # tools.simulate (on_episode_complete -> _shs_stream_enqueue) with their DURABLE
             # replay keys, so here we drain TRANSACTIONALLY and fetch the EXACT episodes by
             # key -- never a random replay sample. The count, watermark and payloads are all
@@ -186,7 +186,7 @@ class Dreamer(nn.Module):
                                 _sbatches.append(_b)
                         if _sbatches:
                             self._wm._shs_reservoir_add(_sbatches)   # review P1 #7: retain for rebuild
-                            # review P0 #4: ONE persistent frozen-target epoch (idempotent begin,
+                            # ONE persistent frozen-target epoch (idempotent begin,
                             # NOT closed per drain) so accumulated stats never mix two versions;
                             # refresh only on a long cadence (rebuild-from-reservoir belongs there).
                             self._wm.begin_shs_repr_epoch()

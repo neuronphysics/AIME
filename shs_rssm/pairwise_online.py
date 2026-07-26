@@ -1,4 +1,4 @@
-"""Online pairwise accumulation for recurrent SHS training (round-19 review blocker 8).
+"""Online pairwise accumulation for recurrent SHS training.
 
 Recomputes each step's pairwise responsibility q(s_{t-1}, s_t) ONE STEP AT A TIME from the
 forward/backward messages and reduces it immediately to the quantities training needs --

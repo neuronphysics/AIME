@@ -155,11 +155,11 @@ class StickyHDP(nn.Module):
                 setattr(module, name, buf.to(module._dtype))
         return module
 
-    # -------------------------------------------------------- stick-breaking
+    #  stick-breaking
     def Ebeta(self) -> torch.Tensor:
         return _rho2beta_safe(self.rho)
 
-    # ------------------------------------------------ conjugate theta update
+    #  conjugate theta update
     def _calc_theta(self, trans_counts: torch.Tensor, start_counts: torch.Tensor):
         """transTheta (K,K+1) and startTheta (K+1,) from counts and current rho."""
         K = self.K
@@ -228,7 +228,7 @@ class StickyHDP(nn.Module):
                 + elbo_local)
         return -elbo
 
-    # --------------------------------------------------- numerical optimisation
+    #  numerical optimisation
     def optimize_rho_omega(self, sumLogPi, startAlphaLogPi, n_iter: int = 200,
                            lr: float = 0.3):
         """Maximise the ELBO over (rho, omega) via L-BFGS on an unconstrained
@@ -256,7 +256,7 @@ class StickyHDP(nn.Module):
             omega = torch.nn.functional.softplus(b) + 1e-6
         return rho.detach(), omega.detach()
 
-    # --------------------------------------------------------- full M-step
+    # full M-step
     @torch.no_grad()
     def update(self, trans_counts: torch.Tensor, start_counts: torch.Tensor,
                n_global_iters: int = 3):
@@ -284,7 +284,7 @@ class StickyHDP(nn.Module):
                 with torch.enable_grad():
                     rho, omega = self.optimize_rho_omega(sumLogPi, startAlphaLogPi)
             except Exception:
-                # L-BFGS itself raised (round-5 review, issue 7): restore the snapshot
+                # L-BFGS itself raised: restore the snapshot
                 # (rho0, omega0) and their conjugate theta, count, and stop iterating.
                 self.rho.copy_(rho0)
                 self.omega.copy_(omega0)
@@ -305,7 +305,7 @@ class StickyHDP(nn.Module):
             tt, st = self._calc_theta(trans_counts, start_counts)
             if not (bool(torch.isfinite(tt).all()) and bool(torch.isfinite(st).all())):
                 # nonfinite Dirichlet params under the NEW (rho, omega): restore the
-                # snapshot too, not just break (round-5 review, issue 7).
+                # snapshot too, not just break.
                 self.rho.copy_(rho0)
                 self.omega.copy_(omega0)
                 tt0, st0 = self._calc_theta(trans_counts, start_counts)
@@ -317,7 +317,7 @@ class StickyHDP(nn.Module):
             self.start_theta.copy_(st)
             obj1 = float(self.alloc_elbo())
             if (not math.isfinite(obj1)) or obj1 < obj0 - 1e-6 * (abs(obj0) + 1.0):
-                # OBJECTIVE ROLLBACK (round-4 review, rec. 8): an L-BFGS overshoot
+                # OBJECTIVE ROLLBACK: an L-BFGS overshoot
                 # is never installed -- restore the previous (rho, omega) and their
                 # conjugate theta, count the rejection, stop iterating.
                 self.rho.copy_(rho0)

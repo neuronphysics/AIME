@@ -172,7 +172,7 @@ class RecurrentStickiness(nn.Module):
         return log_trans, aux
 
     def bound_aux_only(self, base_elogpi, phi_steps):
-        """ROUND-24 review P2 #11: the transition AUX (A, B0, m, c, switch_diag,
+        """The transition AUX (A, B0, m, c, switch_diag,
         base_elogpi) WITHOUT materialising the O(BTK^2) log_trans. Every returned tensor is
         O(BTK) or (K,K); each (B,K,K) transition slice is rebuilt ON DEMAND from this aux via
         trans_slice_from_aux, so recurrent forward-backward never holds the full tensor."""
@@ -405,7 +405,7 @@ class RecurrentStickiness(nn.Module):
         next time each batch's summary is recomputed (memoized semantics)."""
         if not (bool(torch.isfinite(A).all()) and bool(torch.isfinite(h).all())):
             # TRANSACTIONAL: refuse nonfinite summed naturals outright -- keep the
-            # previous valid row posteriors and count (round-4 review, rec. 8)
+            # previous valid row posteriors and count
             self.n_pg_guard_rejects = getattr(self, 'n_pg_guard_rejects', 0) + 1
             return
         wd = self.m_beta.dtype
@@ -413,7 +413,7 @@ class RecurrentStickiness(nn.Module):
         h = h.to(wd)
         Sig0_inv = torch.diag(1.0 / self.sigma0_diag)
         rhs_prior = Sig0_inv @ self.m0
-        # ATOMIC (round-5 review, issue 7): solve every row into TEMP tensors with
+        # ATOMIC: solve every row into TEMP tensors with
         # escalating Cholesky jitter; install nothing unless all K rows succeed and are
         # finite, so a failure on a late row cannot leave earlier rows updated.
         Dp = self.m_beta.shape[-1]
@@ -448,7 +448,7 @@ class RecurrentStickiness(nn.Module):
         self.pg_h.copy_(h)
         self._pg_init = True
 
-    # ------------------------------------------------------------------- ELBO piece
+    # ELBO piece
     @torch.no_grad()
     def beta_kl(self):
         """Sum_i KL(q(beta_i) || p(beta_i)) for state-specific persistence weights."""

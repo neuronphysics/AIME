@@ -51,7 +51,7 @@ class WorldModel(nn.Module):
             if config.shs_move_every > 0:
                 print(f"[SHS] adaptive-K moves ON: shs_move_every={config.shs_move_every}, "
                       f"warmup={config.shs_move_warmup}, birth={config.shs_move_birth}.")
-            # ROUND-20 review P0 #6: normalize/validate the SHS source-mode combination.
+            # normalize/validate the SHS source-mode combination.
             WorldModel._normalize_and_validate_shs(config)
             self.dynamics = SHSRSSM(
                 config.dyn_stoch,
@@ -465,7 +465,7 @@ class WorldModel(nn.Module):
     @torch.no_grad()
     @staticmethod
     def _normalize_and_validate_shs(config):
-        """ROUND-20 review P0 #6: normalize shs_global_source aliases ONCE, validate the enum,
+        """normalize shs_global_source aliases ONCE, validate the enum,
         and enforce the exact source<->online_mode pairing, so a typo or an inconsistent pair
         fails loudly instead of silently producing no global updates. Mutates config in place
         (writes the normalized source back) and returns the normalized source."""
@@ -496,14 +496,14 @@ class WorldModel(nn.Module):
     def _tensor_snapshot(module):
         """TENSOR-ONLY snapshot (parameters + buffers). Deliberately EXCLUDES _extra_state
         (a DICT returned by get_extra_state), which state_dict() includes and which has no
-        .detach() -- the round-16 frozen-target first-use crash (review P0 #1)."""
+        .detach()."""
         snap = {n: p.detach().clone() for n, p in module.named_parameters()}
         snap.update({n: b.detach().clone() for n, b in module.named_buffers()})
         return snap
 
     @staticmethod
     def _tensor_snapshot_params(module):
-        """ROUND-26 review P1 #7: snapshot ONLY the gradient-updated PARAMETERS (the
+        """snapshot ONLY the gradient-updated PARAMETERS (the
         representation: GRU, MLPs, the carry projection P and stickiness projection
         P_stick), NOT buffers -- the regime variational POSTERIORS/sufficient stats are
         buffers and must stay live so streaming updates them. Also excludes _extra_state."""
@@ -546,7 +546,7 @@ class WorldModel(nn.Module):
                 live[n].data.copy_(t)
 
     def begin_shs_repr_epoch(self):
-        """ROUND-20 review P0 #1/#4: open ONE LONG-HORIZON representation epoch and hold a
+        """open ONE LONG-HORIZON representation epoch and hold a
         FROZEN target (encoder + neural RSSM TENSORS only -- no extra-state dict) for the
         WHOLE stream. Idempotent: opened once and NOT closed per drain, so every streamed
         episode shares one coordinate system AND one pinned version (the store never sees
@@ -568,7 +568,7 @@ class WorldModel(nn.Module):
         self.dynamics.regime.end_repr_epoch()
 
     def _shs_reservoir_add(self, data_batches, max_keep=64):
-        """ROUND-26 review P1 #7: retain a BOUNDED reservoir of recently-streamed raw episode
+        """ retain a BOUNDED reservoir of recently-streamed raw episode
         batches so the store can be REBUILT under a new frozen target on epoch refresh."""
         if not hasattr(self, "_shs_reservoir"):
             self._shs_reservoir = []
@@ -577,7 +577,7 @@ class WorldModel(nn.Module):
             self._shs_reservoir = self._shs_reservoir[-max_keep:]
 
     def rebuild_stats_from_reservoir(self):
-        """ROUND-26 review P1 #7: after an epoch refresh (new frozen target), RESET the
+        """after an epoch refresh (new frozen target), RESET the
         streaming store and re-ingest the retained reservoir under the NEW representation, so
         the accumulated sufficient statistics are consistent with the current latent
         coordinate system rather than mixing two. Returns the number of episodes rebuilt."""
@@ -612,7 +612,7 @@ class WorldModel(nn.Module):
         return post, None
 
     def stream_completed_episodes(self, data_batches):
-        """ROUND-15 review issues 1/2: the absorb-ONCE persistent-streaming call-site.
+        """ the absorb-ONCE persistent-streaming call-site.
 
         Encodes each COMPLETED episode ONCE under the current (frozen-for-this-call)
         representation and routes it to `regime.stream_episode`, which adds its analytic

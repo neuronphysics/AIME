@@ -1,6 +1,6 @@
-"""Offline fixed-corpus VB trainer (round-4 review, issue 6).
+"""Offline fixed-corpus VB trainer:
 
-The runnable end-to-end loop for the guarantees this package certifies: a FIXED corpus
+The runnable end-to-end loop for the guarantees this package certifies: a corpus
 with STABLE batch ids, memoized laps under frozen globals-per-visit semantics, optional
 per-lap re-encoding of a learning representation (repr-version bump + automatic
 stale-batch invalidation), and complete-corpus consolidation sweeps whose acceptance is
@@ -53,13 +53,13 @@ def fit_offline_corpus(head, corpus=None, laps: int = 10, encode_fn=None,
         raise ValueError("provide a corpus or an encode_fn")
     if head.stat_store.expected_batches is None:
         raise ValueError("fit_offline_corpus requires a DECLARED expected_batches "
-                         "(the fixed-corpus size); got None (round-6 review, issue 7)")
+                         "(the fixed-corpus size); got None")
 
     exp = head.stat_store.expected_batches
     if corpus is not None and exp is not None and exp != len(corpus):
         raise ValueError(
             f"expected_batches ({exp}) must equal len(corpus) ({len(corpus)}): the "
-            "memoized completeness certificate IS the corpus size (round-5 review, issue 4).")
+            "memoized completeness certificate IS the corpus size.")
 
     def _get_corpus(first):
         if encode_fn is None:
@@ -76,7 +76,7 @@ def fit_offline_corpus(head, corpus=None, laps: int = 10, encode_fn=None,
         if len(batches) != head.stat_store.expected_batches:
             raise ValueError(
                 f"lap {lap}: encode_fn/corpus produced {len(batches)} batches but "
-                f"expected_batches={head.stat_store.expected_batches} (round-6 issue 7)")
+                f"expected_batches={head.stat_store.expected_batches}")
         if len(set(ids)) != len(ids):
             raise ValueError(f"corpus batch ids must be unique, got {ids}")
         if first_ids is None:
@@ -85,8 +85,8 @@ def fit_offline_corpus(head, corpus=None, laps: int = 10, encode_fn=None,
             raise ValueError(
                 f"corpus id set changed across laps ({sorted(first_ids)} -> "
                 f"{sorted(set(ids))}): a fixed corpus must present the SAME stable ids "
-                "every lap, else stale summaries linger in the ledger (round-5 review, issue 4).")
-        # Clean full pass (round-5 review, issue 4): RESET the ledger, accumulate every
+                "every lap, else stale summaries linger in the ledger.")
+        # Clean full pass: RESET the ledger, accumulate every
         # batch with globals FROZEN (stats_only => ledger-only writes), then ONE global
         # step from the complete totals -- correct for both a fixed and a re-encoding
         # representation, and a re-encode never fires corpus-PREFIX updates.

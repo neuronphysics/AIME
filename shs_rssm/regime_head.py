@@ -40,7 +40,7 @@ class RegimeHead(nn.Module):
         deter: int,          # H, GRU carry dim
         K: int = 16,         # truncation (max regimes)
         proj_dim: int | None = 64,   # H'; set to `deter` to disable projection
-        action_dim: int = 0,         # A; >0 adds a per-regime action term B_k a_{t-1} (round-12, item 13)
+        action_dim: int = 0,         # A; >0 adds a per-regime action term B_k a_{t-1} 
         # regime (Normal-Gamma) hyperparameters
         a0: float = 3.0, b0: float = 2.0, v0_scale: float = 1.0, ard: bool = True,
         identity_init: bool = True,
@@ -63,7 +63,7 @@ class RegimeHead(nn.Module):
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     ):
         super().__init__()
-        # replica construction (round-9): every ctor arg, so make_worker can build a
+        # replica construction: every ctor arg, so make_worker can build a
         # DETACHED worker head structurally identical to the master
         self._ctor_kwargs = dict(
             stoch=stoch, deter=deter, K=K, proj_dim=proj_dim,
@@ -162,7 +162,7 @@ class RegimeHead(nn.Module):
         self._gstep_count = 0             # global-step counter for the schedule
         self._episode_cursor = 0          # monotonic completed-episode stream offset (item 1)
         self._repr_frozen = False         # blocker 3: representation-epoch version pin
-        # ROUND-21 review Blocker 4: fixed-Kmax active-state mask. None => all K active
+        # fixed-Kmax active-state mask. None => all K active
         # (legacy shape-changing behaviour). A bool (K,) tensor => inactive slots receive
         # NO responsibility, so K can be held at a fixed capacity while regimes
         # activate/deactivate WITHOUT changing tensor shapes.
@@ -170,7 +170,7 @@ class RegimeHead(nn.Module):
         self._shs_online_pairwise = False # blocker 8: accumulate PG/KL without full xi
         self._async_version = 0    # SDA-Bayes master posterior version
         self._struct_gen = 0       # structural generation (bumped per accepted move)
-        self._commit_lock = threading.RLock()  # serializes master commits (round-10)
+        self._commit_lock = threading.RLock()  # serializes master commits 
 
         # learned initial latent z_0 (eq:init, mu0); covariance handled by the regime prior.
         # nn.Parameter (not a buffer) so Adam actually trains it.
@@ -188,7 +188,7 @@ class RegimeHead(nn.Module):
     def build_g(self, prev_stoch, deter, action=None):
         """g_t = [z_{t-1}, P h_t, a_{t-1}, 1] (action block only when action_dim>0).
 
-        ROUND-12 (review item 13): a per-regime action term enters the CONJUGATE dynamics
+        a per-regime action term enters the CONJUGATE dynamics
         regressor, so  z_t = A_k z_{t-1} + B_k a_{t-1} + b_k + C P h_t (+ U_k f_t) + eps
         keeps exact Normal-Gamma updates -- B_k is simply extra columns of the regime
         regressor block (shared-carry keeps the tied C on P h_t; the action joins r).
@@ -278,7 +278,7 @@ class RegimeHead(nn.Module):
         return log_init, base_elogpi, None
 
     def _transition_potentials_ondemand(self, deter, dtype=None, device=None):
-        """ROUND-24 review P2 #11: recurrent transition potentials WITHOUT materialising the
+        """Recurrent transition potentials WITHOUT materialising the
         O(BTK^2) log_trans. Returns (log_init, aux, trans_fn) where aux is O(BTK) and
         trans_fn(t) builds a single (B,K,K) slice on demand (active-mask aware). Recurrent
         only (uses the stickiness features)."""
@@ -458,7 +458,7 @@ class RegimeHead(nn.Module):
         return out
 
     def _discrete_path_kl_online(self, gamma, deter, is_first, cache):
-        """ROUND-19 blocker 8: the discrete-path KL WITHOUT a materialised xi. The
+        """The discrete-path KL WITHOUT a materialised xi. The
         initial-state term needs only gamma; the pairwise term is accumulated per step by
         pair_kl_online using the cached messages and the DIFFERENTIABLE transition."""
         from shs_rssm.pairwise_online import pair_kl_online
@@ -530,7 +530,7 @@ class RegimeHead(nn.Module):
         # Same target and same evidence convention as the analytic E-step: posterior
         # mean plus the trace correction from q_var.  `stoch` is kept in the signature
         # for API compatibility with Dreamer/RSSM callers.
-        # round-13 review item 3: pass actions so the OPTIMISED loss evidence matches the
+        # pass actions so the OPTIMISED loss evidence matches the
         # action-conditioned E-step evidence (otherwise they diverge when action_dim>0)
         evidence, _, _ = self._vb_evidence(q_mean, deter, is_first=is_first, z_var=q_var,
                                            action=action)
@@ -643,8 +643,8 @@ class RegimeHead(nn.Module):
                     async_version=int(getattr(self, '_async_version', 0)),
                     struct_gen=int(getattr(self, '_struct_gen', 0)),
                     gstep_count=int(getattr(self, '_gstep_count', 0)),
-                    episode_cursor=int(getattr(self, '_episode_cursor', 0)),   # round-13/14
-                    # review P1 #8: the EMA/blend-vs-overwrite flags MUST persist, else the
+                    episode_cursor=int(getattr(self, '_episode_cursor', 0)),  
+                    # the EMA/blend-vs-overwrite flags MUST persist, else the
                     # first update after resume OVERWRITES the loaded stats instead of blending.
                     counts_initialised=bool(getattr(self, '_counts_initialised', False)),
                     stats_initialised=bool(getattr(self.regimes, '_stats_initialised', False)),
@@ -738,15 +738,14 @@ class RegimeHead(nn.Module):
         if st is None or st.mode != "full_batch":
             raise ValueError(
                 "finalize_full_batch_pass() requires online_mode='full_batch' "
-                f"(store mode is {None if st is None else st.mode!r}) "
-                "(round-7 review, issue 6)")
+                f"(store mode is {None if st is None else st.mode!r}) ")
         if getattr(st, "_fb_finalized", False):
             raise ValueError(
                 "full_batch pass already finalized; call begin_full_batch_pass() "
-                "before accumulating and finalizing a new pass (round-6 review, issue 6)")
+                "before accumulating and finalizing a new pass")
         if st._tot_stats is None:
             raise ValueError("cannot finalize an EMPTY full_batch pass -- no batches "
-                             "have been accumulated (round-7 review, issue 6)")
+                             "have been accumulated")
         ok = self.global_step_from_totals()
         if ok:
             st._fb_finalized = True   # FINALIZED only after a SUCCESSFUL global update
@@ -755,7 +754,7 @@ class RegimeHead(nn.Module):
     @torch.no_grad()
     def stream_episode(self, stoch, deter, is_first=None, z_var=None, action=None,
                        valid=None):
-        """ROUND-14 review item 1: completed-episode streaming DRIVER. Absorbs one COMPLETE
+        """Completed-episode streaming DRIVER. Absorbs one COMPLETE
         episode exactly once under a MONOTONIC INTEGER offset -- constant memory (integer
         offsets keep no per-id set) -- advancing an internal cursor that is checkpointed
         via extra_state. This is the ingestion primitive a Dreamer collection loop calls
@@ -776,7 +775,7 @@ class RegimeHead(nn.Module):
     @torch.no_grad()
     def absorb_episode(self, episode_id, stoch, deter, is_first=None, z_var=None,
                        action=None, valid=None):
-        """ROUND-12 review item 1: the explicit unique-new-episode streaming interface.
+        """The explicit unique-new-episode streaming interface.
 
         Contract: `stoch`/`deter` (and optional `z_var`, `action`) are ONE complete
         episode already encoded under the CURRENT representation; `episode_id` is its
@@ -808,7 +807,7 @@ class RegimeHead(nn.Module):
                                                      if gamma.dim() == 3 else gamma.shape[0]),
                     stream_count=int(getattr(st, "_stream_count", 0)))
 
-    # ------------- SDA-Bayes asynchronous master/worker (round-9/10: replica-based) ----
+    #  SDA-Bayes asynchronous master/worker (replica-based)
     def _lock(self):
         lk = getattr(self, "_commit_lock", None)
         if lk is None:
@@ -820,7 +819,7 @@ class RegimeHead(nn.Module):
         """Advance the structural GENERATION. Called after ANY accepted structural move
         (birth/split/merge/delete). A K equality check alone cannot detect a birth
         followed by a merge that returns to the same K with different state identities;
-        the generation counter can (round-9 review, issue 4)."""
+        the generation counter can."""
         self._struct_gen = int(getattr(self, "_struct_gen", 0)) + 1
 
     def master_snapshot(self):
@@ -828,9 +827,9 @@ class RegimeHead(nn.Module):
         inference: the FULL module state dict (emission Normal-Gamma, sticky-HDP and
         recurrent-PG posteriors, the learned carry projection P, recurrent projection
         P_stick, learned initial state z0, EMA count buffers) PLUS the mutable RUNTIME
-        MODE (`recurrent`, which curricula flip on the live head -- round-10 review,
-        issue 3) and structural metadata. Taken under the master lock so a concurrent
-        commit cannot interleave a half-updated posterior into the copy."""
+        MODE (`recurrent`, which curricula flip on the live head) and structural metadata.
+        Taken under the master lock so a concurrent commit cannot interleave a half-updated
+        posterior into the copy."""
         with self._lock():
             return dict(
                 version=int(getattr(self, "_async_version", 0)),
@@ -849,7 +848,7 @@ class RegimeHead(nn.Module):
         """Install a master snapshot into THIS head (worker-replica use): tensors,
         runtime mode, counters, and the immutable snapshot identity `_snap_meta` that
         async_worker_delta tags deltas from. Reloading a reusable worker goes through
-        here, so its posterior and its identity can never disagree (round-10, issue 1)."""
+        here, so its posterior and its identity can never disagree."""
         self.load_state_dict(snap["state"])
         self.K = int(snap["K"])
         self.recurrent = bool(snap.get("recurrent", self.recurrent))
@@ -863,7 +862,7 @@ class RegimeHead(nn.Module):
         master's constructor arguments and loaded from the snapshot (the structural
         pre-load hook resizes K-shaped tensors, so a snapshot taken after moves loads
         cleanly). Local inference on the replica cannot touch the master's parameters,
-        `_struct_cache`, `_estep`, or any other live state (round-9, issue 2). Build ONE
+        `_struct_cache`, `_estep`, or any other live state. Build ONE
         replica per worker thread and refresh it by passing a new snapshot to
         async_worker_delta; commits serialize at the master's lock."""
         snap = self.master_snapshot() if snapshot is None else snapshot
@@ -877,16 +876,14 @@ class RegimeHead(nn.Module):
         """SDA-Bayes WORKER: run LOCAL forward-backward on a DETACHED replica and return
         the sufficient-statistic delta d_xi, tagged from the replica's OWN immutable
         snapshot identity `_snap_meta` -- never from a passed snapshot the replica might
-        not hold (the round-9 reuse path computed under an old posterior but tagged the
-        new snapshot's metadata, letting an obsolete delta pass every master check;
-        round-10 review, issue 1). Reuse contract: pass `worker=` to reuse a replica; if
+        not hold. Reuse contract: pass `worker=` to reuse a replica; if
         `snapshot=` is also given, the snapshot is RELOADED into the replica first; with
         `worker=` alone the replica's existing (possibly deliberately stale) posterior is
         used and truthfully tagged.
 
         `data_repr_version` declares which representation encoded `stoch`/`deter`; it
-        must match the replica's snapshot. It is REQUIRED under strict streaming
-        (round-10 review, issue 4); otherwise optional, because raw-tensor provenance is
+        must match the replica's snapshot. It is REQUIRED under strict streaming; 
+        otherwise optional, because raw-tensor provenance is
         not verifiable -- the declared contract is what can be checked."""
         if worker is None:
             snap = self.master_snapshot() if snapshot is None else snapshot
@@ -896,7 +893,7 @@ class RegimeHead(nn.Module):
             if not hasattr(w, "_snap_meta"):
                 raise ValueError(
                     "reusable worker was not built by make_worker()/load_snapshot(); it "
-                    "has no snapshot identity to tag deltas from (round-10, issue 1)")
+                    "has no snapshot identity to tag deltas from")
             if snapshot is not None:
                 w.load_snapshot(snapshot)
         meta = w._snap_meta
@@ -904,12 +901,12 @@ class RegimeHead(nn.Module):
             if self.stat_store is not None and getattr(self.stat_store, "strict_stream", False):
                 raise ValueError(
                     "strict streaming REQUIRES data_repr_version: declare which "
-                    "representation encoded these tensors (round-10 review, issue 4)")
+                    "representation encoded these tensors")
         elif int(data_repr_version) != int(meta["repr_version"]):
             raise ValueError(
                 f"worker data declares repr_version {int(data_repr_version)} but the "
                 f"replica's snapshot is repr_version {int(meta['repr_version'])}; "
-                "re-encode the data or load the matching snapshot (round-9, issue 5)")
+                "re-encode the data or load the matching snapshot")
         gamma, tc, sc, _ = w.regime_inference(stoch, deter, is_first=is_first,
                                               cache_estep=True, z_var=z_var,
                                               action=action, valid=valid)
@@ -927,14 +924,14 @@ class RegimeHead(nn.Module):
                 es["row_weight"].reshape(-1, w.K))
         em_backup = None
         if int(local_iters) > 1:
-            # ROUND-12 review item 7: local coordinate iterations mutate the REPLICA's
+            # Local coordinate iterations mutate the REPLICA's
             # emission posterior; restore it after the delta so a reused worker's next
             # task starts from its snapshot, not from this episode's local optimum.
             em_backup = ({k: v.detach().clone()
                           for k, v in w.regimes.state_dict().items()},
                          bool(getattr(w.regimes, "_stats_initialised", False)))
         for _it in range(max(0, int(local_iters) - 1)):
-            # ITERATED LOCAL BatchVB (round-11, cost/quality knob): coordinate-ascent on
+            # ITERATED LOCAL BatchVB ( cost/quality knob): coordinate-ascent on
             # the EMISSION block of the LOCAL posterior -- base prior + THIS batch's
             # statistics (the SDA-Bayes framework-1 primitive A(C, xi_0), warm-started
             # at the snapshot posterior's responsibilities). The transition and PG
@@ -972,12 +969,11 @@ class RegimeHead(nn.Module):
         structural generation, representation version, K, runtime mode -- a delta missing
         any is rejected, no defaults), commit to the totals, refresh the global
         posterior, bump the version. The WHOLE commit runs under the master lock, so
-        concurrent commits cannot interleave backups and installs (round-10 review,
-        issue 5). If the refresh fails, the store cursor, totals, EVERY tensor of the
+        concurrent commits cannot interleave backups and installs. 
+        If the refresh fails, the store cursor, totals, EVERY tensor of the
         head (including the EMA count buffers) and the mutated plain attributes
         (`_counts_initialised`, the emission stats/cholesky caches, the PG init flag and
-        guard counter) are ROLLED BACK -- round-9 restored only the three posterior
-        submodules (round-10 review, issue 2). Posterior staleness (older base_version)
+        guard counter) are ROLLED BACK. Posterior staleness
         is tolerated Hogwild-style unless tolerate_stale=False; structural,
         representation or runtime-mode mismatch is never tolerated."""
         with self._lock():
@@ -985,7 +981,7 @@ class RegimeHead(nn.Module):
                 if key not in delta:
                     raise ValueError(
                         f"async delta is missing required metadata {key!r}; deltas must "
-                        "come from async_worker_delta (round-9 review, issue 4)")
+                        "come from async_worker_delta")
             if int(delta["K"]) != int(self.K):
                 raise ValueError(
                     f"async delta was computed at K={int(delta['K'])} but the master is "
@@ -1007,13 +1003,13 @@ class RegimeHead(nn.Module):
                     f"async delta was computed with recurrent={bool(delta['recurrent'])} "
                     f"but the master now runs recurrent={bool(self.recurrent)}; the "
                     "runtime mode changed (curriculum switch) so the delta's statistics "
-                    "are structurally wrong (round-10 review, issue 3)")
+                    "are structurally wrong")
             cur = int(getattr(self, "_async_version", 0))
             if max_stale is not None and cur - int(delta["base_version"]) > int(max_stale):
                 raise ValueError(
                     f"async delta is {cur - int(delta['base_version'])} versions stale at "
                     f"COMMIT time (> max_stale={int(max_stale)}); recompute against a "
-                    "fresher snapshot (round-12 review, item 7)")
+                    "fresher snapshot")
             if not tolerate_stale and int(delta["base_version"]) != cur:
                 raise ValueError(
                     f"async delta is stale (base_version {int(delta['base_version'])} != "
@@ -1072,12 +1068,12 @@ class RegimeHead(nn.Module):
                     raise ValueError(
                         f"async commit ROLLED BACK: the global refresh failed ({e}); "
                         "the offset was not consumed and the master -- tensors, EMA "
-                        "counts, caches and flags -- is unchanged (round-10, issue 2)")
+                        "counts, caches and flags -- is unchanged")
             self._async_version = cur + 1
             return int(self._async_version)
 
     def _hdp_update_scheduled(self, C, s):
-        """ROUND-12 item 18: run the (iterative, expensive) HDP root-stick optimisation
+        """run the (iterative, expensive) HDP root-stick optimisation
         only every `hdp_every` global steps -- the transition COUNTS still accumulate
         every step, so this trades a slightly staler transition posterior for much less
         compute per episode. hdp_every=1 (default) runs every step (unchanged)."""
@@ -1089,7 +1085,7 @@ class RegimeHead(nn.Module):
         return False
 
     def _pg_set_scheduled(self, A, h):
-        """ROUND-12 item 18: refresh the recurrent PG block every `pg_every` global steps
+        """refresh the recurrent PG block every `pg_every` global steps
         (the totals A/h are always current; this only gates the posterior refresh)."""
         every = int(getattr(self, "pg_every", 1))
         if every <= 1 or ((int(getattr(self, "_gstep_count", 1)) - 1) % every) == 0:
@@ -1147,7 +1143,7 @@ class RegimeHead(nn.Module):
         return True
 
     def begin_repr_epoch(self):
-        """ROUND-16 review blocker 3: freeze the representation VERSION for a streaming/
+        """freeze the representation VERSION for a streaming/
         consolidation epoch so every episode absorbed during the epoch shares one latent
         coordinate system and the store accepts them (it otherwise rejects mixed
         versions after the first). The CALLER must ALSO hold the encoder fixed for the
@@ -1203,7 +1199,7 @@ class RegimeHead(nn.Module):
 
     @torch.no_grad()
     def birth_into_slot(self):
-        """ROUND-24 review P1 #9: fixed-Kmax BIRTH -- activate the lowest spare slot AND
+        """fixed-Kmax BIRTH -- activate the lowest spare slot AND
         reset its dynamics parameters to the prior (a fresh regime), so K is unchanged and
         tensor shapes are stable. Returns the slot index, or None if capacity is full."""
         k = self.activate_slot()
@@ -1213,7 +1209,7 @@ class RegimeHead(nn.Module):
 
     @torch.no_grad()
     def delete_slot(self, k):
-        """ROUND-24 review P1 #9: fixed-Kmax DELETE -- deactivate slot k AND clear its
+        """fixed-Kmax DELETE -- deactivate slot k AND clear its
         parameters/stats, shape-stable."""
         self.deactivate_slot(k)
         if hasattr(self.regimes, "reset_slot"):
@@ -1221,7 +1217,7 @@ class RegimeHead(nn.Module):
         return self
 
     def _mask_logpotentials(self, log_init, log_trans):
-        """ROUND-23 review P1 #9: extend the fixed-Kmax active mask to the TRANSITION
+        """extend the fixed-Kmax active mask to the TRANSITION
         potentials (not just the E-step evidence), so INACTIVE regimes get zero mass in
         the initial distribution AND as both transition origin and target. Applied on the
         E-step path and (via masked weights) in imagination."""
@@ -1273,7 +1269,7 @@ class RegimeHead(nn.Module):
         """
         if valid is not None:
             # padding marginals must be zero (regime_inference already masks them; this
-            # is a defensive re-mask so a hand-built gamma is also safe -- round-12 item 9)
+            # is a defensive re-mask so a hand-built gamma is also safe)
             gamma = gamma * valid.reshape(*gamma.shape[:-1], 1).to(gamma.dtype)
         prev = self._prev_stoch(stoch, is_first)
         act = self._shift_action(action, is_first)
@@ -1287,7 +1283,7 @@ class RegimeHead(nn.Module):
         tc = trans_counts.detach().double()
         sc = start_counts.detach().double()
         if self.stat_store is not None:
-            # ---- explicit online-VB semantics (full_batch / streaming / memoized) ----
+            # explicit online-VB semantics (full_batch / streaming / memoized) 
             pg = None
             if self.recurrent and self._estep is not None:
                 es = self._estep
@@ -1321,8 +1317,7 @@ class RegimeHead(nn.Module):
                 # global step fires ONLY when a declared count is reached (below) or via
                 # finalize_full_batch_pass(). An UNDECLARED (expected_batches=None) or
                 # ragged pass therefore never does corpus-prefix updates -- it stays
-                # frozen until finalize is called (round-5 review, issue 5; round-4 fixed
-                # only the declared-size case).
+                # frozen until finalize is called.
                 self._estep = None
                 return
             if stats_only:
@@ -1340,10 +1335,10 @@ class RegimeHead(nn.Module):
             self._counts_initialised = True
             self._hdp_update_scheduled(C_tot, s_tot)
             if self.recurrent and pg_tot is not None:
-                self._pg_set_scheduled(pg_tot["A"], pg_tot["h"])   # round-13 item 8: pg_every on main path
+                self._pg_set_scheduled(pg_tot["A"], pg_tot["h"])   # pg_every on main path
             if self.stat_store.mode == "full_batch":
                 # declared boundary FINALIZED only AFTER the M-step/HDP/PG all
-                # succeeded (round-8 review, issue 3): a failure above leaves the
+                # succeeded: a failure above leaves the
                 # pass NOT finalized, so it can be retried cleanly
                 self.stat_store._fb_finalized = True
             self._estep = None
@@ -1378,7 +1373,7 @@ class RegimeHead(nn.Module):
             )
             self._estep = None
 
-    # --------------------------------------------------------- acceptance bound
+    # acceptance bound
     def _score_potentials(self, deter, hdp, rstick, dtype=torch.float64):
         """Log potentials (init, trans, aux) for scoring under GIVEN globals.
 
@@ -1475,7 +1470,7 @@ class RegimeHead(nn.Module):
                                        hdp=hdp, rstick=rstick, z_var=z_var)
         return local + self.bound_global(regimes=regimes, hdp=hdp, rstick=rstick)
 
-    # ----------------------------------------------------- imagination prior
+    # imagination prior
     def imagine_prior(self, prev_stoch, deter, resp_prev, sample=True, prev_var=None,
                       action=None, mode=None):
         """One-step mixture prior for actor-critic rollouts.
@@ -1519,7 +1514,7 @@ class RegimeHead(nn.Module):
         var = var.clamp_min(1e-8)
         std = var.sqrt()
 
-        # ROUND-16 review blocker 7: EXPLICIT imagination modes.
+        # EXPLICIT imagination modes.
         #   actor_moment    -> differentiable moment-matched single Gaussian; the value
         #                      gradient flows through mean/std (correct for imag_gradient=
         #                      'dynamics'). Belief propagates as the full mixture vector w.

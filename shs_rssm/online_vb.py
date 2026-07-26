@@ -91,7 +91,7 @@ def _ema(tot, x, tau):
 
 
 def _all_finite(x) -> bool:
-    """Recursive finiteness over tensors, dicts, lists and tuples (round-9)."""
+    """Recursive finiteness over tensors, dicts, lists and tuples."""
     if x is None:
         return True
     if torch.is_tensor(x):
@@ -106,7 +106,7 @@ def _all_finite(x) -> bool:
 def _stream_offset(bid):
     """Strict non-negative integer stream offset, or None to use the id-set fallback.
     Rejects non-integral floats (1.5) and non-numeric strings ('auto0') so they cannot
-    silently truncate or collide onto the monotonic cursor (round-6 review, issue 1)."""
+    silently truncate or collide onto the monotonic cursor."""
     if isinstance(bid, bool):
         return None
     if isinstance(bid, int):
@@ -117,10 +117,6 @@ def _stream_offset(bid):
         return int(bid)
     return None
 
-
-# ROUND-12 review item 14: unambiguous mode names. The aliases make it explicit that
-# "online Dreamer training" (live_ema) is NOT streaming VB, while episode_stream /
-# memoized_corpus / full_batch_corpus name the actual VB contracts.
 _MODE_ALIASES = dict(live_ema="legacy_ema", episode_stream="streaming",
                      memoized_corpus="memoized", full_batch_corpus="full_batch")
 
@@ -206,11 +202,11 @@ class SuffStatStore:
             raise ValueError(
                 f"batch_id {batch_id!r} is not in the declared expected_ids; a fixed "
                 "corpus rejects foreign partitions AT INGESTION, before touching the "
-                "totals (round-7 review, issue 5)")
+                "totals")
         if self.mode == "full_batch" and self._fb_finalized:
             raise ValueError(
                 "full_batch pass is FINALIZED; call begin_full_batch_pass() to open a "
-                "new pass before adding data (round-7 review, issue 6)")
+                "new pass before adding data")
         if self.mode == "legacy_ema":
             self._tot_stats = _ema(self._tot_stats, s, self.ema_tau)
             self._tot_C = _ema(self._tot_C, C, self.ema_tau)
@@ -232,9 +228,8 @@ class SuffStatStore:
                 if self._stream_api == "async":
                     raise ValueError(
                         "this streaming store already absorbed data via async_commit(); "
-                        "mixing async commits and the serial cursor would double-count "
-                        "(round-8 review, issue 2)")
-                # O(1) MEMORY (round-5 review, issue 6): with integer stream offsets keep
+                        "mixing async commits and the serial cursor would double-count ")
+                # O(1) MEMORY: with integer stream offsets keep
                 # only a high-water mark + count, not every id forever. Absorb-once is
                 # enforced by strict monotonicity. Non-integer ids fall back to the set
                 # UNLESS strict_stream, which forbids the fallback and requires contiguity.
@@ -243,12 +238,12 @@ class SuffStatStore:
                     if off is None:
                         raise ValueError(
                             f"strict streaming requires a non-negative INTEGER offset with "
-                            f"no id-set fallback; got {batch_id!r} (round-7 review, issue 4)")
+                            f"no id-set fallback; got {batch_id!r} ")
                     exp = 0 if self._stream_hi is None else self._stream_hi + 1
                     if off != exp:
                         raise ValueError(
                             f"strict streaming requires CONTIGUOUS offsets to detect skipped "
-                            f"data: expected {exp}, got {off} (round-7 review, issue 4)")
+                            f"data: expected {exp}, got {off}")
                 if off is not None:
                     hi = getattr(self, "_stream_hi", None)
                     if hi is not None and off <= hi:
@@ -258,20 +253,20 @@ class SuffStatStore:
                             "order (use a monotonic stream cursor).")
                     self._stream_hi = off
                     self._stream_count = getattr(self, "_stream_count", 0) + 1
-                    self._stream_api = "serial"   # marker AFTER success (round-9)
+                    self._stream_api = "serial"   # marker AFTER success 
                 else:
                     if batch_id in self._per_batch:
                         raise ValueError(
                             f"streaming mode saw batch_id {batch_id!r} twice; each datum "
                             "must be absorbed exactly once (use memoized mode to revisit)")
                     self._per_batch[batch_id] = True
-                    self._stream_api = "serial"   # marker AFTER success (round-9)
+                    self._stream_api = "serial"   # marker AFTER success
             else:
                 if self.mode == "full_batch" and batch_id in self._per_batch:
                     # a repeated id means a new sweep over the same corpus: full-batch
                     # semantics accumulate within ONE pass, so start the pass fresh
                     self.reset()
-                # OVERFLOW CHECKED BEFORE MUTATING (round-6 review, issue 6): a foreign
+                # OVERFLOW CHECKED BEFORE MUTATING: a foreign
                 # batch beyond the declared size must not touch the ledger or the totals,
                 # so a caught exception leaves the pass exactly as it was.
                 if (self.mode == "full_batch" and self.expected_batches is not None
@@ -388,13 +383,13 @@ class SuffStatStore:
         statistics and the PG naturals) is built into a temporary and recursively
         finiteness-checked BEFORE any is installed; the streaming-API marker is set only
         AFTER a successful install, so a failed first commit leaves the store exactly as
-        it was (round-9 review, issue 3)."""
+        it was."""
         if self.mode != "streaming":
             raise ValueError("async_commit requires online_mode='streaming'")
         if self._stream_api == "serial":
             raise ValueError(
                 "this streaming store already absorbed data via add_batch(); mixing the "
-                "serial cursor and async commits would double-count (round-8 review, issue 2)")
+                "serial cursor and async commits would double-count")
         for key in ("s", "C", "v"):
             if key not in delta or delta[key] is None:
                 raise ValueError(f"async delta is missing required field {key!r}")
@@ -420,8 +415,8 @@ class SuffStatStore:
         except Exception as e:
             raise ValueError(f"async delta is malformed; master totals unchanged ({e})")
         # RECURSIVE finiteness over tensors, DICTS and tuples -- covers the dict-valued
-        # regime statistics and the PG naturals, which the round-8 top-level
-        # torch.is_tensor() check silently skipped (round-9 review, issue 3).
+        # regime statistics and the PG naturals, which the top-level
+        # torch.is_tensor() check silently skipped.
         for nm, t in (("s", new_stats), ("C", new_C), ("v", new_s), ("p", new_pg)):
             if not _all_finite(t):
                 raise ValueError(

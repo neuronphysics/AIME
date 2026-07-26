@@ -204,7 +204,7 @@ def mixture_kl_variational_bound(q_mean, q_var, comp_mean, comp_var, w, eps: flo
     This is the diagonal special case of `gaussian_to_mixture_kl` (single source of
     truth for the -log sum_k w_k exp(-KL(q||p_k)) Hershey-Olsen bound); kept as a named
     entry point. Reduces to KL(q||N_j) when w is one-hot; MC-free replacement for
-    mixture_kl_monte_carlo wherever an ELBO needs a mixture KL (round-8 review, issue 4)."""
+    mixture_kl_monte_carlo wherever an ELBO needs a mixture KL."""
     return gaussian_to_mixture_kl(q_mean, q_var, comp_mean, comp_var, w, eps=eps)
 
 

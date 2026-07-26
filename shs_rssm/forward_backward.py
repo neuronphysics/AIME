@@ -11,14 +11,14 @@ Given, for a batch of B sequences of length T over K regimes,
                                        re-seeded from log_init and no transition links
                                        t-1 -> t). t=0 is a start UNLESS a carried chunk
                                        message (prev_msg) continues an episode.
-    valid     : (B, T) optional        valid-timestep mask (round-12 item 9). Where
+    valid     : (B, T) optional        valid-timestep mask. Where
                                        valid[b,t]=0 the step is padding: it contributes
                                        NO evidence, NO marginal (gamma=0), and NO
                                        transition count, and the forward/backward messages
                                        pass THROUGH it unchanged. A right-padded batch is
                                        therefore bit-identical to the truncated sequence.
     prev_msg  : (B, K) optional        carried FILTERING message q(s_{last of prev chunk})
-                                       in log space (round-12 item 8). For sequences whose
+                                       in log space. For sequences whose
                                        first step continues an episode (is_first[:,0]=0),
                                        step 0 is linked to the previous chunk by a REAL
                                        transition instead of re-seeding from log_init.
@@ -31,11 +31,10 @@ padding steps contribute nothing), and logZ (B,). Options:
     return_pairwise=True  also returns xi (B, T-1, K, K), the per-step pairwise
                           responsibilities recurrent stickiness needs. When False, xicount
                           is accumulated online WITHOUT ever materialising the O(BTK^2) xi
-                          tensor (round-12 item 17).
+                          tensor.
     return_final=True     also returns final_msg (B, K), the NORMALISED filtered log-alpha
-                          at each sequence's last valid step, to seed the next chunk
-                          (round-12 item 8). Assumes prefix-validity (complete episode or
-                          right-padded chunk).
+                          at each sequence's last valid step, to seed the next chunk. 
+                          Assumes prefix-validity (complete episode or right-padded chunk).
 
 The recursion is sequential in T (a Python loop, T is small) and fully vectorised over
 the batch B and the K x K transitions. Everything is in log space; only the final
@@ -88,7 +87,7 @@ def forward_backward(log_init, log_trans, log_ev, is_first=None, valid=None,
         val = valid.reshape(B, T).to(log_ev.dtype)
     else:
         val = log_ev.new_ones(B, T)
-    # NaN-safe (round-13 review, item 8): -inf log-evidence * 0 would be NaN, so SELECT
+    # NaN-safe : -inf log-evidence * 0 would be NaN, so SELECT
     ev = torch.where(val.unsqueeze(-1) > 0.5, log_ev, torch.zeros_like(log_ev))
 
     # ---------------- forward ----------------
@@ -159,7 +158,7 @@ def forward_backward(log_init, log_trans, log_ev, is_first=None, valid=None,
                 xi[:, t - 1] = x
             xicount = xi.sum(dim=(0, 1))                       # (K,K)
         else:
-            # ROUND-12 item 17: accumulate xicount ONLINE, never allocating xi (B,T-1,K,K)
+            # Accumulate xicount ONLINE, never allocating xi (B,T-1,K,K)
             xi = None
             xicount = log_ev.new_zeros(K, K)
             for t in range(1, T):
@@ -174,7 +173,7 @@ def forward_backward(log_init, log_trans, log_ev, is_first=None, valid=None,
         xi = log_ev.new_zeros(B, 0, K, K)
         xicount = log_ev.new_zeros(K, K)
 
-    # BOUNDARY transition (round-13 review, item 4): the last state of the previous
+    # BOUNDARY transition: the last state of the previous
     # chunk -> the first state of this chunk is a REAL transition that both the internal
     # xi (t=1..T-1) and start_counts omit; add its pairwise marginal to xicount so
     # full-sequence counts == sum of continued-chunk counts INCLUDING the boundary.
@@ -192,12 +191,12 @@ def forward_backward(log_init, log_trans, log_ev, is_first=None, valid=None,
         a_last = log_alpha[torch.arange(B, device=log_ev.device), last]   # (B,K)
         final_msg = a_last - torch.logsumexp(a_last, dim=-1, keepdim=True)
 
-    # round-19 review blocker 8: expose the forward/backward messages so a caller can
+    # expose the forward/backward messages so a caller can
     # recompute each step's pairwise TRANSIENTLY (O(BK^2) memory) and accumulate PG/KL
     # online, instead of materialising the full O(BTK^2) xi tensor.
     if return_messages:
         return gamma, xicount, logZ, log_alpha, log_beta
-    # round-14 review item 6: expose the boundary pairwise so recurrent PG / HDP counts
+    # expose the boundary pairwise so recurrent PG / HDP counts
     # at the chunk seam can be attributed by the caller (None when no carried message)
     if return_boundary:
         extra = [xi] if return_pairwise else []
@@ -216,7 +215,7 @@ def forward_backward(log_init, log_trans, log_ev, is_first=None, valid=None,
 def start_counts_from(gamma, is_first=None, valid=None):
     """Expected initial-state counts: sum of gamma over all episode-start steps. gamma is
     already padding-masked; valid is accepted for symmetry and to zero any start that
-    lands on a padding step (round-12 item 9)."""
+    lands on a padding step."""
     B, T, K = gamma.shape
     if is_first is None:
         w0 = gamma[:, 0]

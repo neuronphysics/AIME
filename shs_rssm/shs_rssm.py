@@ -147,7 +147,7 @@ class SHSRSSM(networks.RSSM):
         # blocker 8: accumulate PG/KL online (no O(BTK^2) xi) in recurrent training
         self.regime._shs_online_pairwise = bool(shs_online_pairwise)
         self._shs_merge_topm = shs_merge_topm
-        # round-16 review blocker 1: WHERE the persistent SHS globals come from.
+        # WHERE the persistent SHS globals come from.
         #   replay_ema              -> replay minibatch stats update the globals (default)
         #   completed_episode_stream-> replay computes the LOCAL loss only; the globals
         #                              are fed ONLY by stream_completed_episodes (absorb-
@@ -155,7 +155,7 @@ class SHSRSSM(networks.RSSM):
         #   offline_memoized        -> fixed-corpus memoized laps (set_batch_id)
         self._shs_global_source = str(shs_global_source)
         self._shs_action_dim = int(shs_action_dim)
-        self._last_action = None   # (B,T,A) stash from observe (round-12 item 13)
+        self._last_action = None   # (B,T,A) stash from observe
         # use the expected log-likelihood under q(z) for the E-step (Rao-Blackwellised)
         self._shs_analytic_estep = bool(shs_analytic_estep)
         self._shs_free = shs_free
@@ -205,7 +205,7 @@ class SHSRSSM(networks.RSSM):
             return None
         act = self._last_action
         if act.shape[1] < ref.shape[1]:
-            # round-14 review: a too-short action is an ERROR when action_dim>0, not a
+            # A too-short action is an ERROR when action_dim>0, not a
             # silent None that would make the E-step and loss use different likelihoods
             raise ValueError(
                 f"stashed action has T={act.shape[1]} < required T={ref.shape[1]} "
@@ -222,7 +222,7 @@ class SHSRSSM(networks.RSSM):
         return super().observe(embed, action, is_first, state, sample=sample)
 
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
-        """ROUND-22 review P1 #10: carry a FILTERED regime belief across online steps.
+        """carry a FILTERED regime belief across online steps.
 
         The base obs_step returns a posterior with NO `regime_resp`, so the next img_step
         resets to a uniform regime prior every step. Here we PREDICT (the prior's propagated
@@ -374,7 +374,7 @@ class SHSRSSM(networks.RSSM):
                         batch_id=f"live{self._shs_step}",
                         repr_version=int(self.regime.repr_version),
                         action=(self._aligned_action(q_mean).detach()
-                                if self._shs_action_dim > 0 else None))   # round-15: current-step action, not cleared _pending
+                                if self._shs_action_dim > 0 else None))   # current-step action, not cleared _pending
                 else:
                     self._move_buffer.add(
                         stoch.detach(), deter.detach(),
@@ -383,7 +383,7 @@ class SHSRSSM(networks.RSSM):
                         batch_id=f"live{self._shs_step}",
                         repr_version=int(self.regime.repr_version),
                         action=(self._aligned_action(q_mean).detach()
-                                if self._shs_action_dim > 0 else None))   # review Important #3: non-analytic branch
+                                if self._shs_action_dim > 0 else None))   # non-analytic branch
         _scheduled = (self._shs_move_every > 0
                       and self._shs_step >= self._shs_move_warmup
                       and self._shs_step % self._shs_move_every == 0)
@@ -406,11 +406,10 @@ class SHSRSSM(networks.RSSM):
                       f"accepted={accepted}")
         elif _scheduled:
             # A scheduled sweep we DECLINE: too few consistent minibatches to be a real
-            # sample (the failure mode of round-4's per-step purge), or a memoized/
-            # streaming ledger is active (its arithmetic needs one encoder version, so
-            # moves there run on complete consolidation buffers, not the live ring).
-            # Skip with a visible counter; fall through to the loss -- never early-return
-            # (that dropped the gradient) and never purge the bounded ring.
+            # sample, or a memoized/streaming ledger is active (its arithmetic needs one 
+            # encoder version, so moves there run on complete consolidation buffers, not 
+            # the live ring). Skip with a visible counter; fall through to the loss -- 
+            # never early-return (that dropped the gradient) and never purge the bounded ring.
             self._n_live_sweeps_skipped = getattr(self, "_n_live_sweeps_skipped", 0) + 1
             self._last_move_log = {}
 
@@ -449,7 +448,7 @@ class SHSRSSM(networks.RSSM):
             dyn_scale=dyn_scale, rep_scale=rep_scale,
             strict_elbo=self._shs_strict_elbo,
             global_scale=self._global_scale,
-            action=self._aligned_action(q_mean),   # round-14 review item 1: loss uses SAME action as E-step
+            action=self._aligned_action(q_mean),   # loss uses SAME action as E-step
         )
 
         # stash this batch for a deferred closed-form M-step (applied next call). Pass the
@@ -578,9 +577,8 @@ class SHSRSSM(networks.RSSM):
         used as a PROPOSAL buffer scored by EXACT acceptance; mixing recent encoder
         versions in it is sound (acceptance is exact on its contents, and it never
         claims to be a whole corpus). Gates: (a) it must hold enough minibatches to be a
-        real sample rather than one step's data -- the exact failure of round-4's
-        per-step purge; (b) the store must NOT be memoized/streaming, whose replace /
-        absorb-once arithmetic requires a single encoder version (those modes run moves
+        real sample rather than one step's data ; (b) the store must NOT be memoized/streaming, 
+        whose replace / absorb-once arithmetic requires a single encoder version (those modes run moves
         on complete consolidation buffers). A complete buffer bypasses both via its own
         whole-corpus certificate.
         """
@@ -601,7 +599,7 @@ class SHSRSSM(networks.RSSM):
 
         The live ring is deliberately NOT purged here: it is a bounded recent-data
         proposal buffer scored by exact acceptance, and dropping it every optimizer step
-        left a single minibatch to score (round-4 regression, this review's issue 1).
+        left a single minibatch to score.
         The strict single-version requirement applies only to COMPLETE consolidation
         buffers and is enforced in _validate_buffer; a complete buffer that spans a bump
         raises there, directing the caller to encode the corpus once under a frozen
@@ -664,7 +662,7 @@ class SHSRSSM(networks.RSSM):
         mode = self._shs_entropy_mode if mode is None else mode
         if getattr(self, "_shs_strict_elbo", False) and mode != "bounds":
             # strict ELBO is provably Monte-Carlo-free: force the deterministic
-            # mixture-entropy bounds, never a sampling estimator (round-7 review, issue 8)
+            # mixture-entropy bounds, never a sampling estimator 
             mode = "bounds"
         if mode == "bounds":
             # deterministic mixture-entropy bounds (Hershey-Olsen style): no sampling.
@@ -697,7 +695,7 @@ class SHSRSSM(networks.RSSM):
         B = deter.shape[0]
         resp_prev = prev_state.get("regime_resp", None)
         if resp_prev is None or resp_prev.shape[-1] != self.regime.K:
-            # round-15 review issue 4: a belief carried across a structural move has the
+            # a belief carried across a structural move has the
             # OLD K; reset it to the current-K uniform prior so actor imagination cannot
             # crash on a dimension mismatch (the weaker fix the reviewer suggested; a
             # fixed Kmax + active mask would preserve history but is a larger change)
@@ -732,15 +730,15 @@ class SHSRSSM(networks.RSSM):
         return state
 
 
-# --------------------------------------------------------------- config wiring
+# config wiring
 # shs_* keys legitimately consumed OUTSIDE the SHSRSSM constructor (WorldModel loop,
 # diagnostics, consolidation cadence). Everything else must be a constructor kwarg;
 # unknown shs_* keys raise, so "option exists in YAML but is silently dead at the
-# construction boundary" (external review, round 2) is now a hard error.
+# construction boundary" is now a hard error.
 SHS_NON_CTOR_KEYS = {
     "shs_diag_log", "shs_diag_figures",
-    "shs_stream_episodes",   # round-15: absorb-once completed-episode streaming (loop-level)
-    "shs_repr_epoch_steps",  # round-20 P0 #4: frozen-target representation-epoch refresh cadence
+    "shs_stream_episodes",   # absorb-once completed-episode streaming (loop-level)
+    "shs_repr_epoch_steps",  # frozen-target representation-epoch refresh cadence
     "shs_consolidate_every_episodes", "shs_consolidate_warmup",
     "shs_consolidate_batches", "shs_consolidate_sweeps", "shs_consolidate_ep_len",
 }
@@ -766,7 +764,7 @@ def shs_kwargs_from_config(config):
             f"and not registered loop-level keys: {unknown}. Either add them to "
             "SHSRSSM.__init__ or to SHS_NON_CTOR_KEYS in shs_rssm/shs_rssm.py.")
     kw = {k: v for k, v in items.items() if k in accepted}
-    # round-15 review issue 1: shs_action_dim = -1 means AUTO -> config.num_actions, so a
+    # shs_action_dim = -1 means AUTO -> config.num_actions, so a
     # preset can enable the per-regime action term without hard-coding the action count.
     # Default 0 (off) is unchanged; -1 is an explicit opt-in.
     if int(kw.get("shs_action_dim", 0)) == -1:

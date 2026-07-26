@@ -1,4 +1,4 @@
-"""Real threaded SDA-Bayes training (round-11): thread-pool workers on DETACHED
+"""Real threaded SDA-Bayes training: thread-pool workers on DETACHED
 replicas, a lock-serialized master, MEASURED wall-clock (not a modeled span).
 
 PyTorch releases the GIL inside tensor kernels, so replica E-steps overlap on CPU.
@@ -42,7 +42,7 @@ def sda_train_threaded(head, batches, *, n_workers: int = 4, refresh_every: int 
         w = _replica()
         lag = int(getattr(head, "_async_version", 0)) - int(w._snap_meta["version"])
         if lag > max_lag or (tl.done > 0 and tl.done % snap_every == 0):
-            # BOUNDED staleness (round-11): refresh when the replica lags the master by
+            # BOUNDED staleness: refresh when the replica lags the master by
             # more than max_lag committed versions (standard bounded-lag Hogwild), plus
             # the periodic task-counter refresh. Unbounded lag measurably degrades
             # quality (staleness ~31 versions dropped aligned acc to 0.43 in the demo).
@@ -52,13 +52,13 @@ def sda_train_threaded(head, batches, *, n_workers: int = 4, refresh_every: int 
             per_worker_tasks[threading.get_ident()] += 1
         b = batches[off - start_offset]
         if isinstance(b, dict):
-            # ROUND-12 review item 5: full payload -- posterior variance, actions,
+            # full payload -- posterior variance, actions,
             # per-item is_first/valid all flow into the SAME analytic evidence as
             # ordinary training.
             d = head.async_worker_delta(
                 b["stoch"], b["deter"],
                 is_first=b.get("is_first", is_first), z_var=b.get("z_var"),
-                action=b.get("action"), valid=b.get("valid"),   # round-14 review: pool now forwards valid
+                action=b.get("action"), valid=b.get("valid"),   # pool now forwards valid
                 worker=w, local_iters=local_iters)
         else:
             z, h = b
@@ -66,7 +66,7 @@ def sda_train_threaded(head, batches, *, n_workers: int = 4, refresh_every: int 
                                         local_iters=local_iters)
         return off, d
 
-    # BACKPRESSURE (round-11): without it, fast workers compute EVERY delta under the
+    # BACKPRESSURE: without it, fast workers compute EVERY delta under the
     # near-initial posterior before the slow master commits any (measured: staleness ~30
     # versions, aligned acc 0.43). A bounded in-flight window keeps compute-time lag
     # within ~window commits, so max_lag can actually bind.
