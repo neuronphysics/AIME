@@ -1,0 +1,480 @@
+defaults:
+
+  logdir: null
+  traindir: null
+  evaldir: null
+  offline_traindir: ''
+  offline_evaldir: ''
+  seed: 0
+  deterministic_run: False
+  steps: 1e6
+  parallel: False
+  eval_every: 1e4
+  eval_episode_num: 10
+  log_every: 1e4
+  reset_every: 0
+  device: 'cuda:0'
+  compile: True
+  precision: 32
+  debug: False
+  video_pred_log: True
+
+  # DMC Environment
+  task: 'dmc_walker_walk'
+  size: [64, 64]
+  envs: 1
+  action_repeat: 2
+  time_limit: 1000
+  grayscale: False
+  prefill: 5000
+  reward_EMA: True
+
+  # Model
+  dyn_hidden: 512
+  dyn_deter: 512
+  dyn_stoch: 32
+  dyn_discrete: 32
+  dyn_rec_depth: 10
+  dyn_mean_act: 'none'
+  dyn_std_act: 'sigmoid2'
+  dyn_min_std: 0.1
+
+  # Sticky-HDP switching RSSM (SHS-RSSM). use_shs: True swaps networks.RSSM for
+  # SHSRSSM. Requires dyn_discrete: 0 (continuous latents). Leave use_shs: False to
+  # train the unchanged stock DreamerV3. The dmc_walker_shs config below enables it.
+  use_shs: False
+  shs_K: 16
+  shs_proj_dim: 64
+  shs_gamma: 5.0
+  shs_alpha: 1.0
+  shs_kappa: 50.0
+  shs_ema_tau: 0.02
+  shs_recurrent: True
+  shs_prior_persist: 0.9
+  shs_pg_iters: 4
+  shs_rstick_dim: 8       # low-dimensional feature for state-dependent recurrent stickiness
+  shs_rstick_stopgrad: True  # stop gradients from transition term into Dreamer GRU carry
+  shs_move_every: 0     # 0 = adaptive-K moves OFF (fixed truncation); set >0 (e.g. 500)
+                        # to enable birth/merge/delete on that step interval after warmup
+  shs_move_warmup: 2000
+  shs_move_birth: True
+  shs_move_split: True   # sub-cluster split move (re-differentiate a broad regime; see moves.py)
+  shs_move_confirm_top: null  # null = confirm all merge/split candidates with the full VB bound; set an int for speed
+  shs_delete_mode: hughes     # hughes = drop-then-refit on the buffer (data-driven reassignment); frozen = installed-globals comparison
+  shs_merge_select: hughes    # hughes = entropy-free complete shortlist (NIPS'15 Sec.4); residual = fast log-det ranking
+  shs_merge_passes: 3         # max accepted-merge restarts per sweep (multiple disjoint merges per lap)
+  shs_move_buffer: 8    # held-out minibatches the move ELBO is scored over (memoized set)
+  shs_move_max_age: 0       # evict move-buffer latents older than this many updates (0=off)
+  shs_online_pairwise: False      # blocker 8: recurrent training accumulates PG/KL online (drops O(BTK^2) xi)
+  shs_imag_mode: actor_moment     # blocker 7: actor_moment (differentiable, actor training) | eval_sample (categorical) | reinforce_sample
+  shs_global_source: replay_ema   # replay_ema | completed_episode_stream | offline_memoized (blocker 1: separates replay-EMA from absorb-once episode ingestion)
+  shs_repr_epoch_steps: 0     # review P0 #4: refresh the frozen SHS target every N steps (0=hold one epoch for the whole run)
+  shs_stream_episodes: False  # round-15: absorb each completed episode ONCE into persistent SHS stats (needs a streaming shs_online_mode)
+  shs_consolidate_every_episodes: 0   # 0=off; else run frozen-rep consolidation every N completed episodes
+  shs_consolidate_warmup: 100000      # env steps before the first consolidation
+  shs_consolidate_batches: 8          # replay batches forming the frozen corpus
+  shs_consolidate_sweeps: 3           # birth/merge/delete passes over the frozen corpus
+  shs_consolidate_ep_len: 500         # truncate each consolidation episode to this many steps
+  shs_imag_sample_mixture: True  # sample the true mixture (vs moment-matched Gaussian) in imagination
+  shs_analytic_estep: True   # E-step uses expected log-lik under q(z) (mean + trace), not a sample
+  shs_q_rank: 0   # 0 = diagonal process noise Q; >0 = low-rank-plus-diagonal Q=diag(d)+U U^T (U is L x q_rank)
+  shs_shared_carry: True   # tie the recurrent carry drift C across regimes (Prop. 1 collapse fix). Works with shs_q_rank>0: low-rank-plus-diagonal Q is fit on the carry residual. Set False for the legacy regime-specific carry (collapse-prone).
+  shs_free: 1.0    # head-level free nats mirror (must be 0 under shs_strict_elbo); the
+                   # RUNTIME kl_free/dyn_scale/rep_scale are also validated in strict mode
+  shs_ard: False   # MacKay EB hyperprior learning (ARD): OPTIONAL and non-variational (outside
+                   # the bound; strict rejects it). Off by default: the Lorenz attribution study
+                   # shows it is the sole source of ELBO non-monotonicity (-123.6 vs -0.15 nats
+                   # worst per-lap dip) and can destabilise move-heavy runs through transiently
+                   # empty states (now also guarded by occupancy-masked MacKay counting).
+  shs_hdp_every: 1            # item 18: run HDP root-stick optimisation every Nth global step
+  shs_pg_every: 1             # item 18: refresh recurrent PG block every Nth global step
+  shs_strict_stream: False    # streaming only: reject non-integer/gap ids (no id-set fallback)
+  shs_action_dim: 0           # >0: per-regime action term B_k a_{t-1} in the conjugate regressor (round-12)
+  shs_merge_topm: null        # recurrent/low-rank merge: exact-refit only the top-M ranked pairs
+  shs_online_mode: ema        # ema (Dreamer replay default) | full_batch | streaming | memoized. memoized REQUIRES
+                              # stable batch ids (SHSRSSM.set_batch_id / consolidation / offline fitting) and now
+                              # fails loudly without them instead of silently appending every replay visit
+  shs_expected_batches: null  # memoized completeness certificate (whole-corpus contract)
+  shs_strict_elbo: False      # True: training loss is ONE analytic switching-head ELBO; requires shs_free: 0,
+                              # shs_ard: False, shs_q_rank: 0, shs_curriculum: [], and shs_corpus_batches set
+  shs_corpus_batches: null    # strict mode: replay minibatches per corpus; global KL charged at 1/this (1 = full batch)
+  shs_entropy_mode: bounds    # bounds = deterministic Hershey-Olsen mixture-entropy bounds (no MC) | mc
+  shs_moves_complete: False   # reserved: require complete-contract buffers for ALL sweeps (consolidation always certifies)
+  shs_birth_style: interval   # interval (Hughes contiguous-window 2-state birth, K+2; episode-safe, linear-time optimal cut) | residual (legacy K+1)
+  shs_diag_log: False     # log SHS regime diagnostics (scalars + figures) on the log cadence
+  shs_diag_figures: True  # also write PNG figures (t-SNE, occupancy, recon) to logdir
+  shs_curriculum: []      # optional in-run staging of {move_every, kappa, move_threshold}
+                          # by gradient-step boundary; [] = no staging. See dmc_walker_shs.
+
+  grad_heads: ['decoder', 'reward', 'cont']
+  units: 512
+  act: 'SiLU'
+  norm: True
+  encoder:
+    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+  decoder:
+    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+  actor:
+    {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  critic:
+    {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  reward_head:
+    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  cont_head:
+    {layers: 2, loss_scale: 1.0, outscale: 1.0}
+  dyn_scale: 0.5
+  rep_scale: 0.1
+  kl_free: 1.0
+  weight_decay: 0.0
+  unimix_ratio: 0.01
+  initial: 'learned'
+
+  # Training
+  batch_size: 26
+  batch_length: 64
+  train_ratio: 512
+  pretrain: 100
+  model_lr: 1e-4
+  opt_eps: 1e-8
+  grad_clip: 1000
+  dataset_size: 1000000
+  opt: 'adam'
+
+  # Behavior.
+  discount: 0.997
+  discount_lambda: 0.95
+  imag_horizon: 15
+  imag_gradient: 'dynamics'
+  imag_gradient_mix: 0.0
+  eval_state_mean: False
+
+  # Exploration
+  expl_behavior: 'greedy'
+  expl_until: 0
+  expl_extr_scale: 0.0
+  expl_intr_scale: 1.0
+  disag_target: 'stoch'
+  disag_log: True
+  disag_models: 10
+  disag_offset: 1
+  disag_layers: 4
+  disag_units: 400
+  disag_action_cond: False
+
+
+shs_strict:
+  # Fixed-corpus strict-ELBO profile: `--configs defaults shs_strict`.
+  # The training loss is ONE analytic switching-head ELBO; the runtime KL profile
+  # (kl_free, dyn_scale, rep_scale) is validated on every kl_loss call. This is the
+  # OFFLINE / fixed-corpus contract: declare shs_corpus_batches and stable batch ids
+  # (SHSRSSM.set_batch_id per corpus chunk); live replay without stable partitions is
+  # rejected for streaming/full_batch and fails loudly for memoized without ids.
+  # A complete profile on its own: enables the SHS head and continuous latents
+  # (round-4 review, issue 6) -- no additional SHS environment preset required.
+  use_shs: True
+  dyn_discrete: 0
+  shs_strict_elbo: True
+  shs_free: 0.0
+  kl_free: 0.0
+  dyn_scale: 1.0
+  rep_scale: 0.0
+  shs_ard: False
+  shs_q_rank: 0
+  shs_curriculum: []
+  shs_corpus_batches: 1
+  shs_online_mode: memoized
+  shs_global_source: offline_memoized   # review P0 #6: memoized REQUIRES this source (validator enforces the pair)
+  shs_strict_stream: True
+  shs_move_every: 0
+  shs_rstick_stopgrad: False
+
+dmc_proprio:
+  steps: 5e5
+  action_repeat: 2
+  envs: 4
+  train_ratio: 512
+  video_pred_log: false
+  encoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  decoder: {mlp_keys: '.*', cnn_keys: '$^'}
+
+dmc_vision:
+  steps: 1e6
+  action_repeat: 2
+  envs: 4
+  train_ratio: 512
+  video_pred_log: true
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+crafter:
+  task: crafter_reward
+  step: 1e6
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  dyn_hidden: 1024
+  dyn_deter: 4096
+  units: 1024
+  encoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  actor: {layers: 5, dist: 'onehot', std: 'none'}
+  value: {layers: 5}
+  reward_head: {layers: 5}
+  cont_head: {layers: 5}
+  imag_gradient: 'reinforce'
+
+atari100k:
+  steps: 4e5
+  envs: 1
+  action_repeat: 4
+  train_ratio: 1024
+  video_pred_log: true
+  eval_episode_num: 100
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  stickey: False
+  lives: unused
+  noops: 30
+  resize: opencv
+  actions: needed
+  time_limit: 108000
+
+minecraft:
+  task: minecraft_diamond
+  step: 1e8
+  parallel: True
+  envs: 16
+  # no eval
+  eval_episode_num: 0
+  eval_every: 1e4
+  action_repeat: 1
+  train_ratio: 16
+  video_pred_log: true
+  dyn_hidden: 1024
+  dyn_deter: 4096
+  units: 1024
+  encoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  decoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  actor: {layers: 5, dist: 'onehot', std: 'none'}
+  value: {layers: 5}
+  reward_head: {layers: 5}
+  cont_head: {layers: 5}
+  imag_gradient: 'reinforce'
+  break_speed: 100.0
+  time_limit: 36000
+
+memorymaze:
+  steps: 1e8
+  action_repeat: 2
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  task: 'memorymaze_9x9'
+
+debug:
+  debug: True
+  pretrain: 1
+  prefill: 1
+  batch_size: 10
+  batch_length: 20
+
+dmc_walker_shs:
+  task: 'dmc_walker_walk'
+  steps: 5e5
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+
+  # Shared carry + low-rank process noise are on for the WHOLE run (structural, cannot be
+  # scheduled mid-run because their buffers are allocated at construction):
+  shs_shared_carry: True      # tied carry drift C (Prop 1 collapse fix)
+  shs_q_rank: 4               # low-rank-plus-diagonal regime noise Q_l
+  # Persistence is provided by the sticky-HDP base (kappa) while the regimes are being formed
+  # and discovered, and only LATER handed over to recurrent (input-dependent) stickiness, which
+  # is why the run STARTS non-recurrent but rstick is pre-built so phase 4 can switch it on:
+  shs_recurrent: True         # recurrent-stickiness module is available from construction; curriculum stages when it is used
+  shs_kappa: 50.0            # base self-transition bias (rho ~ 0.98) for phases 1-3
+  shs_prior_persist: 0.9     # prior dwell for recurrent stickiness once it switches on (phase 4)
+  shs_rstick_dim: 8           # small state-dependent recurrent-stickiness feature
+  shs_rstick_stopgrad: True   # train stickiness feature map, but do not push GRU carry
+
+  # ---------------------------------------------------------------------------------------
+  # IN-RUN CURRICULUM (one training run, staged automatically). `until` is in WORLD-MODEL
+  # GRADIENT STEPS -- the count self._shs_step increments per training update, NOT env steps.
+  # The active phase index and the live knobs are logged every diagnostic step
+  # (shs_curriculum_phase, shs_move_every_live, shs_recurrent_live, shs_kappa_live, ...), so
+  # you can watch the staging happen in your dashboard. The numeric boundaries below are
+  # PLACEHOLDERS: move them to where your own image_loss / dynamics-KL curves flatten.
+  # ---------------------------------------------------------------------------------------
+  shs_move_warmup: 0          # the phase boundary is the warmup now
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_move_split: True
+  shs_curriculum:
+    # 1) FORM: fixed K, strongly sticky (kappa), no moves, no recurrence. Let the encoder and
+    #    the latent geometry converge before any structure search runs on top of them.
+    - {until: 10000,  move_every: 0,   recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 2) DISCOVER: adaptive K on. Data-driven birth/split proposes useful regimes.
+    #    Acceptance is neutral by default: accepted moves improve the plain structured VB bound.
+    - {until: 20000, move_every: 250, recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 3) FULL MODEL: keep Hughes-style structure moves active and switch on recurrent,
+    #    state-specific stickiness. kappa is forced to 0 internally while recurrent stickiness
+    #    is live, avoiding double-counted persistence. Moves remain active so birth/split/merge/delete
+    #    can continue adapting after the latent representation changes under the recurrent transition.
+    - {until: 30000, move_every: 500, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+    # 4) STABLE FULL MODEL: keep recurrent stickiness, low-rank covariance, shared carry, and
+    #    all structure moves active, but reduce their cadence to lower overhead.
+    - {until: -1,     move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_hopper_shs:
+  task: 'dmc_hopper_hop'
+  steps: 5e5
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+
+  shs_shared_carry: True
+  shs_q_rank: 4
+
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 8
+  shs_rstick_stopgrad: True
+
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_move_split: True
+
+  shs_curriculum:
+    # 1) FORM: fixed K, kappa-sticky, no moves. Ends ~240k env steps.
+    - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 2) DISCOVER: adaptive K on (~40 move sweeps). Ends ~480k env steps.
+    - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 3) FULL MODEL: recurrent stickiness on, kappa -> 0. Ends ~720k env steps.
+    - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+    # 4) STABLE: lower move cadence for the final ~280k env steps.
+    - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_humanoid_shs:
+  task: 'dmc_humanoid_walk'
+  steps: 5e6                 # humanoid needs FAR more than hopper's 5e5 -- see note below
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 16                  # richer dynamics than hopper -> a few more regime slots
+
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_action_dim: 21         # humanoid actuators -- set here so it can't be mismatched
+
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 8
+  shs_rstick_stopgrad: True
+
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_move_split: True
+
+  # stages scaled to the longer humanoid budget (hopper's were tuned for 5e5)
+  shs_curriculum:
+    # 1) FORM: humanoid's image_loss was STILL falling at 10.5k grad steps, so give it longer
+    #    than walker's 10k before running structure search. Ends ~720k env steps.
+    - {until: 30000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 2) DISCOVER: adaptive K on. Ends ~1.44M env steps.
+    - {until: 60000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 3) FULL MODEL: recurrent stickiness on, kappa -> 0. Ends ~2.16M env steps.
+    - {until: 90000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+    # 4) STABLE: final ~840k env steps.
+    - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_cheetah_shs:
+  task: 'dmc_cheetah_run'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+
+  # SHS-RSSM requires continuous Dreamer latents.
+  dyn_discrete: 0
+  use_shs: True
+
+  # K is the truncation / maximum available regimes, not necessarily the number used.
+  # Cheetah run has cyclic gait phases, so slightly larger K than walker is reasonable.
+  shs_K: 16
+
+  # Structural choices.
+  shs_shared_carry: True
+  shs_q_rank: 4
+
+  # Recurrent stickiness is constructed from the start, but the curriculum decides
+  # when it is actually used.
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 8
+  shs_rstick_stopgrad: True
+
+  # Adaptive-K move buffer.
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_move_birth: True
+  shs_move_split: True
+  shs_move_confirm_top: null
+
+  # Slightly more discovery-friendly than walker.
+  # create_bonus > 0 encourages birth/split/keeping more regimes early,
+  # then anneals back to 0 so the final model is selected by the plain ELBO.
+
+  shs_curriculum:
+    # 1) FORM: fixed K, kappa-sticky, no moves. Ends ~192k env steps.
+    - {until: 8000,  move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 2) DISCOVER: adaptive K on, birth-friendly bonus. Ends ~384k env steps.
+    - {until: 16000, move_every: 200,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 2.0}
+    # 3) FULL MODEL: recurrent stickiness on, kappa -> 0. Ends ~576k env steps.
+    - {until: 24000, move_every: 400,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 1.0}
+    # 4) ANNEAL: bonus decays toward plain-ELBO selection. Ends ~768k env steps.
+    - {until: 32000, move_every: 750,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.25}
+    # 5) STABLE: pure ELBO selection for the final ~230k env steps.
+    - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
