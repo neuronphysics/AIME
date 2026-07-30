@@ -479,7 +479,7 @@ class WorldModel(nn.Module):
         if gs not in valid:
             raise ValueError(
                 f"unknown shs_global_source; expected one of {sorted(valid)} "
-                "(review P0 #6: an unknown source would silently disable global updates).")
+                "(an unknown source would silently disable global updates).")
         config.shs_global_source = gs
         need = {"replay_ema": "ema", "completed_episode_stream": "streaming",
                 "offline_memoized": "memoized"}[gs]
@@ -487,7 +487,7 @@ class WorldModel(nn.Module):
         if om != need:
             raise ValueError(
                 f"shs_global_source={gs!r} requires shs_online_mode={need!r} but got {om!r} "
-                "(review P0 #6: e.g. completed_episode_stream+ema silently produces NO global "
+                "( e.g. completed_episode_stream+ema silently produces NO global "
                 "updates). Pair them: replay_ema<->ema, completed_episode_stream<->streaming, "
                 "offline_memoized<->memoized.")
         return gs
@@ -511,8 +511,8 @@ class WorldModel(nn.Module):
 
     def _shs_swap_target_in(self):
         """Swap the FROZEN representation in for the WHOLE ingestion batch so both the
-        encode AND the regime regressor (Ph~) use it (review P1 #7). Returns the saved
-        live tensors, or None if no epoch is open."""
+        encode AND the regime regressor (Ph~) use it. Returns the saved live tensors, 
+        or None if no epoch is open."""
         tgt = getattr(self, "_shs_target_state", None)
         if tgt is None:
             return None
@@ -561,7 +561,7 @@ class WorldModel(nn.Module):
 
     def end_shs_repr_epoch(self):
         """Close the long-horizon epoch: drop the frozen target and advance the version.
-        Generally NOT called per-drain (review P0 #4); use for a full reset/refresh."""
+        Generally NOT called per-drain; use for a full reset/refresh."""
         if not hasattr(self.dynamics, "regime") or getattr(self, "_shs_target_state", None) is None:
             return
         self._shs_target_state = None
@@ -593,16 +593,16 @@ class WorldModel(nn.Module):
     def refresh_shs_repr_epoch(self):
         """Advance to a NEW representation epoch (close -> bump version -> reopen with a fresh
         frozen target) AND rebuild the streaming statistics from the retained reservoir --
-        exact old statistics cannot survive a latent-coordinate change (review P0 #4/P1 #7)."""
+        exact old statistics cannot survive a latent-coordinate change."""
         self.end_shs_repr_epoch()
         self.begin_shs_repr_epoch()
         self.rebuild_stats_from_reservoir()
 
     def _shs_target_encode(self, data):
         """Encode + observe under the FROZEN target tensors, DETERMINISTICALLY (sample=False,
-        review P0 #6: a sampled deter trajectory makes re-encodings non-reproducible). Falls
+        a sampled deter trajectory makes re-encodings non-reproducible). Falls
         back to live params (still deterministic) when no epoch is open."""
-        # review P1 #7: the frozen representation is HELD across the whole batch by
+        # the frozen representation is HELD across the whole batch by
         # stream_completed_episodes (so the regime regressor Ph~ uses frozen P too); here we
         # only encode -- deterministically (sample=False) for reproducible re-encodings.
         with torch.no_grad():
@@ -640,13 +640,13 @@ class WorldModel(nn.Module):
         _own_epoch = not getattr(head, "_repr_frozen", False)
         if _own_epoch:
             head.begin_repr_epoch()   # per-call epoch when no long-horizon epoch is open
-        # review P0 #4/#5: BATCH-ATOMIC ingestion. Snapshot the FULL head (all posteriors,
+        # BATCH-ATOMIC ingestion. Snapshot the FULL head (all posteriors,
         # the sufficient-statistic store, EMA buffers, the stream cursor and repr version)
         # before ingesting; if ANY episode fails or produces a non-finite update, restore the
         # whole snapshot so the batch is all-or-nothing (episode 1 is NOT left committed when
         # episode 2 fails). The queue's abort() then leaves every episode pending.
         _snap = head.master_snapshot()
-        # review P1 #7: hold the FROZEN representation (params incl P/P_stick) swapped in for
+        # hold the FROZEN representation (params incl P/P_stick) swapped in for
         # the WHOLE batch so encode AND regime inference share it; regime posteriors (buffers)
         # stay live and are updated by streaming. Undone on success; full rollback on failure.
         _swapped = self._shs_swap_target_in()
@@ -713,8 +713,7 @@ class WorldModel(nn.Module):
         for ci, data in enumerate(data_batches):
             data = self.preprocess(data)
             embed = self.encoder(data)
-            post, _ = self.dynamics.observe(embed, data["action"], data["is_first"],
-                                            sample=False)   # review Important #6: deterministic
+            post, _ = self.dynamics.observe(embed, data["action"], data["is_first"], sample=False)   #  deterministic
             isf = data["is_first"].float()
             _act = (data["action"].float()
                     if int(getattr(self.dynamics, "_shs_action_dim", 0)) > 0 else None)  # Important #3
@@ -730,11 +729,11 @@ class WorldModel(nn.Module):
             sweep_moves(head, buffer=buf,
                         do_birth=getattr(dyn, "_shs_move_birth", True),
                         do_split=getattr(dyn, "_shs_move_split", True),
-                        confirm_top=getattr(dyn, "_shs_move_confirm_top", None),
+                        confirm_top=getattr(dyn, "_shs_move_confirm_top", 8),
                         delete_mode=getattr(dyn, "_shs_delete_mode", "hughes"),
                         merge_select=getattr(dyn, "_shs_merge_select", "hughes"),
-                        merge_passes=getattr(dyn, "_shs_merge_passes", 3),
-                        birth_style=getattr(dyn, "_shs_birth_style", "residual"))
+                        merge_passes=getattr(dyn, "_shs_merge_passes", 12),
+                        birth_style=getattr(dyn, "_shs_birth_style", "interval"))
         return {
             "shs_consolidate_K_before": float(K_before),
             "shs_consolidate_K_after": float(head.K),

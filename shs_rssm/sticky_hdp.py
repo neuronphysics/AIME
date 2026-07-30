@@ -46,6 +46,53 @@ def rho2beta(rho: torch.Tensor) -> torch.Tensor:
 _rho2beta_safe = rho2beta  # alias used below
 
 
+def beta2rho(beta: torch.Tensor, K: int) -> torch.Tensor:
+    """Inverse stick-breaking: beta (K+1,) -> rho (K,).
+
+    rho_k = beta_k / (1 - sum_{m<k} beta_m).  Exact inverse of `rho2beta`, and the
+    closed form used by Hughes et al. (NIPS 2015) supp. F.1 Proposal Step 4/4 to build
+    a merge candidate's top-level sticks without re-running the numerical optimiser.
+    """
+    beta = beta[:K + 1]
+    cum = torch.cumsum(beta, dim=-1)
+    prev = torch.cat([beta.new_zeros(1), cum[:-1]], dim=-1)   # sum_{m<k} beta_m
+    denom = (1.0 - prev[:K]).clamp_min(EPS)
+    return (beta[:K] / denom).clamp(EPS, 1.0 - EPS)
+
+
+def merge_rho_omega(rho: torch.Tensor, omega: torch.Tensor, i: int, j: int):
+    """Closed-form (rho', omega') for merging state j into state i (i < j).
+
+    beta'_i = beta_i + beta_j, other actives unchanged, remainder unchanged;
+    omega'_i = omega_i + omega_j (Hughes supp. F.1 heuristic for the concentration).
+    """
+    K = rho.shape[0]
+    if i > j:
+        i, j = j, i
+    beta = rho2beta(rho)                       # (K+1,)
+    keep = [k for k in range(K) if k != j]
+    b_act = beta[keep].clone()
+    pos_i = keep.index(i)
+    b_act[pos_i] = b_act[pos_i] + beta[j]
+    b_new = torch.cat([b_act, beta[K:K + 1]], dim=-1)
+    b_new = b_new / b_new.sum().clamp_min(EPS)
+    om = omega[keep].clone()
+    om[pos_i] = om[pos_i] + omega[j]
+    return beta2rho(b_new, K - 1), om
+
+
+def drop_rho_omega(rho: torch.Tensor, omega: torch.Tensor, k: int):
+    """Closed-form (rho', omega') for deleting state k: its beta mass goes to the
+    remainder stick, which is what a delete means under the HDP prior."""
+    K = rho.shape[0]
+    beta = rho2beta(rho)
+    keep = [m for m in range(K) if m != k]
+    b_new = torch.cat([beta[keep], (beta[K] + beta[k]).reshape(1)], dim=-1)
+    b_new = b_new / b_new.sum().clamp_min(EPS)
+    return beta2rho(b_new, K - 1), omega[keep].clone()
+
+
+
 def kvec(K: int, device=None, dtype=None) -> torch.Tensor:
     """Descending [K, K-1, ..., 1]."""
     return torch.arange(K, 0, -1, device=device, dtype=dtype)
@@ -134,6 +181,7 @@ class StickyHDP(nn.Module):
         rho0 = (1.0 - remMass) / (K + delta)
         self.register_buffer("rho", rho0.clamp(EPS, 1 - EPS))
         self.register_buffer("omega", (1.0 + self.gamma) * torch.ones(K, dtype=dtype, device=device))
+        self.lbfgs_max_iter = 60   # warm-started root update needs far fewer than 200
         self.register_buffer("trans_theta", torch.zeros(K, K + 1, dtype=dtype, device=device))
         self.register_buffer("start_theta", torch.zeros(K + 1, dtype=dtype, device=device))
         self._dtype = dtype
@@ -231,6 +279,7 @@ class StickyHDP(nn.Module):
     #  numerical optimisation
     def optimize_rho_omega(self, sumLogPi, startAlphaLogPi, n_iter: int = 200,
                            lr: float = 0.3):
+        n_iter = int(min(n_iter, getattr(self, 'lbfgs_max_iter', n_iter)))
         """Maximise the ELBO over (rho, omega) via L-BFGS on an unconstrained
         reparameterisation rho=sigmoid(a), omega=softplus(b)."""
         dtype, device = self.rho.dtype, self.rho.device
@@ -400,6 +449,18 @@ class StickyHDP(nn.Module):
                 + slack_trans + slack_start)
 
     @torch.no_grad()
+    @torch.no_grad()
+    def seed_rho_omega(self, rho_new: torch.Tensor, omega_new: torch.Tensor):
+        """Install closed-form (rho, omega) without any numerical optimisation.
+
+        Used for merge/delete CANDIDATE scoring so the shortlist ranking is a
+        deterministic function of the merged statistics rather than of how far a
+        cold-started L-BFGS happened to converge.
+        """
+        self.rho.copy_(rho_new.to(self.rho.dtype).clamp(EPS, 1 - EPS))
+        self.omega.copy_(omega_new.to(self.omega.dtype).clamp_min(1e-3))
+        return self
+
     def resized_like(self, new_K: int):
         """A fresh StickyHDP at a different truncation with the same hyperparameters."""
         return StickyHDP(K=new_K, gamma=self.gamma, alpha=self.alpha, kappa=self.kappa,

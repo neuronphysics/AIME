@@ -478,3 +478,56 @@ dmc_cheetah_shs:
 
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_acrobot_shs:
+  task: 'dmc_acrobot_swingup'
+  steps: 2e6                  # acrobot is among the hardest DMC tasks; walker's 5e5 is far too few
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 8                    # see note above -- this is close to the K you will END with
+
+  shs_shared_carry: True
+  shs_q_rank: 2               # lower than walker's 4: fewer distinct regimes, and rank
+                              # over-parameterisation was measured to freeze merges entirely
+
+  # --- persistence timescale, derived rather than copied -------------------------------
+  # DMC control step 0.01s, action_repeat=2 -> 0.02s per agent step. An acrobot swing
+  # half-period is roughly 0.5s ~= 25 agent steps, so target mean dwell ~25, not walker's 50.
+  #   kappa/(kappa+alpha) = 25/26 = 0.962  ->  mean dwell 26 steps
+  # walker's kappa=50 gives 0.980 -> dwell 50, which would smear two swings into one regime.
+  shs_recurrent: True
+  shs_kappa: 25.0
+  shs_rho1: 25.0              # == shs_kappa   (Zhou et al. 2020 Thm 1: prior-preserving handover)
+  shs_rho2: 1.0               # == shs_alpha
+  shs_recur_scale: 2.0        # sigma_a^2 = 2/8 = 0.25
+  shs_rstick_dim: 8
+  shs_rstick_stopgrad: True
+
+  shs_move_warmup: 0
+  shs_switch_settle: 200
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_move_split: True
+
+  # Boundaries pushed out ~1.5x vs walker: swingup needs longer before the latent geometry
+  # is stable enough for structure search to mean anything. These are PLACEHOLDERS -- move
+  # them to where your image_loss / dynamics-KL curves actually flatten.
+  shs_curriculum:
+    - {until: 15000, move_every: 0,    recurrent: False, kappa: 25.0, move_threshold: 0.0, create_bonus: 0.0}
+    - {until: 30000, move_every: 250,  recurrent: False, kappa: 25.0, move_threshold: 0.0, create_bonus: 0.0}
+    - {until: 45000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+# SHS regime diagnostics -- default is shs_diag_log: False, so this MUST be set
+  # explicitly or the curriculum/K/branch-switch traces are never logged.
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+
+  # value-identical to defaults, but stated so the block does not depend on also
+  # composing with dmc_vision
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}

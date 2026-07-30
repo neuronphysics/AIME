@@ -31,7 +31,7 @@ from dataclasses import dataclass
 import torch
 
 from .regimes import DiagARRegimes
-from .sticky_hdp import StickyHDP
+from .sticky_hdp import StickyHDP, merge_rho_omega, drop_rho_omega
 from .forward_backward import forward_backward, start_counts_from
 
 
@@ -128,7 +128,7 @@ def _as_buffer(buffer, stoch, deter, is_first, head=None, action=None):
         _validate_buffer(head, buffer)
         return buffer
     b = MoveBuffer(max_batches=1)
-    b.add(stoch, deter, is_first, action=action)   # review Important #3: fallback API carries the action
+    b.add(stoch, deter, is_first, action=action)   # fallback API carries the action
     return b
 
 
@@ -272,7 +272,10 @@ def _accumulate(head, buffer, regimes, hdp, rstick=None):
 
 
 @torch.no_grad()
-def _refine(head, regimes, hdp, buffer, iters: int = 2, hdp_iters: int = 3, rstick=None):
+def _refine(head, regimes, hdp, buffer, iters: int = 2, hdp_iters: int = 1, rstick=None):
+    # hdp_iters 3 -> 1: with the closed-form warm start from `seed_rho_omega` the
+    # root update starts near its optimum, so three cold L-BFGS solves per refine
+    # iteration are wasted. Confirmation still uses the exact whole-buffer bound.
     """Restricted local VB at the candidate K: alternate the E-step (forward-backward
     under the candidate potentials) with closed-form regime, HDP, and (when recurrent)
     Polya-Gamma stickiness M-steps on the buffer. Turns a one-shot birth/merge/delete
@@ -420,8 +423,7 @@ def _entropy_free_score(head, regimes, hdp, rstick=None):
 
     This is the left/right side of Hughes' merge-selection inequality (NIPS 2015,
     Sec. 4), and it reproduces bnpy's `calcHardMergeGap` exactly. Key accounting
-    point, verified numerically against bnpy in tests_bnpy_parity: because the
-    candidate HDP is refit to its own counts (theta = M + alpha*E[beta] + kappa*I),
+    point: because the candidate HDP is refit to its own counts (theta = M + alpha*E[beta] + kappa*I),
     bnpy's slack term  <M + prior - theta, E[log pi]>  is IDENTICALLY ZERO, so the
     linear allocation term collapses to  L_top - c_Dir(transTheta) - c_Dir(startTheta),
     i.e. exactly `StickyHDP.alloc_elbo()` (the afterGlobalStep form). The transition
@@ -473,7 +475,14 @@ def _hughes_merge_shortlist(head, base_reg, base_hdp, baseC, bases, base_rstick=
             C, start = _merge_counts(baseC, bases, i, j)
             cand_reg = base_reg.clone_with_K(K - 1, cand_stats)
             cand_hdp = base_hdp.resized_like(K - 1)
-            cand_hdp.update(C, start, n_global_iters=hdp_iters)
+            # Hughes supp. F.1 Proposal Step 4/4: build the candidate's top-level
+            # sticks in CLOSED FORM from the merged beta, then take the conjugate
+            # theta update only (n_global_iters=0).  Running L-BFGS here costs
+            # O(K^2) numerical solves per sweep AND makes the ranking depend on
+            # optimiser convergence rather than on the merge itself.
+            _r, _o = merge_rho_omega(base_hdp.rho, base_hdp.omega, i, j)
+            cand_hdp.seed_rho_omega(_r, _o)
+            cand_hdp.update(C, start, n_global_iters=0)
             cand_rstick = _rstick_keep(base_rstick, keep)
             score = _entropy_free_score(head, cand_reg, cand_hdp, rstick=cand_rstick)
             gain = score - base_score
@@ -483,10 +492,20 @@ def _hughes_merge_shortlist(head, base_reg, base_hdp, baseC, bases, base_rstick=
     return out
 
 
-def _candidate(head, regime_stats, C, start, new_K, hdp_iters=3):
+def _candidate(head, regime_stats, C, start, new_K, hdp_iters=1, seed_rho=None):
+    """Candidate globals for a proposed structure.
+
+    `seed_rho` is a closed-form (rho, omega) pair for the new truncation; supplying it
+    warm-starts the non-conjugate root update instead of cold-starting L-BFGS from the
+    prior, which is both faster and removes optimiser variance from the score.
+    `hdp_iters` defaults to 1 (was 3): the confirmation step already re-runs a full
+    refine on the buffer, so three cold L-BFGS solves per candidate were wasted work.
+    """
     regimes = head.regimes.clone_with_K(new_K, regime_stats)
     hdp = head.hdp.resized_like(new_K)
-    hdp.update(C.double(), start.double(), n_global_iters=hdp_iters)
+    if seed_rho is not None:
+        hdp.seed_rho_omega(seed_rho[0], seed_rho[1])
+    hdp.update(C.double(), start.double(), n_global_iters=int(hdp_iters))
     return regimes, hdp
 
 
@@ -605,10 +624,24 @@ def delete_move(head, stoch=None, deter=None, is_first=None, *, buffer=None,
     # total corpus mass is a candidate (min_mass=None), and up to `delete_topk` of the
     # least-occupied candidates are each independently verified with the exact
     # whole-buffer bound -- not only the single least-used state.
-    if min_mass is None:
-        min_mass = 0.01 * float(soft.sum())
+    # BUG FIX. The old gate was `min_mass = 0.01 * soft.sum()`, i.e. 1% of TOTAL corpus
+    # mass. Since responsibilities sum to 1 per timestep, soft.sum() == n_timesteps, so
+    # the gate is an ABSOLUTE threshold that does not scale with K. Under roughly uniform
+    # occupancy each state holds 1/K of the mass, so the gate admits a candidate only
+    # when K > 100. For every K in the range where pruning matters (10-40) NO state ever
+    # qualifies and delete returns (False, 0.0) without proposing anything -- which is
+    # why its measured acceptance gain was ~0 while merge's was ~3000.
+    #
+    # Hughes gates on the number of SEQUENCES a state is used in ("10 or fewer"), which
+    # is a compute control, and `delete_topk` already serves that role here. So: always
+    # propose the `delete_topk` least-occupied states. Acceptance is still the exact
+    # whole-buffer bound, so proposing more can never accept something harmful -- it only
+    # costs time. An explicit `min_mass` still filters if the caller passes one.
     order = torch.argsort(soft).tolist()
-    cands = [int(j) for j in order if float(soft[j]) < float(min_mass)]
+    if min_mass is None:
+        cands = [int(j) for j in order]
+    else:
+        cands = [int(j) for j in order if float(soft[j]) < float(min_mass)]
     cands = cands[:max(1, int(delete_topk))]
     if not cands or head.K <= 1:
         return False, 0.0
@@ -655,7 +688,7 @@ def delete_move(head, stoch=None, deter=None, is_first=None, *, buffer=None,
 def merge_move(head, stoch=None, deter=None, is_first=None, *, buffer=None,
                threshold=0.0, confirm_top=None, refine_iters=1,
                size_log_prior_odds: float = 0.0, merge_select: str = "hughes",
-               max_passes: int = 3, merge_topm: int | None = None,
+               max_passes: int = 12, merge_topm: int | None = None,
                action=None):
     """Merge redundant regimes.
 
@@ -700,6 +733,14 @@ def merge_move(head, stoch=None, deter=None, is_first=None, *, buffer=None,
             pairs = [(i, j, _merge_gain_cached(stats, i, j, L))
                      for i in range(K) for j in range(i + 1, K)]
             pairs.sort(key=lambda t: -t[2])
+            # `_exact_all` (recurrent or q_rank>0) disables the cheap entropy-free
+            # screen and would otherwise exact-confirm all K(K-1)/2 pairs, making the
+            # two most interesting configurations the two slowest. Default to a
+            # bounded shortlist; acceptance stays exact, so the only failure mode is
+            # under-merging, never a bad accept. Pass merge_topm=None on a call that
+            # has already set _exact_all to force the full O(K^2) sweep.
+            if _exact_all and merge_topm is None:
+                merge_topm = 40
             if _exact_all and merge_topm is not None:
                 # Hughes top-M SCREENING for the recurrent /
                 # low-rank models. The residual ranking is a PROPOSAL heuristic only --
@@ -717,7 +758,9 @@ def merge_move(head, stoch=None, deter=None, is_first=None, *, buffer=None,
             cand_stats, keep = _merge_stats(stats, i, j)
             C, start = _merge_counts(baseC, bases, i, j)   # buffer-refit transition counts
             cand_rs = _rstick_keep(base_rs, keep)
-            regimes, hdp = _candidate(head, cand_stats, C, start, K - 1)
+            regimes, hdp = _candidate(head, cand_stats, C, start, K - 1,
+                                      seed_rho=merge_rho_omega(base_hdp.rho,
+                                                               base_hdp.omega, i, j))
             regimes, hdp, C, start = _refine(head, regimes, hdp, buf, iters=refine_iters,
                                              rstick=cand_rs)
             cand = aggregate_bound(head, buf, regimes=regimes, hdp=hdp, rstick=cand_rs)
@@ -758,6 +801,47 @@ def _best_cut(z, w, floor=1e-6):
     ok = (n1 > 10 * floor) & (n2 > 10 * floor)
     score = torch.where(ok, score, torch.full_like(score, -1e30))
     return int(score.argmax().item()) + 1
+
+
+@torch.no_grad()
+def _best_cut_ar(z, g, w, L, floor=1e-6):
+    """Linear-time cut maximising the AR data evidence (Hughes NIPS'15 supp. Eq. 60).
+
+    Hughes scores a cut by the CONJUGATE marginal likelihood of the two blocks,
+    `-c_H(S_am + tau_bar) - c_H(S_mb + tau_bar)`.  The autoregressive analogue is the
+    residual covariance after regressing z on the regressor g, i.e. exactly the
+    `_resid_logdet_from` statistic the merge ranking already uses -- so a birth proposes
+    the split that merge would be least willing to undo, and the two moves are scored on
+    one consistent data-fit criterion.
+
+    The previous `_best_cut` scored the weighted marginal variance of z ALONE with a
+    plug-in ML variance.  That clusters by LOCATION and SPREAD rather than by DYNAMICS:
+    two windows with identical A but different mean are split, two windows with
+    different A but similar spread are not -- the wrong objective for an AR-HMM.  It
+    also needed an `n1 > 10*floor` guard because a plug-in ML score has no Occam factor;
+    the collapsed residual form penalises short blocks on its own.
+    """
+    W = z.shape[0]
+    if W < 6:
+        return max(1, W // 2)
+    wz = w[:, None] * z
+    P_N = torch.cumsum(w, 0)
+    P_Sgg = torch.cumsum(w[:, None, None] * (g[:, :, None] * g[:, None, :]), 0)
+    P_Szg = torch.cumsum(wz[:, :, None] * g[:, None, :], 0)
+    P_Szz = torch.cumsum(wz * z, 0)
+    tot = (P_N[-1], P_Sgg[-1], P_Szg[-1], P_Szz[-1])
+    best_c, best_s = max(1, W // 2), -float('inf')
+    lo, hi = max(2, W // 10), min(W - 2, W - max(2, W // 10))
+    for c in range(lo, hi + 1):
+        N1 = P_N[c - 1].clamp_min(floor)
+        N2 = (tot[0] - P_N[c - 1]).clamp_min(floor)
+        ld1 = _resid_logdet_from(N1, P_Sgg[c - 1], P_Szg[c - 1], P_Szz[c - 1], None, L)
+        ld2 = _resid_logdet_from(N2, tot[1] - P_Sgg[c - 1], tot[2] - P_Szg[c - 1],
+                                 tot[3] - P_Szz[c - 1], None, L)
+        sc = float(-0.5 * (N1 * ld1 + N2 * ld2))
+        if sc > best_s:
+            best_s, best_c = sc, c
+    return int(best_c)
 
 
 def interval_birth_move(head, stoch=None, deter=None, is_first=None, *, buffer=None,
@@ -824,8 +908,12 @@ def interval_birth_move(head, stoch=None, deter=None, is_first=None, *, buffer=N
         newcols = gamma.new_zeros(gamma.shape[:2] + (2,))
         if bi == bi_star:
             gate = gates[bi]
-            cut = _best_cut(b.stoch[row_star, t0:t0 + W].double(),
-                            gate[row_star, t0:t0 + W].double())
+            _gw = head.build_g(head._prev_stoch(b.stoch, b.is_first), b.deter,
+                               head._shift_action(getattr(b, "action", None), b.is_first))
+            cut = _best_cut_ar(b.stoch[row_star, t0:t0 + W].double(),
+                               _gw[row_star, t0:t0 + W].double(),
+                               gate[row_star, t0:t0 + W].double(),
+                               head.regimes.L)
             newcols[row_star, t0:t0 + cut, 0] = gate[row_star, t0:t0 + cut]
             newcols[row_star, t0 + cut:t0 + W, 1] = gate[row_star, t0 + cut:t0 + W]
         scale_old = (1.0 - newcols.sum(-1, keepdim=True)).clamp_min(1e-6)
@@ -1039,7 +1127,7 @@ def sweep_moves(head, stoch=None, deter=None, is_first=None, *, buffer=None,
                 do_birth=True, do_split=True, threshold=0.0, create_bonus=0.0,
                 size_log_prior_odds=None, confirm_top=None, refine_iters=3,
                 delete_mode: str = "hughes", merge_select: str = "hughes",
-                merge_passes: int = 3, birth_style: str = "interval",
+                merge_passes: int = 12, birth_style: str = "interval",
                 delete_topk: int = 3, merge_topm: int | None = None, action=None):
     """One birth / split / merge / delete pass (Hughes lap structure: grow during the visit, clean up after). Returns a log {move: (accepted, elbo_gain)},
     where elbo_gain is the change in the PLAIN structured ELBO (so the log is transparent even

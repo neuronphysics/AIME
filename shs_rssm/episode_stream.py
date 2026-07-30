@@ -12,7 +12,7 @@ class CompletedEpisodeQueue:
         self._next_id = 0          # id to assign to the next pushed episode
         self._consumed = -1        # highest id drained (checkpoint watermark)
         self._pending = []         # list of (id, payload, replay_key) pushed, not drained
-        self._reserved = []        # open transaction (review P0 #5), empty when none
+        self._reserved = []        # open transaction, empty when none
 
     @property
     def next_id(self):
@@ -28,7 +28,7 @@ class CompletedEpisodeQueue:
     def push(self, payload, is_complete: bool = True, replay_key=None):
         """Enqueue one COMPLETED episode; returns its monotonic id. `replay_key` is a
         DURABLE identifier (e.g. the replay filename/index) by which the payload can be
-        re-fetched after a checkpoint resume (review P0 #2). A non-complete episode is
+        re-fetched after a checkpoint resume. A non-complete episode is
         rejected."""
         if not is_complete:
             raise ValueError("CompletedEpisodeQueue only accepts COMPLETED episodes "
@@ -49,7 +49,7 @@ class CompletedEpisodeQueue:
             self._consumed = out[-1][0]
         return [(e[0], e[1]) for e in out]
 
-    # ---- transactional protocol (review P0 #5): reserve -> compute -> commit | abort ----
+    # ---- transactional protocol: reserve -> compute -> commit | abort ----
     def reserve(self, max_n: int | None = None):
         """PEEK the next pending episodes WITHOUT advancing the watermark or removing
         them. Returns [(id, payload, replay_key)]. A crash/failure before commit leaves
@@ -78,7 +78,7 @@ class CompletedEpisodeQueue:
 
     def state_dict(self):
         # payloads are NOT serialised (they live in replay); pending ids + DURABLE replay
-        # keys let a resume re-fetch exactly the not-yet-ingested episodes (review P0 #2).
+        # keys let a resume re-fetch exactly the not-yet-ingested episodes.
         # An open reservation is intentionally dropped (rolled back) across a checkpoint.
         return dict(next_id=int(self._next_id), consumed=int(self._consumed),
                     pending_ids=[int(e[0]) for e in self._pending],

@@ -216,7 +216,7 @@ class SHSRSSM(networks.RSSM):
         self._last_is_first = is_first  # (B, T)
         if self._shs_action_dim > 0:
             self._last_action = action.detach()
-        # review P0 #1: forward sample= (base RSSM.observe accepts it); the frozen-target
+        # forward sample= (base RSSM.observe accepts it); the frozen-target
         # SHS encode calls observe(sample=False) -- the override previously dropped it,
         # raising TypeError on the streaming/consolidation paths.
         return super().observe(embed, action, is_first, state, sample=sample)
@@ -626,7 +626,7 @@ class SHSRSSM(networks.RSSM):
         deter = state["deter"].float()
         isf = state.get("is_first", None)
         prev = R._prev_stoch(stoch, isf)
-        # review Important #3: use the SAME action-conditioned regressor as training when
+        # use the SAME action-conditioned regressor as training when
         # action_dim>0 (guarded -- diagnostics must never crash on a stale/short action).
         _act = None
         if self._shs_action_dim > 0:

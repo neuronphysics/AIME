@@ -139,7 +139,7 @@ class SharedCarryRegimes(nn.Module):
             self.register_buffer("Szz_full_resid", torch.zeros(K, L, L, dtype=dtype, device=device))
             self.register_buffer("Ufac", torch.zeros(K, L, self.q_rank, dtype=dtype, device=device))
             self.register_buffer("q_Ddiag", torch.full((K, L), float(b0), dtype=dtype, device=device))
-            # review Important #1: keep the tau-noise E[tau^-1] and the INDEPENDENT U
+            # keep the tau-noise E[tau^-1] and the INDEPENDENT U
             # uncertainty tr Cov(U) SEPARATE, so only the noise is inflated by (1+rVr).
             self.register_buffer("_q_taudiag", torch.full((K, L), float(b0), dtype=dtype, device=device))
             self.register_buffer("_q_Udiag", torch.zeros((K, L), dtype=dtype, device=device))
@@ -158,7 +158,7 @@ class SharedCarryRegimes(nn.Module):
                                           ).expand(K, L, F, F).contiguous().clone())
             # gamma-weighted local-factor sufficient statistics (all K-leading: ledger/remap safe)
             self.register_buffer("Szf", torch.zeros(K, L, F, dtype=dtype, device=device))
-            # review P0 #2: the local-factor regressor stat has width Lr = L+action_dim+1
+            # the local-factor regressor stat has width Lr = L+action_dim+1
             # (the regressor r_t = [z_{t-1}; a_{t-1}; 1]); L+1 crashed when action_dim>0.
             self.register_buffer("Sfr", torch.zeros(K, F, self.Lr, dtype=dtype, device=device))
             self.register_buffer("Sfh", torch.zeros(K, F, self.Hp, dtype=dtype, device=device))
@@ -303,7 +303,7 @@ class SharedCarryRegimes(nn.Module):
             # coefficient-uncertainty (1+rVr); only the tau-scaled diagonal noise is.
             # This makes predictive() consistent with the (already-fixed) predictive_cov.
             factor = (self.Ufac ** 2).sum(-1)                    # (K,L) E[U]E[U]^T diag, unscaled
-            # review Important #1: only E[tau^-1] is inflated by (1+rVr); tr Cov(U) and
+            # only E[tau^-1] is inflated by (1+rVr); tr Cov(U) and
             # the E[U] factor are independent of (A,tau) and stay un-inflated.
             var = infl * self._q_taudiag + self._q_Udiag + factor + carry_var
         else:
@@ -326,7 +326,7 @@ class SharedCarryRegimes(nn.Module):
         Vdiag = torch.diagonal(self.V, dim1=-2, dim2=-1)        # (K,Lr)
         extra_rVr = torch.einsum("kr,...r->...k", Vdiag, r_var)
         if self.q_rank > 0:
-            # review blocker 6 + Important #1: regressor uncertainty inflates the
+            # regressor uncertainty inflates the
             # tau-NOISE only, not tr Cov(U) or the E[U] factor (matches predictive_cov_moments).
             var = var + extra_rVr.unsqueeze(-1) * self._q_taudiag
         else:
@@ -359,7 +359,7 @@ class SharedCarryRegimes(nn.Module):
             # regressor in predictive_cov is a separate effect). The previous U_infl append
             # (sqrt(extra_rVr) * Ufac) wrongly multiplied E[U U^T] by the regressor
             # uncertainty and is removed.
-            d = d + extra_rVr.unsqueeze(-1) * self._q_taudiag                  # review Important #1: tau-noise only
+            d = d + extra_rVr.unsqueeze(-1) * self._q_taudiag                  # tau-noise only
             U_extra = torch.einsum("klr,...r->...klr", self.M, r_var.clamp_min(0.0).sqrt())    # (...,K,L,Lr)
             U = torch.cat([U, U_extra], dim=-1)
         else:
@@ -383,7 +383,7 @@ class SharedCarryRegimes(nn.Module):
         infl = (1.0 + rVr).clamp(min=1e-6, max=self.infl_max)
         carry_var = self._hVCh(htil).unsqueeze(-2)               # (...,1,L)
         if self.q_rank > 0:
-            # review Important #1: inflate tau-noise only; add tr Cov(U) un-inflated.
+            # inflate tau-noise only; add tr Cov(U) un-inflated.
             d = infl.unsqueeze(-1) * self._q_taudiag + self._q_Udiag + carry_var    # (...,K,L)
             # q(U) is INDEPENDENT of the (A,tau) Normal-Gamma block, so the
             # factor loading U0 U0^T is NOT scaled by the coefficient-uncertainty inflation

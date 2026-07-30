@@ -108,7 +108,7 @@ def discover_regimes(Z, K_init=2, n_sweeps=6, refine_iters=4, seed=0):
     _apply(head, reg, hdp, Cc, sc)
     K_traj = [head.K]
     for _ in range(n_sweeps):
-        sweep_moves(head, buffer=buf, refine_iters=refine_iters)
+        sweep_moves(head, buffer=buf, refine_iters=refine_iters, confirm_top=8, merge_topm=25, merge_passes=12)
         K_traj.append(head.K)
     print(f"  regime discovery: K trajectory {K_traj} -> final K={head.K}")
 

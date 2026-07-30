@@ -347,7 +347,7 @@ class RegimeHead(nn.Module):
             _online_pw = bool(getattr(self, "_shs_online_pairwise", False)) and self.recurrent
             _trans_fn = None
             if _online_pw:
-                # blocker 8 + review P2 #11: keep the MESSAGES and build each transition
+                # keep the MESSAGES and build each transition
                 # slice ON DEMAND -- neither the O(BTK^2) xi NOR the O(BTK^2) transition
                 # tensor is ever materialised (peak drops to O(BTK)).
                 log_init, trans_aux, _trans_fn = self._transition_potentials_ondemand(
@@ -362,7 +362,7 @@ class RegimeHead(nn.Module):
                 gamma, counts_base, _logZ_re, xi = forward_backward(
                     log_init, log_trans, ev, is_first=is_first, valid=valid,
                     return_pairwise=True)
-            # blocker 8 + review Important #5: true logZ = shifted logZ + sum_t(shift),
+            # true logZ = shifted logZ + sum_t(shift),
             # but the shift must be masked by VALID (padding steps used zero evidence
             # in forward-backward, so their shift must NOT be added back), and kept as
             # a TENSOR -- converting to float here would force a GPU sync on every
@@ -479,7 +479,7 @@ class RegimeHead(nn.Module):
         ev = cache["evidence_shifted"]
         base_elogpi = self.hdp.expected_log_trans().to(dtype=dtype, device=device)
         if self.recurrent:
-            # review P2 #11: build each transition slice ON DEMAND (no O(BTK^2) tensor).
+            # build each transition slice ON DEMAND (no O(BTK^2) tensor).
             # The DIFFERENTIABLE slices come from freshly-recomputed aux (for the stickiness
             # gradient); the DETACHED slices (for the xi recomputation) come from the cached
             # detached aux -- both are O(BTK) not O(BTK^2).
@@ -658,14 +658,14 @@ class RegimeHead(nn.Module):
         self._struct_gen = int((state or {}).get("struct_gen", 0))
         self._gstep_count = int((state or {}).get("gstep_count", 0))
         self._episode_cursor = int((state or {}).get("episode_cursor", 0))
-        # review P1 #8: restore the blend flags so accumulated stats are not overwritten
+        # restore the blend flags so accumulated stats are not overwritten
         st = state or {}
         self._counts_initialised = bool(st.get("counts_initialised", False))
         if getattr(self, 'regimes', None) is not None:
             self.regimes._stats_initialised = bool(st.get("stats_initialised", False))
         if getattr(self, 'rstick', None) is not None:
             self.rstick._pg_init = bool(st.get("pg_init", False))
-        # review P1 #9: restore the fixed-Kmax active mask (registered as a buffer below,
+        # restore the fixed-Kmax active mask (registered as a buffer below,
         # but the bool list here covers older checkpoints / cross-device loads)
         _am = st.get("active_mask", None)
         if _am is not None:
@@ -1524,7 +1524,7 @@ class RegimeHead(nn.Module):
         #                      sticky path). Nondifferentiable discrete pick (stop-grad).
         #   reinforce_sample-> eval_sample PLUS the categorical log-prob is stashed
         #                      (self._last_imag_logprob) for a score-function estimator.
-        #                      HONEST (review Important #7): the actor loss does NOT yet
+        #                      HONEST: the actor loss does NOT yet
         #                      consume this log-prob, so reinforce_sample currently behaves
         #                      like eval_sample plus a stashed term a REINFORCE actor would
         #                      read; it is a hook, not a wired score-function estimator.

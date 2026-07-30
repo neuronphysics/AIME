@@ -69,7 +69,7 @@ def forward_backward(log_init, log_trans, log_ev, is_first=None, valid=None,
                      return_final=False, return_boundary=False, return_messages=False,
                      trans_fn=None):
     B, T, K = log_ev.shape
-    _Tof = _mk_trans_resolver(trans_fn, log_trans, B, K)   # review P2 #11: on-demand slices
+    _Tof = _mk_trans_resolver(trans_fn, log_trans, B, K)   # on-demand slices
     if log_init.dim() == 1:
         log_init = log_init.unsqueeze(0).expand(B, K)          # (B,K)
 

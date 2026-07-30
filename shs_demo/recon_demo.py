@@ -227,7 +227,7 @@ def fit_regimes_posthoc(z, K0=8, iters_burn=18, iters_prune=12):
         for _ in range(2):
             g, c, s0, _ = head.regime_inference(z, d0, isf)
             head.update_globals(z, d0, g, c, s0, isf)
-        delete_move(head, z, d0, isf, min_mass=mm, threshold=0.0)
+        delete_move(head, z, d0, isf, threshold=0.0)
         merge_move(head, z, d0, isf, threshold=0.0)
     gamma, *_ = head.regime_inference(z, d0, isf)
     return gamma, head.K
