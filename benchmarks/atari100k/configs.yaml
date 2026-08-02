@@ -1,0 +1,60 @@
+# Atari 100k with SHS-RSSM.
+#
+# READ THIS BEFORE RUNNING. use_shs asserts dyn_discrete == 0, i.e. it replaces
+# DreamerV3's 32x32 categorical latent with a continuous Gaussian one. On
+# discrete-action pixel domains the categorical latent is one of the components
+# DreamerV3's own ablations credit with a large share of the score, so
+# `atari100k_shs` is confounded: it differs from the baseline in TWO ways.
+# `atari100k_gauss` is the control that separates them. Run all three arms or
+# do not report Atari.
+
+atari100k_shs:
+  steps: 4e5
+  envs: 1
+  action_repeat: 4
+  train_ratio: 1024
+  video_pred_log: true
+  eval_episode_num: 100
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  stickey: False
+  lives: unused
+  noops: 30
+  resize: opencv
+  actions: needed
+  time_limit: 108000
+
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_move_warmup: 0
+  shs_move_buffer: 8
+  shs_curriculum:
+    - {until: 5000,  move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    - {until: 10000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    - {until: 15000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+
+# Control arm: continuous latent, stock DreamerV3 prior. Isolates the effect of
+# dropping categorical latents from the effect of the switching prior.
+atari100k_gauss:
+  steps: 4e5
+  envs: 1
+  action_repeat: 4
+  train_ratio: 1024
+  video_pred_log: true
+  eval_episode_num: 100
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  stickey: False
+  lives: unused
+  noops: 30
+  resize: opencv
+  actions: needed
+  time_limit: 108000
+  dyn_discrete: 0
+  use_shs: False

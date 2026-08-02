@@ -1,0 +1,151 @@
+# Meta-World (MT1 single-task, goal-observable).
+#
+# IMPORTANT: encoder/decoder mlp_keys are pinned to 'state' rather than '.*'.
+# The rollout loop writes `log_success` into the saved episodes, so an mlp_keys
+# of '.*' would feed the success flag to the encoder as an observation and the
+# agent would learn to read the answer. Do not relax this regex.
+#
+# Episode budget: Meta-World's max_path_length is 500 env steps. With
+# action_repeat 2 that is 250 agent steps, so time_limit is set to 500 (main()
+# divides it by action_repeat).
+
+metaworld_proprio:
+  task: 'metaworld_reach'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 500
+  envs: 4
+  train_ratio: 512
+  prefill: 5000
+  eval_every: 1e4
+  eval_episode_num: 10
+  video_pred_log: false
+  mw_render: false            # no MuJoCo rendering: ~3-5x faster rollouts
+  encoder: {mlp_keys: 'state', cnn_keys: '$^'}
+  decoder: {mlp_keys: 'state', cnn_keys: '$^'}
+
+metaworld_vision:
+  task: 'metaworld_reach'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 500
+  envs: 4
+  train_ratio: 512
+  prefill: 5000
+  eval_every: 1e4
+  eval_episode_num: 10
+  video_pred_log: true
+  mw_render: true
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+# ---------------------------------------------------------------------------
+# SHS-RSSM variants. These inherit from the two configs above conceptually but
+# ruamel does not do YAML inheritance across documents, so the shared keys are
+# repeated. Keep them in sync with the baselines above -- the whole comparison
+# depends on the two arms differing ONLY in the dynamics prior.
+# ---------------------------------------------------------------------------
+
+metaworld_proprio_shs:
+  task: 'metaworld_reach'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 500
+  envs: 4
+  train_ratio: 512
+  prefill: 5000
+  eval_every: 1e4
+  eval_episode_num: 10
+  video_pred_log: false
+  mw_render: false
+  encoder: {mlp_keys: 'state', cnn_keys: '$^'}
+  decoder: {mlp_keys: 'state', cnn_keys: '$^'}
+
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_rstick_dim: 8
+  shs_rstick_stopgrad: True
+  shs_imag_sample_mixture: True
+  shs_analytic_estep: True
+  shs_move_buffer: 8
+  shs_diag_log: True
+  shs_diag_figures: True
+  # Manipulation is phase-structured (reach / approach / grasp / transport /
+  # release), so the curriculum boundaries below are placeholders keyed to where
+  # DMC's curves flattened. Re-fit them from the recon + dyn-KL curves of a
+  # single pilot run before launching the sweep.
+  shs_move_warmup: 0          # phase 1 is the warmup
+  shs_curriculum:
+    # 1) FORM: fixed K, sticky base, no moves, no recurrence.
+    - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 2) DISCOVER: adaptive K under the plain structured bound.
+    - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 3) FULL: recurrent state-dependent stickiness on, kappa zeroed internally.
+    - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+    # 4) STABLE: everything active, reduced move cadence.
+    - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+
+metaworld_vision_shs:
+  task: 'metaworld_reach'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 500
+  envs: 4
+  train_ratio: 512
+  prefill: 5000
+  eval_every: 1e4
+  eval_episode_num: 10
+  video_pred_log: true
+  mw_render: true
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_rstick_dim: 8
+  shs_rstick_stopgrad: True
+  shs_imag_sample_mixture: True
+  shs_analytic_estep: True
+  shs_move_buffer: 8
+  shs_diag_log: True
+  shs_diag_figures: True
+  shs_move_warmup: 0          # phase 1 is the warmup
+  shs_curriculum:
+    # 1) FORM: fixed K, sticky base, no moves, no recurrence.
+    - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 2) DISCOVER: adaptive K under the plain structured bound.
+    - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    # 3) FULL: recurrent state-dependent stickiness on, kappa zeroed internally.
+    - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+    # 4) STABLE: everything active, reduced move cadence.
+    - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+
+# Continuous-latent DreamerV3 ablation. This is the control that isolates the
+# switching prior from the categorical->Gaussian latent change that use_shs
+# forces. Without this arm you cannot attribute any gain to SHS-RSSM.
+metaworld_proprio_gauss:
+  task: 'metaworld_reach'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 500
+  envs: 4
+  train_ratio: 512
+  prefill: 5000
+  eval_every: 1e4
+  eval_episode_num: 10
+  video_pred_log: false
+  mw_render: false
+  encoder: {mlp_keys: 'state', cnn_keys: '$^'}
+  decoder: {mlp_keys: 'state', cnn_keys: '$^'}
+  dyn_discrete: 0
+  use_shs: False

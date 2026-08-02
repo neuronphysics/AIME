@@ -1,0 +1,27 @@
+# DMC lives in the root configs.yaml (dmc_proprio, dmc_vision, and the five
+# dmc_*_shs task configs). This folder holds only the missing control arm.
+#
+# Continuous-latent DreamerV3 on DMC vision. dmc_vision uses dyn_discrete: 32,
+# so a dmc_vision-vs-dmc_walker_shs comparison changes the latent type AND the
+# prior at once. This is the arm that separates them.
+dmc_vision_gauss:
+  steps: 1e6
+  action_repeat: 2
+  envs: 4
+  train_ratio: 512
+  video_pred_log: true
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  dyn_discrete: 0
+  use_shs: False
+
+dmc_proprio_gauss:
+  steps: 5e5
+  action_repeat: 2
+  envs: 4
+  train_ratio: 512
+  video_pred_log: false
+  encoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  decoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  dyn_discrete: 0
+  use_shs: False

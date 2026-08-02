@@ -13,3 +13,10 @@ opencv-python==4.7.0.72
 numpy==1.23.5
 scikit-learn==1.3.2
 tensorboard==2.17.1
+# Meta-World benchmark (benchmarks/metaworld/). Pulls in gymnasium + mujoco>=3;
+# the wrapper bridges gymnasium's 5-tuple step back to the old-gym API the
+# rollout loop uses, so both gym and gymnasium coexist here intentionally.
+metaworld
+# ProcGen (benchmarks/procgen/) is NOT pinned here: it needs its own build
+# toolchain and does not install cleanly alongside gym 0.22 on most setups.
+# Install separately if you actually run that domain: pip install procgen

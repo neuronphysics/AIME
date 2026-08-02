@@ -1,0 +1,46 @@
+# Crafter with SHS-RSSM. Same categorical-latent confound as Atari; the _gauss
+# control arm is mandatory for an attributable claim.
+crafter_shs:
+  task: crafter_reward
+  steps: 1e6
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  dyn_hidden: 1024
+  dyn_deter: 4096
+  units: 1024
+  encoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  actor: {layers: 5, dist: 'onehot', std: 'none'}
+  critic: {layers: 5}
+  reward_head: {layers: 5}
+  cont_head: {layers: 5}
+  imag_gradient: 'reinforce'
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 16
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_move_warmup: 2000
+
+crafter_gauss:
+  task: crafter_reward
+  steps: 1e6
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  dyn_hidden: 1024
+  dyn_deter: 4096
+  units: 1024
+  encoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  actor: {layers: 5, dist: 'onehot', std: 'none'}
+  critic: {layers: 5}
+  reward_head: {layers: 5}
+  cont_head: {layers: 5}
+  imag_gradient: 'reinforce'
+  dyn_discrete: 0
+  use_shs: False

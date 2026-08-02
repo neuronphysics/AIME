@@ -29,6 +29,17 @@ defaults:
   prefill: 5000
   reward_EMA: True
 
+  # Meta-World (suite prefix 'metaworld_', see benchmarks/metaworld/)
+  mw_camera: 'corner2'          # corner2 is the MWM / TD-MPC2 viewpoint
+  mw_render: True               # False = proprio-only, skips MuJoCo rendering
+  mw_randomize_goal: True       # True = per-episode goal (hard, TD-MPC2 setting)
+  mw_terminate_on_success: False  # keep False: changes the benchmark definition
+
+  # ProcGen (suite prefix 'procgen_', see benchmarks/procgen/)
+  procgen_distribution_mode: 'easy'
+  procgen_num_levels: 0         # 0 = unlimited procedural levels
+  procgen_start_level: 0
+
   # Model
   dyn_hidden: 512
   dyn_deter: 512
@@ -208,7 +219,7 @@ dmc_vision:
 
 crafter:
   task: crafter_reward
-  step: 1e6
+  steps: 1e6
   action_repeat: 1
   envs: 1
   train_ratio: 512
@@ -219,7 +230,7 @@ crafter:
   encoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
   decoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
   actor: {layers: 5, dist: 'onehot', std: 'none'}
-  value: {layers: 5}
+  critic: {layers: 5}
   reward_head: {layers: 5}
   cont_head: {layers: 5}
   imag_gradient: 'reinforce'
@@ -242,7 +253,7 @@ atari100k:
 
 minecraft:
   task: minecraft_diamond
-  step: 1e8
+  steps: 1e8
   parallel: True
   envs: 16
   # no eval
@@ -257,7 +268,7 @@ minecraft:
   encoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
   decoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
   actor: {layers: 5, dist: 'onehot', std: 'none'}
-  value: {layers: 5}
+  critic: {layers: 5}
   reward_head: {layers: 5}
   cont_head: {layers: 5}
   imag_gradient: 'reinforce'

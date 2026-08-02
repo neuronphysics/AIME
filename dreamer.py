@@ -329,6 +329,33 @@ def make_env(config, mode, id):
 
         env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
         env = wrappers.OneHotAction(env)
+    elif suite == "metaworld":
+        from envs.metaworld import MetaWorld
+
+        env = MetaWorld(
+            task,
+            action_repeat=config.action_repeat,
+            size=config.size,
+            seed=config.seed + id,
+            camera=config.mw_camera,
+            render=config.mw_render,
+            randomize_goal=config.mw_randomize_goal,
+            terminate_on_success=config.mw_terminate_on_success,
+        )
+        env = wrappers.NormalizeActions(env)
+    elif suite == "procgen":
+        from envs.procgen import ProcGen
+
+        env = ProcGen(
+            task,
+            action_repeat=config.action_repeat,
+            size=config.size,
+            seed=config.seed + id,
+            distribution_mode=config.procgen_distribution_mode,
+            num_levels=config.procgen_num_levels,
+            start_level=config.procgen_start_level,
+        )
+        env = wrappers.OneHotAction(env)
     else:
         raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit)
@@ -503,9 +530,19 @@ if __name__ == "__main__":
     parser.add_argument("--configs", nargs="+")
     args, remaining = parser.parse_known_args()
     yaml_loader = yaml.YAML(typ="safe", pure=True)
-    configs = yaml_loader.load(
-       (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
-    )
+    root = pathlib.Path(sys.argv[0]).parent
+    configs = yaml_loader.load((root / "configs.yaml").read_text())
+    # Per-benchmark configs live in benchmarks/<name>/configs.yaml and are merged
+    # into the same flat namespace, so `--configs metaworld_shs` works exactly
+    # like the configs defined in the root file. Root definitions win on a name
+    # clash so nothing that already works can be silently overridden.
+    for extra in sorted((root / "benchmarks").glob("*/configs.yaml")):
+        for name, cfg in (yaml_loader.load(extra.read_text()) or {}).items():
+            if name in configs:
+                raise ValueError(
+                    f"config '{name}' in {extra} collides with configs.yaml"
+                )
+            configs[name] = cfg
 
     def recursive_update(base, update):
         for key, value in update.items():

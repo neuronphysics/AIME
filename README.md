@@ -250,3 +250,21 @@ the Lorenz attribution study), optional ML low-rank process noise, the frozen st
 projection, stop-grads / variance caps / curricula (rejected by the strict-ELBO
 profile). Monte Carlo appears only in generative rollouts and optional diagnostics;
 fitting and move acceptance are deterministic. 
+
+## Benchmarks
+
+Per-domain configs live in `benchmarks/<domain>/configs.yaml` and are merged into
+the same named-config namespace as the root `configs.yaml` at startup, so
+`--configs metaworld_proprio_shs` works exactly like a built-in config. Name
+collisions raise rather than silently override. See `benchmarks/README.md`.
+
+Meta-World (`benchmarks/metaworld/`) is new: 50 manipulation tasks, a wrapper
+verified against the real `metaworld` package, the Seo et al. difficulty tiers,
+a sweep launcher, and an aggregation script that reports IQM with stratified
+bootstrap CIs from `metrics.jsonl`.
+
+Note that `use_shs: True` requires `dyn_discrete: 0`, so an SHS-vs-DreamerV3
+comparison changes both the dynamics prior and the latent type. Each benchmark
+folder therefore also defines a `*_gauss` control arm (continuous latent, stock
+amortised prior) which is what makes a difference attributable to the switching
+prior. Details in `benchmarks/README.md`.

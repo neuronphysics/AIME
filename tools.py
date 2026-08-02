@@ -219,15 +219,20 @@ def simulate(
                 score = float(np.array(cache[envs[i].id]["reward"]).sum())
                 video = cache[envs[i].id]["image"]
                 # record logs given from environments
+                episode_logs = {}
                 for key in list(cache[envs[i].id].keys()):
                     if "log_" in key:
-                        logger.scalar(
-                            key, float(np.array(cache[envs[i].id][key]).sum())
+                        episode_logs[key] = float(
+                            np.array(cache[envs[i].id][key]).sum()
                         )
                         # log items won't be used later
                         cache[envs[i].id].pop(key)
 
                 if not is_eval:
+                    # Train episodes flush after every episode, so writing the
+                    # per-episode value here records all of them.
+                    for key, value in episode_logs.items():
+                        logger.scalar(key, value)
                     step_in_dataset = erase_over_episodes(cache, limit)
                     logger.scalar(f"dataset_size", step_in_dataset)
                     logger.scalar(f"train_return", score)
@@ -238,10 +243,18 @@ def simulate(
                     if not "eval_lengths" in locals():
                         eval_lengths = []
                         eval_scores = []
+                        eval_logs = {}
                         eval_done = False
                     # start counting scores for evaluation
                     eval_scores.append(score)
                     eval_lengths.append(length)
+                    # Eval flushes ONCE, after the last episode. Calling
+                    # logger.scalar per episode would leave only the final
+                    # episode's value, which for a 0/1 metric like Meta-World
+                    # success is a coin flip rather than a rate. Accumulate and
+                    # average instead.
+                    for key, value in episode_logs.items():
+                        eval_logs.setdefault(key, []).append(value)
 
                     score = sum(eval_scores) / len(eval_scores)
                     length = sum(eval_lengths) / len(eval_lengths)
@@ -251,6 +264,12 @@ def simulate(
                         logger.scalar(f"eval_return", score)
                         logger.scalar(f"eval_length", length)
                         logger.scalar(f"eval_episodes", len(eval_scores))
+                        for key, values in eval_logs.items():
+                            # e.g. log_success -> eval_log_success, the mean
+                            # over eval_episode_num episodes = success rate.
+                            logger.scalar(
+                                f"eval_{key}", sum(values) / len(values)
+                            )
                         logger.write(step=logger.step)
                         eval_done = True
     if is_eval:

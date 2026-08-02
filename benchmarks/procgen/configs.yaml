@@ -1,0 +1,47 @@
+# ProcGen. Untested end to end -- envs/procgen.py is new and the `procgen`
+# package is not in requirements.txt (it needs its own build toolchain and does
+# not coexist cleanly with newer gym). Treat this as scaffolding.
+#
+# Protocol: DreamerV3's ProcGen numbers come from one seed per game (the paper
+# says so explicitly, for compute reasons), which makes it a noisy comparison
+# target in both directions. Match distribution_mode and num_levels to the
+# DreamerV3 appendix before claiming anything.
+#
+# Same categorical-latent confound as Atari applies here. See ../atari100k/.
+
+procgen_baseline:
+  task: 'procgen_coinrun'
+  steps: 25e6
+  envs: 8
+  action_repeat: 1
+  train_ratio: 64
+  time_limit: 10000
+  video_pred_log: true
+  procgen_distribution_mode: 'easy'
+  procgen_num_levels: 0
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+procgen_shs:
+  task: 'procgen_coinrun'
+  steps: 25e6
+  envs: 8
+  action_repeat: 1
+  train_ratio: 64
+  time_limit: 10000
+  video_pred_log: true
+  procgen_distribution_mode: 'easy'
+  procgen_num_levels: 0
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_move_warmup: 2000
