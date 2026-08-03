@@ -118,3 +118,39 @@ Never run: a real training step. No GPU, no torch in the sandbox.
 existing env wrapper. No SHS-RSSM code was modified. Existing DMC configs
 (`dmc_walker_shs` and friends) are byte-identical, so prior DMC results remain
 reproducible.
+
+---
+
+## Follow-up fixes (after first sanity run)
+
+The `metaworld_proprio` sanity run reached eval successfully and then crashed in
+the tensorboard video writer. Two independent causes, both fixed.
+
+### 1. `tools.py` + `dreamer.py` — eval rollout video logged unconditionally
+
+`simulate` called `logger.video("eval_policy", ...)` on every eval episode
+regardless of `config.video_pred_log`. For proprioceptive runs the frames are
+the 1x1 placeholder the env emits (so `models.preprocess` can still divide
+`obs['image']` by 255), so the video is meaningless as well as a crash risk.
+
+`simulate` now takes `log_video=True`; `dreamer.py` passes
+`config.video_pred_log` at the eval call site. Proprio runs never touch the
+video path.
+
+### 2. `compat.py` (new) — numpy >= 2.1 removed `np.reshape(newshape=)`
+
+`torch.utils.tensorboard._utils._prepare_video` still passes `newshape=`, so any
+run that logs a video dies at the first eval with
+`TypeError: reshape() got an unexpected keyword argument 'newshape'`.
+
+This is a dependency-version problem, not a model problem, and it affects
+**every vision config** — `dmc_vision`, `crafter`, `atari100k`, `minecraft`,
+`metaworld_vision` — not just Meta-World. Fix #1 alone only rescues proprio runs.
+
+`compat.py` restores the removed alias, and is a no-op on environments where the
+keyword still works. Imported from `tools.py`. Verified against torch's exact
+call pattern plus positional, `shape=`, `order=`, and `copy=` call styles, and
+verified idempotent on re-import.
+
+The durable fix is to upgrade torch or hold `numpy < 2.1`; delete `compat.py`
+and its import once the environment is pinned.

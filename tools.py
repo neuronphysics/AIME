@@ -10,6 +10,8 @@ import random
 
 import numpy as np
 
+import compat  # noqa: F401  numpy/tensorboard version shims; see compat.py
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -137,6 +139,7 @@ def simulate(
     episodes=0,
     state=None,
     on_episode_complete=None,
+    log_video=True,
 ):
     # initialize or unpack simulation state
     if state is None:
@@ -258,7 +261,12 @@ def simulate(
 
                     score = sum(eval_scores) / len(eval_scores)
                     length = sum(eval_lengths) / len(eval_lengths)
-                    logger.video(f"eval_policy", np.array(video)[None])
+                    # Proprioceptive runs have no meaningful frames (the env
+                    # emits a 1x1 placeholder so models.preprocess still works),
+                    # so writing a video is both useless and a crash risk in the
+                    # tensorboard video writer. Gated on config.video_pred_log.
+                    if log_video:
+                        logger.video(f"eval_policy", np.array(video)[None])
 
                     if len(eval_scores) >= episodes and not eval_done:
                         logger.scalar(f"eval_return", score)
