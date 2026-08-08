@@ -35,8 +35,16 @@ import numpy as np
 
 
 def read_curve(path, metric):
-    """Return (steps, values) arrays for one run's metrics.jsonl."""
-    steps, values = [], []
+    """Return (steps, values) arrays for one run's metrics.jsonl.
+
+    metrics.jsonl is APPENDED to, not truncated, so a logdir that was resumed
+    after a timeout -- or rerun after a crash -- contains several runs' rows
+    interleaved, with repeated step values. Left alone, a stale row from an
+    abandoned run can win the `last N points` selection and silently corrupt a
+    score. Later rows are from the more recent run, so keep the last value seen
+    for each step.
+    """
+    latest = {}
     with open(path) as f:
         for line in f:
             try:
@@ -44,10 +52,10 @@ def read_curve(path, metric):
             except json.JSONDecodeError:
                 continue
             if metric in rec:
-                steps.append(rec["step"])
-                values.append(rec[metric])
-    order = np.argsort(steps)
-    return np.asarray(steps)[order], np.asarray(values, np.float64)[order]
+                latest[rec["step"]] = rec[metric]
+    steps = np.array(sorted(latest))
+    values = np.array([latest[s] for s in steps], np.float64)
+    return steps, values
 
 
 def value_at(steps, values, at, window=5):
