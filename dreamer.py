@@ -8,6 +8,8 @@ os.environ.setdefault("MUJOCO_GL", "osmesa")
 import numpy as np
 import ruamel.yaml as yaml
 
+import compat  # noqa: F401  numpy 2 shims; must precede matplotlib/torch use
+
 sys.path.append(str(pathlib.Path(__file__).parent))
 
 import exploration as expl
