@@ -1,0 +1,42 @@
+# Legacy environment for run_rslds.py (Linderman et al. 2017 stack).
+#
+# The rSLDS reference implementation depends on Cython extensions
+# (pybasicbayes / pyhsmm / autoregressive / pylds / pyslds / pypolyagamma)
+# written against python<=3.8 and numpy<1.24 idioms (np.int, deprecated C
+# APIs).  They do not build on the modern environment used by run_shs.py and
+# run_trslds.py; this file gives a known-good-era recipe instead.
+#
+# NOTE these pins are assembled from the stack's 2017-2021 compatibility
+# window, not re-verified by CI in this repository -- if a build breaks,
+# nudge numpy within 1.19-1.23 and keep cython<3 (the extensions predate
+# Cython 3's semantics).  pypolyagamma needs a C compiler; OpenMP is
+# optional (single-threaded sampling works without it).
+#
+#   conda env create -f environment-baselines.yml
+#   conda activate rslds-legacy
+#   # if the single pip pass fails, install the pip lines one at a time,
+#   # top to bottom (they are ordered by dependency).
+#   python run_rslds.py --dataset nascar
+#
+# Results land in the shared results/<dataset>/ folder; aggregate with
+# make_figures.py from either environment.
+name: rslds-legacy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.8
+  - numpy=1.21
+  - scipy=1.7
+  - cython=0.29.36
+  - scikit-learn=1.1
+  - matplotlib=3.5
+  - future
+  - requests
+  - pip
+  - pip:
+      - pypolyagamma            # C extension; builds with the cython above
+      - git+https://github.com/mattjj/pybasicbayes.git
+      - git+https://github.com/mattjj/pyhsmm.git
+      - git+https://github.com/mattjj/pyhsmm-autoregressive.git
+      - git+https://github.com/mattjj/pylds.git
+      - git+https://github.com/slinderman/pyslds.git

@@ -1,0 +1,34 @@
+# Ignore all __pycache__ directories
+**/__pycache__/
+# **/__pycache__/__init__.cpython*.pyc
+logs/
+shs_demo/compare/results*/
+shs_demo/compare/figures*/
+shs_demo/compare/data_cache*/
+logdir/
+logs/
+slurm-*.out
+slurm-*.err
+wandb/
+# large artefacts
+*.pt
+*.ckpt
+*.npz
+*.pyc
+__pycache__/
+logdir/
+shs_rssm/tests_*.py
+# Ignore .DS_Store (macOS folder metadata)
+.DS_Store
+core.*
+.idea
+build/
+dist/ 
+develop-eggs/
+eggs/
+.eggs/
+wheels/ 
+*.egg-info
+*.egg
+*.whl
+.vscode/settings.json

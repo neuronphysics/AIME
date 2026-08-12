@@ -1,0 +1,451 @@
+defaults:
+
+  logdir: null
+  traindir: null
+  evaldir: null
+  offline_traindir: ''
+  offline_evaldir: ''
+  seed: 0
+  deterministic_run: False
+  steps: 1e6
+  parallel: False
+  eval_every: 1e4
+  eval_episode_num: 10
+  log_every: 1e4
+  reset_every: 0
+  device: 'cuda:0'
+  compile: True
+  precision: 32
+  debug: False
+  video_pred_log: True
+
+  task: 'dmc_walker_walk'
+  size: [64, 64]
+  envs: 1
+  action_repeat: 2
+  time_limit: 1000
+  grayscale: False
+  prefill: 5000
+  reward_EMA: True
+
+  dyn_hidden: 512
+  dyn_deter: 512
+  dyn_stoch: 32
+  dyn_discrete: 32
+  dyn_rec_depth: 10
+  dyn_mean_act: 'none'
+  dyn_std_act: 'sigmoid2'
+  dyn_min_std: 0.1
+
+  use_shs: False
+  shs_K: 16
+  shs_proj_dim: 64
+  shs_gamma: 5.0
+  shs_alpha: 1.0
+  shs_kappa: 50.0
+  shs_ema_tau: 0.02
+  shs_recurrent: True
+  shs_prior_persist: 0.9
+  shs_pg_iters: 4
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_every: 0
+  shs_move_warmup: 2000
+  shs_move_birth: True
+  shs_move_split: True
+  shs_move_confirm_top: null
+  shs_delete_mode: hughes
+  shs_merge_select: hughes    # hughes = entropy-free complete shortlist (NIPS'15 Sec.4); residual = fast log-det ranking
+  shs_merge_passes: 3
+  shs_move_buffer: 8
+  shs_move_max_age: 0
+  shs_online_pairwise: False
+  shs_imag_mode: 'actor_moment'
+  shs_global_source: replay_ema
+  shs_repr_epoch_steps: 0
+  shs_ckpt_reservoir: False
+  shs_stream_episodes: False
+  shs_consolidate_every_episodes: 0
+  shs_consolidate_warmup: 100000
+  shs_consolidate_batches: 8
+  shs_consolidate_sweeps: 3
+  shs_consolidate_ep_len: 500
+  shs_stream_chunked: True
+  shs_imag_sample_mixture: True
+  shs_analytic_estep: True
+  shs_moment_consistent: True
+  shs_inference_mode: filtered
+  shs_chunk_boundary_mask: True
+  shs_q_rank: 0
+  shs_shared_carry: True
+  shs_free: 1.0
+  shs_ard: False
+  shs_hdp_every: 1
+  shs_pg_every: 1
+  shs_strict_stream: False
+  shs_stream_local_iters: 1
+  shs_stream_discount: 1.0
+  shs_a0: 3.0
+  shs_b0: 2.0
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_learn_b0: False
+  shs_b0_strength: 2.0
+  shs_action_dim: 0
+  shs_merge_topm: null
+  shs_online_mode: ema
+  shs_expected_batches: null
+  shs_strict_elbo: False
+  shs_corpus_batches: null
+  shs_entropy_mode: bounds
+  shs_moves_complete: False
+  shs_birth_style: seqcreate
+  shs_diag_log: False
+  shs_diag_figures: True
+  shs_curriculum: []
+
+  grad_heads: ['decoder', 'reward', 'cont']
+  units: 512
+  act: 'SiLU'
+  norm: True
+  encoder:
+    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+  decoder:
+    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+  actor:
+    {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  critic:
+    {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  reward_head:
+    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  cont_head:
+    {layers: 2, loss_scale: 1.0, outscale: 1.0}
+  dyn_scale: 0.5
+  rep_scale: 0.1
+  kl_free: 1.0
+  weight_decay: 0.0
+  unimix_ratio: 0.01
+  initial: 'learned'
+
+  batch_size: 26
+  batch_length: 64
+  train_ratio: 512
+  pretrain: 100
+  model_lr: 1e-4
+  opt_eps: 1e-8
+  grad_clip: 1000
+  dataset_size: 1000000
+  opt: 'adam'
+
+  discount: 0.997
+  discount_lambda: 0.95
+  imag_horizon: 15
+  imag_gradient: 'dynamics'
+  imag_gradient_mix: 0.0
+  eval_state_mean: False
+
+  expl_behavior: 'greedy'
+  expl_until: 0
+  expl_extr_scale: 0.0
+  expl_intr_scale: 1.0
+  disag_target: 'stoch'
+  disag_log: True
+  disag_models: 10
+  disag_offset: 1
+  disag_layers: 4
+  disag_units: 400
+  disag_action_cond: False
+
+shs_strict:
+  use_shs: True
+  dyn_discrete: 0
+  shs_strict_elbo: True
+  shs_free: 0.0
+  kl_free: 0.0
+  dyn_scale: 1.0
+  rep_scale: 0.0
+  shs_ard: False
+  shs_q_rank: 0
+  shs_curriculum: []
+  shs_corpus_batches: 1
+  # NOTE: memoized mode REQUIRES a stable batch id per replay partition.
+  # Nothing in this repository calls SHSRSSM.set_batch_id(), so this preset
+  # raises on the second queued global update by design (RegimeHead.
+  # update_globals refuses batch_id=None rather than silently appending a
+  # new batch on every replay revisit).  Wire set_batch_id() to your replay
+  # partition id -- and set shs_expected_batches -- before using shs_strict.
+  shs_online_mode: memoized
+  shs_global_source: offline_memoized
+  shs_strict_stream: True
+  shs_move_every: 0
+  shs_rstick_stopgrad: False
+
+dmc_proprio:
+  steps: 5e5
+  action_repeat: 2
+  envs: 4
+  train_ratio: 512
+  video_pred_log: false
+  encoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  decoder: {mlp_keys: '.*', cnn_keys: '$^'}
+
+dmc_vision:
+  steps: 1e6
+  action_repeat: 2
+  envs: 4
+  train_ratio: 512
+  video_pred_log: true
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+crafter:
+  task: crafter_reward
+  step: 1e6
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: true
+  dyn_hidden: 1024
+  dyn_deter: 4096
+  units: 1024
+  encoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  actor: {layers: 5, dist: 'onehot', std: 'none'}
+  value: {layers: 5}
+  reward_head: {layers: 5}
+  cont_head: {layers: 5}
+  imag_gradient: 'reinforce'
+
+atari100k:
+  steps: 4e5
+  envs: 1
+  action_repeat: 4
+  train_ratio: 1024
+  video_pred_log: true
+  eval_episode_num: 100
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  stickey: False
+  lives: unused
+  noops: 30
+  resize: opencv
+  actions: needed
+  time_limit: 108000
+
+minecraft:
+  task: minecraft_diamond
+  step: 1e8
+  parallel: True
+  envs: 16
+  eval_episode_num: 0
+  eval_every: 1e4
+  action_repeat: 1
+  train_ratio: 16
+  video_pred_log: true
+  dyn_hidden: 1024
+  dyn_deter: 4096
+  units: 1024
+  encoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  decoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  actor: {layers: 5, dist: 'onehot', std: 'none'}
+  value: {layers: 5}
+  reward_head: {layers: 5}
+  cont_head: {layers: 5}
+  imag_gradient: 'reinforce'
+  break_speed: 100.0
+  time_limit: 36000
+
+memorymaze:
+  steps: 1e8
+  action_repeat: 2
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  task: 'memorymaze_9x9'
+
+debug:
+  debug: True
+  pretrain: 1
+  prefill: 1
+  batch_size: 10
+  batch_length: 20
+
+# shared SHS block
+# grad steps = steps / action_repeat / (batch_size*batch_length/train_ratio) = steps/16
+# kappa is read ONLY in recurrent:False phases; the gate zeroes it when recurrent:True
+# prior_persist is matched to kappa/(alpha+kappa) so the handoff is continuous
+dmc_walker_shs:
+  task: 'dmc_walker_walk'
+  steps: 1e6                 # 62,500 grad steps
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 16                  # over-provision; merge/delete prune down
+  shs_action_dim: 6
+
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9    # independent of shs_kappa: the gate replaces the
+                            # sticky Dirichlet (base_kappa -> 0 when recurrent).
+                            # To CARRY OVER kappa=50, alpha=1 exactly, this would
+                            # be 50/51 = 0.980; 0.9 is a deliberately weaker prior.
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+
+  shs_curriculum:
+    - {until: 18000, move_every: 0,    recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until: 30000, move_every: 2000, recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until: 40000, move_every: 2000, recurrent: True,               birth: False, split: False, create_bonus: 0.0}
+    - {until: -1,    move_every: 2000, recurrent: True,               birth: True,  split: True,  create_bonus: 0.0}
+
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_hopper_shs:
+  task: 'dmc_hopper_hop'
+  steps: 1e6                 # 62,500 grad steps
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 16
+  shs_action_dim: 4
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until: 12000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    # 2. GROWTH: births and splits on from the first move.  
+    - {until: 30000, move_every: 2000, recurrent: False, kappa: 10.0, birth: True, split: True, create_bonus: 25.0}
+    # 3. recurrent gate on, still growing
+    - {until: 60000, move_every: 2000, recurrent: True,               birth: True, split: True, create_bonus: 25.0}
+    # 4. steady state: births stay available, subsidy removed
+    - {until: -1,    move_every: 2000, recurrent: True,               birth: True, split: True, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_cheetah_shs:
+  task: 'dmc_cheetah_run'
+  steps: 1e6                 # 62,500 grad steps
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 16
+  shs_action_dim: 6
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until: 18000, move_every: 0,    recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until: 30000, move_every: 2000, recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until: 40000, move_every: 2000, recurrent: True,               birth: False, split: False, create_bonus: 0.0}
+    - {until: -1,    move_every: 2000, recurrent: True,               birth: True,  split: True,  create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_acrobot_shs:
+  task: 'dmc_acrobot_swingup'
+  steps: 2e6                 # 125,000 grad steps
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+  shs_action_dim: 1          # acrobot has ONE actuator
+  shs_shared_carry: True
+  shs_q_rank: 2
+  shs_recurrent: True
+  shs_kappa: 25.0
+  shs_prior_persist: 0.962   # = 25/(1+25)
+  shs_rstick_weight_var: 0.25
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until: 25000, move_every: 0,    recurrent: False, kappa: 25.0, birth: False, split: False, create_bonus: 0.0}
+    - {until: 45000, move_every: 3000, recurrent: False, kappa: 25.0, birth: False, split: False, create_bonus: 0.0}
+    - {until: 60000, move_every: 3000, recurrent: True,               birth: False, split: False, create_bonus: 0.0}
+    - {until: -1,    move_every: 3000, recurrent: True,               birth: True,  split: True,  create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_humanoid_shs:
+  task: 'dmc_humanoid_walk'
+  steps: 5e6                 # 312,500 grad steps
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 16                # 21 actuators, many distinct gait/recovery modes
+  shs_action_dim: 21
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 4000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until: 90000,  move_every: 0,    recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until: 140000, move_every: 8000, recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until: 180000, move_every: 8000, recurrent: True,               birth: False, split: False, create_bonus: 0.0}
+    - {until: -1,     move_every: 8000, recurrent: True,               birth: True,  split: True,  create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
