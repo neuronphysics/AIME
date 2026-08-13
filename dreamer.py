@@ -285,6 +285,10 @@ def make_env(config, mode, id):
             seed=config.seed + id,
         )
         env = wrappers.OneHotAction(env)
+    elif suite == "procgen":
+        import envs.procgen as procgen
+        env = procgen.ProcGen(task, config.size, seed=config.seed + id)
+        env = wrappers.OneHotAction(env)
     elif suite == "memorymaze":
         from envs.memorymaze import MemoryMaze
 

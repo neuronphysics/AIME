@@ -7,7 +7,7 @@ import networks
 from .regime_head import RegimeHead
 from .moves import sweep_moves, MoveBuffer
 from .checks import check_occupancy_vs_beta
-
+from .mixture_prior import mixture_weights, mixture_entropy_monte_carlo, mixture_entropy_monte_carlo_lowrank
 
 class SHSRSSM(networks.RSSM):
     def __init__(self, *args,
@@ -66,7 +66,7 @@ class SHSRSSM(networks.RSSM):
             start_alpha=shs_start_alpha, ema_tau=shs_ema_tau, hdp_iters=shs_hdp_iters,
             recurrent=shs_recurrent, prior_persist=shs_prior_persist, pg_iters=shs_pg_iters,
             rstick_dim=shs_rstick_dim, rstick_stopgrad=shs_rstick_stopgrad,
-            rstick_weight_var=shs_rstick_weight_var,
+            rstick_weight_var=shs_rstick_weight_var, rstick_use_action=config.shs_rstick_use_action,
             q_rank=shs_q_rank, shared_carry=shs_shared_carry,
             action_dim=shs_action_dim,
             online_mode=shs_online_mode, expected_batches=shs_expected_batches,
@@ -528,8 +528,7 @@ class SHSRSSM(networks.RSSM):
         self.regime.bump_repr_version()
 
     def prior_entropy(self, state, n_samples: int = 64, mode: str | None = None):
-        from .mixture_prior import (mixture_weights, mixture_entropy_monte_carlo,
-                                    mixture_entropy_monte_carlo_lowrank)
+        
         R = self.regime
         stoch = state["stoch"].float()
         deter = state["deter"].float()
@@ -554,7 +553,7 @@ class SHSRSSM(networks.RSSM):
             rr = stoch.new_full(stoch.shape[:2] + (R.K,), 1.0 / R.K)
         rr_prev = R._shift_resp(rr.float(), isf)
         if R.recurrent:
-            phi = R.build_stick_phi(deter)
+            phi = R.build_stick_phi(deter, _act)
             Pi = torch.softmax(R.hdp.expected_log_trans().to(g.dtype), dim=-1)
             sig = R.rstick.sigma(phi)
             eye = torch.eye(R.K, dtype=g.dtype, device=g.device)

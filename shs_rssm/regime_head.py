@@ -15,7 +15,7 @@ from .forward_backward import forward_backward, start_counts_from
 from .mixture_prior import mixture_weights, _diag_gauss_kl
 from .recurrent_stick import RecurrentStickiness
 from .structured_elbo import diag_gauss_entropy
-
+from .continuous_smoother import chain_potentials, build_blocks, smooth
 
 class RegimeHead(nn.Module):
     def __init__(
@@ -34,9 +34,8 @@ class RegimeHead(nn.Module):
         recurrent: bool = False, prior_persist: float = 0.9, pg_iters: int = 4,
         rstick_dim: int | None = 8, rstick_stopgrad: bool = True,
         rstick_weight_var: float = 1.0,
-        rstick_bias_var: float = 4.0,   # prior variance of the gate's
-                                       # logit bias; small = strongly
-                                       # persistent unless data insists
+        rstick_bias_var: float = 4.0,   # prior variance of the gate's logit bias; small = strongly persistent unless data insists
+        rstick_use_action: bool = False,     # feed a_{t-1} to the gate
         ema_tau: float = 0.02, hdp_iters: int = 2,
         online_mode: str = "ema",
         stream_local_iters: int = 1,
@@ -63,6 +62,8 @@ class RegimeHead(nn.Module):
             expected_ids=(set(expected_ids) if expected_ids is not None else None),
             strict_stream=strict_stream, hdp_every=hdp_every, pg_every=pg_every,
             rstick_weight_var=rstick_weight_var,
+            rstick_bias_var=rstick_bias_var,           
+            rstick_use_action=rstick_use_action,        
             stream_local_iters=stream_local_iters,
             stream_discount=stream_discount,
             dtype=dtype, device=device)
@@ -91,6 +92,7 @@ class RegimeHead(nn.Module):
         self.recurrent = recurrent
         self.rstick_stopgrad = bool(rstick_stopgrad)
         self.rstick_dim = int(min(deter, rstick_dim)) if rstick_dim is not None else self.Hp
+        self.rstick_action_dim = int(action_dim) if rstick_use_action else 0
 
         if self.use_proj:
             self.P = nn.Linear(deter, self.Hp, bias=False,
@@ -124,7 +126,7 @@ class RegimeHead(nn.Module):
                              start_alpha=start_alpha, dtype=torch.float64, device=device)
 
         self.rstick = RecurrentStickiness(
-            K=K, feat_dim=self.rstick_dim, prior_persist=prior_persist, pg_iters=pg_iters,
+            K=K, feat_dim=self.rstick_dim + self.rstick_action_dim, prior_persist=prior_persist, pg_iters=pg_iters,
             weight_prior_var=rstick_weight_var,
             bias_prior_var=rstick_bias_var,
             dtype=torch.float64, device=device,
@@ -176,12 +178,22 @@ class RegimeHead(nn.Module):
         isf = is_first.reshape(*action.shape[:-1], 1).to(action.dtype)
         return action * (1.0 - isf)
 
-    def build_stick_phi(self, deter):
+    def build_stick_phi(self, deter, action=None, is_first=None):
         h = deter.detach() if self.rstick_stopgrad else deter
         htil = self.P_stick(h) if self.P_stick is not None else h
         htil = torch.tanh(htil[..., :self.rstick_dim])
         ones = htil[..., :1] * 0.0 + 1.0
-        return torch.cat([htil, ones], dim=-1)
+        parts = [htil]
+        if self.rstick_action_dim > 0:
+            if action is None:
+                action = htil.new_zeros(*htil.shape[:-1], self.rstick_action_dim)
+            elif is_first is not None:
+                # match build_g: no previous action at an episode start
+                isf = is_first.reshape(*action.shape[:-1], 1).to(action.dtype)
+                action = action * (1.0 - isf)
+            parts.append(action.to(htil.dtype))
+        parts.append(ones)
+        return torch.cat(parts, dim=-1)
 
     def _prev_stoch(self, stoch, is_first):
         B, T, L = stoch.shape
@@ -199,13 +211,13 @@ class RegimeHead(nn.Module):
         zeros_tail = g[..., self.L:] * 0.0
         return torch.cat([prev_var, zeros_tail], dim=-1)
 
-    def _transition_logpotentials(self, deter, dtype=None, device=None):
+    def _transition_logpotentials(self, deter, dtype=None, device=None, action=None, is_first=None):
         dtype = dtype if dtype is not None else deter.dtype
         device = device if device is not None else deter.device
         log_init = self.hdp.expected_log_init().to(dtype=dtype, device=device)
         base_elogpi = self.hdp.expected_log_trans().to(dtype=dtype, device=device)
         if self.recurrent:
-            phi = self.build_stick_phi(deter.to(dtype))
+            phi = self.build_stick_phi(deter.to(dtype), action, is_first=is_first)
             log_trans, aux = self.rstick.bound_log_trans(base_elogpi, phi[:, 1:])
             aux = dict(aux, phi_steps=phi[:, 1:])
             log_init, log_trans = self._mask_logpotentials(log_init, log_trans)
@@ -213,12 +225,12 @@ class RegimeHead(nn.Module):
         log_init, base_elogpi = self._mask_logpotentials(log_init, base_elogpi)
         return log_init, base_elogpi, None
 
-    def _transition_potentials_ondemand(self, deter, dtype=None, device=None):
+    def _transition_potentials_ondemand(self, deter, dtype=None, device=None, action=None, is_first=None):
         dtype = dtype if dtype is not None else deter.dtype
         device = device if device is not None else deter.device
         log_init = self.hdp.expected_log_init().to(dtype=dtype, device=device)
         base = self.hdp.expected_log_trans().to(dtype=dtype, device=device)
-        phi = self.build_stick_phi(deter.to(dtype))
+        phi = self.build_stick_phi(deter.to(dtype), action, is_first=is_first)
         aux = dict(self.rstick.bound_aux_only(base, phi[:, 1:]), phi_steps=phi[:, 1:])
         if self.active_mask is not None:
             m = self.active_mask.to(log_init.device)
@@ -276,7 +288,7 @@ class RegimeHead(nn.Module):
             _trans_fn = None
             if _online_pw:
                 log_init, trans_aux, _trans_fn = self._transition_potentials_ondemand(
-                    d, dtype=d.dtype, device=d.device)
+                    d, dtype=d.dtype, device=d.device, action=action, is_first=is_first)
                 _tf64 = (lambda _t: _trans_fn(_t).double()) if _trans_fn is not None else None
                 gamma, counts_base, _logZ_re, _la, _lb = forward_backward(
                     log_init.double(), None, ev.double(), is_first=is_first, valid=valid,
@@ -289,7 +301,7 @@ class RegimeHead(nn.Module):
                 xi = None
             else:
                 log_init, log_trans, trans_aux = self._transition_logpotentials(
-                    d, dtype=d.dtype, device=d.device)
+                    d, dtype=d.dtype, device=d.device, action=action, is_first=is_first)
                 gamma, counts_base, _logZ_re, xi = forward_backward(
                     log_init.double(), log_trans.double(), ev.double(),
                     is_first=is_first, valid=valid, return_pairwise=True,
@@ -345,7 +357,7 @@ class RegimeHead(nn.Module):
             assume_start_at_t0=not getattr(self, 'chunk_boundary_mask', True))
         return gamma, counts, start_counts, g
 
-    def _discrete_path_kl(self, gamma, xi, deter, is_first=None):
+    def _discrete_path_kl(self, gamma, xi, deter, is_first=None, action=None):
         B, T, K = gamma.shape
         dtype, device = gamma.dtype, gamma.device
         log_init = self.hdp.expected_log_init().to(dtype=dtype, device=device)
@@ -366,7 +378,7 @@ class RegimeHead(nn.Module):
 
         base_elogpi = self.hdp.expected_log_trans().to(dtype=dtype, device=device)
         if self.recurrent:
-            phi = self.build_stick_phi(deter)
+            phi = self.build_stick_phi(deter, action, is_first=is_first)
             log_trans, _ = self.rstick.bound_log_trans(base_elogpi, phi[:, 1:])
         else:
             log_trans = base_elogpi.view(1, 1, K, K).expand(B, T - 1, K, K)
@@ -378,7 +390,7 @@ class RegimeHead(nn.Module):
         out[:, 1:] = out[:, 1:] + (1.0 - isf[:, 1:]) * pair_kl
         return out
 
-    def _discrete_path_kl_online(self, gamma, deter, is_first, cache):
+    def _discrete_path_kl_online(self, gamma, deter, is_first, cache, action=None):
         from shs_rssm.pairwise_online import pair_kl_online
         B, T, K = gamma.shape
         dtype, device = gamma.dtype, gamma.device
@@ -397,7 +409,7 @@ class RegimeHead(nn.Module):
         ev = cache["evidence_shifted"]
         base_elogpi = self.hdp.expected_log_trans().to(dtype=dtype, device=device)
         if self.recurrent:
-            phi = self.build_stick_phi(deter)
+            phi = self.build_stick_phi(deter, action, is_first=is_first)
             aux_diff = self.rstick.bound_aux_only(base_elogpi, phi[:, 1:])
             trans_diff_fn = lambda t: self.rstick.trans_slice_from_aux(aux_diff, t)
             _caux = cache.get("trans_aux", None)
@@ -430,7 +442,7 @@ class RegimeHead(nn.Module):
         _c = getattr(self, "_struct_cache", None)
         if _c is not None and _c.get("online", False) \
                 and _c.get("gamma", None) is not None and _c["gamma"].shape == gamma.shape:
-            disc = self._discrete_path_kl_online(gam, deter, is_first, _c)
+            disc = self._discrete_path_kl_online(gam, deter, is_first, _c, action=action)
         else:
             xi = None
             if _c is not None and _c.get("gamma", None) is not None \
@@ -441,10 +453,10 @@ class RegimeHead(nn.Module):
                     ev = evidence.detach()
                     ev = ev - ev.max(dim=-1, keepdim=True).values
                     log_init, log_trans, _ = self._transition_logpotentials(
-                        deter.detach(), dtype=ev.dtype, device=ev.device)
+                        deter.detach(), dtype=ev.dtype, device=ev.device, action=action, is_first=is_first)
                     _, _, _, xi = forward_backward(
                         log_init, log_trans, ev, is_first=is_first, return_pairwise=True)
-            disc = self._discrete_path_kl(gam, xi.to(gam.device, gam.dtype), deter, is_first)
+            disc = self._discrete_path_kl(gam, xi.to(gam.device, gam.dtype), deter, is_first, action=action)
 
         rstick_kl = q_mean.new_tensor(0.0)
         if self.recurrent and getattr(self, "rstick", None) is not None:
@@ -550,7 +562,7 @@ class RegimeHead(nn.Module):
         if valid is not None:
             ev = ev * valid.to(ev.dtype).unsqueeze(-1)
         log_init, log_trans, _aux = self._transition_logpotentials(
-            deter, dtype=ev.dtype, device=ev.device)
+            deter, dtype=ev.dtype, device=ev.device, action=action, is_first=is_first)
         _fb = forward_backward(
             log_init, log_trans, ev, is_first=is_first, valid=valid,
             assume_start_at_t0=not getattr(self, "chunk_boundary_mask", True))
@@ -560,7 +572,6 @@ class RegimeHead(nn.Module):
     @torch.no_grad()
     def smoothed_estep(self, z_enc, deter, is_first=None, valid=None, action=None,
                        enc_prec=100.0, prior_prec=1.0, n_iters=2, cache_estep=True):
-        from .continuous_smoother import chain_potentials, build_blocks, smooth
 
         reg = self.regimes
         L = int(reg.L)
@@ -1280,12 +1291,12 @@ class RegimeHead(nn.Module):
             )
             self._estep = None
 
-    def _score_potentials(self, deter, hdp, rstick, dtype=torch.float64):
+    def _score_potentials(self, deter, hdp, rstick, dtype=torch.float64, action=None, is_first=None):
         device = deter.device
         log_init = hdp.expected_log_init().to(dtype=dtype, device=device)
         base_elogpi = hdp.expected_log_trans().to(dtype=dtype, device=device)
         if rstick is not None:
-            phi = self.build_stick_phi(deter).to(dtype)
+            phi = self.build_stick_phi(deter, action, is_first=is_first).to(dtype)
             log_trans, aux = rstick.bound_log_trans(base_elogpi, phi[:, 1:])
             return log_init, log_trans, dict(aux, phi_steps=phi[:, 1:])
         return log_init, base_elogpi, None
@@ -1309,7 +1320,7 @@ class RegimeHead(nn.Module):
         g = self.build_g(prev, deter, act)
         g_var = None if _cond_prev else self._g_var_from_z_var(z_var, g, is_first=is_first)
         ev = regimes.expected_loglik(stoch, g, z_var=z_var, g_var=g_var).double()
-        log_init, log_trans, aux = self._score_potentials(deter, hdp, rstick)
+        log_init, log_trans, aux = self._score_potentials(deter, hdp, rstick, action=action, is_first=is_first)
         valid = self._chunk_valid(valid, is_first, stoch.shape[0], stoch.shape[1],
                                   stoch.dtype, stoch.device)
         gamma, xicount, logZ, xi = forward_backward(
@@ -1355,7 +1366,7 @@ class RegimeHead(nn.Module):
         else:
             g_var = None
         if self.recurrent:
-            phi = self.build_stick_phi(deter)
+            phi = self.build_stick_phi(deter, action)
             Pi = self._Epi().to(prev_stoch.dtype)
             sig = self.rstick.sigma(phi)
             eye = torch.eye(self.K, dtype=prev_stoch.dtype, device=prev_stoch.device)
