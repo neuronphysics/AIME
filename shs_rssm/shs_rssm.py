@@ -27,6 +27,8 @@ class SHSRSSM(networks.RSSM):
                  shs_pg_iters: int = 4, shs_rstick_dim: int | None = 8,
                  shs_rstick_stopgrad: bool = True,
                  shs_rstick_weight_var: float = 1.0,
+                 shs_rstick_bias_var: float = 4.0,
+                 shs_rstick_use_action: bool = False,
                  shs_move_every: int = 0, shs_move_warmup: int = 2000,
                  shs_move_birth: bool = True, shs_move_buffer: int = 8,
                  shs_move_max_age: int = 0, shs_move_split: bool = True,
@@ -66,7 +68,9 @@ class SHSRSSM(networks.RSSM):
             start_alpha=shs_start_alpha, ema_tau=shs_ema_tau, hdp_iters=shs_hdp_iters,
             recurrent=shs_recurrent, prior_persist=shs_prior_persist, pg_iters=shs_pg_iters,
             rstick_dim=shs_rstick_dim, rstick_stopgrad=shs_rstick_stopgrad,
-            rstick_weight_var=shs_rstick_weight_var, rstick_use_action=config.shs_rstick_use_action,
+            rstick_weight_var=shs_rstick_weight_var,
+            rstick_bias_var=shs_rstick_bias_var,
+            rstick_use_action=shs_rstick_use_action,
             q_rank=shs_q_rank, shared_carry=shs_shared_carry,
             action_dim=shs_action_dim,
             online_mode=shs_online_mode, expected_batches=shs_expected_batches,
@@ -631,6 +635,9 @@ SHS_NON_CTOR_KEYS = {
     "shs_ckpt_reservoir",
 }
 
+# Mirror of SHS_NON_CTOR_KEYS for the other direction.
+SHS_PINNED_KEYS = set()
+
 
 def shs_kwargs_from_config(config):
     import inspect
@@ -646,7 +653,25 @@ def shs_kwargs_from_config(config):
             "dead config wiring: these shs_* keys are not SHSRSSM constructor kwargs "
             f"and not registered loop-level keys: {unknown}. Either add them to "
             "SHSRSSM.__init__ or to SHS_NON_CTOR_KEYS in shs_rssm/shs_rssm.py.")
+    unreachable = sorted(accepted - set(items) - SHS_PINNED_KEYS)
+    if unreachable:
+        raise ValueError(
+            "unreachable knobs: these SHSRSSM constructor kwargs have no "
+            f"configs.yaml entry: {unreachable}. They are pinned at their "
+            "Python defaults and cannot be set from the command line, because "
+            "dreamer.py builds its --flags from the merged config dict. Add "
+            "them to the `defaults:` block of configs.yaml, or to "
+            "SHS_PINNED_KEYS in shs_rssm/shs_rssm.py if the Python default is "
+            "intentionally not user-facing.")
     kw = {k: v for k, v in items.items() if k in accepted}
     if int(kw.get("shs_action_dim", 0)) == -1:
-        kw["shs_action_dim"] = int(getattr(config, "num_actions", 0))
+        n_act = int(getattr(config, "num_actions", 0))
+        if n_act <= 0:
+            raise ValueError(
+                "shs_action_dim: -1 means 'inherit config.num_actions', but "
+                f"num_actions resolved to {n_act}. dreamer.py sets it from the "
+                "env action space before the world model is built, so this "
+                "means SHSRSSM is being constructed off that path. Set "
+                "shs_action_dim to the action width explicitly.")
+        kw["shs_action_dim"] = n_act
     return kw

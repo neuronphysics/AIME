@@ -92,6 +92,14 @@ class RegimeHead(nn.Module):
         self.recurrent = recurrent
         self.rstick_stopgrad = bool(rstick_stopgrad)
         self.rstick_dim = int(min(deter, rstick_dim)) if rstick_dim is not None else self.Hp
+        if rstick_use_action and int(action_dim) <= 0:
+            raise ValueError(
+                f"rstick_use_action=True requires action_dim > 0, got {action_dim}. "
+                "The gate features are sized at construction time, so this would "
+                "silently build the action-free model (build_stick_phi skips the "
+                "concat when rstick_action_dim == 0) and hand you a clean run of "
+                "the wrong ablation. Set shs_action_dim to the action width, or "
+                "-1 to inherit config.num_actions.")
         self.rstick_action_dim = int(action_dim) if rstick_use_action else 0
 
         if self.use_proj:

@@ -49,6 +49,12 @@ defaults:
   shs_pg_iters: 4
   shs_rstick_dim: 32
   shs_rstick_stopgrad: True
+  shs_rstick_weight_var: 1.0
+  shs_rstick_bias_var: 4.0    # prior var of gate logit bias; small = strongly persistent
+  shs_start_alpha: 1.0
+  shs_v0_scale: 1.0
+  shs_hdp_iters: 2
+  shs_global_update_every: 1
   shs_move_every: 0
   shs_move_warmup: 2000
   shs_move_birth: True
