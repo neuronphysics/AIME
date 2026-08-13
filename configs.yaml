@@ -87,7 +87,7 @@ defaults:
   shs_stream_discount: 1.0
   shs_a0: 3.0
   shs_b0: 2.0
-  shs_rstick_use_action:: False
+  shs_rstick_use_action: False
   shs_calibrate_b0: True
   shs_calibrate_sF: 1.0
   shs_learn_b0: False
@@ -478,6 +478,7 @@ procgen_shs:
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True
+  shs_rstick_use_action: True
   shs_kappa: 20.0           # 15 fps, no repeat -> shorter dwell than DMC
   shs_prior_persist: 0.9
   shs_rstick_dim: 32
@@ -491,6 +492,43 @@ procgen_shs:
     - {until: 15000, move_every: 0,    recurrent: False, kappa: 20.0, birth: False, split: False, create_bonus: 0.0}
     - {until: 32000, move_every: 2000, recurrent: False, kappa: 20.0, birth: True,  split: True,  create_bonus: 25.0}
     - {until: 65000, move_every: 2000, recurrent: True,                birth: True,  split: True,  create_bonus: 25.0}
+    - {until: -1,    move_every: 2000, recurrent: True,                birth: True,  split: True,  create_bonus: 0.0}
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+procgen_bigfish_shs:
+  task: 'procgen_bigfish'
+  steps: 5e7
+  action_repeat: 1          # procgen has none built in; 15 fps native
+  envs: 8
+  train_ratio: 512
+  time_limit: 1000
+  dyn_discrete: 0           # SHS needs continuous stoch
+  use_shs: True
+  shs_K: 12                 # fewer plausible modes than a platformer
+  shs_action_dim: 15        # one-hot width, all procgen games
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_rstick_use_action: True    # gate reads a_{t-1}: jump causes the switch
+  shs_kappa: 10.0           # prey/threat/navigate last ~10-30 frames
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 0.1     # NOT 1.0 -- see hopper's single-regime collapse
+  shs_curriculum:
+    - {until: 12000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until: 30000, move_every: 2000, recurrent: False, kappa: 10.0, birth: True,  split: True,  create_bonus: 25.0}
+    - {until: 60000, move_every: 2000, recurrent: True,                birth: True,  split: True,  create_bonus: 25.0}
     - {until: -1,    move_every: 2000, recurrent: True,                birth: True,  split: True,  create_bonus: 0.0}
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
