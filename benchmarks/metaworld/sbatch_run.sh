@@ -18,16 +18,23 @@
 
 set -euo pipefail
 
-CONFIG=${1:?usage: sbatch_run.sh <config> <task> <seed> <steps>}
+CONFIG=${1:?usage: sbatch_run.sh <config> <task> <seed> <steps> [tag] [extra dreamer flags...]}
 TASK=${2:?missing task}
 SEED=${3:?missing seed}
 STEPS=${4:?missing steps}
+# Optional 5th arg: a tag appended to the logdir, so a variant run (e.g. fixed
+# goals) gets its OWN replay buffer and checkpoint instead of resuming into the
+# previous run's data. Anything after it is passed straight to dreamer.py.
+TAG=${5:-}
+shift $(( $# < 5 ? $# : 5 ))
+EXTRA=("$@")
 
 REPO=/home/gsubbara/AIME
 # Layout matches what benchmarks/eval/aggregate.py expects:
 #   <logdir>/<arm>/<task>/seed<k>/
 ARM=${CONFIG#metaworld_proprio_}
 [ "$ARM" = "metaworld_proprio" ] && ARM=baseline
+[ -n "$TAG" ] && ARM="${ARM}_${TAG}"
 LOGDIR=./logdir/${ARM}/${TASK}/seed${SEED}
 
 cd "$REPO"
@@ -44,11 +51,14 @@ echo "logdir $LOGDIR | host $(hostname) | started $(date)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # Auto-resumes from $LOGDIR/latest.pt, so resubmitting after a timeout continues.
-python3 dreamer.py \
+# -u is required: python block-buffers stdout when it is a file, so a job killed
+# at the SLURM time limit loses whatever is still in the buffer.
+python3 -u dreamer.py \
     --configs "$CONFIG" \
     --task "metaworld_${TASK}" \
     --seed "$SEED" \
     --steps "$STEPS" \
-    --logdir "$LOGDIR"
+    --logdir "$LOGDIR" \
+    "${EXTRA[@]}"
 
 echo "finished $(date)"
