@@ -1,13 +1,12 @@
 # Atari 100k with SHS-RSSM.
 #
-# READ THIS BEFORE RUNNING. use_shs asserts dyn_discrete == 0, i.e. it replaces
+# READ BEFORE RUNNING. use_shs asserts dyn_discrete == 0, i.e. it replaces
 # DreamerV3's 32x32 categorical latent with a continuous Gaussian one. On
 # discrete-action pixel domains the categorical latent is one of the components
-# DreamerV3's own ablations credit with a large share of the score, so
-# `atari100k_shs` is confounded: it differs from the baseline in TWO ways.
-# `atari100k_gauss` is the control that separates them. Run all three arms or
-# do not report Atari.
-
+# DreamerV3's own ablations credit heavily, so atari100k_shs is confounded: it
+# differs from the baseline in TWO ways. atari100k_gauss is the control that
+# separates them -- but that arm is currently BROKEN (see
+# benchmarks/metaworld/configs.yaml). Do not report Atari until it is fixed.
 atari100k_shs:
   steps: 4e5
   envs: 1
@@ -23,10 +22,10 @@ atari100k_shs:
   resize: opencv
   actions: needed
   time_limit: 108000
-
   dyn_discrete: 0
   use_shs: True
   shs_K: 12
+  shs_init_scale: 0.01
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True
@@ -39,8 +38,6 @@ atari100k_shs:
     - {until: 15000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
     - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
 
-# Control arm: continuous latent, stock DreamerV3 prior. Isolates the effect of
-# dropping categorical latents from the effect of the switching prior.
 atari100k_gauss:
   steps: 4e5
   envs: 1

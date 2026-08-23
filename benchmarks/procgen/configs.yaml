@@ -1,14 +1,9 @@
-# ProcGen. Untested end to end -- envs/procgen.py is new and the `procgen`
-# package is not in requirements.txt (it needs its own build toolchain and does
-# not coexist cleanly with newer gym). Treat this as scaffolding.
+# ProcGen. UNTESTED -- envs/procgen.py has never been run and the `procgen`
+# package is not in requirements.txt. Scaffolding only.
 #
-# Protocol: DreamerV3's ProcGen numbers come from one seed per game (the paper
-# says so explicitly, for compute reasons), which makes it a noisy comparison
-# target in both directions. Match distribution_mode and num_levels to the
-# DreamerV3 appendix before claiming anything.
-#
-# Same categorical-latent confound as Atari applies here. See ../atari100k/.
-
+# DreamerV3's ProcGen numbers use ONE seed per game, which makes it a noisy
+# comparison target in both directions. Match distribution_mode and num_levels
+# to the DreamerV3 appendix before claiming anything.
 procgen_baseline:
   task: 'procgen_coinrun'
   steps: 25e6
@@ -41,6 +36,7 @@ procgen_shs:
   dyn_discrete: 0
   use_shs: True
   shs_K: 12
+  shs_init_scale: 0.01
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True

@@ -68,6 +68,7 @@ class DiagARRegimes(nn.Module):
         v0_scale: float = 1.0,
         ard: bool = True,
         identity_init: bool = True,
+        init_scale: float = 0.0,      # >0: break the K-fold symmetry of the regime maps
         jitter: float = 1e-6,
         q_rank: int = 0,
         infl_max: float = 10.0,
@@ -115,7 +116,13 @@ class DiagARRegimes(nn.Module):
         self.register_buffer("M0", M0)
 
         # ---- posterior parameters (buffers) ----
-        self.register_buffer("M", M0.clone().unsqueeze(0).repeat(K, 1, 1))      # (K,L,G)
+        # Symmetry breaking -- see the long note in regimes_shared.py. Perturbs the
+        # POSTERIOR mean only; M0 stays the shared prior mean used by the KL and m_step.
+        Minit = M0.clone().unsqueeze(0).repeat(K, 1, 1)                          # (K,L,G)
+        if float(init_scale) > 0.0 and K > 1:
+            Minit = Minit + float(init_scale) * torch.randn(
+                K, L, G, dtype=dtype, device=device)
+        self.register_buffer("M", Minit)                                         # (K,L,G)
         self.register_buffer("lam", torch.diag_embed(self.lam0_diag).unsqueeze(0).repeat(K, 1, 1))  # (K,G,G)
         self.register_buffer("a", torch.full((K, L), float(a0), dtype=dtype, device=device))   # (K,L)
         self.register_buffer("b", torch.full((K, L), float(b0), dtype=dtype, device=device))   # (K,L)

@@ -336,6 +336,8 @@ class WorldModel(nn.Module):
             stoch, gamma, str(out / "latent_clustering.png"),
             title=f"SHS-RSSM regimes @ step {int(step)}")
 
+        # reconstruction over the context + open-loop imagination past it (episode 0),
+        # seeded from the annotated last-step regime belief
         # The reconstruction figure needs a CNN decoder head. Proprioceptive
         # configs (e.g. metaworld_proprio_shs) set cnn_keys: '$^', so there is no
         # "image" output to plot -- the latent-clustering figure and every scalar
@@ -343,8 +345,6 @@ class WorldModel(nn.Module):
         if not getattr(self.heads["decoder"], "cnn_shapes", None):
             return metrics
 
-        # reconstruction over the context + open-loop imagination past it (episode 0),
-        # seeded from the annotated last-step regime belief
         recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()
         init = {k: v[:, -1] for k, v in states.items()}
         prior = self.dynamics.imagine_with_action(data["action"][:B, ctx:], init)
@@ -375,6 +375,7 @@ class WorldModel(nn.Module):
         # single-pixel frames rather than an error.
         if not getattr(self.heads["decoder"], "cnn_shapes", None):
             return {}
+
 
         data = self.preprocess(data)
         b = int(episode)

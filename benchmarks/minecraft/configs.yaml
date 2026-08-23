@@ -1,12 +1,9 @@
-# Minecraft. Deliberately left as baseline-only scaffolding.
+# Minecraft. Deliberately scaffolding only.
 #
-# DreamerV3's Minecraft result is 100M env steps x 10 seeds on A100s, and the
-# headline metric is "fraction of runs that ever collect a diamond". SHS-RSSM
-# disables torch.compile (Python-side conjugate updates and shape-changing
-# structure moves cannot be traced), so throughput is strictly worse than the
-# baseline before the forward-backward E-step is even counted. Budget this
-# domain honestly before starting: it is the most expensive single line item in
-# the DreamerV3 paper and the least likely to produce an attributable result.
+# DreamerV3's Minecraft result is 100M env steps x 10 seeds, and the headline
+# metric is "fraction of runs that ever collect a diamond". SHS-RSSM disables
+# torch.compile, and measured throughput on Meta-World proprio was 0.57x the
+# baseline. Budget this domain honestly before starting.
 minecraft_shs:
   task: minecraft_diamond
   steps: 1e8
@@ -32,6 +29,7 @@ minecraft_shs:
   dyn_discrete: 0
   use_shs: True
   shs_K: 16
+  shs_init_scale: 0.01
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True

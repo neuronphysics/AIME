@@ -101,6 +101,10 @@ defaults:
   shs_pg_every: 1             # item 18: refresh recurrent PG block every Nth global step
   shs_strict_stream: False    # streaming only: reject non-integer/gap ids (no id-set fallback)
   shs_action_dim: 0           # >0: per-regime action term B_k a_{t-1} in the conjugate regressor 
+  shs_init_scale: 0.0         # >0: perturb each regime's posterior map at init. All K regimes are
+                              # otherwise built identically, so one takes ~all responsibility mass
+                              # immediately and shs_active_regimes sits at 1 from the first
+                              # diagnostic. 0.01-0.05 differentiates them; >0.1 risks unstable maps.
   shs_merge_topm: null        # recurrent/low-rank merge: exact-refit only the top-M ranked pairs
   shs_online_mode: ema        # ema (Dreamer replay default) | full_batch | streaming | memoized. memoized REQUIRES
                               # stable batch ids (SHSRSSM.set_batch_id / consolidation / offline fitting) and now

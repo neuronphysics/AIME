@@ -1,85 +1,63 @@
 # Benchmarks
 
-Each subfolder holds the named configs for one domain. `dreamer.py` merges every
-`benchmarks/*/configs.yaml` into the same flat namespace as the root
-`configs.yaml`, so a config defined here is used exactly like a built-in one:
+Per-domain configs. `dreamer.py` merges every `benchmarks/*/configs*.yaml` into
+the same flat namespace as the root `configs.yaml`, so a config here is used
+exactly like a built-in one. Name collisions raise at startup.
 
 ```bash
-python3 dreamer.py --configs metaworld_proprio_shs --task metaworld_assembly \
-    --logdir ./logdir/shs/assembly/seed0
+python3 -u dreamer.py --configs metaworld_proprio_shs --task metaworld_door-open \
+    --logdir ./logdir/shs/door-open/seed0
 ```
 
-Name collisions with the root `configs.yaml` raise at startup rather than
-silently overriding, so nothing that already works can be shadowed.
+| Folder | Status |
+|---|---|
+| `metaworld/` | working, extensively run |
+| `eval/` | `aggregate.py` (IQM + bootstrap CIs), `summarize.py` (compact curves) |
+| `dmc/` | control arms only; DMC configs are in the root `configs.yaml` |
+| `atari100k/`, `crafter/` | configs only, never run |
+| `minecraft/`, `procgen/` | scaffolding; `envs/procgen.py` is untested |
 
-| Folder | Status | Notes |
-|---|---|---|
-| `metaworld/` | **new, smoke-tested** | 50 manipulation tasks. Wrapper verified against the real `metaworld` package. |
-| `dmc/` | control arms only | DMC configs live in the root `configs.yaml`; this folder adds the missing continuous-latent controls. |
-| `atari100k/` | configs only | Confounded, see below. |
-| `crafter/` | configs only | Confounded, see below. |
-| `procgen/` | scaffolding | `envs/procgen.py` is new and untested end to end; `procgen` is not in `requirements.txt`. |
-| `minecraft/` | scaffolding | 100M steps x 10 seeds in the original paper. Budget before starting. |
-| `eval/` | **new** | `aggregate.py`: IQM / median / mean with stratified bootstrap CIs from `metrics.jsonl`. |
+## The three-arm rule, and why one arm is broken
 
-## The three-arm rule
+`use_shs: True` asserts `dyn_discrete == 0` — it swaps the dynamics prior AND
+replaces the 32x32 categorical latent with a 32-dim Gaussian. So baseline-vs-SHS
+changes two things. The intended control is `*_gauss` (Gaussian latent, stock
+prior).
 
-`use_shs: True` asserts `dyn_discrete == 0`. It does not just swap the dynamics
-prior — it also replaces DreamerV3's 32x32 categorical latent with a continuous
-Gaussian one. So a `baseline` vs `shs` comparison changes **two** things at once.
+**That control does not work in this codebase.** Two independent 500k runs gave
+`actor_grad_norm ~1e-6` and `actor_entropy` frozen at 5.675 (exactly
+sigma = max_std) — the actor never trained. Bit-identical with and without
+`torch.compile`. No original config combines `dyn_discrete: 0` with
+`use_shs: False`, so `networks.RSSM`'s continuous branch appears to be dead
+code. Until fixed, use a K=1 SHS config as the control.
 
-Every domain folder therefore defines three arms:
+## Results so far (door-open, seed 0, 500k steps)
 
-| Arm | Latent | Prior |
-|---|---|---|
-| `baseline` | categorical (32x32) | amortised |
-| `gauss` | continuous Gaussian | amortised |
-| `shs` | continuous Gaussian | switching (SHS-RSSM) |
+| Arm | goals | success | return | % of expert (4492) |
+|---|---|---|---|---|
+| baseline | random | 0.00 | ~1000 | 22% |
+| baseline | fixed | 0.00 | 1973 | 44% |
+| SHS | random | 0.00 | 1089 | 24% |
+| **SHS** | **fixed** | **1.00** | **4270** | **95%** |
+| SHS + action_dim 4 | fixed | 1.00 | 4300 | 96% |
 
-Without the `gauss` arm you cannot say whether a difference came from the
-switching prior or from the latent type. On DMC the latent swap is cheap; on
-discrete-action pixel domains (Atari, ProcGen, Crafter, Minecraft) the
-categorical latent is one of the components DreamerV3's own ablations credit
-heavily, so the confound there is large and runs in the direction that hurts you.
+Two open caveats: the result exists only under fixed goals (the easier variant,
+`_freeze_rand_vec=True`), and `shs_current_K` collapsed to 1 in every run, so
+the switching prior was inert and the win is attributable to the
+continuous-latent + sticky parameterisation rather than to switching.
 
-## Which domains are worth running
-
-**Meta-World is the strongest target.** It is not in the DreamerV3 paper, so
-there is no official baseline to beat — every published DreamerV3 Meta-World
-number is somebody else's re-run, and those re-runs are consistently weak
-(TD-MPC2's appendix notes DreamerV3 often fails to converge; other papers report
-0.0 success on several tasks even at 1M steps). Clearing that bar is likely but
-a reviewer will point out the baseline was under-tuned. Run your own baseline in
-this codebase (`use_shs: False`, identical pipeline) and report that.
-
-It is also the best *scientific* fit: manipulation is genuinely phase-structured
-(approach / contact / grasp / transport / release), which is closer to the
-switching-regime inductive bias than walker gait phases are. Regime occupancy
-aligning with manipulation phases is a real interpretability result independent
-of the score.
-
-**Atari / ProcGen / Crafter / Minecraft** cost three arms each, hit the
-categorical-latent confound, and run with `torch.compile` disabled (the SHS
-model does Python-side conjugate updates and shape-changing structure moves that
-cannot be traced). DreamerV3's own ProcGen numbers use one seed per game, which
-makes it noisy in both directions as a target. If you want one discrete-domain
-data point, Crafter is the cheapest: 1M steps, single env.
+`shs_init_scale` (new) addresses the second: all K regimes were previously
+constructed identically, so one took ~all responsibility mass immediately and
+`shs_active_regimes` read 1 from the first diagnostic, before any structure
+move. See `shs_rssm/regimes_shared.py` and `metaworld/configs_switching.yaml`.
 
 ## Workflow
 
 ```bash
-# 1. See the sweep before running it
-python3 benchmarks/metaworld/launch.py --suite suite15 --seeds 3
-#    -> 135 jobs (15 tasks x 3 arms x 3 seeds)
-
-# 2. Pilot one task first to place the curriculum boundaries
-python3 dreamer.py --configs metaworld_proprio_shs --task metaworld_assembly \
-    --logdir ./logdir/pilot
-
-# 3. Launch
-python3 benchmarks/metaworld/launch.py --sbatch | bash
-
-# 4. Aggregate
+python3 benchmarks/metaworld/launch.py --suite suite6 --seeds 3   # inspect
+sbatch --job-name=mw-shs-do benchmarks/metaworld/sbatch_run.sh \
+    metaworld_proprio_shs door-open 0 500000 fixedgoal --mw_randomize_goal False
+python3 benchmarks/eval/summarize.py door-open                     # compact curves
 python3 benchmarks/eval/aggregate.py ./logdir --arms shs baseline \
-    --metric eval_log_success --at 1000000
+    --metric eval_log_success --at 500000                          # IQM + CIs
 ```

@@ -1,9 +1,9 @@
 # DMC lives in the root configs.yaml (dmc_proprio, dmc_vision, and the five
-# dmc_*_shs task configs). This folder holds only the missing control arm.
+# dmc_*_shs task configs). This folder holds only the missing control arms.
 #
-# Continuous-latent DreamerV3 on DMC vision. dmc_vision uses dyn_discrete: 32,
-# so a dmc_vision-vs-dmc_walker_shs comparison changes the latent type AND the
-# prior at once. This is the arm that separates them.
+# WARNING: dyn_discrete: 0 + use_shs: False is a BROKEN code path in this repo
+# (see benchmarks/metaworld/configs.yaml, metaworld_proprio_gauss). These two
+# configs exercise it. Verify actor_grad_norm is not ~1e-6 before using them.
 dmc_vision_gauss:
   steps: 1e6
   action_repeat: 2

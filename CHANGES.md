@@ -1,156 +1,75 @@
-# Changes: Meta-World benchmark + evaluation tooling
+# Changes to AIME: Meta-World benchmark, eval tooling, and SHS symmetry breaking
 
-Diffed against the pristine `AIME-main.zip`. Five existing files touched
-(101 lines added, 6 changed), 13 new files.
+Diffed against the original `AIME-main.zip`.
 
-## Modified files
+## Modified (7 files)
 
-### `tools.py` (+21) — **bug fix, review first**
+| File | What |
+|---|---|
+| `dreamer.py` | `metaworld` + `procgen` suites in `make_env`; merges `benchmarks/*/configs*.yaml`; passes `log_video` to eval; imports `compat` |
+| `tools.py` | eval `log_*` averaging fix; `log_video` flag; imports `compat` |
+| `models.py` | two guards so SHS diagnostics skip image figures on proprio configs |
+| `configs.yaml` | `mw_*` / `procgen_*` defaults; `shs_init_scale`; 3 pre-existing bug fixes |
+| `shs_rssm/{regimes_shared,regimes,regime_head,shs_rssm}.py` | `init_scale` symmetry breaking |
+| `.gitignore` | venv patterns (`git clean -fdx` would otherwise delete an in-repo venv) |
+| `README.md`, `requirements.txt` | docs, `metaworld` dependency |
 
-Per-episode `log_*` metrics were written with `logger.scalar` on every episode,
-but the eval branch flushes the logger exactly once, after the final episode.
-Each call overwrote the previous, so an eval `log_*` metric recorded only the
-**last episode's value**. For a 0/1 metric like Meta-World success that is a
-coin flip, not a rate over `eval_episode_num` episodes.
-
-Now: per-episode values are collected into `episode_logs`; train writes them per
-episode as before (train flushes every episode, so nothing changes there); eval
-accumulates into `eval_logs` and emits the mean as `eval_<key>` at flush time.
-
-New metric name: **`eval_log_success`**. Affects any env emitting `log_*`
-(Crafter's achievement logs go through the same path).
-
-### `configs.yaml` (+15, 6 changed)
-
-New `defaults` keys so argparse registers them: `mw_camera`, `mw_render`,
-`mw_randomize_goal`, `mw_terminate_on_success`, `procgen_distribution_mode`,
-`procgen_num_levels`, `procgen_start_level`.
-
-Pre-existing bugs fixed:
+### Pre-existing bugs fixed in `configs.yaml`
 
 | Config | Was | Now | Effect |
 |---|---|---|---|
-| `crafter` | `step: 1e6` | `steps: 1e6` | none (default was already 1e6) |
 | `minecraft` | `step: 1e8` | `steps: 1e8` | **ran to 1e6, 100x short** |
+| `crafter` | `step: 1e6` | `steps: 1e6` | none (default matched) |
 | `crafter`, `minecraft` | `value: {layers: 5}` | `critic: {layers: 5}` | code reads `config.critic`; the 5-layer critic was never applied |
 
-### `dreamer.py` (+40)
+### `tools.py` eval logging — read this if you have old Crafter numbers
 
-`make_env`: two new suites, `metaworld` and `procgen`. No existing branch
-touched.
+Per-episode `log_*` metrics were written with `logger.scalar` on every episode,
+but the eval branch flushes the logger once, after the final episode. Each call
+overwrote the previous, so an eval `log_*` recorded only the **last episode's
+value**. For a 0/1 metric that is a coin flip, not a rate. Now accumulated and
+emitted as `eval_<key>`. Affects any env emitting `log_*`, including Crafter.
 
-Config loader: merges every `benchmarks/*/configs.yaml` into the same flat
-named-config namespace. Raises on a name collision with the root file rather
-than silently overriding.
+### `shs_rssm` symmetry breaking (new `shs_init_scale`, default 0.0)
 
-### `README.md` (+18), `requirements.txt` (+7)
+All K regimes were constructed identically (same `M0`, same `lam`, zero
+sufficient statistics), so responsibilities were driven only by the HDP stick
+weights and one regime took ~all the mass immediately. `shs_active_regimes` read
+**1 at the first diagnostic in every run**, long before any structure move — so
+the later merges were garbage collection on empty components, not a model
+selection verdict. That is why merge gains were near-identical across different
+tasks (`22.0/22.9/18.7` on reach vs `21.97/22.88/18.74` on door-open).
 
-Docs and the `metaworld` dependency. `procgen` deliberately not pinned — it
-needs its own build toolchain and does not install cleanly next to gym 0.22.
+`init_scale` perturbs the POSTERIOR mean `M` per regime. It deliberately does
+not touch `M0`, the shared prior mean used in the KL and m-step. Measured at
+L=32, K=12: the perturbation inflates `max|eig(A_k)|` by ~`init_scale*sqrt(L)`
+(0.005 -> 1.04, 0.01 -> 1.06, 0.02 -> 1.14, 0.05 -> 1.36 expansive). **0.01 is
+the recommended start.** Default 0.0 leaves existing behaviour bit-identical.
 
-## New files
+## New (17 files)
 
-| File | Lines | Status |
-|---|---|---|
-| `envs/metaworld.py` | 208 | smoke-tested against the real package |
-| `envs/procgen.py` | 102 | **untested**, scaffolding |
-| `benchmarks/metaworld/{configs.yaml,tasks.py,launch.py,README.md}` | 383 | tested |
-| `benchmarks/eval/aggregate.py` | 174 | tested on synthetic logs |
-| `benchmarks/{atari100k,crafter,dmc,minecraft,procgen}/configs.yaml` | 218 | config only, unrun |
-| `benchmarks/README.md` | 85 | — |
+`compat.py` (numpy 2 shims), `envs/metaworld.py`, `envs/procgen.py` (untested),
+`benchmarks/` (7 config folders, `tasks.py`, `launch.py`, `sbatch_run.sh`,
+`eval/aggregate.py`, `eval/summarize.py`, READMEs), `CHANGES.md`.
 
-## What was verified
+## Verified
 
-Against the installed `metaworld` package:
+- All 50 Meta-World tasks: action dim **4**, obs dim **39**, `max_path_length` 500
+- Wrapper: 250 agent steps/episode, `is_terminal` never fires, `log_success` sums to exactly 1 under the scripted expert, fixed vs randomised goals behave as documented
+- Eval fix: 10-episode eval with 7 successes yields `eval_log_success = 0.7`
+- `init_scale`: 0.0 leaves regimes identical, 0.01 differentiates them
+- All 29 named configs load through `dreamer.py`'s exact argparse path; every `use_shs: True` config has `dyn_discrete: 0`
+- Everything compiles
 
-- Task-name normalisation (`reach` / `pick_place` / `pick-place-v3`)
-- Full episode = 250 agent steps x action_repeat 2 = 500 env steps = `max_path_length`
-- `is_terminal` never fires
-- `randomize_goal=True` gives different goals across resets; `False` gives identical ones
-- Meta-World's scripted expert on `reach`: `log_success` sums to exactly 1.0 per episode, 3/3 episodes
-- The `tools.py` fix: fake 10-episode eval with 7 successes yields `eval_log_success = 0.7`
-- `dreamer.py`'s config-loading path reproduced for all 11 new configs; every `use_shs: True` config has `dyn_discrete: 0`
-- All modified and new Python files compile
+Never run here: a real training step (no GPU in the authoring environment).
 
-Never run: a real training step. No GPU, no torch in the sandbox.
+## Known broken
 
-## Review checklist
+`*_gauss` arms (`dyn_discrete: 0` + `use_shs: False`). Two independent 500k runs
+gave `actor_grad_norm ~1e-6`, `actor_entropy` frozen at 5.675. Bit-identical
+with and without `torch.compile`. No original config exercises this path.
 
-**Correctness — read the code**
+## Known dead config keys
 
-1. `tools.py` diff. It changes logging for *all* domains, not just Meta-World.
-   Confirm your existing Crafter/DMC dashboards still read what you expect.
-2. `envs/metaworld.py` `step()`: reward accumulates across `action_repeat`,
-   `terminated`/`truncated` break the loop, success latches once.
-3. `envs/metaworld.py` `_setup_renderer()`: swaps `env.mujoco_renderer` to force
-   camera and resolution. Untested — **no GL in the sandbox.** First thing to
-   verify on a real node if you run `metaworld_vision`.
-
-**Protocol — these change the numbers**
-
-4. `mw_randomize_goal: True`. The goal-observable classes ship with
-   `_freeze_rand_vec = True` (fixed goal, easier). Default here randomises per
-   episode, matching TD-MPC2. If your DreamerV3 comparison point used fixed
-   goals, this is not a fair fight in your favour.
-5. `mw_terminate_on_success: False`. Success does not end the episode.
-6. `mlp_keys: 'state'` in the Meta-World configs. `save_episodes` writes
-   `log_success` into the replay `.npz` before `log_*` keys are popped, so
-   `mlp_keys: '.*'` would feed the success flag to the encoder. **Do not relax
-   this regex.**
-7. `benchmarks/metaworld/tasks.py`: easy (28) and medium (11) are published
-   lists verbatim; the hard tier is the remaining 11, of which 4 have unverified
-   hard-vs-very-hard assignments. Do not publish a hard/very-hard split without
-   checking Seo et al. Appendix F.
-
-**Before launching the sweep**
-
-8. `shs_curriculum` boundaries in `benchmarks/metaworld/configs.yaml` are copied
-   from `dmc_walker_shs`. At `batch_size 26 x batch_length 64 / train_ratio 512`
-   there is one gradient step per 3.25 agent steps, so 10k/20k/30k grad steps =
-   65k/130k/195k env steps. Refit from a pilot before committing.
-9. Decide whether the `*_gauss` control arms stay. `use_shs: True` forces
-   `dyn_discrete: 0`, so baseline-vs-shs changes the latent type *and* the
-   prior. Without `gauss` the result is not attributable.
-
-## Untouched
-
-`models.py`, `networks.py`, all of `shs_rssm/`, `envs/wrappers.py`, and every
-existing env wrapper. No SHS-RSSM code was modified. Existing DMC configs
-(`dmc_walker_shs` and friends) are byte-identical, so prior DMC results remain
-reproducible.
-
----
-
-## Follow-up fixes (after first sanity run)
-
-The `metaworld_proprio` sanity run reached eval successfully and then crashed in
-the tensorboard video writer. Two independent causes, both fixed.
-
-### 1. `tools.py` + `dreamer.py` — eval rollout video logged unconditionally
-
-`simulate` called `logger.video("eval_policy", ...)` on every eval episode
-regardless of `config.video_pred_log`. For proprioceptive runs the frames are
-the 1x1 placeholder the env emits (so `models.preprocess` can still divide
-`obs['image']` by 255), so the video is meaningless as well as a crash risk.
-
-`simulate` now takes `log_video=True`; `dreamer.py` passes
-`config.video_pred_log` at the eval call site. Proprio runs never touch the
-video path.
-
-### 2. `compat.py` (new) — numpy >= 2.1 removed `np.reshape(newshape=)`
-
-`torch.utils.tensorboard._utils._prepare_video` still passes `newshape=`, so any
-run that logs a video dies at the first eval with
-`TypeError: reshape() got an unexpected keyword argument 'newshape'`.
-
-This is a dependency-version problem, not a model problem, and it affects
-**every vision config** — `dmc_vision`, `crafter`, `atari100k`, `minecraft`,
-`metaworld_vision` — not just Meta-World. Fix #1 alone only rescues proprio runs.
-
-`compat.py` restores the removed alias, and is a no-op on environments where the
-keyword still works. Imported from `tools.py`. Verified against torch's exact
-call pattern plus positional, `shape=`, `order=`, and `copy=` call styles, and
-verified idempotent on re-import.
-
-The durable fix is to upgrade torch or hold `numpy < 2.1`; delete `compat.py`
-and its import once the environment is pinned.
+`dmc_acrobot_shs` sets `shs_rho1`, `shs_rho2`, `shs_recur_scale`,
+`shs_switch_settle`. Grep finds zero references in any `.py`. Left untouched.
