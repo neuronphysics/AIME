@@ -1,0 +1,127 @@
+# Meta-World SHS switching ablation, randomised goals.
+#
+# WHY THESE EXIST
+# ---------------
+# On door-open with FIXED goals, SHS reached 1.00 success / 96% of the scripted
+# expert while the DreamerV3 baseline never scored a single success. But
+# shs_current_K collapsed to 1 in every run, so the switching prior was inert:
+# the win came from the continuous-latent + sticky parameterisation, not from
+# switching. Two problems with testing switching there:
+#
+#   1. door-open fixed-goal is SATURATED at 96% of expert. Even a mechanism that
+#      helps has ~4% of headroom to show it in.
+#   2. Fixed goals make the task one trajectory to memorise, so one regime
+#      genuinely suffices and K=1 is the correct inference.
+#
+# Randomised goals (mw_randomize_goal: True, the default and the standard
+# Meta-World protocol) fixes both: both arms score 0.00 there, so it is
+# completely unsaturated, and the approach phase now varies per episode while
+# grasp/pull dynamics stay invariant given contact -- exactly the structure a
+# switching model is for.
+#
+# The two configs below differ in EXACTLY ONE THING: whether K is allowed to
+# stay above 1. Everything else is identical, so a difference is attributable
+# to switching.
+#
+# CALIBRATING create_bonus
+# ------------------------
+# Moves are accepted iff they increase J = L + create_bonus * K_active, so
+# create_bonus is a per-regime log-odds under a geometric prior on model size,
+# in NATS, directly comparable to the logged merge gains.
+#
+# Observed on door-open fixed-goal:
+#   create_bonus 0.0  -> K 12 -> 1 in three sweeps; final merges gained 12.1
+#                        (K=2->1 was 2.04)
+#   create_bonus 25.0 -> K 12 -> 64; births accepted at -15 nats of FIT, i.e.
+#                        the bonus was overpaying by ~10 nats per regime
+#
+# 5.0 sits above the last merge (2.04) and below the bulk (11-17), so it should
+# block the final collapse and settle around K=2-4. This is interpolated from
+# three gains on ONE task under fixed goals -- randomised goals will produce
+# different gains, so CHECK shs_current_K at the phase-2 sweep (~3h in) before
+# letting the run go the full 18h. If K still hits 1, raise to 8; if K runs away
+# past ~12, lower to 3.
+
+# --- ARM A: K collapses to 1 (switching inert) --------------------------------
+# create_bonus 0.0 throughout = the plain structured ELBO. This is the same
+# configuration that won on fixed goals, run on randomised goals.
+metaworld_proprio_shs_k1:
+  task: 'metaworld_door-open'
+  steps: 5e5
+  action_repeat: 2
+  time_limit: 500
+  envs: 4
+  train_ratio: 512
+  prefill: 5000
+  eval_every: 1e4
+  eval_episode_num: 10
+  video_pred_log: false
+  mw_render: false
+  mw_randomize_goal: true       # standard protocol; both arms score 0.00 here today
+  encoder: {mlp_keys: 'state', cnn_keys: '$^'}
+  decoder: {mlp_keys: 'state', cnn_keys: '$^'}
+
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+  shs_action_dim: 4             # Sawyer: 3 xyz deltas + gripper. Keep this.
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_rstick_dim: 8
+  shs_rstick_stopgrad: True
+  shs_imag_sample_mixture: True
+  shs_analytic_estep: True
+  shs_move_buffer: 8
+  shs_move_warmup: 0
+  shs_diag_log: True
+  shs_diag_figures: False       # scalars only; skips matplotlib entirely
+  shs_curriculum:
+    - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
+
+# --- ARM B: K held above 1 (switching active) ---------------------------------
+# IDENTICAL to arm A except create_bonus is held at 5.0 instead of annealed to
+# 0. Held CONSTANT, not annealed: the fixed-goal run showed that annealing to 0
+# in the final phase walks K from 58 back down to 1 over 15k gradient steps, so
+# an annealed schedule cannot hold regimes no matter how high the early value.
+metaworld_proprio_shs_k5:
+  task: 'metaworld_door-open'
+  steps: 5e5
+  action_repeat: 2
+  time_limit: 500
+  envs: 4
+  train_ratio: 512
+  prefill: 5000
+  eval_every: 1e4
+  eval_episode_num: 10
+  video_pred_log: false
+  mw_render: false
+  mw_randomize_goal: true
+  encoder: {mlp_keys: 'state', cnn_keys: '$^'}
+  decoder: {mlp_keys: 'state', cnn_keys: '$^'}
+
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+  shs_action_dim: 4
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_rstick_dim: 8
+  shs_rstick_stopgrad: True
+  shs_imag_sample_mixture: True
+  shs_analytic_estep: True
+  shs_move_buffer: 8
+  shs_move_warmup: 0
+  shs_diag_log: True
+  shs_diag_figures: False
+  shs_curriculum:
+    - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 5.0}
+    - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 5.0}
+    - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 5.0}
