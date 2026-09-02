@@ -408,7 +408,7 @@ dmc_cheetah_shs:
 
 dmc_acrobot_shs:
   task: 'dmc_acrobot_swingup'
-  steps: 2e6                 # 125,000 grad steps
+  steps: 1e6                 # 125,000 grad steps
   action_repeat: 2
   time_limit: 1000
   envs: 4
@@ -422,20 +422,18 @@ dmc_acrobot_shs:
   shs_kappa: 25.0
   # Gate persistence prior: E[pi_jj] = (kappa + alpha/K)/(alpha + kappa) for
   # Dir(alpha*beta + kappa*I), with kappa from the last non-recurrent phase.
-  shs_prior_persist: 0.778   # = (25 + 8/12)/(8 + 25)
-  shs_rstick_weight_var: 0.25
+  shs_prior_persist: 0.9   # = (25 + 8/12)/(8 + 25)
   shs_rstick_dim: 32
   shs_rstick_stopgrad: True
   shs_move_warmup: 0
   shs_move_buffer: 64
-  shs_move_max_age: 2000
   shs_calibrate_b0: True
   shs_calibrate_sF: 1.0
   shs_curriculum:
-    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 25.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: 650000, move_every_env: 48000, recurrent: False, kappa: 25.0, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: 800000, move_every_env: 48000, recurrent: True,               birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: -1,    move_every_env: 48000, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 650000, move_every_env: 22400, recurrent: False, kappa: 10.0, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 800000, move_every_env: 22400, recurrent: True,               birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,    move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
   shs_diag_log: True
   shs_diag_figures: True
   video_pred_log: True
