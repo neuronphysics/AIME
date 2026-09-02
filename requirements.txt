@@ -1,0 +1,30 @@
+# ---- core training (DreamerV3-torch + SHS-RSSM) ----------------------------
+torch>=2.4
+numpy>=1.24
+ruamel.yaml==0.17.4
+einops==0.3.0
+protobuf==3.20.0
+tensorboard>=2.17
+moviepy==1.0.3
+opencv-python>=4.7
+cloudpickle>=2.2
+pillow>=9.0
+
+# ---- environments -----------------------------------------------------------
+gym==0.22.0
+mujoco==2.3.5
+dm_control==1.0.9
+memory_maze==1.0.3
+crafter==1.8.0
+procgen
+
+scipy>=1.10          
+matplotlib>=3.5
+scikit-learn>=1.3
+pandas>=1.5
+seaborn>=0.12
+tqdm
+joblib
+numba                # TrSLDS baseline
+polyagamma           # PG draws for the TrSLDS baseline
+
