@@ -42,6 +42,12 @@
 # letting the run go the full 18h. If K still hits 1, raise to 8; if K runs away
 # past ~12, lower to 3.
 
+# NOTE (added after inspecting the code): all K regimes are CONSTRUCTED IDENTICALLY,
+# so shs_active_regimes sits at 1 from the very first diagnostic -- before any structure
+# move runs. create_bonus alone therefore cannot make switching happen: it changes how
+# many regimes are RETAINED, not whether any of them are USED. Both configs below now set
+# shs_init_scale to break that symmetry. See the note in shs_rssm/regimes_shared.py.
+
 # --- ARM A: K collapses to 1 (switching inert) --------------------------------
 # create_bonus 0.0 throughout = the plain structured ELBO. This is the same
 # configuration that won on fixed goals, run on randomised goals.
@@ -65,6 +71,7 @@ metaworld_proprio_shs_k1:
   use_shs: True
   shs_K: 12
   shs_action_dim: 4             # Sawyer: 3 xyz deltas + gripper. Keep this.
+  shs_init_scale: 0.01          # break the K-fold symmetry of the regime maps
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True
@@ -108,6 +115,7 @@ metaworld_proprio_shs_k5:
   use_shs: True
   shs_K: 12
   shs_action_dim: 4
+  shs_init_scale: 0.01          # break the K-fold symmetry of the regime maps
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True

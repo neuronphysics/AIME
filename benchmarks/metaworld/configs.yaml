@@ -1,13 +1,17 @@
 # Meta-World (MT1 single-task, goal-observable).
 #
-# IMPORTANT: encoder/decoder mlp_keys are pinned to 'state' rather than '.*'.
-# The rollout loop writes `log_success` into the saved episodes, so an mlp_keys
-# of '.*' would feed the success flag to the encoder as an observation and the
-# agent would learn to read the answer. Do not relax this regex.
+# All 50 tasks share one embodiment: action dim 4, observation dim 39,
+# max_path_length 500. Verified across the whole registry. So shs_action_dim: 4
+# is correct for every task and never needs a per-task override.
 #
-# Episode budget: Meta-World's max_path_length is 500 env steps. With
-# action_repeat 2 that is 250 agent steps, so time_limit is set to 500 (main()
-# divides it by action_repeat).
+# IMPORTANT: encoder/decoder mlp_keys are pinned to 'state' rather than '.*'.
+# tools.save_episodes writes the cache BEFORE the log_ keys are popped, so
+# log_success lands in the replay .npz. An mlp_keys of '.*' would feed the
+# success flag to the encoder as an observation and the agent would learn to
+# read the answer. Do not relax this regex.
+#
+# Episode budget: max_path_length is 500 env steps. With action_repeat 2 that is
+# 250 agent steps, so time_limit is 500 (main() divides it by action_repeat).
 
 metaworld_proprio:
   task: 'metaworld_reach'
@@ -40,10 +44,16 @@ metaworld_vision:
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
 
 # ---------------------------------------------------------------------------
-# SHS-RSSM variants. These inherit from the two configs above conceptually but
-# ruamel does not do YAML inheritance across documents, so the shared keys are
-# repeated. Keep them in sync with the baselines above -- the whole comparison
-# depends on the two arms differing ONLY in the dynamics prior.
+# SHS-RSSM variants. Keep the shared keys in sync with the baselines above --
+# the whole comparison depends on the arms differing ONLY in the dynamics prior.
+#
+# MEASURED (door-open, fixed goals, seed 0, 500k steps):
+#   metaworld_proprio      -> 0.00 success, return ~1970 (44% of expert)
+#   metaworld_proprio_shs  -> 1.00 success, return ~4270 (95% of expert)
+# but shs_current_K collapsed to 1 in every run, so the switching prior was
+# INERT and the win came from the continuous-latent + sticky parameterisation.
+# See benchmarks/metaworld/configs_switching.yaml for the symmetry-breaking
+# follow-up (shs_init_scale).
 # ---------------------------------------------------------------------------
 
 metaworld_proprio_shs:
@@ -64,6 +74,8 @@ metaworld_proprio_shs:
   dyn_discrete: 0
   use_shs: True
   shs_K: 12
+  shs_action_dim: 4           # Sawyer: 3 xyz deltas + gripper. Same for all 50 tasks.
+  shs_init_scale: 0.01        # break the K-fold symmetry of the regime maps
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True
@@ -73,6 +85,7 @@ metaworld_proprio_shs:
   shs_imag_sample_mixture: True
   shs_analytic_estep: True
   shs_move_buffer: 8
+  shs_move_warmup: 0
   shs_diag_log: True
   shs_diag_figures: True
   shs_action_dim: 4    # Meta-World Sawyer: 3 xyz deltas + gripper
@@ -85,6 +98,14 @@ metaworld_proprio_shs:
     - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
     - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 25.0}
     - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 10.0}
+  shs_diag_figures: False     # scalars only; skips matplotlib entirely
+  # Boundaries are in world-model GRADIENT steps. At batch_size 26 x
+  # batch_length 64 / train_ratio 512 there is one gradient step per 3.25 agent
+  # steps, so at action_repeat 2: 10k grad = 65k env steps, 20k = 130k, 30k = 195k.
+  shs_curriculum:
+    - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
+    - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
     - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
 
 metaworld_vision_shs:
@@ -105,6 +126,8 @@ metaworld_vision_shs:
   dyn_discrete: 0
   use_shs: True
   shs_K: 12
+  shs_action_dim: 4
+  shs_init_scale: 0.01
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True
@@ -114,23 +137,27 @@ metaworld_vision_shs:
   shs_imag_sample_mixture: True
   shs_analytic_estep: True
   shs_move_buffer: 8
+  shs_move_warmup: 0
   shs_diag_log: True
   shs_diag_figures: True
   shs_move_warmup: 0          # phase 1 is the warmup
   shs_action_dim: 4    # Meta-World Sawyer: 3 xyz deltas + gripper
   shs_curriculum:
-    # 1) FORM: fixed K, sticky base, no moves, no recurrence.
     - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
-    # 2) DISCOVER: adaptive K under the plain structured bound.
     - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
-    # 3) FULL: recurrent state-dependent stickiness on, kappa zeroed internally.
     - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
-    # 4) STABLE: everything active, reduced move cadence.
     - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
 
-# Continuous-latent DreamerV3 ablation. This is the control that isolates the
-# switching prior from the categorical->Gaussian latent change that use_shs
-# forces. Without this arm you cannot attribute any gain to SHS-RSSM.
+# Continuous-latent DreamerV3 ablation -- the control that isolates the
+# switching prior from the categorical->Gaussian latent change use_shs forces.
+#
+# WARNING: THIS ARM IS BROKEN IN THIS CODEBASE. Two independent 500k runs
+# produced actor_grad_norm ~1e-6 and actor_entropy frozen at 5.675 (exactly
+# sigma = max_std), i.e. the actor never trained. Bit-identical with and without
+# torch.compile, so compilation is not the cause. No original config in the repo
+# combines dyn_discrete: 0 with use_shs: False, so networks.RSSM's continuous
+# branch appears to be dead code. Do not report numbers from this arm until it
+# is fixed; use a K=1 SHS config as the control instead.
 metaworld_proprio_gauss:
   task: 'metaworld_reach'
   steps: 1e6

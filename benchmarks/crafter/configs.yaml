@@ -1,5 +1,4 @@
-# Crafter with SHS-RSSM. Same categorical-latent confound as Atari; the _gauss
-# control arm is mandatory for an attributable claim.
+# Crafter with SHS-RSSM. Same categorical-latent confound as Atari.
 crafter_shs:
   task: crafter_reward
   steps: 1e6
@@ -20,6 +19,7 @@ crafter_shs:
   dyn_discrete: 0
   use_shs: True
   shs_K: 16
+  shs_init_scale: 0.01
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True

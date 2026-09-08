@@ -5,6 +5,9 @@ Design notes
 * The repo's rollout loop (``tools.simulate``) speaks the *old* gym 4-tuple API
   (``obs, reward, done, info``).  Meta-World is gymnasium-native and returns a
   5-tuple, so the conversion happens here.
+* All 50 Meta-World tasks share one embodiment: action dim 4 (3 end-effector
+  deltas + gripper) and observation dim 39, verified across the whole registry.
+  So `shs_action_dim: 4` is correct for every task, not just one.
 * Meta-World has **no terminal state** in the MDP sense: an episode ends by time
   limit, and reaching ``success`` does not end it.  ``is_terminal`` is therefore
   always ``False`` (exactly like DMC), so the continuation head is not taught a
@@ -21,6 +24,12 @@ Design notes
   the *easy* single-goal variant.  We default to randomised goals per episode
   (the harder variant used by TD-MPC / TD-MPC2); flip ``randomize_goal=False``
   if you are reproducing a paper that used the fixed-goal setting.
+
+  MEASURED CONSEQUENCE: with randomised goals the object moves ~5.7cm (door) to
+  ~8.9cm (hammer) per episode, and in this codebase neither DreamerV3 nor
+  SHS-RSSM learned door-open at 500k steps.  With fixed goals SHS reached 1.00
+  success.  If you report fixed-goal numbers, say so explicitly and compare only
+  against papers that also set _freeze_rand_vec=True.
 """
 
 import gym
@@ -107,6 +116,10 @@ class MetaWorld:
         gymnasium's MujocoRenderer fixes camera and size at construction time and
         ``render()`` takes no camera argument, so the only reliable way to
         override both is to swap the renderer object.
+
+        NOTE: this path is UNTESTED -- it has never been exercised on a machine
+        with a working GL backend in this project. Verify before trusting
+        metaworld_vision results.
         """
         import mujoco
         from gymnasium.envs.mujoco.mujoco_rendering import MujocoRenderer

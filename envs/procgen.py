@@ -1,20 +1,21 @@
 """ProcGen wrapper exposing the same interface as envs/dmc.py.
 
+UNTESTED SCAFFOLDING. `procgen` is not in requirements.txt -- it needs its own
+build toolchain and does not install cleanly alongside gym 0.22 on most setups.
+Nothing in this project has ever run it.
+
 ProcGen is natively 64x64 RGB with a Discrete(15) action space, so no resizing
-or action remapping is needed -- it maps onto the Dreamer pipeline almost
-directly.
+or action remapping is needed.
 
 Protocol caveat: "beating DreamerV3 on ProcGen" is only meaningful if the level
-distribution matches.  The two axes that matter are ``distribution_mode``
-(easy/hard) and ``num_levels`` (0 = unlimited procedural levels, i.e. the
-train-on-everything setting; a finite value creates a train/test generalisation
-split).  Check the DreamerV3 appendix and set these to match before claiming a
-comparison -- a mismatch here swamps any modelling difference.
+distribution matches. The two axes that matter are `distribution_mode`
+(easy/hard) and `num_levels` (0 = unlimited procedural levels; a finite value
+creates a train/test generalisation split). Check the DreamerV3 appendix and set
+these to match before claiming a comparison.
 """
 
 import gym
 import numpy as np
-
 
 GAMES = (
     "bigfish", "bossfight", "caveflyer", "chaser", "climber", "coinrun",
@@ -26,16 +27,8 @@ GAMES = (
 class ProcGen:
     metadata = {}
 
-    def __init__(
-        self,
-        name,
-        action_repeat=1,
-        size=(64, 64),
-        seed=0,
-        distribution_mode="easy",
-        num_levels=0,
-        start_level=0,
-    ):
+    def __init__(self, name, action_repeat=1, size=(64, 64), seed=0,
+                 distribution_mode="easy", num_levels=0, start_level=0):
         game = name.replace("_", "-").strip().lower()
         if game not in GAMES:
             raise ValueError(f"Unknown ProcGen game '{game}'. Valid: {GAMES}")
@@ -44,16 +37,12 @@ class ProcGen:
         self._env = gym.make(
             f"procgen:procgen-{game}-v0",
             distribution_mode=distribution_mode,
-            num_levels=num_levels,
-            start_level=start_level,
-            rand_seed=seed,
+            num_levels=num_levels, start_level=start_level, rand_seed=seed,
         )
         self._action_repeat = action_repeat
         self._size = tuple(size)
         if self._size != (64, 64):
-            raise ValueError(
-                "ProcGen renders natively at 64x64; set size: [64, 64]."
-            )
+            raise ValueError("ProcGen renders natively at 64x64; set size: [64, 64].")
         self.reward_range = [-np.inf, np.inf]
 
     @property
@@ -68,11 +57,8 @@ class ProcGen:
         return self._env.action_space
 
     def _obs(self, image, is_first, is_terminal):
-        return {
-            "image": np.asarray(image, np.uint8),
-            "is_first": is_first,
-            "is_terminal": is_terminal,
-        }
+        return {"image": np.asarray(image, np.uint8),
+                "is_first": is_first, "is_terminal": is_terminal}
 
     def step(self, action):
         reward = 0.0
@@ -81,16 +67,11 @@ class ProcGen:
             reward += float(r)
             if done:
                 break
-        return (
-            self._obs(image, is_first=False, is_terminal=bool(done)),
-            reward,
-            bool(done),
-            {"discount": np.float32(1.0 - float(done))},
-        )
+        return (self._obs(image, False, bool(done)), reward, bool(done),
+                {"discount": np.float32(1.0 - float(done))})
 
     def reset(self):
-        image = self._env.reset()
-        return self._obs(image, is_first=True, is_terminal=False)
+        return self._obs(self._env.reset(), True, False)
 
     def render(self, *args, **kwargs):
         raise NotImplementedError("ProcGen observations are already images.")

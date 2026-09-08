@@ -68,6 +68,7 @@ class SharedCarryRegimes(nn.Module):
         vC0_scale: float = 1.0,       # prior precision of the shared-C rows
         ard: bool = True,
         identity_init: bool = True,
+        init_scale: float = 0.0,      # >0: break the K-fold symmetry of the regime maps
         jitter: float = 1e-6,
         q_rank: int = 0,              # only diagonal supported on the shared-carry path
         action_dim: int = 0,          # action joins the regime regressor r
@@ -99,7 +100,33 @@ class SharedCarryRegimes(nn.Module):
         self.register_buffer("M0", M0)
 
         # ---- regime posterior ----
-        self.register_buffer("M", M0.clone().unsqueeze(0).repeat(K, 1, 1))                 # (K,L,Lr)
+        # SYMMETRY BREAKING. Every regime is otherwise constructed identically (same M0,
+        # same lam, zero sufficient statistics), so the responsibilities gamma_t(k) are
+        # driven only by the HDP stick weights, which are decreasing in k. One regime
+        # therefore takes ~all the mass immediately and the rest stay empty for the whole
+        # run -- shs_active_regimes == 1 from the FIRST diagnostic, long before any
+        # structure move. The later merges are then just garbage collection on empty
+        # components, which is why their ELBO gains are near-identical across tasks and
+        # independent of the data.
+        #
+        # `init_scale` perturbs the POSTERIOR mean per regime. It deliberately does NOT
+        # touch M0: M0 is the shared prior mean used in the KL (`self.M - self.M0`) and in
+        # the m_step normal equations, so perturbing it would change the MODEL rather than
+        # the initialisation.
+        #
+        # Scale guidance (measured at L=32, K=12): the perturbation inflates the spectral
+        # radius of A_k by roughly init_scale * sqrt(L), so the AR block goes expansive at
+        # larger scales even though M starts at the identity:
+        #     0.005 -> max|eig(A_k)| 1.04     0.02 -> 1.14
+        #     0.010 -> 1.06                   0.05 -> 1.36  (expansive)
+        # 0.01 is the recommended starting point: regimes are clearly distinct (mean
+        # pairwise ||M_i - M_j|| ~ 0.49) while every A_k stays near the z_t ~ z_{t-1}
+        # prior. Re-derive the bound if L changes -- it scales with sqrt(L).
+        Minit = M0.clone().unsqueeze(0).repeat(K, 1, 1)                                    # (K,L,Lr)
+        if float(init_scale) > 0.0 and K > 1:
+            Minit = Minit + float(init_scale) * torch.randn(
+                K, L, self.Lr, dtype=dtype, device=device)
+        self.register_buffer("M", Minit)                                                   # (K,L,Lr)
         self.register_buffer("lam", torch.diag_embed(self.lam0_diag).unsqueeze(0).repeat(K, 1, 1))  # (K,Lr,Lr)
         self.register_buffer("V", torch.diag_embed(1.0 / self.lam0_diag).unsqueeze(0).repeat(K, 1, 1))
         self.register_buffer("a", torch.full((K, L), float(a0), dtype=dtype, device=device))

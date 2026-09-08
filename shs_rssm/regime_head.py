@@ -44,6 +44,7 @@ class RegimeHead(nn.Module):
         # regime (Normal-Gamma) hyperparameters
         a0: float = 3.0, b0: float = 2.0, v0_scale: float = 1.0, ard: bool = True,
         identity_init: bool = True,
+        init_scale: float = 0.0,      # >0: break the K-fold symmetry of the regime maps
         q_rank: int = 0,
         shared_carry: bool = False,   # tie the carry drift C across regimes (Prop. 1 fix)
         # sticky-HDP hyperparameters
@@ -68,7 +69,8 @@ class RegimeHead(nn.Module):
         self._ctor_kwargs = dict(
             stoch=stoch, deter=deter, K=K, proj_dim=proj_dim,
             action_dim=action_dim, a0=a0, b0=b0,
-            v0_scale=v0_scale, ard=ard, identity_init=identity_init, q_rank=q_rank,
+            v0_scale=v0_scale, ard=ard, identity_init=identity_init,
+            init_scale=init_scale, q_rank=q_rank,
             shared_carry=shared_carry, gamma=gamma, alpha=alpha, kappa=kappa,
             start_alpha=start_alpha, recurrent=recurrent, prior_persist=prior_persist,
             pg_iters=pg_iters, rstick_dim=rstick_dim, rstick_stopgrad=rstick_stopgrad,
@@ -129,13 +131,15 @@ class RegimeHead(nn.Module):
             self.regimes = SharedCarryRegimes(
                 K=K, L=self.L, G=self.G, action_dim=self.action_dim,
                 a0=a0, b0=b0, v0_scale=v0_scale, ard=ard,
-                identity_init=identity_init, q_rank=q_rank, dtype=dtype, device=device,
+                identity_init=identity_init, init_scale=init_scale,
+                q_rank=q_rank, dtype=dtype, device=device,
             )
         else:
             self.regimes = DiagARRegimes(
                 K=K, L=self.L, G=self.G, action_dim=self.action_dim,
                 a0=a0, b0=b0, v0_scale=v0_scale, ard=ard,
-                identity_init=identity_init, q_rank=q_rank, dtype=dtype, device=device,
+                identity_init=identity_init, init_scale=init_scale,
+                q_rank=q_rank, dtype=dtype, device=device,
             )
         # sticky-HDP runs in float64 internally for the digamma/lgamma optimisation.
         # When recurrent stickiness is on, the base transition must be NON-sticky

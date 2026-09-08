@@ -539,6 +539,10 @@ if __name__ == "__main__":
     # into the same flat namespace, so `--configs metaworld_shs` works exactly
     # like the configs defined in the root file. Root definitions win on a name
     # clash so nothing that already works can be silently overridden.
+    # Per-benchmark configs live in benchmarks/<name>/configs*.yaml and are merged
+    # into the same flat namespace, so `--configs metaworld_proprio_shs` works
+    # exactly like the configs defined in the root file. Root definitions win on a
+    # name clash so nothing that already works can be silently overridden.
     for extra in sorted((root / "benchmarks").glob("*/configs*.yaml")):
         for name, cfg in (yaml_loader.load(extra.read_text()) or {}).items():
             if name in configs:
