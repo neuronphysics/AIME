@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3_3g.40gb:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/home/gsubbara/AIME/slurm_logs/%x-%j.out
 #SBATCH --error=/home/gsubbara/AIME/slurm_logs/%x-%j.err
 

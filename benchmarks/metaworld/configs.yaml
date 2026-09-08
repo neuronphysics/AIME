@@ -75,19 +75,16 @@ metaworld_proprio_shs:
   shs_move_buffer: 8
   shs_diag_log: True
   shs_diag_figures: True
+  shs_action_dim: 4    # Meta-World Sawyer: 3 xyz deltas + gripper
   # Manipulation is phase-structured (reach / approach / grasp / transport /
   # release), so the curriculum boundaries below are placeholders keyed to where
   # DMC's curves flattened. Re-fit them from the recon + dyn-KL curves of a
   # single pilot run before launching the sweep.
   shs_move_warmup: 0          # phase 1 is the warmup
   shs_curriculum:
-    # 1) FORM: fixed K, sticky base, no moves, no recurrence.
     - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
-    # 2) DISCOVER: adaptive K under the plain structured bound.
-    - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
-    # 3) FULL: recurrent state-dependent stickiness on, kappa zeroed internally.
-    - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
-    # 4) STABLE: everything active, reduced move cadence.
+    - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 25.0}
+    - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 10.0}
     - {until: -1,    move_every: 1000, recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 0.0}
 
 metaworld_vision_shs:
@@ -120,6 +117,7 @@ metaworld_vision_shs:
   shs_diag_log: True
   shs_diag_figures: True
   shs_move_warmup: 0          # phase 1 is the warmup
+  shs_action_dim: 4    # Meta-World Sawyer: 3 xyz deltas + gripper
   shs_curriculum:
     # 1) FORM: fixed K, sticky base, no moves, no recurrence.
     - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
