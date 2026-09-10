@@ -52,6 +52,11 @@ class RegimeHead(nn.Module):
         # recurrent stickiness (h-dependent persistence with Polya-Gamma)
         recurrent: bool = False, prior_persist: float = 0.9, pg_iters: int = 4,
         rstick_dim: int | None = 8, rstick_stopgrad: bool = True,
+        rstick_weight_var: float = 1.0,
+        rstick_bias_var: float = 4.0,
+        rstick_use_action: bool = False,
+        gate_input: str = "carry",
+        gate_inner_iters: int = 2,
         # online schedule
         ema_tau: float = 0.02, hdp_iters: int = 2,
         online_mode: str = "ema",          # "ema" | "full_batch" | "streaming" | "memoized"
@@ -74,6 +79,10 @@ class RegimeHead(nn.Module):
             shared_carry=shared_carry, gamma=gamma, alpha=alpha, kappa=kappa,
             start_alpha=start_alpha, recurrent=recurrent, prior_persist=prior_persist,
             pg_iters=pg_iters, rstick_dim=rstick_dim, rstick_stopgrad=rstick_stopgrad,
+            rstick_weight_var=rstick_weight_var,
+            rstick_bias_var=rstick_bias_var,
+            rstick_use_action=rstick_use_action,
+            gate_input=gate_input, gate_inner_iters=gate_inner_iters,
             ema_tau=ema_tau, hdp_iters=hdp_iters, online_mode=online_mode,
             expected_batches=expected_batches,
             expected_ids=(set(expected_ids) if expected_ids is not None else None),
@@ -107,6 +116,11 @@ class RegimeHead(nn.Module):
         self.recurrent = recurrent
         self.rstick_stopgrad = bool(rstick_stopgrad)
         self.rstick_dim = int(min(deter, rstick_dim)) if rstick_dim is not None else self.Hp
+        if rstick_use_action and int(action_dim) <= 0:
+            raise ValueError(
+                "rstick_use_action=True requires action_dim > 0; set "
+                "shs_action_dim to the action width or disable gate actions")
+        self.rstick_action_dim = int(action_dim) if rstick_use_action else 0
 
         # the only neural parameter added: linear carry projection (no bias)
         if self.use_proj:
@@ -155,10 +169,35 @@ class RegimeHead(nn.Module):
         # not consulted while self.recurrent is False. Feature is the carry projection
         # [P h_t; 1] (dim Hp); when recurrent is on, the base kappa is forced to 0 (below /
         # in the curriculum) so the Bernoulli persistence is not double-counted.
-        self.rstick = RecurrentStickiness(
-            K=K, feat_dim=self.rstick_dim, prior_persist=prior_persist, pg_iters=pg_iters,
-            dtype=torch.float64, device=device,
-        )
+        self.gate_input = str(gate_input)
+        self.gate_inner_iters = max(1, int(gate_inner_iters))
+        if self.gate_input not in ("carry", "latent"):
+            raise ValueError(
+                f"gate_input must be 'carry' or 'latent', got {gate_input!r}")
+        if self.gate_input == "latent":
+            from .latent_stick import LatentStickiness
+            self.rstick = LatentStickiness(
+                K=K,
+                feat_dim=self.L + self.rstick_action_dim,
+                latent_dim=self.L,
+                prior_persist=prior_persist,
+                weight_prior_var=rstick_weight_var,
+                bias_prior_var=rstick_bias_var,
+                pg_iters=pg_iters,
+                dtype=torch.float64,
+                device=device,
+            )
+        else:
+            self.rstick = RecurrentStickiness(
+                K=K,
+                feat_dim=self.rstick_dim + self.rstick_action_dim,
+                prior_persist=prior_persist,
+                weight_prior_var=rstick_weight_var,
+                bias_prior_var=rstick_bias_var,
+                pg_iters=pg_iters,
+                dtype=torch.float64,
+                device=device,
+            )
         self._estep = None  # cache of recurrent-E-step quantities for the global update
         self._struct_cache = None  # cached xi/gamma for the structured sequence KL
         self.hdp_every = int(hdp_every)   # item 18: staggered global-block schedule
@@ -217,7 +256,7 @@ class RegimeHead(nn.Module):
         isf = is_first.reshape(*action.shape[:-1], 1).to(action.dtype)
         return action * (1.0 - isf)
 
-    def build_stick_phi(self, deter):
+    def build_stick_phi(self, deter, action=None, is_first=None):
         """Low-dimensional recurrent-stickiness feature phi_t=[S h_t; 1].
 
         This is intentionally separate from the dynamics regressor g_t. With
@@ -228,7 +267,36 @@ class RegimeHead(nn.Module):
         htil = self.P_stick(h) if self.P_stick is not None else h
         htil = torch.tanh(htil[..., :self.rstick_dim])
         ones = htil[..., :1] * 0.0 + 1.0
-        return torch.cat([htil, ones], dim=-1)
+        parts = [htil]
+        if self.rstick_action_dim > 0:
+            if action is None:
+                action = htil.new_zeros(
+                    *htil.shape[:-1], self.rstick_action_dim)
+            elif is_first is not None:
+                isf = is_first.reshape(*action.shape[:-1], 1).to(action.dtype)
+                action = action * (1.0 - isf)
+            parts.append(action.to(htil.dtype))
+        parts.append(ones)
+        return torch.cat(parts, dim=-1)
+
+    def build_stick_phi_z(self, z_mean, z_var, action=None, is_first=None):
+        """Packed moments for ``phi_t=[z_{t-1}, a_{t-1}, 1]``."""
+        prev_mean = self._prev_stoch(z_mean, is_first)
+        prev_var = (
+            self._shift_var(z_var, is_first)
+            if z_var is not None else torch.zeros_like(prev_mean)
+        )
+        gate_action = None
+        if self.rstick_action_dim > 0:
+            gate_action = (
+                self._shift_action(action, is_first)
+                if action is not None
+                else prev_mean.new_zeros(
+                    *prev_mean.shape[:-1], self.rstick_action_dim)
+            )
+        phi_mean, phi_var = self.rstick.build_phi_moments(
+            prev_mean, prev_var, gate_action)
+        return self.rstick.pack(phi_mean, phi_var)
 
     def _prev_stoch(self, stoch, is_first):
         """z_{t-1} from stoch (shift by one), reset to z0 at episode starts.
@@ -257,8 +325,25 @@ class RegimeHead(nn.Module):
         zeros_tail = g[..., self.L:] * 0.0
         return torch.cat([prev_var, zeros_tail], dim=-1)
 
+    def _gate_phi(self, deter, action=None, is_first=None, z_mean=None,
+                  z_var=None, dtype=None):
+        """Build gate features from the configured latent or carry input."""
+        if self.gate_input == "latent":
+            if z_mean is None:
+                raise ValueError(
+                    "gate_input='latent' requires z_mean because the gate reads "
+                    "the continuous stochastic latent")
+            phi = self.build_stick_phi_z(
+                z_mean, z_var, action, is_first=is_first)
+        else:
+            phi = self.build_stick_phi(
+                deter, action, is_first=is_first)
+        return phi if dtype is None else phi.to(dtype)
+
     # ------------------------------------------------------------ regime E-step
-    def _transition_logpotentials(self, deter, dtype=None, device=None):
+    def _transition_logpotentials(self, deter, dtype=None, device=None,
+                                  action=None, is_first=None, z_mean=None,
+                                  z_var=None):
         """Return log p(s_1) and log p(s_t|s_{t-1}) for the current transition model.
 
         If recurrent stickiness is active, the transition tensor is time varying with
@@ -273,7 +358,8 @@ class RegimeHead(nn.Module):
             # probit moment approximation): forward-backward on these is exact
             # structured VB over the joint (regime, persistence-indicator) chain and
             # its log-partition is a valid ELBO term.
-            phi = self.build_stick_phi(deter.to(dtype))
+            phi = self._gate_phi(
+                deter.to(dtype), action, is_first, z_mean, z_var, dtype)
             log_trans, aux = self.rstick.bound_log_trans(base_elogpi, phi[:, 1:])
             aux = dict(aux, phi_steps=phi[:, 1:])
             log_init, log_trans = self._mask_logpotentials(log_init, log_trans)  # P1 #9
@@ -281,7 +367,9 @@ class RegimeHead(nn.Module):
         log_init, base_elogpi = self._mask_logpotentials(log_init, base_elogpi)  # P1 #9
         return log_init, base_elogpi, None
 
-    def _transition_potentials_ondemand(self, deter, dtype=None, device=None):
+    def _transition_potentials_ondemand(self, deter, dtype=None, device=None,
+                                        action=None, is_first=None, z_mean=None,
+                                        z_var=None):
         """Recurrent transition potentials WITHOUT materialising the
         O(BTK^2) log_trans. Returns (log_init, aux, trans_fn) where aux is O(BTK) and
         trans_fn(t) builds a single (B,K,K) slice on demand (active-mask aware). Recurrent
@@ -290,7 +378,8 @@ class RegimeHead(nn.Module):
         device = device if device is not None else deter.device
         log_init = self.hdp.expected_log_init().to(dtype=dtype, device=device)
         base = self.hdp.expected_log_trans().to(dtype=dtype, device=device)
-        phi = self.build_stick_phi(deter.to(dtype))
+        phi = self._gate_phi(
+            deter.to(dtype), action, is_first, z_mean, z_var, dtype)
         aux = dict(self.rstick.bound_aux_only(base, phi[:, 1:]), phi_steps=phi[:, 1:])
         if self.active_mask is not None:
             m = self.active_mask.to(log_init.device)
@@ -330,7 +419,7 @@ class RegimeHead(nn.Module):
 
     def regime_inference(self, stoch, deter, is_first=None, cache_estep: bool = False,
                          z_var=None,
-                         action=None, valid=None):
+                         action=None, valid=None, inner_iters=None):
         """Structured VB E-step for the discrete regime path.
 
         The local potentials are the fully Bayesian expected log likelihoods
@@ -338,6 +427,23 @@ class RegimeHead(nn.Module):
         used later by `dynamics_kl`, so the E-step and loss cannot drift apart as
         regime noise parameters specialise.
         """
+        requested_iters = int(
+            self.gate_inner_iters if inner_iters is None else inner_iters)
+        if self.recurrent and self.gate_input == "latent" and requested_iters > 1:
+            # The continuous and discrete updates are coupled by the latent gate,
+            # but the current filtered training path does not feed an updated q(z)
+            # between passes. Repeating this step would therefore be idempotent.
+            if not getattr(self, "_warned_latent_iters", False):
+                print("[SHS] gate_input='latent': coupled inner-loop updates are "
+                      "not threaded yet; running one E-step")
+                self._warned_latent_iters = True
+        return self._regime_inference_once(
+            stoch, deter, is_first=is_first, cache_estep=cache_estep,
+            z_var=z_var, action=action, valid=valid)
+
+    def _regime_inference_once(self, stoch, deter, is_first=None,
+                               cache_estep: bool = False, z_var=None,
+                               action=None, valid=None):
         with torch.amp.autocast("cuda", enabled=False):
             z = stoch.float()
             d = deter.float()
@@ -355,14 +461,16 @@ class RegimeHead(nn.Module):
                 # slice ON DEMAND -- neither the O(BTK^2) xi NOR the O(BTK^2) transition
                 # tensor is ever materialised (peak drops to O(BTK)).
                 log_init, trans_aux, _trans_fn = self._transition_potentials_ondemand(
-                    d, dtype=torch.float32, device=d.device)
+                    d, dtype=torch.float32, device=d.device, action=action,
+                    is_first=is_first, z_mean=z, z_var=zvar)
                 gamma, counts_base, _logZ_re, _la, _lb = forward_backward(
                     log_init, None, ev, is_first=is_first, valid=valid,
                     return_messages=True, trans_fn=_trans_fn)
                 xi = None
             else:
                 log_init, log_trans, trans_aux = self._transition_logpotentials(
-                    d, dtype=torch.float32, device=d.device)
+                    d, dtype=torch.float32, device=d.device, action=action,
+                    is_first=is_first, z_mean=z, z_var=zvar)
                 gamma, counts_base, _logZ_re, xi = forward_backward(
                     log_init, log_trans, ev, is_first=is_first, valid=valid,
                     return_pairwise=True)
@@ -420,7 +528,8 @@ class RegimeHead(nn.Module):
         return gamma, counts, start_counts, g
 
     # ------------------------------------------------------------ structured KL
-    def _discrete_path_kl(self, gamma, xi, deter, is_first=None):
+    def _discrete_path_kl(self, gamma, xi, deter, is_first=None, action=None,
+                          z_mean=None, z_var=None):
         """Per-step KL(q(s_{1:T}) || p(s_{1:T}|phi)) under detached q(s).
 
         This is the discrete part of the structured variational objective.  Its
@@ -449,7 +558,8 @@ class RegimeHead(nn.Module):
 
         base_elogpi = self.hdp.expected_log_trans().to(dtype=dtype, device=device)
         if self.recurrent:
-            phi = self.build_stick_phi(deter)
+            phi = self._gate_phi(
+                deter, action, is_first, z_mean, z_var)
             log_trans, _ = self.rstick.bound_log_trans(base_elogpi, phi[:, 1:])
         else:
             log_trans = base_elogpi.view(1, 1, K, K).expand(B, T - 1, K, K)
@@ -461,7 +571,8 @@ class RegimeHead(nn.Module):
         out[:, 1:] = out[:, 1:] + (1.0 - isf[:, 1:]) * pair_kl
         return out
 
-    def _discrete_path_kl_online(self, gamma, deter, is_first, cache):
+    def _discrete_path_kl_online(self, gamma, deter, is_first, cache,
+                                 action=None, z_mean=None, z_var=None):
         """The discrete-path KL WITHOUT a materialised xi. The
         initial-state term needs only gamma; the pairwise term is accumulated per step by
         pair_kl_online using the cached messages and the DIFFERENTIABLE transition."""
@@ -487,7 +598,8 @@ class RegimeHead(nn.Module):
             # The DIFFERENTIABLE slices come from freshly-recomputed aux (for the stickiness
             # gradient); the DETACHED slices (for the xi recomputation) come from the cached
             # detached aux -- both are O(BTK) not O(BTK^2).
-            phi = self.build_stick_phi(deter)
+            phi = self._gate_phi(
+                deter, action, is_first, z_mean, z_var)
             aux_diff = self.rstick.bound_aux_only(base_elogpi, phi[:, 1:])
             trans_diff_fn = lambda t: self.rstick.trans_slice_from_aux(aux_diff, t)
             _caux = cache.get("trans_aux", None)
@@ -548,7 +660,9 @@ class RegimeHead(nn.Module):
         if _c is not None and _c.get("online", False) \
                 and _c.get("gamma", None) is not None and _c["gamma"].shape == gamma.shape:
             # blocker 8: online discrete-path KL, no materialised xi
-            disc = self._discrete_path_kl_online(gam, deter, is_first, _c)
+            disc = self._discrete_path_kl_online(
+                gam, deter, is_first, _c, action=action,
+                z_mean=q_mean, z_var=q_var)
         else:
             xi = None
             if _c is not None and _c.get("gamma", None) is not None \
@@ -559,10 +673,14 @@ class RegimeHead(nn.Module):
                     ev = evidence.detach()
                     ev = ev - ev.max(dim=-1, keepdim=True).values
                     log_init, log_trans, _ = self._transition_logpotentials(
-                        deter.detach(), dtype=ev.dtype, device=ev.device)
+                        deter.detach(), dtype=ev.dtype, device=ev.device,
+                        action=action, is_first=is_first,
+                        z_mean=q_mean.detach(), z_var=q_var.detach())
                     _, _, _, xi = forward_backward(
                         log_init, log_trans, ev, is_first=is_first, return_pairwise=True)
-            disc = self._discrete_path_kl(gam, xi.to(gam.device, gam.dtype), deter, is_first)
+            disc = self._discrete_path_kl(
+                gam, xi.to(gam.device, gam.dtype), deter, is_first,
+                action=action, z_mean=q_mean, z_var=q_var)
 
         # Global KL for the state-specific recurrent-stickiness variational posterior.
         # This is a true ELBO complexity term.  It is a scalar buffer-side penalty (the PG
@@ -1378,7 +1496,8 @@ class RegimeHead(nn.Module):
             self._estep = None
 
     # acceptance bound
-    def _score_potentials(self, deter, hdp, rstick, dtype=torch.float64):
+    def _score_potentials(self, deter, hdp, rstick, dtype=torch.float64,
+                          action=None, is_first=None, z_mean=None, z_var=None):
         """Log potentials (init, trans, aux) for scoring under GIVEN globals.
 
         With `rstick` (a RecurrentStickiness at hdp.K) the transition potentials are
@@ -1390,7 +1509,8 @@ class RegimeHead(nn.Module):
         log_init = hdp.expected_log_init().to(dtype=dtype, device=device)
         base_elogpi = hdp.expected_log_trans().to(dtype=dtype, device=device)
         if rstick is not None:
-            phi = self.build_stick_phi(deter).to(dtype)
+            phi = self._gate_phi(
+                deter, action, is_first, z_mean, z_var).to(dtype)
             log_trans, aux = rstick.bound_log_trans(base_elogpi, phi[:, 1:])
             return log_init, log_trans, dict(aux, phi_steps=phi[:, 1:])
         return log_init, base_elogpi, None
@@ -1425,7 +1545,9 @@ class RegimeHead(nn.Module):
         g = self.build_g(prev, deter, act)
         g_var = self._g_var_from_z_var(z_var, g, is_first=is_first)
         ev = regimes.expected_loglik(stoch, g, z_var=z_var, g_var=g_var).double()  # (B,T,K)
-        log_init, log_trans, aux = self._score_potentials(deter, hdp, rstick)
+        log_init, log_trans, aux = self._score_potentials(
+            deter, hdp, rstick, action=action, is_first=is_first,
+            z_mean=stoch, z_var=z_var)
         gamma, xicount, logZ, xi = forward_backward(
             log_init, log_trans, ev, is_first=is_first, valid=valid,
             return_pairwise=True)
@@ -1495,10 +1617,20 @@ class RegimeHead(nn.Module):
             g_var = torch.cat([prev_var.to(g.dtype), zeros_tail], dim=-1)
         else:
             g_var = None
-        base_elogpi = self.hdp.expected_log_trans().to(prev_stoch.dtype)
         if self.recurrent:
-            phi = self.build_stick_phi(deter)                       # (B,D+1)
-            Pi = torch.softmax(base_elogpi, dim=-1)
+            if self.gate_input == "latent":
+                gate_var = (
+                    prev_var if prev_var is not None
+                    else torch.zeros_like(prev_stoch)
+                )
+                gate_action = (
+                    action if self.rstick_action_dim > 0 else None)
+                phi_mean, phi_var = self.rstick.build_phi_moments(
+                    prev_stoch, gate_var, gate_action)
+                phi = self.rstick.pack(phi_mean, phi_var)
+            else:
+                phi = self.build_stick_phi(deter, action)
+            Pi = self._Epi().to(prev_stoch.dtype)
             sig = self.rstick.sigma(phi)                            # (B,K), row-specific
             eye = torch.eye(self.K, dtype=prev_stoch.dtype, device=prev_stoch.device)
             M = sig[..., :, None] * eye + (1.0 - sig[..., :, None]) * Pi  # (B,K,K)

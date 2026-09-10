@@ -51,7 +51,7 @@ This closes a collapse mode in which each regime absorbs its own high-capacity c
 \pi_i \sim \mathrm{Dir}(\alpha \beta + \kappa \delta_i).
 ```
 
-**State-dependent recurrent stickiness.** Optionally (`shs_recurrent: True`), each origin regime `i` carries a logistic persistence model on a low-dimensional feature `phi_t` of the world-model state:
+**State-dependent recurrent stickiness.** Optionally (`shs_recurrent: True`), each origin regime `i` carries a logistic persistence model. By default the gate reads the previous stochastic latent, `phi_t = [z_{t-1}, 1]`; set `shs_gate_input: carry` for the older projected-GRU feature. The latent feature stays linear, so its first and second moments under the Gaussian encoder posterior enter the Polya-Gamma update exactly:
 
 ```math
 \rho_{t,i} = \sigma(w_i^\top \phi_t + b_i), \qquad
@@ -153,6 +153,9 @@ Any key in `configs.yaml` can be overridden on the command line, for example `--
 | `shs_q_rank` | `0` | `0` for diagonal process noise, `> 0` for low-rank-plus-diagonal `Q_k`. Structural. |
 | `shs_kappa` | `50.0` | Sticky self-transition bias of the base HDP transition. |
 | `shs_recurrent` | `True` | Build the state-dependent recurrent-stickiness module. |
+| `shs_gate_input` | `latent` | `latent` gates on `z_{t-1}` with exact posterior moments; `carry` gates on a projection of `h_t`. |
+| `shs_rstick_use_action` | `False` | Append `a_{t-1}` to the selected gate input. |
+| `shs_rstick_bias_var`, `shs_rstick_weight_var` | `4.0`, `1.0` | Prior variances for the gate bias and feature weights. |
 | `shs_rstick_dim` | `8` | Feature dimension for recurrent stickiness. |
 | `shs_rstick_stopgrad` | `True` | Do not push transition gradients into the Dreamer GRU carry. |
 | `shs_move_every` | `0` | `0` disables structure moves (fixed `K`); `> 0` runs a move sweep on that gradient-step interval after `shs_move_warmup`. |

@@ -247,7 +247,13 @@ def _accumulate(head, buffer, regimes, hdp, rstick=None):
                          head._shift_action(getattr(b, "action", None), b.is_first))
         g_var = head._g_var_from_z_var(b.z_var, g, is_first=b.is_first)
         ev = regimes.expected_loglik(b.stoch, g, z_var=b.z_var, g_var=g_var).double()
-        log_init, log_trans, aux = head._score_potentials(b.deter, hdp, rstick)
+        log_init, log_trans, aux = head._score_potentials(
+            b.deter, hdp, rstick,
+            action=getattr(b, "action", None),
+            is_first=b.is_first,
+            z_mean=b.stoch,
+            z_var=b.z_var,
+        )
         gamma, xicount, _, xi = forward_backward(
             log_init, log_trans, ev, is_first=b.is_first, return_pairwise=True)
         if aux is not None:

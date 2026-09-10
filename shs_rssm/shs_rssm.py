@@ -45,6 +45,11 @@ class SHSRSSM(networks.RSSM):
                  shs_recurrent: bool = False, shs_prior_persist: float = 0.9,
                  shs_pg_iters: int = 4, shs_rstick_dim: int | None = 8,
                  shs_rstick_stopgrad: bool = True,
+                 shs_rstick_weight_var: float = 1.0,
+                 shs_rstick_bias_var: float = 4.0,
+                 shs_rstick_use_action: bool = False,
+                 shs_gate_input: str = "carry",
+                 shs_gate_inner_iters: int = 2,
                  shs_move_every: int = 0, shs_move_warmup: int = 2000,
                  shs_move_birth: bool = True, shs_move_buffer: int = 8,
                  shs_move_max_age: int = 0, shs_move_split: bool = True,
@@ -81,6 +86,11 @@ class SHSRSSM(networks.RSSM):
             start_alpha=shs_start_alpha, ema_tau=shs_ema_tau, hdp_iters=shs_hdp_iters,
             recurrent=shs_recurrent, prior_persist=shs_prior_persist, pg_iters=shs_pg_iters,
             rstick_dim=shs_rstick_dim, rstick_stopgrad=shs_rstick_stopgrad,
+            rstick_weight_var=shs_rstick_weight_var,
+            rstick_bias_var=shs_rstick_bias_var,
+            rstick_use_action=shs_rstick_use_action,
+            gate_input=shs_gate_input,
+            gate_inner_iters=shs_gate_inner_iters,
             q_rank=shs_q_rank, shared_carry=shs_shared_carry,
             action_dim=shs_action_dim,
             init_scale=shs_init_scale,
@@ -652,7 +662,15 @@ class SHSRSSM(networks.RSSM):
         if R.recurrent:
             # exact state-specific sticky weights w = gamma_prev @
             # (rho_i I + (1-rho_i) Pi), matching the structured training prior.
-            phi = R.build_stick_phi(deter)
+            if R.gate_input == "latent":
+                phi_mean, phi_var = R.rstick.build_phi_moments(
+                    prev,
+                    torch.zeros_like(prev),
+                    _act if R.rstick_action_dim > 0 else None,
+                )
+                phi = R.rstick.pack(phi_mean, phi_var)
+            else:
+                phi = R.build_stick_phi(deter, _act)
             Pi = torch.softmax(R.hdp.expected_log_trans().to(g.dtype), dim=-1)
             sig = R.rstick.sigma(phi)
             eye = torch.eye(R.K, dtype=g.dtype, device=g.device)

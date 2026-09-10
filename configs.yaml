@@ -65,6 +65,11 @@ defaults:
   shs_pg_iters: 4
   shs_rstick_dim: 8       # low-dimensional feature for state-dependent recurrent stickiness
   shs_rstick_stopgrad: True  # stop gradients from transition term into Dreamer GRU carry
+  shs_rstick_weight_var: 1.0
+  shs_rstick_bias_var: 4.0    # prior variance of the gate logit bias
+  shs_rstick_use_action: False  # optionally append a_{t-1} to either gate input
+  shs_gate_input: latent      # latent = z_{t-1}; carry = projected deterministic h_t
+  shs_gate_inner_iters: 2     # reserved for coupled latent/discrete E-step passes
   shs_move_every: 0     # 0 = adaptive-K moves OFF (fixed truncation); set >0 (e.g. 500)
                         # to enable birth/merge/delete on that step interval after warmup
   shs_move_warmup: 2000
