@@ -85,20 +85,13 @@ metaworld_proprio_shs:
   shs_imag_sample_mixture: True
   shs_analytic_estep: True
   shs_move_buffer: 8
-  shs_move_warmup: 0
   shs_diag_log: True
-  shs_diag_figures: True
-  shs_action_dim: 4    # Meta-World Sawyer: 3 xyz deltas + gripper
+  shs_diag_figures: False     # scalars only; skips matplotlib entirely
   # Manipulation is phase-structured (reach / approach / grasp / transport /
   # release), so the curriculum boundaries below are placeholders keyed to where
   # DMC's curves flattened. Re-fit them from the recon + dyn-KL curves of a
   # single pilot run before launching the sweep.
   shs_move_warmup: 0          # phase 1 is the warmup
-  shs_curriculum:
-    - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
-    - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 25.0}
-    - {until: 30000, move_every: 500,  recurrent: True,  kappa: 0.0,  move_threshold: 0.0, create_bonus: 10.0}
-  shs_diag_figures: False     # scalars only; skips matplotlib entirely
   # Boundaries are in world-model GRADIENT steps. At batch_size 26 x
   # batch_length 64 / train_ratio 512 there is one gradient step per 3.25 agent
   # steps, so at action_repeat 2: 10k grad = 65k env steps, 20k = 130k, 30k = 195k.
@@ -140,8 +133,6 @@ metaworld_vision_shs:
   shs_move_warmup: 0
   shs_diag_log: True
   shs_diag_figures: True
-  shs_move_warmup: 0          # phase 1 is the warmup
-  shs_action_dim: 4    # Meta-World Sawyer: 3 xyz deltas + gripper
   shs_curriculum:
     - {until: 10000, move_every: 0,    recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
     - {until: 20000, move_every: 250,  recurrent: False, kappa: 50.0, move_threshold: 0.0, create_bonus: 0.0}
