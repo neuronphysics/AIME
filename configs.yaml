@@ -192,12 +192,6 @@ shs_strict:
   shs_q_rank: 0
   shs_curriculum: []
   shs_corpus_batches: 1
-  # NOTE: memoized mode REQUIRES a stable batch id per replay partition.
-  # Nothing in this repository calls SHSRSSM.set_batch_id(), so this preset
-  # raises on the second queued global update by design (RegimeHead.
-  # update_globals refuses batch_id=None rather than silently appending a
-  # new batch on every replay revisit).  Wire set_batch_id() to your replay
-  # partition id -- and set shs_expected_batches -- before using shs_strict.
   shs_online_mode: memoized
   shs_global_source: offline_memoized
   shs_strict_stream: True
@@ -255,6 +249,82 @@ atari100k:
   resize: opencv
   actions: needed
   time_limit: 108000
+
+atari100k_shs:
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 16
+  shs_action_dim: -1
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 650000, move_every_env: 22400, recurrent: False, kappa: 10.0, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 800000, move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,    move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+atari100k_shs_gate:
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 16
+  shs_action_dim: -1
+  shs_proj_dim: 256
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 10.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_ema_tau: 0.01
+  shs_b0: 0.2
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 0.1
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_curriculum:
+    - {until_env: 10000, move_every: 0,          recurrent: True, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 40000, move_every_env: 5000,   recurrent: True, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 60000, move_every_env: 5000,   recurrent: True, birth: True,  split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,    move_every_env: 5000,   recurrent: True, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+
+atari_breakout_shs:
+  task: 'atari_breakout'
+atari_demon_attack_shs:
+  task: 'atari_demon_attack'
+atari_ms_pacman_shs:
+  task: 'atari_ms_pacman'
+atari_alien_shs:
+  task: 'atari_alien'
+atari_seaquest_shs:
+  task: 'atari_seaquest'
+atari_hero_shs:
+  task: 'atari_hero'
+atari_frostbite_shs:
+  task: 'atari_frostbite'
+atari_freeway_shs:
+  task: 'atari_freeway'
 
 minecraft:
   task: minecraft_diamond
@@ -440,6 +510,213 @@ dmc_acrobot_shs:
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
 
+dmc_pendulum_shs:
+  task: 'dmc_pendulum_swingup'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 8
+  shs_action_dim: 1
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 650000, move_every_env: 22400, recurrent: False, kappa: 10.0, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 800000, move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,    move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_pendulum_shs_gate:
+  task: 'dmc_pendulum_swingup'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 8
+  shs_action_dim: 1
+  shs_proj_dim: 256
+  shs_shared_carry: True
+  shs_q_rank: 2
+  shs_recurrent: True
+  shs_kappa: 10.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_ema_tau: 0.01
+  shs_b0: 0.2
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 0.1
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_curriculum:
+    - {until_env: 50000,  move_every: 0,          recurrent: True, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 200000, move_every_env: 10400,  recurrent: True, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 300000, move_every_env: 10400,  recurrent: True, birth: True,  split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 10400,  recurrent: True, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_finger_turn_hard_shs:
+  task: 'dmc_finger_turn_hard'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+  shs_action_dim: 2
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 650000, move_every_env: 22400, recurrent: False, kappa: 10.0, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 800000, move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,    move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_finger_turn_hard_shs_gate:
+  task: 'dmc_finger_turn_hard'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12
+  shs_action_dim: 2
+  shs_proj_dim: 256
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 10.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_ema_tau: 0.01
+  shs_b0: 0.2
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 0.1
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_curriculum:
+    - {until_env: 50000,  move_every: 0,          recurrent: True, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 200000, move_every_env: 10400,  recurrent: True, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 300000, move_every_env: 10400,  recurrent: True, birth: True,  split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 10400,  recurrent: True, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_quadruped_walk_shs:
+  task: 'dmc_quadruped_walk'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 24
+  shs_action_dim: 12
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 650000, move_every_env: 22400, recurrent: False, kappa: 10.0, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 800000, move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,    move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_quadruped_walk_shs_gate:
+  task: 'dmc_quadruped_walk'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 24
+  shs_action_dim: 12
+  shs_proj_dim: 256
+  shs_shared_carry: True
+  shs_q_rank: 8
+  shs_recurrent: True
+  shs_kappa: 10.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_ema_tau: 0.01
+  shs_b0: 0.2
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 0.1
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_curriculum:
+    - {until_env: 50000,  move_every: 0,          recurrent: True, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 200000, move_every_env: 10400,  recurrent: True, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 300000, move_every_env: 10400,  recurrent: True, birth: True,  split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 10400,  recurrent: True, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
 dmc_humanoid_shs:
   task: 'dmc_humanoid_walk'
   steps: 5e6                 # 312,500 grad steps
@@ -448,7 +725,7 @@ dmc_humanoid_shs:
   envs: 4
   dyn_discrete: 0
   use_shs: True
-  shs_K: 16                # 21 actuators, many distinct gait/recovery modes
+  shs_K: 24                # 21 actuators, many distinct gait/recovery modes
   shs_action_dim: 21
   shs_shared_carry: True
   shs_q_rank: 4
