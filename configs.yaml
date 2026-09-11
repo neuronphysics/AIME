@@ -494,11 +494,13 @@ dmc_acrobot_shs:
   # Dir(alpha*beta + kappa*I), with kappa from the last non-recurrent phase.
   shs_prior_persist: 0.9   # = (25 + 8/12)/(8 + 25)
   shs_rstick_dim: 32
-  shs_rstick_stopgrad: True
   shs_move_warmup: 0
   shs_move_buffer: 64
+  shs_rstick_stopgrad: True
+  shs_ema_tau: 0.01
+  shs_b0: 0.2
   shs_calibrate_b0: True
-  shs_calibrate_sF: 1.0
+  shs_calibrate_sF: 0.1
   shs_curriculum:
     - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
     - {until_env: 650000, move_every_env: 22400, recurrent: False, kappa: 10.0, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
