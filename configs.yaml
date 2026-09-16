@@ -484,33 +484,32 @@ dmc_acrobot_shs:
   envs: 4
   dyn_discrete: 0
   use_shs: True
-  shs_K: 12
+  shs_K: 32
   shs_action_dim: 1          # acrobot has ONE actuator
   shs_shared_carry: True
-  shs_q_rank: 2
+  shs_q_rank: 8
   shs_recurrent: True
-  shs_kappa: 25.0
-  # Gate persistence prior: E[pi_jj] = (kappa + alpha/K)/(alpha + kappa) for
-  # Dir(alpha*beta + kappa*I), with kappa from the last non-recurrent phase.
-  shs_prior_persist: 0.9   # = (25 + 8/12)/(8 + 25)
+  shs_alpha: 8.0
+  shs_kappa: 69.5            # (8/32 + 69.5)/(8 + 69.5) = 0.900
+  shs_prior_persist: 0.9    
   shs_rstick_dim: 32
   shs_move_warmup: 0
   shs_move_buffer: 64
   shs_rstick_stopgrad: True
-  shs_ema_tau: 0.01
-  shs_b0: 0.2
+  shs_move_max_age: 2000
   shs_calibrate_b0: True
-  shs_calibrate_sF: 0.1
+  shs_calibrate_sF: 1.0
   shs_curriculum:
-    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: 650000, move_every_env: 22400, recurrent: False, kappa: 10.0, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: 800000, move_every_env: 22400, recurrent: True,               birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: -1,    move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 120000, move_every: 0,           recurrent: False, kappa: 69.5, birth: False, split: False}
+    - {until_env: 250000, move_every_env: 22400,   recurrent: False, kappa: 69.5, birth: False, split: False, move_threshold: 10.0}
+    - {until_env: 350000, move_every_env: 22400,   recurrent: True,                birth: False, split: False, move_threshold: 10.0}
+    - {until_env: -1,     move_every_env: 22400,   recurrent: True,                birth: True,  split: True,  move_threshold: 10.0}
   shs_diag_log: True
   shs_diag_figures: True
   video_pred_log: True
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
 
 dmc_pendulum_shs:
   task: 'dmc_pendulum_swingup'
@@ -650,6 +649,76 @@ dmc_finger_turn_hard_shs_gate:
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
 
+dmc_reacher_hard_shs:
+  task: 'dmc_reacher_hard'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 12                  # 2-link arm, smooth and non-chaotic; over-provision
+                             # and let merge/delete prune down
+  shs_action_dim: 2          # reacher has TWO actuators
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_alpha: 8.0
+  shs_kappa: 65.33           # (65.33 + 8/12)/(8 + 65.33) = 0.900
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until_env: 120000, move_every: 0,         recurrent: False, kappa: 65.33, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 250000, move_every_env: 22400, recurrent: False, kappa: 65.33, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 350000, move_every_env: 22400, recurrent: True,                birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 22400, recurrent: True,                birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+dmc_quadruped_run_shs:
+  task: 'dmc_quadruped_run'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 24
+  shs_action_dim: 12
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_alpha: 8.0
+  shs_kappa: 68.67           # (68.67 + 8/24)/(8 + 68.67) = 0.900
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until_env: 120000, move_every: 0,         recurrent: False, kappa: 68.67, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 250000, move_every_env: 22400, recurrent: False, kappa: 68.67, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 350000, move_every_env: 22400, recurrent: True,                birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 22400, recurrent: True,                birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+  
 dmc_quadruped_walk_shs:
   task: 'dmc_quadruped_walk'
   steps: 1e6
