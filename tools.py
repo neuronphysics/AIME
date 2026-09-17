@@ -236,8 +236,8 @@ def simulate(
                         eval_done = False
                     eval_scores.append(score)
                     eval_lengths.append(length)
-                    if "context" in cache[envs[i].id]:
-                        ctx = tuple(np.round(np.asarray(cache[envs[i].id]["context"])[0], 6))
+                    if "context_id" in cache[envs[i].id]:  # stable id from the configured context set
+                        ctx = int(np.asarray(cache[envs[i].id]["context_id"])[0])
                         eval_ctx_scores.setdefault(ctx, []).append(score)
 
                     score = sum(eval_scores) / len(eval_scores)
@@ -249,9 +249,9 @@ def simulate(
                             # equal weight per context, so uneven episode counts cannot bias the mean
                             ctx_means = [np.mean(v) for _, v in sorted(eval_ctx_scores.items())]
                             score = float(np.mean(ctx_means))
-                            for j, (ctx, v) in enumerate(sorted(eval_ctx_scores.items())):
-                                logger.scalar(f"eval_return_ctx{j}", float(np.mean(v)))
-                                logger.scalar(f"eval_episodes_ctx{j}", len(v))
+                            for ctx, v in sorted(eval_ctx_scores.items()):
+                                logger.scalar(f"eval_return_ctx{ctx}", float(np.mean(v)))
+                                logger.scalar(f"eval_episodes_ctx{ctx}", len(v))
                         logger.scalar(f"eval_return", score)
                         logger.scalar(f"eval_length", length)
                         logger.scalar(f"eval_episodes", len(eval_scores))

@@ -322,6 +322,7 @@ def make_env(config, mode, id):
             seed=config.seed + id,
             contexts=cfg["train_contexts"] if is_train else cfg["eval_contexts"],
             selector=cfg["train_selector"] if is_train else cfg["eval_selector"],
+            start=id,
         )
         env = wrappers.NormalizeActions(env)
     else:

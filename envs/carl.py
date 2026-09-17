@@ -30,7 +30,7 @@ class CARL:
         self._contexts = self.build_contexts(cls, contexts)
         self._rng = np.random.RandomState(seed)
         sel = getattr(selection, self._SELECTORS[selector])(self._contexts)
-        if selector == "round_robin":  # stagger parallel workers so each batch covers all contexts
+        if selector == "round_robin" and len(self._contexts) > 1:  # stagger workers; must stay None for 1 context
             sel.context_id = (start - 1) % len(self._contexts)
         if selector == "random":  # CARL's RandomSelector uses the global np.random
             sel._select = lambda: (lambda cid: (sel.contexts[sel.contexts_keys[cid]], cid))(
@@ -101,6 +101,7 @@ class CARL:
             "image": self.render(),
             "state": np.asarray(raw["obs"], np.float32),
             "context": np.asarray(raw["context"], np.float32),
+            "context_id": np.int32(self._env.context_id),
             "is_first": is_first,
             "is_terminal": is_terminal,
         }
