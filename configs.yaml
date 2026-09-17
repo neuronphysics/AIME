@@ -28,6 +28,16 @@ defaults:
   prefill: 2500
   reward_EMA: True
 
+  # CARL (contextual dm_control) -- only read when task starts with 'carl_'.
+  # {feature: [values]} per key; >1 key -> cartesian product. Every context is
+  # the env default updated with these, so unspecified features stay nominal.
+  # train and eval get DIFFERENT context sets => eval = generalisation.
+  carl:
+    train_contexts: {}          # {} = single default context (== plain DMC)
+    eval_contexts: {}
+    train_selector: random      # random | round_robin | static
+    eval_selector: round_robin  # round_robin visits every eval context equally
+
   dyn_hidden: 512
   dyn_deter: 512
   dyn_stoch: 32
@@ -392,9 +402,11 @@ dmc_walker_shs:
   shs_move_warmup: 0
   shs_move_buffer: 64
   shs_move_max_age: 2000
+  shs_ema_tau: 0.005
+  shs_b0: 0.2
   shs_calibrate_b0: True
-  shs_calibrate_sF: 1.0
-
+  shs_calibrate_sF: 0.1
+  shs_proj_dim: 128
   shs_curriculum:
     - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
     - {until_env: 650000, move_every_env: 20800, recurrent: False, kappa: 10.0, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
@@ -441,6 +453,75 @@ dmc_hopper_shs:
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
 
+dmc_quadruped_run_shs:
+  task: 'dmc_quadruped_run'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 24
+  shs_action_dim: 12
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_curriculum:
+    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 650000, move_every_env: 22400, recurrent: False, kappa: 10.0, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 800000, move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,    move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+ 
+dmc_quadruped_run_shs_gate:
+  task: 'dmc_quadruped_run'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 24
+  shs_action_dim: 12
+  shs_proj_dim: 256
+  shs_shared_carry: True
+  shs_q_rank: 8
+  shs_recurrent: True
+  shs_kappa: 10.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_ema_tau: 0.01
+  shs_b0: 0.2
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 0.1
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_curriculum:
+    - {until_env: 50000,  move_every: 0,          recurrent: True, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 200000, move_every_env: 10400,  recurrent: True, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 300000, move_every_env: 10400,  recurrent: True, birth: True,  split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 10400,  recurrent: True, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+ 
 dmc_cheetah_shs:
   task: 'dmc_cheetah_run'
   steps: 1e6                 # curriculum *_env keys are ENV steps (batch-invariant)
@@ -484,28 +565,26 @@ dmc_acrobot_shs:
   envs: 4
   dyn_discrete: 0
   use_shs: True
-  shs_K: 12
+  shs_K: 32
   shs_action_dim: 1          # acrobot has ONE actuator
   shs_shared_carry: True
-  shs_q_rank: 2
+  shs_q_rank: 8
   shs_recurrent: True
-  shs_kappa: 25.0
-  # Gate persistence prior: E[pi_jj] = (kappa + alpha/K)/(alpha + kappa) for
-  # Dir(alpha*beta + kappa*I), with kappa from the last non-recurrent phase.
-  shs_prior_persist: 0.9   # = (25 + 8/12)/(8 + 25)
+  shs_alpha: 8.0
+  shs_kappa: 69.5            # (8/32 + 69.5)/(8 + 69.5) = 0.900
+  shs_prior_persist: 0.9    
   shs_rstick_dim: 32
   shs_move_warmup: 0
   shs_move_buffer: 64
   shs_rstick_stopgrad: True
-  shs_ema_tau: 0.01
-  shs_b0: 0.2
+  shs_move_max_age: 2000
   shs_calibrate_b0: True
-  shs_calibrate_sF: 0.1
+  shs_calibrate_sF: 1.0
   shs_curriculum:
-    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: 650000, move_every_env: 22400, recurrent: False, kappa: 10.0, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: 800000, move_every_env: 22400, recurrent: True,               birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: -1,    move_every_env: 22400, recurrent: True,               birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 120000, move_every: 0,           recurrent: False, kappa: 69.5, birth: False, split: False}
+    - {until_env: 250000, move_every_env: 22400,   recurrent: False, kappa: 69.5, birth: False, split: False, move_threshold: 10.0}
+    - {until_env: 350000, move_every_env: 22400,   recurrent: True,                birth: False, split: False, move_threshold: 10.0}
+    - {until_env: -1,     move_every_env: 22400,   recurrent: True,                birth: True,  split: True,  move_threshold: 10.0}
   shs_diag_log: True
   shs_diag_figures: True
   video_pred_log: True
@@ -892,3 +971,66 @@ dmc_vanilla_compare:
   batch_size: 16
   prefill: 2500
   dyn_rec_depth: 1
+
+
+# =============================================================================
+#  CARL: contextual variants of the DMC tasks that CARL ships
+#  (walker-walk, quadruped-walk, finger-spin, fish-swim; no cheetah / hopper /
+#  acrobot / pendulum / reacher in CARL).
+#
+#  These blocks only set `task` and `carl`. Layer them AFTER the matching DMC
+#  SHS block so shs_action_dim, curriculum, encoder/decoder etc. are inherited:
+#
+#    python dreamer.py --configs dmc_vision dmc_walker_shs         carl_walker_gravity
+#    python dreamer.py --configs dmc_vision dmc_quadruped_walk_shs carl_quadruped_gravity
+#    python dreamer.py --configs dmc_vision dmc_finger_turn_hard_shs carl_finger_gravity
+#
+#  For the vanilla-RSSM baseline layer on dmc_vision alone (no *_shs block).
+#
+#  Hidden-context protocol (default): encoder mlp_keys '$^' ignores the
+#  14-dim `context` obs key, so the agent must infer dynamics from pixels.
+#  Visible-context protocol: add   encoder: {mlp_keys: 'context', cnn_keys: 'image'}
+#
+#  Multipliers of the nominal value, so train covers {0.5x, 1x, 2x} and eval
+#  probes {0.25x, 4x} -- both sides outside the training interval.
+# =============================================================================
+
+carl_walker_gravity:                      # nominal g = 9.81
+  task: 'carl_dmc_walker'
+  carl:
+    train_contexts: {gravity: [4.905, 9.81, 19.62]}
+    eval_contexts:  {gravity: [2.4525, 39.24]}
+
+carl_walker_friction:                     # nominal friction_tangential = 1.0
+  task: 'carl_dmc_walker'
+  carl:
+    train_contexts: {friction_tangential: [0.5, 1.0, 2.0]}
+    eval_contexts:  {friction_tangential: [0.25, 4.0]}
+
+carl_walker_gravity_friction:             # 3 x 3 = 9 train, 2 x 2 = 4 eval contexts
+  task: 'carl_dmc_walker'
+  carl:
+    train_contexts: {gravity: [4.905, 9.81, 19.62], friction_tangential: [0.5, 1.0, 2.0]}
+    eval_contexts:  {gravity: [2.4525, 39.24],      friction_tangential: [0.25, 4.0]}
+
+carl_quadruped_gravity:                   # inherits shs_action_dim: 12 from dmc_quadruped_walk_shs
+  task: 'carl_dmc_quadruped'
+  carl:
+    train_contexts: {gravity: [4.905, 9.81, 19.62]}
+    eval_contexts:  {gravity: [2.4525, 39.24]}
+
+carl_quadruped_actuator:                  # nominal actuator_strength = 1.0
+  task: 'carl_dmc_quadruped'
+  carl:
+    train_contexts: {actuator_strength: [0.5, 1.0, 2.0]}
+    eval_contexts:  {actuator_strength: [0.25, 4.0]}
+
+carl_finger_gravity:                      # NOTE: CARL's finger task is SPIN, not turn_hard.
+  task: 'carl_dmc_finger'                 # action dim (2) matches dmc_finger_turn_hard_shs,
+  carl:                                   # so that block is safe to layer on, but returns
+    train_contexts: {gravity: [4.905, 9.81, 19.62]}   # are not comparable to finger_turn_hard.
+    eval_contexts:  {gravity: [2.4525, 39.24]}
+
+carl_walker_context_visible:              # add on top of any carl_walker_* block
+  encoder: {mlp_keys: 'context', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^',      cnn_keys: 'image'}   # reconstruct pixels only, not the context

@@ -310,6 +310,24 @@ def make_env(config, mode, id):
 
         env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
         env = wrappers.OneHotAction(env)
+    elif suite == "carl":
+        # CARL contextual variants of dm_control (task = dmc_walker | dmc_quadruped |
+        # dmc_finger | dmc_fish). Same contract as envs.dmc; the context set differs
+        # between train and eval envs so eval measures generalisation to held-out
+        # dynamics. See envs/carl.py for the context spec format.
+        import envs.carl as carl
+
+        cfg = config.carl
+        is_train = "train" in mode
+        env = carl.CARL(
+            task,
+            config.action_repeat,
+            config.size,
+            seed=config.seed + id,
+            contexts=cfg["train_contexts"] if is_train else cfg["eval_contexts"],
+            selector=cfg["train_selector"] if is_train else cfg["eval_selector"],
+        )
+        env = wrappers.NormalizeActions(env)
     else:
         raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit)
