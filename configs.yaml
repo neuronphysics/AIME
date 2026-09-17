@@ -969,23 +969,12 @@ dmc_vanilla_compare:
 
 
 # CARL contextual dm_control (pixels). Tasks: walker walk, quadruped walk, finger spin.
+# Vanilla DreamerV3 baseline: append carl_vanilla to any carl_*_shs block.
 
-carl_vision:
-  task: 'carl_dmc_walker'
-  steps: 1e6
-  action_repeat: 2
-  time_limit: 1000
-  envs: 4
-  train_ratio: 512
-  video_pred_log: True
-  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
-  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
-  carl:
-    train_contexts: {gravity: [4.905, 9.81, 19.62]}
-    eval_contexts: {gravity: [2.4525, 39.24]}
 
 carl_walker_shs:
   task: 'carl_dmc_walker'
+  eval_episode_num: 12
   steps: 1e6                 # curriculum *_env keys are ENV steps (batch-invariant)
   action_repeat: 2
   time_limit: 1000
@@ -1030,6 +1019,7 @@ carl_walker_shs:
 
 carl_walker_gravity_friction_shs:
   task: 'carl_dmc_walker'
+  eval_episode_num: 12
   steps: 1e6                 # curriculum *_env keys are ENV steps (batch-invariant)
   action_repeat: 2
   time_limit: 1000
@@ -1074,6 +1064,7 @@ carl_walker_gravity_friction_shs:
 
 carl_quadruped_walk_shs:
   task: 'carl_dmc_quadruped'
+  eval_episode_num: 12
   steps: 1e6
   action_repeat: 2
   time_limit: 1000
@@ -1110,6 +1101,7 @@ carl_quadruped_walk_shs:
 
 carl_quadruped_actuator_shs:
   task: 'carl_dmc_quadruped'
+  eval_episode_num: 12
   steps: 1e6
   action_repeat: 2
   time_limit: 1000
@@ -1146,6 +1138,7 @@ carl_quadruped_actuator_shs:
 
 carl_finger_spin_shs:
   task: 'carl_dmc_finger'
+  eval_episode_num: 12
   steps: 1e6
   action_repeat: 2
   time_limit: 1000
@@ -1179,6 +1172,10 @@ carl_finger_spin_shs:
   carl:
     train_contexts: {gravity: [4.905, 9.81, 19.62]}
     eval_contexts: {gravity: [2.4525, 39.24]}
+
+carl_vanilla:
+  use_shs: False
+  dyn_discrete: 32
 
 carl_context_visible:
   encoder: {mlp_keys: 'context', cnn_keys: 'image'}

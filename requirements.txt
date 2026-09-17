@@ -28,3 +28,6 @@ joblib
 numba                # TrSLDS baseline
 polyagamma           # PG draws for the TrSLDS baseline
 
+
+# CARL contextual 
+carl-bench>=1.1.1
