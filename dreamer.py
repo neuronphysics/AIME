@@ -311,10 +311,6 @@ def make_env(config, mode, id):
         env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
         env = wrappers.OneHotAction(env)
     elif suite == "carl":
-        # CARL contextual variants of dm_control (task = dmc_walker | dmc_quadruped |
-        # dmc_finger | dmc_fish). Same contract as envs.dmc; the context set differs
-        # between train and eval envs so eval measures generalisation to held-out
-        # dynamics. See envs/carl.py for the context spec format.
         import envs.carl as carl
 
         cfg = config.carl
