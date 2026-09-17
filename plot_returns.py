@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import warnings
 from collections import defaultdict
 import matplotlib
 matplotlib.use("Agg")
@@ -20,51 +21,164 @@ KNOWN_ENVS = [
 ]
 SEED_RE = re.compile(r"(?:seed|s)[_-]?(\d+)", re.I)
 
-OKABE_ITO = ["#0072B2", "#D55E00", "#009E73", "#CC79A7",
-             "#E69F00", "#56B4E9", "#B22222", "#000000"]
+OKABE_ITO = [
+    "#0072B2",  # Blue
+    "#D55E00",  # Vermillion
+    "#009E73",  # Bluish Green
+    "#CC79A7",  # Purple
+    "#E69F00",  # Yellow-Orange
+    "#56B4E9",  # Sky Blue
+    "#B22222",  # Firebrick
+    "#000000",  # Black
+]
 
 METRIC_LABELS = {
     "eval_return": "Evaluation return",
     "train_return": "Training return",
 }
 
-# run-directory suffix -> method label. SHS is the proposed model (solid),
-# vanilla DreamerV3 is the baseline (dashed). Unknown -> single-method mode.
-METHOD_TAGS = [("_shs", "SHS-RSSM"), ("_vanilla", "DreamerV3"), ("_dreamer", "DreamerV3")]
-METHOD_STYLE = {"SHS-RSSM": ("#0072B2", "-"), "DreamerV3": ("#D55E00", "--")}
+# Fixed colors per method/configuration; all use solid lines ("-")
+CANONICAL_COLORS = {
+    "SHS-RSSM": "#0072B2",          # Blue
+    "SHS-RSSM (v2)": "#009E73",     # Green
+    "SHS-RSSM (gate)": "#CC79A7",   # Purple
+    "DreamerV3": "#D55E00",         # Vermillion / Orange
+    "DreamerV3 (v2)": "#E69F00",    # Yellow-Orange
+    "Vanilla Dreamer": "#D55E00",   # Vermillion / Orange
+}
 
 
-def infer_run(path: str, logdir: str) -> tuple[str, str]:
-    """(env/grid label, method label) from the run directory name.
-    carl_walker_gravity_friction_shs/seed_2/metrics.jsonl -> ('walker_gravity_friction', 'SHS-RSSM')
-    pendulum_swingup_dreamer/seed_1/metrics.jsonl         -> ('pendulum_swingup', 'DreamerV3')
-    walker_walk/seed_1/metrics.jsonl                       -> ('walker_walk', '')"""
+def format_method(raw: str) -> str:
+    if not raw:
+        return ""
+    r = raw.lower().replace("-", "_")
+
+    if r.startswith("shs"):
+        rest = r[3:].strip("_")
+        if not rest or rest == "rssm":
+            return "SHS-RSSM"
+        if rest.startswith("rssm_"):
+            rest = rest[5:]
+        return f"SHS-RSSM ({rest})"
+
+    if any(r.startswith(k) for k in ("dreamerv3", "dreamer_v3", "vanilla_dreamer")):
+        rest = re.sub(r"^(?:dreamerv3|dreamer_v3|vanilla_dreamer)_?", "", r).strip("_")
+        return f"DreamerV3 ({rest})" if rest else "DreamerV3"
+
+    if r.startswith("dreamer"):
+        rest = r[7:].strip("_")
+        if not rest or rest in ("v3", "3"):
+            return "DreamerV3"
+        if rest in ("v2", "2"):
+            return "DreamerV2"
+        return f"DreamerV3 ({rest})"
+
+    if r.startswith("vanilla"):
+        rest = r[7:].strip("_")
+        return f"DreamerV3 ({rest})" if rest else "DreamerV3"
+
+    if r.startswith("baseline"):
+        rest = r[8:].strip("_")
+        return f"Baseline ({rest})" if rest else "Baseline"
+
+    if r.startswith("rssm"):
+        rest = r[4:].strip("_")
+        return f"RSSM ({rest})" if rest else "RSSM"
+
+    return raw.replace("_", " ").title()
+
+
+def infer_run_details(path: str, logdir: str) -> tuple[str, str, str | None]:
+    """Extracts (env, method, seed) from a file path."""
     rel = os.path.relpath(path, logdir if os.path.isdir(logdir) else os.path.dirname(logdir))
-    parts = [p for p in rel.replace("\\", "/").split("/") if p][:-1]  # drop filename
+    parts = [p for p in rel.replace("\\", "/").split("/") if p]
+    if parts and (parts[-1].endswith(".jsonl") or parts[-1].endswith(".json")):
+        parts = parts[:-1]
+    if not parts:
+        parts = [os.path.splitext(os.path.basename(path))[0]]
+
+    seed = None
+    if parts and (SEED_RE.fullmatch(parts[-1]) or re.fullmatch(r"\d+", parts[-1])):
+        m = SEED_RE.search(parts[-1])
+        seed = m.group(1) if m else parts[-1]
+        parts = parts[:-1]
+
+    if seed is None:
+        for i in reversed(range(len(parts))):
+            m = re.search(r"[_-](?:seed|s)[_-]?(\d+)$", parts[i], re.I)
+            if m:
+                seed = m.group(1)
+                parts[i] = parts[i][:m.start()]
+                break
+
+    if seed is None:
+        m = SEED_RE.search(path)
+        if m:
+            seed = m.group(1)
+
     comp = next((p for p in parts if any(e in p.lower() for e in KNOWN_ENVS)), None)
     if comp is None:
-        comp = next((p for p in reversed(parts) if not SEED_RE.fullmatch(p) and p not in (".", "logs", "logdir")), parts[-1] if parts else "run")
-    name, method = comp.lower(), ""
-    visible = name.endswith("_visible")
+        comp = parts[-1] if parts else "run"
+
+    name = comp.lower()
+
+    visible = False
+    if "_visible" in name or "-visible" in name:
+        visible = True
+        name = re.sub(r"[_-]visible\b", "", name)
+
+    name = re.sub(r"^(?:carl_|dmc_)", "", name)
+    name = re.sub(r"[_-](?:seed|s)[_-]?\d+$", "", name, flags=re.I)
+
+    method_pattern = re.compile(
+        r"^(.*?)[_-]("
+        r"shs(?:[_-].*)?|"
+        r"dreamerv3(?:[_-].*)?|"
+        r"dreamer[_-]v3(?:[_-].*)?|"
+        r"dreamer(?:[_-].*)?|"
+        r"vanilla(?:[_-].*)?|"
+        r"baseline(?:[_-].*)?|"
+        r"rssm(?:[_-].*)?"
+        r")$",
+        re.I,
+    )
+
+    m = method_pattern.match(name)
+    if m:
+        env_raw = m.group(1)
+        method_raw = m.group(2)
+    else:
+        env_raw = name
+        method_raw = ""
+
+    method = format_method(method_raw)
     if visible:
-        name = name[: -len("_visible")]
-    for tag, label in METHOD_TAGS:
-        if name.endswith(tag):
-            method, name = label, name[: -len(tag)]
-            break
-    if visible:
-        method = (method or "run") + " (ctx visible)"
-    name = re.sub(r"^(carl_|dmc_)", "", name)
-    return name, method
+        method = f"{method} (ctx visible)" if method else "ctx visible"
+
+    env = env_raw.strip("_-")
+    return env, method, seed
+
+
+def method_sort_key(m: str) -> tuple[int, str]:
+    m_low = m.lower()
+    if m == "SHS-RSSM":
+        return (0, m)
+    if "shs" in m_low:
+        return (1, m)
+    if any(k in m_low for k in ("dreamer", "vanilla", "baseline")):
+        return (3, m)
+    return (2, m)
 
 
 def method_style(method: str, i: int) -> tuple[str, str]:
-    if method in METHOD_STYLE:
-        return METHOD_STYLE[method]
-    base = method.split(" (")[0]
-    if base in METHOD_STYLE:  # "(ctx visible)" variants: same hue, dotted
-        return METHOD_STYLE[base][0], ":"
-    return OKABE_ITO[(i + 2) % len(OKABE_ITO)], "-"
+    # Always return a solid line ("-") and assign a distinct color
+    if method in CANONICAL_COLORS:
+        return CANONICAL_COLORS[method], "-"
+    base = method.replace(" (ctx visible)", "").strip()
+    if base in CANONICAL_COLORS:
+        return CANONICAL_COLORS[base], "-"
+    color = OKABE_ITO[i % len(OKABE_ITO)]
+    return color, "-"
 
 
 def set_style() -> None:
@@ -100,7 +214,7 @@ def set_style() -> None:
 
 
 def style_axis(ax) -> None:
-    for s in ax.spines.values():           # full frame on all four sides
+    for s in ax.spines.values():
         s.set_visible(True)
     ax.grid(True, which="major")
     ax.xaxis.set_minor_locator(AutoMinorLocator(2))
@@ -109,11 +223,14 @@ def style_axis(ax) -> None:
 
 
 def pretty_env(env: str) -> str:
-    if env.lower() in KNOWN_ENVS:
-        return env.replace("_", " ").title()
-    head, _, arm = env.rpartition("_")
-    if head and head.lower() in KNOWN_ENVS:
-        return f"{head.replace('_', ' ').title()} ({arm})"
+    env_clean = env.replace("-", "_")
+    for ke in KNOWN_ENVS:
+        if env_clean.lower().startswith(ke):
+            task = env_clean[len(ke):].strip("_")
+            domain = ke.title()
+            if task:
+                return f"{domain} ({task.replace('_', ' ')})"
+            return domain
     return env.replace("_", " ").title()
 
 
@@ -132,25 +249,6 @@ def find_metric_files(logdir: str, filename: str = "metrics.jsonl") -> list[str]
     return sorted(set(hits))
 
 
-def infer_env(path: str, logdir: str) -> str:
-    rel = os.path.relpath(path, logdir if os.path.isdir(logdir) else os.path.dirname(logdir))
-    parts = [p for p in rel.replace("\\", "/").split("/") if p]
-    hay = "_".join(parts).lower()
-    for env in KNOWN_ENVS:
-        if env in hay:
-            m = re.search(rf"{env}[_-]([a-z]+)", hay)
-            return f"{env}_{m.group(1)}" if m and m.group(1) not in ("metrics", "seed") else env
-    for p in reversed(parts[:-1]):
-        if p not in (".", "logs", "logdir"):
-            return p
-    return os.path.splitext(parts[-1])[0].replace("_metrics", "")
-
-
-def infer_seed(path: str) -> str | None:
-    m = SEED_RE.search(path)
-    return m.group(1) if m else None
-
-
 def load_series(path: str, metric: str) -> tuple[np.ndarray, np.ndarray]:
     steps, vals, bad = [], [], 0
     with open(path, "r") as fh:
@@ -165,7 +263,8 @@ def load_series(path: str, metric: str) -> tuple[np.ndarray, np.ndarray]:
                 continue
             if metric in d and d[metric] is not None and "step" in d:
                 try:
-                    steps.append(float(d["step"])); vals.append(float(d[metric]))
+                    steps.append(float(d["step"]))
+                    vals.append(float(d[metric]))
                 except (TypeError, ValueError):
                     bad += 1
     if bad:
@@ -174,7 +273,7 @@ def load_series(path: str, metric: str) -> tuple[np.ndarray, np.ndarray]:
     o = np.argsort(steps, kind="stable")
     s, v = np.asarray(steps)[o], np.asarray(vals)[o]
     if len(s):
-        keep = np.concatenate([s[1:] != s[:-1], [True]])   # resume-safe: last wins
+        keep = np.concatenate([s[1:] != s[:-1], [True]])
         s, v = s[keep], v[keep]
     return s, v
 
@@ -221,11 +320,11 @@ def main() -> int:
 
     runs: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     for f in files:
-        env, method = infer_run(f, args.logdir)
+        env, method, seed = infer_run_details(f, args.logdir)
         if args.envs and not any(e.lower() in env.lower() or e.lower() in f.lower()
                                  for e in args.envs):
             continue
-        if args.methods and method not in args.methods:
+        if args.methods and not any(m.lower() in method.lower() for m in args.methods):
             continue
         s, v = load_series(f, args.metric)
         if len(s) == 0:
@@ -234,8 +333,8 @@ def main() -> int:
         if args.max_steps:
             m = s <= args.max_steps
             s, v = s[m], v[m]
-        runs[env][method].append((infer_seed(f), s, v, f))
-        print(f"  {env:<26} {method or '-':<12} seed={infer_seed(f) or '-':<4} n={len(s):<6} "
+        runs[env][method].append((seed, s, v, f))
+        print(f"  {env:<22} {method or '-':<18} seed={seed or '-':<4} n={len(s):<6} "
               f"steps<= {s[-1]:>12,.0f}  {os.path.relpath(f, args.logdir)}")
 
     if not runs:
@@ -250,7 +349,8 @@ def main() -> int:
 
     if args.separate:
         n = len(envs)
-        ncol = min(3, n); nrow = int(np.ceil(n / ncol))
+        ncol = min(3, n)
+        nrow = int(np.ceil(n / ncol))
         fig, axes = plt.subplots(nrow, ncol, figsize=(3.7 * ncol, 2.8 * nrow),
                                  squeeze=False, constrained_layout=True)
         axes = axes.ravel()
@@ -260,60 +360,78 @@ def main() -> int:
 
     summary = []
     for i, env in enumerate(envs):
-      ax = axes[i]
-      for mi, (method, series) in enumerate(sorted(runs[env].items(), key=lambda kv: kv[0] != "SHS-RSSM")):
-        # separate panels: colour = method; combined panel: colour = env, linestyle = method
-        mc, ls = method_style(method, mi)
-        c = mc if (args.separate or len(envs) == 1) else colors[env]
-        if not method:
-            c, ls = colors[env], "-"
-        label = pretty_env(env) if not method else (method if args.separate else f"{pretty_env(env)} — {method}")
-        if len(series) > 1 and not args.no_aggregate:
-            grid = np.unique(np.concatenate([s for _, s, _, _ in series]))
-            lo = max(s[0] for _, s, _, _ in series)
-            hi = min(s[-1] for _, s, _, _ in series)
-            grid = grid[(grid >= lo) & (grid <= hi)]
-            M = np.vstack([np.interp(grid, s, v, left=np.nan, right=np.nan)
-                           for _, s, v, _ in series])
-            med = np.nanmedian(M, 0)
-            q1, q3 = np.nanpercentile(M, 25, 0), np.nanpercentile(M, 75, 0)
-            mp, q1p, q3p = (smooth(a, args.smooth) for a in (med, q1, q3))
-            gp = grid[len(grid) - len(mp):]
-            ax.fill_between(gp / 1e6, q1p, q3p, color=c, alpha=.16, lw=0, zorder=2)
-            ax.plot(gp / 1e6, mp, color=c, ls=ls, lw=2.0, zorder=3,
-                    label=f"{label}, $n={len(series)}$")
-            s_ref, v_ref = grid, med
-        else:
-            for sd, s, v, _ in series:
-                y = smooth(v, args.smooth); x = s[len(s) - len(y):]
-                lab = label if sd is None else f"{label} s{sd}"
-                ax.plot(x / 1e6, y, color=c, ls=ls, lw=1.5, alpha=.85, zorder=3, label=lab)
-            s_ref, v_ref = series[0][1], series[0][2]
+        ax = axes[i]
+        sorted_methods = sorted(runs[env].items(), key=lambda kv: method_sort_key(kv[0]))
+        for mi, (method, series) in enumerate(sorted_methods):
+            mc, ls = method_style(method, mi)
+            c = mc if (args.separate or len(envs) == 1) else colors[env]
+            if not method:
+                c, ls = colors[env], "-"
+            label = pretty_env(env) if not method else (method if args.separate else f"{pretty_env(env)} — {method}")
 
-        if env in ref or any(k in env for k in ref):
-            key = env if env in ref else next(k for k in ref if k in env)
-            ax.axhline(ref[key], color="0.25", ls=(0, (5, 3)), lw=1.1, zorder=1)
-            ax.text(.995, ref[key], f"ref {ref[key]:g} ",
-                    transform=ax.get_yaxis_transform(),
-                    va="top", ha="right", fontsize=7.5, color="0.25")
+            if len(series) > 1 and not args.no_aggregate:
+                grid = np.unique(np.concatenate([s for _, s, _, _ in series]))
+                lo = min(s[0] for _, s, _, _ in series)
+                hi = max(s[-1] for _, s, _, _ in series)
+                grid = grid[(grid >= lo) & (grid <= hi)]
+                if len(grid) == 0:
+                    grid = np.unique(np.concatenate([s for _, s, _, _ in series]))
 
-        sl = slope_per_1m(s_ref, v_ref)
-        k = max(2, int(len(v_ref) * .25))
-        summary.append(dict(env=env, method=method or "-", n_runs=len(series), steps=float(s_ref[-1]),
-                            final=float(np.nanmean(v_ref[-k:])),
-                            std=float(np.nanstd(v_ref[-k:])), best=float(np.nanmax(v_ref)),
-                            slope_per_1M=sl,
-                            status="converged" if abs(sl) < 100 else "still changing"))
-      if args.separate:
-        style_axis(ax)
-        ax.set_title(pretty_env(env), loc="left", fontweight="bold")
-        finals = [r for r in summary if r["env"] == env]
-        ax.text(0.98, 0.04, "\n".join(f"{r['method']}: {r['final']:.0f}$\\pm${r['std']:.0f}" for r in finals),
-                transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="0.35")
-        ax.set_xlabel(r"Environment steps ($\times 10^6$)")
-        ax.set_ylabel(ylab)
-        if len(runs[env]) > 1 or any(runs[env]):
-            ax.legend(borderaxespad=0.6)
+                M = np.vstack([np.interp(grid, s, v, left=np.nan, right=np.nan)
+                               for _, s, v, _ in series])
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    med = np.nanmedian(M, axis=0)
+                    q1 = np.nanpercentile(M, 25, axis=0)
+                    q3 = np.nanpercentile(M, 75, axis=0)
+
+                valid = ~np.isnan(med)
+                if np.any(valid):
+                    gp = grid[valid]
+                    med_v, q1_v, q3_v = med[valid], q1[valid], q3[valid]
+                    mp, q1p, q3p = (smooth(a, args.smooth) for a in (med_v, q1_v, q3_v))
+                    gp = gp[len(gp) - len(mp):]
+
+                    ax.fill_between(gp / 1e6, q1p, q3p, color=c, alpha=.16, lw=0, zorder=2)
+                    ax.plot(gp / 1e6, mp, color=c, ls="-", lw=2.0, zorder=3,
+                            label=f"{label}, $n={len(series)}$")
+                    s_ref, v_ref = gp, mp
+                else:
+                    s_ref, v_ref = series[0][1], series[0][2]
+            else:
+                for sd, s, v, _ in series:
+                    y = smooth(v, args.smooth)
+                    x = s[len(s) - len(y):]
+                    lab = label if sd is None else f"{label} s{sd}"
+                    ax.plot(x / 1e6, y, color=c, ls="-", lw=1.5, alpha=.85, zorder=3, label=lab)
+                s_ref, v_ref = series[0][1], series[0][2]
+
+            if env in ref or any(k in env for k in ref):
+                key = env if env in ref else next(k for k in ref if k in env)
+                ax.axhline(ref[key], color="0.25", ls=(0, (5, 3)), lw=1.1, zorder=1)
+                ax.text(.995, ref[key], f"ref {ref[key]:g} ",
+                        transform=ax.get_yaxis_transform(),
+                        va="top", ha="right", fontsize=7.5, color="0.25")
+
+            sl = slope_per_1m(s_ref, v_ref)
+            k = max(2, int(len(v_ref) * .25))
+            summary.append(dict(env=env, method=method or "-", n_runs=len(series), steps=float(s_ref[-1]),
+                                final=float(np.nanmean(v_ref[-k:])),
+                                std=float(np.nanstd(v_ref[-k:])), best=float(np.nanmax(v_ref)),
+                                slope_per_1M=sl,
+                                status="converged" if abs(sl) < 100 else "still changing"))
+
+        if args.separate:
+            style_axis(ax)
+            ax.set_title(pretty_env(env), loc="left", fontweight="bold")
+            finals = [r for r in summary if r["env"] == env]
+            ax.text(0.98, 0.04, "\n".join(f"{r['method']}: {r['final']:.0f}$\\pm${r['std']:.0f}" for r in finals),
+                    transform=ax.transAxes, ha="right", va="bottom", fontsize=7.5, color="0.35")
+            ax.set_xlabel(r"Environment steps ($\times 10^6$)")
+            ax.set_ylabel(ylab)
+            if len(runs[env]) > 1 or any(runs[env]):
+                ax.legend(borderaxespad=0.6)
 
     if not args.separate:
         style_axis(ax0)
@@ -331,16 +449,17 @@ def main() -> int:
     fig.savefig(args.out, bbox_inches="tight")
     print(f"\nwrote {args.out}")
 
-    print(f"\n{'env':<26}{'method':<12}{'runs':>5}{'steps':>13}{'final':>10}{'best':>9}"
+    print(f"\n{'env':<22}{'method':<18}{'runs':>5}{'steps':>13}{'final':>10}{'best':>9}"
           f"{'slope/1M':>11}  status")
     for r in summary:
-        print(f"{r['env']:<26}{r['method']:<12}{r['n_runs']:>5}{r['steps']:>13,.0f}{r['final']:>10.1f}"
+        print(f"{r['env']:<22}{r['method']:<18}{r['n_runs']:>5}{r['steps']:>13,.0f}{r['final']:>10.1f}"
               f"{r['best']:>9.1f}{r['slope_per_1M']:>11.0f}  {r['status']}")
 
     if args.csv:
         with open(args.csv, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(summary[0]))
-            w.writeheader(); w.writerows(summary)
+            w.writeheader()
+            w.writerows(summary)
         print(f"wrote {args.csv}")
     return 0
 
