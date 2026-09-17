@@ -127,6 +127,7 @@ def infer_run_details(path: str, logdir: str) -> tuple[str, str, str | None]:
         visible = True
         name = re.sub(r"[_-]visible\b", "", name)
 
+    is_carl = name.startswith("carl_")  # keep CARL runs apart from plain-DMC runs of the same domain
     name = re.sub(r"^(?:carl_|dmc_)", "", name)
     name = re.sub(r"[_-](?:seed|s)[_-]?\d+$", "", name, flags=re.I)
 
@@ -156,6 +157,8 @@ def infer_run_details(path: str, logdir: str) -> tuple[str, str, str | None]:
         method = f"{method} (ctx visible)" if method else "ctx visible"
 
     env = env_raw.strip("_-")
+    if is_carl:
+        env = f"{env}_carl"
     return env, method, seed
 
 
@@ -170,15 +173,18 @@ def method_sort_key(m: str) -> tuple[int, str]:
     return (2, m)
 
 
-def method_style(method: str, i: int) -> tuple[str, str]:
-    # Always return a solid line ("-") and assign a distinct color
-    if method in CANONICAL_COLORS:
-        return CANONICAL_COLORS[method], "-"
+def method_style(method: str, used: set[str]) -> tuple[str, str]:
+    """Solid lines everywhere; canonical colour if defined, otherwise the first
+    palette colour not already used on this panel, so a variant never collides
+    with a canonical method's colour."""
     base = method.replace(" (ctx visible)", "").strip()
-    if base in CANONICAL_COLORS:
-        return CANONICAL_COLORS[base], "-"
-    color = OKABE_ITO[i % len(OKABE_ITO)]
-    return color, "-"
+    for key in (method, base):
+        if key in CANONICAL_COLORS:
+            return CANONICAL_COLORS[key], "-"
+    for c in OKABE_ITO:
+        if c not in used:
+            return c, "-"
+    return OKABE_ITO[len(used) % len(OKABE_ITO)], "-"
 
 
 def set_style() -> None:
@@ -229,7 +235,7 @@ def pretty_env(env: str) -> str:
             task = env_clean[len(ke):].strip("_")
             domain = ke.title()
             if task:
-                return f"{domain} ({task.replace('_', ' ')})"
+                return f"{domain} ({task.replace('_', ' ').replace('carl', 'CARL')})"
             return domain
     return env.replace("_", " ").title()
 
@@ -362,20 +368,25 @@ def main() -> int:
     for i, env in enumerate(envs):
         ax = axes[i]
         sorted_methods = sorted(runs[env].items(), key=lambda kv: method_sort_key(kv[0]))
-        for mi, (method, series) in enumerate(sorted_methods):
-            mc, ls = method_style(method, mi)
+        used_colors: set[str] = set()
+        for method, series in sorted_methods:
+            mc, ls = method_style(method, used_colors)
             c = mc if (args.separate or len(envs) == 1) else colors[env]
             if not method:
                 c, ls = colors[env], "-"
+            used_colors.add(c)
             label = pretty_env(env) if not method else (method if args.separate else f"{pretty_env(env)} — {method}")
 
             if len(series) > 1 and not args.no_aggregate:
+                # Aggregate only where EVERY seed has data, so the legend's n and the
+                # IQR band are honest; seeds that ran further are cut at the shortest.
                 grid = np.unique(np.concatenate([s for _, s, _, _ in series]))
-                lo = min(s[0] for _, s, _, _ in series)
-                hi = max(s[-1] for _, s, _, _ in series)
-                grid = grid[(grid >= lo) & (grid <= hi)]
-                if len(grid) == 0:
-                    grid = np.unique(np.concatenate([s for _, s, _, _ in series]))
+                lo = max(s[0] for _, s, _, _ in series)
+                hi = min(s[-1] for _, s, _, _ in series)
+                sel = grid[(grid >= lo) & (grid <= hi)]
+                if len(sel) < 2:  # no overlap yet (a seed barely started): fall back to the union
+                    sel = grid
+                grid = sel
 
                 M = np.vstack([np.interp(grid, s, v, left=np.nan, right=np.nan)
                                for _, s, v, _ in series])
