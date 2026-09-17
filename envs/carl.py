@@ -27,11 +27,12 @@ class CARL:
         cls = getattr(carl_envs, self._CLASSES[name])
         self._contexts = self.build_contexts(cls, contexts)
         self._rng = np.random.RandomState(seed)
-        self._env = self._seeded(cls)(
-            contexts=self._contexts,
-            context_selector=getattr(selection, self._SELECTORS[selector]),
-            obs_context_as_dict=False,
-        )
+        sel = getattr(selection, self._SELECTORS[selector])(self._contexts)
+        if selector == "random":  # CARL's RandomSelector uses the global np.random
+            sel._select = lambda: (lambda cid: (sel.contexts[sel.contexts_keys[cid]], cid))(
+                int(self._rng.choice(sel.context_ids))
+            )
+        self._env = self._seeded(cls)(contexts=self._contexts, context_selector=sel, obs_context_as_dict=False)
         self._env._draw_seed = lambda: int(self._rng.randint(2**31 - 1))
         self._action_repeat = action_repeat
         self._size = tuple(size)
