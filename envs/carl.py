@@ -18,7 +18,9 @@ class CARL:
     }
     _SELECTORS = {"round_robin": "RoundRobinSelector", "random": "RandomSelector", "static": "StaticSelector"}
 
-    def __init__(self, name, action_repeat=1, size=(64, 64), camera=None, seed=0, contexts=None, selector="round_robin"):
+    def __init__(
+        self, name, action_repeat=1, size=(64, 64), camera=None, seed=0, contexts=None, selector="round_robin", start=0
+    ):
         import carl.envs as carl_envs
         from carl.context import selection
 
@@ -28,6 +30,8 @@ class CARL:
         self._contexts = self.build_contexts(cls, contexts)
         self._rng = np.random.RandomState(seed)
         sel = getattr(selection, self._SELECTORS[selector])(self._contexts)
+        if selector == "round_robin":  # stagger parallel workers so each batch covers all contexts
+            sel.context_id = (start - 1) % len(self._contexts)
         if selector == "random":  # CARL's RandomSelector uses the global np.random
             sel._select = lambda: (lambda cid: (sel.contexts[sel.contexts_keys[cid]], cid))(
                 int(self._rng.choice(sel.context_ids))
