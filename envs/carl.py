@@ -26,18 +26,39 @@ class CARL:
             raise NotImplementedError(f"CARL task {name!r}; known: {sorted(self._CLASSES)}")
         cls = getattr(carl_envs, self._CLASSES[name])
         self._contexts = self.build_contexts(cls, contexts)
-        self._env = cls(
+        self._rng = np.random.RandomState(seed)
+        self._env = self._seeded(cls)(
             contexts=self._contexts,
             context_selector=getattr(selection, self._SELECTORS[selector]),
             obs_context_as_dict=False,
         )
+        self._env._draw_seed = lambda: int(self._rng.randint(2**31 - 1))
         self._action_repeat = action_repeat
         self._size = tuple(size)
         domain = name.split("_", 1)[1]
         self._camera = dict(quadruped=2).get(domain, 0) if camera is None else camera
-        self._seed = seed
-        self._needs_seed = True
         self.reward_range = [-np.inf, np.inf]
+
+    @staticmethod
+    def _seeded(cls):
+        # CARL rebuilds the dm_control env on every context switch and never
+        # passes a seed, so initial states are unseeded. Pass one per rebuild.
+        from carl.envs.dmc.loader import load_dmc_env
+        from carl.envs.dmc.wrappers import MujocoToGymWrapper
+
+        class Seeded(cls):
+            def _update_context(self):
+                env = load_dmc_env(
+                    domain_name=self.domain,
+                    task_name=self.task,
+                    context=self.context,
+                    task_kwargs={"random": self._draw_seed()},
+                    environment_kwargs={"flat_observation": True},
+                )
+                self.env = MujocoToGymWrapper(env)
+
+        Seeded.__name__ = cls.__name__
+        return Seeded
 
     @staticmethod
     def build_contexts(cls, spec):
@@ -80,11 +101,7 @@ class CARL:
         }
 
     def reset(self):
-        if self._needs_seed:
-            raw, _ = self._env.reset(seed=self._seed)
-            self._needs_seed = False
-        else:
-            raw, _ = self._env.reset()
+        raw, _ = self._env.reset()
         return self._obs(raw, is_first=True, is_terminal=False)
 
     def step(self, action):
