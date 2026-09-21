@@ -26,6 +26,7 @@ import argparse
 import csv
 import json
 import pathlib
+import re
 import sys
 
 import numpy as np
@@ -40,8 +41,31 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 CMAP, VMAX = "tab20", 19          # keep identical to plots.py ribbon colours
 MODEL_LABEL = {"shs": "SHS (ours)", "trslds": "TrSLDS", "rslds": "rSLDS"}
+
+# Tags that may fill each model row, in priority order.  Matched EXACTLY after
+# stripping the _seed<k> suffix, so shsPrune / fhnv* cannot leak into the shs
+# row nor rslds_ro into rslds.  First name with runs wins; never pooled.
+MODEL_TAGS = {
+    "shs": ["shs", "shsPersist"],
+    "trslds": ["trslds"],
+    "rslds": ["rslds"],
+    "rslds_ro": ["rslds_ro"],
+    "rslds_sticky": ["rslds_sticky"],
+}
+_TAG_SEED_RE = re.compile(r"_seed\d+$")
+
 DATASET_TITLE = {"fhn": "FitzHugh--Nagumo", "nascar": "NASCAR",
                  "toyark13": "ToyARK13", "mocap6": "MoCap6"}
+
+
+def _candidates(found, model):
+    """(resolved tag, [(key, run), ...]) for one model row; [] if absent."""
+    for name in MODEL_TAGS.get(model, [model]):
+        hits = [(k, v) for k, v in found.items()
+                if _TAG_SEED_RE.sub("", k) == name]
+        if hits:
+            return name, hits
+    return model, []
 
 
 # ---------------------------------------------------------------- style
@@ -115,11 +139,14 @@ def build_from_results(names, models, seq_idx=0):
         found = IO.load_results(name)
         rows = []
         for model in models:
-            cands = [(k, v) for k, v in found.items()
-                     if k == model or k.startswith(model)]
+            resolved, cands = _candidates(found, model)
             if not cands:
-                print(f"  [warn] {name}: no result for '{model}', skipping")
+                print(f"  [warn] {name}: no result for '{model}' "
+                      f"(looked for {MODEL_TAGS.get(model, [model])})")
                 continue
+            if resolved != model:
+                print(f"  [info] {name}: '{model}' row filled by "
+                      f"'{resolved}' ({len(cands)} seed(s))")
             scored = []
             for k, v in cands:
                 zp = np.asarray(v["z_pred"]).astype(int)
@@ -130,7 +157,7 @@ def build_from_results(names, models, seq_idx=0):
             met = dict(hamming=ham, m2o=many_to_one(z_true_all, z_pred_all),
                        K_used=int(np.unique(z_pred_all).size),
                        wall_time=float(hit.get("wall_time", np.nan)),
-                       n_seeds=len(scored), tag=tag)  # ...the drawn ribbon
+                       n_seeds=len(scored), tag=tag, variant=resolved)
             rows.append((model, _remap(z_pred_all, mapping)[s0:s1], met))
         spec.append(dict(name=name, title=DATASET_TITLE.get(name, name),
                          obs=obs, z_true=z_true_all[s0:s1], rows=rows,
@@ -273,11 +300,12 @@ def render(spec, out, title=None):
 def write_csv(spec, path):
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["dataset", "model", "hamming", "m2o", "K_used",
+        w.writerow(["dataset", "model", "variant", "hamming", "m2o", "K_used",
                     "wall_time_s", "n_seeds", "tag"])
         for d in spec:
             for model, _z, met in d["rows"]:
-                w.writerow([d["name"], model, f"{met['hamming']:.4f}",
+                w.writerow([d["name"], model, met.get("variant", model),
+                            f"{met['hamming']:.4f}",
                             f"{met['m2o']:.4f}", met["K_used"],
                             f"{met.get('wall_time', float('nan')):.1f}",
                             met.get("n_seeds", 1), met.get("tag", model)])

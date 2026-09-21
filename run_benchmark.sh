@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=shs-benchmarks
-#SBATCH --account=def-irina
+#SBATCH --account=aip-irina
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=16:00:00
-#SBATCH -o /home/memole/links/projects/def-irina/memole/AIME/logs/slurm-shs-benchmarks-%j.out
-#SBATCH -e /home/memole/links/projects/def-irina/memole/AIME/logs/slurm-shs-benchmarks-%j.err
+#SBATCH -o /home/memole/scratch/AIME/logs/slurm-shs-benchmarks-%j.out
+#SBATCH -e /home/memole/scratch/AIME/logs/slurm-shs-benchmarks-%j.err
 
 # Benchmark sweep, three seeds, plus the unified paper figure.
 #
@@ -46,7 +46,7 @@ set -uo pipefail
 echo "Date:     $(date)"
 echo "Hostname: $(hostname)"
 
-PROJECT_DIR="${PROJECT_DIR:-/home/memole/links/projects/def-irina/memole/AIME}"
+PROJECT_DIR="${PROJECT_DIR:-/home/memole/scratch/AIME}"
 mkdir -p "${PROJECT_DIR}/logs"
 
 module --force purge || true
@@ -57,7 +57,7 @@ module load scipy-stack/2024a
 module load mpi4py/3.1.6
 module load arrow
 
-VENV_DIR="${VENV_DIR:-/home/memole/links/D2E}"
+VENV_DIR="${VENV_DIR:-/home/memole/D2E}"
 if [[ -f "${VENV_DIR}/bin/activate" ]]; then
   source "${VENV_DIR}/bin/activate"
 else

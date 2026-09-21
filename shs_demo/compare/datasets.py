@@ -14,9 +14,12 @@ TrSLDS) consume identical data:
         x_true      list of (T_i, D_lat) arrays or None  (nascar only)
     )
 
-NASCAR is generated once and cached to ``data_cache/`` so that runs in the
-modern environment (SHS, TrSLDS) and the legacy rSLDS environment see the
-*same* realisation.  The generator is a pure-numpy port of
+NASCAR and FHN are cached to ``data_cache/`` so that runs in the main
+environment (SHS, TrSLDS) and the separate rSLDS environment see the *same*
+realisation.  The FHN cache also lets an environment without torch load it,
+since ``fhn_demo`` imports torch and ``shs_rssm`` at module level.
+
+The NASCAR generator is a pure-numpy port of
 ``recurrent-slds-master/examples/nascar.py`` (Linderman et al., AISTATS 2017):
 recurrence-only stick-breaking transitions over four regimes -- two rotations
 around (+/-2, 0) plus two straight-line regimes -- observed through a random
@@ -170,11 +173,20 @@ def load_mocap6(standardize=True, path=None):
 
 
 # ------------------------------------------------------------------ fhn
-def load_fhn(n_seq=6, **kw):
-    import sys
-    sys.path.insert(0, str(HERE.parent))
-    from fhn_demo import simulate
-    X, doc_range, Z, _lat = simulate(n_seq=n_seq, **kw)
+def load_fhn(n_seq=6, refresh=False, **kw):
+    """FitzHugh-Nagumo, cached like nascar so a torch-free env can load it."""
+    CACHE.mkdir(exist_ok=True)
+    key = "_".join(f"{k}{v}" for k, v in sorted(kw.items())) or "default"
+    f = CACHE / f"fhn_N{n_seq}_{key}.npz"
+    if f.exists() and not refresh:
+        d = np.load(f)
+        X, doc_range, Z = d["X"], d["doc_range"], d["Z"]
+    else:
+        import sys
+        sys.path.insert(0, str(HERE.parent))
+        from fhn_demo import simulate
+        X, doc_range, Z, _lat = simulate(n_seq=n_seq, **kw)
+        np.savez(f, X=X, Z=Z, doc_range=doc_range)
     seqs = [X[a:b] for a, b in zip(doc_range[:-1], doc_range[1:])]
     zs = [Z[a:b] for a, b in zip(doc_range[:-1], doc_range[1:])]
     return _bundle("fhn", seqs, zs, K_true=int(Z.max()) + 1)

@@ -3,8 +3,8 @@
 #SBATCH --nodes=1
 #SBATCH --gpus=l40s:1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=15
-#SBATCH --mem=150G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
 #SBATCH --time=01-23:59:59
 #SBATCH --account=aip-irina
 #SBATCH --array=1-4                        # seeds 1-4
@@ -26,7 +26,7 @@ SHS_Q_RANK="${SHS_Q_RANK:-4}"
 SHS_ACTION_DIM="${SHS_ACTION_DIM:-6}"
 FLAGS="${FLAGS:-}"
 
-LOGDIR="${LOGDIR:-${PROJECT_DIR}/logdir/dmc_walker_shs_seed_${SEED}}"
+LOGDIR="${LOGDIR:-${PROJECT_DIR}/logdir/dmc_walker_shs_v2_seed_${SEED}}"
 
 # --- environment ----------------------------------------------------------
 
@@ -108,6 +108,7 @@ fi
 python -u dreamer.py --configs dmc_vision dmc_walker_shs \
   --seed "${SEED}" \
   --compile False \
+  --shs_proj_dim 128 \
   --batch_size "${BATCH_SIZE}" --batch_length "${BATCH_LENGTH}" \
   --steps "${STEPS}" \
   --shs_q_rank "${SHS_Q_RANK}" \
