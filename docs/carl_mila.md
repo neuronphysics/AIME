@@ -12,17 +12,17 @@ randomly; evaluation cycles through held-out contexts. `state` and `context` are
 recorded in replay but excluded from the default encoder. The optional
 `carl_context_visible` overlay adds context to the encoder, not privileged state.
 
-One full array runs **5 context grids × 2 models × 4 seeds = 40 jobs**:
+One full array runs **5 context grids × 2 models × 5 seeds = 50 jobs**:
 
 | SHS indices | Vanilla indices | SHS preset | Train contexts | Held-out evaluation contexts |
 |---|---|---|---|---|
-| 0–3 | 20–23 | `carl_walker_shs` | gravity: 4.905, 9.81, 19.62 | gravity: 2.4525, 39.24 |
-| 4–7 | 24–27 | `carl_walker_gravity_friction_shs` | gravity above × tangential friction: 0.5, 1, 2 | held-out gravity above × friction: 0.25, 4 |
-| 8–11 | 28–31 | `carl_quadruped_walk_shs` | gravity: 4.905, 9.81, 19.62 | gravity: 2.4525, 39.24 |
-| 12–15 | 32–35 | `carl_quadruped_actuator_shs` | actuator strength: 0.5, 1, 2 | actuator strength: 0.25, 4 |
-| 16–19 | 36–39 | `carl_finger_spin_shs` | gravity: 4.905, 9.81, 19.62 | gravity: 2.4525, 39.24 |
+| 0–4 | 25–29 | `carl_walker_shs` | gravity: 4.905, 9.81, 19.62 | gravity: 2.4525, 39.24 |
+| 5–9 | 30–34 | `carl_walker_gravity_friction_shs` | gravity above × tangential friction: 0.5, 1, 2 | held-out gravity above × friction: 0.25, 4 |
+| 10–14 | 35–39 | `carl_quadruped_walk_shs` | gravity: 4.905, 9.81, 19.62 | gravity: 2.4525, 39.24 |
+| 15–19 | 40–44 | `carl_quadruped_actuator_shs` | actuator strength: 0.5, 1, 2 | actuator strength: 0.25, 4 |
+| 20–24 | 45–49 | `carl_finger_spin_shs` | gravity: 4.905, 9.81, 19.62 | gravity: 2.4525, 39.24 |
 
-Within each four-index block, seeds are 1, 2, 3, 4. Feature grids are Cartesian
+Within each five-index block, seeds are 1, 2, 3, 4, 5. Feature grids are Cartesian
 products: the gravity/friction experiment has 9 training and 4 evaluation contexts;
 the others have 3 and 2. The vanilla arm appends `carl_vanilla` to the same preset,
 setting `use_shs=False` and `dyn_discrete=32` without changing its context grid.
@@ -85,7 +85,7 @@ Inspect commands locally without Python dependencies, CUDA, or Slurm:
 
 ```bash
 DRY_RUN=1 bash run_dreamer_carl_mila.sh
-DRY_RUN=1 SLURM_ARRAY_TASK_ID=20 bash run_dreamer_carl_mila.sh
+DRY_RUN=1 SLURM_ARRAY_TASK_ID=25 bash run_dreamer_carl_mila.sh
 DRY_RUN=1 bash run_carl_smoke_mila.sh
 ```
 
@@ -96,7 +96,7 @@ export CONDA_ENV=aime-carl
 sbatch run_carl_smoke_mila.sh
 ```
 
-This submits indices 0 and 20 sequentially (SHS and vanilla, seed 1), each with one
+This submits indices 0 and 25 sequentially (SHS and vanilla, seed 1), each with one
 L40S, four CPUs, 32 GB RAM, and a 30-minute limit on `unkillable`. The reduced run
 uses 2,000 steps, one environment, smaller batches, a shorter episode limit,
 minimal pretraining, and disabled SHS figures/video predictions. It still exercises
@@ -107,7 +107,7 @@ status. The time limit is a starting allocation, not a guaranteed completion tim
 To smoke-test every preset and model, one seed each:
 
 ```bash
-sbatch --array=0,4,8,12,16,20,24,28,32,36%1 run_carl_smoke_mila.sh
+sbatch --array=0,5,10,15,20,25,30,35,40,45%1 run_carl_smoke_mila.sh
 ```
 
 Every job first checks CUDA and training imports, then resets, renders, and steps
@@ -117,7 +117,7 @@ and physical gravity where applicable. This preflight does not change the traini
 selector. For context/render checks without training:
 
 ```bash
-PREFLIGHT_ONLY=1 sbatch --array=0,4,8,12,16%1 run_carl_smoke_mila.sh
+PREFLIGHT_ONLY=1 sbatch --array=0,5,10,15,20%1 run_carl_smoke_mila.sh
 ```
 
 Rendering defaults to EGL. A failed environment preflight retries with OSMesa;
@@ -129,14 +129,14 @@ not converted blindly to numeric device IDs.
 
 ## 3. Submit production runs
 
-After the smoke jobs succeed, start with the four-seed Walker comparison:
+After the smoke jobs succeed, start with the five-seed Walker comparison:
 
 ```bash
 export CONDA_ENV=aime-carl
-sbatch --array=0-3,20-23%2 run_dreamer_carl_mila.sh
+sbatch --array=0-4,25-29%2 run_dreamer_carl_mila.sh
 ```
 
-Or submit the full 40-run comparison:
+Or submit the full 50-run comparison:
 
 ```bash
 sbatch run_dreamer_carl_mila.sh
@@ -151,9 +151,9 @@ change; consult [Mila's partition reference](https://docs.mila.quebec/technical_
 Additional examples:
 
 ```bash
-sbatch --array=8 --time=2-00:00:00 run_dreamer_carl_mila.sh
-VISIBLE=1 sbatch --array=0-3,20-23%2 run_dreamer_carl_mila.sh
-LOG_ROOT="$PWD/logdir/batch8" sbatch --array=0,20%1 run_dreamer_carl_mila.sh --batch_size 8
+sbatch --array=10 --time=2-00:00:00 run_dreamer_carl_mila.sh
+VISIBLE=1 sbatch --array=0-4,25-29%2 run_dreamer_carl_mila.sh
+LOG_ROOT="$PWD/logdir/batch8" sbatch --array=0,25%1 run_dreamer_carl_mila.sh --batch_size 8
 STEPS=2000000 sbatch --array=0 run_dreamer_carl_mila.sh
 ```
 
@@ -189,7 +189,7 @@ seed, exact command, Git revision, Python executable, and key dependency version
 Slurm stdout/stderr are separate and append across restarts. Training results use:
 
 ```text
-logdir/<preset-or-vanilla-name>[_visible]/seed_<1..4>/
+logdir/<preset-or-vanilla-name>[_visible]/seed_<1..5>/
   latest.pt
   metrics.jsonl
   events.out.tfevents.*

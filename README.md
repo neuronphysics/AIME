@@ -164,7 +164,7 @@ are resized before loading.
 
 See [the CARL/Mila runbook](docs/carl_mila.md) for environment setup, the five
 train/held-out context grids, array indices, smoke tests, and restart instructions.
-`run_dreamer_carl_mila.sh` runs the existing 40-experiment comparison;
+`run_dreamer_carl_mila.sh` runs the 50-experiment comparison;
 `run_carl_smoke_mila.sh` checks SHS and vanilla training before a full submission.
 
 ---

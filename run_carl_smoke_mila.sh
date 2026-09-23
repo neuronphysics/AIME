@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --mem=32G
 #SBATCH --time=00:30:00
-#SBATCH --array=0,20%1
+#SBATCH --array=0,25%1
 #SBATCH --output=slurm-aime-carl-smoke-%A_%a.out
 #SBATCH --error=slurm-aime-carl-smoke-%A_%a.err
 #SBATCH --open-mode=append

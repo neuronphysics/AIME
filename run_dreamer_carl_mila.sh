@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --mem=64G
 #SBATCH --time=1-17:00:00
-#SBATCH --array=0-39%2
+#SBATCH --array=0-49%2
 #SBATCH --output=slurm-aime-carl-%A_%a.out
 #SBATCH --error=slurm-aime-carl-%A_%a.err
 #SBATCH --open-mode=append
@@ -26,11 +26,11 @@ PRESETS=(
   carl_finger_spin_shs
 )
 MODELS=(shs vanilla)
-NSEED=4
+NSEED=5
 NPRESET=${#PRESETS[@]}
 IDX="${SLURM_ARRAY_TASK_ID:-0}"
 if [[ ! "${IDX}" =~ ^(0|[1-9][0-9]?)$ ]] || (( IDX >= NPRESET * NSEED * ${#MODELS[@]} )); then
-  echo "array index '${IDX}' must be an integer from 0 to 39" >&2
+  echo "array index '${IDX}' must be an integer from 0 to 49" >&2
   exit 2
 fi
 MODEL="${MODELS[$(( IDX / (NPRESET * NSEED) ))]}"
