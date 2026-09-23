@@ -1,152 +1,181 @@
 #!/bin/bash
 #SBATCH --job-name=AIME-CARL
+#SBATCH --partition=long
 #SBATCH --cpus-per-task=8
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:l40s:1
-#SBATCH --constraint=48gb
 #SBATCH --mem=64G
 #SBATCH --time=1-17:00:00
-#SBATCH --array=0-39%12                                   # 5 grids x {shs, vanilla} x 4 seeds
-#SBATCH -o /home/mila/z/zahra.sheikhbahaee/scratch/AIME/logs/bootstrap/slurm-aime-carl-%A_%a.out
-#SBATCH -e /home/mila/z/zahra.sheikhbahaee/scratch/AIME/logs/bootstrap/slurm-aime-carl-%A_%a.err
+#SBATCH --array=0-39%2
+#SBATCH --output=slurm-aime-carl-%A_%a.out
+#SBATCH --error=slurm-aime-carl-%A_%a.err
+#SBATCH --open-mode=append
 
-# SHS-RSSM on CARL contextual dm_control (pixels), Mila cluster.
-# One submission = every CARL grid x {SHS-RSSM, vanilla DreamerV3} x seeds 1..4.
-#   index 0-19  : SHS      (preset = idx/4,      seed = idx%4+1)
-#   index 20-39 : vanilla  (preset = (idx-20)/4, seed = idx%4+1)
-#
-#   sbatch run_dreamer_carl_mila.sh                                  # all 40
-#   sbatch --array=0-3 run_dreamer_carl_mila.sh                      # carl_walker_shs, seeds 1-4
-#   sbatch --array=20-23 run_dreamer_carl_mila.sh                    # walker gravity grid, vanilla Dreamer
-#   sbatch --array=8 run_dreamer_carl_mila.sh                        # carl_quadruped_walk_shs seed 1 (canary)
-#   VISIBLE=1 sbatch run_dreamer_carl_mila.sh                        # + carl_context_visible on every run
-#   STEPS=500000 sbatch run_dreamer_carl_mila.sh
-#   FLAGS="--batch_size 8" sbatch run_dreamer_carl_mila.sh
-#
-# Before the first submit:  mkdir -p /home/mila/z/zahra.sheikhbahaee/scratch/AIME/logs/bootstrap
+set -euo pipefail
 
-set -uo pipefail
+PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}}"
+cd "${PROJECT_DIR}"
+[[ -f dreamer.py && -f configs.yaml ]] || { echo "PROJECT_DIR must point to the AIME checkout" >&2; exit 2; }
 
-echo "Date:     $(date)"
-echo "Hostname: $(hostname)"
-
-PROJECT_DIR="${PROJECT_DIR:-/home/mila/z/zahra.sheikhbahaee/scratch/AIME}"
-CONDA_ENV="${CONDA_ENV:-trifinger_rl_venv}"
-mkdir -p "${PROJECT_DIR}/logs/bootstrap"
-
-# ---- preset / seed from the array index --------------------------------------
 PRESETS=(
-  carl_walker_shs                     # walker-walk, gravity grid
-  carl_walker_gravity_friction_shs    # walker-walk, gravity x friction grid
-  carl_quadruped_walk_shs             # quadruped-walk, gravity grid
-  carl_quadruped_actuator_shs         # quadruped-walk, actuator_strength grid
-  carl_finger_spin_shs                # finger-spin, gravity grid
+  carl_walker_shs
+  carl_walker_gravity_friction_shs
+  carl_quadruped_walk_shs
+  carl_quadruped_actuator_shs
+  carl_finger_spin_shs
 )
-MODELS=(shs vanilla)                  # vanilla = same grid, + carl_vanilla overlay (use_shs False, dyn_discrete 32)
+MODELS=(shs vanilla)
 NSEED=4
 NPRESET=${#PRESETS[@]}
 IDX="${SLURM_ARRAY_TASK_ID:-0}"
-if (( IDX >= NPRESET * NSEED * ${#MODELS[@]} )); then
-  echo "array index ${IDX} out of range (${NPRESET} presets x ${#MODELS[@]} models x ${NSEED} seeds)" >&2; exit 2
+if [[ ! "${IDX}" =~ ^(0|[1-9][0-9]?)$ ]] || (( IDX >= NPRESET * NSEED * ${#MODELS[@]} )); then
+  echo "array index '${IDX}' must be an integer from 0 to 39" >&2
+  exit 2
 fi
 MODEL="${MODELS[$(( IDX / (NPRESET * NSEED) ))]}"
 REM=$(( IDX % (NPRESET * NSEED) ))
 PRESET="${PRESETS[$(( REM / NSEED ))]}"
 SEED="${SEED:-$(( REM % NSEED + 1 ))}"
-
-case "${PRESET}" in
-  carl_walker*)             CARL_TASK=dmc_walker ;;
-  carl_quadruped*)          CARL_TASK=dmc_quadruped ;;
-  carl_finger*)             CARL_TASK=dmc_finger ;;
-  *) echo "unknown preset '${PRESET}'" >&2; exit 2 ;;
-esac
-
-EXTRA_CONFIGS=""
+CONFIGS=("${PRESET}")
 RUN="${PRESET}"
-if [[ "${MODEL}" == "vanilla" ]]; then EXTRA_CONFIGS="carl_vanilla"; RUN="${PRESET%_shs}_vanilla"; fi
-if [[ "${VISIBLE:-0}" == "1" ]]; then EXTRA_CONFIGS="${EXTRA_CONFIGS} carl_context_visible"; RUN="${RUN}_visible"; fi
+if [[ "${MODEL}" == "vanilla" ]]; then
+  CONFIGS+=(carl_vanilla)
+  RUN="${PRESET%_shs}_vanilla"
+fi
+if [[ "${VISIBLE:-0}" == "1" ]]; then
+  CONFIGS+=(carl_context_visible)
+  RUN="${RUN}_visible"
+fi
 
-# conda's activate is not `set -u` clean; relax strictness across it only.
+STEPS="${STEPS:-1000000}"
+LOGDIR="${LOGDIR:-${LOG_ROOT:-${PROJECT_DIR}/logdir}/${RUN}/seed_${SEED}}"
+COMMAND=(python -u dreamer.py --configs "${CONFIGS[@]}"
+  --seed "${SEED}" --compile False --steps "${STEPS}" --logdir "${LOGDIR}")
+if [[ -n "${FLAGS:-}" ]]; then
+  read -r -a FLAG_ARGS <<< "${FLAGS}"
+  COMMAND+=("${FLAG_ARGS[@]}")
+fi
+COMMAND+=("$@")
+
+echo "Date: $(date) | Host: $(hostname) | Array index: ${IDX}"
+echo "Configs: ${CONFIGS[*]} | Model: ${MODEL} | Seed: ${SEED}"
+echo "Project: ${PROJECT_DIR} | Logdir: ${LOGDIR}"
+printf 'Command:'
+printf ' %q' "${COMMAND[@]}"
+printf '\n'
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  exit 0
+fi
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+  echo "Submit with sbatch (or use DRY_RUN=1 to inspect without a GPU)." >&2
+  exit 2
+fi
+if [[ -n "${VENV_PATH:-}" && -n "${CONDA_ENV:-}" ]]; then
+  echo "Set only one of VENV_PATH and CONDA_ENV." >&2
+  exit 2
+fi
+
 set +u
-module unload python
-module load anaconda/3
-conda activate "${CONDA_ENV}"
-module load gcc/9.3.0
-module unload anaconda
-module load python/3.10
+if [[ -n "${VENV_PATH:-}" ]]; then
+  source "${VENV_PATH}/bin/activate"
+elif [[ -n "${CONDA_ENV:-}" ]]; then
+  if ! command -v conda >/dev/null 2>&1; then
+    module load "${CONDA_MODULE:-miniconda/3}"
+  fi
+  CONDA_BASE="$(conda info --base)"
+  source "${CONDA_BASE}/etc/profile.d/conda.sh"
+  conda activate "${CONDA_ENV}"
+fi
 set -u
+command -v python
+
 unset CUDA_LAUNCH_BLOCKING
-
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export BLIS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-export PYTHONUNBUFFERED=1
-export PYTHONFAULTHANDLER=1
-export TORCH_SHOW_CPP_STACKTRACES=1
-export TORCH_LINALG_PREFER_CUSOLVER=1
-export TORCH_DISABLE_ADDR2LINE=1
-
-export MUJOCO_GL=egl
-export PYOPENGL_PLATFORM=egl
-_EGL_DEV="${CUDA_VISIBLE_DEVICES:-0}"
-export MUJOCO_EGL_DEVICE_ID="${_EGL_DEV%%,*}"
-export EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID}"
+export MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BLIS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 PYTHONNOUSERSITE=1
+export TORCH_SHOW_CPP_STACKTRACES=1 TORCH_LINALG_PREFER_CUSOLVER=1 TORCH_DISABLE_ADDR2LINE=1
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export PYOPENGL_PLATFORM="${MUJOCO_GL}"
+if [[ "${MUJOCO_GL}" == "egl" ]]; then
+  EGL_CANDIDATE="${CUDA_VISIBLE_DEVICES:-}"
+  EGL_CANDIDATE="${EGL_CANDIDATE%%,*}"
+  if [[ -z "${MUJOCO_EGL_DEVICE_ID:-}" && "${EGL_CANDIDATE}" =~ ^[0-9]+$ ]]; then
+    export MUJOCO_EGL_DEVICE_ID="${EGL_CANDIDATE}"
+  fi
+fi
 export DISABLE_RENDER_THREAD_OFFLOADING=1
 unset DISPLAY
 
-cd "${PROJECT_DIR}"
-
-STEPS="${STEPS:-1000000}"
-FLAGS="${FLAGS:-}"
-LOGDIR="${LOGDIR:-${PROJECT_DIR}/logdir/${RUN}/seed_${SEED}}"
-RUNLOG="${PROJECT_DIR}/logs/aime_${RUN}_seed${SEED}"
-
-scontrol update JobId="${SLURM_JOB_ID}" JobName="aime_${RUN}_s${SEED}" 2>/dev/null || true
-
-# Human-readable per-run logs; SLURM cannot expand PRESET/SEED in #SBATCH -o.
-exec > "${RUNLOG}.out" 2> "${RUNLOG}.err"
-
-nvidia-smi || echo "nvidia-smi unavailable"
+nvidia-smi || true
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
-echo "Python:  $(command -v python)"
-echo "Configs: ${PRESET} ${EXTRA_CONFIGS}  (${CARL_TASK}, model=${MODEL})  seed=${SEED}  steps=${STEPS}"
-echo "Logdir:  ${LOGDIR}"
+git rev-parse HEAD || true
+python - <<'PY'
+import importlib.metadata as metadata
+import sys
+import torch
+import dreamer
 
-# ---- preflight: the full adapter chain (gym, carl, dm_control, render) -------
-carl_preflight () {
-python - <<PY
-import os, sys, torch
 print("Python:", sys.executable)
-print("MUJOCO_GL:", os.environ.get("MUJOCO_GL"))
-print("Torch:", torch.__version__, "| CUDA:", torch.version.cuda, "| available:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("GPU:", torch.cuda.get_device_name(0))
-import importlib.metadata as md, gym, gymnasium, carl
-print("gym", gym.__version__, "| gymnasium", gymnasium.__version__, "| carl-bench", md.version("carl-bench"))
-import envs.carl as ec
-e = ec.CARL("${CARL_TASK}", 2, (64, 64), seed=0, contexts={"gravity": [4.905, 19.62]}, selector="round_robin")
-o = e.reset()
-g = -e._env.env.env.physics.model.opt.gravity[2]
-print("CARL render:", o["image"].shape, "| action", e.action_space.shape, "| context_id", int(o["context_id"]), "| physics gravity", round(float(g), 3))
-assert abs(g - 4.905) < 1e-6, "context did not reach the physics"
+for package in ("torch", "numpy", "gym", "gymnasium", "carl-bench", "dm-control", "mujoco"):
+    print(package, metadata.version(package))
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is unavailable; check the GPU allocation and PyTorch installation")
+print("GPU:", torch.cuda.get_device_name(0))
+PY
+
+carl_preflight() {
+  python - "${PRESET}" "${SEED}" <<'PY'
+import pathlib
+import sys
+
+import numpy as np
+from ruamel.yaml import YAML
+from envs.carl import CARL
+
+configs = YAML(typ="safe", pure=True).load(pathlib.Path("configs.yaml").read_text())
+preset = configs[sys.argv[1]]
+for split in ("train", "eval"):
+    spec = preset["carl"][f"{split}_contexts"]
+    environment = CARL(
+        preset["task"].removeprefix("carl_"),
+        action_repeat=preset["action_repeat"],
+        size=(64, 64),
+        seed=int(sys.argv[2]),
+        contexts=spec,
+        selector="round_robin",
+    )
+    context_count = int(np.prod([len(values) for values in spec.values()]))
+    seen = set()
+    for context_index in range(context_count):
+        observation = environment.reset()
+        seen.add(int(observation["context_id"]))
+        assert observation["image"].shape == (64, 64, 3)
+        assert environment.action_space.shape == (preset["shs_action_dim"],)
+        if "gravity" in spec:
+            gravity = -environment._env.env.env.physics.model.opt.gravity[2]
+            assert np.isclose(gravity, environment.context["gravity"]), "context did not reach physics"
+        observation, reward, done, info = environment.step(
+            np.zeros(environment.action_space.shape, dtype=np.float32)
+        )
+        assert np.isfinite(reward)
+        assert np.isfinite(observation["state"]).all()
+    assert len(seen) == context_count, (seen, context_count)
+    print(f"{split}: rendered and stepped all {context_count} contexts: {spec}")
 PY
 }
 
 if ! carl_preflight; then
-  echo "[gl] egl preflight failed on $(hostname); falling back to osmesa" >&2
+  if [[ "${MUJOCO_GL}" != "egl" ]]; then
+    exit 3
+  fi
+  echo "Preflight failed with EGL; retrying with OSMesa." >&2
   export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa LP_NUM_THREADS=3
   unset MUJOCO_EGL_DEVICE_ID EGL_DEVICE_ID
-  carl_preflight || { echo "[gl] osmesa also failed on $(hostname)" >&2; exit 3; }
+  carl_preflight || { echo "OSMesa preflight also failed; see traceback." >&2; exit 3; }
+fi
+if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
+  exit 0
 fi
 
-# ---- run ---------------------------------------------------------------------
-
-python -u dreamer.py --configs "${PRESET}" ${EXTRA_CONFIGS} \
-  --seed "${SEED}" \
-  --compile False \
-  --steps "${STEPS}" \
-  --logdir "${LOGDIR}" \
-  ${FLAGS}
+exec srun "${COMMAND[@]}"

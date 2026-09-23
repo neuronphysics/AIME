@@ -160,6 +160,13 @@ Training resumes automatically from `<logdir>/latest.pt`, including across struc
 moves: checkpoints carry the current regime shapes and curriculum counters, and buffers
 are resized before loading.
 
+### CARL experiments on Mila
+
+See [the CARL/Mila runbook](docs/carl_mila.md) for environment setup, the five
+train/held-out context grids, array indices, smoke tests, and restart instructions.
+`run_dreamer_carl_mila.sh` runs the existing 40-experiment comparison;
+`run_carl_smoke_mila.sh` checks SHS and vanilla training before a full submission.
+
 ---
 
 ## Configuration

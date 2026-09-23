@@ -1,0 +1,16 @@
+torch==2.4.1
+numpy==1.26.4
+ruamel.yaml==0.17.4
+einops==0.3.0
+protobuf==3.20.0
+tensorboard>=2.17
+moviepy==1.0.3
+cloudpickle>=2.2
+pillow>=9.0,<10
+gym==0.22.0
+gymnasium==0.29.1
+mujoco==2.3.5
+dm_control==1.0.9
+carl-bench[dm_control]==1.1.1
+scipy>=1.10
+matplotlib>=3.5
