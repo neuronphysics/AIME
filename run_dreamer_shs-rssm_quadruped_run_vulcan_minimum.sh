@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=48G
-#SBATCH --time=01-22:59:59
+#SBATCH --time=08:59:59
 #SBATCH --account=aip-irina
 #SBATCH --array=1-4                        # seeds 1-4
 #SBATCH --output=/home/memole/scratch/AIME/logs/dreamer_shs_quadruped_run_%A_%a.out

@@ -3,9 +3,9 @@
 #SBATCH --nodes=1
 #SBATCH --gpus=l40s:1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=15
-#SBATCH --mem=60G
-#SBATCH --time=01-23:59:59
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=20G
+#SBATCH --time=06:59:59
 #SBATCH --account=aip-irina
 #SBATCH --array=1-4                        # seeds 1-4
 #SBATCH --output=/home/memole/scratch/AIME/logs/dreamer_shs_finger_turn_hard_%A_%a.out
