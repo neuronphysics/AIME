@@ -1,0 +1,20 @@
+name: rslds-legacy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.8
+  - numpy=1.21
+  - scipy=1.7
+  - cython=0.29.36
+  - scikit-learn=1.1
+  - matplotlib=3.5
+  - future
+  - requests
+  - pip
+  - pip:
+      - pypolyagamma
+      - git+https://github.com/mattjj/pybasicbayes.git
+      - git+https://github.com/mattjj/pyhsmm.git
+      - git+https://github.com/mattjj/pyhsmm-autoregressive.git
+      - git+https://github.com/mattjj/pylds.git
+      - git+https://github.com/slinderman/pyslds.git
