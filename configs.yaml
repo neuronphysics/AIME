@@ -2135,7 +2135,7 @@ carl_quadruped_actuator_shs:
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
   carl:
     train_contexts: {actuator_strength: [0.5, 1.0, 2.0]}
-    eval_contexts: {actuator_strength: [0.25, 4.0]}
+    eval_contexts: {actuator_strength: [0.25, 2.5]}
 
 carl_finger_spin_shs:
   shs_forget_mode: evidence

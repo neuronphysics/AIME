@@ -105,11 +105,22 @@ class CARL:
         return self._obs(raw, is_first=True, is_terminal=False)
 
     def step(self, action):
+        from dm_control.rl.control import PhysicsError
+
         assert np.isfinite(action).all(), action
         reward = 0.0
         terminated = truncated = False
-        for _ in range(self._action_repeat):
-            raw, r, terminated, truncated, _ = self._env.step(action)
+        for substep in range(self._action_repeat):
+            try:
+                raw, r, terminated, truncated, _ = self._env.step(action)
+            except PhysicsError:
+                print(
+                    f"[carl] PhysicsError: context_id={self.context_id}, "
+                    f"context={self.context}, repeat_substep={substep + 1}, "
+                    f"action={np.asarray(action).tolist()}",
+                    flush=True,
+                )
+                raise
             reward += float(r)
             if terminated or truncated:
                 break

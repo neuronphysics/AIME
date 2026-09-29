@@ -9,7 +9,7 @@ class ProcGen:
                  distribution_mode="easy"):
         import procgen
         self._env = gym.make(
-            f"procgen:procgen-{task}-v0",
+            f"procgen-{task}-v0",
             start_level=seed, num_levels=num_levels,
             distribution_mode=distribution_mode,
             render_mode="rgb_array",
