@@ -1771,11 +1771,12 @@ shs_move_gate:
   shs_delete_empty: True
 
 procgen:
-  task: 'procgen_coinrun'
-  steps: 5e7
+  steps: 1e7
   action_repeat: 1
   envs: 8
-  train_ratio: 512
+  parallel: False
+  train_ratio: 64
+  eval_every: 1e5
   time_limit: 1000
   video_pred_log: true
   actor: {dist: 'onehot', std: 'none'}
@@ -1783,37 +1784,45 @@ procgen:
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
 
-procgen_shs:
+procgen_coinrun_shs:
   task: 'procgen_coinrun'
-  steps: 5e7
+  steps: 1e7
   action_repeat: 1
   envs: 8
-  train_ratio: 512
+  parallel: False
+  train_ratio: 64
+  eval_every: 1e5
   time_limit: 1000
   dyn_discrete: 0
   use_shs: True
-  shs_ema_gate: False
-  shs_structure_moves: True
   shs_K: 16
   shs_action_dim: 15
+  shs_proj_dim: 128
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True
   shs_rstick_use_action: True
-  shs_kappa: 20.0
+  shs_alpha: 8.0
+  shs_kappa: 50.0
   shs_prior_persist: 0.9
   shs_rstick_dim: 32
   shs_rstick_stopgrad: True
+  shs_ema_gate: True
+  shs_forget_mode: fixed
+  shs_structure_moves: True
+  shs_move_holdout: 8
+  shs_move_K_headroom: 8
+  shs_delete_empty: True
   shs_move_warmup: 0
   shs_move_buffer: 64
   shs_move_max_age: 2000
   shs_calibrate_b0: True
   shs_calibrate_sF: 0.1
   shs_curriculum:
-    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: 650000, move_every_env: 32000, recurrent: False, kappa: 10.0, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: 800000, move_every_env: 32000, recurrent: True,                birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: -1,    move_every_env: 32000, recurrent: True,                birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 400000, move_every: 0,         recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 600000, move_every_env: 32000, recurrent: False, kappa: 10.0, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 750000, move_every_env: 32000, recurrent: True,              birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 32000, recurrent: True,              birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   shs_diag_log: True
@@ -1824,35 +1833,42 @@ procgen_shs:
 
 procgen_bigfish_shs:
   task: 'procgen_bigfish'
-  steps: 5e7
+  steps: 1e7
   action_repeat: 1
   envs: 8
-  train_ratio: 512
+  parallel: False
+  train_ratio: 64
+  eval_every: 1e5
   time_limit: 1000
   dyn_discrete: 0
   use_shs: True
-  shs_ema_gate: False
-  shs_structure_moves: True
   shs_K: 16
   shs_action_dim: 15
+  shs_proj_dim: 128
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True
   shs_rstick_use_action: True
-  shs_kappa: 10.0
+  shs_kappa: 25.0
   shs_prior_persist: 0.9
   shs_rstick_dim: 32
   shs_rstick_stopgrad: True
+  shs_ema_gate: True
+  shs_forget_mode: fixed
+  shs_structure_moves: True
+  shs_move_holdout: 8
+  shs_move_K_headroom: 8
+  shs_delete_empty: True
   shs_move_warmup: 0
   shs_move_buffer: 64
   shs_move_max_age: 2000
   shs_calibrate_b0: True
   shs_calibrate_sF: 0.1
   shs_curriculum:
-    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: 650000, move_every_env: 32000, recurrent: False, kappa: 10.0, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: 800000, move_every_env: 32000, recurrent: True,                birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: -1,    move_every_env: 32000, recurrent: True,                birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 400000, move_every: 0,         recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 550000, move_every_env: 32000, recurrent: False, kappa: 10.0, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 800000, move_every_env: 32000, recurrent: True,              birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 32000, recurrent: True,              birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   shs_diag_log: True
@@ -1863,35 +1879,89 @@ procgen_bigfish_shs:
 
 procgen_fruitbot_shs:
   task: 'procgen_fruitbot'
-  steps: 5e7
+  steps: 1e7
   action_repeat: 1
   envs: 8
-  train_ratio: 512
+  parallel: False
+  train_ratio: 64
+  eval_every: 1e5
   time_limit: 1000
   dyn_discrete: 0
   use_shs: True
-  shs_ema_gate: False
-  shs_structure_moves: True
   shs_K: 16
   shs_action_dim: 15
+  shs_proj_dim: 128
   shs_shared_carry: True
   shs_q_rank: 4
   shs_recurrent: True
   shs_rstick_use_action: True
-  shs_kappa: 15.0
-  shs_prior_persist: 0.674
+  shs_kappa: 25.0
+  shs_prior_persist: 0.9
   shs_rstick_dim: 32
   shs_rstick_stopgrad: True
+  shs_ema_gate: True
+  shs_forget_mode: fixed
+  shs_structure_moves: True
+  shs_move_holdout: 8
+  shs_move_K_headroom: 8
+  shs_delete_empty: True
   shs_move_warmup: 0
   shs_move_buffer: 64
   shs_move_max_age: 2000
   shs_calibrate_b0: True
   shs_calibrate_sF: 0.1
   shs_curriculum:
-    - {until_env: 500000, move_every: 0,    recurrent: False, kappa: 15.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: 650000, move_every_env: 32000, recurrent: False, kappa: 15.0, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: 800000, move_every_env: 32000, recurrent: True,                birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
-    - {until_env: -1,    move_every_env: 32000, recurrent: True,                birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 400000, move_every: 0,         recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 550000, move_every_env: 32000, recurrent: False, kappa: 10.0, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 800000, move_every_env: 32000, recurrent: True,              birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 32000, recurrent: True,              birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
+procgen_chaser_shs:
+  task: 'procgen_chaser'
+  steps: 1e7
+  action_repeat: 1
+  envs: 8
+  parallel: False
+  train_ratio: 64
+  eval_every: 1e5
+  time_limit: 1000
+  dyn_discrete: 0
+  use_shs: True
+  shs_K: 16
+  shs_action_dim: 15
+  shs_proj_dim: 128
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_recurrent: True
+  shs_rstick_use_action: True
+  shs_alpha: 8.0
+  shs_kappa: 25.0
+  shs_prior_persist: 0.85
+  shs_rstick_dim: 32
+  shs_rstick_stopgrad: True
+  shs_ema_gate: True
+  shs_forget_mode: fixed
+  shs_structure_moves: True
+  shs_move_holdout: 8
+  shs_move_K_headroom: 8
+  shs_delete_empty: True
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 0.1
+  shs_curriculum:
+    - {until_env: 400000, move_every: 0,         recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 600000, move_every_env: 32000, recurrent: False, kappa: 10.0, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 750000, move_every_env: 32000, recurrent: True,              birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 32000, recurrent: True,              birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   shs_diag_log: True
