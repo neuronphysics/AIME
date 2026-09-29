@@ -615,6 +615,15 @@ atari_frostbite_shs_moves:
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
 
+atari100k_schedule:
+  steps: 4e5
+  shs_move_first_env: 10000
+  shs_curriculum:
+    - {until_env: 10000, move_every: 0,        recurrent: False, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 20000, move_every_env: 2080, recurrent: False, birth: False, split: False, move_threshold: 10.0, shrink_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: 50000, move_every_env: 2080, recurrent: False, birth: True,  split: False, move_threshold: 10.0, shrink_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: -1,    move_every_env: 2080, recurrent: True,  birth: True,  split: True,  move_threshold: 10.0, shrink_threshold: 0.0, create_bonus: 0.0}
+
 minecraft:
   task: minecraft_diamond
   step: 1e8
