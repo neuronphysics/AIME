@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=48G
+#SBATCH --mem=96G
 #SBATCH --time=12:00:00
 #SBATCH --account=aip-irina
 #SBATCH --output=/home/memole/scratch/AIME/logs/vismnist_p2_%j.out

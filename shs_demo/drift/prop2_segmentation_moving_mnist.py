@@ -471,8 +471,8 @@ def plot_main(out,cfg):
     style={f"ema_{MAIN_TAU:g}":("ema",rf"EMA ($\tau={MAIN_TAU:g}$)"),"svb":("svb","Streaming VB"),
            "pp":("pp",rf"Power prior ($\rho={1-MAIN_TAU:g}$)"),
            "window":("window",rf"Window ($W={window_len(MAIN_TAU)}$)"),
-           "gated":("gated","AIME, no retention"),
-           "retain":("retain","AIME (proposed): gated + change-point retention")}
+           "gated":("gated","Gated EMA (AIME)"),
+           "retain":("retain","Gated EMA + change-point retention (AIME)")}
 
     fig,axs=plt.subplots(1,3,figsize=(13.2,3.8),gridspec_kw={"width_ratios":[1.05,1.2,1.05]})
     fig.subplots_adjust(wspace=.32,bottom=.24)
@@ -500,7 +500,7 @@ def plot_main(out,cfg):
     ax.axvspan(cs+1,de,color=".92",lw=0,zorder=0)
     for nm in shown:
         j=names.index(nm);fam,lab=style[nm]
-        ax.plot(xb,mean[j],color=COLOR[fam],ls=LINESTYLE[fam],lw=2.5 if fam=="retain" else 1.6,label=lab,zorder=3 if fam=="retain" else 2)
+        ax.plot(xb,mean[j],color=COLOR[fam],ls=LINESTYLE[fam],lw=1.8,label=lab,zorder=2)
         ax.fill_between(xb,mean[j]-half[j],mean[j]+half[j],color=COLOR[fam],alpha=.10,lw=0)
     ax.axvline(cs+1,color=".65",lw=.8,ls="--");ax.axvline(de,color=".65",lw=.8,ls="--")
     ax.set_xlabel("Minibatch update");ax.set_ylabel("Prequential NLL (nats / transition)")
@@ -519,7 +519,7 @@ def plot_main(out,cfg):
     panel(ax,"(c)")
 
     handles=[Line2D([],[],color=COLOR[f],ls=LINESTYLE[f],lw=1.8,label=l) for _,(f,l) in style.items()]
-    fig.legend(handles=handles,loc="lower center",bbox_to_anchor=(.5,.03),ncol=4,frameon=False,fontsize=8.5)
+    fig.legend(handles=handles,loc="lower center",bbox_to_anchor=(.5,.02),ncol=3,frameon=False,fontsize=8.5)
     for ext in ("pdf","svg","png"):
         fig.savefig(out/f"figure_visual_mnist_prop2.{ext}",dpi=240,bbox_inches="tight",pad_inches=.04)
     plt.close(fig)
@@ -530,18 +530,19 @@ def plot_sensitivity(out,cfg):
     import matplotlib;matplotlib.use("Agg");import matplotlib.pyplot as plt
     data=[np.load(out/f"seed_{s:03d}.npz") for s in cfg["seed_ids"]];names=list(data[0]["arms"])
     xs,ym,lo,hi,refs=_sensitivity_values(data,names,cfg)
-    fig,ax=plt.subplots(figsize=(4.4,3.3))
+    fig,ax=plt.subplots(figsize=(4.6,3.4))
     ax.errorbar(xs,ym,yerr=np.array([lo,hi]),color=COLOR["ema"],marker="o",lw=1.5,
-                capsize=2.5,label="EMA")
+                capsize=2.5,label=r"EMA, swept $\tau$")
     for nm,fam,lab in [("svb","svb","Streaming VB"),
                        ("pp","pp",rf"Power prior ($\rho={1-MAIN_TAU:g}$)"),
                        ("window","window",rf"Window ($W={window_len(MAIN_TAU)}$)"),
-                       ("gated","gated","AIME, no retention"),
-                       ("retain","retain","AIME (proposed): gated + change-point retention")]:
+                       ("gated","gated",rf"Gated EMA (AIME), $\tau={MAIN_TAU:g}$"),
+                       ("retain","retain",rf"Gated EMA + retention (AIME), $\tau={MAIN_TAU:g}$")]:
         ax.axhline(refs[nm][0],color=COLOR[fam],ls=LINESTYLE[fam],lw=1.25,label=lab)
     ax.axvline(MAIN_TAU,color=".45",lw=.8,ls=":",zorder=0)
-    ax.set_xscale("log");ax.set_xlabel(r"EMA gain $\tau$");ax.set_ylabel("Mean drift NLL")
-    ax.grid(axis="y",alpha=.16);ax.legend(frameon=False,fontsize=8)
+    ax.set_xscale("log");ax.set_xlabel(r"EMA gain $\tau$");ax.set_ylabel("Mean NLL in the drift window")
+    ax.grid(axis="y",alpha=.16)
+    ax.legend(frameon=False,fontsize=7.5,ncol=2,loc="upper center",bbox_to_anchor=(.5,-.22),handlelength=2.2,columnspacing=1.4)
     for ext in ("pdf","svg","png"):
         fig.savefig(out/f"figure_visual_mnist_tau_sensitivity.{ext}",dpi=240,bbox_inches="tight",pad_inches=.04)
     plt.close(fig)
