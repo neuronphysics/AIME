@@ -696,6 +696,58 @@ dmc_walker_shs:
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
 
+# (job 391718, seed 1). Eval return 954 at 480k frames.
+dmc_walker_walk_shs_4env_ema:
+  task: 'dmc_walker_walk'
+  steps: 1e6
+  action_repeat: 2
+  time_limit: 1000
+  envs: 4
+  train_ratio: 128
+  batch_size: 16
+  batch_length: 64
+  dyn_hidden: 512
+  dyn_deter: 512
+  dyn_stoch: 32
+  dyn_discrete: 0
+  units: 512
+  use_shs: True
+  shs_structure_moves: True
+  shs_ema_gate: False
+  shs_forget_mode: fixed
+  shs_online_mode: ema
+  shs_ema_tau: 0.02
+  shs_K: 12
+  shs_action_dim: 6
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_proj_dim: 64
+  shs_recurrent: True
+  shs_kappa: 50.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 8
+  shs_rstick_use_action: False
+  shs_rstick_stopgrad: True
+  shs_a0: 3.0
+  shs_b0: 2.0
+  shs_learn_b0: False
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_imag_mode: actor_moment
+  shs_curriculum:
+    - {until_env: 160000, move_every: 0,    recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 320000, move_every: 250,  recurrent: False, kappa: 50.0, birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: 480000, move_every: 500,  recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 1000, recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+  shs_diag_log: True
+  shs_diag_figures: True
+  video_pred_log: True
+  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+
 
 walker_walk_launch:
   shs_structure_moves: True
