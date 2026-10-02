@@ -2040,6 +2040,18 @@ dmc_vanilla_compare:
 
 
 
+# Appended last for every CARL SHS run. Walker and quadruped recipes replace
+# shs_curriculum and shs_rstick_use_action, so this block has to come after them.
+shs_4env_schedule:
+  train_ratio: 128
+  shs_rstick_use_action: False
+  shs_structure_moves: True
+  shs_curriculum:
+    - {until_env: 160000, move_every: 0,    recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 320000, move_every: 250,  recurrent: False, kappa: 50.0, birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: 480000, move_every: 500,  recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 1000, recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+
 carl_walker_shs:
   shs_forget_mode: evidence
   task: 'carl_dmc_walker'
@@ -2048,6 +2060,7 @@ carl_walker_shs:
   action_repeat: 2
   time_limit: 1000
   envs: 4
+  train_ratio: 128
 
   dyn_discrete: 0
   use_shs: True
@@ -2060,7 +2073,9 @@ carl_walker_shs:
   shs_kappa: 50.0
   shs_prior_persist: 0.9
   shs_rstick_dim: 32
+  shs_rstick_use_action: False
   shs_rstick_stopgrad: True
+  shs_structure_moves: True
 
   shs_move_warmup: 0
   shs_move_buffer: 64
@@ -2071,8 +2086,10 @@ carl_walker_shs:
   shs_calibrate_sF: 0.1
   shs_proj_dim: 128
   shs_curriculum:
-    - {until_env: 225000, move_every: 0, recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: -1,     move_every: 0, recurrent: True,               birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 160000, move_every: 0,    recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 320000, move_every: 250,  recurrent: False, kappa: 50.0, birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: 480000, move_every: 500,  recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 1000, recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
   shs_diag_log: True
   shs_diag_figures: True
   video_pred_log: True
@@ -2090,6 +2107,7 @@ carl_walker_gravity_friction_shs:
   action_repeat: 2
   time_limit: 1000
   envs: 4
+  train_ratio: 128
 
   dyn_discrete: 0
   use_shs: True
@@ -2102,7 +2120,9 @@ carl_walker_gravity_friction_shs:
   shs_kappa: 50.0
   shs_prior_persist: 0.9
   shs_rstick_dim: 32
+  shs_rstick_use_action: False
   shs_rstick_stopgrad: True
+  shs_structure_moves: True
 
   shs_move_warmup: 0
   shs_move_buffer: 64
@@ -2113,8 +2133,10 @@ carl_walker_gravity_friction_shs:
   shs_calibrate_sF: 0.1
   shs_proj_dim: 128
   shs_curriculum:
-    - {until_env: 225000, move_every: 0, recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: -1,     move_every: 0, recurrent: True,               birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 160000, move_every: 0,    recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 320000, move_every: 250,  recurrent: False, kappa: 50.0, birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: 480000, move_every: 500,  recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 1000, recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
   shs_diag_log: True
   shs_diag_figures: True
   video_pred_log: True
@@ -2132,6 +2154,7 @@ carl_quadruped_walk_shs:
   action_repeat: 2
   time_limit: 1000
   envs: 4
+  train_ratio: 128
   dyn_discrete: 0
   use_shs: True
   shs_imag_mode: 'st_sample'
@@ -2143,15 +2166,19 @@ carl_quadruped_walk_shs:
   shs_kappa: 50.0
   shs_prior_persist: 0.9
   shs_rstick_dim: 32
+  shs_rstick_use_action: False
   shs_rstick_stopgrad: True
+  shs_structure_moves: True
   shs_move_warmup: 0
   shs_move_buffer: 64
   shs_move_max_age: 2000
   shs_calibrate_b0: True
   shs_calibrate_sF: 1.0
   shs_curriculum:
-    - {until_env: 225000, move_every: 0, recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: -1,     move_every: 0, recurrent: True,               birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 160000, move_every: 0,    recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 320000, move_every: 250,  recurrent: False, kappa: 50.0, birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: 480000, move_every: 500,  recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 1000, recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
   shs_diag_log: True
   shs_diag_figures: True
   video_pred_log: True
@@ -2169,6 +2196,7 @@ carl_quadruped_actuator_shs:
   action_repeat: 2
   time_limit: 1000
   envs: 4
+  train_ratio: 128
   dyn_discrete: 0
   use_shs: True
   shs_imag_mode: 'st_sample'
@@ -2180,15 +2208,19 @@ carl_quadruped_actuator_shs:
   shs_kappa: 50.0
   shs_prior_persist: 0.9
   shs_rstick_dim: 32
+  shs_rstick_use_action: False
   shs_rstick_stopgrad: True
+  shs_structure_moves: True
   shs_move_warmup: 0
   shs_move_buffer: 64
   shs_move_max_age: 2000
   shs_calibrate_b0: True
   shs_calibrate_sF: 1.0
   shs_curriculum:
-    - {until_env: 225000, move_every: 0, recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: -1,     move_every: 0, recurrent: True,               birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 160000, move_every: 0,    recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 320000, move_every: 250,  recurrent: False, kappa: 50.0, birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: 480000, move_every: 500,  recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 1000, recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
   shs_diag_log: True
   shs_diag_figures: True
   video_pred_log: True
@@ -2206,6 +2238,7 @@ carl_finger_spin_shs:
   action_repeat: 2
   time_limit: 1000
   envs: 4
+  train_ratio: 128
   dyn_discrete: 0
   use_shs: True
   shs_imag_mode: 'st_sample'
@@ -2217,15 +2250,19 @@ carl_finger_spin_shs:
   shs_kappa: 50.0
   shs_prior_persist: 0.9
   shs_rstick_dim: 32
+  shs_rstick_use_action: False
   shs_rstick_stopgrad: True
+  shs_structure_moves: True
   shs_move_warmup: 0
   shs_move_buffer: 64
   shs_move_max_age: 2000
   shs_calibrate_b0: True
   shs_calibrate_sF: 1.0
   shs_curriculum:
-    - {until_env: 225000, move_every: 0, recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
-    - {until_env: -1,     move_every: 0, recurrent: True,               birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 160000, move_every: 0,    recurrent: False, kappa: 50.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 320000, move_every: 250,  recurrent: False, kappa: 50.0, birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: 480000, move_every: 500,  recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 1000, recurrent: True,  kappa: 0.0,  birth: True,  split: True,  move_threshold: 0.0, create_bonus: 0.0}
   shs_diag_log: True
   shs_diag_figures: True
   video_pred_log: True
