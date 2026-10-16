@@ -5,6 +5,16 @@ import torch
 import torch.nn as nn
 
 EPS = 1e-8
+OMEGA_MIN = 1e-3
+OMEGA_MAX = 1e6          # Beta concentration cap: keeps q(beta) finite and the warm start finite
+GUARD_ABS_TOL = 1e-3     # nats; absolute slack of the monotonicity guard (float rounding only)
+
+
+def _inv_softplus(x: torch.Tensor) -> torch.Tensor:
+    """Inverse of softplus, stable for large x (log(expm1(x)) overflows to inf for x > ~709)."""
+    x = x.clamp(min=OMEGA_MIN)
+    small = torch.log(torch.expm1(x.clamp(max=30.0)))
+    return torch.where(x > 30.0, x, small)
 
 
 def rho2beta(rho: torch.Tensor) -> torch.Tensor:
@@ -204,7 +214,7 @@ class StickyHDP(nn.Module):
         n_iter = int(min(n_iter, getattr(self, 'lbfgs_max_iter', n_iter)))
         dtype, device = self.rho.dtype, self.rho.device
         a = torch.logit(self.rho.clamp(1e-4, 1 - 1e-4)).clone().detach().requires_grad_(True)
-        b = torch.log(torch.expm1(self.omega.clamp(min=1e-3))).clone().detach().requires_grad_(True)
+        b = _inv_softplus(self.omega.clamp(OMEGA_MIN, OMEGA_MAX)).clone().detach().requires_grad_(True)
 
         opt = torch.optim.LBFGS([a, b], lr=lr, max_iter=n_iter,
                                 line_search_fn="strong_wolfe", tolerance_grad=1e-9,
@@ -221,7 +231,7 @@ class StickyHDP(nn.Module):
         opt.step(closure)
         with torch.no_grad():
             rho = torch.sigmoid(a).clamp(EPS, 1 - EPS)
-            omega = torch.nn.functional.softplus(b) + 1e-6
+            omega = (torch.nn.functional.softplus(b) + 1e-6).clamp(OMEGA_MIN, OMEGA_MAX)
         return rho.detach(), omega.detach()
 
     @torch.no_grad()
@@ -233,6 +243,7 @@ class StickyHDP(nn.Module):
         tt, st = self._calc_theta(trans_counts, start_counts)
         if not (bool(torch.isfinite(tt).all()) and bool(torch.isfinite(st).all())):
             self.n_guard_rejects = getattr(self, "n_guard_rejects", 0) + 1
+            self._note_reject("theta_nonfinite_pre")
             return
         self.trans_theta.copy_(tt)
         self.start_theta.copy_(st)
@@ -244,22 +255,29 @@ class StickyHDP(nn.Module):
             startAlphaLogPi = self.start_alpha * startELogPi
             rho0 = self.rho.clone()
             omega0 = self.omega.clone()
+            # Monotonicity guard on the full allocation objective.  With the rows refreshed to
+            # theta = prior + counts the slack terms of exact_alloc_elbo cancel the expected count
+            # log-likelihood D, so the full objective F = exact_alloc_elbo + D equals alloc_elbo
+            # at the refreshed rows.  F is what the coordinate step (rho, omega) -> theta
+            # increases; exact_alloc_elbo alone is F - D and can decrease on a valid step.
             obj0 = float(self.alloc_elbo())
             try:
                 with torch.enable_grad():
                     rho, omega = self.optimize_rho_omega(sumLogPi, startAlphaLogPi)
-            except Exception:
+            except Exception as exc:
                 self.rho.copy_(rho0)
                 self.omega.copy_(omega0)
                 tt, st = self._calc_theta(trans_counts, start_counts)
                 self.trans_theta.copy_(tt)
                 self.start_theta.copy_(st)
                 self.n_guard_rejects = getattr(self, "n_guard_rejects", 0) + 1
+                self._note_reject("lbfgs_exception:" + type(exc).__name__)
                 break
             if not (bool(torch.isfinite(rho).all()) and bool(torch.isfinite(omega).all())
                     and bool((omega > 0).all()) and bool((rho > 0).all())
                     and bool((rho < 1).all())):
                 self.n_guard_rejects = getattr(self, "n_guard_rejects", 0) + 1
+                self._note_reject("rho_omega_nonfinite")
                 break
             self.rho.copy_(rho)
             self.omega.copy_(omega)
@@ -271,18 +289,27 @@ class StickyHDP(nn.Module):
                 self.trans_theta.copy_(tt0)
                 self.start_theta.copy_(st0)
                 self.n_guard_rejects = getattr(self, "n_guard_rejects", 0) + 1
+                self._note_reject("theta_nonfinite_post")
                 break
             self.trans_theta.copy_(tt)
             self.start_theta.copy_(st)
             obj1 = float(self.alloc_elbo())
-            if (not math.isfinite(obj1)) or obj1 < obj0 - 1e-6 * (abs(obj0) + 1.0):
+            if (not math.isfinite(obj1)) or obj1 < obj0 - (1e-6 * (abs(obj0) + 1.0) + GUARD_ABS_TOL):
                 self.rho.copy_(rho0)
                 self.omega.copy_(omega0)
                 tt, st = self._calc_theta(trans_counts, start_counts)
                 self.trans_theta.copy_(tt)
                 self.start_theta.copy_(st)
                 self.n_guard_rejects = getattr(self, 'n_guard_rejects', 0) + 1
+                self._note_reject("bound_decreased" if math.isfinite(obj1) else "bound_nonfinite")
+                self._last_bound_drop = (obj0, obj1)
                 break
+
+    def _note_reject(self, reason: str):
+        d = getattr(self, "guard_reject_reasons", None)
+        if d is None:
+            d = self.guard_reject_reasons = {}
+        d[reason] = d.get(reason, 0) + 1
 
     @torch.no_grad()
     def root_kl(self) -> torch.Tensor:
@@ -326,7 +353,7 @@ class StickyHDP(nn.Module):
     @torch.no_grad()
     def seed_rho_omega(self, rho_new: torch.Tensor, omega_new: torch.Tensor):
         self.rho.copy_(rho_new.to(self.rho.dtype).clamp(EPS, 1 - EPS))
-        self.omega.copy_(omega_new.to(self.omega.dtype).clamp_min(1e-3))
+        self.omega.copy_(omega_new.to(self.omega.dtype).clamp(OMEGA_MIN, OMEGA_MAX))
         return self
 
     def resized_like(self, new_K: int):

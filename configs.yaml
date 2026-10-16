@@ -93,7 +93,28 @@ defaults:
   shs_ema_gate_ref: 0.0
   shs_ema_gate_floor: 0.0
   shs_forget_mode: fixed
-  shs_schedule_unit: agent
+  shs_schedule_unit: frame
+  shs_init_blocks: False
+  shs_init_block_len: null
+  # Prior variance multiplier of the low-rank noise factor U: per-entry variance
+  # = shs_q_prior_mult * b0 / ((a0 - 1) * q_rank).  Its trace enters every regime's predictive
+  # variance until U has evidence, so it is tied to the noise prior rather than fixed.
+  shs_q_prior_mult: 1.0
+  # Update clock of the recurrent gate: 'occupancy' (gain from the responsibility share, as in
+  # the paper) or 'redraw' (legacy, from the redraw-count share).
+  shs_gate_clock: occupancy
+  # Grad step at which the noise prior b0 is calibrated from the data.  -1 (default) keeps the
+  # original timing, the first curriculum boundary, which with frame units is reached on every
+  # task.  n >= 1 calibrates at grad step n (1 = first minibatch, i.e. on the random encoder).
+  shs_calibrate_b0_at: -1
+  # Re-seed the regime head at the calibration step: the regime statistics and EMA counts are
+  # dropped and re-initialised from random contiguous blocks of that minibatch, so the regimes
+  # are seeded on a trained representation (first curriculum boundary) rather than on the
+  # random encoder of step 1.  Off by default.
+  shs_reseed_at_calibration: False
+  # Grace period after the re-seed, in environment steps (same unit as the *_env keys): no
+  # structure sweep, hence no delete_empty, until it has elapsed.  0 = none.
+  shs_reseed_grace_env: 0
   shs_global_source: replay_ema
   shs_repr_epoch_steps: 0
   shs_ckpt_reservoir: False

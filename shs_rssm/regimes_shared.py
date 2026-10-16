@@ -39,11 +39,13 @@ class SharedCarryRegimes(nn.Module):
         action_dim: int = 0,
         infl_max: float = 10.0,
         n_block_iters: int = 3,
+        u_prior_mult: float = 1.0,
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         dtype=torch.float32,
     ):
         super().__init__()
         self.K, self.L, self.G = K, L, G
+        self.u_prior_mult = float(u_prior_mult)
         self.action_dim = int(action_dim)
         self.Hp = G - L - self.action_dim - 1
         assert self.Hp >= 0, "G must be >= L+1 (regressor [z; h~; 1])"
@@ -99,7 +101,12 @@ class SharedCarryRegimes(nn.Module):
             self.register_buffer("q_Ddiag", torch.full((K, L), float(b0), dtype=dtype, device=device))
             self.register_buffer("_q_taudiag", torch.full((K, L), float(b0), dtype=dtype, device=device))
             self.register_buffer("_q_Udiag", torch.zeros((K, L), dtype=dtype, device=device))
-            self.u_prior_scale = 0.5
+            # Prior variance of each entry of the low-rank noise factor U (the property
+            # u_prior_scale, derived from the current b0 so that it is always consistent with the
+            # noise prior, also after a checkpoint is loaded).  Its trace enters every regime's
+            # predictive variance (q_Ddiag = E[1/tau] + tr Ucov) until U has evidence: a priori
+            # the F factor directions together carry as much variance as the isotropic noise,
+            # E[1/tau] = b0 / (a0 - 1), times u_prior_mult.
             F = self.q_rank
             self.register_buffer("Umean", 0.01 * torch.randn(K, L, F, dtype=dtype, device=device))
             self.register_buffer("Ucov", (self.u_prior_scale
@@ -116,30 +123,54 @@ class SharedCarryRegimes(nn.Module):
 
     @torch.no_grad()
     def log_marginal_from_stats(self, N, Sgg, Szg, Szz):
+        """Normal-Gamma marginal likelihood of a window under one fresh regime, from weighted
+        sufficient statistics.  Sgg / Szg may be given over the full regressor g = [x; h~; a; 1]
+        (G columns) or over the regime regressor r = [x; a; 1] (Lr columns).  With full-g
+        statistics the carry contribution C h~ is removed at the current posterior mean of C and
+        the regime columns are selected as _split_g does.  The prior mean M0 enters as in the
+        M-step: M_N = (M0 Lam0 + Szr) Lam_N^-1, b_N = b0 + (Szz + M0 Lam0 M0^T - M_N Lam_N M_N^T)/2."""
         L, Lr = self.L, self.Lr
-        Sgg_r = Sgg[..., :Lr, :Lr] if Sgg.shape[-1] != Lr else Sgg
-        Szg_r = Szg[..., :, :Lr] if Szg.shape[-1] != Lr else Szg
         batched = (Szz.dim() == 2)
         if not batched:
             N = N.reshape(1) if torch.is_tensor(N) else torch.as_tensor([float(N)])
-            Sgg_r, Szg_r, Szz = Sgg_r.unsqueeze(0), Szg_r.unsqueeze(0), Szz.unsqueeze(0)
-        N = N.to(self.lam0_diag.dtype).reshape(-1)
-        Sgg_r, Szg_r, Szz = (t.to(self.lam0_diag.dtype) for t in (Sgg_r, Szg_r, Szz))
+            Sgg, Szg, Szz = Sgg.unsqueeze(0), Szg.unsqueeze(0), Szz.unsqueeze(0)
+        dt = self.lam0_diag.dtype
+        N = N.to(dt).reshape(-1)
+        Sgg, Szg, Szz = (t.to(dt) for t in (Sgg, Szg, Szz))
+        if Sgg.shape[-1] == self.G and self.G != Lr:
+            ridx = torch.cat([torch.arange(0, L), torch.arange(L + self.Hp, self.G)]).to(Sgg.device)
+            hidx = torch.arange(L, L + self.Hp, device=Sgg.device)
+            if self.Hp > 0:
+                Cm = self.Cmean.to(dt)                                        # (L, Hp)
+                Szh = Szg[..., :, hidx]                                       # (b, L, Hp)
+                Shh = Sgg[..., hidx, :][..., :, hidx]                         # (b, Hp, Hp)
+                Shr = Sgg[..., hidx, :][..., :, ridx]                         # (b, Hp, Lr)
+                Szz = (Szz - 2.0 * torch.einsum("lh,blh->bl", Cm, Szh)
+                       + torch.einsum("lh,bhg,lg->bl", Cm, Shh, Cm))
+                Szg_r = Szg[..., :, ridx] - torch.einsum("lh,bhr->blr", Cm, Shr)
+            else:
+                Szg_r = Szg[..., :, ridx]
+            Sgg_r = Sgg[..., ridx, :][..., :, ridx]
+        else:
+            Sgg_r, Szg_r = Sgg[..., :Lr, :Lr], Szg[..., :, :Lr]
         lam0 = torch.diag(self.lam0_diag)
         eye = torch.eye(Lr, dtype=lam0.dtype, device=lam0.device)
         lam = lam0.unsqueeze(0) + Sgg_r + self.jitter * eye
         chol = torch.linalg.cholesky(lam)
         V = torch.cholesky_inverse(chol)
-        MN = torch.einsum("blg,bgh->blh", Szg_r, V)
+        M0 = self.M0.to(dt)
+        rhs = (M0 @ lam0).unsqueeze(0) + Szg_r
+        MN = torch.einsum("blg,bgh->blh", rhs, V)
         logdet_lam = 2.0 * torch.log(torch.diagonal(chol, dim1=-2, dim2=-1)).sum(-1)
         logdet_lam0 = torch.log(self.lam0_diag).sum()
         lamM = torch.einsum("bgh,blh->blg", lam, MN)
         MlamM = torch.einsum("blg,blg->bl", MN, lamM)
+        m0lam0m0 = torch.einsum("ir,rs,is->i", M0, lam0, M0).unsqueeze(0)
         _b0 = self._b0_rate() if hasattr(self, "_b0_rate") else self.b0
         b0 = _b0.expand(L).reshape(1, L) if _b0.dim() == 0 else _b0.reshape(1, L)
         a0 = float(self.a0)
         aN = a0 + 0.5 * N.reshape(-1, 1)
-        bN = torch.clamp(b0 + 0.5 * (Szz - MlamM), min=1e-12)
+        bN = torch.clamp(b0 + 0.5 * (Szz + m0lam0m0 - MlamM), min=1e-12)
         out = (-0.5 * N.reshape(-1, 1) * float(np.log(2.0 * np.pi))
                + 0.5 * (logdet_lam0 - logdet_lam).reshape(-1, 1)
                + a0 * torch.log(b0) - aN * torch.log(bN)
@@ -632,6 +663,48 @@ class SharedCarryRegimes(nn.Module):
         self._q_Udiag.copy_(trU.clamp_min(0.0))
         self.Ufac.copy_(self.Umean)
 
+    def _derive_u_prior_scale(self, b0: float, a0: float) -> float:
+        F = max(int(self.q_rank), 1)
+        return float(self.u_prior_mult) * float(b0) / max(float(a0) - 1.0, 1e-3) / F
+
+    @property
+    def u_prior_scale(self) -> float:
+        """Per-entry prior variance of U, derived from the current noise prior rate and
+        u_prior_mult.  Being a function of the b0 buffer it survives state_dict round trips and
+        cloning; it is not stored and cannot be assigned (change u_prior_mult instead)."""
+        b0 = self._b0_rate() if hasattr(self, "_b0_rate") else self.b0
+        b0m = float(b0.mean()) if torch.is_tensor(b0) else float(b0)
+        a0 = float(self.a0.reshape(-1)[0]) if torch.is_tensor(self.a0) else float(self.a0)
+        return self._derive_u_prior_scale(b0m, a0)
+
+    @torch.no_grad()
+    def set_b0(self, b0_new):
+        """Set the noise-prior rate b0 and keep everything derived from it consistent: the
+        learned-b0 prior, the low-rank prior scale, and the posterior of regimes that have no
+        statistics yet (regimes with evidence are refit from their statistics)."""
+        b0_new = torch.as_tensor(b0_new, dtype=self.b0.dtype, device=self.b0.device)
+        if self.b0.dim() == 0:
+            self.b0.copy_(b0_new.mean() if b0_new.dim() > 0 else b0_new)
+        else:
+            self.b0.copy_(b0_new.reshape(self.b0.shape) if b0_new.numel() == self.b0.numel()
+                          else b0_new.mean().expand_as(self.b0))
+        b0m = float(self.b0.mean())
+        self.b0_d0.copy_(torch.as_tensor(float(self.b0_c0) / max(b0m, 1e-12), dtype=self.b0_d0.dtype))
+        self.b0_dhat.copy_(self.b0_d0)
+        if self.q_rank > 0:
+            F = self.q_rank
+            fresh = (self.N <= 0)
+            eyeF = torch.eye(F, dtype=self.Ucov.dtype, device=self.Ucov.device)
+            prior_cov = (self.u_prior_scale * eyeF).expand(self.K, self.L, F, F)
+            self.Ucov.copy_(torch.where(fresh.view(-1, 1, 1, 1), prior_cov, self.Ucov))
+        if getattr(self, "_stats_initialised", False):
+            self.m_step()
+        else:
+            self.b.copy_(self._b0_rate().expand_as(self.b) if torch.is_tensor(self._b0_rate())
+                         else torch.full_like(self.b, float(self._b0_rate())))
+            if self.q_rank > 0:
+                self._refresh_lowrank_predictive_cache()
+
     @torch.no_grad()
     def reset_slot(self, k):
         k = int(k)
@@ -748,6 +821,7 @@ class SharedCarryRegimes(nn.Module):
             jitter=self.jitter, q_rank=self.q_rank, action_dim=self.action_dim,
             learn_b0=getattr(self, "learn_b0", False),
             b0_c0=float(getattr(self, "b0_c0", torch.tensor(2.0))),
+            u_prior_mult=float(getattr(self, "u_prior_mult", 1.0)),
             device=self.M.device, dtype=self.M.dtype,
         )
         if getattr(self, "learn_b0", False):

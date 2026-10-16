@@ -5,6 +5,7 @@ shs_demo/compare/results*/
 shs_demo/compare/figures*/
 shs_demo/compare/data_cache*/
 logdir/
+logdir_*/
 logs/
 slurm-*.out
 slurm-*.err

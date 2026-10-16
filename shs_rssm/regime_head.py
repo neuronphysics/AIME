@@ -30,6 +30,7 @@ class RegimeHead(nn.Module):
         learn_b0: bool = False, b0_strength: float = 2.0,
         identity_init: bool = True,
         q_rank: int = 0,
+        q_prior_mult: float = 1.0,
         shared_carry: bool = False,
         gamma: float = 5.0, alpha: float = 1.0, kappa: float = 50.0, start_alpha: float = 1.0,
         recurrent: bool = False, prior_persist: float = 0.9, pg_iters: int = 4,
@@ -57,6 +58,7 @@ class RegimeHead(nn.Module):
             action_dim=action_dim, a0=a0, b0=b0,
             learn_b0=learn_b0, b0_strength=b0_strength,
             v0_scale=v0_scale, ard=ard, identity_init=identity_init, q_rank=q_rank,
+            q_prior_mult=q_prior_mult,
             shared_carry=shared_carry, gamma=gamma, alpha=alpha, kappa=kappa,
             start_alpha=start_alpha, recurrent=recurrent, prior_persist=prior_persist,
             pg_iters=pg_iters, rstick_dim=rstick_dim, rstick_stopgrad=rstick_stopgrad,
@@ -83,6 +85,11 @@ class RegimeHead(nn.Module):
         self.ema_gate_ref = 0.0
         self.ema_gate_floor = 0.0
         self.forget_mode = "fixed"
+        self.init_blocks = False          # break the regime symmetry on the first global update
+        self.init_block_len = None        # mean block length in steps (default max(4, T // (2K)))
+        self.init_seed = 0
+        self.gate_clock = "occupancy"     # "occupancy": gate gain from responsibility share (paper);
+                                          # "redraw": legacy, from the redraw-count share
         self._drift = {}
         self._retention_last = {}
         self.online_mode = online_mode
@@ -126,7 +133,8 @@ class RegimeHead(nn.Module):
                 K=K, L=self.L, G=self.G, action_dim=self.action_dim,
                 a0=a0, b0=b0, learn_b0=learn_b0, b0_c0=b0_strength,
                 v0_scale=v0_scale, ard=ard,
-                identity_init=identity_init, q_rank=q_rank, dtype=dtype, device=device,
+                identity_init=identity_init, q_rank=q_rank, u_prior_mult=q_prior_mult,
+                dtype=dtype, device=device,
             )
         else:
             self.regimes = DiagARRegimes(
@@ -779,6 +787,9 @@ class RegimeHead(nn.Module):
                     stream_audit=dict(getattr(self, '_stream_audit', {}) or {}),
                     counts_initialised=bool(getattr(self, '_counts_initialised', False)),
                     stats_initialised=bool(getattr(self.regimes, '_stats_initialised', False)),
+                    init_blocks=bool(getattr(self, 'init_blocks', False)),
+                    init_blocks_done=bool(getattr(self, '_init_blocks_done', False)),
+                    n_reseeds=int(getattr(self, 'n_reseeds', 0)),
                     pg_init=bool(getattr(getattr(self, 'rstick', None), '_pg_init', False))
                     if getattr(self, 'rstick', None) is not None else False,
                     active_mask=(self.active_mask.tolist()
@@ -807,6 +818,10 @@ class RegimeHead(nn.Module):
         self._counts_initialised = bool(st.get("counts_initialised", False))
         if getattr(self, 'regimes', None) is not None:
             self.regimes._stats_initialised = bool(st.get("stats_initialised", False))
+        if "init_blocks" in st:          # a pending block init / re-seed survives a checkpoint
+            self.init_blocks = bool(st["init_blocks"])
+            self._init_blocks_done = bool(st.get("init_blocks_done", False))
+        self.n_reseeds = int(st.get("n_reseeds", 0))
         if getattr(self, 'rstick', None) is not None:
             self.rstick._pg_init = bool(st.get("pg_init", False))
         _am = st.get("active_mask", None)
@@ -1413,9 +1428,46 @@ class RegimeHead(nn.Module):
             return
         from .forgetting import (EmissionEvidence, GateEvidence, TransitionEvidence,
                                  memory_stats, stream_weights)
+        if (getattr(self, "init_blocks", False) and not getattr(self, "_init_blocks_done", False)
+                and not getattr(self.regimes, "_stats_initialised", False)):
+            # All regimes start identical, so the first E-step is uniform and every regime would
+            # receive the same statistics.  Seed them from random contiguous blocks instead.
+            gamma_b, tc_b, sc_b, xi = self._random_block_labels(gamma, is_first, valid)
+            if float(gamma_b.sum()) < 1.0:
+                # no valid step in this minibatch: keep the initialisation pending
+                self._estep = None
+                return
+            gamma, tc, sc = gamma_b, tc_b, sc_b
+            self._init_blocks_done = True
+            stats = self.regimes.stats_from_batch(
+                gamma.detach(), stoch.detach(), g.detach(),
+                z_var=None if z_var is None else z_var.detach(), g_z_var=g_z_var,
+                g_zcov=g_zcov, zg_xcov=xc,
+                z_cov=None if z_cov is None else z_cov.detach())
+            if self.recurrent:
+                # The recurrent model has two branches per step: persistence (the gate) and a
+                # redraw from the Dirichlet row.  Attribute the hard block path between them with
+                # the current gate potentials, exactly as the E-step attributes its pairwise
+                # marginals, so that the row counts (redraw mass only) and the gate's
+                # Polya-Gamma statistics describe the same path as the dynamics statistics.
+                with torch.no_grad():
+                    _, _, aux = self._transition_logpotentials(
+                        deter, dtype=deter.dtype, device=deter.device, action=action,
+                        is_first=is_first, z_mean=stoch, z_var=z_var)
+                with torch.no_grad():
+                    r_mass, row_weight, tc = self.rstick.attribute_bound(xi.to(aux["A"].dtype), aux)
+                tc = tc.detach().double()
+                self._estep = dict(
+                    phi_steps=aux["phi_steps"].detach(), r_mass=r_mass.detach(),
+                    row_weight=row_weight.detach(),
+                    sig=(r_mass / row_weight.clamp_min(1e-12)).detach(),
+                    is_first=is_first, valid=valid)
+            else:
+                self._estep = None
         evidence = getattr(self, "forget_mode", "fixed") == "evidence"
         tau_k, tau_row = self._ema_rates(stats["N"], tc, zero_use=evidence)
         u_k, u_row = self._usage(stats["N"], tc)
+        self._last_usage = u_k.detach()   # min(1, K share_k) of this minibatch, for diagnostics
         tau = max(float(self.ema_tau), 1e-300)
         rho_e = None
         if evidence and getattr(self.regimes, "_stats_initialised", False):
@@ -1451,14 +1503,95 @@ class RegimeHead(nn.Module):
             r_mass = es["r_mass"].reshape(-1, K)
             row_weight = es["row_weight"].reshape(-1, K)
             rho_g = None
+            # The gate of regime j is observed on every step spent in j (its Bernoulli trials),
+            # so its gain follows the occupancy share, as the destination rows follow the
+            # redraw share.  "redraw" keeps the legacy clock.
+            if getattr(self, "gate_clock", "occupancy") == "redraw":
+                tau_g, u_g = tau_row, u_row
+            else:
+                tau_g, u_g = tau_k, u_k
             if evidence and getattr(self.rstick, "_pg_init", False):
                 rs = self.rstick
                 st = rs.pg_stats_from_batch(phi, r_mass, row_weight)
                 rho_g = self._retain("gate", lambda: GateEvidence(
                     rs.sigma0_diag, rs.m0, rs.pg_A, rs.pg_h, st["A"], st["h"],
-                    *stream_weights(tau_row, tau)), u_row)
-            self.rstick.pg_update_statewise(phi, r_mass, row_weight, lr=tau_row, retain=rho_g)
+                    *stream_weights(tau_g, tau)), u_g)
+            self.rstick.pg_update_statewise(phi, r_mass, row_weight, lr=tau_g, retain=rho_g)
             self._estep = None
+
+    @torch.no_grad()
+    def reseed_regimes(self):
+        """Drop the regime statistics and the EMA transition counts so that the next global
+        update re-initialises them from random contiguous blocks of its minibatch (the
+        `init_blocks` path).  The regime parameters keep their current values until that update,
+        so the E-step of the current batch is unaffected.  The HDP stick posterior, the gate
+        posterior and the move buffer are kept: the first two adapt to the new counts at their
+        own rates, the buffer holds raw batches whose E-steps are recomputed.  Used by
+        `shs_reseed_at_calibration`."""
+        self.regimes._stats_initialised = False
+        self._counts_initialised = False
+        self._init_blocks_done = False
+        self.init_blocks = True
+        self._drift = {}
+        self._retention_last = {}
+        self.n_reseeds = int(getattr(self, "n_reseeds", 0)) + 1
+
+    @torch.no_grad()
+    def _random_block_labels(self, gamma, is_first, valid=None):
+        """Random contiguous block assignment of one minibatch to the active regimes, as in
+        init_from_random_blocks.  Returns (gamma, trans_counts, start_counts, xi): one-hot
+        responsibilities, all-link transition counts, start counts and the one-hot pairwise
+        path, in the shapes update_globals and the E-step use.  Links across chunk boundaries
+        and invalid steps are not counted."""
+        B, T, K = gamma.shape
+        dev = gamma.device
+        am = getattr(self, "active_mask", None)
+        slots = (am.nonzero().reshape(-1).cpu() if am is not None and int(am.sum()) > 0
+                 else torch.arange(K))
+        Ka = int(slots.numel())
+        g = torch.Generator().manual_seed(int(self.init_seed) + 7919 * int(K) + int(B) * int(T))
+        bl = int(self.init_block_len or max(4, T // (2 * Ka)))
+        lab = torch.zeros(B, T, dtype=torch.long)
+        for r in range(B):
+            pos, order, i = 0, slots[torch.randperm(Ka, generator=g)], 0
+            while pos < T:
+                n = int(torch.randint(max(1, bl // 2), 2 * bl + 1, (1,), generator=g).item())
+                lab[r, pos:pos + n] = order[i % Ka]
+                pos += n
+                i += 1
+        lab = lab.to(dev)
+        gam = torch.zeros(B, T, K, dtype=gamma.dtype, device=dev)
+        gam.scatter_(2, lab.unsqueeze(-1), 1.0)
+        isf = None if is_first is None else (is_first.reshape(B, T).to(dev) > 0.5)
+        val = None if valid is None else (valid.reshape(B, T).to(dev) > 0.5)
+        if val is not None:
+            gam = gam * val.unsqueeze(-1).to(gam.dtype)
+        cnt = torch.zeros(K, K, dtype=torch.float64, device=dev)
+        xi = torch.zeros(B, max(T - 1, 0), K, K, dtype=gamma.dtype, device=dev)
+        if T > 1:
+            link = torch.ones(B, T - 1, dtype=torch.bool, device=dev)
+            if isf is not None:
+                link &= ~isf[:, 1:]
+            if val is not None:
+                link &= val[:, 1:] & val[:, :-1]
+            a, b = lab[:, :-1][link], lab[:, 1:][link]
+            if a.numel():
+                cnt.view(-1).scatter_add_(0, a * K + b,
+                                          torch.ones(a.numel(), dtype=torch.float64, device=dev))
+            # one-hot pairwise path, in the layout of the E-step's xi (pair t-1 -> t at index t-1)
+            bi, ti = link.nonzero(as_tuple=True)
+            xi[bi, ti, lab[:, :-1][link], lab[:, 1:][link]] = 1.0
+        starts = torch.zeros(B, T, dtype=torch.bool, device=dev)
+        starts[:, 0] = True
+        if isf is not None:
+            starts |= isf
+        if val is not None:
+            starts &= val
+        sc = torch.zeros(K, dtype=torch.float64, device=dev)
+        s_lab = lab[starts]
+        if s_lab.numel():
+            sc.scatter_add_(0, s_lab, torch.ones(s_lab.numel(), dtype=torch.float64, device=dev))
+        return gam, cnt, sc, xi
 
     def _usage(self, n_batch, trans_batch):
         """Responsibility share of each regime and transition row relative to rho_ref, clipped to [0, 1]."""

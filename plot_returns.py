@@ -37,7 +37,8 @@ REFERENCE = {
 }
 
 # Run folders written by the launchers, relative to --logdir, one pattern per method.
-# Colour marks the forgetting rule; dashed = structure moves, dotted = Gaussian-latent DreamerV3.
+# Colour marks the method: forget rule, or a distinct hue when structure moves.
+# Dotted = Gaussian-latent DreamerV3.
 SHS = r"_shs(?P<moves>_moves)?_(?P<forget>gated|retain|fixed)"
 SUITES = {
     "carl": dict(at=1e6, rules=[
@@ -54,8 +55,9 @@ SUITES = {
         r"dreamer_(?P<dreamer>cat|gauss)/dmc_(?P<task>[a-z0-9_]+)/seed_?\d+"]),
 }
 FORGET_COLORS = {"gated": "#d62728", "retain": "#ff7f0e", "fixed": "#17becf"}
+MOVES_COLORS = {"gated": "#9467bd", "retain": "#e377c2", "fixed": "#8c564b"}
 DREAMER_COLOR = "#1f77b4"
-EXTRA_COLORS = ["#e377c2", "#8c564b", "#7f7f7f", "#bcbd22"]
+EXTRA_COLORS = ["#8c564b", "#7f7f7f", "#bcbd22", "#17becf"]
 
 
 def canon(task):
@@ -207,7 +209,7 @@ def task_key(suite, task):
 
 def run_dirs(logdir, depth=3):
     skip = {"train_eps", "eval_eps", "shs_diagnostics"}
-    for d, subdirs, files in os.walk(logdir):
+    for d, subdirs, files in os.walk(logdir, followlinks=True):
         rel = os.path.relpath(d, logdir).replace(os.sep, "/")
         level = 0 if rel == "." else rel.count("/") + 1
         subdirs[:] = [] if level >= depth else [s for s in subdirs if s not in skip and not s.startswith(".")]
@@ -230,8 +232,9 @@ def discover(logdir, suite):
                        color=DREAMER_COLOR, ls=":" if gauss else "-", rank=(3, gauss))
         else:
             moves = bool(g.get("moves")) or suite == "procgen" or (suite in ("atari", "dmc") and not g.get("fixedk"))
+            colors = MOVES_COLORS if moves else FORGET_COLORS
             arm = dict(label=f"SHS-RSSM, {g['forget']}" + (" + moves" if moves else ""),
-                       color=FORGET_COLORS[g["forget"]], ls="--" if moves else "-",
+                       color=colors[g["forget"]], ls="-",
                        rank=(list(FORGET_COLORS).index(g["forget"]), moves))
         found[g["task"]].setdefault(arm["label"], dict(arm, dirs=[]))["dirs"].append(d)
     return found

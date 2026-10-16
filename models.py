@@ -298,36 +298,49 @@ class WorldModel(nn.Module):
 
     @torch.no_grad()
     def shs_diagnostics(self, data, step, logdir, context=5, make_figures=True):
+        """Regime diagnostics on one replay batch.
+
+        The occupancy statistics (active regimes, entropy, effective regimes) are computed from
+        the regime posterior of every sequence over its full length, excluding the first step of
+        each sequence, whose responsibility comes from the initial-state distribution rather than
+        from the transition model.  
+        """
         if not hasattr(self.dynamics, "annotate_regime_resp"):
             return {}
         import pathlib
         data = self.preprocess(data)
         embed = self.encoder(data)
-        B = min(6, embed.shape[0])
+        B = embed.shape[0]
         T = embed.shape[1]
         ctx = min(context, T)
+        act = (data["action"] if getattr(self.dynamics, "_shs_action_dim", 0) > 0 else None)
 
-        states, prior = self.dynamics.observe(
-            embed[:B, :ctx], data["action"][:B, :ctx], data["is_first"][:B, :ctx]
-        )
-        self.dynamics.annotate_regime_resp(states, data["is_first"][:B, :ctx],
-                                          action=(data["action"][:B, :ctx] if getattr(self.dynamics, "_shs_action_dim", 0) > 0 else None))
+        states, prior = self.dynamics.observe(embed, data["action"], data["is_first"])
+        self.dynamics.annotate_regime_resp(states, data["is_first"], action=act)
         gamma = states["regime_resp"].float()
         stoch = states["stoch"].float()
 
-        occ = gamma.reshape(-1, gamma.shape[-1]).sum(0)
+        Kc = gamma.shape[-1]
+        keep = (1.0 - data["is_first"].reshape(B, T).float()) if T > 1 else torch.ones(B, T, device=gamma.device)
+        keep[:, 0] = 0.0
+        if float(keep.sum()) <= 0:
+            keep = torch.ones_like(keep)
+        occ = (gamma * keep.unsqueeze(-1)).reshape(-1, Kc).sum(0)
         occ = occ / occ.sum().clamp_min(1e-12)
         entropy = float(-(occ.clamp_min(1e-12) * occ.clamp_min(1e-12).log()).sum())
         active = int((occ > 0.01).sum().item())
+        effective = float(torch.clamp(Kc * occ, max=1.0).sum())
         Epi = self.dynamics.regime._Epi()
         self_trans = float(torch.diagonal(Epi).mean())
         metrics = {
             "shs_active_regimes": float(active),
             "shs_current_K": float(self.dynamics.regime.K),
             "shs_regime_entropy": entropy,
+            "shs_effective_regimes_diag": effective,
+            "shs_diag_steps": float(keep.sum()),
             "shs_expected_self_transition": self_trans,
         }
-        prior["is_first"] = data["is_first"][:B, :ctx]
+        prior["is_first"] = data["is_first"]
         if hasattr(self.dynamics, "prior_entropy_bounds"):
             _ent_lo, _ent_hi = self.dynamics.prior_entropy_bounds(prior)
             metrics["shs_prior_mixture_ent"] = float(_ent_lo.mean())
@@ -336,10 +349,12 @@ class WorldModel(nn.Module):
             metrics["shs_prior_mixture_ent"] = float(self.dynamics.prior_entropy(prior).mean())
         if hasattr(self.dynamics, "curriculum_state"):
             metrics.update(self.dynamics.curriculum_state())
-        metrics.update(self._shs_imagination_multimodality(states, data["action"][:B, :ctx]))
+        metrics.update(self._shs_imagination_multimodality(states, data["action"]))
 
         if not make_figures:
             return metrics
+        # figures: reconstruction of a short context followed by open-loop prediction
+        states = {k: v[:, :ctx] for k, v in states.items()}
 
         try:
             from shs_rssm import shs_diagnostics as D

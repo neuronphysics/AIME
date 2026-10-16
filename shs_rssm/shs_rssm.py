@@ -83,6 +83,13 @@ class SHSRSSM(networks.RSSM):
                  shs_ema_gate_floor: float = 0.0,
                  shs_forget_mode: str = "fixed",
                  shs_schedule_unit: str = "agent",
+                 shs_init_blocks: bool = False,
+                 shs_init_block_len: int | None = None,
+                 shs_q_prior_mult: float = 1.0,
+                 shs_gate_clock: str = "occupancy",
+                 shs_calibrate_b0_at: int = -1,
+                 shs_reseed_at_calibration: bool = False,
+                 shs_reseed_grace_env: float = 0.0,
                  **kwargs):
         self._grad_per_env = (float(shs_grad_per_env)
                               if shs_grad_per_env else None)
@@ -120,7 +127,7 @@ class SHSRSSM(networks.RSSM):
             rstick_weight_var=shs_rstick_weight_var,
             rstick_bias_var=shs_rstick_bias_var,
             rstick_use_action=shs_rstick_use_action,
-            q_rank=shs_q_rank, shared_carry=shs_shared_carry,
+            q_rank=shs_q_rank, q_prior_mult=shs_q_prior_mult, shared_carry=shs_shared_carry,
             gate_input=shs_gate_input, gate_inner_iters=shs_gate_inner_iters,
             action_dim=shs_action_dim,
             online_mode=shs_online_mode, expected_batches=shs_expected_batches,
@@ -217,6 +224,26 @@ class SHSRSSM(networks.RSSM):
         self._shs_calibrate_b0 = bool(shs_calibrate_b0)
         self._shs_calibrate_sF = float(shs_calibrate_sF)
         self._shs_b0_calibrated = False
+        # grad step at which the noise prior is calibrated from data.  A negative value (default)
+        # keeps the original timing, the first curriculum boundary (now in frames, so it is
+        # reached on every task); n >= 1 calibrates at grad step n (1 = first minibatch).
+        self._shs_calibrate_b0_at = int(shs_calibrate_b0_at)
+        # Re-seed the regime head when b0 is calibrated: drop the regime statistics and EMA
+        # counts and re-initialise them from random blocks of that minibatch, i.e. the regimes
+        # are seeded on a trained representation instead of on the random encoder of step 1.
+        self._shs_reseed_at_calibration = bool(shs_reseed_at_calibration)
+        # Grace period after a re-seed (environment steps, converted like the curriculum keys):
+        # no structure sweep, and therefore no deletion, until it has elapsed and the seeded
+        # statistics have been installed.  Sweeps are scheduled on the absolute grad step, so
+        # without this the first sweep after a re-seed can come within a few hundred updates.
+        self._shs_reseed_grace_env = float(shs_reseed_grace_env)
+        self._reseed_step = None
+        self.regime.init_blocks = bool(shs_init_blocks)
+        self.regime.init_block_len = (None if shs_init_block_len is None
+                                      else int(shs_init_block_len))
+        if str(shs_gate_clock) not in ("occupancy", "redraw"):
+            raise ValueError(f"shs_gate_clock must be 'occupancy' or 'redraw', got {shs_gate_clock!r}")
+        self.regime.gate_clock = str(shs_gate_clock)
         self.regime.chunk_boundary_mask = bool(shs_chunk_boundary_mask)
         self.regime.ema_gate = bool(shs_ema_gate)
         self.regime.ema_gate_ref = float(shs_ema_gate_ref)
@@ -257,6 +284,8 @@ class SHSRSSM(networks.RSSM):
             if "move_every_env" in _p:
                 _p["move_every"] = (0 if float(_p["move_every_env"]) <= 0
                                     else self._env2gs(_p["move_every_env"]))
+        self._reseed_grace_gs = (0 if self._shs_reseed_grace_env <= 0
+                                 else int(self._env2gs(self._shs_reseed_grace_env)))
         if self._grad_per_env is not None and self._curriculum:
             print("[SHS] schedule units: %s steps, grad/step=%.5f  curriculum(grad-steps)=%s"
                   % (self._shs_schedule_unit, self._grad_per_env,
@@ -468,6 +497,15 @@ class SHSRSSM(networks.RSSM):
         if _g is not None:
             out["shs_ema_gate_mean"] = float(_g.mean())
             out["shs_ema_gate_at_floor"] = float((_g <= float(self.regime.ema_gate_floor) + 1e-12).sum())
+        _u = getattr(self.regime, "_last_usage", None)
+        if _u is not None:
+            # sum_k min(1, K share_k) over the last global update: 1 = one regime holds all mass
+            out["shs_effective_regimes"] = float(_u.sum())
+        out["shs_reseeds"] = float(getattr(self.regime, "n_reseeds", 0))
+        out["shs_reseed_grace_skips"] = float(getattr(self, "_shs_grace_skips", 0))
+        out["shs_live_sweeps"] = float(getattr(self, "_n_live_sweeps", 0))
+        for _reason, _n in (getattr(self.regime.hdp, "guard_reject_reasons", None) or {}).items():
+            out[f"shs_hdp_reject_{_reason.split(':')[0]}"] = float(_n)
         _errs = []
         for _f, _info in (getattr(self.regime, "_retention_last", None) or {}).items():
             out[f"shs_retention_{_f}_mean"] = float(_info["r"].mean())
@@ -514,7 +552,9 @@ class SHSRSSM(networks.RSSM):
         a0 = float(reg.a0) if not torch.is_tensor(reg.a0) else float(reg.a0.reshape(-1)[0])
         b_new = self._shs_calibrate_sF * (a0 - 1.0) * var
         old = float(reg.b0.reshape(-1)[0]) if torch.is_tensor(reg.b0) else float(reg.b0)
-        if torch.is_tensor(reg.b0):
+        if hasattr(reg, "set_b0"):
+            reg.set_b0(b_new.mean() if (torch.is_tensor(reg.b0) and reg.b0.dim() == 0) else b_new)
+        elif torch.is_tensor(reg.b0):
             tgt = b_new.to(reg.b0.dtype)
             reg.b0.copy_(tgt.mean() if reg.b0.dim() == 0
                          else tgt.reshape(reg.b0.shape))
@@ -550,10 +590,19 @@ class SHSRSSM(networks.RSSM):
         deter = post["deter"].float()
         self._shs_step += 1
 
-        _b0_at = int(self._curriculum[0].get("until", 0)) if self._curriculum else 0
+        if self._shs_calibrate_b0_at >= 0:
+            _b0_at = int(self._shs_calibrate_b0_at)
+        else:
+            _b0_at = int(self._curriculum[0].get("until", 0)) if self._curriculum else 0
         if (self._shs_calibrate_b0 and not self._shs_b0_calibrated
                 and self._shs_step >= max(1, _b0_at)):
             self._calibrate_noise_prior(q_mean, is_first)
+            if self._shs_reseed_at_calibration and hasattr(self.regime, "reseed_regimes"):
+                self.regime.reseed_regimes()
+                self._reseed_step = int(self._shs_step)
+                print("[SHS] regime head re-seeded at grad step %d: statistics and EMA counts "
+                      "dropped, the next global update starts from random blocks; structure "
+                      "sweeps resume after %d grad steps" % (self._shs_step, self._reseed_grace_gs))
 
         _pz = stoch if getattr(self, "_shs_moment_consistent", True) else None
 
@@ -599,6 +648,7 @@ class SHSRSSM(networks.RSSM):
                 print(f"[SHS] first structure sweep (shs_move_first={self._move_first}) "
                       f"@ grad-step {self._shs_step}")
             self._move_first_pending = False
+            self._n_live_sweeps = int(getattr(self, "_n_live_sweeps", 0)) + 1
             with torch.no_grad():
                 _grow = self._move_K_cap is None or int(self.regime.K) < self._move_K_cap
                 self._last_move_log = sweep_moves(
@@ -800,6 +850,15 @@ class SHSRSSM(networks.RSSM):
                 self._shs_stale_dropped = getattr(self, "_shs_stale_dropped", 0) + dropped
         except Exception:
             pass
+        # a pending or recent re-seed blocks sweeps (and with them delete_empty)
+        R = self.regime
+        if getattr(R, "init_blocks", False) and not getattr(R, "_init_blocks_done", False) \
+                and not getattr(R.regimes, "_stats_initialised", False):
+            self._shs_grace_skips = getattr(self, "_shs_grace_skips", 0) + 1
+            return False
+        if self._reseed_step is not None and self._shs_step < self._reseed_step + self._reseed_grace_gs:
+            self._shs_grace_skips = getattr(self, "_shs_grace_skips", 0) + 1
+            return False
         enough = len(buf.batches) >= int(getattr(self, "_shs_min_live_batches", 4))
         store = getattr(self.regime, "stat_store", None)
         ema_mode = (store is None) or (store.mode == "legacy_ema")
@@ -817,7 +876,8 @@ class SHSRSSM(networks.RSSM):
                     shs_step=int(self._shs_step), phase=int(self._curr_phase),
                     K=int(self.regime.K),
                     move_first_pending=bool(getattr(self, "_move_first_pending", False)),
-                    move_K_cap=getattr(self, "_move_K_cap", None))
+                    move_K_cap=getattr(self, "_move_K_cap", None),
+                    reseed_step=self._reseed_step)
 
     def load_live_state(self, live, runtime=None, encoder=None):
         """Restore the non-tensor runtime saved by live_state() and the teacher, if any."""
@@ -826,6 +886,8 @@ class SHSRSSM(networks.RSSM):
         regime = self.regime
         if "shs_step" in live:
             self._shs_step = int(live["shs_step"])
+        if "reseed_step" in live:
+            self._reseed_step = None if live["reseed_step"] is None else int(live["reseed_step"])
         self._shs_b0_calibrated = bool(live.get("b0_calibrated",
                                                 runtime.get("b0_calibrated", self._shs_b0_calibrated)))
         if "recurrent" in live and getattr(regime, "rstick", None) is not None:

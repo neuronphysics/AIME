@@ -117,10 +117,16 @@ class CARL:
                 print(
                     f"[carl] PhysicsError: context_id={self.context_id}, "
                     f"context={self.context}, repeat_substep={substep + 1}, "
-                    f"action={np.asarray(action).tolist()}",
+                    f"action={np.asarray(action).tolist()}; ending the episode",
                     flush=True,
                 )
-                raise
+                raw, _ = self._env.reset()
+                obs = self._obs(raw, is_first=False, is_terminal=True)
+                info = {
+                    "discount": np.array(0.0, np.float32),
+                    "context_id": self._env.context_id,
+                }
+                return obs, reward, True, info
             reward += float(r)
             if terminated or truncated:
                 break
