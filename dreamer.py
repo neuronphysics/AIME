@@ -96,6 +96,10 @@ class Dreamer(nn.Module):
                 if self._config.video_pred_log:
                     openl = self._wm.video_pred(next(self._dataset))
                     self._logger.video("train_openl", to_np(openl))
+                # open-loop prediction error on a replay batch, within episodes only
+                for _k, _v in models.openl_summary(
+                        [self._wm.openl_error(next(self._dataset))]).items():
+                    self._logger.scalar(_k, _v)
                 if getattr(self._config, "use_shs", False) and \
                         getattr(self._config, "shs_diag_log", False):
                     shs_metrics = self._wm.shs_diagnostics(
@@ -364,7 +368,7 @@ SCHEDULES = ("_should_log", "_should_train", "_should_reset")
 RUN_CONTROL_KEYS = frozenset((
     "logdir", "traindir", "evaldir", "offline_traindir", "offline_evaldir", "steps", "eval_every",
     "eval_episode_num", "log_every", "video_pred_log", "shs_diag_log", "shs_diag_figures",
-    "device", "compile", "parallel", "debug"))
+    "device", "compile", "parallel", "debug", "checkpoint_at"))
 
 
 class StopRequest:
@@ -653,6 +657,12 @@ def main(config):
                 set_rng_state(checkpoint["rng"])
         del _sd
     checkpoint = None
+    # checkpoint_at: frame counts at which one extra copy of the checkpoint is kept
+    # (checkpoint_<frames>.pt), written by the first save after the run passes that count, so
+    # that runs can be compared at a common budget after they have moved on.
+    keep_marks = sorted({int(float(v)) for v in
+                         str(getattr(config, "checkpoint_at", "") or "").replace(",", " ").split()})
+    saved_at = [int(logger.step)]
 
     def save_checkpoint(train_remaining):
         metrics = logdir / "metrics.jsonl"
@@ -692,6 +702,13 @@ def main(config):
                                   if isinstance(_probe, dict) else None),
             }
         atomic_save(items_to_save, logdir / "latest.pt")
+        now = int(logger.step)
+        for frames in keep_marks:
+            keep = logdir / f"checkpoint_{frames}.pt"
+            if saved_at[0] < frames <= now and not keep.exists():
+                atomic_save(items_to_save, keep)
+                print(f"[checkpoint] kept {keep.name} at {now} frames")
+        saved_at[0] = now
 
     try:
         while remaining > 0 or agent._step < config.steps + config.eval_every:
@@ -715,6 +732,12 @@ def main(config):
                     if config.video_pred_log:
                         video_pred = agent._wm.video_pred(next(eval_dataset))
                         logger.video("eval_openl", to_np(video_pred))
+                    # The same open-loop error on the episodes of this evaluation round, which
+                    # are not in the training replay (CARL: the held-out contexts, each weighing
+                    # the same).  Eight batches; written with the next log line.
+                    _parts = [agent._wm.openl_error(next(eval_dataset)) for _ in range(8)]
+                    for _k, _v in models.openl_summary(_parts, "eval_").items():
+                        logger.scalar(_k, _v)
                 remaining = config.eval_every
                 print("Start training.")
             else:

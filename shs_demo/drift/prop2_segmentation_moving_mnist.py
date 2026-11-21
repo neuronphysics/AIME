@@ -135,7 +135,7 @@ class SwitchingCoreND:
         self.start = self.prior_start + stats["start"]
         self.gate.pg_set_totals(stats["pg_A"], stats["pg_h"])
         if getattr(self.gate, "n_pg_guard_rejects", 0):
-            raise FloatingPointError("AIME gate rejected an update")
+            raise FloatingPointError("SHS-RSSM gate rejected an update")
         if not torch.isfinite(self.dyn.M).all() or not (self.dyn.b > 0).all():
             raise FloatingPointError("Invalid conjugate refit")
 
@@ -471,8 +471,8 @@ def plot_main(out,cfg):
     style={f"ema_{MAIN_TAU:g}":("ema",rf"EMA ($\tau={MAIN_TAU:g}$)"),"svb":("svb","Streaming VB"),
            "pp":("pp",rf"Power prior ($\rho={1-MAIN_TAU:g}$)"),
            "window":("window",rf"Window ($W={window_len(MAIN_TAU)}$)"),
-           "gated":("gated","Gated EMA (AIME)"),
-           "retain":("retain","Gated EMA + change-point retention (AIME)")}
+           "gated":("gated","Gated EMA (SHS-RSSM)"),
+           "retain":("retain","Gated EMA + change-point retention (SHS-RSSM)")}
 
     fig,axs=plt.subplots(1,3,figsize=(13.2,3.8),gridspec_kw={"width_ratios":[1.05,1.2,1.05]})
     fig.subplots_adjust(wspace=.32,bottom=.24)
@@ -536,8 +536,8 @@ def plot_sensitivity(out,cfg):
     for nm,fam,lab in [("svb","svb","Streaming VB"),
                        ("pp","pp",rf"Power prior ($\rho={1-MAIN_TAU:g}$)"),
                        ("window","window",rf"Window ($W={window_len(MAIN_TAU)}$)"),
-                       ("gated","gated",rf"Gated EMA (AIME), $\tau={MAIN_TAU:g}$"),
-                       ("retain","retain",rf"Gated EMA + retention (AIME), $\tau={MAIN_TAU:g}$")]:
+                       ("gated","gated",rf"Gated EMA (SHS-RSSM), $\tau={MAIN_TAU:g}$"),
+                       ("retain","retain",rf"Gated EMA + retention (SHS-RSSM), $\tau={MAIN_TAU:g}$")]:
         ax.axhline(refs[nm][0],color=COLOR[fam],ls=LINESTYLE[fam],lw=1.25,label=lab)
     ax.axvline(MAIN_TAU,color=".45",lw=.8,ls=":",zorder=0)
     ax.set_xscale("log");ax.set_xlabel(r"EMA gain $\tau$");ax.set_ylabel("Mean NLL in the drift window")

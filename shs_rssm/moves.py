@@ -454,9 +454,99 @@ def _rowmap_keep(K_old, keep, sum_into=None, device=None):
     return M
 
 
-def _rowmap_append(K_old, m, device=None):
-    return torch.cat([torch.eye(K_old, dtype=torch.float64, device=device),
-                      torch.zeros(m, K_old, dtype=torch.float64, device=device)], 0)
+def _rowmap_append(K_old, m, device=None, retain=None):
+    """Row map of a growth move: the K_old live regimes keep their rows, m newborn rows are
+    seeded from the candidate.  `retain` (K_old,) is the share of its memory that each live
+    regime keeps (see `_retained_share`); without it live rows are copied unchanged, so the
+    installed model holds the old memory plus the newborns' seed."""
+    top = torch.eye(K_old, dtype=torch.float64, device=device)
+    if retain is not None:
+        top = torch.diag(retain.to(dtype=torch.float64, device=device).reshape(-1))
+    return torch.cat([top, torch.zeros(m, K_old, dtype=torch.float64, device=device)], 0)
+
+
+@torch.no_grad()
+def _window_gamma(head, b, regimes, hdp, rstick):
+    """Regime responsibilities of one window batch under (regimes, hdp, rstick); the E-step of
+    `_accumulate` without the statistics.  Invalid steps carry zero responsibility."""
+    prev = head._prev_stoch(b.stoch, b.is_first)
+    act = getattr(b, "action", None)
+    g = head.build_g(prev, b.deter, head._shift_action(act, b.is_first))
+    g_var = head._g_var_from_z_var(b.z_var, g, is_first=b.is_first)
+    ev = regimes.expected_loglik(b.stoch, g, z_var=b.z_var, g_var=g_var).double()
+    log_init, log_trans, _ = head._score_potentials(
+        b.deter, hdp, rstick, action=act, is_first=b.is_first,
+        z_mean=b.stoch, z_var=getattr(b, 'z_var', None))
+    vm = head._chunk_valid(getattr(b, "valid", None), b.is_first,
+                           b.stoch.shape[0], b.stoch.shape[1],
+                           b.stoch.dtype, b.stoch.device,
+                           episode_first=getattr(b, "episode_first", None))
+    return forward_backward(
+        log_init, log_trans, ev, is_first=b.is_first, valid=vm,
+        assume_start_at_t0=not bool(getattr(head, "chunk_boundary_mask", True)))[0].double()
+
+
+@torch.no_grad()
+def _retained_share(head, buf, cand_reg, cand_hdp, cand_rs, K_old):
+    """Share of its memory that each live regime keeps when a growth move is installed in remap
+    mode (head.move_remap_retain, config shs_move_remap_retain).
+
+    A newborn is seeded with its window statistics at the scale of the memory (window total /
+    number of window batches).  The time steps it takes are held by live regimes now, so their
+    mass is taken out of those regimes' memory: live regime k hands over
+
+        x_k = scale * sum over the window of  resp_live(t, k) * resp_candidate(t, newborns)
+
+    the mass of the newborns' time steps that the live model attributes to k.  The x_k add up
+    to the mass the newborns are seeded with, so the total emission mass of the model is the
+    same before and after the move.  All statistics of one regime (dynamics moments, transition
+    rows and columns, start count, gate statistics) are scaled together by 1 - x_k / N_memory_k:
+    its data moments keep their proportions, so its fit to its own data is unchanged, while its
+    posterior moves towards the prior by as much as the fixed prior weighs more against less
+    evidence.  This is a redistribution of mass, not a reconstruction of the statistics the
+    candidate was scored with: transition and start counts follow the same shares and are
+    conserved only approximately.  A regime cannot hand over more than it holds; only if its
+    memory is smaller than x_k does the total grow.  Only for the replay-EMA statistics;
+    None = live regimes are copied unchanged."""
+    if not bool(getattr(head, "move_remap_retain", False)):
+        return None
+    if getattr(head, "stat_store", None) is not None:
+        return None
+    if str(getattr(head, "_commit_mode", "remap")) != "remap":
+        return None
+    if getattr(head.regimes, "_residual_only", False):
+        return None
+    scale = getattr(head, "_commit_scale", None)
+    scale = 1.0 if scale is None else float(scale)
+    mem = head.regimes.N.detach().to(torch.float64).reshape(-1)
+    nc = cand_reg.N.detach().to(torch.float64).reshape(-1)
+    if mem.numel() != K_old or nc.numel() <= K_old:
+        return None
+    born = scale * float(nc[K_old:].clamp_min(0.0).sum())
+    if not born > 0.0:
+        return None
+    live_rs = _clone_rstick(_head_rstick(head), K_old)
+    x = torch.zeros(K_old, dtype=torch.float64, device=mem.device)
+    try:
+        for b in buf.batches:
+            g_live = _window_gamma(head, b, head.regimes, head.hdp, live_rs)
+            g_cand = _window_gamma(head, b, cand_reg, cand_hdp, cand_rs)
+            x += torch.einsum("bt,btk->k", g_cand[..., K_old:].sum(-1), g_live).to(x.device)
+    except (RuntimeError, ValueError) as err:
+        # never lose a run over the bookkeeping of a move: install it the old way and say so
+        head._handover_failures = int(getattr(head, "_handover_failures", 0)) + 1
+        if head._handover_failures == 1:
+            print(f"[SHS] hand-over of a growth move could not be computed ({err}); "
+                  "live regimes are copied unchanged for this move")
+        return None
+    tot = float(x.sum())
+    if not (tot > 0.0 and bool(torch.isfinite(x).all())):
+        return None
+    x = x * (born / tot)                 # exactly the mass the newborns are seeded with
+    left = (mem - x).clamp_min(0.0)
+    f = torch.where(mem > 0.0, left / mem.clamp_min(1e-30), torch.ones_like(mem))
+    f = torch.nan_to_num(f, nan=1.0, posinf=1.0, neginf=1.0)
+    return f.clamp(1e-6, 1.0)
 
 
 def _remap_commit(head, regimes, hdp, C, start, rstick, row_map, scale):
@@ -492,7 +582,10 @@ def _apply(head, regimes, hdp, C, start, rstick=None, row_map=None, scored_bound
     if row_map is None and regimes.K >= K_old:
         row_map = torch.zeros(regimes.K, K_old, dtype=torch.float64)
         row_map[:K_old, :K_old] = torch.eye(K_old, dtype=torch.float64)
-    advance_belief_generation(head, row_map)
+    # A regime belief follows the structure (which old regime became which new one), not the
+    # share of memory a regime keeps: a fractional entry of the row map counts as 1 here.
+    advance_belief_generation(head, None if row_map is None
+                              else (row_map > 0).to(row_map.dtype))
     if getattr(head, "rstick", None) is not None:
         if rstick is not None:
             head.rstick = rstick
@@ -999,14 +1092,20 @@ def seqcreate_birth_move(head, stoch=None, deter=None, is_first=None, *, buffer=
     if not idx_map:
         return False, 0.0
     any_accept, total_gain = False, 0.0
+    # Passes of the candidate over the whole window after the newborns were fitted on their own
+    # sequence (head.birth_full_refine, config shs_birth_full_refine).  The base gets the same
+    # number, so the gain compares two models refit equally often.
+    n_full = max(0, int(getattr(head, "birth_full_refine", 1)))
+    base = None          # bound of the refit current structure; valid until a birth is committed
 
     for n in rng.permutation(len(idx_map))[:max(1, int(n_proposals))]:
         K = head.K
         if K + 2 > K_max:
             break
         live_rs = _head_rstick(head)
-        base_rs = _clone_rstick(live_rs, K)
-        base, _, _, _, _ = _fit_score(head, head.regimes, head.hdp, buf, iters=1, rstick=base_rs)
+        if base is None:
+            base, _, _, _, _ = _fit_score(head, head.regimes, head.hdp, buf, iters=1 + n_full,
+                                          rstick=_clone_rstick(live_rs, K))
         bi, row = idx_map[int(n)]
         b = buf.batches[bi]
         gamma, _, _, _ = head.regime_inference(
@@ -1048,11 +1147,19 @@ def seqcreate_birth_move(head, stoch=None, deter=None, is_first=None, *, buffer=
                               device=bb.stoch.device)
                 for i, bb in enumerate(buf.batches)}
         comp[bi][row] = False
-        fr_agg, fr_C, fr_s, _ = _accumulate(head, buf, head.regimes, head.hdp,
-                                            rstick=base_rs, row_mask=comp)
+        # same E-step as the first pass of the base (live regimes, live HDP, live gate), on
+        # every sequence but the target one
+        fr_agg, fr_C, fr_s, fr_pg = _accumulate(head, buf, head.regimes, head.hdp,
+                                                rstick=_clone_rstick(live_rs, K),
+                                                row_mask=comp)
         fr_agg = _pad_stats(fr_agg, 2)
         fr_C = torch.nn.functional.pad(fr_C, (0, 2, 0, 2))
         fr_s = torch.nn.functional.pad(fr_s, (0, 2))
+        if fr_pg is not None:
+            # gate trials of every other sequence of the window (fixed); the newborns have none
+            fr_pg = dict(phi=fr_pg["phi"],
+                         r_mass=torch.nn.functional.pad(fr_pg["r_mass"], (0, 2)),
+                         row_weight=torch.nn.functional.pad(fr_pg["row_weight"], (0, 2)))
 
         only = {bi: torch.zeros(b.stoch.shape[0], dtype=torch.bool,
                                 device=b.stoch.device)}
@@ -1071,25 +1178,43 @@ def seqcreate_birth_move(head, stoch=None, deter=None, is_first=None, *, buffer=
         agg = {k: fr_agg[k] + t_agg[k] for k in fr_agg}
         regimes, hdp = _candidate(head, agg, fr_C + t_C, fr_s + t_s, K + 2)
 
+        t_pg = None
         for _ in range(int(n_refine)):
             t_agg, t_C, t_s, t_pg = _accumulate(head, buf, regimes, hdp,
                                                 rstick=cand_rs, row_mask=only)
-            if (getattr(head, 'recurrent', False) and cand_rs is not None
-                    and t_pg is not None):
-                cand_rs.pg_update_statewise(t_pg["phi"], t_pg["r_mass"],
-                                            t_pg["row_weight"], lr=None)
             agg = {k: fr_agg[k] + t_agg[k] for k in fr_agg}
             regimes = regimes.clone_with_K(K + 2, agg)
             hdp = hdp.resized_like(K + 2)
             hdp.update(fr_C + t_C, fr_s + t_s, n_global_iters=1)
+        if (getattr(head, 'recurrent', False) and cand_rs is not None
+                and t_pg is not None):
+            # The gate of every regime is refit once, on all of its trials in the window: those
+            # of the other sequences (fixed) and those of the target sequence.  The base gets
+            # one such refit per pass too, so the two are compared on equal terms.  (It used to
+            # be refit after every pass on the target sequence alone, which replaced the gate
+            # of each regime present there by a fit on a few dozen trials.)
+            pg_all = t_pg if fr_pg is None else {
+                k: torch.cat([fr_pg[k].to(t_pg[k].dtype), t_pg[k]], 0) for k in t_pg}
+            cand_rs.pg_update_statewise(pg_all["phi"], pg_all["r_mass"],
+                                        pg_all["row_weight"], lr=None)
 
+        C_c, s_c = fr_C + t_C, fr_s + t_s
+        if n_full > 0:
+            # Let the newborns compete for every sequence of the window.  Fitted on one segment
+            # only, a newborn is installed with that segment's statistics divided by the number
+            # of window batches, which is less than one observation: an empty slot.
+            regimes, hdp, C_c, s_c = _refine(head, regimes, hdp, buf, iters=n_full,
+                                             rstick=cand_rs)
         cand = aggregate_bound(head, buf, regimes=regimes, hdp=hdp, rstick=cand_rs)
         if _accept(cand, base, K + 2, K, threshold, size_log_prior_odds) \
-                and _commit(head, regimes, hdp, fr_C + t_C, fr_s + t_s, kind="grow",
+                and _commit(head, regimes, hdp, C_c, s_c, kind="grow",
                             check=commit_check, rstick=cand_rs, scored_bound=cand,
-                            row_map=_rowmap_append(K, 2, device=head.z0.device)):
+                            row_map=_rowmap_append(
+                                K, 2, device=head.z0.device,
+                                retain=_retained_share(head, buf, regimes, hdp, cand_rs, K))):
             any_accept = True
             total_gain += cand - base
+            base = None
     return any_accept, total_gain
 
 
@@ -1218,7 +1343,9 @@ def interval_birth_move(head, stoch=None, deter=None, is_first=None, *, buffer=N
     if _accept(cand, base, K + 2, K, threshold, size_log_prior_odds) \
             and _commit(head, regimes, hdp, Cc, sc, kind="grow", check=commit_check,
                         rstick=cand_rs, scored_bound=cand,
-                        row_map=_rowmap_append(K, 2, device=head.z0.device)):
+                        row_map=_rowmap_append(
+                            K, 2, device=head.z0.device,
+                            retain=_retained_share(head, buf, regimes, hdp, cand_rs, K))):
         return True, cand - base
     return False, cand - base
 
@@ -1290,7 +1417,9 @@ def birth_move(head, stoch=None, deter=None, is_first=None, *, buffer=None,
     if _accept(cand, base, K + 1, K, threshold, size_log_prior_odds) \
             and _commit(head, regimes, hdp, Cc, sc, kind="grow", check=commit_check,
                         rstick=cand_rs, scored_bound=cand,
-                        row_map=_rowmap_append(K, 1, device=head.z0.device)):
+                        row_map=_rowmap_append(
+                            K, 1, device=head.z0.device,
+                            retain=_retained_share(head, buf, regimes, hdp, cand_rs, K))):
         return True, cand - base
     return False, cand - base
 
@@ -1393,7 +1522,9 @@ def split_move(head, stoch=None, deter=None, is_first=None, *, buffer=None,
         if _accept(cand, base, K + 1, K, threshold, size_log_prior_odds) \
                 and _commit(head, regimes, hdp, Cc, sc, kind="grow", check=commit_check,
                             rstick=cand_rs, scored_bound=cand,
-                            row_map=_rowmap_append(K, 1, device=head.z0.device)):
+                            row_map=_rowmap_append(
+                                K, 1, device=head.z0.device,
+                                retain=_retained_share(head, buf, regimes, hdp, cand_rs, K))):
             return True, float(cand - base)
     return False, 0.0
 
@@ -1488,8 +1619,8 @@ def sweep_moves(head, stoch=None, deter=None, is_first=None, *, buffer=None,
         head._holdout_base_score = float(state["pred"].mean())
 
     def check(kind):
-        rec = dict(kind=kind, ok=False, fit_gain=float("nan"), n=0,
-                   mean=float("nan"), se=float("nan"))
+        rec = dict(kind=kind, move=getattr(head, "_move_name", None), ok=False,
+                   fit_gain=float("nan"), n=0, mean=float("nan"), se=float("nan"))
         head._commit_checks.append(rec)
         installed = None
         if installed_mode:
@@ -1525,22 +1656,30 @@ def sweep_moves(head, stoch=None, deter=None, is_first=None, *, buffer=None,
         check = None
 
     if delete_empty:
+        head._move_name = "empty"
         _removed = remove_empty_regimes(head, buf, occupancy=_occ, threshold=float(shrink_threshold),
                                         size_log_prior_odds=s, commit_check=check)
         log["empty"] = (bool(_removed), float(len(_removed)))
 
+    head._move_name = "merge"
     log["merge"] = _verify("merge", merge_move(
         head, buffer=buf, threshold=float(shrink_threshold), refine_iters=cheap,
         confirm_top=confirm_top, size_log_prior_odds=s, merge_select=merge_select,
         max_passes=merge_passes, merge_topm=merge_topm, commit_check=check))
+    head._move_name = "delete"
     log["delete"] = _verify("delete", delete_move(
         head, buffer=buf, threshold=float(shrink_threshold), size_log_prior_odds=s,
         refine_iters=cheap, mode=delete_mode, delete_topk=delete_topk, commit_check=check))
     if do_birth:
+        head._move_name = "birth"
         if birth_style == "seqcreate":
+            # The window of a seqcreate birth is drawn at random.  Seed the draw from the sweep
+            # (lap, K, window size) so that a run is reproducible; it used an unseeded generator.
+            _bseed = (int(round(1000.0 * float(head._lap))) * 7919 + 104729 * int(head.K)
+                      + len(buf.batches)) % (2 ** 31 - 1)
             log["birth"] = _verify("birth", seqcreate_birth_move(
                 head, buffer=buf, threshold=threshold, size_log_prior_odds=s, K_max=K_cap,
-                n_proposals=int(seqcreate_proposals), commit_check=check))
+                n_proposals=int(seqcreate_proposals), seed=_bseed, commit_check=check))
         elif birth_style == "interval":
             log["birth"] = _verify("birth", interval_birth_move(
                 head, buffer=buf, threshold=threshold, K_max=K_cap,
@@ -1550,9 +1689,11 @@ def sweep_moves(head, stoch=None, deter=None, is_first=None, *, buffer=None,
                 head, buffer=buf, threshold=threshold, K_max=K_cap,
                 refine_iters=max(3, refine_iters), size_log_prior_odds=s, commit_check=check))
     if do_split:
+        head._move_name = "split"
         log["split"] = _verify("split", split_move(
             head, buffer=buf, threshold=threshold, refine_iters=max(3, refine_iters), K_max=K_cap,
             confirm_top=confirm_top, size_log_prior_odds=s, commit_check=check))
+    head._move_name = None
     accepted_any = any(isinstance(v, tuple) and bool(v[0]) for v in log.values())
     if accepted_any and getattr(full, "complete", False):
         head.resync_store_from_buffer(full)

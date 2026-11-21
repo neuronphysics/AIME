@@ -89,17 +89,31 @@ class SHSRSSM(networks.RSSM):
                  shs_gate_clock: str = "occupancy",
                  shs_calibrate_b0_at: int = -1,
                  shs_reseed_at_calibration: bool = False,
+                 shs_reseed_holdoff: int = -1,
                  shs_reseed_grace_env: float = 0.0,
+                 shs_move_remap_retain: bool = False,
+                 shs_birth_full_refine: int = 1,
+                 shs_ema_schedule: str = "constant",
+                 shs_freeze_globals_env: float | None = None,
+                 shs_schedule_scale: float = 1.0,
                  **kwargs):
         self._grad_per_env = (float(shs_grad_per_env)
                               if shs_grad_per_env else None)
+
+        # Divides every schedule value given in schedule units: curriculum boundaries, move
+        # intervals, shs_move_first_env, shs_freeze_globals_env.  1 = the schedule as written;
+        # e.g. 25 lets a 16k-frame run pass through every phase of a 400k-frame schedule, for a
+        # short check of an arm on the cluster.
+        self._schedule_scale = float(shs_schedule_scale)
+        if not self._schedule_scale > 0:
+            raise ValueError(f"shs_schedule_scale must be positive, got {shs_schedule_scale!r}")
 
         def _env2gs(v):
             if self._grad_per_env is None:
                 raise ValueError(
                     "*_env schedule keys require shs_grad_per_env (auto-set "
                     "by shs_kwargs_from_config)")
-            return max(1, int(round(float(v) * self._grad_per_env)))
+            return max(1, int(round(float(v) * self._grad_per_env / self._schedule_scale)))
         self._env2gs = _env2gs
 
         if shs_ema_memory_env is not None:
@@ -232,12 +246,61 @@ class SHSRSSM(networks.RSSM):
         # counts and re-initialise them from random blocks of that minibatch, i.e. the regimes
         # are seeded on a trained representation instead of on the random encoder of step 1.
         self._shs_reseed_at_calibration = bool(shs_reseed_at_calibration)
-        # Grace period after a re-seed (environment steps, converted like the curriculum keys):
-        # no structure sweep, and therefore no deletion, until it has elapsed and the seeded
-        # statistics have been installed.  Sweeps are scheduled on the absolute grad step, so
-        # without this the first sweep after a re-seed can come within a few hundred updates.
-        self._shs_reseed_grace_env = float(shs_reseed_grace_env)
-        self._reseed_step = None
+        # Structure sweeps are held back from the moment a re-seed is requested until its seeded
+        # statistics are installed (the next global update with enough valid data), and then for
+        # shs_reseed_holdoff further grad steps: -1 = one move interval of the current
+        # curriculum phase, 0 = no extra delay, n = n updates.  Without this a sweep scheduled
+        # on the re-seed step runs on the un-seeded model and can prune it first.
+        self._shs_reseed_holdoff = int(shs_reseed_holdoff)
+        # Older key for the same purpose, given in schedule units (the unit of the *_env keys):
+        # a lower bound on the hold-off.  0 = none.
+        self._reseed_grace_gs = (0 if shs_reseed_grace_env is None or float(shs_reseed_grace_env) <= 0
+                                 else int(_env2gs(shs_reseed_grace_env)))
+        self._reseed_pending = False
+        self._reseed_hold_until = 0
+        self._n_sweeps_held_reseed = 0
+        # Growth moves in remap mode: the mass a newborn is seeded with is taken out of the
+        # memory of the live regimes that hold its time steps (moves._retained_share), so a
+        # birth or split leaves the total mass of the model unchanged.  False copies live
+        # regimes unchanged and adds the newborn on top.
+        self.regime.move_remap_retain = bool(shs_move_remap_retain)
+        # seqcreate births: passes of the candidate over the whole window before it is scored.
+        self.regime.birth_full_refine = max(0, int(shs_birth_full_refine))
+        # Online-update ablation.  "constant": the fixed-rate blend (rate shs_ema_tau).
+        # "harmonic": rate 1/n, the uniform average of the minibatch statistics since the re-seed.
+        # "power": power prior with discount 1 - shs_ema_tau, S <- (1 - tau) S + s.
+        if str(shs_ema_schedule) not in ("constant", "harmonic", "power"):
+            raise ValueError("shs_ema_schedule must be 'constant', 'harmonic' or 'power', "
+                             f"got {shs_ema_schedule!r}")
+        if str(shs_ema_schedule) == "power" and (bool(shs_structure_moves) or bool(shs_ema_gate)
+                                                 or str(shs_forget_mode) != "fixed"):
+            # The structure moves convert between window and memory statistics on the assumption
+            # that the memory holds one minibatch of evidence, and the gated and retention rules
+            # are other update rules, not modifiers of this one.
+            raise ValueError("shs_ema_schedule 'power' is the plain power-prior update for a fixed "
+                             "number of regimes: use it with shs_structure_moves False, "
+                             "shs_ema_gate False and shs_forget_mode fixed")
+        if str(shs_ema_schedule) != "constant" and str(shs_online_mode) != "ema":
+            # the other storage modes keep the statistics in their own store and never reach
+            # the branch that applies this schedule
+            raise ValueError(f"shs_ema_schedule {str(shs_ema_schedule)!r} is implemented for the "
+                             "replay-EMA statistics only (shs_online_mode: ema), got "
+                             f"shs_online_mode {shs_online_mode!r}")
+        if str(shs_ema_schedule) == "power" and not bool(shs_shared_carry):
+            raise ValueError("shs_ema_schedule 'power' needs shs_shared_carry True: the regimes "
+                             "without a shared carry map do not implement the power-prior update")
+        self.regime.ema_schedule = str(shs_ema_schedule)
+        # Online-update ablation, "fixed parameters" arm: from this point of the schedule (in
+        # the unit of the *_env keys) no regime factor changes: no statistics update, no
+        # structure sweep, no refresh at curriculum boundaries.  Regime responsibilities are
+        # still inferred and the networks keep training.  None = never.
+        self._freeze_at = (None if shs_freeze_globals_env is None
+                           or float(shs_freeze_globals_env) < 0
+                           else _env2gs(shs_freeze_globals_env))
+        self._n_frozen_updates = 0
+        # cumulative structure-move statistics (logged; see curriculum_state)
+        self._n_sweeps_run = 0
+        self._move_stats = {}
         self.regime.init_blocks = bool(shs_init_blocks)
         self.regime.init_block_len = (None if shs_init_block_len is None
                                       else int(shs_init_block_len))
@@ -284,12 +347,12 @@ class SHSRSSM(networks.RSSM):
             if "move_every_env" in _p:
                 _p["move_every"] = (0 if float(_p["move_every_env"]) <= 0
                                     else self._env2gs(_p["move_every_env"]))
-        self._reseed_grace_gs = (0 if self._shs_reseed_grace_env <= 0
-                                 else int(self._env2gs(self._shs_reseed_grace_env)))
         if self._grad_per_env is not None and self._curriculum:
-            print("[SHS] schedule units: %s steps, grad/step=%.5f  curriculum(grad-steps)=%s"
+            print("[SHS] schedule units: %s steps, grad/step=%.5f  curriculum(grad-steps)=%s%s"
                   % (self._shs_schedule_unit, self._grad_per_env,
-                     [int(q.get("until", -1)) for q in self._curriculum]))
+                     [int(q.get("until", -1)) for q in self._curriculum],
+                     "" if self._schedule_scale == 1.0
+                     else "  (schedule divided by %g)" % self._schedule_scale))
         self._move_threshold = 0.0
         self._move_shrink_threshold = None
         self._move_create_bonus = 0.0
@@ -417,6 +480,24 @@ class SHSRSSM(networks.RSSM):
             post["regime_gen"] = self._gen_like(post["regime_resp"])
         return post, prior
 
+    def _reseed_default_holdoff(self) -> int:
+        """Grad steps for which sweeps stay off after a re-seed when shs_reseed_holdoff is -1: the
+        move interval of the current curriculum phase or, if that phase has no sweeps (a re-seed
+        at an explicit step before the first sweep phase), of the first later phase that has."""
+        if int(self._shs_move_every) > 0:
+            return int(self._shs_move_every)
+        if not getattr(self, "_shs_structure_moves", True):
+            return 0
+        step = int(self._shs_step)
+        for p in self._curriculum or []:
+            until = int(p.get("until", -1))
+            if 0 <= until <= step:
+                continue                      # a phase that is already over
+            every = int(p.get("move_every", 0) or 0)
+            if every > 0:
+                return every
+        return 0
+
     def _apply_curriculum(self):
         if not self._curriculum:
             return
@@ -439,9 +520,15 @@ class SHSRSSM(networks.RSSM):
             self._shs_move_birth = bool(phase["birth"])
         if "split" in phase:
             self._shs_move_split = bool(phase["split"])
-        if "recurrent" in phase and getattr(self.regime, "rstick", None) is not None:
+        # Once the regime factors are frozen (shs_freeze_globals_env) a phase change may still
+        # adjust the move settings, which are not used any more, but nothing that defines or
+        # refreshes the factors: the persistence model, kappa and the HDP posterior stay as
+        # they were at the freeze.
+        _frozen = self._globals_frozen()
+        if ("recurrent" in phase and getattr(self.regime, "rstick", None) is not None
+                and not _frozen):
             self.regime.recurrent = bool(phase["recurrent"])
-        if getattr(self.regime, "hdp", None) is not None:
+        if getattr(self.regime, "hdp", None) is not None and not _frozen:
             if self.regime.recurrent:
                 self.regime.hdp.kappa = 0.0
             elif "kappa" in phase:
@@ -451,7 +538,8 @@ class SHSRSSM(networks.RSSM):
             try:
                 _tc = getattr(self.regime, "ema_trans_counts", None)
                 _sc = getattr(self.regime, "ema_start_counts", None)
-                if _tc is not None and _sc is not None and float(_tc.sum()) > 0:
+                if (not _frozen and _tc is not None and _sc is not None
+                        and float(_tc.sum()) > 0):
                     self.regime.hdp.update(_tc.double(), _sc.double(),
                                            n_global_iters=1)
             except Exception as _e:
@@ -501,9 +589,33 @@ class SHSRSSM(networks.RSSM):
         if _u is not None:
             # sum_k min(1, K share_k) over the last global update: 1 = one regime holds all mass
             out["shs_effective_regimes"] = float(_u.sum())
+        _N = getattr(self.regime.regimes, "N", None)
+        if _N is not None and _N.numel():
+            # total evidence held by the regimes (EMA scale: about one minibatch of time steps)
+            # and the largest regime's share of it
+            _Nt = float(_N.sum())
+            out["shs_memory_mass"] = _Nt
+            out["shs_memory_top_share"] = float(_N.max()) / max(_Nt, 1e-12)
+        out["shs_move_handover_failures"] = float(getattr(self.regime, "_handover_failures", 0))
+        # cumulative move statistics (see _record_move_stats)
+        out["shs_sweeps_run"] = float(getattr(self, "_n_sweeps_run", 0))
+        for _m in ("empty", "merge", "delete", "birth", "split"):
+            _st = (getattr(self, "_move_stats", None) or {}).get(_m)
+            out[f"shs_moves_{_m}_attempts"] = float(_st.get("attempts", 0)) if _st else 0.0
+            out[f"shs_moves_{_m}_tried"] = float(_st["tried"]) if _st else 0.0
+            out[f"shs_moves_{_m}_accepted"] = float(_st["accepted"]) if _st else 0.0
+            out[f"shs_moves_{_m}_sweeps"] = float(_st["sweeps"]) if _st else 0.0
+            if _st and _st["n_hold"] > 0:
+                out[f"shs_moves_{_m}_holdout_gain"] = _st["hold_gain"] / _st["n_hold"]
+            if _st and _st["n_fit"] > 0:
+                out[f"shs_moves_{_m}_fit_gain"] = _st["fit_gain"] / _st["n_fit"]
+        out["shs_ema_rate"] = float(self.regime._tau()) if hasattr(self.regime, "_tau") else float("nan")
+        out["shs_globals_frozen"] = float(self._globals_frozen())
+        out["shs_frozen_updates"] = float(getattr(self, "_n_frozen_updates", 0))
         out["shs_reseeds"] = float(getattr(self.regime, "n_reseeds", 0))
-        out["shs_reseed_grace_skips"] = float(getattr(self, "_shs_grace_skips", 0))
-        out["shs_live_sweeps"] = float(getattr(self, "_n_live_sweeps", 0))
+        out["shs_reseed_pending"] = float(bool(getattr(self, "_reseed_pending", False)))
+        out["shs_sweeps_held_reseed"] = float(getattr(self, "_n_sweeps_held_reseed", 0))
+        out["shs_reseed_skipped_batches"] = float(getattr(self.regime, "_init_blocks_skipped", 0))
         for _reason, _n in (getattr(self.regime.hdp, "guard_reject_reasons", None) or {}).items():
             out[f"shs_hdp_reject_{_reason.split(':')[0]}"] = float(_n)
         _errs = []
@@ -576,6 +688,10 @@ class SHSRSSM(networks.RSSM):
                 "(0, 1, 0). Set kl_free: 0.0, dyn_scale: 1.0, rep_scale: 0.0 (the "
                 "`shs_strict` preset does this) -- the constructor cannot see these "
                 "training-loop values, so they are validated here on every call.")
+        if getattr(self.regime, "_reseed_pending", False):
+            # the head is the source of truth for a requested re-seed (it may come from a
+            # checkpoint written before the hold-off state existed, or from a transfer source)
+            self._reseed_pending = True
         if self._pending is not None:
             self._flush_pending()
 
@@ -598,15 +714,33 @@ class SHSRSSM(networks.RSSM):
                 and self._shs_step >= max(1, _b0_at)):
             self._calibrate_noise_prior(q_mean, is_first)
             if self._shs_reseed_at_calibration and hasattr(self.regime, "reseed_regimes"):
-                self.regime.reseed_regimes()
-                self._reseed_step = int(self._shs_step)
-                print("[SHS] regime head re-seeded at grad step %d: statistics and EMA counts "
-                      "dropped, the next global update starts from random blocks; structure "
-                      "sweeps resume after %d grad steps" % (self._shs_step, self._reseed_grace_gs))
+                if getattr(self.regime, "stat_store", None) is not None:
+                    print("[SHS] shs_reseed_at_calibration ignored: the block re-seed is only "
+                          "implemented for the replay-EMA statistics (shs_online_mode: ema)")
+                else:
+                    self.regime.reseed_regimes()
+                    self._reseed_pending = True
+                    print("[SHS] regime head re-seed requested at grad step %d: statistics and "
+                          "EMA counts are replaced from random blocks at the next global update; "
+                          "structure sweeps wait for it" % self._shs_step)
 
         _pz = stoch if getattr(self, "_shs_moment_consistent", True) else None
 
         self._apply_curriculum()
+
+        if self._reseed_pending and not getattr(self.regime, "_reseed_pending", False):
+            # The deferred global update at the top of this call installed the seeded
+            # statistics: start the hold-off, counted from this update and not from the
+            # request.  (After _apply_curriculum, so the move interval is the current phase's
+            # also on the first call after a checkpoint was loaded.)
+            self._reseed_pending = False
+            _hold = int(self._shs_reseed_holdoff)
+            if _hold < 0:
+                _hold = self._reseed_default_holdoff()
+            _hold = max(_hold, int(getattr(self, "_reseed_grace_gs", 0)))
+            self._reseed_hold_until = int(self._shs_step) + max(0, _hold)
+            print("[SHS] seeded statistics installed at grad step %d; structure sweeps held "
+                  "until grad step %d" % (self._shs_step, self._reseed_hold_until))
 
         if self._move_buffer is not None:
             with torch.no_grad():
@@ -642,13 +776,18 @@ class SHSRSSM(networks.RSSM):
         _first_due = (getattr(self, "_move_first_pending", False)
                       and self._shs_move_every > 0
                       and self._shs_step >= self._move_first)
-        _scheduled = _periodic or _first_due
-        if _scheduled and self._live_sweep_allowed():
+        _scheduled = (_periodic or _first_due) and not self._globals_frozen()
+        _held = self._reseed_pending or self._shs_step < int(self._reseed_hold_until)
+        if _scheduled and _held:
+            # a re-seed is waiting to be installed, or its seeded regimes are still inside the
+            # hold-off: no merge / delete / birth / split yet.  shs_move_first stays pending.
+            self._n_sweeps_held_reseed = int(getattr(self, "_n_sweeps_held_reseed", 0)) + 1
+            self._last_move_log = {}
+        elif _scheduled and self._live_sweep_allowed():
             if _first_due:
                 print(f"[SHS] first structure sweep (shs_move_first={self._move_first}) "
                       f"@ grad-step {self._shs_step}")
             self._move_first_pending = False
-            self._n_live_sweeps = int(getattr(self, "_n_live_sweeps", 0)) + 1
             with torch.no_grad():
                 _grow = self._move_K_cap is None or int(self.regime.K) < self._move_K_cap
                 self._last_move_log = sweep_moves(
@@ -674,6 +813,8 @@ class SHSRSSM(networks.RSSM):
                 print(f"[SHS] sweep @ grad-step {self._shs_step} deferred: "
                       f"{self.regime._last_defer_reason}")
                 self.regime._last_defer_reason = None
+            if self._last_move_log:
+                self._record_move_stats()
             accepted = {m: round(float(g), 3) for m, (ok, g) in self._last_move_log.items() if ok}
             if getattr(self, "_teacher", None) is not None:
                 self._teacher.mark_move()
@@ -718,13 +859,15 @@ class SHSRSSM(networks.RSSM):
                 and self._shs_global_source != "completed_episode_stream"):
             self._pending_episode_first = getattr(
                 self, "_last_episode_first", None)
+            # _aligned_action is None when the regimes take no action input (shs_action_dim 0)
+            _pact = self._aligned_action(q_mean)
             self._pending = (q_mean.detach(), deter.detach(), gamma.detach(),
                              counts.detach(), start_counts.detach(),
                              None if is_first is None else is_first.detach(),
                              (q_std ** 2).detach(),
                              self._next_batch_id,
                              int(self.regime.repr_version),
-                             None if self._last_action is None else self._aligned_action(q_mean).detach(),
+                             None if _pact is None else _pact.detach(),
                              None if _pz is None else _pz.detach())
             self._next_batch_id = None
 
@@ -749,10 +892,64 @@ class SHSRSSM(networks.RSSM):
                     prev_stoch=None if pz is None else pz.float(), action=act,
                     episode_first=epf)
                 self._pending_recomputed = int(getattr(self, "_pending_recomputed", 0)) + 1
+            if self._globals_frozen():
+                # "fixed parameters" arm: the regime factors stay as they are
+                self._n_frozen_updates = int(getattr(self, "_n_frozen_updates", 0)) + 1
+                self.regime._estep = None
+                return
             self.regime.update_globals(q_mean, deter, gamma, counts, start, is_first, z_var,
                                        batch_id=p[7], action=act, prev_stoch=pz,
                                        episode_first=epf,
                                        repr_version=(p[8] if len(p) > 8 else None))
+
+    def _globals_frozen(self) -> bool:
+        """True once the schedule has passed shs_freeze_globals_env.  A re-seed that is still
+        waiting for its seeded statistics is carried out first."""
+        at = getattr(self, "_freeze_at", None)
+        return (at is not None and int(self._shs_step) > int(at)
+                and not bool(getattr(self, "_reseed_pending", False)))
+
+    def _record_move_stats(self):
+        """Cumulative statistics of the structure sweeps, per move type.
+
+        attempts  sweeps in which the move type was enabled and searched for a candidate
+        tried     candidates that passed the proposal score and were installed for the
+                  acceptance checks (installed-model bound, held-out forecast)
+        accepted  candidates that were kept; tried - accepted were rolled back
+        sweeps    sweeps in which at least one candidate of the type was kept
+        For the kept candidates the change of the window bound (nats) and of the held-out
+        forecast score (nats per step, paired over held-out rows) is summed."""
+        self._n_sweeps_run = int(getattr(self, "_n_sweeps_run", 0)) + 1
+        stats = self._move_stats
+        new = lambda: dict(attempts=0, tried=0, accepted=0, fit_gain=0.0, n_fit=0,
+                           hold_gain=0.0, n_hold=0, sweeps=0)
+        seen = set()
+        for rec in (getattr(self.regime, "_commit_checks", None) or []):
+            m = str(rec.get("move") or rec.get("kind") or "move")
+            seen.add(m)
+            st = stats.setdefault(m, new())
+            st["tried"] += 1
+            if rec.get("ok"):
+                st["accepted"] += 1
+                fg = rec.get("fit_gain", float("nan"))
+                if isinstance(fg, float) and math.isfinite(fg):
+                    st["fit_gain"] += fg
+                    st["n_fit"] += 1
+                hm = rec.get("mean", float("nan"))
+                if int(rec.get("n", 0) or 0) > 0 and isinstance(hm, float) and math.isfinite(hm):
+                    st["hold_gain"] += hm
+                    st["n_hold"] += 1
+        for m, res in (self._last_move_log or {}).items():
+            if not isinstance(res, tuple):
+                continue
+            st = stats.setdefault(m, new())
+            st["attempts"] += 1
+            if bool(res[0]):
+                st["sweeps"] += 1
+                if m not in seen:         # kept without an acceptance check (no check configured)
+                    n = max(1, int(res[1])) if m == "empty" else 1
+                    st["tried"] += n
+                    st["accepted"] += n
 
     @torch.no_grad()
     def annotate_regime_resp(self, post, is_first=None, action=None):
@@ -797,7 +994,13 @@ class SHSRSSM(networks.RSSM):
                     empty_removed=int(getattr(self.regime, "_n_empty_removed", 0)),
                     holdout_vetoes=int(getattr(self.regime, "_holdout_vetoes", 0)),
                     fit_vetoes=int(getattr(self.regime, "_fit_vetoes", 0)),
-                    sweeps_deferred=int(getattr(self.regime, "_sweeps_deferred", 0)))
+                    sweeps_deferred=int(getattr(self.regime, "_sweeps_deferred", 0)),
+                    reseed_pending=bool(getattr(self, "_reseed_pending", False)),
+                    reseed_hold_until=int(getattr(self, "_reseed_hold_until", 0)),
+                    sweeps_held_reseed=int(getattr(self, "_n_sweeps_held_reseed", 0)),
+                    sweeps_run=int(getattr(self, "_n_sweeps_run", 0)),
+                    move_stats={k: dict(v) for k, v in (getattr(self, "_move_stats", None) or {}).items()},
+                    frozen_updates=int(getattr(self, "_n_frozen_updates", 0)))
 
     def set_extra_state(self, state):
         dev = self.regime.ema_trans_counts.device
@@ -826,6 +1029,13 @@ class SHSRSSM(networks.RSSM):
         self.regime._n_empty_removed = int(state.get("empty_removed", 0))
         self.regime._holdout_vetoes = int(state.get("holdout_vetoes", 0))
         self.regime._fit_vetoes = int(state.get("fit_vetoes", 0))
+        # a re-seed that was requested or is inside its hold-off when the checkpoint was taken
+        self._reseed_pending = bool(state.get("reseed_pending", False))
+        self._reseed_hold_until = int(state.get("reseed_hold_until", 0))
+        self._n_sweeps_held_reseed = int(state.get("sweeps_held_reseed", 0))
+        self._n_sweeps_run = int(state.get("sweeps_run", 0))
+        self._move_stats = {k: dict(v) for k, v in (state.get("move_stats") or {}).items()}
+        self._n_frozen_updates = int(state.get("frozen_updates", 0))
 
     def begin_full_batch_pass(self):
         self.regime.begin_full_batch_pass()
@@ -850,15 +1060,6 @@ class SHSRSSM(networks.RSSM):
                 self._shs_stale_dropped = getattr(self, "_shs_stale_dropped", 0) + dropped
         except Exception:
             pass
-        # a pending or recent re-seed blocks sweeps (and with them delete_empty)
-        R = self.regime
-        if getattr(R, "init_blocks", False) and not getattr(R, "_init_blocks_done", False) \
-                and not getattr(R.regimes, "_stats_initialised", False):
-            self._shs_grace_skips = getattr(self, "_shs_grace_skips", 0) + 1
-            return False
-        if self._reseed_step is not None and self._shs_step < self._reseed_step + self._reseed_grace_gs:
-            self._shs_grace_skips = getattr(self, "_shs_grace_skips", 0) + 1
-            return False
         enough = len(buf.batches) >= int(getattr(self, "_shs_min_live_batches", 4))
         store = getattr(self.regime, "stat_store", None)
         ema_mode = (store is None) or (store.mode == "legacy_ema")
@@ -876,8 +1077,7 @@ class SHSRSSM(networks.RSSM):
                     shs_step=int(self._shs_step), phase=int(self._curr_phase),
                     K=int(self.regime.K),
                     move_first_pending=bool(getattr(self, "_move_first_pending", False)),
-                    move_K_cap=getattr(self, "_move_K_cap", None),
-                    reseed_step=self._reseed_step)
+                    move_K_cap=getattr(self, "_move_K_cap", None))
 
     def load_live_state(self, live, runtime=None, encoder=None):
         """Restore the non-tensor runtime saved by live_state() and the teacher, if any."""
@@ -886,8 +1086,6 @@ class SHSRSSM(networks.RSSM):
         regime = self.regime
         if "shs_step" in live:
             self._shs_step = int(live["shs_step"])
-        if "reseed_step" in live:
-            self._reseed_step = None if live["reseed_step"] is None else int(live["reseed_step"])
         self._shs_b0_calibrated = bool(live.get("b0_calibrated",
                                                 runtime.get("b0_calibrated", self._shs_b0_calibrated)))
         if "recurrent" in live and getattr(regime, "rstick", None) is not None:

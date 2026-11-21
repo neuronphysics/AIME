@@ -552,6 +552,10 @@ def configure_loaded_shs(agent, checkpoint, live, *, resume=False, clock="source
     if not resume:
         dynamics._pending = None
         dynamics._next_batch_id = None
+        # the source run's re-seed hold-off is on the source clock; keep only a re-seed that
+        # the source checkpoint had requested and not yet installed
+        dynamics._reseed_pending = bool(getattr(regime, "_reseed_pending", False))
+        dynamics._reseed_hold_until = 0
         regime._drift, regime._retention_last = {}, {}
         wm._shs_reservoir = []
         wm._shs_target_state = None

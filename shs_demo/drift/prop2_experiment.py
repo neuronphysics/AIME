@@ -19,11 +19,11 @@ MAIN_TAU = 0.02
 HPP_GAMMA = 0.1
 FAMILY = dict(retain="#2a78d6", ema="#eb6834", gated="#1baf7a", pp="#eda100", window="#e87ba4", svb="#008300",
               hpp="#7b52c7")
-NAME = dict(ema="EMA", pp="PP", hpp="HPP", svb="SVB", window="Window", gated="AIME, no retention",
-            retain="AIME (proposed)")
+NAME = dict(ema="EMA", pp="PP", hpp="HPP", svb="SVB", window="Window", gated="SHS-RSSM, no retention",
+            retain="SHS-RSSM (proposed)")
 LONG = dict(ema="EMA", pp="Power-prior SVB", hpp="Hierarchical power-prior SVB", svb="Streaming VB",
-            window="Sliding window", gated="AIME without retention: responsibility-gated EMA",
-            retain="AIME (proposed): responsibility-gated EMA with change-point retention")
+            window="Sliding window", gated="SHS-RSSM without retention: responsibility-gated EMA",
+            retain="SHS-RSSM (proposed): responsibility-gated EMA with change-point retention")
 MARK = dict(ema="o", pp="s", window="^")
 LS = dict(ema="-", pp="-", window=(0, (4, 2)), svb="-", hpp=(0, (6, 1.5, 1.2, 1.5)), gated=(0, (4, 1.6)),
           retain="-")
@@ -63,9 +63,9 @@ def short_label(kind, t=MAIN_TAU):
     if kind == "window":
         return f"Window ({window_len(t)})"
     if kind == "gated":
-        return f"AIME, no retention ({dec(t)})"
+        return f"SHS-RSSM, no retention ({dec(t)})"
     if kind == "retain":
-        return f"AIME (proposed, {dec(t)})"
+        return f"SHS-RSSM (proposed, {dec(t)})"
     return NAME[kind]
 
 
@@ -569,8 +569,8 @@ def latex_tables(out, cfg, arms, s, speeds, stat):
             (arm_name("pp", MAIN_TAU), rf"Power-prior SVB, $\rho={1-MAIN_TAU:g}$"),
             (arm_name("window", MAIN_TAU), rf"Sliding window, $W={window_len(MAIN_TAU)}$"),
             ("hpp", r"Hierarchical power-prior SVB"), ("svb", r"Streaming VB"),
-            (arm_name("gated", MAIN_TAU), rf"AIME without retention: gated EMA, $\tau={MAIN_TAU:g}$"),
-            (arm_name("retain", MAIN_TAU), rf"AIME (proposed): gated EMA, $\tau={MAIN_TAU:g}$, change-point retention")]
+            (arm_name("gated", MAIN_TAU), rf"SHS-RSSM without retention: gated EMA, $\tau={MAIN_TAU:g}$"),
+            (arm_name("retain", MAIN_TAU), rf"SHS-RSSM (proposed): gated EMA, $\tau={MAIN_TAU:g}$, change-point retention")]
     lines = [r"\begin{tabular}{lcccc}", r"\toprule",
              r"Update & Stationary & Drift & After drift & Drift minus EMA \\", r"\midrule"]
     for nm, lab in rows:

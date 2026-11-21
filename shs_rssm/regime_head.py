@@ -88,8 +88,16 @@ class RegimeHead(nn.Module):
         self.init_blocks = False          # break the regime symmetry on the first global update
         self.init_block_len = None        # mean block length in steps (default max(4, T // (2K)))
         self.init_seed = 0
-        self.gate_clock = "occupancy"     # "occupancy": gate gain from responsibility share (paper);
-                                          # "redraw": legacy, from the redraw-count share
+        self.gate_clock = "occupancy"     # "occupancy": gate gain from the share of the gate's own
+                                          # trials (steps spent in the regime that have an outgoing
+                                          # transition); "redraw": legacy, from the redraw-count share
+        self._reseed_pending = False      # reseed_regimes() was called and not yet carried out
+        self._init_blocks_skipped = 0     # batches a pending block init had to pass over
+        self.move_remap_retain = False    # True: growth moves take the newborn's seed out of the parents' memory
+        self.ema_schedule = "constant"    # "constant": blend at rate ema_tau; "harmonic": 1/n (uniform
+                                          # average); "power": power prior with discount 1 - ema_tau
+        self._n_ema_updates = 0           # global updates absorbed since the statistics were (re-)initialised
+        self.birth_full_refine = 1        # seqcreate births: whole-window passes before scoring
         self._drift = {}
         self._retention_last = {}
         self.online_mode = online_mode
@@ -790,6 +798,11 @@ class RegimeHead(nn.Module):
                     init_blocks=bool(getattr(self, 'init_blocks', False)),
                     init_blocks_done=bool(getattr(self, '_init_blocks_done', False)),
                     n_reseeds=int(getattr(self, 'n_reseeds', 0)),
+                    reseed_pending=bool(getattr(self, '_reseed_pending', False)),
+                    init_blocks_skipped=int(getattr(self, '_init_blocks_skipped', 0)),
+                    n_ema_updates=int(getattr(self, '_n_ema_updates', 0)),
+                    u_prior_override=getattr(getattr(self, 'regimes', None),
+                                             '_u_prior_scale_override', None),
                     pg_init=bool(getattr(getattr(self, 'rstick', None), '_pg_init', False))
                     if getattr(self, 'rstick', None) is not None else False,
                     active_mask=(self.active_mask.tolist()
@@ -822,6 +835,18 @@ class RegimeHead(nn.Module):
             self.init_blocks = bool(st["init_blocks"])
             self._init_blocks_done = bool(st.get("init_blocks_done", False))
         self.n_reseeds = int(st.get("n_reseeds", 0))
+        # checkpoints written before this flag existed: a re-seed is pending exactly when it was
+        # requested (n_reseeds), armed, not carried out, and the statistics are still dropped
+        self._reseed_pending = bool(st.get(
+            "reseed_pending",
+            self.n_reseeds > 0 and bool(getattr(self, "init_blocks", False))
+            and not bool(getattr(self, "_init_blocks_done", False))
+            and not bool(st.get("stats_initialised", False))))
+        self._init_blocks_skipped = int(st.get("init_blocks_skipped", 0))
+        self._n_ema_updates = int(st.get("n_ema_updates", 0))
+        if "u_prior_override" in st and getattr(self, 'regimes', None) is not None \
+                and hasattr(self.regimes, "_u_prior_scale_override"):
+            self.regimes._u_prior_scale_override = st["u_prior_override"]
         if getattr(self, 'rstick', None) is not None:
             self.rstick._pg_init = bool(st.get("pg_init", False))
         _am = st.get("active_mask", None)
@@ -1429,16 +1454,27 @@ class RegimeHead(nn.Module):
         from .forgetting import (EmissionEvidence, GateEvidence, TransitionEvidence,
                                  memory_stats, stream_weights)
         if (getattr(self, "init_blocks", False) and not getattr(self, "_init_blocks_done", False)
-                and not getattr(self.regimes, "_stats_initialised", False)):
+                and (not getattr(self.regimes, "_stats_initialised", False)
+                     or getattr(self, "_reseed_pending", False))):
             # All regimes start identical, so the first E-step is uniform and every regime would
             # receive the same statistics.  Seed them from random contiguous blocks instead.
-            gamma_b, tc_b, sc_b, xi = self._random_block_labels(gamma, is_first, valid)
-            if float(gamma_b.sum()) < 1.0:
-                # no valid step in this minibatch: keep the initialisation pending
+            # The one-shot seeding needs data: a batch with (almost) no valid steps must not
+            # consume it, so that update is skipped and the seeding stays pending.
+            _B, _T, _K = gamma.shape
+            _sup = (float(_B * _T) if valid is None
+                    else float((valid.reshape(_B, _T) > 0.5).sum()))
+            _am = getattr(self, "active_mask", None)
+            _Ka = int(_am.sum()) if (_am is not None and int(_am.sum()) > 0) else int(_K)
+            if _sup < 2.0 * _Ka:
+                self._init_blocks_skipped = int(getattr(self, "_init_blocks_skipped", 0)) + 1
                 self._estep = None
                 return
-            gamma, tc, sc = gamma_b, tc_b, sc_b
-            self._init_blocks_done = True
+            # A re-seed replaces statistics and counts even if a structure move has installed
+            # new regime objects (with initialised statistics) since it was requested.
+            self.regimes._stats_initialised = False
+            self._counts_initialised = False
+            gamma, tc, sc, xi = self._random_block_labels(gamma, is_first, valid)
+            self._reseed_pending = False
             stats = self.regimes.stats_from_batch(
                 gamma.detach(), stoch.detach(), g.detach(),
                 z_var=None if z_var is None else z_var.detach(), g_z_var=g_z_var,
@@ -1468,17 +1504,29 @@ class RegimeHead(nn.Module):
         tau_k, tau_row = self._ema_rates(stats["N"], tc, zero_use=evidence)
         u_k, u_row = self._usage(stats["N"], tc)
         self._last_usage = u_k.detach()   # min(1, K share_k) of this minibatch, for diagnostics
-        tau = max(float(self.ema_tau), 1e-300)
+        tau = max(self._tau(), 1e-300)
         rho_e = None
         if evidence and getattr(self.regimes, "_stats_initialised", False):
             rho_e = self._retain("emission", lambda: EmissionEvidence(
                 self.regimes, memory_stats(self.regimes), stats, *stream_weights(tau_k, tau)), u_k)
-        self.regimes.ema_update_stats(stats, tau_k, retain=rho_e)
+        # "power": the power prior with the constant discount rho = 1 - tau.  The stored
+        # statistics of every factor (dynamics, transition rows, start counts, gate) are tempered
+        # by rho and the minibatch statistics are added at full weight, S <- rho S + s, with the
+        # base prior at full strength.  In steady state the memory then holds about 1/tau
+        # minibatches of evidence, where the blend S <- (1 - tau) S + tau s holds one.
+        power = str(getattr(self, "ema_schedule", "constant")) == "power"
+        if power:
+            self.regimes.ema_update_stats(stats, tau, inflow=1.0)
+        else:
+            self.regimes.ema_update_stats(stats, tau_k, retain=rho_e)
         self.regimes.m_step()
         if not self._counts_initialised:
             self.ema_trans_counts.copy_(tc)
             self.ema_start_counts.copy_(sc)
             self._counts_initialised = True
+        elif power:
+            self.ema_trans_counts.mul_(1.0 - tau).add_(tc.to(self.ema_trans_counts.dtype))
+            self.ema_start_counts.mul_(1.0 - tau).add_(sc.to(self.ema_start_counts.dtype))
         else:
             _tr = tau_row.to(self.ema_trans_counts.dtype).unsqueeze(-1)
             _tk = tau_k.to(self.ema_start_counts.dtype)
@@ -1503,21 +1551,31 @@ class RegimeHead(nn.Module):
             r_mass = es["r_mass"].reshape(-1, K)
             row_weight = es["row_weight"].reshape(-1, K)
             rho_g = None
-            # The gate of regime j is observed on every step spent in j (its Bernoulli trials),
-            # so its gain follows the occupancy share, as the destination rows follow the
-            # redraw share.  "redraw" keeps the legacy clock.
+            # The gate of regime j has one Bernoulli trial per transition that leaves a step
+            # spent in j, so its gain follows the share of those trials (`row_weight`).  The
+            # emission occupancy also counts steps with no outgoing transition (the last step
+            # of a sequence, a step before an episode boundary): a regime seen only there has
+            # occupancy but no trial, and would have its gate statistics shrunk without any
+            # evidence.  "redraw" keeps the legacy clock (share of redraw counts).
             if getattr(self, "gate_clock", "occupancy") == "redraw":
                 tau_g, u_g = tau_row, u_row
             else:
-                tau_g, u_g = tau_k, u_k
+                tau_g, u_g = self._gate_trial_rates(row_weight, zero_use=evidence)
             if evidence and getattr(self.rstick, "_pg_init", False):
                 rs = self.rstick
                 st = rs.pg_stats_from_batch(phi, r_mass, row_weight)
                 rho_g = self._retain("gate", lambda: GateEvidence(
                     rs.sigma0_diag, rs.m0, rs.pg_A, rs.pg_h, st["A"], st["h"],
                     *stream_weights(tau_g, tau)), u_g)
-            self.rstick.pg_update_statewise(phi, r_mass, row_weight, lr=tau_g, retain=rho_g)
+            if power:
+                rs = self.rstick
+                st = rs.pg_stats_from_batch(phi, r_mass, row_weight)
+                rs.pg_set_totals((1.0 - tau) * rs.pg_A + st["A"].to(rs.pg_A.dtype),
+                                 (1.0 - tau) * rs.pg_h + st["h"].to(rs.pg_h.dtype))
+            else:
+                self.rstick.pg_update_statewise(phi, r_mass, row_weight, lr=tau_g, retain=rho_g)
             self._estep = None
+        self._n_ema_updates = int(getattr(self, "_n_ema_updates", 0)) + 1
 
     @torch.no_grad()
     def reseed_regimes(self):
@@ -1532,6 +1590,8 @@ class RegimeHead(nn.Module):
         self._counts_initialised = False
         self._init_blocks_done = False
         self.init_blocks = True
+        self._reseed_pending = True       # cleared when the seeded statistics are installed
+        self._n_ema_updates = 0           # the average restarts with the seeded statistics
         self._drift = {}
         self._retention_last = {}
         self.n_reseeds = int(getattr(self, "n_reseeds", 0)) + 1
@@ -1591,6 +1651,7 @@ class RegimeHead(nn.Module):
         s_lab = lab[starts]
         if s_lab.numel():
             sc.scatter_add_(0, s_lab, torch.ones(s_lab.numel(), dtype=torch.float64, device=dev))
+        self._init_blocks_done = True
         return gam, cnt, sc, xi
 
     def _usage(self, n_batch, trans_batch):
@@ -1606,7 +1667,7 @@ class RegimeHead(nn.Module):
 
     def _ema_rates(self, n_batch, trans_batch, zero_use=False):
         K = int(self.K)
-        tau = float(self.ema_tau)
+        tau = self._tau()
         dev = self.ema_trans_counts.device
         if not getattr(self, "ema_gate", False):
             full = torch.full((K,), tau, dtype=torch.float64, device=dev)
@@ -1627,6 +1688,43 @@ class RegimeHead(nn.Module):
         g_row = gate(trans_batch.sum(-1).reshape(-1))
         self._ema_gate_last = g_k
         return tau * g_k, tau * g_row
+
+    def _tau(self) -> float:
+        """Averaging rate of the current global update.
+
+        "constant" (default) and "power": ema_tau.  "constant" is the fixed-rate blend of the
+        paper; "power" uses the same rate as the discount 1 - ema_tau of a power prior (see
+        update_globals).
+        "harmonic": 1/n at the n-th update since the statistics were (re-)initialised, which
+        makes the stored statistic the uniform average of the minibatch statistics since then
+        (a re-seed restarts it).  The evidence stays at the scale of one minibatch, so this is
+        not an accumulating streaming posterior; it is the equal-weights arm of the
+        online-update ablation."""
+        if str(getattr(self, "ema_schedule", "constant")) == "harmonic":
+            return 1.0 / float(max(1, int(getattr(self, "_n_ema_updates", 0)) + 1))
+        return float(self.ema_tau)
+
+    def _gate_trial_rates(self, row_weight, zero_use=False):
+        """EMA gain and usage share of the recurrent gate, per source regime, from the mass of
+        its Bernoulli trials in this minibatch (row_weight: steps x K).  Same rule as
+        `_ema_rates` / `_usage`, applied to the trials instead of the emission occupancy."""
+        K = int(self.K)
+        tau = self._tau()
+        dev = self.ema_trans_counts.device
+        mass = row_weight.detach().to(torch.float64).to(dev).clamp_min(0.0).reshape(-1, K).sum(0)
+        ref = float(self.ema_gate_ref) if float(self.ema_gate_ref) > 0 else 1.0 / max(K, 1)
+        share = mass / mass.sum().clamp_min(1e-12)
+        usage = (share / ref).clamp(0.0, 1.0)
+        if not getattr(self, "ema_gate", False):
+            # constant-rate forgetting: every gate moves at tau (evidence mode: only the used ones)
+            rate = torch.full((K,), tau, dtype=torch.float64, device=dev)
+            if zero_use:
+                rate = rate * (mass > 0).to(torch.float64)
+            return rate, usage
+        floor = float(self.ema_gate_floor)
+        gain = torch.where(mass > 0, (share / ref).clamp(min=floor, max=1.0),
+                           torch.zeros_like(share))
+        return tau * gain, usage
 
     def _retain(self, name, build, usage):
         from .forgetting import DriftPosterior, retention

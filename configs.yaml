@@ -18,6 +18,9 @@ defaults:
   precision: 32
   debug: False
   video_pred_log: True
+  # Frame counts, comma-separated, at which one extra copy of the checkpoint is kept as
+  # checkpoint_<frames>.pt (written by the first save after the run passes the count).  Empty: none.
+  checkpoint_at: ''
 
   task: 'dmc_walker_walk'
   size: [64, 64]
@@ -112,9 +115,50 @@ defaults:
   # are seeded on a trained representation (first curriculum boundary) rather than on the
   # random encoder of step 1.  Off by default.
   shs_reseed_at_calibration: False
-  # Grace period after the re-seed, in environment steps (same unit as the *_env keys): no
-  # structure sweep, hence no delete_empty, until it has elapsed.  0 = none.
+  # Older key for the delay after a re-seed, in schedule units (same unit as the *_env keys):
+  # a lower bound on shs_reseed_holdoff below.  0 = none.
   shs_reseed_grace_env: 0
+  # Grad steps for which structure sweeps (merge, delete, birth, split) stay off after a re-seed.
+  # No sweep runs between the re-seed request and the update that installs the seeded
+  # statistics; this key adds a delay after that update: -1 = one move interval of the current
+  # curriculum phase (of the first later phase with sweeps if the current one has none),
+  # 0 = none, n = n grad steps.
+  shs_reseed_holdoff: -1
+  # Growth moves (birth, split) in remap mode.  A newborn is seeded with its window statistics
+  # at the scale of the memory.  True: that mass is taken out of the memory of the live regimes
+  # that hold the newborn's time steps (all statistics of a regime are scaled together).  The
+  # total emission mass is then the same before and after the move as long as every donor
+  # holds at least the mass asked of it; a donor cannot give more than it has, and the total
+  # grows by that shortfall.  Transition and start counts are conserved only approximately.
+  # If the shares cannot be computed the move falls back to copying, counted in
+  # shs_move_handover_failures.  False: live regimes are copied unchanged
+  # and the newborn is added on top, so the installed model holds more mass than the scored one
+  # (the behaviour of the original code).  Off by default: equal on the standard test, worse
+  # on recovery from one regime with one-sequence births.
+  shs_move_remap_retain: False
+  # seqcreate births: number of passes of the candidate over the whole window after its two
+  # newborns were fitted on their own sequence, before it is scored (the base gets the same
+  # number).  0 = the newborns are fitted on that one sequence only.
+  shs_birth_full_refine: 1
+  # Online-update ablation.  'constant': the fixed-rate blend with rate shs_ema_tau (default),
+  # S <- (1 - tau) S + tau s.
+  # 'power': the power prior with the constant discount rho = 1 - shs_ema_tau.  The stored
+  # statistics of every factor are tempered by rho and the minibatch is added at full weight,
+  # S <- rho S + s, with the base prior at full strength; in steady state the memory holds
+  # about 1/tau minibatches of evidence.  For a fixed number of regimes (no structure moves),
+  # with shs_ema_gate False and shs_forget_mode fixed.
+  # 'harmonic': rate 1/n at the n-th global update since the statistics were (re-)initialised,
+  # i.e. the uniform average of the minibatch statistics since then.  The stored evidence stays
+  # at the scale of one minibatch; it is not an accumulating streaming posterior.
+  shs_ema_schedule: constant
+  # Online-update ablation, "fixed parameters": from this point of the schedule (same unit as
+  # the *_env curriculum keys) no regime factor changes any more: no statistics update, no
+  # structure sweep, no refresh at later curriculum boundaries.  null = never.
+  shs_freeze_globals_env: null
+  # Divides every schedule value given in schedule units (curriculum boundaries, move intervals,
+  # shs_move_first_env, shs_freeze_globals_env).  1 = as written.  For a short check of an arm:
+  # with 25 a 16k-frame run passes through every phase of the rebuttal schedule.
+  shs_schedule_scale: 1.0
   shs_global_source: replay_ema
   shs_repr_epoch_steps: 0
   shs_ckpt_reservoir: False
@@ -2227,3 +2271,146 @@ carl_vanilla:
 
 carl_context_visible:
   encoder: {mlp_keys: 'context', cnn_keys: 'image'}
+
+# ==============================================================================================
+# Rebuttal protocol (AISTATS 2027).  One SHS configuration for every DMC and CARL task, with
+# the schedule in FRAMES so that every mechanism is active inside a 500k-frame run, and one
+# preset per ablation rung / forgetting arm requested by the reviewers.
+#
+#   python dreamer.py --configs dmc_vision dmc_walker_shs_moves shs_rebuttal rb_full --seed 1
+#   python dreamer.py --configs carl_walker_shs shs_rebuttal rb_k1 --seed 1
+#
+# The task preset only supplies the task, the action repeat and the suite's train ratio;
+# shs_rebuttal overrides every SHS setting it carries.  Rungs (each differs from the next by
+# one switch, for the whole run):
+#   rb_k1       one linear-Gaussian action-conditioned regime, conjugate online updates
+#   rb_nostick  K = 16 fixed, no persistence prior (kappa 0), no gate, no moves
+#   rb_sticky   K = 16 fixed, constant stickiness kappa = 10, no gate, no moves
+#   rb_gate     K = 16 fixed, state-dependent persistence gate, no moves
+#   rb_full     the gate plus merge / delete / birth / split moves (this is shs_rebuttal itself)
+# Update rules of the regime statistics, appended after a rung.  The launchers put them on
+# rb_gate (K fixed, no structure moves), so that the arms differ in the update rule only:
+#   rb_gated     responsibility-gated EMA (the default; rb_gate itself)
+#   rb_ema       plain EMA
+#   rb_power     power prior with discount rho = 1 - shs_ema_tau (minibatch at full weight)
+#   rb_retain    inferred retention
+#   rb_noforget  uniform average of the minibatch statistics since the re-seed (rate 1/n)
+#   rb_frozen    the default update until 200k frames, then every regime factor is frozen
+# rb_handover is for rb_full: growth moves take the newborn's mass out of its parents' memory.
+# The two Dreamer controls need no preset: dmc_vanilla_compare (or carl_vanilla) with
+# --dyn_discrete 32 (categorical, the baseline of the paper) or --dyn_discrete 0 (Gaussian).
+shs_rebuttal:
+  dyn_discrete: 0
+  use_shs: True
+  shs_schedule_unit: frame
+  shs_K: 16
+  shs_action_dim: -1
+  shs_shared_carry: True
+  shs_q_rank: 4
+  shs_proj_dim: 128
+  shs_recurrent: True
+  shs_kappa: 10.0
+  shs_prior_persist: 0.9
+  shs_rstick_dim: 32
+  shs_rstick_use_action: False
+  shs_rstick_stopgrad: True
+  shs_ema_tau: 0.02
+  shs_ema_gate: True
+  shs_forget_mode: fixed
+  shs_ema_schedule: constant
+  shs_freeze_globals_env: null
+  shs_b0: 0.2
+  shs_calibrate_b0: True
+  shs_calibrate_sF: 1.0
+  shs_calibrate_b0_at: -1
+  shs_reseed_at_calibration: True
+  shs_reseed_holdoff: -1
+  shs_imag_mode: actor_moment
+  shs_structure_moves: True
+  shs_delete_empty: True
+  shs_move_version: teacher
+  shs_move_first: null
+  shs_move_first_env: null
+  shs_move_holdout: 8
+  shs_move_holdout_z: 2.0
+  shs_move_K_headroom: 8
+  shs_move_warmup: 0
+  shs_move_buffer: 64
+  shs_move_max_age: 2000
+  shs_move_remap_retain: False
+  shs_birth_full_refine: 1
+  shs_diag_log: True
+  # frames: no moves until 100k (noise prior calibrated and regimes re-seeded there), merge
+  # and delete from 100k, births from 200k, splits from 300k; a sweep every 20,800 frames
+  shs_curriculum:
+    - {until_env: 100000, move_every: 0,         recurrent: True, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: 200000, move_every_env: 20800, recurrent: True, birth: False, split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: 300000, move_every_env: 20800, recurrent: True, birth: True,  split: False, move_threshold: 10.0, create_bonus: 0.0}
+    - {until_env: -1,     move_every_env: 20800, recurrent: True, birth: True,  split: True,  move_threshold: 10.0, create_bonus: 0.0}
+
+rb_full:
+  shs_structure_moves: True
+
+rb_gate:
+  shs_structure_moves: False
+  shs_delete_empty: False
+  shs_curriculum:
+    - {until_env: 100000, move_every: 0, recurrent: True, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 0, recurrent: True, birth: False, split: False, create_bonus: 0.0}
+
+rb_sticky:
+  shs_structure_moves: False
+  shs_delete_empty: False
+  shs_recurrent: False
+  shs_curriculum:
+    - {until_env: 100000, move_every: 0, recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 0, recurrent: False, kappa: 10.0, birth: False, split: False, create_bonus: 0.0}
+
+rb_nostick:
+  shs_structure_moves: False
+  shs_delete_empty: False
+  shs_recurrent: False
+  shs_kappa: 0.0
+  shs_curriculum:
+    - {until_env: 100000, move_every: 0, recurrent: False, kappa: 0.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 0, recurrent: False, kappa: 0.0, birth: False, split: False, create_bonus: 0.0}
+
+# The statistics of the single regime are reset at 100k frames like those of the other arms.
+rb_k1:
+  shs_K: 1
+  shs_structure_moves: False
+  shs_delete_empty: False
+  shs_recurrent: False
+  shs_kappa: 0.0
+  shs_curriculum:
+    - {until_env: 100000, move_every: 0, recurrent: False, kappa: 0.0, birth: False, split: False, create_bonus: 0.0}
+    - {until_env: -1,     move_every: 0, recurrent: False, kappa: 0.0, birth: False, split: False, create_bonus: 0.0}
+
+rb_ema:
+  shs_ema_gate: False
+  shs_forget_mode: fixed
+
+rb_gated:
+  shs_ema_gate: True
+  shs_forget_mode: fixed
+
+rb_retain:
+  shs_ema_gate: True
+  shs_forget_mode: evidence
+
+rb_power:
+  shs_ema_gate: False
+  shs_forget_mode: fixed
+  shs_ema_schedule: power
+
+rb_noforget:
+  shs_ema_gate: False
+  shs_forget_mode: fixed
+  shs_ema_schedule: harmonic
+
+rb_frozen:
+  shs_freeze_globals_env: 200000
+
+# growth moves take the newborn's mass out of its parents' memory (off in every other arm)
+rb_handover:
+  shs_move_remap_retain: True

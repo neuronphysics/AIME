@@ -15,6 +15,39 @@
 #SBATCH --error=./logs/slurm-dreamer-shs-rssm-carl-%A_%a.err
 #SBATCH --open-mode=append
 
+# Runs a list of CARL runs through a few lanes (array indices); each lane takes the next open
+# run of the list, works on it for a 12 h slice and queues its own next slice.
+#   SETUPS        arms, in priority order (see below)        CARL_PRESETS  task presets
+#   SEEDS         seeds                                       STEPS         frames per run
+#   ORDER=seed    go through the list seed by seed (all arms get their first seed before any
+#                 gets its second); default: arm by arm
+# Arms of the paper:   shs:<forget>  shs_moves:<forget>  vanilla      (forget: gated retain fixed)
+# Rebuttal arms (one configuration for every task, schedule in frames; presets shs_rebuttal and
+# rb_* in configs.yaml), logged under logdir/rebuttal/<task>/<arm>/seed_<n>:
+#   dv3           DreamerV3, categorical latents, context hidden
+#   dv3_gauss     DreamerV3, Gaussian latents, context hidden
+#   dv3_ctx       DreamerV3 that observes the context (concat-context of Prasanna et al.)
+#   rb_k1  rb_nostick  rb_sticky  rb_gate  rb_full       the ablation ladder, context hidden
+#   rb_ema  rb_power  rb_retain  rb_noforget  rb_frozen
+#                 rb_gate with another update of the regime statistics (rb_gate itself is the
+#                 gated EMA; rb_power is the power prior); K fixed, no structure moves
+#   rb_handover   rb_full with the memory hand-over of growth moves
+#   rb_K<n>       rb_gate with n regimes
+# Example (1M frames per run, the default; each lane requeues itself until its runs are done):
+#   SETUPS="rb_full rb_k1 dv3_gauss dv3_ctx dv3" CARL_PRESETS=carl_walker_shs SEEDS="1 2 3" \
+#     ORDER=seed sbatch --time=1-00:00:00 --array=1-8 run_dreamer_carl_mila.sh
+# With a rebuttal arm, KEEP_AT (default 500000) makes dreamer.py keep checkpoint_<frames>.pt when
+# a run passes that many frames, so that all arms can be compared at that budget later; KEEP_AT=
+# keeps none.
+# A fresh rebuttal run first takes the arm through its whole schedule on random data
+# (selfcheck.py, verdict in <logdir>/selfcheck.txt; a verdict other than OK is also copied to
+# logs/SELFCHECK_<verdict>_<task>_<arm>_seed<n>.txt).  SELFCHECK=1 (default): training starts
+# whatever the check reports.  SELFCHECK=strict: a run whose check FAILED is not trained and
+# stays blocked (.selfcheck_failed in its log directory) while the lanes go on with the other
+# runs.  SELFCHECK=0: no check.
+# FLAGS adds dreamer.py options to every run; with rebuttal arms it needs TAG=<name>, which is
+# appended to the arm in the log directory.  TAG names the runs of the older arms too.
+
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}}"
@@ -23,20 +56,47 @@ cd "${PROJECT_DIR}"
 
 CONDA_ENV="${CONDA_ENV:-trifinger_rl_venv}"
 STEPS="${STEPS:-1000000}"
+KEEP_AT="${KEEP_AT-500000}"
+if [[ -n "${KEEP_AT}" && ! "${KEEP_AT}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+  echo "KEEP_AT must be frame counts separated by commas (or empty), got '${KEEP_AT}'" >&2
+  exit 2
+fi
+SELFCHECK="${SELFCHECK:-1}"
+if [[ "${SELFCHECK}" != 0 && "${SELFCHECK}" != 1 && "${SELFCHECK}" != strict ]]; then
+  echo "SELFCHECK must be 1 (check, then train whatever it reports), strict (a failed check blocks the run) or 0 (no check), got '${SELFCHECK}'" >&2
+  exit 2
+fi
 MAX_FAILS=3
 LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/logdir}"
 read -r -a SETUPS <<< "${SETUPS:-shs:gated shs_moves:gated shs:retain shs_moves:retain}"
 read -r -a PRESETS <<< "${CARL_PRESETS:-carl_walker_shs carl_walker_gravity_friction_shs carl_quadruped_walk_shs carl_quadruped_actuator_shs carl_finger_spin_shs}"
 read -r -a SEEDS <<< "${SEEDS:-1 2 3 4}"
 
+TAG="${TAG:-}"
+if [[ -n "${TAG}" && ! "${TAG}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+  echo "TAG may hold letters, digits, dots and dashes only, got '${TAG}'" >&2; exit 2
+fi
+
 RUN_LIST=()
-for setup in "${SETUPS[@]}"; do
-  for seed in "${SEEDS[@]}"; do
-    for preset in "${PRESETS[@]}"; do
-      RUN_LIST+=("${setup}/${preset}/${seed}")
-    done
-  done
-done
+case "${ORDER:-setup}" in
+  setup)
+    for setup in "${SETUPS[@]}"; do
+      for seed in "${SEEDS[@]}"; do
+        for preset in "${PRESETS[@]}"; do
+          RUN_LIST+=("${setup}/${preset}/${seed}")
+        done
+      done
+    done ;;
+  seed)
+    for seed in "${SEEDS[@]}"; do
+      for preset in "${PRESETS[@]}"; do
+        for setup in "${SETUPS[@]}"; do
+          RUN_LIST+=("${setup}/${preset}/${seed}")
+        done
+      done
+    done ;;
+  *) echo "ORDER must be setup or seed, got '${ORDER}'" >&2; exit 2 ;;
+esac
 
 run_settings() {
   local setup extra
@@ -45,7 +105,32 @@ run_settings() {
   CONFIGS=("${PRESET}")
   RUN="${PRESET}"
   FORGET_FLAGS=()
-  if [[ "${ARM}" == vanilla ]]; then
+  REBUTTAL=0
+  if [[ "${ARM}" == dv3* || "${ARM}" == rb_* ]]; then
+    # rebuttal arms: the task preset only supplies the task, its contexts and the train ratio
+    REBUTTAL=1
+    if [[ -n "${FORGET:-}" ]]; then
+      echo "Rebuttal arms take no ':<forget>' part (use rb_ema, rb_retain, ...), got '${setup}'" >&2; exit 2
+    fi
+    case "${ARM}" in
+      dv3)       CONFIGS+=(carl_vanilla) ;;
+      dv3_gauss) CONFIGS+=(carl_vanilla); FORGET_FLAGS=(--dyn_discrete 0) ;;
+      dv3_ctx)   CONFIGS+=(carl_vanilla carl_context_visible) ;;
+      rb_k1|rb_nostick|rb_sticky|rb_gate|rb_full)
+                 CONFIGS+=(shs_rebuttal "${ARM}") ;;
+      rb_ema|rb_power|rb_retain|rb_noforget|rb_frozen)
+                 CONFIGS+=(shs_rebuttal rb_gate "${ARM}") ;;
+      rb_handover)
+                 CONFIGS+=(shs_rebuttal rb_full rb_handover) ;;
+      rb_K[1-9]|rb_K[1-9][0-9])
+                 CONFIGS+=(shs_rebuttal rb_gate); FORGET_FLAGS=(--shs_K "${ARM#rb_K}") ;;
+      *) echo "Unknown rebuttal arm '${ARM}' (dv3, dv3_gauss, dv3_ctx, rb_k1, rb_nostick, rb_sticky, rb_gate, rb_full, rb_ema, rb_power, rb_retain, rb_noforget, rb_frozen, rb_handover, rb_K<n>)" >&2; exit 2 ;;
+    esac
+    if [[ -n "${FLAGS:-}" && -z "${TAG}" ]]; then
+      echo "FLAGS with a rebuttal arm needs TAG=<name>, so that the runs get their own log directories" >&2; exit 2
+    fi
+    RUN="rebuttal/${PRESET%_shs}/${ARM}${TAG:+_${TAG}}"
+  elif [[ "${ARM}" == vanilla ]]; then
     CONFIGS+=(carl_vanilla)
     RUN="${PRESET%_shs}_vanilla"
   else
@@ -56,7 +141,7 @@ run_settings() {
     case "${ARM}" in
       shs)       ;;
       shs_moves) CONFIGS+=(carl_moves); RUN="${PRESET}_moves" ;;
-      *) echo "Unknown arm '${ARM}' (shs, shs_moves, vanilla)" >&2; exit 2 ;;
+      *) echo "Unknown arm '${ARM}' (shs, shs_moves, vanilla, or a rebuttal arm: dv3, dv3_gauss, dv3_ctx, rb_k1, rb_nostick, rb_sticky, rb_gate, rb_full, rb_ema, rb_power, rb_retain, rb_noforget, rb_frozen, rb_handover, rb_K<n>)" >&2; exit 2 ;;
     esac
     case "${FORGET:-}" in
       gated)  FORGET_FLAGS=(--shs_ema_gate True --shs_forget_mode fixed) ;;
@@ -66,9 +151,13 @@ run_settings() {
     esac
     RUN="${RUN}_${FORGET}"
   fi
+  if (( ! REBUTTAL )); then RUN="${RUN}${TAG:+_${TAG}}"; fi
   LOGDIR="${LOG_ROOT}/${RUN}/seed_${SEED}"
   COMMAND=(python -u dreamer.py --configs "${CONFIGS[@]}"
     --seed "${SEED}" --compile False --steps "${STEPS}" --logdir "${LOGDIR}" "${FORGET_FLAGS[@]}")
+  if (( REBUTTAL )) && [[ -n "${KEEP_AT}" ]]; then
+    COMMAND+=(--checkpoint_at "${KEEP_AT}")
+  fi
   if [[ -n "${FLAGS:-}" ]]; then
     read -r -a extra <<< "${FLAGS}"
     COMMAND+=("${extra[@]}")
@@ -83,17 +172,41 @@ lock_owner() {
   cat "${LOGDIR}/.lane_lock/job" 2>/dev/null || true
 }
 
+# Frames a finished run was trained for (first line of .finished written by this script;
+# older marker files hold a date only and count as finished for any budget).
+finished_steps() {
+  local n
+  n="$(sed -n 's/^steps=\([0-9][0-9]*\)$/\1/p' "${LOGDIR}/.finished" 2>/dev/null | head -n 1)"
+  echo "${n:-}"
+}
+
+# A run is finished when .finished exists, unless it records fewer frames than STEPS asks for
+# now: then the run is continued from its checkpoint.
+run_is_finished() {
+  local n
+  [[ -f "${LOGDIR}/.finished" ]] || return 1
+  n="$(finished_steps)"
+  [[ -z "${n}" || ! "${STEPS}" =~ ^[0-9]+$ ]] || (( n >= STEPS ))
+}
+
+# With SELFCHECK=strict a run whose self-check failed stays closed until .selfcheck_failed is removed.
+selfcheck_blocked() {
+  [[ "${SELFCHECK}" == strict && -f "${LOGDIR}/.selfcheck_failed" ]]
+}
+
 run_is_open() {
-  [[ ! -f "${LOGDIR}/.finished" && ! -f "${LOGDIR}/.config_mismatch" ]] && (( $(failure_count) < MAX_FAILS ))
+  ! run_is_finished && [[ ! -f "${LOGDIR}/.config_mismatch" ]] && (( $(failure_count) < MAX_FAILS )) && ! selfcheck_blocked
 }
 
 run_progress() {
   local last
-  if [[ -f "${LOGDIR}/.finished" ]]; then echo "finished"; return; fi
+  if run_is_finished; then echo "finished"; return; fi
   if [[ -f "${LOGDIR}/.config_mismatch" ]]; then echo "blocked: checkpoint of other settings"; return; fi
   if (( $(failure_count) >= MAX_FAILS )); then echo "blocked: failed ${MAX_FAILS} times"; return; fi
+  if selfcheck_blocked; then echo "blocked: self-check failed (remove .selfcheck_failed to try again)"; return; fi
   last="$(tail -n 1 "${LOGDIR}/metrics.jsonl" 2>/dev/null | grep -o '"step": [0-9.]*' | grep -o '[0-9.]*$' || true)"
-  if [[ -n "${last}" ]]; then echo "at frame ${last%.*}"; else echo "not started"; fi
+  if [[ -f "${LOGDIR}/.finished" ]]; then echo "finished at $(finished_steps) frames, to be continued to ${STEPS}"
+  elif [[ -n "${last}" ]]; then echo "at frame ${last%.*}"; else echo "not started"; fi
 }
 
 claim_run() {
@@ -135,13 +248,16 @@ work_remains() {
   return 1
 }
 
+# a misspelt arm stops the script here, not inside a lane
+for entry in "${RUN_LIST[@]}"; do run_settings "${entry}"; done
+
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
   echo "${#RUN_LIST[@]} runs in priority order, logdirs under ${LOG_ROOT}"
   n=0
   for entry in "${RUN_LIST[@]}"; do
     n=$(( n + 1 ))
     run_settings "${entry}"
-    printf '%3d  %-18s %-34s seed %s  %s\n' "${n}" "${ARM}${FORGET:+:${FORGET}}" "${PRESET}" "${SEED}" "$(run_progress)"
+    printf '%3d  %-18s %-34s seed %s  %s  %s\n' "${n}" "${ARM}${FORGET:+:${FORGET}}" "${PRESET}" "${SEED}" "$(run_progress)" "${LOGDIR}"
     printf '      '; printf ' %q' "${COMMAND[@]}"; printf '\n'
   done
   exit 0
@@ -246,7 +362,7 @@ while [[ -z "${STOP}" ]]; do
   fi
   echo "=== $(date) | lane ${LANE} | ${ARM} ${FORGET:-} | ${PRESET} | seed ${SEED} | $(run_progress)"
   printf 'Command:'; printf ' %q' "${COMMAND[@]}"; printf '\n'
-  scontrol update JobId="${SLURM_JOB_ID}" JobName="carl_${RUN}_s${SEED}" 2>/dev/null || true
+  scontrol update JobId="${SLURM_JOB_ID}" JobName="carl_${RUN//\//_}_s${SEED}" 2>/dev/null || true
 
   if ! carl_preflight; then
     export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa LP_NUM_THREADS=3
@@ -258,6 +374,37 @@ while [[ -z "${STOP}" ]]; do
     fi
   fi
   if [[ -n "${STOP}" ]]; then release_run; break; fi
+
+  # Before a fresh rebuttal run: the arm goes through every phase of its schedule on random
+  # data on this GPU.  The verdict is the first line of <logdir>/selfcheck.txt (OK, INCOMPLETE,
+  # FAILED, NO VERDICT); anything but OK is copied to logs/SELFCHECK_*.  Training starts
+  # whatever the verdict is, unless SELFCHECK=strict and the verdict is FAILED.
+  if (( REBUTTAL )) && [[ "${SELFCHECK}" != 0 && ! -f "${LOGDIR}/latest.pt" ]]; then
+    python -u selfcheck.py "${COMMAND[@]:3}" --selfcheck_report "${LOGDIR}/selfcheck.txt" &
+    PY_PID=$!
+    sc=0
+    wait "${PY_PID}" || sc=$?
+    PY_PID=""
+    if [[ -n "${STOP}" ]]; then release_run; break; fi
+    VERDICT="$(head -n 1 "${LOGDIR}/selfcheck.txt" 2>/dev/null | sed -n 's/^\[selfcheck\] \(OK\|INCOMPLETE\|FAILED\|NO VERDICT\).*/\1/p' || true)"
+    VERDICT="${VERDICT:-NO VERDICT}"
+    FLAG_RUN="${RUN#rebuttal/}"; FLAG_RUN="${FLAG_RUN//\//_}_seed${SEED}"
+    mkdir -p "${PROJECT_DIR}/logs"
+    rm -f "${PROJECT_DIR}/logs/SELFCHECK_"*"_${FLAG_RUN}.txt"
+    if [[ "${VERDICT}" != OK ]]; then
+      FLAG="${PROJECT_DIR}/logs/SELFCHECK_${VERDICT// /_}_${FLAG_RUN}.txt"
+      cp "${LOGDIR}/selfcheck.txt" "${FLAG}" 2>/dev/null || echo "[selfcheck] NO VERDICT: no report was written" > "${FLAG}"
+      echo "[selfcheck] ${ARM}: ${VERDICT} (exit ${sc}); see ${FLAG}" >&2
+    fi
+    if [[ "${SELFCHECK}" == strict && "${VERDICT}" == FAILED ]]; then
+      date > "${LOGDIR}/.selfcheck_failed"
+      echo "[lane ${LANE}] SELFCHECK=strict and the check of ${ARM} failed: not trained; ${LOGDIR}/.selfcheck_failed blocks the run until it is removed" >&2
+      release_run
+      continue
+    fi
+    rm -f "${LOGDIR}/.selfcheck_failed"
+    [[ "${VERDICT}" == OK ]] || echo "[selfcheck] ${ARM}: training starts anyway (SELFCHECK=${SELFCHECK})" >&2
+  fi
 
   "${COMMAND[@]}" &
   PY_PID=$!
@@ -272,7 +419,7 @@ while [[ -z "${STOP}" ]]; do
   PY_PID=""
 
   case "${status}" in
-    0)  date > "${LOGDIR}/.finished"; echo "[lane ${LANE}] finished ${LOGDIR}" ;;
+    0)  { echo "steps=${STEPS}"; date; } > "${LOGDIR}/.finished"; echo "[lane ${LANE}] finished ${LOGDIR}" ;;
     75) echo "[lane ${LANE}] saved ${LOGDIR}/latest.pt" ;;
     78) date > "${LOGDIR}/.config_mismatch"; echo "[lane ${LANE}] ${LOGDIR} has a checkpoint of other settings; skipped" >&2 ;;
     *)  echo "$(date) exit ${status} on $(hostname)" >> "${LOGDIR}/.failures"

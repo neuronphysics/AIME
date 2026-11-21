@@ -732,13 +732,13 @@ def plot_results(out, cfg, panel_labels=False):
     from scipy.stats import t as student_t
     plt.rcParams.update(PAPER_STYLE)
     tau, tau_s = cfg["tau"], cfg["tau_slow"]
-    labels = dict(ema_retain=r"AIME (proposed): gain $\tau u_k$ + change-point retention $\mathbb{E}[r_k]$",
-                  ema_gated=r"AIME ablation: gain $\tau u_k$, no retention",
+    labels = dict(ema_retain=r"SHS-RSSM (proposed): gain $\tau u_k$ + change-point retention $\mathbb{E}[r_k]$",
+                  ema_gated=r"SHS-RSSM ablation: gain $\tau u_k$, no retention",
                   ema=rf"Fixed EMA, $\tau={tau:g}$ for every regime", ema_slow=rf"Fixed EMA, $\tau={tau_s:g}$",
                   ema_moves=rf"Fixed EMA, $\tau={tau:g}$ + birth/split/merge/delete",
                   svb="Sequential SVB (no forgetting)", window=f"Sliding window, W = {cfg['window']}",
                   cumavg="Cumulative mean")
-    short = dict(ema_retain="AIME (proposed)", ema_gated="AIME, no retention", ema=rf"Fixed EMA, $\tau={tau:g}$",
+    short = dict(ema_retain="SHS-RSSM (proposed)", ema_gated="SHS-RSSM, no retention", ema=rf"Fixed EMA, $\tau={tau:g}$",
                  ema_moves=rf"Fixed EMA, $\tau={tau:g}$ + moves", ema_slow=rf"Fixed EMA, $\tau={tau_s:g}$",
                  window=f"Window, W = {cfg['window']}", svb="Sequential SVB", cumavg="Cumulative mean")
     style = dict(ema_retain="-", ema_gated=(0, (4, 1.6)), ema="-", ema_slow="-", ema_moves="-.", svb="-",
@@ -867,7 +867,7 @@ def plot_results(out, cfg, panel_labels=False):
             ha="center", va="bottom", fontsize=9, style="italic", color=".3")
     k = ARMS.index("ema_retain")
     at = int(np.argmin(np.abs(xb-(cs+cfg["rotation_steps"]*.6))))
-    ax.annotate("AIME (proposed)", xy=(xb[at], curve[k, at]), xytext=(xb[at], curve[k, at]/4.5), ha="center",
+    ax.annotate("SHS-RSSM (proposed)", xy=(xb[at], curve[k, at]), xytext=(xb[at], curve[k, at]/4.5), ha="center",
                 fontsize=9, color=".15", arrowprops=dict(arrowstyle="-", color=".45", lw=.7))
     ax.set(xlabel="Minibatch update", ylabel="Excess predictive NLL (nats / transition)")
     ax.grid(True, which="major")

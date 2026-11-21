@@ -28,6 +28,74 @@ class RewardEMA:
         return offset.detach(), scale.detach()
 
 
+def openl_summary(parts, prefix=""):
+    """Scalars from the sums of WorldModel.openl_error over one or more batches.
+
+    <prefix>openl_mse and <prefix>openl_mse_15 are means over the counted forecast steps;
+    when the data carry context ids, openl_mse is the mean of the per-context means, so that
+    every context weighs the same however many sequences were drawn from it, and the
+    per-context means are returned as <prefix>openl_mse_ctx<id>.  <prefix>openl_steps is the
+    number of forecast steps counted and <prefix>openl_contexts the number of contexts that
+    contributed any (compare it with the number of contexts of the split: a context without a
+    counted step is not in the mean).  Empty when no step could be counted."""
+    se = sum(p["se"] for p in parts)
+    n = sum(p["n"] for p in parts)
+    se15 = sum(p["se15"] for p in parts)
+    n15 = sum(p["n15"] for p in parts)
+    if n <= 0:
+        return {}
+    out = {prefix + "openl_mse": se / n, prefix + "openl_steps": n}
+    if n15 > 0:
+        out[prefix + "openl_mse_15"] = se15 / n15
+    ctx = {}
+    for p in parts:
+        for c, (s_, n_) in p.get("ctx", {}).items():
+            acc = ctx.setdefault(c, [0.0, 0.0])
+            acc[0] += s_
+            acc[1] += n_
+    means = {c: v[0] / v[1] for c, v in ctx.items() if v[1] > 0}
+    if means:
+        out[prefix + "openl_mse"] = sum(means.values()) / len(means)
+        out[prefix + "openl_contexts"] = float(len(means))
+        for c, v in sorted(means.items()):
+            out[f"{prefix}openl_mse_ctx{c}"] = v
+    return out
+
+
+def regime_context_alignment(gamma, context_id, weight=None):
+    """Agreement between regime responsibilities and a discrete context label per time step.
+
+    gamma: (B, T, K) responsibilities; context_id: (B, T) labels; weight: (B, T) step weights.
+    Returns the normalised mutual information, MI / sqrt(H(regime) H(context)), and the share
+    of the context entropy that the regime explains, MI / H(context): 0 when the regimes carry
+    no information about the context, 1 when the regime identifies it.  Both are 0 when the
+    batch holds a single context or a single regime carries all the mass."""
+    B, T, K = gamma.shape
+    ctx = context_id.reshape(B, T).round().long()
+    w = torch.ones(B, T, device=gamma.device) if weight is None else weight.reshape(B, T).float()
+    ids = torch.unique(ctx)
+    out = {"shs_context_count": float(ids.numel()), "shs_context_nmi": 0.0,
+           "shs_context_explained": 0.0}
+    if ids.numel() < 2:
+        return out
+    onehot = (ctx.unsqueeze(-1) == ids.view(1, 1, -1)).float()
+    joint = torch.einsum("btk,btc,bt->kc", gamma.float(), onehot, w)
+    total = joint.sum()
+    if float(total) <= 0:
+        return out
+    joint = joint / total
+    pk, pc = joint.sum(1), joint.sum(0)
+    ent = lambda p: -(p.clamp_min(1e-12) * p.clamp_min(1e-12).log()).sum()
+    hk, hc = ent(pk), ent(pc)
+    ratio = joint.clamp_min(1e-12) / (pk[:, None] * pc[None, :]).clamp_min(1e-12)
+    mi = (joint * ratio.log()).sum().clamp_min(0.0)
+    if float(hc) > 1e-9:
+        out["shs_context_explained"] = float(mi / hc)
+        if float(hk) > 1e-9:
+            out["shs_context_nmi"] = float(mi / torch.sqrt(hk * hc))
+    return out
+
+
 class WorldModel(nn.Module):
     def __init__(self, obs_space, act_space, step, config):
         super(WorldModel, self).__init__()
@@ -271,6 +339,50 @@ class WorldModel(nn.Module):
         return torch.cat([truth, model, error], 2)
 
     @torch.no_grad()
+    def openl_error(self, data, context=5):
+        """Open-loop pixel error of the world model on one batch, the same for every variant.
+
+        The first `context` frames of each sequence are filtered; from there the prior is
+        rolled out with the recorded actions and decoded, as in video_pred.  A replay sequence
+        can run over the end of an episode into the next one (is_first marks the join), so a
+        forecast step is counted only while no episode has started since the first frame: a
+        sequence whose context contains a join is left out, and after a later join the rest of
+        the sequence is.  Returns sums, to be pooled over batches with openl_summary:
+        se, n over all counted steps, se15, n15 over the first 15 forecast steps, and ctx, the
+        same sums per context id when the data carry one (CARL)."""
+        data = self.preprocess(data)
+        embed = self.encoder(data)
+        B, T = int(embed.shape[0]), int(embed.shape[1])
+        out = {"se": 0.0, "n": 0.0, "se15": 0.0, "n15": 0.0, "ctx": {}}
+        if T <= context:
+            return out
+        states, _ = self.dynamics.observe(
+            embed[:, :context], data["action"][:, :context], data["is_first"][:, :context])
+        if hasattr(self.dynamics, "annotate_regime_resp"):
+            self.dynamics.annotate_regime_resp(
+                states, data["is_first"][:, :context],
+                action=(data["action"][:, :context]
+                        if getattr(self.dynamics, "_shs_action_dim", 0) > 0 else None))
+        init = {k: v[:, -1] for k, v in states.items()}
+        prior = self.dynamics.imagine_with_action(data["action"][:, context:], init)
+        openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
+        truth = data["image"][:, context:]
+        sq = ((openl.float() - truth.float()) ** 2).flatten(2).mean(-1)          # (B, T - context)
+        first = data["is_first"].reshape(B, T) > 0.5
+        joined = torch.cumsum(first[:, 1:].float(), dim=1) > 0                   # a join at or before step t
+        valid = (~joined[:, context - 1:]).float()                              # steps context .. T-1
+        w15 = valid.clone()
+        w15[:, 15:] = 0.0
+        out.update(se=float((sq * valid).sum()), n=float(valid.sum()),
+                   se15=float((sq * w15).sum()), n15=float(w15.sum()))
+        if "context_id" in data:
+            ctx = data["context_id"].reshape(B, T)[:, 0].round().long()          # context of the counted episode
+            for c in torch.unique(ctx).tolist():
+                m = (ctx == c).float().unsqueeze(-1)
+                out["ctx"][int(c)] = [float((sq * valid * m).sum()), float((valid * m).sum())]
+        return out
+
+    @torch.no_grad()
     def _shs_imagination_multimodality(self, states, action):
         """One imagined step from posterior states: how much of the predictive
         variance comes from regime disagreement, and how peaked the weights are."""
@@ -303,7 +415,7 @@ class WorldModel(nn.Module):
         The occupancy statistics (active regimes, entropy, effective regimes) are computed from
         the regime posterior of every sequence over its full length, excluding the first step of
         each sequence, whose responsibility comes from the initial-state distribution rather than
-        from the transition model.  
+        from the transition model.  `context` only sets the open-loop split of the figures.
         """
         if not hasattr(self.dynamics, "annotate_regime_resp"):
             return {}
@@ -340,6 +452,11 @@ class WorldModel(nn.Module):
             "shs_diag_steps": float(keep.sum()),
             "shs_expected_self_transition": self_trans,
         }
+        if "context_id" in data:
+            # contextual environments (CARL): what the inferred regime says about the hidden
+            # physical context of the episode
+            metrics.update(regime_context_alignment(
+                gamma, data["context_id"].reshape(B, T), keep))
         prior["is_first"] = data["is_first"]
         if hasattr(self.dynamics, "prior_entropy_bounds"):
             _ent_lo, _ent_hi = self.dynamics.prior_entropy_bounds(prior)

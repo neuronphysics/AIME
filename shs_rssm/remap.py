@@ -30,8 +30,17 @@ def remap_stats(live, cand, row_map, scale=None):
 
 
 def remap_counts(C_live, s_live, C_cand, s_cand, row_map, scale=None):
+    """EMA-scale transition and start counts for the new structure.
+
+    A row of `row_map` with 0/1 entries keeps or sums live rows (delete, merge).  A fractional
+    entry w on a kept row means that regime keeps the share w of its time steps (a growth move
+    gave the rest to a newborn): a transition between two different regimes survives when both
+    ends are kept (w_j w_k), a self-transition when its regime is kept (w_j, not w_j^2)."""
     M = row_map.to(dtype=C_live.dtype, device=C_live.device)
     C = M @ C_live @ M.t()
+    frac = (M * (1.0 - M)).clamp_min(0.0)
+    if float(frac.sum()) > 0.0:
+        C = C + torch.diag(frac @ torch.diagonal(C_live))
     s = M @ s_live
     fresh = newborn_rows(row_map)
     if fresh:

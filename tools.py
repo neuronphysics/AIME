@@ -149,6 +149,7 @@ def simulate(
         reward = [0] * len(envs)
     else:
         step, episode, done, length, obs, agent_state, reward = state
+    completed = []  # ids of the episodes that ended during this call, in order
     while (steps and step < steps) or (episodes and episode < episodes):
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
@@ -196,6 +197,7 @@ def simulate(
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
             for i in indices:
+                completed.append(envs[i].id)
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
                 if on_episode_complete is not None and not is_eval:
                     try:
@@ -259,8 +261,19 @@ def simulate(
                         logger.write(step=logger.step)
                         eval_done = True
     if is_eval:
-        while len(cache) > 1:
-            cache.popitem(last=False)
+        # Keep exactly the episodes completed in this evaluation round, the most recent
+        # `episodes` of them (it used to be the single last cache entry).  The cache feeds the
+        # evaluation video and the open-loop error, which should see every evaluation context.
+        # Episodes still running when the round ended are dropped: they are never continued
+        # (the next round resets every environment), and with unequal episode lengths they
+        # would otherwise displace completed ones.
+        keep = set(completed[-max(1, int(episodes)):])
+        if keep:
+            for key in [k for k in cache if k not in keep]:
+                del cache[key]
+        else:
+            while len(cache) > 1:
+                cache.popitem(last=False)
     return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
 
 

@@ -107,6 +107,7 @@ class SharedCarryRegimes(nn.Module):
             # predictive variance (q_Ddiag = E[1/tau] + tr Ucov) until U has evidence: a priori
             # the F factor directions together carry as much variance as the isotropic noise,
             # E[1/tau] = b0 / (a0 - 1), times u_prior_mult.
+            self._u_prior_scale_override = None
             F = self.q_rank
             self.register_buffer("Umean", 0.01 * torch.randn(K, L, F, dtype=dtype, device=device))
             self.register_buffer("Ucov", (self.u_prior_scale
@@ -514,7 +515,10 @@ class SharedCarryRegimes(nn.Module):
             names += ["Szz_full", "Szf", "Sfr", "Sfh", "Sff"]
         return names
 
-    def ema_update_stats(self, stats, tau, retain=None):
+    def ema_update_stats(self, stats, tau, retain=None, inflow=None):
+        """S <- keep * S + w * s with keep = (1 - tau) [* retain].  The weight w of the minibatch
+        statistics is tau (the blend) unless `inflow` gives it: inflow = 1 with keep = 1 - tau
+        is the power-prior update, which adds the minibatch at full weight."""
         if not self._stats_initialised:
             self.set_stats(stats); return
         for name in self.raw_stat_names():
@@ -525,7 +529,7 @@ class SharedCarryRegimes(nn.Module):
             keep = 1.0 - t
             if retain is not None:
                 keep = keep * retain.to(device=S.device, dtype=S.dtype).reshape(lead)
-            S.mul_(keep).add_(t * stats[name])
+            S.mul_(keep).add_((t if inflow is None else inflow) * stats[name])
 
     @torch.no_grad()
     def _regime_mstep_from_resid(self, Szg, Szz_resid):
@@ -669,13 +673,20 @@ class SharedCarryRegimes(nn.Module):
 
     @property
     def u_prior_scale(self) -> float:
-        """Per-entry prior variance of U, derived from the current noise prior rate and
-        u_prior_mult.  Being a function of the b0 buffer it survives state_dict round trips and
-        cloning; it is not stored and cannot be assigned (change u_prior_mult instead)."""
+        """Per-entry prior variance of U, derived from the current noise prior rate.  Being a
+        function of the b0 buffer it survives state_dict round trips; it is not stored."""
+        ov = getattr(self, "_u_prior_scale_override", None)
+        if ov is not None:
+            return float(ov)
         b0 = self._b0_rate() if hasattr(self, "_b0_rate") else self.b0
         b0m = float(b0.mean()) if torch.is_tensor(b0) else float(b0)
         a0 = float(self.a0.reshape(-1)[0]) if torch.is_tensor(self.a0) else float(self.a0)
         return self._derive_u_prior_scale(b0m, a0)
+
+    @u_prior_scale.setter
+    def u_prior_scale(self, value):
+        # explicit override (experiments); None restores the derived value
+        self._u_prior_scale_override = None if value is None else float(value)
 
     @torch.no_grad()
     def set_b0(self, b0_new):
@@ -831,6 +842,14 @@ class SharedCarryRegimes(nn.Module):
         new.M0.copy_(self.M0)
         new.Cmean.copy_(self.Cmean); new.Ccov.copy_(self.Ccov); new.C0mean.copy_(self.C0mean)
         new._freeze_C = True
+        _ov = getattr(self, "_u_prior_scale_override", None)
+        if _ov is not None and self.q_rank > 0:
+            # an explicit prior-scale override (experiments) follows the regimes through
+            # structure moves; regimes without evidence start at that prior
+            new._u_prior_scale_override = float(_ov)
+            _F = self.q_rank
+            new.Ucov.copy_((float(_ov) * torch.eye(_F, dtype=new.Ucov.dtype, device=new.Ucov.device)
+                            ).expand(new_K, self.L, _F, _F))
         if stats is not None:
             new.set_stats(stats)
             new.m_step()
